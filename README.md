@@ -136,46 +136,46 @@ Add to your `~/.zshrc`:
 bash ~/.openclaw/projects/claude-proxy/start.sh 2>/dev/null
 ```
 
-## OpenClaw 升级后恢复
+## Recovery after OpenClaw upgrade
 
-OpenClaw 升级（`npm update -g openclaw`）**不会覆盖** `~/.openclaw/openclaw.json` 用户配置。但如果 claude-local 模型不可用，按以下步骤排查：
+OpenClaw upgrades (`npm update -g openclaw`) **do not overwrite** the user config at `~/.openclaw/openclaw.json`. However, if the claude-local models stop working after an upgrade, follow these steps:
 
-### 快速诊断
+### Quick diagnosis
 
 ```bash
-# 1. 检查 proxy 是否运行
+# 1. Check if proxy is running
 curl http://127.0.0.1:3456/health
-# 应返回: {"status":"ok"}
+# Expected: {"status":"ok"}
 
-# 2. 检查 Claude CLI 是否正常
+# 2. Verify Claude CLI works
 claude -p "hello" --model sonnet --output-format text
-# 应返回文本回复
+# Expected: text response
 
-# 3. 检查 OpenClaw 配置
+# 3. Verify OpenClaw config
 cat ~/.openclaw/openclaw.json | grep -A3 claude-local
 ```
 
-### 常见故障与恢复
+### Common issues and fixes
 
-| 症状 | 原因 | 恢复方法 |
-|------|------|---------|
-| Agent 不回复，proxy 无日志 | Gateway 未加载 claude-local provider | 检查 `openclaw.json` 中 `models.providers.claude-local` 配置 |
-| Proxy 报 `exit 1` | Claude CLI 未登录或 token 过期 | 运行 `claude login` 重新认证 |
-| `🔑 unknown` 显示 | 正常现象（无 API key，走 OAuth） | 不影响功能，可忽略 |
-| `/status` 显示 Context 0% | 消息未到达 proxy（SSE 格式问题） | 确保 proxy 是最新版本，支持 streaming |
-| Gateway 报 `invalid api type` | OpenClaw 新版本改了 API 类型名 | 检查 `api` 字段是否仍为有效值（如 `openai-completions`） |
-| Proxy 启动但 `EADDRINUSE` | 端口 3456 被占用 | `lsof -i :3456` 找到并杀掉旧进程 |
+| Symptom | Cause | Fix |
+|---------|-------|-----|
+| Agent doesn't reply, no proxy logs | Gateway didn't load claude-local provider | Check `models.providers.claude-local` in `openclaw.json` |
+| Proxy reports `exit 1` | Claude CLI not logged in or token expired | Run `claude login` to re-authenticate |
+| `🔑 unknown` in `/status` | Normal — no API key, using OAuth | Does not affect functionality, safe to ignore |
+| `/status` shows Context 0% | Messages not reaching proxy (SSE format issue) | Ensure proxy is latest version with streaming support |
+| Gateway reports `invalid api type` | OpenClaw renamed API type in new version | Check `api` field is still valid (e.g., `openai-completions`) |
+| Proxy startup `EADDRINUSE` | Port 3456 already in use | `lsof -i :3456` to find and kill the old process |
 
-### 一键恢复
+### One-command recovery
 
 ```bash
-cd ~/.openclaw/projects/claude-proxy   # 或你 clone 的位置
-git pull                                # 拉取最新版本
-node setup.mjs                          # 重新配置 OpenClaw + 启动 proxy
+cd ~/.openclaw/projects/claude-proxy   # or wherever you cloned it
+git pull                                # pull latest version
+node setup.mjs                          # reconfigure OpenClaw + start proxy
 openclaw gateway restart
 ```
 
-### 升级前备份（推荐）
+### Pre-upgrade backup (recommended)
 
 ```bash
 cp ~/.openclaw/openclaw.json ~/.openclaw/openclaw.json.bak
@@ -187,7 +187,7 @@ cp ~/.openclaw/openclaw.json ~/.openclaw/openclaw.json.bak
 - The `🔑` field in `/status` may show the dummy auth key — this is normal
 - Each request spawns a `claude -p` process; concurrent requests are supported
 - The proxy must run on the same machine as the Claude CLI (uses local OAuth)
-- 同一个 Claude 账号可在多台机器上使用（共享用量额度）
+- The same Claude account can be used on multiple machines (shared usage quota)
 
 ## License
 
