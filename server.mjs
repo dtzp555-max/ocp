@@ -36,18 +36,27 @@ const VERSION = _pkg.version;
 const START_TIME = Date.now();
 
 // Model alias mapping: request model → claude CLI --model arg
+// Maps both shorthand aliases AND full model IDs to the canonical full model ID
+// that the claude CLI accepts. Using short names like "sonnet"/"opus"/"haiku"
+// causes the CLI to reject the --model arg and crash immediately.
 const MODEL_MAP = {
-  "claude-opus-4-6": "opus",
-  "claude-opus-4": "opus",
-  "claude-sonnet-4-6": "sonnet",
-  "claude-sonnet-4": "sonnet",
-  "claude-haiku-4": "haiku",
+  // Full canonical IDs (pass through as-is)
+  "claude-opus-4-6": "claude-opus-4-6",
+  "claude-sonnet-4-6": "claude-sonnet-4-6",
+  "claude-haiku-4-5-20251001": "claude-haiku-4-5-20251001",
+  // Short aliases → full canonical IDs
+  "claude-opus-4": "claude-opus-4-6",
+  "claude-haiku-4": "claude-haiku-4-5-20251001",
+  "claude-haiku-4-5": "claude-haiku-4-5-20251001",
+  "opus": "claude-opus-4-6",
+  "sonnet": "claude-sonnet-4-6",
+  "haiku": "claude-haiku-4-5-20251001",
 };
 
 const MODELS = [
   { id: "claude-opus-4-6", name: "Claude Opus 4.6" },
   { id: "claude-sonnet-4-6", name: "Claude Sonnet 4.6" },
-  { id: "claude-haiku-4", name: "Claude Haiku 4" },
+  { id: "claude-haiku-4-5-20251001", name: "Claude Haiku 4.5" },
 ];
 
 // ── Process Pool ──────────────────────────────────────────────────────────
@@ -56,6 +65,11 @@ const MODELS = [
 // After the process finishes, a new one is spawned to replace it.
 
 const pool = new Map(); // model → [{ proc, ready }]
+
+// Exponential backoff state per model: tracks consecutive fast failures
+// to prevent a tight spawn/die loop when workers crash on startup.
+// Delays: 0s (1st), 1s (2nd), 5s (3rd), 30s (4th+)
+const poolBackoff = new Map(); // model → { failures: number, timer: TimeoutId|null }
 
 function spawnWarm(cliModel) {
   const env = { ...process.env };
@@ -70,20 +84,43 @@ function spawnWarm(cliModel) {
 
   const entry = { proc, cliModel, ready: true, spawnedAt: Date.now() };
 
+  // Capture stderr from pool workers so crash reasons are visible in logs
+  let stderrBuf = "";
+  proc.stderr.on("data", (d) => {
+    stderrBuf += d;
+    if (stderrBuf.length > 500) stderrBuf = stderrBuf.slice(-500);
+  });
+
   proc.on("error", (err) => {
     console.error(`[pool] spawn error model=${cliModel}: ${err.message}`);
     entry.ready = false;
   });
 
-  proc.on("exit", () => {
+  proc.on("exit", (code) => {
+    const livedMs = Date.now() - entry.spawnedAt;
     entry.ready = false;
+
+    // Log stderr from crashed pool worker (first 500 chars) to aid debugging
+    if (stderrBuf.trim()) {
+      console.error(`[pool] worker stderr model=${cliModel} exit=${code} lived=${livedMs}ms: ${stderrBuf.slice(0, 500)}`);
+    }
+
+    // If the process survived > 10s, it was healthy — reset the backoff counter
+    if (livedMs > 10000) {
+      const state = poolBackoff.get(cliModel);
+      if (state && state.failures > 0) {
+        console.log(`[pool] resetting backoff for model=${cliModel} (lived ${livedMs}ms)`);
+        state.failures = 0;
+      }
+    }
+
     // Remove from pool
     const arr = pool.get(cliModel);
     if (arr) {
       const idx = arr.indexOf(entry);
       if (idx !== -1) arr.splice(idx, 1);
     }
-    // Replenish
+    // Replenish with backoff
     replenishPool(cliModel);
   });
 
@@ -109,12 +146,48 @@ setInterval(recycleStaleProcesses, 15000); // check every 15s
 
 function replenishPool(cliModel) {
   if (!pool.has(cliModel)) pool.set(cliModel, []);
+  if (!poolBackoff.has(cliModel)) poolBackoff.set(cliModel, { failures: 0, timer: null });
+
   const arr = pool.get(cliModel);
+  const state = poolBackoff.get(cliModel);
+
   const alive = arr.filter((e) => e.ready).length;
-  for (let i = alive; i < POOL_SIZE; i++) {
-    const entry = spawnWarm(cliModel);
-    arr.push(entry);
-    console.log(`[pool] pre-spawned model=${cliModel} (pool size: ${arr.filter(e => e.ready).length})`);
+  const needed = POOL_SIZE - alive;
+  if (needed <= 0) return;
+
+  // Cancel any pending backoff timer for this model before scheduling a new one
+  if (state.timer) {
+    clearTimeout(state.timer);
+    state.timer = null;
+  }
+
+  // Determine backoff delay based on consecutive fast-failure count
+  let delayMs = 0;
+  if (state.failures === 1) delayMs = 1000;
+  else if (state.failures === 2) delayMs = 5000;
+  else if (state.failures >= 3) {
+    delayMs = 30000;
+    console.warn(`[pool] WARNING: model=${cliModel} has failed ${state.failures} times consecutively; backing off ${delayMs / 1000}s before next spawn`);
+  }
+
+  state.failures += 1;
+
+  const doSpawn = () => {
+    state.timer = null;
+    const currentAlive = arr.filter((e) => e.ready).length;
+    const currentNeeded = POOL_SIZE - currentAlive;
+    for (let i = 0; i < currentNeeded; i++) {
+      const entry = spawnWarm(cliModel);
+      arr.push(entry);
+      console.log(`[pool] pre-spawned model=${cliModel} (pool size: ${arr.filter(e => e.ready).length}, failures=${state.failures})`);
+    }
+  };
+
+  if (delayMs > 0) {
+    console.log(`[pool] backoff model=${cliModel} delay=${delayMs}ms (failures=${state.failures})`);
+    state.timer = setTimeout(doSpawn, delayMs);
+  } else {
+    doSpawn();
   }
 }
 
