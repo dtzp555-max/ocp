@@ -52,7 +52,8 @@ openclaw gateway restart
 ## Security
 
 - **Localhost only** — the proxy binds to `127.0.0.1` and is not exposed to the internet or your local network
-- **No API keys** — authentication goes through Claude CLI's OAuth session, no credentials are stored in the proxy
+- **Bearer token auth (optional)** — set `PROXY_API_KEY` to require a Bearer token on all requests (except `/health`). When unset, auth is disabled for backwards compatibility
+- **No API keys for Claude** — authentication to Anthropic goes through Claude CLI's OAuth session, no Anthropic credentials are stored in the proxy
 - **Auto-start via launchd/systemd** — `node setup.mjs` installs a user-level launch agent (macOS) or systemd user service (Linux) so the proxy starts automatically on login
 - **Remove auto-start** at any time:
 
@@ -78,7 +79,7 @@ Add to `~/.openclaw/openclaw.json` under `models.providers`:
 "claude-local": {
   "baseUrl": "http://127.0.0.1:3456/v1",
   "api": "openai-completions",
-  "authHeader": false,
+  "apiKey": "<your PROXY_API_KEY, or omit if auth disabled>",
   "models": [
     {
       "id": "claude-opus-4-6",
@@ -126,6 +127,30 @@ openclaw gateway restart
 | `claude-sonnet-4-6` | sonnet | Good balance of speed/quality |
 | `claude-haiku-4` | haiku | Fastest, lightweight |
 
+## Authentication
+
+The proxy supports optional Bearer token authentication via the `PROXY_API_KEY` environment variable.
+
+**When `PROXY_API_KEY` is set**, all requests (except `GET /health`) must include a valid `Authorization: Bearer <token>` header. Requests with a missing or invalid token receive a `401 Unauthorized` response.
+
+**When `PROXY_API_KEY` is not set**, authentication is disabled and all requests are accepted (backwards compatible with v1.6.x and earlier).
+
+```bash
+# Start with auth enabled
+PROXY_API_KEY=my-secret-token node server.mjs
+
+# Configure OpenClaw provider with the matching key
+# In openclaw.json, set apiKey under the claude-local provider:
+"claude-local": {
+  "baseUrl": "http://127.0.0.1:3456/v1",
+  "api": "openai-completions",
+  "apiKey": "my-secret-token",
+  ...
+}
+```
+
+The proxy logs auth status on startup: `Auth: enabled (PROXY_API_KEY set)` or `Auth: disabled (no PROXY_API_KEY)`.
+
 ## Environment Variables
 
 | Variable | Default | Description |
@@ -133,6 +158,7 @@ openclaw gateway restart
 | `CLAUDE_PROXY_PORT` | `3456` | Listen port |
 | `CLAUDE_BIN` | `claude` | Path to claude binary |
 | `CLAUDE_TIMEOUT` | `120000` | Request timeout (ms) |
+| `PROXY_API_KEY` | *(unset)* | Bearer token for API authentication; when unset, auth is disabled |
 
 ## API Endpoints
 
@@ -207,7 +233,7 @@ cp ~/.openclaw/openclaw.json ~/.openclaw/openclaw.json.bak
 ## Notes
 
 - Cost shows as $0 because billing goes through your Claude subscription
-- The `🔑` field in `/status` may show the dummy auth key — this is normal
+- The `🔑` field in `/status` shows the configured auth key (or `unknown` if auth is disabled) — this is normal
 - Each request spawns a `claude -p` process; concurrent requests are supported
 - The proxy must run on the same machine as the Claude CLI (uses local OAuth)
 - The same Claude account can be used on multiple machines (shared usage quota)
