@@ -14,7 +14,8 @@
  *   CLAUDE_PROXY_PORT  — listen port (default: 3456)
  *   CLAUDE_BIN         — path to claude binary (default: "claude")
  *   CLAUDE_TIMEOUT     — per-request timeout in ms (default: 120000)
- *   CLAUDE_POOL_SIZE   — warm process pool size per model (default: 1)
+ *   CLAUDE_FIRST_BYTE_TIMEOUT — abort if no stdout within this ms (default: 30000)
+ *   CLAUDE_POOL_SIZE   — warm process pool size per model (default: 0, set >0 to enable pool)
  *   PROXY_API_KEY      — Bearer token for API authentication (optional, if unset auth is disabled)
  */
 import { createServer } from "node:http";
@@ -66,8 +67,9 @@ function resolveClaude() {
 
 const PORT = parseInt(process.env.CLAUDE_PROXY_PORT || "3456", 10);
 const CLAUDE = resolveClaude();
-const TIMEOUT = parseInt(process.env.CLAUDE_TIMEOUT || "300000", 10);
-const POOL_SIZE = parseInt(process.env.CLAUDE_POOL_SIZE || "1", 10);
+const TIMEOUT = parseInt(process.env.CLAUDE_TIMEOUT || "120000", 10);
+const FIRST_BYTE_TIMEOUT = parseInt(process.env.CLAUDE_FIRST_BYTE_TIMEOUT || "30000", 10);
+const POOL_SIZE = parseInt(process.env.CLAUDE_POOL_SIZE || "0", 10);
 const POOL_MAX_IDLE = parseInt(process.env.CLAUDE_POOL_MAX_IDLE || "60000", 10); // max idle time before recycle
 const PROXY_API_KEY = process.env.PROXY_API_KEY || "";
 
@@ -330,11 +332,22 @@ function callClaude(model, messages) {
 
     let stdout = "";
     let stderr = "";
+    let gotFirstByte = false;
     const t0 = Date.now();
 
-    proc.stdout.on("data", (d) => (stdout += d));
+    proc.stdout.on("data", (d) => {
+      if (!gotFirstByte) {
+        gotFirstByte = true;
+        clearTimeout(firstByteTimer);
+        const fbElapsed = Date.now() - t0;
+        console.log(`[claude] first-byte model=${cliModel} elapsed=${fbElapsed}ms`);
+      }
+      stdout += d;
+    });
     proc.stderr.on("data", (d) => (stderr += d));
     proc.on("close", (code) => {
+      clearTimeout(timer);
+      clearTimeout(firstByteTimer);
       const elapsed = Date.now() - t0;
       if (code !== 0) {
         console.error(`[claude] exit=${code} model=${cliModel} elapsed=${elapsed}ms stderr=${stderr.slice(0, 300)}`);
@@ -344,7 +357,7 @@ function callClaude(model, messages) {
         resolve(stdout.trim());
       }
     });
-    proc.on("error", reject);
+    proc.on("error", (err) => { clearTimeout(timer); clearTimeout(firstByteTimer); reject(err); });
 
     // Log prompt size for debugging
     console.log(`[claude] request model=${cliModel} prompt_chars=${prompt.length} pool=${usedPool}`);
@@ -355,8 +368,21 @@ function callClaude(model, messages) {
       proc.stdin.end();
     }
 
-    const timer = setTimeout(() => { proc.kill(); reject(new Error("timeout")); }, TIMEOUT);
-    proc.on("close", () => clearTimeout(timer));
+    // First-byte timeout: abort early if Claude CLI produces no output
+    const firstByteTimer = setTimeout(() => {
+      if (!gotFirstByte) {
+        console.error(`[claude] first-byte timeout model=${cliModel} after ${FIRST_BYTE_TIMEOUT}ms — aborting`);
+        proc.kill();
+        reject(new Error("first-byte timeout"));
+      }
+    }, FIRST_BYTE_TIMEOUT);
+
+    // Overall request timeout
+    const timer = setTimeout(() => {
+      console.error(`[claude] total timeout model=${cliModel} after ${TIMEOUT}ms`);
+      proc.kill();
+      reject(new Error("timeout"));
+    }, TIMEOUT);
   });
 }
 
@@ -496,6 +522,8 @@ const server = createServer(async (req, res) => {
       uptimeHuman: `${Math.floor(uptimeMs / 3600000)}h ${Math.floor((uptimeMs % 3600000) / 60000)}m ${Math.floor((uptimeMs % 60000) / 1000)}s`,
       claudeBinary: CLAUDE,
       claudeBinaryOk: binaryOk,
+      timeout: TIMEOUT,
+      firstByteTimeout: FIRST_BYTE_TIMEOUT,
       pool: poolStatus,
     });
   }
@@ -515,7 +543,7 @@ server.listen(PORT, "0.0.0.0", () => {
   console.log(`openclaw-claude-proxy v${VERSION} listening on http://0.0.0.0:${PORT}`);
   console.log(`Models: ${MODELS.map((m) => m.id).join(", ")}`);
   console.log(`Claude binary: ${CLAUDE}`);
-  console.log(`Timeout: ${TIMEOUT}ms`);
-  console.log(`Pool size: ${POOL_SIZE} per model, max idle: ${POOL_MAX_IDLE / 1000}s`);
+  console.log(`Timeout: ${TIMEOUT}ms (first-byte: ${FIRST_BYTE_TIMEOUT}ms)`);
+  console.log(`Pool: ${POOL_SIZE > 0 ? `${POOL_SIZE} per model, max idle: ${POOL_MAX_IDLE / 1000}s` : "disabled (on-demand)"}`);
   console.log(`Auth: ${PROXY_API_KEY ? "enabled (PROXY_API_KEY set)" : "disabled (no PROXY_API_KEY)"}`);
 });
