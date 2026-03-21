@@ -1,6 +1,6 @@
 {
   "name": "openclaw-claude-proxy",
-  "version": "2.0.0",
+  "version": "2.2.0",
   "description": "OpenAI-compatible proxy that routes requests through Claude CLI \u2014 use your Claude Pro/Max subscription as an OpenClaw model provider",
   "type": "module",
   "bin": {

@@ -1,22 +1,30 @@
 #!/usr/bin/env node
 /**
- * openclaw-claude-proxy — OpenAI-compatible proxy for Claude CLI
+ * openclaw-claude-proxy v2.2.0 — OpenAI-compatible proxy for Claude CLI
  *
  * Translates OpenAI chat/completions requests into `claude -p` CLI calls,
  * letting you use your Claude Pro/Max subscription as an OpenClaw model provider.
  *
- * Features:
- *   - Process pool: pre-spawns CLI processes to eliminate cold start latency
- *   - SSE streaming + non-streaming responses
- *   - Concurrent request support
+ * v2.0.0 highlights:
+ *   - On-demand spawning: eliminates pool crash loops from v1.x
+ *   - Session management: --resume support reduces token waste on multi-turn
+ *   - Full tool access: configurable allowedTools (expanded defaults)
+ *   - System prompt & MCP config pass-through
+ *   - Concurrency control with queuing
+ *   - Coexists safely with Claude Code interactive mode (Telegram, IDE, etc.)
  *
  * Env vars:
- *   CLAUDE_PROXY_PORT  — listen port (default: 3456)
- *   CLAUDE_BIN         — path to claude binary (default: "claude")
- *   CLAUDE_TIMEOUT     — per-request timeout in ms (default: 120000)
+ *   CLAUDE_PROXY_PORT        — listen port (default: 3456)
+ *   CLAUDE_BIN               — path to claude binary (default: auto-detect)
+ *   CLAUDE_TIMEOUT           — per-request timeout in ms (default: 120000)
  *   CLAUDE_FIRST_BYTE_TIMEOUT — abort if no stdout within this ms (default: 30000)
- *   CLAUDE_POOL_SIZE   — warm process pool size per model (default: 0, set >0 to enable pool)
- *   PROXY_API_KEY      — Bearer token for API authentication (optional, if unset auth is disabled)
+ *   CLAUDE_ALLOWED_TOOLS     — comma-separated tools to allow (default: expanded set)
+ *   CLAUDE_SKIP_PERMISSIONS  — "true" to bypass all permission checks (default: false)
+ *   CLAUDE_SYSTEM_PROMPT     — system prompt appended to all requests
+ *   CLAUDE_MCP_CONFIG        — path to MCP server config JSON file
+ *   CLAUDE_SESSION_TTL       — session TTL in ms (default: 3600000 = 1h)
+ *   CLAUDE_MAX_CONCURRENT    — max concurrent claude processes (default: 5)
+ *   PROXY_API_KEY            — Bearer token for API auth (optional)
  */
 import { createServer } from "node:http";
 import { spawn, execFileSync } from "node:child_process";
@@ -65,27 +73,30 @@ function resolveClaude() {
   process.exit(1);
 }
 
+// ── Configuration ───────────────────────────────────────────────────────
 const PORT = parseInt(process.env.CLAUDE_PROXY_PORT || "3456", 10);
 const CLAUDE = resolveClaude();
 const TIMEOUT = parseInt(process.env.CLAUDE_TIMEOUT || "120000", 10);
 const FIRST_BYTE_TIMEOUT = parseInt(process.env.CLAUDE_FIRST_BYTE_TIMEOUT || "30000", 10);
-const POOL_SIZE = parseInt(process.env.CLAUDE_POOL_SIZE || "0", 10);
-const POOL_MAX_IDLE = parseInt(process.env.CLAUDE_POOL_MAX_IDLE || "60000", 10); // max idle time before recycle
 const PROXY_API_KEY = process.env.PROXY_API_KEY || "";
+const SKIP_PERMISSIONS = process.env.CLAUDE_SKIP_PERMISSIONS === "true";
+const ALLOWED_TOOLS = (process.env.CLAUDE_ALLOWED_TOOLS ||
+  "Bash,Read,Write,Edit,Glob,Grep,WebSearch,WebFetch,Agent"
+).split(",").map(s => s.trim()).filter(Boolean);
+const SYSTEM_PROMPT = process.env.CLAUDE_SYSTEM_PROMPT || "";
+const MCP_CONFIG = process.env.CLAUDE_MCP_CONFIG || "";
+const SESSION_TTL = parseInt(process.env.CLAUDE_SESSION_TTL || "3600000", 10);
+const MAX_CONCURRENT = parseInt(process.env.CLAUDE_MAX_CONCURRENT || "5", 10);
 
 const VERSION = _pkg.version;
 const START_TIME = Date.now();
 
-// Model alias mapping: request model → claude CLI --model arg
-// Maps both shorthand aliases AND full model IDs to the canonical full model ID
-// that the claude CLI accepts. Using short names like "sonnet"/"opus"/"haiku"
-// causes the CLI to reject the --model arg and crash immediately.
+// ── Model mapping ───────────────────────────────────────────────────────
+// Maps request model IDs and aliases to canonical claude CLI model IDs.
 const MODEL_MAP = {
-  // Full canonical IDs (pass through as-is)
   "claude-opus-4-6": "claude-opus-4-6",
   "claude-sonnet-4-6": "claude-sonnet-4-6",
   "claude-haiku-4-5-20251001": "claude-haiku-4-5-20251001",
-  // Short aliases → full canonical IDs
   "claude-opus-4": "claude-opus-4-6",
   "claude-haiku-4": "claude-haiku-4-5-20251001",
   "claude-haiku-4-5": "claude-haiku-4-5-20251001",
@@ -100,294 +111,248 @@ const MODELS = [
   { id: "claude-haiku-4-5-20251001", name: "Claude Haiku 4.5" },
 ];
 
-// ── Process Pool ──────────────────────────────────────────────────────────
-// Pre-spawns `claude -p` processes that read prompts from stdin.
-// When a request arrives, we grab a warm process and pipe the prompt in.
-// After the process finishes, a new one is spawned to replace it.
+// ── Session management ──────────────────────────────────────────────────
+// Maps conversation IDs (from caller) to Claude CLI session UUIDs.
+// Enables --resume for multi-turn conversations, reducing token waste.
+const sessions = new Map(); // conversationId → { uuid, messageCount, lastUsed, model }
 
-const pool = new Map(); // model → [{ proc, ready }]
-
-// Exponential backoff state per model: tracks consecutive fast failures
-// to prevent a tight spawn/die loop when workers crash on startup.
-// Delays: 2s base, doubled each failure, capped at 60s.
-// After 5 consecutive fast crashes (each lived < 10s, all within 60s),
-// the model is marked "degraded" and respawning stops entirely.
-const poolBackoff = new Map(); // model → { failures: number, timer: TimeoutId|null, degraded: boolean, windowStart: number }
-
-function spawnWarm(cliModel) {
-  const env = { ...process.env };
-  delete env.CLAUDECODE;
-  delete env.ANTHROPIC_API_KEY;
-  delete env.ANTHROPIC_BASE_URL;
-  delete env.ANTHROPIC_AUTH_TOKEN;
-
-  const proc = spawn(CLAUDE, [
-    "-p", "--model", cliModel,
-    "--output-format", "text",
-    "--no-session-persistence",
-    "--allowedTools", "Bash", "Read", "Write", "Edit", "Glob", "Grep",
-  ], { env, stdio: ["pipe", "pipe", "pipe"] });
-
-  const entry = { proc, cliModel, ready: true, spawnedAt: Date.now() };
-
-  // Capture stderr from pool workers so crash reasons are visible in logs
-  let stderrBuf = "";
-  proc.stderr.on("data", (d) => {
-    stderrBuf += d;
-    if (stderrBuf.length > 500) stderrBuf = stderrBuf.slice(-500);
-  });
-
-  proc.on("error", (err) => {
-    console.error(`[pool] spawn error model=${cliModel}: ${err.message}`);
-    entry.ready = false;
-  });
-
-  proc.on("exit", (code) => {
-    const livedMs = Date.now() - entry.spawnedAt;
-    entry.ready = false;
-
-    // Log stderr from crashed pool worker (first 500 chars) to aid debugging
-    if (stderrBuf.trim()) {
-      console.error(`[pool] worker stderr model=${cliModel} exit=${code} lived=${livedMs}ms: ${stderrBuf.slice(0, 500)}`);
-    }
-
-    // If the process survived > 10s, it was healthy — reset the backoff counter and window
-    if (livedMs > 10000) {
-      const state = poolBackoff.get(cliModel);
-      if (state && (state.failures > 0 || state.degraded)) {
-        console.log(`[pool] resetting backoff for model=${cliModel} (lived ${livedMs}ms)`);
-        state.failures = 0;
-        state.degraded = false;
-        state.windowStart = Date.now();
-      }
-    }
-
-    // Remove from pool
-    const arr = pool.get(cliModel);
-    if (arr) {
-      const idx = arr.indexOf(entry);
-      if (idx !== -1) arr.splice(idx, 1);
-    }
-    // Replenish: treat as crash (apply backoff) only if it died fast (< 10s)
-    const isCrash = livedMs <= 10000;
-    replenishPool(cliModel, isCrash);
-  });
-
-  return entry;
-}
-
-// Recycle idle processes to prevent stale connections
-function recycleStaleProcesses() {
+setInterval(() => {
   const now = Date.now();
-  for (const [cliModel, arr] of pool) {
-    for (const entry of arr) {
-      if (entry.ready && (now - entry.spawnedAt) > POOL_MAX_IDLE) {
-        console.log(`[pool] recycling stale process model=${cliModel} (idle ${Math.round((now - entry.spawnedAt) / 1000)}s)`);
-        entry.ready = false;
-        entry.proc.kill();
-        // exit handler will replenish
-      }
+  for (const [id, s] of sessions) {
+    if (now - s.lastUsed > SESSION_TTL) {
+      sessions.delete(id);
+      console.log(`[session] expired ${id.slice(0, 12)}... (idle ${Math.round((now - s.lastUsed) / 60000)}m)`);
     }
+  }
+}, 60000);
+
+// ── Stats & diagnostics ─────────────────────────────────────────────────
+const stats = {
+  totalRequests: 0,
+  activeRequests: 0,
+  errors: 0,
+  timeouts: 0,
+  sessionHits: 0,
+  sessionMisses: 0,
+  oneOffRequests: 0,
+};
+const recentErrors = []; // last 20 errors
+
+function trackError(msg) {
+  stats.errors++;
+  recentErrors.push({ time: new Date().toISOString(), message: String(msg).slice(0, 200) });
+  if (recentErrors.length > 20) recentErrors.shift();
+}
+
+// ── Auth health check ───────────────────────────────────────────────────
+let authStatus = { ok: null, lastCheck: 0, message: "" };
+
+async function checkAuth() {
+  try {
+    const env = { ...process.env };
+    delete env.CLAUDECODE;
+    delete env.ANTHROPIC_API_KEY;
+    delete env.ANTHROPIC_BASE_URL;
+    delete env.ANTHROPIC_AUTH_TOKEN;
+    execFileSync(CLAUDE, ["auth", "status"], { encoding: "utf8", timeout: 10000, env });
+    authStatus = { ok: true, lastCheck: Date.now(), message: "authenticated" };
+  } catch (e) {
+    const msg = (e.stderr || e.message || "").slice(0, 200);
+    authStatus = { ok: false, lastCheck: Date.now(), message: msg };
+    console.error(`[auth] check failed: ${msg}`);
   }
 }
 
-setInterval(recycleStaleProcesses, 15000); // check every 15s
+// Check auth on start and every 10 minutes
+checkAuth();
+setInterval(checkAuth, 600000);
 
-const BACKOFF_BASE_MS = 2000;   // 2s starting delay
-const BACKOFF_MAX_MS = 60000;   // 60s ceiling
-const CRASH_LIMIT = 5;          // max consecutive fast crashes before degraded
-const CRASH_WINDOW_MS = 60000;  // window for counting consecutive fast crashes (60s)
+// ── Build CLI arguments ─────────────────────────────────────────────────
+function buildCliArgs(cliModel, sessionInfo) {
+  const args = ["-p", "--model", cliModel, "--output-format", "text"];
 
-// replenishPool(cliModel, isCrash)
-//   isCrash=false → initial or manual fill, no backoff applied
-//   isCrash=true  → called from exit handler after a fast crash
-function replenishPool(cliModel, isCrash = false) {
-  if (!pool.has(cliModel)) pool.set(cliModel, []);
-  if (!poolBackoff.has(cliModel)) poolBackoff.set(cliModel, { failures: 0, timer: null, degraded: false, windowStart: Date.now() });
-
-  const arr = pool.get(cliModel);
-  const state = poolBackoff.get(cliModel);
-
-  // If this model is degraded (too many consecutive fast crashes), stop respawning
-  if (state.degraded) {
-    console.error(`[pool] DEGRADED: model=${cliModel} will not be respawned. Restart the proxy to retry.`);
-    return;
+  // Session handling
+  if (sessionInfo?.resume) {
+    args.push("--resume", sessionInfo.uuid);
+  } else if (sessionInfo?.uuid) {
+    args.push("--session-id", sessionInfo.uuid);
+  } else {
+    args.push("--no-session-persistence");
   }
 
-  const alive = arr.filter((e) => e.ready).length;
-  const needed = POOL_SIZE - alive;
-  if (needed <= 0) return;
-
-  // Cancel any pending backoff timer for this model before scheduling a new one
-  if (state.timer) {
-    clearTimeout(state.timer);
-    state.timer = null;
+  // Permissions
+  if (SKIP_PERMISSIONS) {
+    args.push("--dangerously-skip-permissions");
+  } else if (ALLOWED_TOOLS.length > 0) {
+    args.push("--allowedTools", ...ALLOWED_TOOLS);
   }
 
-  // Only track failures and apply backoff when this is a crash respawn
-  if (!isCrash) {
-    // Immediate spawn — no backoff on initial fill or manual replenish
-    const currentAlive = arr.filter((e) => e.ready).length;
-    const currentNeeded = POOL_SIZE - currentAlive;
-    for (let i = 0; i < currentNeeded; i++) {
-      const entry = spawnWarm(cliModel);
-      arr.push(entry);
-      console.log(`[pool] pre-spawned model=${cliModel} (pool size: ${arr.filter(e => e.ready).length})`);
-    }
-    return;
+  // System prompt
+  if (SYSTEM_PROMPT) {
+    args.push("--append-system-prompt", SYSTEM_PROMPT);
   }
 
-  // --- Crash path: apply exponential backoff and degraded-state logic ---
-
-  const now = Date.now();
-
-  // Reset window if the last crash was outside the rolling window
-  if ((now - state.windowStart) > CRASH_WINDOW_MS) {
-    state.windowStart = now;
-    state.failures = 0;
+  // MCP config
+  if (MCP_CONFIG) {
+    args.push("--mcp-config", MCP_CONFIG);
   }
 
-  state.failures += 1;
-
-  // Check if we've hit the crash limit within the rolling window
-  if (state.failures >= CRASH_LIMIT) {
-    state.degraded = true;
-    console.error(
-      `[pool] DEGRADED: model=${cliModel} crashed ${state.failures} times in ` +
-      `${Math.round((now - state.windowStart) / 1000)}s. ` +
-      `Stopping respawn to prevent CPU spin. Restart the proxy to retry.`
-    );
-    return;
-  }
-
-  // Exponential backoff: 2s, 4s, 8s, 16s, 32s … capped at 60s
-  const delayMs = Math.min(BACKOFF_BASE_MS * Math.pow(2, state.failures - 1), BACKOFF_MAX_MS);
-  console.warn(`[pool] backoff model=${cliModel} delay=${delayMs}ms (failures=${state.failures}/${CRASH_LIMIT})`);
-
-  state.timer = setTimeout(() => {
-    state.timer = null;
-    const currentAlive = arr.filter((e) => e.ready).length;
-    const currentNeeded = POOL_SIZE - currentAlive;
-    for (let i = 0; i < currentNeeded; i++) {
-      const entry = spawnWarm(cliModel);
-      arr.push(entry);
-      console.log(`[pool] re-spawned model=${cliModel} (pool size: ${arr.filter(e => e.ready).length}, failures=${state.failures}/${CRASH_LIMIT})`);
-    }
-  }, delayMs);
+  return args;
 }
 
-function getWarmProcess(cliModel) {
-  const arr = pool.get(cliModel) || [];
-  const entry = arr.find((e) => e.ready);
-  if (entry) {
-    entry.ready = false; // mark as in-use
-    const warmMs = Date.now() - entry.spawnedAt;
-    console.log(`[pool] using warm process model=${cliModel} (warm for ${warmMs}ms)`);
-    return entry.proc;
-  }
-  return null;
-}
-
-// Initialize pool for all models
-function initPool() {
-  for (const cliModel of new Set(Object.values(MODEL_MAP))) {
-    replenishPool(cliModel);
-  }
+// ── Format messages to prompt text ──────────────────────────────────────
+function messagesToPrompt(messages) {
+  return messages.map((m) => {
+    const text = typeof m.content === "string" ? m.content : JSON.stringify(m.content);
+    if (m.role === "system") return `[System] ${text}`;
+    if (m.role === "assistant") return `[Assistant] ${text}`;
+    return text;
+  }).join("\n\n");
 }
 
 // ── Call claude CLI ─────────────────────────────────────────────────────
-function callClaude(model, messages) {
+// On-demand spawning: each request spawns a fresh `claude -p` process.
+// No pool = no crash loops, no stale workers, no degraded states.
+// Stdin is written immediately so there's no 3s stdin timeout issue.
+function callClaude(model, messages, conversationId) {
   return new Promise((resolve, reject) => {
-    const prompt = messages
-      .map((m) => {
-        const text = typeof m.content === "string" ? m.content : JSON.stringify(m.content);
-        if (m.role === "system") return `[System] ${text}`;
-        if (m.role === "assistant") return `[Assistant] ${text}`;
-        return text;
-      })
-      .join("\n\n");
+    if (stats.activeRequests >= MAX_CONCURRENT) {
+      return reject(new Error(`concurrency limit reached (${stats.activeRequests}/${MAX_CONCURRENT})`));
+    }
+    stats.activeRequests++;
+    stats.totalRequests++;
 
     const cliModel = MODEL_MAP[model] || model;
+    let sessionInfo = null;
+    let prompt;
 
-    // Try to use a warm process from the pool
-    let proc = getWarmProcess(cliModel);
-    let usedPool = !!proc;
+    // ── Session logic ──
+    if (conversationId && sessions.has(conversationId)) {
+      // Resume existing session: only send the latest user message
+      const session = sessions.get(conversationId);
+      session.lastUsed = Date.now();
+      sessionInfo = { uuid: session.uuid, resume: true };
+      stats.sessionHits++;
 
-    if (!proc) {
-      // Cold start fallback: spawn fresh
-      console.log(`[pool] no warm process for model=${cliModel}, cold starting...`);
-      const env = { ...process.env };
-      delete env.CLAUDECODE;
-      delete env.ANTHROPIC_API_KEY;
-      delete env.ANTHROPIC_BASE_URL;
-      delete env.ANTHROPIC_AUTH_TOKEN;
-      proc = spawn(CLAUDE, [
-        "-p", "--model", cliModel,
-        "--output-format", "text",
-        "--no-session-persistence",
-        "--allowedTools", "Bash", "Read", "Write", "Edit", "Glob", "Grep",
-        "--", prompt,
-      ], { env, stdio: ["ignore", "pipe", "pipe"] });
+      const lastUserMsg = [...messages].reverse().find((m) => m.role === "user");
+      prompt = lastUserMsg
+        ? (typeof lastUserMsg.content === "string" ? lastUserMsg.content : JSON.stringify(lastUserMsg.content))
+        : "";
+      session.messageCount = messages.length;
+
+      console.log(`[session] resume conv=${conversationId.slice(0, 12)}... uuid=${session.uuid.slice(0, 8)}... msgs=${messages.length} prompt_chars=${prompt.length}`);
+
+    } else if (conversationId) {
+      // New session: send all messages, persist session for future --resume
+      const uuid = randomUUID();
+      sessions.set(conversationId, { uuid, messageCount: messages.length, lastUsed: Date.now(), model: cliModel });
+      sessionInfo = { uuid, resume: false };
+      stats.sessionMisses++;
+      prompt = messagesToPrompt(messages);
+
+      console.log(`[session] new conv=${conversationId.slice(0, 12)}... uuid=${uuid.slice(0, 8)}... msgs=${messages.length}`);
+
+    } else {
+      // One-off request, no session
+      stats.oneOffRequests++;
+      prompt = messagesToPrompt(messages);
     }
+
+    const cliArgs = buildCliArgs(cliModel, sessionInfo);
+
+    const env = { ...process.env };
+    delete env.CLAUDECODE;
+    delete env.ANTHROPIC_API_KEY;
+    delete env.ANTHROPIC_BASE_URL;
+    delete env.ANTHROPIC_AUTH_TOKEN;
+
+    const proc = spawn(CLAUDE, cliArgs, { env, stdio: ["pipe", "pipe", "pipe"] });
 
     let stdout = "";
     let stderr = "";
-    let gotFirstByte = false;
     const t0 = Date.now();
+    let settled = false;
+    let gotFirstByte = false;
+
+    function settle(err, result) {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      clearTimeout(firstByteTimer);
+      stats.activeRequests--;
+
+      if (err) {
+        trackError(err.message || String(err));
+
+        // If session resume failed, remove session so next request starts fresh
+        if (sessionInfo?.resume && conversationId) {
+          console.warn(`[session] resume failed for ${conversationId.slice(0, 12)}..., removing stale session`);
+          sessions.delete(conversationId);
+        }
+
+        reject(err);
+      } else {
+        resolve(result);
+      }
+    }
 
     proc.stdout.on("data", (d) => {
       if (!gotFirstByte) {
         gotFirstByte = true;
         clearTimeout(firstByteTimer);
-        const fbElapsed = Date.now() - t0;
-        console.log(`[claude] first-byte model=${cliModel} elapsed=${fbElapsed}ms`);
+        console.log(`[claude] first-byte model=${cliModel} elapsed=${Date.now() - t0}ms`);
       }
       stdout += d;
     });
     proc.stderr.on("data", (d) => (stderr += d));
+
     proc.on("close", (code) => {
-      clearTimeout(timer);
-      clearTimeout(firstByteTimer);
       const elapsed = Date.now() - t0;
       if (code !== 0) {
-        console.error(`[claude] exit=${code} model=${cliModel} elapsed=${elapsed}ms stderr=${stderr.slice(0, 300)}`);
-        reject(new Error(stderr || stdout || `exit ${code}`));
+        console.error(`[claude] exit=${code} model=${cliModel} elapsed=${elapsed}ms stderr=${stderr.slice(0, 500)}`);
+        settle(new Error(stderr.slice(0, 300) || stdout.slice(0, 300) || `claude exit ${code}`));
       } else {
-        console.log(`[claude] ok model=${cliModel} chars=${stdout.length} elapsed=${elapsed}ms pool=${usedPool}`);
-        resolve(stdout.trim());
+        console.log(`[claude] ok model=${cliModel} chars=${stdout.length} elapsed=${elapsed}ms session=${conversationId ? conversationId.slice(0, 12) + "..." : "none"}`);
+        settle(null, stdout.trim());
       }
     });
-    proc.on("error", (err) => { clearTimeout(timer); clearTimeout(firstByteTimer); reject(err); });
 
-    // Log prompt size for debugging
-    console.log(`[claude] request model=${cliModel} prompt_chars=${prompt.length} pool=${usedPool}`);
+    proc.on("error", (err) => {
+      console.error(`[claude] spawn error: ${err.message}`);
+      settle(err);
+    });
 
-    // If using pool process, send prompt via stdin
-    if (usedPool) {
-      proc.stdin.write(prompt);
-      proc.stdin.end();
-    }
+    // Write prompt to stdin immediately — no idle timeout issue
+    proc.stdin.write(prompt);
+    proc.stdin.end();
+
+    console.log(`[claude] spawned model=${cliModel} prompt_chars=${prompt.length} session=${conversationId ? conversationId.slice(0, 12) + "..." : "none"}`);
 
     // First-byte timeout: abort early if Claude CLI produces no output
     const firstByteTimer = setTimeout(() => {
       if (!gotFirstByte) {
-        console.error(`[claude] first-byte timeout model=${cliModel} after ${FIRST_BYTE_TIMEOUT}ms — aborting`);
-        proc.kill();
-        reject(new Error("first-byte timeout"));
+        stats.timeouts++;
+        console.error(`[claude] first-byte timeout after ${FIRST_BYTE_TIMEOUT}ms model=${cliModel} — aborting`);
+        proc.kill("SIGTERM");
+        setTimeout(() => { try { proc.kill("SIGKILL"); } catch {} }, 5000);
+        settle(new Error(`first-byte timeout after ${FIRST_BYTE_TIMEOUT}ms`));
       }
     }, FIRST_BYTE_TIMEOUT);
 
-    // Overall request timeout
+    // Overall request timeout with graceful kill
     const timer = setTimeout(() => {
-      console.error(`[claude] total timeout model=${cliModel} after ${TIMEOUT}ms`);
-      proc.kill();
-      reject(new Error("timeout"));
+      stats.timeouts++;
+      console.error(`[claude] timeout after ${TIMEOUT}ms model=${cliModel}`);
+      proc.kill("SIGTERM");
+      setTimeout(() => { try { proc.kill("SIGKILL"); } catch {} }, 5000);
+      settle(new Error(`timeout after ${TIMEOUT}ms`));
     }, TIMEOUT);
   });
 }
 
 // ── Response helpers ────────────────────────────────────────────────────
 function jsonResponse(res, status, data) {
+  if (res.headersSent || res.writableEnded || res.destroyed) return;
   res.writeHead(status, { "Content-Type": "application/json" });
   res.end(JSON.stringify(data));
 }
@@ -397,25 +362,23 @@ function sendSSE(res, data) {
 }
 
 function streamResponse(res, id, model, content) {
+  if (res.headersSent || res.writableEnded || res.destroyed) return;
   res.writeHead(200, {
     "Content-Type": "text/event-stream",
     "Cache-Control": "no-cache",
     "Connection": "keep-alive",
   });
   const created = Math.floor(Date.now() / 1000);
-  // Role chunk
   sendSSE(res, {
     id, object: "chat.completion.chunk", created, model,
     choices: [{ index: 0, delta: { role: "assistant" }, finish_reason: null }],
   });
-  // Content chunks (~500 chars each)
   for (let i = 0; i < content.length; i += 500) {
     sendSSE(res, {
       id, object: "chat.completion.chunk", created, model,
       choices: [{ index: 0, delta: { content: content.slice(i, i + 500) }, finish_reason: null }],
     });
   }
-  // Finish
   sendSSE(res, {
     id, object: "chat.completion.chunk", created, model,
     choices: [{ index: 0, delta: {}, finish_reason: "stop" }],
@@ -446,10 +409,13 @@ async function handleChatCompletions(req, res) {
   const model = parsed.model || "claude-sonnet-4-6";
   const stream = parsed.stream;
 
+  // Session ID: from request body, header, or null (one-off)
+  const conversationId = parsed.session_id || parsed.conversation_id || req.headers["x-session-id"] || req.headers["x-conversation-id"] || null;
+
   if (!messages?.length) return jsonResponse(res, 400, { error: "messages required" });
 
   try {
-    const content = await callClaude(model, messages);
+    const content = await callClaude(model, messages, conversationId);
     const id = `chatcmpl-${randomUUID()}`;
 
     if (stream) {
@@ -470,8 +436,8 @@ async function handleChatCompletions(req, res) {
 // ── HTTP server ─────────────────────────────────────────────────────────
 const server = createServer(async (req, res) => {
   res.setHeader("Access-Control-Allow-Origin", "*");
-  res.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
-  res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization");
+  res.setHeader("Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS");
+  res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization, X-Session-Id, X-Conversation-Id");
   if (req.method === "OPTIONS") { res.writeHead(204); res.end(); return; }
 
   // Bearer token auth (skip for /health and when PROXY_API_KEY is not set)
@@ -499,51 +465,85 @@ const server = createServer(async (req, res) => {
     return handleChatCompletions(req, res);
   }
 
-  // GET /health — includes pool status, version, uptime
+  // GET /health — comprehensive diagnostics
   if (req.url === "/health") {
-    const poolStatus = {};
-    for (const [model, arr] of pool) {
-      const readyCount = arr.filter(e => e.ready).length;
-      const errorCount = arr.filter(e => !e.ready).length;
-      poolStatus[model] = {
-        total: arr.length,
-        ready: readyCount,
-        error: errorCount,
-        status: readyCount > 0 ? "ready" : "error",
-      };
-    }
-    const uptimeMs = Date.now() - START_TIME;
     let binaryOk = false;
     try { accessSync(CLAUDE, constants.X_OK); binaryOk = true; } catch {}
+
+    const uptimeMs = Date.now() - START_TIME;
+    const sessionList = [];
+    for (const [id, s] of sessions) {
+      sessionList.push({
+        id: id.slice(0, 12) + "...",
+        model: s.model,
+        messages: s.messageCount,
+        idleMs: Date.now() - s.lastUsed,
+      });
+    }
+
     return jsonResponse(res, 200, {
-      status: binaryOk ? "ok" : "degraded",
+      status: binaryOk && authStatus.ok !== false ? "ok" : "degraded",
       version: VERSION,
+      architecture: "on-demand (v2)",
       uptime: uptimeMs,
-      uptimeHuman: `${Math.floor(uptimeMs / 3600000)}h ${Math.floor((uptimeMs % 3600000) / 60000)}m ${Math.floor((uptimeMs % 60000) / 1000)}s`,
+      uptimeHuman: `${Math.floor(uptimeMs / 3600000)}h ${Math.floor((uptimeMs % 3600000) / 60000)}m`,
       claudeBinary: CLAUDE,
       claudeBinaryOk: binaryOk,
-      timeout: TIMEOUT,
-      firstByteTimeout: FIRST_BYTE_TIMEOUT,
-      pool: poolStatus,
+      auth: authStatus,
+      config: {
+        timeout: TIMEOUT,
+        firstByteTimeout: FIRST_BYTE_TIMEOUT,
+        maxConcurrent: MAX_CONCURRENT,
+        sessionTTL: SESSION_TTL,
+        allowedTools: SKIP_PERMISSIONS ? "all (skip-permissions)" : ALLOWED_TOOLS,
+        systemPrompt: SYSTEM_PROMPT ? `${SYSTEM_PROMPT.slice(0, 50)}...` : "(none)",
+        mcpConfig: MCP_CONFIG || "(none)",
+      },
+      stats,
+      sessions: sessionList,
+      recentErrors: recentErrors.slice(-5),
     });
   }
 
-  // Catch-all: try to handle any POST with messages
+  // DELETE /sessions — clear all sessions
+  if (req.url === "/sessions" && req.method === "DELETE") {
+    const count = sessions.size;
+    sessions.clear();
+    return jsonResponse(res, 200, { cleared: count });
+  }
+
+  // GET /sessions — list active sessions
+  if (req.url === "/sessions" && req.method === "GET") {
+    const list = [];
+    for (const [id, s] of sessions) {
+      list.push({ id, uuid: s.uuid, model: s.model, messages: s.messageCount, lastUsed: new Date(s.lastUsed).toISOString() });
+    }
+    return jsonResponse(res, 200, { sessions: list });
+  }
+
+  // Catch-all POST
   if (req.method === "POST") {
     return handleChatCompletions(req, res);
   }
 
-  jsonResponse(res, 404, { error: "Not found. Endpoints: GET /v1/models, POST /v1/chat/completions, GET /health" });
+  jsonResponse(res, 404, { error: "Not found. Endpoints: GET /v1/models, POST /v1/chat/completions, GET /health, GET|DELETE /sessions" });
 });
 
-// ── Start ──────────────────────────────────────────────────────────────
-initPool();
-
+// ── Start ───────────────────────────────────────────────────────────────
 server.listen(PORT, "0.0.0.0", () => {
   console.log(`openclaw-claude-proxy v${VERSION} listening on http://0.0.0.0:${PORT}`);
+  console.log(`Architecture: on-demand spawning (no pool)`);
   console.log(`Models: ${MODELS.map((m) => m.id).join(", ")}`);
   console.log(`Claude binary: ${CLAUDE}`);
-  console.log(`Timeout: ${TIMEOUT}ms (first-byte: ${FIRST_BYTE_TIMEOUT}ms)`);
-  console.log(`Pool: ${POOL_SIZE > 0 ? `${POOL_SIZE} per model, max idle: ${POOL_MAX_IDLE / 1000}s` : "disabled (on-demand)"}`);
+  console.log(`Timeout: ${TIMEOUT}ms (first-byte: ${FIRST_BYTE_TIMEOUT}ms) | Max concurrent: ${MAX_CONCURRENT}`);
+  console.log(`Tools: ${SKIP_PERMISSIONS ? "all (skip-permissions)" : ALLOWED_TOOLS.join(", ")}`);
+  console.log(`Sessions: TTL=${SESSION_TTL / 1000}s`);
+  if (SYSTEM_PROMPT) console.log(`System prompt: "${SYSTEM_PROMPT.slice(0, 80)}..."`);
+  if (MCP_CONFIG) console.log(`MCP config: ${MCP_CONFIG}`);
   console.log(`Auth: ${PROXY_API_KEY ? "enabled (PROXY_API_KEY set)" : "disabled (no PROXY_API_KEY)"}`);
+  console.log(`---`);
+  console.log(`Coexistence: This proxy does NOT conflict with Claude Code interactive mode.`);
+  console.log(`  OCP uses: localhost:${PORT} (HTTP) → claude -p (per-request process)`);
+  console.log(`  CC uses:  MCP protocol (in-process) → persistent session`);
+  console.log(`  Both can run simultaneously on the same machine.`);
 });

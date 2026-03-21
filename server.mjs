@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 /**
- * openclaw-claude-proxy v2.0.0 — OpenAI-compatible proxy for Claude CLI
+ * openclaw-claude-proxy v2.2.0 — OpenAI-compatible proxy for Claude CLI
  *
  * Translates OpenAI chat/completions requests into `claude -p` CLI calls,
  * letting you use your Claude Pro/Max subscription as an OpenClaw model provider.
@@ -16,7 +16,8 @@
  * Env vars:
  *   CLAUDE_PROXY_PORT        — listen port (default: 3456)
  *   CLAUDE_BIN               — path to claude binary (default: auto-detect)
- *   CLAUDE_TIMEOUT           — per-request timeout in ms (default: 300000)
+ *   CLAUDE_TIMEOUT           — per-request timeout in ms (default: 120000)
+ *   CLAUDE_FIRST_BYTE_TIMEOUT — abort if no stdout within this ms (default: 30000)
  *   CLAUDE_ALLOWED_TOOLS     — comma-separated tools to allow (default: expanded set)
  *   CLAUDE_SKIP_PERMISSIONS  — "true" to bypass all permission checks (default: false)
  *   CLAUDE_SYSTEM_PROMPT     — system prompt appended to all requests
@@ -75,7 +76,8 @@ function resolveClaude() {
 // ── Configuration ───────────────────────────────────────────────────────
 const PORT = parseInt(process.env.CLAUDE_PROXY_PORT || "3456", 10);
 const CLAUDE = resolveClaude();
-const TIMEOUT = parseInt(process.env.CLAUDE_TIMEOUT || "300000", 10);
+const TIMEOUT = parseInt(process.env.CLAUDE_TIMEOUT || "120000", 10);
+const FIRST_BYTE_TIMEOUT = parseInt(process.env.CLAUDE_FIRST_BYTE_TIMEOUT || "30000", 10);
 const PROXY_API_KEY = process.env.PROXY_API_KEY || "";
 const SKIP_PERMISSIONS = process.env.CLAUDE_SKIP_PERMISSIONS === "true";
 const ALLOWED_TOOLS = (process.env.CLAUDE_ALLOWED_TOOLS ||
@@ -270,11 +272,13 @@ function callClaude(model, messages, conversationId) {
     let stderr = "";
     const t0 = Date.now();
     let settled = false;
+    let gotFirstByte = false;
 
     function settle(err, result) {
       if (settled) return;
       settled = true;
       clearTimeout(timer);
+      clearTimeout(firstByteTimer);
       stats.activeRequests--;
 
       if (err) {
@@ -292,7 +296,14 @@ function callClaude(model, messages, conversationId) {
       }
     }
 
-    proc.stdout.on("data", (d) => (stdout += d));
+    proc.stdout.on("data", (d) => {
+      if (!gotFirstByte) {
+        gotFirstByte = true;
+        clearTimeout(firstByteTimer);
+        console.log(`[claude] first-byte model=${cliModel} elapsed=${Date.now() - t0}ms`);
+      }
+      stdout += d;
+    });
     proc.stderr.on("data", (d) => (stderr += d));
 
     proc.on("close", (code) => {
@@ -317,7 +328,18 @@ function callClaude(model, messages, conversationId) {
 
     console.log(`[claude] spawned model=${cliModel} prompt_chars=${prompt.length} session=${conversationId ? conversationId.slice(0, 12) + "..." : "none"}`);
 
-    // Timeout with graceful kill
+    // First-byte timeout: abort early if Claude CLI produces no output
+    const firstByteTimer = setTimeout(() => {
+      if (!gotFirstByte) {
+        stats.timeouts++;
+        console.error(`[claude] first-byte timeout after ${FIRST_BYTE_TIMEOUT}ms model=${cliModel} — aborting`);
+        proc.kill("SIGTERM");
+        setTimeout(() => { try { proc.kill("SIGKILL"); } catch {} }, 5000);
+        settle(new Error(`first-byte timeout after ${FIRST_BYTE_TIMEOUT}ms`));
+      }
+    }, FIRST_BYTE_TIMEOUT);
+
+    // Overall request timeout with graceful kill
     const timer = setTimeout(() => {
       stats.timeouts++;
       console.error(`[claude] timeout after ${TIMEOUT}ms model=${cliModel}`);
@@ -470,6 +492,7 @@ const server = createServer(async (req, res) => {
       auth: authStatus,
       config: {
         timeout: TIMEOUT,
+        firstByteTimeout: FIRST_BYTE_TIMEOUT,
         maxConcurrent: MAX_CONCURRENT,
         sessionTTL: SESSION_TTL,
         allowedTools: SKIP_PERMISSIONS ? "all (skip-permissions)" : ALLOWED_TOOLS,
@@ -512,7 +535,7 @@ server.listen(PORT, "0.0.0.0", () => {
   console.log(`Architecture: on-demand spawning (no pool)`);
   console.log(`Models: ${MODELS.map((m) => m.id).join(", ")}`);
   console.log(`Claude binary: ${CLAUDE}`);
-  console.log(`Timeout: ${TIMEOUT}ms | Max concurrent: ${MAX_CONCURRENT}`);
+  console.log(`Timeout: ${TIMEOUT}ms (first-byte: ${FIRST_BYTE_TIMEOUT}ms) | Max concurrent: ${MAX_CONCURRENT}`);
   console.log(`Tools: ${SKIP_PERMISSIONS ? "all (skip-permissions)" : ALLOWED_TOOLS.join(", ")}`);
   console.log(`Sessions: TTL=${SESSION_TTL / 1000}s`);
   if (SYSTEM_PROMPT) console.log(`System prompt: "${SYSTEM_PROMPT.slice(0, 80)}..."`);
