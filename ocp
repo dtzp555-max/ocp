@@ -1,0 +1,384 @@
+#!/usr/bin/env bash
+# ocp — OpenClaw Proxy CLI
+# Usage: ocp <command> [args]
+#
+# Talks to the local claude-proxy at http://127.0.0.1:3456
+
+set -euo pipefail
+
+PROXY="http://127.0.0.1:3456"
+
+_json() { python3 -m json.tool 2>/dev/null || cat; }
+
+_bar() {
+  local pct=$1 width=20
+  local filled=$(( pct * width / 100 ))
+  local empty=$(( width - filled ))
+  printf '['
+  printf '█%.0s' $(seq 1 $filled 2>/dev/null) || true
+  printf '░%.0s' $(seq 1 $empty 2>/dev/null) || true
+  printf '] %d%%' "$pct"
+}
+
+# ── usage ────────────────────────────────────────────────────────────────
+cmd_usage_help() {
+  cat <<'EOF'
+ocp usage — Show Claude plan usage limits
+
+Displays current session utilization, weekly limits, extra usage status,
+and proxy request statistics. Data is fetched from the Anthropic API
+via a minimal probe call (cached for 5 minutes).
+
+Usage: ocp usage
+EOF
+}
+
+cmd_usage() {
+  local data
+  data=$(curl -sf --max-time 15 "$PROXY/usage" 2>&1) || { echo "Error: proxy unreachable"; exit 1; }
+
+  echo "$data" | python3 -c "
+import sys, json
+
+d = json.loads(sys.stdin.read())
+p = d['plan']
+s = p['currentSession']
+w = p['weeklyLimits']['allModels']
+e = p['extraUsage']
+px = d['proxy']
+models = d.get('models', {})
+
+print('Plan Usage Limits')
+print('─────────────────────────────────────')
+print(f'  Current session     {s[\"percent\"]:>4} used')
+print(f'                      Resets in {s[\"resetsIn\"]}  ({s[\"resetsAtHuman\"]})')
+print()
+print(f'  Weekly (all models) {w[\"percent\"]:>4} used')
+print(f'                      Resets in {w[\"resetsIn\"]}  ({w[\"resetsAtHuman\"]})')
+print()
+status_icon = 'on' if e['status'] == 'allowed' else 'off'
+print(f'  Extra usage         {status_icon}')
+print()
+
+if models:
+    print('Model Stats (since proxy start)')
+    print('─────────────────────────────────────────────────────────────────────')
+    hdr = f'  {\"Model\":<25} {\"Reqs\":>5} {\"OK\":>4} {\"Err\":>4} {\"Avg Time\":>9} {\"Max Time\":>9} {\"Avg Prompt\":>11} {\"Max Prompt\":>11}'
+    print(hdr)
+    print('  ' + '─' * (len(hdr) - 2))
+    total_reqs = 0
+    for model in sorted(models):
+        m = models[model]
+        total_reqs += m['requests']
+        avg_t = f'{m[\"avgElapsed\"]/1000:.0f}s' if m['avgElapsed'] else '-'
+        max_t = f'{m[\"maxElapsed\"]/1000:.0f}s' if m['maxElapsed'] else '-'
+        avg_p = f'{m[\"avgPromptChars\"]/1000:.0f}K' if m['avgPromptChars'] else '-'
+        max_p = f'{m[\"maxPromptChars\"]/1000:.0f}K' if m['maxPromptChars'] else '-'
+        print(f'  {model:<25} {m[\"requests\"]:>5} {m[\"successes\"]:>4} {m[\"errors\"]:>4} {avg_t:>9} {max_t:>9} {avg_p:>11} {max_p:>11}')
+    print(f'  {\"Total\":<25} {total_reqs:>5}')
+else:
+    print('  No model requests yet.')
+
+print()
+print(f'Proxy: up {px[\"uptime\"]} | {px[\"totalRequests\"]} reqs | {px[\"activeRequests\"]} active | {px[\"errors\"]} err | {px[\"timeouts\"]} timeout')
+"
+}
+
+# ── status ───────────────────────────────────────────────────────────────
+cmd_status_help() {
+  cat <<'EOF'
+ocp status — Quick combined overview (usage + health)
+
+Usage: ocp status
+EOF
+}
+
+cmd_status() {
+  curl -sf --max-time 15 "$PROXY/status" | _json
+}
+
+# ── health ───────────────────────────────────────────────────────────────
+cmd_health_help() {
+  cat <<'EOF'
+ocp health — Proxy health and diagnostics
+
+Shows proxy status, version, uptime, auth, config, sessions, and recent errors.
+
+Usage: ocp health
+EOF
+}
+
+cmd_health() {
+  curl -sf --max-time 10 "$PROXY/health" | _json
+}
+
+# ── logs ─────────────────────────────────────────────────────────────────
+cmd_logs_help() {
+  cat <<'EOF'
+ocp logs — Show recent proxy log entries
+
+Usage: ocp logs [N] [LEVEL]
+
+Arguments:
+  N       Number of entries to show (default: 20, max: 200)
+  LEVEL   Filter level: error, warn, info, all (default: error)
+
+Examples:
+  ocp logs              Last 20 errors
+  ocp logs 50 all       Last 50 entries of any level
+  ocp logs 10 warn      Last 10 warnings
+EOF
+}
+
+cmd_logs() {
+  local n=${1:-20}
+  local level=${2:-error}
+  curl -sf --max-time 10 "$PROXY/logs?n=$n&level=$level" | python3 -c "
+import sys, json
+d = json.loads(sys.stdin.read())
+entries = d.get('entries', [])
+if not entries:
+    print(f'No {d.get(\"level\",\"\")} log entries.')
+else:
+    for e in entries:
+        if 'raw' in e:
+            print(e['raw'][:200])
+        else:
+            ts = e.get('ts','')[:19]
+            ev = e.get('event','?')
+            lvl = e.get('level','')
+            model = e.get('model','')
+            extra = ' '.join(f'{k}={v}' for k,v in e.items() if k not in ('ts','event','level','model'))
+            parts = [ts, lvl.upper(), ev]
+            if model: parts.append(model)
+            if extra: parts.append(extra)
+            print(' | '.join(parts))
+"
+}
+
+# ── models ───────────────────────────────────────────────────────────────
+cmd_models_help() {
+  cat <<'EOF'
+ocp models — List available Claude models
+
+Usage: ocp models
+EOF
+}
+
+cmd_models() {
+  curl -sf --max-time 5 "$PROXY/v1/models" | python3 -c "
+import sys, json
+d = json.loads(sys.stdin.read())
+for m in d.get('data', []):
+    print(f\"  {m['id']}\")
+"
+}
+
+# ── sessions ─────────────────────────────────────────────────────────────
+cmd_sessions_help() {
+  cat <<'EOF'
+ocp sessions — List active CLI sessions
+
+Usage: ocp sessions
+EOF
+}
+
+cmd_sessions() {
+  curl -sf --max-time 5 "$PROXY/sessions" | python3 -c "
+import sys, json
+d = json.loads(sys.stdin.read())
+sessions = d.get('sessions', [])
+if not sessions:
+    print('No active sessions.')
+else:
+    for s in sessions:
+        print(f\"  {s['id'][:16]}...  model={s['model']}  msgs={s['messages']}  last={s['lastUsed']}\")
+"
+}
+
+# ── clear ────────────────────────────────────────────────────────────────
+cmd_clear_help() {
+  cat <<'EOF'
+ocp clear — Clear all active CLI sessions
+
+Usage: ocp clear
+EOF
+}
+
+cmd_clear() {
+  local result
+  result=$(curl -sf --max-time 5 -X DELETE "$PROXY/sessions")
+  local count
+  count=$(echo "$result" | python3 -c "import sys,json; print(json.loads(sys.stdin.read())['cleared'])")
+  echo "Cleared $count sessions."
+}
+
+# ── restart ──────────────────────────────────────────────────────────────
+cmd_restart_help() {
+  cat <<'EOF'
+ocp restart — Restart the proxy or gateway
+
+Usage:
+  ocp restart            Restart the Claude proxy service
+  ocp restart gateway    Restart the OpenClaw gateway
+                         (briefly disconnects all Telegram/Discord bots)
+EOF
+}
+
+cmd_restart() {
+  if [[ "${1:-}" == "gateway" ]]; then
+    echo "Restarting gateway..."
+    openclaw gateway restart 2>&1
+  else
+    echo "Restarting proxy..."
+    launchctl kickstart -k gui/501/ai.openclaw.proxy 2>/dev/null || {
+      echo "launchctl failed, trying kill + restart..."
+      pkill -f "claude-proxy/server.mjs" 2>/dev/null || true
+      sleep 1
+      cd "$HOME/.openclaw/projects/claude-proxy" && nohup node server.mjs >> "$HOME/.openclaw/logs/proxy.log" 2>&1 &
+    }
+    sleep 3
+    if curl -sf --max-time 5 "$PROXY/health" > /dev/null 2>&1; then
+      echo "✓ Proxy restarted successfully."
+      cmd_usage
+    else
+      echo "✗ Proxy not responding after restart."
+    fi
+  fi
+}
+
+# ── settings ─────────────────────────────────────────────────────────────
+cmd_settings_help() {
+  cat <<'EOF'
+ocp settings — View or update proxy settings at runtime
+
+Usage:
+  ocp settings                   Show all tunable settings
+  ocp settings <key> <value>     Update a setting (no restart needed)
+
+Tunable keys:
+  timeout            Overall request timeout (ms)         [30000 - 600000]
+  firstByteTimeout   Base first-byte timeout (ms)         [15000 - 300000]
+  maxConcurrent      Max concurrent claude processes      [1 - 32]
+  sessionTTL         Session idle expiry (ms)             [60000 - 86400000]
+  maxPromptChars     Prompt truncation limit (chars)      [10000 - 1000000]
+  tiers.opus.base    Opus first-byte timeout base (ms)    [30000 - 600000]
+  tiers.opus.perChar    Opus per-char timeout (ms/char)   [0 - 0.01]
+  tiers.sonnet.base  Sonnet first-byte timeout base (ms)  [30000 - 600000]
+  tiers.sonnet.perChar  Sonnet per-char timeout (ms/char) [0 - 0.01]
+  tiers.haiku.base   Haiku first-byte timeout base (ms)   [15000 - 300000]
+  tiers.haiku.perChar   Haiku per-char timeout (ms/char)  [0 - 0.01]
+
+Examples:
+  ocp settings maxPromptChars 200000
+  ocp settings tiers.sonnet.base 150000
+EOF
+}
+
+cmd_settings() {
+  if [[ -z "${1:-}" ]]; then
+    # GET — show all settings
+    curl -sf --max-time 5 "$PROXY/settings" | python3 -c "
+import sys, json
+d = json.loads(sys.stdin.read())
+print('OCP Settings')
+print('─────────────────────────────────────')
+for k in ('timeout','firstByteTimeout','maxConcurrent','sessionTTL','maxPromptChars'):
+    v = d.get(k, {})
+    val = v.get('value', '?')
+    unit = v.get('unit', '')
+    desc = v.get('desc', '')
+    print(f'  {k:<20} {val:>8} {unit:<6}  {desc}')
+t = d.get('tiers', {})
+print()
+print('Timeout Tiers (first-byte):')
+for tier in ('opus','sonnet','haiku'):
+    info = t.get(tier, {})
+    print(f'  {tier:<8} base={info.get(\"base\",\"?\"):>6}ms  perChar={info.get(\"perPromptChar\",\"?\")}')
+"
+  elif [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
+    cmd_settings_help
+  elif [[ -z "${2:-}" ]]; then
+    echo "Usage: ocp settings <key> <value>"
+    echo "Run 'ocp settings --help' for available keys."
+    return 1
+  else
+    # PATCH — update a setting
+    local key="$1"
+    local value="$2"
+    local result
+    result=$(curl -s --max-time 5 -X PATCH "$PROXY/settings" \
+      -H "Content-Type: application/json" \
+      -d "{\"$key\": $value}" 2>&1)
+    if echo "$result" | python3 -c "import sys,json; d=json.loads(sys.stdin.read()); errs=d.get('errors',[]); exit(1 if errs else 0)" 2>/dev/null; then
+      echo "✓ $key = $value"
+    else
+      echo "$result" | python3 -c "
+import sys, json
+d = json.loads(sys.stdin.read())
+for e in d.get('errors', []):
+    print(f'✗ {e}')
+" 2>/dev/null || echo "✗ $result"
+    fi
+  fi
+}
+
+# ── help ─────────────────────────────────────────────────────────────────
+cmd_help() {
+  cat <<'EOF'
+ocp — OpenClaw Proxy CLI
+
+Usage: ocp <command> [args]
+
+Commands:
+  usage              Plan usage limits
+  status             Quick overview (usage + health)
+  health             Proxy diagnostics
+  settings           View or update tunable settings
+  logs [N] [level]   Recent logs (default: 20, error)
+  models             Available models
+  sessions           Active sessions
+  clear              Clear all sessions
+  restart            Restart proxy
+  restart gateway    Restart gateway
+
+Run 'ocp <command> --help' for details on a specific command.
+EOF
+}
+
+# ── dispatch ─────────────────────────────────────────────────────────────
+# Check for --help/-h on any subcommand: ocp <cmd> --help
+subcmd="${1:-help}"
+shift 2>/dev/null || true
+
+# Global --help
+if [[ "$subcmd" == "--help" || "$subcmd" == "-h" || "$subcmd" == "help" ]]; then
+  cmd_help
+  exit 0
+fi
+
+# Per-subcommand --help
+for arg in "$@"; do
+  if [[ "$arg" == "--help" || "$arg" == "-h" ]]; then
+    fn="cmd_${subcmd}_help"
+    if declare -f "$fn" > /dev/null 2>&1; then
+      "$fn"
+    else
+      echo "No help available for '$subcmd'."
+    fi
+    exit 0
+  fi
+done
+
+case "$subcmd" in
+  usage)    cmd_usage ;;
+  status)   cmd_status ;;
+  health)   cmd_health ;;
+  settings) cmd_settings "${1:-}" "${2:-}" ;;
+  logs)     cmd_logs "${1:-20}" "${2:-error}" ;;
+  models)   cmd_models ;;
+  sessions) cmd_sessions ;;
+  clear)    cmd_clear ;;
+  restart)  cmd_restart "${1:-}" ;;
+  *)        echo "Unknown command: $subcmd"; echo ""; cmd_help; exit 1 ;;
+esac

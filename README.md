@@ -1,66 +1,108 @@
-# openclaw-claude-proxy
+# openclaw-claude-proxy (OCP)
 
 > **Already paying for Claude Pro/Max? Use it as your OpenClaw model provider — $0 extra API cost.**
 
-A lightweight, zero-dependency proxy that lets [OpenClaw](https://github.com/openclaw/openclaw) agents talk to Claude through your existing subscription. One command to set up, one file to run.
+A lightweight, zero-dependency proxy that lets [OpenClaw](https://github.com/openclaw/openclaw) agents talk to Claude through your existing subscription. One command to set up, one file to run. Now with built-in plan usage monitoring, runtime settings, and a CLI.
 
-## v2.5.0 — Emergency Fix: Sliding-Window Circuit Breaker
+## What's New in v3.0.0
 
-**Incident (2026-03-22):** Multi-agent burst (ClawTeam with 5+ Opus agents) caused cascading timeout failure. The old consecutive-count circuit breaker (threshold=3) tripped within seconds, blocking ALL requests globally — including unrelated agents and new sessions. With fallback models removed, this resulted in complete service outage ("LLM request timed out." on every message).
+### `/ocp` — Your Proxy Command Center
 
-**Root cause:** v2.4.0's circuit breaker counted consecutive failures per model. When ClawTeam spawned multiple concurrent Opus agents and Claude API had moderate latency, 3 quick timeouts opened the breaker for the entire model. With `fallbacks: []`, the gateway had no alternative path.
+Full management interface available from Telegram, Discord, or any terminal.
 
-**What's new in v2.5.0:**
-- **Sliding-window circuit breaker** — counts failures in a 5-minute window (default: 6 failures) instead of 3 consecutive. Multi-agent bursts no longer trip the breaker instantly.
-- **Graduated backoff** — cooldown doubles on each re-open (120s → 240s → 300s cap), resets fully on first success. Prevents oscillation between open/half-open during extended API issues.
-- **Multi-probe half-open** — allows 2 concurrent probe requests in half-open state (was 1), improving recovery speed.
-- **Increased default timeouts** — Opus first-byte 60s→90s, Sonnet 45s→60s, overall 120s→300s, max concurrent 5→8. Designed for large agent system prompts (30K+ chars).
-- **Health endpoint shows breaker state** — `/health` now exposes per-model breaker state (window failures, cooldown, reopen count). Status is "degraded" when any breaker is open.
+```
+$ ocp usage
+Plan Usage Limits
+─────────────────────────────────────
+  Current session       3% used
+                      Resets in 4h 32m  (Tue, Mar 24, 10:00 PM)
 
-**New env vars:**
+  Weekly (all models)   3% used
+                      Resets in 6d 6h  (Tue, Mar 31, 12:00 AM)
 
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `CLAUDE_BREAKER_WINDOW` | `300000` | Sliding window duration (ms) for failure counting |
-| `CLAUDE_BREAKER_HALF_OPEN_MAX` | `2` | Max concurrent probe requests in half-open state |
+  Extra usage         off
 
-**Updated defaults:**
+Model Stats
+Model          Req   OK  Er  AvgT  MaxT  AvgP  MaxP
+──────────────────────────────────────────────────────
+haiku            1    1   0    6s    6s     0K    0K
+opus             2    2   0   20s   26s   42K   43K
+sonnet           2    2   0   24s   24s   41K   41K
+Total            5
 
-| Variable | Old Default | New Default |
-|----------|-------------|-------------|
-| `CLAUDE_TIMEOUT` | `120000` | `300000` |
-| `CLAUDE_FIRST_BYTE_TIMEOUT` | `45000` | `90000` |
-| `CLAUDE_MAX_CONCURRENT` | `5` | `8` |
-| `CLAUDE_BREAKER_THRESHOLD` | `3` | `6` |
-| `CLAUDE_BREAKER_COOLDOWN` | `60000` | `120000` |
+Proxy: up 0h 37m | 5 reqs | 0 err | 0 timeout
+```
 
-**Upgrade:** Pull latest and restart the proxy. The new defaults take effect immediately. If you have custom env vars set in your plist/service file, review and adjust them.
+**All commands:**
+
+```
+$ ocp --help
+ocp usage              Plan usage limits & model stats
+ocp status             Quick overview
+ocp health             Proxy diagnostics
+ocp settings           View tunable settings
+ocp settings <k> <v>   Update a setting at runtime
+ocp logs [N] [level]   Recent logs (default: 20, error)
+ocp models             Available models
+ocp sessions           Active sessions
+ocp clear              Clear all sessions
+ocp restart            Restart proxy
+ocp restart gateway    Restart gateway
+```
+
+In **Telegram/Discord**, use `/ocp usage`, `/ocp settings`, etc. — registered as a native slash command via the OCP gateway plugin.
+
+### Runtime Settings (No Restart Needed)
+
+```
+$ ocp settings
+OCP Settings
+─────────────────────────────────────
+  timeout                300000 ms      Overall request timeout
+  firstByteTimeout        90000 ms      Base first-byte timeout
+  maxConcurrent               8         Max concurrent claude processes
+  sessionTTL            3600000 ms      Session idle expiry
+  maxPromptChars         150000 chars   Prompt truncation limit
+
+Timeout Tiers (first-byte):
+  opus     base=150000ms  perChar=0.0005
+  sonnet   base=120000ms  perChar=0.0005
+  haiku    base= 45000ms  perChar=0.0001
+```
+
+Change any setting live:
+
+```
+$ ocp settings maxPromptChars 200000
+✓ maxPromptChars = 200000
+
+$ ocp settings maxConcurrent 999
+✗ maxConcurrent: value 999 out of range [1, 32]
+```
+
+### Circuit Breaker Removed
+
+The v2.5.0 circuit breaker has been **removed entirely**. It was designed for direct API connections but caused cascading failures in the CLI-proxy architecture — once API got briefly slow, the breaker blocked ALL agents for 120s+, making the problem worse. With CLI spawning, timeouts are transient and don't benefit from back-off.
+
+### Prompt Truncation Guard
+
+New safety valve prevents runaway context from conversation history accumulation (a recurring issue where prompts balloon from 40K to 400K+ chars).
+
+- Default limit: **150K characters** (configurable via `maxPromptChars`)
+- When exceeded: keeps system messages + as many recent messages as fit
+- Logs `prompt_truncated` events for monitoring
+
+### Increased Timeouts
+
+| Model | Old Base | New Base | Per 100K chars |
+|-------|----------|----------|----------------|
+| Opus | 90s | **150s** | +50s |
+| Sonnet | 60s | **120s** | +50s |
+| Haiku | 30s | **45s** | +10s |
 
 ---
 
-## v2.0.0 — Major Upgrade
-
-**What's new:**
-- **On-demand spawning** — eliminates the pool crash loops, DEGRADED states, and stdin timeout errors from v1.x. Each request spawns a fresh `claude -p` process with stdin written immediately. No more stale workers, no more backoff spirals.
-- **Session management** — multi-turn conversations use `--resume` to avoid resending full history. Reduces token waste and enables Claude Code's built-in context compression on long conversations.
-- **Full tool access** — expanded default tools (Bash, Read, Write, Edit, Glob, Grep, WebSearch, WebFetch, Agent). Configurable via `CLAUDE_ALLOWED_TOOLS` or bypass all checks with `CLAUDE_SKIP_PERMISSIONS=true`.
-- **System prompt pass-through** — set `CLAUDE_SYSTEM_PROMPT` to inject context into every request.
-- **MCP config support** — set `CLAUDE_MCP_CONFIG` to load MCP servers (Telegram, etc.) into claude -p calls.
-- **Concurrency control** — `CLAUDE_MAX_CONCURRENT` prevents runaway process spawning (default: 5).
-- **Auth health monitoring** — periodic `claude auth status` checks with status exposed on `/health`.
-- **Session API** — `GET /sessions` to list, `DELETE /sessions` to clear active sessions.
-- **Improved diagnostics** — `/health` endpoint shows stats, active sessions, recent errors, auth status, and full config.
-
-**Coexistence with Claude Code interactive mode:**
-OCP and Claude Code (interactive/Telegram) run on completely different paths and can coexist on the same machine without conflict:
-- OCP: `localhost:3456` (HTTP) → spawns `claude -p` processes (per-request, stateless)
-- CC: MCP protocol (in-process) → persistent interactive session
-- No shared ports, no shared processes, no shared sessions
-
-**Daemon advantage over CC:**
-OCP runs as a system daemon (launchd/systemd) that auto-starts on boot and auto-recovers from crashes. Unlike Claude Code interactive mode, OCP does not require a terminal session to stay open — it survives disconnects, reboots, and SSH drops. Combined with OpenClaw's memory system, this means your agents never lose continuity.
-
-## How it works
+## How It Works
 
 ```
 OpenClaw Gateway → proxy (localhost:3456) → claude -p CLI → Anthropic (via OAuth)
@@ -68,13 +110,7 @@ OpenClaw Gateway → proxy (localhost:3456) → claude -p CLI → Anthropic (via
 
 The proxy translates OpenAI-compatible `/v1/chat/completions` requests into `claude -p` CLI calls. Anthropic sees normal Claude Code usage under your subscription — no API billing, no separate key.
 
-## Prerequisites
-
-- **Node.js** >= 18
-- **Claude CLI** installed and authenticated (`claude login`)
-- **OpenClaw** installed
-
-## Quick Start (Node.js)
+## Quick Start
 
 ```bash
 git clone https://github.com/dtzp555-max/openclaw-claude-proxy.git
@@ -84,119 +120,69 @@ cd openclaw-claude-proxy
 node setup.mjs
 ```
 
-That's it. The setup script will:
+The setup script will:
 1. Verify Claude CLI is installed and authenticated
 2. Add `claude-local` provider to `openclaw.json`
-3. Add auth profiles to all agents
-4. Start the proxy
-5. Install auto-start on login (launchd on macOS, systemd on Linux)
+3. Start the proxy and install auto-start (launchd on macOS, systemd on Linux)
 
-Then set your preferred Claude model as default:
+Then set your preferred model:
 ```bash
-openclaw config set agents.defaults.model.primary "claude-local/claude-opus-4-6"
+openclaw config set agents.defaults.model.primary "claude-local/claude-sonnet-4-6"
 openclaw gateway restart
 ```
 
-## Session Management (v2.0)
+### Install the CLI
 
-Multi-turn conversations can use sessions to avoid resending full message history on every request.
+The `ocp` command is included in the repo:
 
-**How to enable:** Include a `session_id` or `conversation_id` field in your request body, or set the `X-Session-Id` / `X-Conversation-Id` header.
+```bash
+# Option 1: symlink to PATH
+ln -sf $(pwd)/ocp /usr/local/bin/ocp
 
+# Option 2: npm link (if installed globally)
+npm link
+```
+
+### Install the Gateway Plugin (for Telegram/Discord)
+
+Copy the plugin to the OpenClaw extensions directory:
+
+```bash
+cp -r ocp-plugin/ ~/.openclaw/extensions/ocp/
+# Or into the bundled extensions:
+cp -r ocp-plugin/ /opt/homebrew/lib/node_modules/openclaw/dist/extensions/ocp/
+```
+
+Add to `~/.openclaw/openclaw.json`:
 ```json
 {
-  "model": "claude-opus-4-6",
-  "session_id": "conv-abc-123",
-  "messages": [
-    {"role": "user", "content": "Hello"},
-    {"role": "assistant", "content": "Hi there!"},
-    {"role": "user", "content": "What did I just say?"}
-  ]
+  "plugins": {
+    "allow": ["ocp"],
+    "entries": { "ocp": { "enabled": true } }
+  }
 }
 ```
 
-**First request** with a new session_id: all messages are sent, session is persisted via `--session-id`.
-**Subsequent requests** with the same session_id: only the latest user message is sent via `--resume`, reducing token consumption.
+Restart the gateway: `openclaw gateway restart`
 
-Sessions expire after 1 hour of inactivity (configurable via `CLAUDE_SESSION_TTL`).
+## API Endpoints
 
-**API endpoints:**
-- `GET /sessions` — list all active sessions
-- `DELETE /sessions` — clear all sessions
-
-## Security
-
-- **Localhost only** — the proxy binds to `127.0.0.1` and is not exposed to the internet or your local network
-- **Bearer token auth (optional)** — set `PROXY_API_KEY` to require a Bearer token on all requests (except `/health`). When unset, auth is disabled for backwards compatibility
-- **No API keys for Claude** — authentication to Anthropic goes through Claude CLI's OAuth session, no Anthropic credentials are stored in the proxy
-- **Auto-start via launchd/systemd** — `node setup.mjs` installs a user-level launch agent (macOS) or systemd user service (Linux) so the proxy starts automatically on login
-- **Remove auto-start** at any time:
-
-```bash
-node uninstall.mjs
-```
-
-## Manual Install
-
-### 1. Start the proxy
-
-```bash
-node server.mjs
-# or in background:
-bash start.sh
-```
-
-### 2. Configure OpenClaw
-
-Add to `~/.openclaw/openclaw.json` under `models.providers`:
-
-```json
-"claude-local": {
-  "baseUrl": "http://127.0.0.1:3456/v1",
-  "api": "openai-completions",
-  "apiKey": "<your PROXY_API_KEY, or omit if auth disabled>",
-  "models": [
-    {
-      "id": "claude-opus-4-6",
-      "name": "Claude Opus 4.6",
-      "reasoning": true,
-      "input": ["text"],
-      "cost": { "input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0 },
-      "contextWindow": 200000,
-      "maxTokens": 16384
-    },
-    {
-      "id": "claude-sonnet-4-6",
-      "name": "Claude Sonnet 4.6",
-      "reasoning": true,
-      "input": ["text"],
-      "cost": { "input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0 },
-      "contextWindow": 200000,
-      "maxTokens": 16384
-    },
-    {
-      "id": "claude-haiku-4",
-      "name": "Claude Haiku 4",
-      "reasoning": false,
-      "input": ["text"],
-      "cost": { "input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0 },
-      "contextWindow": 200000,
-      "maxTokens": 8192
-    }
-  ]
-}
-```
-
-### 3. Set as default model
-
-```bash
-openclaw config set agents.defaults.model.primary "claude-local/claude-opus-4-6"
-openclaw gateway restart
-```
+| Endpoint | Method | Description |
+|----------|--------|-------------|
+| `/v1/models` | GET | List available models |
+| `/v1/chat/completions` | POST | Chat completion (streaming + non-streaming) |
+| `/health` | GET | Comprehensive health check |
+| `/usage` | GET | Plan usage limits + per-model stats |
+| `/status` | GET | Combined overview (usage + health) |
+| `/settings` | GET | View tunable settings |
+| `/settings` | PATCH | Update settings at runtime |
+| `/logs` | GET | Recent log entries (`?n=20&level=error`) |
+| `/sessions` | GET | List active sessions |
+| `/sessions` | DELETE | Clear all sessions |
 
 ## Available Models
 
-| Model ID | Claude CLI model | Notes |
+| Model ID | Claude CLI Model | Notes |
 |----------|-----------------|-------|
 | `claude-opus-4-6` | claude-opus-4-6 | Most capable, slower |
 | `claude-sonnet-4-6` | claude-sonnet-4-6 | Good balance of speed/quality |
@@ -209,87 +195,101 @@ openclaw gateway restart
 | `CLAUDE_PROXY_PORT` | `3456` | Listen port |
 | `CLAUDE_BIN` | *(auto-detect)* | Path to claude binary |
 | `CLAUDE_TIMEOUT` | `300000` | Overall request timeout (ms) |
-| `CLAUDE_FIRST_BYTE_TIMEOUT` | `90000` | Base first-byte timeout (ms), adaptive by model tier |
-| `CLAUDE_ALLOWED_TOOLS` | `Bash,Read,...,Agent` | Comma-separated tools to pre-approve |
-| `CLAUDE_SKIP_PERMISSIONS` | `false` | Set `true` to bypass all permission checks |
-| `CLAUDE_SYSTEM_PROMPT` | *(empty)* | System prompt appended to all requests |
-| `CLAUDE_MCP_CONFIG` | *(empty)* | Path to MCP server config JSON file |
-| `CLAUDE_SESSION_TTL` | `3600000` | Session expiry in ms (default: 1 hour) |
+| `CLAUDE_FIRST_BYTE_TIMEOUT` | `90000` | Base first-byte timeout (ms) |
 | `CLAUDE_MAX_CONCURRENT` | `8` | Max concurrent claude processes |
-| `CLAUDE_BREAKER_THRESHOLD` | `6` | Failures in window before circuit opens |
-| `CLAUDE_BREAKER_COOLDOWN` | `120000` | Base cooldown (ms) before half-open (graduates on re-open) |
-| `CLAUDE_BREAKER_WINDOW` | `300000` | Sliding window duration (ms) for failure counting |
-| `CLAUDE_BREAKER_HALF_OPEN_MAX` | `2` | Max concurrent probe requests in half-open state |
+| `CLAUDE_MAX_PROMPT_CHARS` | `150000` | Prompt truncation limit (chars) |
+| `CLAUDE_SESSION_TTL` | `3600000` | Session expiry (ms, default: 1 hour) |
+| `CLAUDE_ALLOWED_TOOLS` | `Bash,Read,...,Agent` | Comma-separated tools to pre-approve |
+| `CLAUDE_SKIP_PERMISSIONS` | `false` | Bypass all permission checks |
+| `CLAUDE_SYSTEM_PROMPT` | *(empty)* | System prompt appended to all requests |
+| `CLAUDE_MCP_CONFIG` | *(empty)* | Path to MCP server config JSON |
 | `PROXY_API_KEY` | *(unset)* | Bearer token for API authentication |
 
-## API Endpoints
+## Session Management
 
-- `GET /v1/models` — List available models
-- `POST /v1/chat/completions` — Chat completion (streaming + non-streaming)
-- `GET /health` — Comprehensive health check (stats, sessions, auth, config)
-- `GET /sessions` — List active sessions
-- `DELETE /sessions` — Clear all sessions
+Multi-turn conversations use `--resume` to avoid resending full history on every request.
 
-## Authentication
+Include a `session_id` field in the request body or `X-Session-Id` header:
 
-The proxy supports optional Bearer token authentication via the `PROXY_API_KEY` environment variable.
-
-**When `PROXY_API_KEY` is set**, all requests (except `GET /health`) must include a valid `Authorization: Bearer <token>` header. Requests with a missing or invalid token receive a `401 Unauthorized` response.
-
-**When `PROXY_API_KEY` is not set**, authentication is disabled and all requests are accepted.
-
-```bash
-# Start with auth enabled
-PROXY_API_KEY=my-secret-token node server.mjs
+```json
+{
+  "model": "claude-sonnet-4-6",
+  "session_id": "conv-abc-123",
+  "messages": [
+    {"role": "user", "content": "Hello"},
+    {"role": "assistant", "content": "Hi!"},
+    {"role": "user", "content": "What did I just say?"}
+  ]
+}
 ```
 
-## Architecture: v1 vs v2
+Sessions expire after 1 hour of inactivity (configurable via `CLAUDE_SESSION_TTL`).
 
-| | v1.x (pool) | v2.0 (on-demand) |
+## Security
+
+- **Localhost only** — binds to `127.0.0.1`, not exposed to the network
+- **Bearer token auth (optional)** — set `PROXY_API_KEY` to require auth on all requests except `/health`
+- **No API keys** — authentication to Anthropic goes through Claude CLI's OAuth session
+- **Auto-start** — launchd (macOS) / systemd (Linux) via `node setup.mjs`
+- **Remove auto-start**: `node uninstall.mjs`
+
+## Architecture
+
+| | v1.x (pool) | v2.0+ (on-demand) |
 |---|---|---|
 | Process lifecycle | Pre-spawn idle workers | Spawn per request |
-| Crash handling | Backoff → DEGRADED → manual restart | No crash loops (no idle workers) |
-| Session support | None (stateless) | --resume with session tracking |
-| Tool access | 6 tools hardcoded | Configurable, expanded defaults |
-| System prompt | None | CLAUDE_SYSTEM_PROMPT env |
-| MCP support | None | CLAUDE_MCP_CONFIG env |
-| Concurrency | Unlimited (dangerous) | CLAUDE_MAX_CONCURRENT limit |
-| Auth monitoring | None | Periodic health checks |
-| Diagnostics | Basic /health | Full stats, sessions, errors |
+| Crash handling | Backoff spiral | No crash loops |
+| Session support | None | `--resume` with tracking |
+| Tool access | 6 hardcoded | Configurable, expanded |
+| Prompt guard | None | Truncation at 150K chars |
+| Monitoring | Basic `/health` | `/usage`, `/status`, `/settings`, `/logs` |
+| CLI | None | `ocp` command |
+| Gateway plugin | None | `/ocp` slash command |
 
 ## Coexistence with Claude Code
 
-OCP and Claude Code interactive mode (including Telegram bots) are completely independent:
+OCP and Claude Code interactive mode are completely independent:
 
-| | OCP (this proxy) | CC interactive |
+| | OCP (this proxy) | Claude Code |
 |---|---|---|
 | Protocol | HTTP (localhost:3456) | MCP (in-process) |
 | Process model | Per-request spawn | Persistent session |
-| Lifecycle | Daemon (auto-start, auto-recover) | Requires terminal |
-| Permission model | Pre-approved tools | Interactive prompts |
+| Lifecycle | Daemon (auto-start) | Requires terminal |
 | Use case | Automated agent work | Human-in-the-loop |
 
-Both can run on the same machine simultaneously. No shared state, no port conflicts.
+Both run on the same machine simultaneously. No shared state, no port conflicts.
 
-## Recovery after OpenClaw upgrade
-
-OpenClaw upgrades (`npm update -g openclaw`) **do not overwrite** the user config at `~/.openclaw/openclaw.json`. However, if the claude-local models stop working after an upgrade:
-
-### One-command recovery
+## Recovery After OpenClaw Upgrade
 
 ```bash
-cd ~/.openclaw/projects/claude-proxy   # or wherever you cloned it
-git pull                                # pull latest version
-node setup.mjs                          # reconfigure OpenClaw + start proxy
+cd ~/.openclaw/projects/claude-proxy
+git pull
+node setup.mjs
 openclaw gateway restart
 ```
 
-## Notes
+## Changelog
 
-- Cost shows as $0 because billing goes through your Claude subscription
-- Each request spawns a `claude -p` process; concurrent requests are capped by `CLAUDE_MAX_CONCURRENT`
-- The proxy must run on the same machine as the Claude CLI (uses local OAuth)
-- Session data is stored by Claude CLI on disk; session map is in-memory (lost on proxy restart)
+### v3.0.0 (2026-03-24)
+- **`/ocp` CLI** — full management from terminal (`ocp usage`, `ocp settings`, etc.)
+- **`/ocp` gateway plugin** — native slash command in Telegram/Discord
+- **Plan usage monitoring** — real-time session/weekly limits via Anthropic API rate-limit headers
+- **Per-model stats** — request count, avg/max elapsed time, avg/max prompt size
+- **Runtime settings** — `PATCH /settings` to tune timeouts, concurrency, prompt limits without restart
+- **Prompt truncation** — auto-truncate prompts exceeding 150K chars to prevent timeout cascades
+- **Circuit breaker removed** — caused more harm than good in CLI-proxy architecture
+- **Timeout increases** — Opus 150s, Sonnet 120s, Haiku 45s (base first-byte)
+- **New endpoints** — `/usage`, `/status`, `/settings`, `/logs`
+
+### v2.5.0 (2026-03-22)
+- Sliding-window circuit breaker (replaced consecutive-count)
+- Graduated backoff, multi-probe half-open
+- Increased default timeouts for large agent prompts
+
+### v2.0.0
+- On-demand spawning (replaced pool architecture)
+- Session management with `--resume`
+- Full tool access, system prompt, MCP config support
 
 ## License
 

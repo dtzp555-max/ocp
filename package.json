@@ -1,10 +1,11 @@
 {
   "name": "openclaw-claude-proxy",
-  "version": "2.5.0",
-  "description": "OpenAI-compatible proxy for Claude CLI v2 — sliding-window circuit breaker, adaptive first-byte timeout, structured logging",
+  "version": "3.0.0",
+  "description": "OpenAI-compatible proxy for Claude CLI — plan usage monitoring, runtime settings, prompt truncation, OCP CLI",
   "type": "module",
   "bin": {
-    "openclaw-claude-proxy": "./server.mjs"
+    "openclaw-claude-proxy": "./server.mjs",
+    "ocp": "./ocp"
   },
   "scripts": {
     "start": "node server.mjs",

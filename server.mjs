@@ -85,10 +85,11 @@ function resolveClaude() {
 }
 
 // ── Configuration ───────────────────────────────────────────────────────
+// Settings marked with `let` can be changed at runtime via PATCH /settings.
 const PORT = parseInt(process.env.CLAUDE_PROXY_PORT || "3456", 10);
 const CLAUDE = resolveClaude();
-const TIMEOUT = parseInt(process.env.CLAUDE_TIMEOUT || "300000", 10);
-const BASE_FIRST_BYTE_TIMEOUT = parseInt(process.env.CLAUDE_FIRST_BYTE_TIMEOUT || "90000", 10);
+let TIMEOUT = parseInt(process.env.CLAUDE_TIMEOUT || "300000", 10);
+let BASE_FIRST_BYTE_TIMEOUT = parseInt(process.env.CLAUDE_FIRST_BYTE_TIMEOUT || "90000", 10);
 const PROXY_API_KEY = process.env.PROXY_API_KEY || "";
 const SKIP_PERMISSIONS = process.env.CLAUDE_SKIP_PERMISSIONS === "true";
 const ALLOWED_TOOLS = (process.env.CLAUDE_ALLOWED_TOOLS ||
@@ -96,8 +97,8 @@ const ALLOWED_TOOLS = (process.env.CLAUDE_ALLOWED_TOOLS ||
 ).split(",").map(s => s.trim()).filter(Boolean);
 const SYSTEM_PROMPT = process.env.CLAUDE_SYSTEM_PROMPT || "";
 const MCP_CONFIG = process.env.CLAUDE_MCP_CONFIG || "";
-const SESSION_TTL = parseInt(process.env.CLAUDE_SESSION_TTL || "3600000", 10);
-const MAX_CONCURRENT = parseInt(process.env.CLAUDE_MAX_CONCURRENT || "8", 10);
+let SESSION_TTL = parseInt(process.env.CLAUDE_SESSION_TTL || "3600000", 10);
+let MAX_CONCURRENT = parseInt(process.env.CLAUDE_MAX_CONCURRENT || "8", 10);
 const BREAKER_THRESHOLD = parseInt(process.env.CLAUDE_BREAKER_THRESHOLD || "6", 10);
 const BREAKER_COOLDOWN = parseInt(process.env.CLAUDE_BREAKER_COOLDOWN || "120000", 10);
 const BREAKER_WINDOW = parseInt(process.env.CLAUDE_BREAKER_WINDOW || "300000", 10);
@@ -116,129 +117,28 @@ function logEvent(level, event, data = {}) {
   }
 }
 
-// ── Per-model sliding-window circuit breaker ─────────────────────────────
-// Uses a time-windowed failure rate instead of consecutive-count. This prevents
-// multi-agent burst scenarios (e.g. ClawTeam spawning 5+ Opus agents) from
-// tripping the breaker after just 3 quick timeouts.
-//
-// States: closed → open → half-open → closed (on success) or open (on failure)
-// Half-open allows up to BREAKER_HALF_OPEN_MAX concurrent probes (not just 1).
-// Cooldown uses graduated backoff: doubles on each re-open, resets on success.
-const breakers = new Map(); // cliModel → BreakerState
+// ── Circuit breaker (DISABLED) ──────────────────────────────────────────
+// Disabled: CLI proxy has its own retry logic, and the breaker was causing
+// cascading failures — once API got briefly slow, ALL agents lost connectivity
+// for 120s+ due to the breaker rejecting every request.
+// The timeout/failure tracking stubs below are kept as no-ops so callers
+// don't need to be changed.
+function breakerRecordSuccess(_cliModel) {}
+function breakerRecordTimeout(_cliModel) {}
+function getBreakerState(_cliModel) { return { state: "closed" }; }
+function getBreakerSnapshot() { return { _note: "circuit breaker disabled" }; }
 
-function newBreakerState() {
-  return {
-    state: "closed",        // closed | open | half-open
-    failureTimestamps: [],  // timestamps of failures within the sliding window
-    successCount: 0,        // successes within window (for rate calculation)
-    openedAt: 0,
-    currentCooldown: BREAKER_COOLDOWN, // graduates on repeated opens
-    reopenCount: 0,         // how many times breaker has re-opened without a full reset
-    halfOpenProbes: 0,      // active probe requests in half-open state
-  };
-}
+// Legacy constants kept for /health display
+const _BREAKER_DISABLED_NOTE = "disabled";
+/* Original breaker code removed — see git history for v2.5.0 implementation.
+   Re-enable by reverting this block if needed in the future.
+   Reason for disabling: CLI-proxy architecture means each request spawns a
+   fresh claude process. The breaker was designed for persistent API connections
+   where a degraded backend benefits from back-off. With CLI spawning, timeouts
+   are usually transient (API load, large prompts) and the breaker's 120s+
+   cooldown with graduated backoff made things worse, not better.
+*/
 
-function pruneWindow(b) {
-  const cutoff = Date.now() - BREAKER_WINDOW;
-  b.failureTimestamps = b.failureTimestamps.filter(ts => ts > cutoff);
-}
-
-function getBreakerState(cliModel) {
-  if (!breakers.has(cliModel)) {
-    breakers.set(cliModel, newBreakerState());
-  }
-  const b = breakers.get(cliModel);
-
-  // Auto-recover: if cooldown has elapsed, transition to half-open
-  if (b.state === "open" && Date.now() - b.openedAt >= b.currentCooldown) {
-    b.state = "half-open";
-    b.halfOpenProbes = 0;
-    logEvent("info", "breaker_half_open", { model: cliModel, cooldownMs: b.currentCooldown, reopenCount: b.reopenCount });
-  }
-  return b;
-}
-
-function breakerRecordSuccess(cliModel) {
-  const b = getBreakerState(cliModel);
-  b.successCount++;
-
-  if (b.state === "half-open") {
-    b.halfOpenProbes = Math.max(0, b.halfOpenProbes - 1);
-  }
-
-  if (b.state !== "closed") {
-    logEvent("info", "breaker_reset", {
-      model: cliModel,
-      previousFailures: b.failureTimestamps.length,
-      previousState: b.state,
-      reopenCount: b.reopenCount,
-    });
-    // Full reset on success — graduated backoff resets too
-    b.state = "closed";
-    b.openedAt = 0;
-    b.currentCooldown = BREAKER_COOLDOWN;
-    b.reopenCount = 0;
-    b.halfOpenProbes = 0;
-    b.failureTimestamps = [];
-    b.successCount = 0;
-  }
-}
-
-function breakerRecordTimeout(cliModel) {
-  const b = getBreakerState(cliModel);
-  const now = Date.now();
-  b.failureTimestamps.push(now);
-  pruneWindow(b);
-
-  if (b.state === "half-open") {
-    b.halfOpenProbes = Math.max(0, b.halfOpenProbes - 1);
-  }
-
-  const windowFailures = b.failureTimestamps.length;
-  logEvent("warn", "breaker_failure", {
-    model: cliModel,
-    windowFailures,
-    threshold: BREAKER_THRESHOLD,
-    windowMs: BREAKER_WINDOW,
-    state: b.state,
-  });
-
-  if (windowFailures >= BREAKER_THRESHOLD && b.state !== "open") {
-    b.state = "open";
-    b.openedAt = now;
-    b.halfOpenProbes = 0;
-    // Graduated backoff: double cooldown on each re-open, cap at 5 min
-    if (b.reopenCount > 0) {
-      b.currentCooldown = Math.min(b.currentCooldown * 2, 300000);
-    }
-    b.reopenCount++;
-    logEvent("error", "breaker_open", {
-      model: cliModel,
-      windowFailures,
-      cooldownMs: b.currentCooldown,
-      reopenCount: b.reopenCount,
-    });
-  }
-}
-
-// Expose breaker snapshot for /health endpoint
-function getBreakerSnapshot() {
-  const snapshot = {};
-  for (const [model, b] of breakers) {
-    pruneWindow(b);
-    snapshot[model] = {
-      state: b.state,
-      windowFailures: b.failureTimestamps.length,
-      threshold: BREAKER_THRESHOLD,
-      windowMs: BREAKER_WINDOW,
-      currentCooldown: b.currentCooldown,
-      reopenCount: b.reopenCount,
-      halfOpenProbes: b.halfOpenProbes,
-      ...(b.openedAt ? { openedAt: new Date(b.openedAt).toISOString() } : {}),
-    };
-  }
-  return snapshot;
-}
 
 // ── Model mapping ───────────────────────────────────────────────────────
 // Maps request model IDs and aliases to canonical claude CLI model IDs.
@@ -289,6 +189,57 @@ const stats = {
   oneOffRequests: 0,
 };
 const recentErrors = []; // last 20 errors
+
+// Per-model request stats
+const modelStats = new Map(); // cliModel → { requests, errors, timeouts, totalElapsed, maxElapsed, totalPromptChars, maxPromptChars }
+
+function getModelStats(cliModel) {
+  if (!modelStats.has(cliModel)) {
+    modelStats.set(cliModel, {
+      requests: 0, successes: 0, errors: 0, timeouts: 0,
+      totalElapsed: 0, maxElapsed: 0,
+      totalPromptChars: 0, maxPromptChars: 0,
+    });
+  }
+  return modelStats.get(cliModel);
+}
+
+function recordModelRequest(cliModel, promptChars) {
+  const m = getModelStats(cliModel);
+  m.requests++;
+  m.totalPromptChars += promptChars;
+  if (promptChars > m.maxPromptChars) m.maxPromptChars = promptChars;
+}
+
+function recordModelSuccess(cliModel, elapsedMs) {
+  const m = getModelStats(cliModel);
+  m.successes++;
+  m.totalElapsed += elapsedMs;
+  if (elapsedMs > m.maxElapsed) m.maxElapsed = elapsedMs;
+}
+
+function recordModelError(cliModel, isTimeout) {
+  const m = getModelStats(cliModel);
+  m.errors++;
+  if (isTimeout) m.timeouts++;
+}
+
+function getModelStatsSnapshot() {
+  const result = {};
+  for (const [model, m] of modelStats) {
+    result[model] = {
+      requests: m.requests,
+      successes: m.successes,
+      errors: m.errors,
+      timeouts: m.timeouts,
+      avgElapsed: m.successes > 0 ? Math.round(m.totalElapsed / m.successes) : 0,
+      maxElapsed: m.maxElapsed,
+      avgPromptChars: m.requests > 0 ? Math.round(m.totalPromptChars / m.requests) : 0,
+      maxPromptChars: m.maxPromptChars,
+    };
+  }
+  return result;
+}
 
 function trackError(msg) {
   stats.errors++;
@@ -353,21 +304,65 @@ function buildCliArgs(cliModel, sessionInfo) {
 }
 
 // ── Format messages to prompt text ──────────────────────────────────────
+// Truncation guard: if total chars exceed MAX_PROMPT_CHARS, keep the system
+// message(s) + first user message + last N messages, dropping the middle.
+// This prevents runaway context from gateway-side conversation accumulation.
+let MAX_PROMPT_CHARS = parseInt(process.env.CLAUDE_MAX_PROMPT_CHARS || "150000", 10);
+
 function messagesToPrompt(messages) {
-  return messages.map((m) => {
+  const full = messages.map((m) => {
     const text = typeof m.content === "string" ? m.content : JSON.stringify(m.content);
     if (m.role === "system") return `[System] ${text}`;
     if (m.role === "assistant") return `[Assistant] ${text}`;
     return text;
-  }).join("\n\n");
+  });
+
+  const joined = full.join("\n\n");
+  if (joined.length <= MAX_PROMPT_CHARS) return joined;
+
+  // Truncation: keep system messages, first user msg, and trim from the tail
+  logEvent("warn", "prompt_truncated", {
+    originalChars: joined.length,
+    maxChars: MAX_PROMPT_CHARS,
+    originalMessages: messages.length,
+  });
+
+  const system = [];
+  const rest = [];
+  for (let i = 0; i < full.length; i++) {
+    if (messages[i].role === "system") system.push(full[i]);
+    else rest.push(full[i]);
+  }
+
+  // Keep system + as many recent messages as fit
+  const systemText = system.join("\n\n");
+  const budget = MAX_PROMPT_CHARS - systemText.length - 200; // 200 for separator
+  const kept = [];
+  let used = 0;
+  for (let i = rest.length - 1; i >= 0; i--) {
+    if (used + rest[i].length + 2 > budget) break;
+    kept.unshift(rest[i]);
+    used += rest[i].length + 2;
+  }
+
+  const truncNote = `[System] Note: ${rest.length - kept.length} older messages were truncated to fit context limit.`;
+  const result = [systemText, truncNote, ...kept].filter(Boolean).join("\n\n");
+
+  logEvent("info", "prompt_after_truncation", {
+    chars: result.length,
+    keptMessages: kept.length,
+    droppedMessages: rest.length - kept.length,
+  });
+
+  return result;
 }
 
 // Model tier multipliers for first-byte timeout.
 // Opus is much slower to produce first token, especially with large contexts.
-const MODEL_TIMEOUT_TIERS = {
-  "opus": { base: 90000, perPromptChar: 0.00020 },    // 90s base + ~20s per 100k chars
-  "sonnet": { base: 60000, perPromptChar: 0.00010 },  // 60s base + ~10s per 100k chars
-  "haiku": { base: 30000, perPromptChar: 0.00005 },   // 30s base + ~5s per 100k chars
+let MODEL_TIMEOUT_TIERS = {
+  "opus": { base: 150000, perPromptChar: 0.00050 },   // 150s base + ~50s per 100k chars
+  "sonnet": { base: 120000, perPromptChar: 0.00050 }, // 120s base + ~50s per 100k chars
+  "haiku": { base: 45000, perPromptChar: 0.00010 },   // 45s base + ~10s per 100k chars
 };
 
 function getModelTier(cliModel) {
@@ -392,22 +387,7 @@ function spawnClaudeProcess(model, messages, conversationId) {
 
   const cliModel = MODEL_MAP[model] || model;
 
-  // Circuit breaker check: fail fast if model is in open state
-  const breaker = getBreakerState(cliModel);
-  if (breaker.state === "open") {
-    const remainingMs = breaker.currentCooldown - (Date.now() - breaker.openedAt);
-    logEvent("warn", "breaker_rejected", { model: cliModel, remainingCooldownMs: remainingMs, reopenCount: breaker.reopenCount });
-    throw new Error(`circuit breaker open for ${cliModel}: ${breaker.failureTimestamps.length} timeouts in window, retry in ${Math.ceil(remainingMs / 1000)}s`);
-  }
-  // Half-open: allow limited probe requests
-  if (breaker.state === "half-open" && breaker.halfOpenProbes >= BREAKER_HALF_OPEN_MAX) {
-    logEvent("warn", "breaker_half_open_full", { model: cliModel, activeProbes: breaker.halfOpenProbes, max: BREAKER_HALF_OPEN_MAX });
-    throw new Error(`circuit breaker half-open for ${cliModel}: ${breaker.halfOpenProbes}/${BREAKER_HALF_OPEN_MAX} probe slots in use, wait for probe result`);
-  }
-  if (breaker.state === "half-open") {
-    breaker.halfOpenProbes++;
-    logEvent("info", "breaker_probe", { model: cliModel, activeProbes: breaker.halfOpenProbes, max: BREAKER_HALF_OPEN_MAX });
-  }
+  // Circuit breaker: disabled (see comment at top of breaker section)
 
   stats.activeRequests++;
   stats.totalRequests++;
@@ -487,12 +467,14 @@ function spawnClaudeProcess(model, messages, conversationId) {
   proc.stdin.write(prompt);
   proc.stdin.end();
 
+  recordModelRequest(cliModel, prompt.length);
   logEvent("info", "claude_spawned", { model: cliModel, promptChars: prompt.length, firstByteTimeout: firstByteTimeoutMs, tier: getModelTier(cliModel), session: conversationId ? conversationId.slice(0, 12) + "..." : "none" });
 
   // First-byte timeout
   const firstByteTimer = setTimeout(() => {
     if (!gotFirstByte && !cleaned) {
       stats.timeouts++;
+      recordModelError(cliModel, true);
       breakerRecordTimeout(cliModel);
       logEvent("error", "first_byte_timeout", { model: cliModel, timeoutMs: firstByteTimeoutMs, promptChars: prompt.length });
       try { proc.kill("SIGTERM"); } catch {}
@@ -504,6 +486,7 @@ function spawnClaudeProcess(model, messages, conversationId) {
   const overallTimer = setTimeout(() => {
     if (!cleaned) {
       stats.timeouts++;
+      recordModelError(cliModel, true);
       breakerRecordTimeout(cliModel);
       logEvent("error", "request_timeout", { model: cliModel, timeoutMs: TIMEOUT });
       try { proc.kill("SIGTERM"); } catch {}
@@ -542,11 +525,13 @@ function callClaude(model, messages, conversationId) {
       const elapsed = Date.now() - t0;
       cleanup();
       if (code !== 0) {
+        recordModelError(cliModel, false);
         logEvent("error", "claude_exit", { model: cliModel, code, signal: signal || "none", elapsed, stderr: stderr.slice(0, 300) });
         trackError(stderr.slice(0, 300) || stdout.slice(0, 300) || `claude exit ${code}`);
         handleSessionFailure();
         reject(new Error(stderr.slice(0, 300) || stdout.slice(0, 300) || `claude exit ${code}`));
       } else {
+        recordModelSuccess(cliModel, elapsed);
         breakerRecordSuccess(cliModel);
         logEvent("info", "claude_ok", { model: cliModel, chars: stdout.length, elapsed, session: convId ? convId.slice(0, 12) + "..." : "none" });
         resolve(stdout.trim());
@@ -620,15 +605,14 @@ function callClaudeStreaming(model, messages, conversationId, res) {
     const elapsed = Date.now() - t0;
 
     if (code !== 0) {
+      recordModelError(cliModel, false);
       logEvent("error", "claude_exit", { model: cliModel, code, signal: signal || "none", elapsed, stderr: stderr.slice(0, 300) });
       trackError(stderr.slice(0, 300) || `claude exit ${code}`);
       handleSessionFailure();
 
       if (!headersSent && !res.writableEnded && !res.destroyed) {
-        // No output was sent yet — return a JSON error
         jsonResponse(res, 500, { error: { message: stderr.slice(0, 300) || `claude exit ${code}`, type: "proxy_error" } });
       } else if (!res.writableEnded && !res.destroyed) {
-        // Already streaming — close the stream gracefully
         sendSSE(res, {
           id, object: "chat.completion.chunk", created, model,
           choices: [{ index: 0, delta: {}, finish_reason: "stop" }],
@@ -637,6 +621,7 @@ function callClaudeStreaming(model, messages, conversationId, res) {
         res.end();
       }
     } else {
+      recordModelSuccess(cliModel, elapsed);
       breakerRecordSuccess(cliModel);
       logEvent("info", "claude_ok", { model: cliModel, chars: totalChars, elapsed, session: convId ? convId.slice(0, 12) + "..." : "none" });
 
@@ -690,6 +675,337 @@ function completionResponse(res, id, model, content) {
     model,
     choices: [{ index: 0, message: { role: "assistant", content }, finish_reason: "stop" }],
     usage: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 },
+  });
+}
+
+// ── Plan usage probe ────────────────────────────────────────────────────
+// Reads the OAuth token from macOS keychain and makes a minimal API call
+// to Anthropic to capture rate-limit headers (plan usage info).
+// Caches the result for 5 minutes to avoid excessive API calls.
+
+let usageCache = { data: null, fetchedAt: 0 };
+const USAGE_CACHE_TTL = 300000; // 5 min
+
+function getOAuthToken() {
+  try {
+    const raw = execFileSync("security", [
+      "find-generic-password", "-s", "Claude Code-credentials", "-w"
+    ], { encoding: "utf8", timeout: 5000 }).trim();
+    const creds = JSON.parse(raw);
+    return creds?.claudeAiOauth?.accessToken || null;
+  } catch {
+    return null;
+  }
+}
+
+async function fetchUsageFromApi() {
+  const token = getOAuthToken();
+  if (!token) {
+    return { error: "No OAuth token found in keychain" };
+  }
+
+  // Minimal API call to haiku (cheapest) with max_tokens=1 — we only need the headers
+  const body = JSON.stringify({
+    model: "claude-haiku-4-5-20251001",
+    max_tokens: 1,
+    messages: [{ role: "user", content: "." }],
+  });
+
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 15000);
+
+  try {
+    const resp = await fetch("https://api.anthropic.com/v1/messages", {
+      method: "POST",
+      headers: {
+        "x-api-key": token,
+        "anthropic-version": "2023-06-01",
+        "Content-Type": "application/json",
+      },
+      body,
+      signal: controller.signal,
+    });
+    clearTimeout(timeout);
+
+    // Extract all rate-limit headers
+    const rl = {};
+    for (const [k, v] of resp.headers) {
+      if (k.startsWith("anthropic-ratelimit")) {
+        rl[k] = v;
+      }
+    }
+
+    // Parse into structured usage object
+    const now = Date.now();
+    const session5hUtil = parseFloat(rl["anthropic-ratelimit-unified-5h-utilization"] || "0");
+    const session5hReset = parseInt(rl["anthropic-ratelimit-unified-5h-reset"] || "0", 10);
+    const weekly7dUtil = parseFloat(rl["anthropic-ratelimit-unified-7d-utilization"] || "0");
+    const weekly7dReset = parseInt(rl["anthropic-ratelimit-unified-7d-reset"] || "0", 10);
+    const overageStatus = rl["anthropic-ratelimit-unified-overage-status"] || "unknown";
+    const overageDisabledReason = rl["anthropic-ratelimit-unified-overage-disabled-reason"] || "";
+    const status = rl["anthropic-ratelimit-unified-status"] || "unknown";
+    const representativeClaim = rl["anthropic-ratelimit-unified-representative-claim"] || "";
+    const fallbackPct = parseFloat(rl["anthropic-ratelimit-unified-fallback-percentage"] || "0");
+
+    function formatReset(epochSec) {
+      if (!epochSec) return "unknown";
+      const diff = epochSec * 1000 - now;
+      if (diff <= 0) return "now";
+      const h = Math.floor(diff / 3600000);
+      const m = Math.floor((diff % 3600000) / 60000);
+      if (h > 24) {
+        const d = Math.floor(h / 24);
+        return `${d}d ${h % 24}h`;
+      }
+      return h > 0 ? `${h}h ${m}m` : `${m}m`;
+    }
+
+    function resetDay(epochSec) {
+      if (!epochSec) return "";
+      const d = new Date(epochSec * 1000);
+      return d.toLocaleDateString("en-US", { weekday: "short", month: "short", day: "numeric", hour: "numeric", minute: "2-digit" });
+    }
+
+    return {
+      status,
+      fetchedAt: new Date(now).toISOString(),
+      plan: {
+        currentSession: {
+          utilization: session5hUtil,
+          percent: `${Math.round(session5hUtil * 100)}%`,
+          resetsIn: formatReset(session5hReset),
+          resetsAt: session5hReset ? new Date(session5hReset * 1000).toISOString() : null,
+          resetsAtHuman: resetDay(session5hReset),
+        },
+        weeklyLimits: {
+          allModels: {
+            utilization: weekly7dUtil,
+            percent: `${Math.round(weekly7dUtil * 100)}%`,
+            resetsIn: formatReset(weekly7dReset),
+            resetsAt: weekly7dReset ? new Date(weekly7dReset * 1000).toISOString() : null,
+            resetsAtHuman: resetDay(weekly7dReset),
+          },
+        },
+        extraUsage: {
+          status: overageStatus,
+          disabledReason: overageDisabledReason || undefined,
+        },
+        representativeClaim,
+        fallbackPercentage: fallbackPct,
+      },
+      proxy: {
+        totalRequests: stats.totalRequests,
+        activeRequests: stats.activeRequests,
+        errors: stats.errors,
+        timeouts: stats.timeouts,
+        uptime: `${Math.floor((now - START_TIME) / 3600000)}h ${Math.floor(((now - START_TIME) % 3600000) / 60000)}m`,
+      },
+      models: getModelStatsSnapshot(),
+      _raw: rl,
+    };
+  } catch (err) {
+    clearTimeout(timeout);
+    return { error: `Failed to fetch usage: ${err.message}` };
+  }
+}
+
+async function handleUsage(_req, res) {
+  const now = Date.now();
+  let data;
+  if (usageCache.data && (now - usageCache.fetchedAt) < USAGE_CACHE_TTL) {
+    data = usageCache.data;
+  } else {
+    data = await fetchUsageFromApi();
+    if (!data.error) {
+      usageCache = { data, fetchedAt: now };
+    }
+  }
+  // Always attach live model stats and proxy stats (not cached)
+  const uptimeMs = now - START_TIME;
+  const response = {
+    ...data,
+    proxy: {
+      totalRequests: stats.totalRequests,
+      activeRequests: stats.activeRequests,
+      errors: stats.errors,
+      timeouts: stats.timeouts,
+      uptime: `${Math.floor(uptimeMs / 3600000)}h ${Math.floor((uptimeMs % 3600000) / 60000)}m`,
+    },
+    models: getModelStatsSnapshot(),
+  };
+  jsonResponse(res, data.error ? 502 : 200, response);
+}
+
+// ── Logs endpoint ──────────────────────────────────────────────────────
+// Returns recent structured log entries from the proxy log file.
+// GET /logs?n=20&level=error  (default: n=30, level=all)
+function handleLogs(req, res) {
+  const url = new URL(req.url, `http://127.0.0.1:${PORT}`);
+  const n = Math.min(parseInt(url.searchParams.get("n") || "30", 10), 200);
+  const level = url.searchParams.get("level") || "all"; // all | error | warn | info
+
+  const LOG_PATH = join(process.env.HOME || "/tmp", ".openclaw/logs/proxy.log");
+  let lines;
+  try {
+    const raw = readFileSync(LOG_PATH, "utf8");
+    lines = raw.split("\n").filter(Boolean);
+  } catch (err) {
+    return jsonResponse(res, 500, { error: `Cannot read log: ${err.message}` });
+  }
+
+  // Parse JSON lines, fall back to raw text
+  let entries = lines.slice(-n * 3).map(line => {
+    try { return JSON.parse(line); } catch { return { raw: line }; }
+  });
+
+  // Filter by level
+  if (level !== "all") {
+    entries = entries.filter(e => {
+      if (e.level) return e.level === level;
+      if (level === "error") return e.raw?.includes("error") || e.raw?.includes("Error");
+      return true;
+    });
+  }
+
+  entries = entries.slice(-n);
+
+  return jsonResponse(res, 200, {
+    count: entries.length,
+    level,
+    entries,
+  });
+}
+
+// ── Status endpoint (combined summary) ─────────────────────────────────
+async function handleStatus(_req, res) {
+  const now = Date.now();
+  const uptimeMs = now - START_TIME;
+
+  // Get usage (from cache if fresh)
+  let usage = null;
+  if (usageCache.data && (now - usageCache.fetchedAt) < USAGE_CACHE_TTL) {
+    usage = usageCache.data;
+  } else {
+    usage = await fetchUsageFromApi();
+    if (!usage.error) usageCache = { data: usage, fetchedAt: now };
+  }
+
+  // Auth
+  let binaryOk = false;
+  try { accessSync(CLAUDE, constants.X_OK); binaryOk = true; } catch {}
+
+  return jsonResponse(res, 200, {
+    proxy: {
+      status: binaryOk && authStatus.ok !== false ? "ok" : "degraded",
+      version: VERSION,
+      uptime: `${Math.floor(uptimeMs / 3600000)}h ${Math.floor((uptimeMs % 3600000) / 60000)}m`,
+      auth: authStatus.ok ? "ok" : authStatus.message,
+      activeSessions: sessions.size,
+    },
+    requests: {
+      total: stats.totalRequests,
+      active: stats.activeRequests,
+      errors: stats.errors,
+      timeouts: stats.timeouts,
+    },
+    plan: usage?.plan || usage?.error || null,
+    recentErrors: recentErrors.slice(-3),
+  });
+}
+
+// ── Settings endpoint ───────────────────────────────────────────────────
+// GET  /settings → view current tunable parameters
+// PATCH /settings → update one or more parameters at runtime
+//
+// Tunable keys and their types/ranges:
+const SETTINGS_SCHEMA = {
+  timeout:          { type: "number", min: 30000, max: 600000, unit: "ms", desc: "Overall request timeout" },
+  firstByteTimeout: { type: "number", min: 15000, max: 300000, unit: "ms", desc: "Base first-byte timeout" },
+  maxConcurrent:    { type: "number", min: 1, max: 32, unit: "", desc: "Max concurrent claude processes" },
+  sessionTTL:       { type: "number", min: 60000, max: 86400000, unit: "ms", desc: "Session idle expiry" },
+  maxPromptChars:   { type: "number", min: 10000, max: 1000000, unit: "chars", desc: "Prompt truncation limit" },
+  "tiers.opus.base":        { type: "number", min: 30000, max: 600000, unit: "ms", desc: "Opus base first-byte timeout" },
+  "tiers.opus.perChar":     { type: "number", min: 0, max: 0.01, unit: "ms/char", desc: "Opus per-char timeout addition" },
+  "tiers.sonnet.base":      { type: "number", min: 30000, max: 600000, unit: "ms", desc: "Sonnet base first-byte timeout" },
+  "tiers.sonnet.perChar":   { type: "number", min: 0, max: 0.01, unit: "ms/char", desc: "Sonnet per-char timeout addition" },
+  "tiers.haiku.base":       { type: "number", min: 15000, max: 300000, unit: "ms", desc: "Haiku base first-byte timeout" },
+  "tiers.haiku.perChar":    { type: "number", min: 0, max: 0.01, unit: "ms/char", desc: "Haiku per-char timeout addition" },
+};
+
+function getSettings() {
+  return {
+    timeout:          { value: TIMEOUT, ...SETTINGS_SCHEMA.timeout },
+    firstByteTimeout: { value: BASE_FIRST_BYTE_TIMEOUT, ...SETTINGS_SCHEMA.firstByteTimeout },
+    maxConcurrent:    { value: MAX_CONCURRENT, ...SETTINGS_SCHEMA.maxConcurrent },
+    sessionTTL:       { value: SESSION_TTL, ...SETTINGS_SCHEMA.sessionTTL },
+    maxPromptChars:   { value: MAX_PROMPT_CHARS, ...SETTINGS_SCHEMA.maxPromptChars },
+    tiers: {
+      opus:   { base: MODEL_TIMEOUT_TIERS.opus.base, perPromptChar: MODEL_TIMEOUT_TIERS.opus.perPromptChar },
+      sonnet: { base: MODEL_TIMEOUT_TIERS.sonnet.base, perPromptChar: MODEL_TIMEOUT_TIERS.sonnet.perPromptChar },
+      haiku:  { base: MODEL_TIMEOUT_TIERS.haiku.base, perPromptChar: MODEL_TIMEOUT_TIERS.haiku.perPromptChar },
+    },
+  };
+}
+
+function applySettingUpdate(key, value) {
+  const schema = SETTINGS_SCHEMA[key];
+  if (!schema) return `unknown setting: ${key}`;
+  if (typeof value !== schema.type) return `${key}: expected ${schema.type}, got ${typeof value}`;
+  if (value < schema.min || value > schema.max) return `${key}: value ${value} out of range [${schema.min}, ${schema.max}]`;
+
+  switch (key) {
+    case "timeout":          TIMEOUT = value; break;
+    case "firstByteTimeout": BASE_FIRST_BYTE_TIMEOUT = value; break;
+    case "maxConcurrent":    MAX_CONCURRENT = value; break;
+    case "sessionTTL":       SESSION_TTL = value; break;
+    case "maxPromptChars":   MAX_PROMPT_CHARS = value; break;
+    case "tiers.opus.base":        MODEL_TIMEOUT_TIERS.opus.base = value; break;
+    case "tiers.opus.perChar":     MODEL_TIMEOUT_TIERS.opus.perPromptChar = value; break;
+    case "tiers.sonnet.base":      MODEL_TIMEOUT_TIERS.sonnet.base = value; break;
+    case "tiers.sonnet.perChar":   MODEL_TIMEOUT_TIERS.sonnet.perPromptChar = value; break;
+    case "tiers.haiku.base":       MODEL_TIMEOUT_TIERS.haiku.base = value; break;
+    case "tiers.haiku.perChar":    MODEL_TIMEOUT_TIERS.haiku.perPromptChar = value; break;
+    default: return `${key}: not implemented`;
+  }
+  logEvent("info", "setting_changed", { key, value });
+  return null; // success
+}
+
+async function handleSettings(req, res) {
+  if (req.method === "GET") {
+    return jsonResponse(res, 200, getSettings());
+  }
+
+  // PATCH
+  let body = "";
+  for await (const chunk of req) {
+    body += chunk;
+    if (body.length > 10000) return jsonResponse(res, 413, { error: "Body too large" });
+  }
+  let updates;
+  try { updates = JSON.parse(body); } catch { return jsonResponse(res, 400, { error: "Invalid JSON" }); }
+
+  if (typeof updates !== "object" || Array.isArray(updates)) {
+    return jsonResponse(res, 400, { error: "Expected JSON object with key-value pairs" });
+  }
+
+  const results = {};
+  const errors = [];
+  for (const [key, value] of Object.entries(updates)) {
+    const err = applySettingUpdate(key, value);
+    if (err) {
+      errors.push(err);
+      results[key] = { error: err };
+    } else {
+      results[key] = { ok: true, value };
+    }
+  }
+
+  const status = errors.length === 0 ? 200 : (Object.keys(results).length > errors.length ? 207 : 400);
+  return jsonResponse(res, status, {
+    results,
+    ...(errors.length ? { errors } : {}),
+    current: getSettings(),
   });
 }
 
@@ -799,11 +1115,8 @@ const server = createServer(async (req, res) => {
       });
     }
 
-    const breakerState = getBreakerSnapshot();
-    const anyBreakerOpen = Object.values(breakerState).some(b => b.state === "open");
-
     return jsonResponse(res, 200, {
-      status: binaryOk && authStatus.ok !== false && !anyBreakerOpen ? "ok" : "degraded",
+      status: binaryOk && authStatus.ok !== false ? "ok" : "degraded",
       version: VERSION,
       architecture: "on-demand (v2)",
       uptime: uptimeMs,
@@ -816,16 +1129,13 @@ const server = createServer(async (req, res) => {
         firstByteTimeout: BASE_FIRST_BYTE_TIMEOUT,
         maxConcurrent: MAX_CONCURRENT,
         sessionTTL: SESSION_TTL,
-        breakerThreshold: BREAKER_THRESHOLD,
-        breakerCooldown: BREAKER_COOLDOWN,
-        breakerWindow: BREAKER_WINDOW,
-        breakerHalfOpenMax: BREAKER_HALF_OPEN_MAX,
+        circuitBreaker: "disabled",
         allowedTools: SKIP_PERMISSIONS ? "all (skip-permissions)" : ALLOWED_TOOLS,
         systemPrompt: SYSTEM_PROMPT ? `${SYSTEM_PROMPT.slice(0, 50)}...` : "(none)",
         mcpConfig: MCP_CONFIG || "(none)",
       },
       stats,
-      breakers: breakerState,
+      circuitBreaker: "disabled",
       sessions: sessionList,
       recentErrors: recentErrors.slice(-5),
     });
@@ -847,7 +1157,28 @@ const server = createServer(async (req, res) => {
     return jsonResponse(res, 200, { sessions: list });
   }
 
-  jsonResponse(res, 404, { error: "Not found. Endpoints: GET /v1/models, POST /v1/chat/completions, GET /health, GET|DELETE /sessions" });
+  // GET /usage — fetch plan usage limits from Anthropic API
+  if (req.url === "/usage" && req.method === "GET") {
+    return handleUsage(req, res);
+  }
+
+  // GET /logs — recent proxy log entries (errors and key events)
+  if (req.url?.startsWith("/logs") && req.method === "GET") {
+    return handleLogs(req, res);
+  }
+
+  // GET /status — combined usage + health summary
+  if (req.url === "/status" && req.method === "GET") {
+    return handleStatus(req, res);
+  }
+
+  // GET /settings — view current tunable settings
+  // PATCH /settings — update settings at runtime (JSON body)
+  if (req.url === "/settings" && (req.method === "GET" || req.method === "PATCH")) {
+    return handleSettings(req, res);
+  }
+
+  jsonResponse(res, 404, { error: "Not found. Endpoints: GET /v1/models, POST /v1/chat/completions, GET /health, GET /usage, GET /status, GET /logs, GET|PATCH /settings, GET|DELETE /sessions" });
 });
 
 
@@ -910,7 +1241,7 @@ server.listen(PORT, "127.0.0.1", () => {
   console.log(`Models: ${MODELS.map((m) => m.id).join(", ")}`);
   console.log(`Claude binary: ${CLAUDE}`);
   console.log(`Timeout: ${TIMEOUT}ms (base first-byte: ${BASE_FIRST_BYTE_TIMEOUT}ms, adaptive by model/prompt) | Max concurrent: ${MAX_CONCURRENT}`);
-  console.log(`Circuit breaker: threshold=${BREAKER_THRESHOLD} in ${BREAKER_WINDOW/1000}s window, cooldown=${BREAKER_COOLDOWN/1000}s (graduated), half-open probes=${BREAKER_HALF_OPEN_MAX}`);
+  console.log(`Circuit breaker: disabled`);
   console.log(`Tools: ${SKIP_PERMISSIONS ? "all (skip-permissions)" : ALLOWED_TOOLS.join(", ")}`);
   console.log(`Sessions: TTL=${SESSION_TTL / 1000}s`);
   if (SYSTEM_PROMPT) console.log(`System prompt: "${SYSTEM_PROMPT.slice(0, 80)}..."`);
