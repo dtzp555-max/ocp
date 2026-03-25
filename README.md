@@ -135,15 +135,24 @@ openclaw gateway restart
 
 ### Install the CLI
 
-The `ocp` command is included in the repo:
+The `ocp` command is included in the repo but **not automatically added to PATH**. You need to do one of:
 
 ```bash
-# Option 1: symlink to PATH
+# Option 1: symlink to PATH (recommended)
+sudo ln -sf ~/.openclaw/projects/ocp/ocp /usr/local/bin/ocp
+
+# Option 2: from the repo directory
+cd ~/.openclaw/projects/ocp   # or wherever you cloned it
 ln -sf $(pwd)/ocp /usr/local/bin/ocp
 
-# Option 2: npm link (if installed globally)
-npm link
+# Option 3: add to PATH in your shell profile
+echo 'export PATH="$HOME/.openclaw/projects/ocp:$PATH"' >> ~/.bashrc
+source ~/.bashrc
 ```
+
+Verify: `ocp --help`
+
+> **Common issue on cloud/Linux servers:** If you get `ocp: command not found`, the repo was cloned but the binary isn't in PATH. Use one of the options above. The full path is typically `~/.openclaw/projects/ocp/ocp`.
 
 ### Install the Gateway Plugin (for Telegram/Discord)
 
