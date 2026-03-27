@@ -195,23 +195,6 @@ async function cmdTest() {
   }
 }
 
-async function cmdBackends() {
-  try {
-    const d = await fetchJSON("/backends");
-    if (!d.backends?.length) return "No backends registered.";
-    let out = "Backends\n─────────────────────────────\n";
-    for (const b of d.backends) {
-      const icon = b.health?.ok ? "🟢" : "🔴";
-      out += `${icon} ${b.displayName} (${b.id}) [${b.tier}]\n`;
-      out += `  Models: ${b.models?.join(", ") || "none"}\n`;
-      out += `  Health: ${b.health?.message || "unknown"} (${b.health?.latencyMs || "?"}ms)\n\n`;
-    }
-    return out.trimEnd();
-  } catch {
-    return "Backends endpoint not available (requires v4+).";
-  }
-}
-
 async function cmdRestart(args) {
   const target = (args || "").trim().toLowerCase();
   const { execSync } = await import("node:child_process");
@@ -272,8 +255,7 @@ function cmdHelp() {
 /ocp restart gateway    Restart gateway
 /ocp restart all        Restart both
 /ocp version            Version & platform info
-/ocp test               End-to-end proxy test
-/ocp backends           Registered backends`;
+/ocp test               End-to-end proxy test`;
 }
 
 // ── Plugin entry point ──────────────────────────────────────────────────
@@ -304,7 +286,6 @@ export default function (api) {
           case "restart":  text = await cmdRestart(subargs); break;
           case "version":  text = await cmdVersion(); break;
           case "test":     text = await cmdTest(); break;
-          case "backends": text = await cmdBackends(); break;
           case "logs":     text = await cmdLogs(subargs); break;
           case "help": case "--help": case "-h": case "":
             text = cmdHelp(); break;
