@@ -176,8 +176,6 @@ Add to `~/.openclaw/openclaw.json`:
 
 Restart the gateway: `openclaw gateway restart`
 
-> ⚠️ **Known Issue:** `/ocp` may intermittently return "Unknown skill: ocp" due to an OpenClaw gateway bug with slash sessions ([#26895](https://github.com/openclaw/openclaw/issues/26895)). See [Known Issues](#known-issues) for the workaround.
-
 ### Upgrading from v2.x (skill-based /ocp)
 
 If you previously used the skill-based `/ocp` command (via `skills/ocp/SKILL.md`), remove it to avoid conflicts:
@@ -318,31 +316,6 @@ openclaw gateway restart
 - On-demand spawning (replaced pool architecture)
 - Session management with `--resume`
 - Full tool access, system prompt, MCP config support
-
-## Known Issues
-
-### `/ocp` command intermittently returns "Unknown skill: ocp"
-
-This is a known OpenClaw gateway bug ([#26895](https://github.com/openclaw/openclaw/issues/26895), [#54485](https://github.com/openclaw/openclaw/issues/54485)). The gateway creates a `telegram:slash` session on the first `/ocp` invocation, and subsequent calls get routed to this session (sent to the agent) instead of the plugin command handler.
-
-**Workaround:** Delete the slash session entries and restart the gateway:
-
-```bash
-# Remove slash sessions for all agents
-python3 -c "
-import json, glob
-for f in glob.glob('~/.openclaw/agents/*/sessions/sessions.json'):
-    d = json.load(open(f))
-    keys = [k for k in d if 'slash' in k]
-    for k in keys: del d[k]
-    if keys: json.dump(d, open(f, 'w'), indent=2); print(f'Cleaned {len(keys)} slash sessions from {f}')
-"
-
-# Restart gateway
-openclaw gateway restart
-```
-
-**Important:** Do not add `ocp` to agent `skills` lists in `openclaw.json` — this creates a routing conflict with the plugin and makes the problem worse. OCP should only be registered as a plugin, never as a skill.
 
 ## License
 
