@@ -317,6 +317,27 @@ openclaw gateway restart
 - Session management with `--resume`
 - Full tool access, system prompt, MCP config support
 
+## Known Issues
+
+### `/ocp` command returns "Unknown skill: ocp"
+
+The `/ocp` plugin command may intermittently stop working and return "Unknown skill: ocp". This is caused by an OpenClaw gateway bug where internal session routing interferes with plugin command dispatch ([openclaw/openclaw#26895](https://github.com/openclaw/openclaw/issues/26895)).
+
+**Workaround:** Send `/new` to reset the session, then `/ocp restart` to restart the proxy:
+
+```
+/new
+/ocp restart
+```
+
+This reliably restores the plugin. The issue may recur after some time — repeat the workaround as needed.
+
+**Important:**
+- Do **not** add `ocp` to agent `skills` lists in `openclaw.json` — this creates a routing conflict and makes the problem worse. OCP should only be registered as a **plugin**.
+- Do **not** place a `SKILL.md` file in the workspace skills directory for ocp — same conflict.
+
+We are tracking the upstream fix. This section will be updated when it is resolved.
+
 ## License
 
 MIT
