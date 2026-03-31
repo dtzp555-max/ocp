@@ -1,7 +1,7 @@
 {
   "name": "openclaw-claude-proxy",
   "version": "3.0.0",
-  "description": "OCP (OpenClaw Control Plane) — stable proxy for Claude CLI subscriptions. Plan usage monitoring, runtime settings, prompt truncation, OCP CLI.",
+  "description": "OCP (Open Claude Proxy) — use your Claude Pro/Max subscription as an OpenAI-compatible API for any IDE. Works with Cline, OpenCode, Aider, Continue.dev, OpenClaw, and more.",
   "type": "module",
   "bin": {
     "openclaw-claude-proxy": "./server.mjs",
