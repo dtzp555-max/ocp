@@ -1,6 +1,6 @@
 # OCP — Open Claude Proxy
 
-> **Status: Stable (v3.2.0)** — Feature-complete. Bug fixes only.
+> **Status: Stable (v3.2.1)** — Feature-complete. Bug fixes only.
 
 > **Already paying for Claude Pro/Max? Use your subscription as an OpenAI-compatible API — $0 extra cost.**
 
@@ -187,6 +187,50 @@ Add to `~/.openclaw/openclaw.json`:
 ```
 
 Restart: `openclaw gateway restart`
+
+## Troubleshooting
+
+### Requests fail with exit 143 / SIGTERM after ~60 seconds
+
+**Symptom:** Claude returns errors or stops responding after about 60 seconds, especially during tool use (Bash, Read, etc.).
+
+**Cause:** OpenClaw's gateway has a default `idleTimeoutSeconds` of 60 seconds. When Claude calls tools, the token stream pauses while the tool executes — if that takes longer than 60s, the gateway kills the connection.
+
+**Fix:** `setup.mjs` (v3.2.1+) sets this automatically. If you installed an older version, add this to `~/.openclaw/openclaw.json`:
+
+```json
+{
+  "agents": {
+    "defaults": {
+      "llm": {
+        "idleTimeoutSeconds": 0
+      }
+    }
+  }
+}
+```
+
+Then restart: `openclaw gateway restart`
+
+### Agents stuck in "typing" but never respond
+
+Usually caused by stuck sessions from previous timeout errors. Fix:
+
+```bash
+# Clear all sessions
+ocp clear
+
+# Restart both services
+ocp restart
+openclaw gateway restart
+```
+
+If that doesn't help, manually clear the session store:
+```bash
+# Find and reset stuck Telegram sessions
+cat ~/.openclaw/agents/main/sessions/sessions.json
+# Remove entries with "telegram" channel, then restart gateway
+```
 
 ## Upgrading from v3.0.x
 

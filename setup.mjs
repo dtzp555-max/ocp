@@ -169,6 +169,19 @@ for (const [key, val] of Object.entries(MODEL_ALIASES)) {
 }
 log(`Model aliases added to agents.defaults.models`);
 
+// Set idleTimeoutSeconds to 0 — critical for Claude tool-use.
+// When Claude calls tools (Bash, Read, etc.), the token stream pauses for 30-120s.
+// OpenClaw's default idleTimeoutSeconds (60s) kills the connection mid-tool-call,
+// causing exit 143 (SIGTERM) and stuck sessions. Setting to 0 disables the idle timer.
+if (!config.agents.defaults.llm) config.agents.defaults.llm = {};
+if (config.agents.defaults.llm.idleTimeoutSeconds === undefined ||
+    config.agents.defaults.llm.idleTimeoutSeconds > 0) {
+  config.agents.defaults.llm.idleTimeoutSeconds = 0;
+  log(`Set agents.defaults.llm.idleTimeoutSeconds = 0 (prevents tool-call timeouts)`);
+} else {
+  log(`idleTimeoutSeconds already configured: ${config.agents.defaults.llm.idleTimeoutSeconds}`);
+}
+
 writeJSON(CONFIG_PATH, config);
 log(`Config saved`);
 
