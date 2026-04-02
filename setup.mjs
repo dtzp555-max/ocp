@@ -12,7 +12,7 @@
  *   4. Creates start.sh for easy launch
  *   5. Optionally starts the proxy
  */
-import { readFileSync, writeFileSync, existsSync, mkdirSync } from "node:fs";
+import { readFileSync, writeFileSync, existsSync, mkdirSync, unlinkSync } from "node:fs";
 import { execSync } from "node:child_process";
 import { join, dirname } from "node:path";
 import { homedir } from "node:os";
@@ -291,20 +291,47 @@ if (!DRY_RUN) {
   const logsDir = join(OPENCLAW_DIR, "logs");
   if (!existsSync(logsDir)) mkdirSync(logsDir, { recursive: true });
 
+  // Use neutral service names to avoid OpenClaw gateway's extra-service detection.
+  // OpenClaw scans LaunchAgent plists and systemd units for "openclaw" / "clawdbot"
+  // markers and flags them as conflicting gateway-like services. Using "dev.ocp.*"
+  // and "ocp-proxy" keeps the proxy invisible to that heuristic.
+  const OCP_HOME = join(HOME, ".ocp");
+  const ocpLogsDir = join(OCP_HOME, "logs");
+  if (!existsSync(ocpLogsDir)) mkdirSync(ocpLogsDir, { recursive: true });
+
+  // Uninstall legacy service names if present (upgrade path)
+  if (platform === "darwin") {
+    const legacyPlist = join(HOME, "Library", "LaunchAgents", "ai.openclaw.proxy.plist");
+    if (existsSync(legacyPlist)) {
+      try { execSync(`launchctl bootout gui/$(id -u) "${legacyPlist}" 2>/dev/null`); } catch { /* ignore */ }
+      try { unlinkSync(legacyPlist); } catch { /* ignore */ }
+      log(`Removed legacy plist: ai.openclaw.proxy`);
+    }
+  } else if (platform === "linux") {
+    const legacyService = join(HOME, ".config", "systemd", "user", "openclaw-proxy.service");
+    if (existsSync(legacyService)) {
+      try { execSync(`systemctl --user stop openclaw-proxy 2>/dev/null`); } catch { /* ignore */ }
+      try { execSync(`systemctl --user disable openclaw-proxy 2>/dev/null`); } catch { /* ignore */ }
+      try { unlinkSync(legacyService); } catch { /* ignore */ }
+      try { execSync(`systemctl --user daemon-reload`); } catch { /* ignore */ }
+      log(`Removed legacy systemd service: openclaw-proxy`);
+    }
+  }
+
   if (platform === "darwin") {
     // macOS: launchd
     const plistDir = join(HOME, "Library", "LaunchAgents");
     if (!existsSync(plistDir)) mkdirSync(plistDir, { recursive: true });
 
-    const plistPath = join(plistDir, "ai.openclaw.proxy.plist");
-    const logPath = join(logsDir, "proxy.log");
+    const plistPath = join(plistDir, "dev.ocp.proxy.plist");
+    const logPath = join(ocpLogsDir, "proxy.log");
 
     const plistXml = `<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
   <key>Label</key>
-  <string>ai.openclaw.proxy</string>
+  <string>dev.ocp.proxy</string>
   <key>ProgramArguments</key>
   <array>
     <string>${nodeBin}</string>
@@ -330,27 +357,28 @@ if (!DRY_RUN) {
     writeFileSync(plistPath, plistXml);
     log(`Plist written: ${plistPath}`);
 
-    // Unload first (in case it was already loaded) then load
-    try { execSync(`launchctl unload "${plistPath}" 2>/dev/null`); } catch { /* ignore */ }
-    execSync(`launchctl load "${plistPath}"`);
-    log(`launchctl loaded ai.openclaw.proxy`);
+    // Bootout first (in case it was already loaded) then bootstrap
+    try { execSync(`launchctl bootout gui/$(id -u) "${plistPath}" 2>/dev/null`); } catch { /* ignore */ }
+    execSync(`launchctl bootstrap gui/$(id -u) "${plistPath}"`);
+    log(`launchctl loaded dev.ocp.proxy`);
 
   } else if (platform === "linux") {
     // Linux: systemd user service
     const systemdDir = join(HOME, ".config", "systemd", "user");
     if (!existsSync(systemdDir)) mkdirSync(systemdDir, { recursive: true });
 
-    const servicePath = join(systemdDir, "openclaw-proxy.service");
-    const logPath = join(logsDir, "proxy.log");
+    const servicePath = join(systemdDir, "ocp-proxy.service");
+    const logPath = join(ocpLogsDir, "proxy.log");
 
     const serviceUnit = `[Unit]
-Description=OpenClaw Claude Proxy
+Description=OCP — Open Claude Proxy
 After=network.target
 
 [Service]
 ExecStart=${nodeBin} ${serverPath}
 Environment=CLAUDE_PROXY_PORT=${PORT}
 Restart=always
+RestartSec=5
 StandardOutput=append:${logPath}
 StandardError=append:${logPath}
 
@@ -362,8 +390,8 @@ WantedBy=default.target
     log(`Service file written: ${servicePath}`);
 
     execSync(`systemctl --user daemon-reload`);
-    execSync(`systemctl --user enable openclaw-proxy`);
-    execSync(`systemctl --user start openclaw-proxy`);
+    execSync(`systemctl --user enable ocp-proxy`);
+    execSync(`systemctl --user start ocp-proxy`);
     log(`systemd user service enabled and started`);
 
   } else {

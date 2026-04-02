@@ -1,6 +1,6 @@
 {
   "name": "ocp",
-  "version": "1.0.0",
+  "version": "3.1.0",
   "description": "Slash commands for the OpenClaw Proxy",
   "main": "index.js",
   "type": "module",
