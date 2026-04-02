@@ -246,8 +246,10 @@ cmd_restart() {
       echo "Service restart failed, trying kill + restart..."
       pkill -f "server.mjs.*CLAUDE_PROXY" 2>/dev/null || pkill -f "claude-proxy/server.mjs" 2>/dev/null || true
       sleep 1
-      local script_dir
-      script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+      local self_r script_dir
+      self_r="${BASH_SOURCE[0]}"
+      while [[ -L "$self_r" ]]; do self_r="$(readlink "$self_r")"; done
+      script_dir="$(cd "$(dirname "$self_r")" && pwd)"
       nohup node "$script_dir/server.mjs" >> "$HOME/.ocp/logs/proxy.log" 2>&1 &
     fi
     sleep 3
@@ -351,8 +353,11 @@ EOF
 }
 
 cmd_update() {
-  local script_dir
-  script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+  local script_dir self
+  self="${BASH_SOURCE[0]}"
+  # Resolve symlinks (e.g. ~/.local/bin/ocp → real location)
+  while [[ -L "$self" ]]; do self="$(readlink "$self")"; done
+  script_dir="$(cd "$(dirname "$self")" && pwd)"
 
   # Check-only mode
   if [[ "${1:-}" == "--check" ]]; then
