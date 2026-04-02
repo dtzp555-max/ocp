@@ -1,6 +1,6 @@
 # OCP — Open Claude Proxy
 
-> **Status: Stable (v3.0.0)** — Feature-complete. Bug fixes only.
+> **Status: Stable (v3.2.0)** — Feature-complete. Bug fixes only.
 
 > **Already paying for Claude Pro/Max? Use your subscription as an OpenAI-compatible API — $0 extra cost.**
 
@@ -95,7 +95,8 @@ ocp sessions           Active sessions
 ocp clear              Clear all sessions
 ocp restart            Restart proxy
 ocp restart gateway    Restart gateway
-ocp version            Show version
+ocp update             Update to latest version
+ocp update --check     Check for updates without applying
 ocp --help             Command reference
 ```
 
@@ -110,6 +111,16 @@ ocp --help
 ```
 
 > **Cloud/Linux servers:** If `ocp: command not found`, the binary isn't in PATH. Full path: `~/.openclaw/projects/ocp/ocp`
+
+### Self-Update
+
+```bash
+# Check if a new version is available
+ocp update --check
+
+# Pull latest, sync plugin, restart proxy — one command
+ocp update
+```
 
 ### Runtime Settings (No Restart Needed)
 
@@ -157,6 +168,7 @@ OCP was originally built for [OpenClaw](https://github.com/openclaw/openclaw) an
 - **`setup.mjs`** auto-configures the `claude-local` provider in `openclaw.json`
 - **Gateway plugin** registers `/ocp` as a native slash command in Telegram/Discord
 - **Multi-agent** — 8 concurrent requests sharing one subscription
+- **No conflicts** — uses neutral service names (`dev.ocp.proxy` / `ocp-proxy`) that don't trigger OpenClaw's gateway-like service detection
 
 ### Install the Gateway Plugin
 
@@ -175,6 +187,10 @@ Add to `~/.openclaw/openclaw.json`:
 ```
 
 Restart: `openclaw gateway restart`
+
+## Upgrading from v3.0.x
+
+If you installed OCP before v3.1.0, the auto-start service used names that OpenClaw's gateway detected as conflicting (`ai.openclaw.proxy` on macOS, `openclaw-proxy` on Linux). Running `node setup.mjs` or `ocp update` will automatically migrate to the new neutral names.
 
 ## Environment Variables
 
@@ -197,20 +213,6 @@ Restart: `openclaw gateway restart`
 - **Bearer token auth (optional)** — set `PROXY_API_KEY` to require auth
 - **No API keys needed** — authentication goes through Claude CLI's OAuth session
 - **Auto-start** — launchd (macOS) / systemd (Linux)
-
-## Known Issues
-
-### `/ocp` command returns "Unknown skill: ocp" (OpenClaw only)
-
-The `/ocp` plugin command may intermittently stop working in Telegram/Discord. This is caused by an OpenClaw gateway bug ([openclaw/openclaw#26895](https://github.com/openclaw/openclaw/issues/26895)).
-
-**Workaround:**
-```
-/new
-/ocp restart
-```
-
-**Important:** Do not add `ocp` to agent `skills` lists or place a `SKILL.md` in workspace skills — this creates a routing conflict.
 
 ## License
 
