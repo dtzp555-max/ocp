@@ -231,12 +231,25 @@ cmd_restart() {
     openclaw gateway restart 2>&1
   else
     echo "Restarting proxy..."
-    launchctl kickstart -k gui/501/ai.openclaw.proxy 2>/dev/null || {
-      echo "launchctl failed, trying kill + restart..."
-      pkill -f "claude-proxy/server.mjs" 2>/dev/null || true
+    # Try current service name, then legacy, then manual restart
+    local uid
+    uid=$(id -u)
+    if launchctl kickstart -k "gui/$uid/dev.ocp.proxy" 2>/dev/null; then
+      true
+    elif launchctl kickstart -k "gui/$uid/ai.openclaw.proxy" 2>/dev/null; then
+      true
+    elif systemctl --user restart ocp-proxy 2>/dev/null; then
+      true
+    elif systemctl --user restart openclaw-proxy 2>/dev/null; then
+      true
+    else
+      echo "Service restart failed, trying kill + restart..."
+      pkill -f "server.mjs.*CLAUDE_PROXY" 2>/dev/null || pkill -f "claude-proxy/server.mjs" 2>/dev/null || true
       sleep 1
-      cd "$HOME/.openclaw/projects/claude-proxy" && nohup node server.mjs >> "$HOME/.openclaw/logs/proxy.log" 2>&1 &
-    }
+      local script_dir
+      script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+      nohup node "$script_dir/server.mjs" >> "$HOME/.ocp/logs/proxy.log" 2>&1 &
+    fi
     sleep 3
     if curl -sf --max-time 5 "$PROXY/health" > /dev/null 2>&1; then
       echo "✓ Proxy restarted successfully."
@@ -323,6 +336,99 @@ for e in d.get('errors', []):
   fi
 }
 
+# ── update ──────────────────────────────────────────────────────────────
+cmd_update_help() {
+  cat <<'EOF'
+ocp update — Update OCP to the latest version
+
+Pulls the latest code from GitHub, restarts the proxy service,
+and optionally syncs the plugin to the OpenClaw extensions directory.
+
+Usage:
+  ocp update             Pull latest and restart
+  ocp update --check     Check for updates without applying
+EOF
+}
+
+cmd_update() {
+  local script_dir
+  script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+  # Check-only mode
+  if [[ "${1:-}" == "--check" ]]; then
+    cd "$script_dir"
+    git fetch origin main --quiet 2>/dev/null
+    local local_ver remote_ver
+    local_ver=$(python3 -c "import json; print(json.load(open('package.json'))['version'])" 2>/dev/null || echo "?")
+    remote_ver=$(git show origin/main:package.json 2>/dev/null | python3 -c "import sys,json; print(json.load(sys.stdin)['version'])" 2>/dev/null || echo "?")
+    local behind
+    behind=$(git rev-list HEAD..origin/main --count 2>/dev/null || echo "?")
+    echo "OCP Update Check"
+    echo "─────────────────────────────────────"
+    echo "  Current:  v$local_ver"
+    echo "  Latest:   v$remote_ver"
+    if [[ "$behind" == "0" ]]; then
+      echo "  Status:   ✓ Up to date"
+    else
+      echo "  Status:   $behind commit(s) behind"
+      echo ""
+      echo "  Run 'ocp update' to apply."
+    fi
+    return 0
+  fi
+
+  echo "Updating OCP..."
+  echo ""
+
+  # 1. Pull latest
+  cd "$script_dir"
+  local old_ver
+  old_ver=$(python3 -c "import json; print(json.load(open('package.json'))['version'])" 2>/dev/null || echo "?")
+
+  echo "  Pulling latest from GitHub..."
+  if ! git pull origin main --ff-only 2>&1 | sed 's/^/    /'; then
+    echo "  ✗ Git pull failed. Resolve conflicts manually in: $script_dir"
+    return 1
+  fi
+
+  local new_ver
+  new_ver=$(python3 -c "import json; print(json.load(open('package.json'))['version'])" 2>/dev/null || echo "?")
+
+  if [[ "$old_ver" == "$new_ver" ]]; then
+    echo "  ✓ Already at latest (v$new_ver)"
+  else
+    echo "  ✓ Updated v$old_ver → v$new_ver"
+  fi
+
+  # 2. Sync plugin to extensions dir
+  local ext_dir="$HOME/.openclaw/extensions/ocp"
+  if [[ -d "$ext_dir" && -d "$script_dir/ocp-plugin" ]]; then
+    echo ""
+    echo "  Syncing OCP plugin..."
+    cp "$script_dir/ocp-plugin/index.js" "$ext_dir/index.js" 2>/dev/null
+    cp "$script_dir/ocp-plugin/package.json" "$ext_dir/package.json" 2>/dev/null
+    cp "$script_dir/ocp-plugin/openclaw.plugin.json" "$ext_dir/openclaw.plugin.json" 2>/dev/null
+    echo "  ✓ Plugin synced to $ext_dir"
+  fi
+
+  # 3. Restart proxy
+  echo ""
+  echo "  Restarting proxy..."
+  cmd_restart > /dev/null 2>&1
+  sleep 2
+
+  if curl -sf --max-time 5 "$PROXY/health" > /dev/null 2>&1; then
+    local running_ver
+    running_ver=$(curl -sf --max-time 5 "$PROXY/health" | python3 -c "import sys,json; print(json.loads(sys.stdin.read())['version'])" 2>/dev/null || echo "?")
+    echo "  ✓ Proxy running (v$running_ver)"
+  else
+    echo "  ⚠ Proxy not responding — check: ocp health"
+  fi
+
+  echo ""
+  echo "Done."
+}
+
 # ── help ─────────────────────────────────────────────────────────────────
 cmd_help() {
   cat <<'EOF'
@@ -341,6 +447,8 @@ Commands:
   clear              Clear all sessions
   restart            Restart proxy
   restart gateway    Restart gateway
+  update             Update OCP to latest version
+  update --check     Check for updates
 
 Run 'ocp <command> --help' for details on a specific command.
 EOF
@@ -380,5 +488,6 @@ case "$subcmd" in
   sessions) cmd_sessions ;;
   clear)    cmd_clear ;;
   restart)  cmd_restart "${1:-}" ;;
+  update)   cmd_update "${1:-}" ;;
   *)        echo "Unknown command: $subcmd"; echo ""; cmd_help; exit 1 ;;
 esac

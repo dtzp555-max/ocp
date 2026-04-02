@@ -2,7 +2,7 @@
   "id": "ocp",
   "name": "OCP Commands",
   "description": "Slash commands for the OpenClaw Proxy — /ocp usage, /ocp settings, /ocp health, etc.",
-  "version": "3.1.0",
+  "version": "3.2.0",
   "configSchema": {
     "type": "object",
     "additionalProperties": false,
