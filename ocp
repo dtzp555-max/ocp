@@ -357,7 +357,7 @@ cmd_update() {
   # Check-only mode
   if [[ "${1:-}" == "--check" ]]; then
     cd "$script_dir"
-    git fetch origin main --quiet 2>/dev/null
+    git fetch origin main --quiet 2>/dev/null || true
     local local_ver remote_ver
     local_ver=$(python3 -c "import json; print(json.load(open('package.json'))['version'])" 2>/dev/null || echo "?")
     remote_ver=$(git show origin/main:package.json 2>/dev/null | python3 -c "import sys,json; print(json.load(sys.stdin)['version'])" 2>/dev/null || echo "?")
