@@ -1,6 +1,6 @@
 # OCP — Open Claude Proxy
 
-> **Status: Stable (v3.2.1)** — Feature-complete. Bug fixes only.
+> **Status: Stable (v3.3.0)** — Feature-complete. Bug fixes only.
 
 > **Already paying for Claude Pro/Max? Use your subscription as an OpenAI-compatible API — $0 extra cost.**
 
@@ -242,8 +242,7 @@ If you installed OCP before v3.1.0, the auto-start service used names that OpenC
 |----------|---------|-------------|
 | `CLAUDE_PROXY_PORT` | `3456` | Listen port |
 | `CLAUDE_BIN` | *(auto-detect)* | Path to claude binary |
-| `CLAUDE_TIMEOUT` | `300000` | Overall request timeout (ms) |
-| `CLAUDE_FIRST_BYTE_TIMEOUT` | `90000` | Base first-byte timeout (ms) |
+| `CLAUDE_TIMEOUT` | `600000` | Request timeout (ms, default: 10 min) |
 | `CLAUDE_MAX_CONCURRENT` | `8` | Max concurrent claude processes |
 | `CLAUDE_MAX_PROMPT_CHARS` | `150000` | Prompt truncation limit (chars) |
 | `CLAUDE_SESSION_TTL` | `3600000` | Session expiry (ms, default: 1 hour) |

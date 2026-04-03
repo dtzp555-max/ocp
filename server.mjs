@@ -1,30 +1,19 @@
 #!/usr/bin/env node
 /**
- * openclaw-claude-proxy v2.5.0 — OpenAI-compatible proxy for Claude CLI
+ * openclaw-claude-proxy — OpenAI-compatible proxy for Claude CLI
  *
  * Translates OpenAI chat/completions requests into `claude -p` CLI calls,
  * letting you use your Claude Pro/Max subscription as an OpenClaw model provider.
  *
- * v2.5.0:
- *   - Sliding-window circuit breaker: uses time-windowed failure rate instead of
- *     consecutive-count, preventing multi-agent burst scenarios from tripping the
- *     breaker too aggressively. Half-open state allows configurable probe requests.
- *   - Graduated backoff: cooldown doubles on each re-open (capped at 5min),
- *     resets fully on success.
- *   - Health endpoint now exposes per-model breaker state and sliding window stats.
- *   - Increased default timeout tiers for Opus/Sonnet to handle large agent prompts.
- *
- * v2.4.0:
- *   - Per-model circuit breaker: consecutive timeouts temporarily mark a model as degraded
- *   - Adaptive first-byte timeout: scales by model tier + prompt size
- *   - Structured JSON logging for key events (easier to parse/alert on)
- *   - On-demand spawning (no pool), session management, full tool access
+ * Timeout design: single CLAUDE_TIMEOUT (default 600s / 10 min).
+ * No separate first-byte or idle timeout — Claude tool-use causes long pauses
+ * in the token stream (30s-5min) that make fine-grained timeouts unreliable.
+ * This matches LiteLLM, OpenAI SDK, and other major LLM proxies.
  *
  * Env vars:
  *   CLAUDE_PROXY_PORT            — listen port (default: 3456)
  *   CLAUDE_BIN                   — path to claude binary (default: auto-detect)
- *   CLAUDE_TIMEOUT               — per-request timeout in ms (default: 300000)
- *   CLAUDE_FIRST_BYTE_TIMEOUT    — base first-byte timeout in ms (default: 90000)
+ *   CLAUDE_TIMEOUT               — per-request timeout in ms (default: 600000)
  *   CLAUDE_ALLOWED_TOOLS         — comma-separated tools to allow (default: expanded set)
  *   CLAUDE_SKIP_PERMISSIONS      — "true" to bypass all permission checks (default: false)
  *   CLAUDE_SYSTEM_PROMPT         — system prompt appended to all requests
@@ -89,8 +78,7 @@ function resolveClaude() {
 // Settings marked with `let` can be changed at runtime via PATCH /settings.
 const PORT = parseInt(process.env.CLAUDE_PROXY_PORT || "3456", 10);
 const CLAUDE = resolveClaude();
-let TIMEOUT = parseInt(process.env.CLAUDE_TIMEOUT || "300000", 10);
-let BASE_FIRST_BYTE_TIMEOUT = parseInt(process.env.CLAUDE_FIRST_BYTE_TIMEOUT || "90000", 10);
+let TIMEOUT = parseInt(process.env.CLAUDE_TIMEOUT || "600000", 10);
 const PROXY_API_KEY = process.env.PROXY_API_KEY || "";
 const SKIP_PERMISSIONS = process.env.CLAUDE_SKIP_PERMISSIONS === "true";
 const ALLOWED_TOOLS = (process.env.CLAUDE_ALLOWED_TOOLS ||
@@ -358,26 +346,11 @@ function messagesToPrompt(messages) {
   return result;
 }
 
-// Model tier multipliers for first-byte timeout.
-// Opus is much slower to produce first token, especially with large contexts.
-let MODEL_TIMEOUT_TIERS = {
-  "opus": { base: 150000, perPromptChar: 0.00050 },   // 150s base + ~50s per 100k chars
-  "sonnet": { base: 120000, perPromptChar: 0.00050 }, // 120s base + ~50s per 100k chars
-  "haiku": { base: 45000, perPromptChar: 0.00010 },   // 45s base + ~10s per 100k chars
-};
-
+// Model tier — used for logging only (no timeout logic).
 function getModelTier(cliModel) {
   if (cliModel.includes("opus")) return "opus";
   if (cliModel.includes("haiku")) return "haiku";
   return "sonnet";
-}
-
-function computeFirstByteTimeout(cliModel, promptLength) {
-  const tier = MODEL_TIMEOUT_TIERS[getModelTier(cliModel)];
-  const adaptive = tier.base + Math.floor(promptLength * tier.perPromptChar);
-  // Use whichever is larger: adaptive calculation or BASE_FIRST_BYTE_TIMEOUT (env override)
-  const timeout = Math.max(adaptive, BASE_FIRST_BYTE_TIMEOUT);
-  return Math.min(timeout, Math.max(TIMEOUT - 5000, 10000));
 }
 
 // ── Spawn claude CLI (shared setup) ─────────────────────────────────────
@@ -439,7 +412,6 @@ function spawnClaudeProcess(model, messages, conversationId) {
   activeProcesses.add(proc);
 
   const t0 = Date.now();
-  const firstByteTimeoutMs = computeFirstByteTimeout(cliModel, prompt.length);
   let gotFirstByte = false;
   let cleaned = false;
 
@@ -447,7 +419,6 @@ function spawnClaudeProcess(model, messages, conversationId) {
     if (cleaned) return;
     cleaned = true;
     clearTimeout(overallTimer);
-    clearTimeout(firstByteTimer);
     stats.activeRequests--;
   }
 
@@ -461,7 +432,6 @@ function spawnClaudeProcess(model, messages, conversationId) {
   function markFirstByte() {
     if (!gotFirstByte) {
       gotFirstByte = true;
-      clearTimeout(firstByteTimer);
       console.log(`[claude] first-byte model=${cliModel} elapsed=${Date.now() - t0}ms`);
     }
   }
@@ -471,27 +441,17 @@ function spawnClaudeProcess(model, messages, conversationId) {
   proc.stdin.end();
 
   recordModelRequest(cliModel, prompt.length);
-  logEvent("info", "claude_spawned", { model: cliModel, promptChars: prompt.length, firstByteTimeout: firstByteTimeoutMs, tier: getModelTier(cliModel), session: conversationId ? conversationId.slice(0, 12) + "..." : "none" });
+  logEvent("info", "claude_spawned", { model: cliModel, promptChars: prompt.length, timeout: TIMEOUT, tier: getModelTier(cliModel), session: conversationId ? conversationId.slice(0, 12) + "..." : "none" });
 
-  // First-byte timeout
-  const firstByteTimer = setTimeout(() => {
-    if (!gotFirstByte && !cleaned) {
-      stats.timeouts++;
-      recordModelError(cliModel, true);
-      breakerRecordTimeout(cliModel);
-      logEvent("error", "first_byte_timeout", { model: cliModel, timeoutMs: firstByteTimeoutMs, promptChars: prompt.length });
-      try { proc.kill("SIGTERM"); } catch {}
-      setTimeout(() => { try { proc.kill("SIGKILL"); } catch {} }, 5000);
-    }
-  }, firstByteTimeoutMs);
-
-  // Overall request timeout
+  // Single request timeout — no separate first-byte timer.
+  // Claude tool-use causes long pauses in the token stream (30s-5min),
+  // making first-byte/idle timeouts unreliable. One generous timeout is simpler and correct.
   const overallTimer = setTimeout(() => {
     if (!cleaned) {
       stats.timeouts++;
       recordModelError(cliModel, true);
       breakerRecordTimeout(cliModel);
-      logEvent("error", "request_timeout", { model: cliModel, timeoutMs: TIMEOUT });
+      logEvent("error", "request_timeout", { model: cliModel, timeoutMs: TIMEOUT, elapsed: Date.now() - t0 });
       try { proc.kill("SIGTERM"); } catch {}
       setTimeout(() => { try { proc.kill("SIGKILL"); } catch {} }, 5000);
     }
@@ -931,31 +891,18 @@ async function handleStatus(_req, res) {
 //
 // Tunable keys and their types/ranges:
 const SETTINGS_SCHEMA = {
-  timeout:          { type: "number", min: 30000, max: 600000, unit: "ms", desc: "Overall request timeout" },
-  firstByteTimeout: { type: "number", min: 15000, max: 300000, unit: "ms", desc: "Base first-byte timeout" },
+  timeout:          { type: "number", min: 30000, max: 1800000, unit: "ms", desc: "Request timeout (default: 600s)" },
   maxConcurrent:    { type: "number", min: 1, max: 32, unit: "", desc: "Max concurrent claude processes" },
   sessionTTL:       { type: "number", min: 60000, max: 86400000, unit: "ms", desc: "Session idle expiry" },
   maxPromptChars:   { type: "number", min: 10000, max: 1000000, unit: "chars", desc: "Prompt truncation limit" },
-  "tiers.opus.base":        { type: "number", min: 30000, max: 600000, unit: "ms", desc: "Opus base first-byte timeout" },
-  "tiers.opus.perChar":     { type: "number", min: 0, max: 0.01, unit: "ms/char", desc: "Opus per-char timeout addition" },
-  "tiers.sonnet.base":      { type: "number", min: 30000, max: 600000, unit: "ms", desc: "Sonnet base first-byte timeout" },
-  "tiers.sonnet.perChar":   { type: "number", min: 0, max: 0.01, unit: "ms/char", desc: "Sonnet per-char timeout addition" },
-  "tiers.haiku.base":       { type: "number", min: 15000, max: 300000, unit: "ms", desc: "Haiku base first-byte timeout" },
-  "tiers.haiku.perChar":    { type: "number", min: 0, max: 0.01, unit: "ms/char", desc: "Haiku per-char timeout addition" },
 };
 
 function getSettings() {
   return {
     timeout:          { value: TIMEOUT, ...SETTINGS_SCHEMA.timeout },
-    firstByteTimeout: { value: BASE_FIRST_BYTE_TIMEOUT, ...SETTINGS_SCHEMA.firstByteTimeout },
     maxConcurrent:    { value: MAX_CONCURRENT, ...SETTINGS_SCHEMA.maxConcurrent },
     sessionTTL:       { value: SESSION_TTL, ...SETTINGS_SCHEMA.sessionTTL },
     maxPromptChars:   { value: MAX_PROMPT_CHARS, ...SETTINGS_SCHEMA.maxPromptChars },
-    tiers: {
-      opus:   { base: MODEL_TIMEOUT_TIERS.opus.base, perPromptChar: MODEL_TIMEOUT_TIERS.opus.perPromptChar },
-      sonnet: { base: MODEL_TIMEOUT_TIERS.sonnet.base, perPromptChar: MODEL_TIMEOUT_TIERS.sonnet.perPromptChar },
-      haiku:  { base: MODEL_TIMEOUT_TIERS.haiku.base, perPromptChar: MODEL_TIMEOUT_TIERS.haiku.perPromptChar },
-    },
   };
 }
 
@@ -967,16 +914,9 @@ function applySettingUpdate(key, value) {
 
   switch (key) {
     case "timeout":          TIMEOUT = value; break;
-    case "firstByteTimeout": BASE_FIRST_BYTE_TIMEOUT = value; break;
     case "maxConcurrent":    MAX_CONCURRENT = value; break;
     case "sessionTTL":       SESSION_TTL = value; break;
     case "maxPromptChars":   MAX_PROMPT_CHARS = value; break;
-    case "tiers.opus.base":        MODEL_TIMEOUT_TIERS.opus.base = value; break;
-    case "tiers.opus.perChar":     MODEL_TIMEOUT_TIERS.opus.perPromptChar = value; break;
-    case "tiers.sonnet.base":      MODEL_TIMEOUT_TIERS.sonnet.base = value; break;
-    case "tiers.sonnet.perChar":   MODEL_TIMEOUT_TIERS.sonnet.perPromptChar = value; break;
-    case "tiers.haiku.base":       MODEL_TIMEOUT_TIERS.haiku.base = value; break;
-    case "tiers.haiku.perChar":    MODEL_TIMEOUT_TIERS.haiku.perPromptChar = value; break;
     default: return `${key}: not implemented`;
   }
   logEvent("info", "setting_changed", { key, value });
@@ -1138,7 +1078,6 @@ const server = createServer(async (req, res) => {
       auth: authStatus,
       config: {
         timeout: TIMEOUT,
-        firstByteTimeout: BASE_FIRST_BYTE_TIMEOUT,
         maxConcurrent: MAX_CONCURRENT,
         sessionTTL: SESSION_TTL,
         circuitBreaker: "disabled",
@@ -1252,7 +1191,7 @@ server.listen(PORT, "127.0.0.1", () => {
   console.log(`Architecture: on-demand spawning (no pool)`);
   console.log(`Models: ${MODELS.map((m) => m.id).join(", ")}`);
   console.log(`Claude binary: ${CLAUDE}`);
-  console.log(`Timeout: ${TIMEOUT}ms (base first-byte: ${BASE_FIRST_BYTE_TIMEOUT}ms, adaptive by model/prompt) | Max concurrent: ${MAX_CONCURRENT}`);
+  console.log(`Timeout: ${TIMEOUT / 1000}s | Max concurrent: ${MAX_CONCURRENT}`);
   console.log(`Circuit breaker: disabled`);
   console.log(`Tools: ${SKIP_PERMISSIONS ? "all (skip-permissions)" : ALLOWED_TOOLS.join(", ")}`);
   console.log(`Sessions: TTL=${SESSION_TTL / 1000}s`);
