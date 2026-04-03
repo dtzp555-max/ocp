@@ -374,7 +374,9 @@ function getModelTier(cliModel) {
 
 function computeFirstByteTimeout(cliModel, promptLength) {
   const tier = MODEL_TIMEOUT_TIERS[getModelTier(cliModel)];
-  const timeout = tier.base + Math.floor(promptLength * tier.perPromptChar);
+  const adaptive = tier.base + Math.floor(promptLength * tier.perPromptChar);
+  // Use whichever is larger: adaptive calculation or BASE_FIRST_BYTE_TIMEOUT (env override)
+  const timeout = Math.max(adaptive, BASE_FIRST_BYTE_TIMEOUT);
   return Math.min(timeout, Math.max(TIMEOUT - 5000, 10000));
 }
 
