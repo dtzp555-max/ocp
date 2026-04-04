@@ -1,6 +1,6 @@
 # OCP — Open Claude Proxy
 
-> **Status: Stable (v3.3.0)** — Feature-complete. Bug fixes only.
+> **Status: Stable (v3.3.1)** — Feature-complete. Bug fixes only.
 
 > **Already paying for Claude Pro/Max? Use your subscription as an OpenAI-compatible API — $0 extra cost.**
 
