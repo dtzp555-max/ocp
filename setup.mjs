@@ -298,7 +298,16 @@ if (!DRY_RUN) {
   console.log("\n🔄 Installing auto-start on login...\n");
 
   const platform = process.platform;
-  const nodeBin = process.execPath;
+  // Use stable symlink path instead of versioned Cellar path (e.g. /opt/homebrew/opt/node/bin/node
+  // instead of /opt/homebrew/Cellar/node/25.8.0/bin/node) so the plist survives node upgrades.
+  let nodeBin = process.execPath;
+  if (platform === "darwin" && nodeBin.includes("/Cellar/")) {
+    const stable = nodeBin.replace(/\/Cellar\/[^/]+\/[^/]+\//, "/opt/");
+    if (existsSync(stable)) {
+      nodeBin = stable;
+      log(`Using stable node path: ${nodeBin}`);
+    }
+  }
 
   // Ensure logs dir exists
   const logsDir = join(OPENCLAW_DIR, "logs");
