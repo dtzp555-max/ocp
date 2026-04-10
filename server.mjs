@@ -33,6 +33,7 @@ import { readFileSync, accessSync, constants } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 import { homedir } from "node:os";
+import { validateKey, recordUsage, getUsageByKey, getUsageTimeline, getRecentUsage, createKey, listKeys, revokeKey, closeDb } from "./keys.mjs";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const _pkg = JSON.parse(readFileSync(join(__dirname, "package.json"), "utf8"));
@@ -92,6 +93,9 @@ const BREAKER_THRESHOLD = parseInt(process.env.CLAUDE_BREAKER_THRESHOLD || "6", 
 const BREAKER_COOLDOWN = parseInt(process.env.CLAUDE_BREAKER_COOLDOWN || "120000", 10);
 const BREAKER_WINDOW = parseInt(process.env.CLAUDE_BREAKER_WINDOW || "300000", 10);
 const BREAKER_HALF_OPEN_MAX = parseInt(process.env.CLAUDE_BREAKER_HALF_OPEN_MAX || "2", 10);
+const BIND_ADDRESS = process.env.CLAUDE_BIND || "127.0.0.1";
+const AUTH_MODE = process.env.CLAUDE_AUTH_MODE || (PROXY_API_KEY ? "shared" : "none");
+const ADMIN_KEY = process.env.OCP_ADMIN_KEY || "";
 
 const VERSION = _pkg.version;
 const START_TIME = Date.now();
@@ -514,7 +518,7 @@ function callClaude(model, messages, conversationId) {
 // ── Call claude CLI (real streaming) ─────────────────────────────────────
 // Pipes stdout from the claude process directly to SSE chunks as they arrive.
 // Each data chunk becomes a proper SSE event with delta content in real time.
-function callClaudeStreaming(model, messages, conversationId, res) {
+function callClaudeStreaming(model, messages, conversationId, res, authInfo = {}) {
   const id = `chatcmpl-${randomUUID()}`;
   const created = Math.floor(Date.now() / 1000);
 
@@ -569,6 +573,7 @@ function callClaudeStreaming(model, messages, conversationId, res) {
 
     if (code !== 0) {
       recordModelError(cliModel, false);
+      recordUsage({ keyId: authInfo.keyId, keyName: authInfo.keyName, model, promptChars: 0, responseChars: 0, elapsedMs: elapsed, success: false });
       logEvent("error", "claude_exit", { model: cliModel, code, signal: signal || "none", elapsed, stderr: stderr.slice(0, 300) });
       trackError(stderr.slice(0, 300) || `claude exit ${code}`);
       handleSessionFailure();
@@ -586,6 +591,7 @@ function callClaudeStreaming(model, messages, conversationId, res) {
     } else {
       recordModelSuccess(cliModel, elapsed);
       breakerRecordSuccess(cliModel);
+      recordUsage({ keyId: authInfo.keyId, keyName: authInfo.keyName, model, promptChars: messages.reduce((a, m) => a + (typeof m.content === "string" ? m.content.length : JSON.stringify(m.content).length), 0), responseChars: totalChars, elapsedMs: elapsed, success: true });
       logEvent("info", "claude_ok", { model: cliModel, chars: totalChars, elapsed, session: convId ? convId.slice(0, 12) + "..." : "none" });
 
       if (!headersSent) ensureHeaders();
@@ -995,14 +1001,18 @@ async function handleChatCompletions(req, res) {
 
   if (stream) {
     // Real streaming: pipe stdout from claude process directly as SSE chunks
-    return callClaudeStreaming(model, messages, conversationId, res);
+    return callClaudeStreaming(model, messages, conversationId, res, { keyId: req._authKeyId, keyName: req._authKeyName });
   }
 
+  const t0Usage = Date.now();
+  const promptChars = messages.reduce((a, m) => a + (typeof m.content === "string" ? m.content.length : JSON.stringify(m.content).length), 0);
   try {
     const content = await callClaude(model, messages, conversationId);
     const id = `chatcmpl-${randomUUID()}`;
     completionResponse(res, id, model, content);
+    recordUsage({ keyId: req._authKeyId, keyName: req._authKeyName, model, promptChars, responseChars: content.length, elapsedMs: Date.now() - t0Usage, success: true });
   } catch (err) {
+    recordUsage({ keyId: req._authKeyId, keyName: req._authKeyName, model, promptChars, responseChars: 0, elapsedMs: Date.now() - t0Usage, success: false });
     console.error(`[proxy] error: ${err.message}`);
     if (res.headersSent || res.writableEnded || res.destroyed) {
       try { res.end(); } catch {}
@@ -1016,24 +1026,51 @@ async function handleChatCompletions(req, res) {
 
 // ── HTTP server ─────────────────────────────────────────────────────────
 const server = createServer(async (req, res) => {
-  // Dynamic CORS: only allow localhost origins
+  // Dynamic CORS: allow localhost and LAN origins
   const origin = req.headers["origin"] || "";
-  const isLocalhost = /^https?:\/\/(127\.0\.0\.1|localhost)(:\d+)?$/.test(origin);
-  res.setHeader("Access-Control-Allow-Origin", isLocalhost ? origin : `http://127.0.0.1:${PORT}`);
-  res.setHeader("Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS");
+  const isAllowedOrigin = /^https?:\/\/(127\.0\.0\.1|localhost|192\.168\.\d+\.\d+|172\.(1[6-9]|2\d|3[01])\.\d+\.\d+|10\.\d+\.\d+\.\d+)(:\d+)?$/.test(origin);
+  res.setHeader("Access-Control-Allow-Origin", isAllowedOrigin ? origin : "*");
+  res.setHeader("Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS, PATCH");
   res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization, X-Session-Id, X-Conversation-Id");
   if (req.method === "OPTIONS") { res.writeHead(204); res.end(); return; }
 
-  // Bearer token auth (skip for /health and when PROXY_API_KEY is not set)
-  if (PROXY_API_KEY && req.url !== "/health") {
+  // 3-mode auth: none | shared | multi
+  const isPublicEndpoint = req.url === "/health";
+  let authKeyName = "local";
+  let authKeyId = null;
+
+  if (!isPublicEndpoint) {
     const auth = req.headers["authorization"] || "";
     const token = auth.startsWith("Bearer ") ? auth.slice(7) : "";
-    const tokenBuf = Buffer.from(token);
-    const keyBuf = Buffer.from(PROXY_API_KEY);
-    if (tokenBuf.length !== keyBuf.length || !timingSafeEqual(tokenBuf, keyBuf)) {
-      return jsonResponse(res, 401, { error: { message: "Unauthorized: invalid or missing Bearer token", type: "auth_error" } });
+
+    if (AUTH_MODE === "shared") {
+      if (PROXY_API_KEY) {
+        const tokenBuf = Buffer.from(token);
+        const keyBuf = Buffer.from(PROXY_API_KEY);
+        if (tokenBuf.length !== keyBuf.length || !timingSafeEqual(tokenBuf, keyBuf)) {
+          return jsonResponse(res, 401, { error: { message: "Unauthorized: invalid or missing Bearer token", type: "auth_error" } });
+        }
+        authKeyName = "shared";
+      }
+    } else if (AUTH_MODE === "multi") {
+      if (!token) {
+        return jsonResponse(res, 401, { error: { message: "Unauthorized: Bearer token required", type: "auth_error" } });
+      }
+      if (ADMIN_KEY && token === ADMIN_KEY) {
+        authKeyName = "admin";
+      } else {
+        const keyInfo = validateKey(token);
+        if (!keyInfo) {
+          return jsonResponse(res, 401, { error: { message: "Unauthorized: invalid or revoked API key", type: "auth_error" } });
+        }
+        authKeyName = keyInfo.name;
+        authKeyId = keyInfo.id;
+      }
     }
   }
+
+  req._authKeyName = authKeyName;
+  req._authKeyId = authKeyId;
 
   // GET /v1/models
   if (req.url === "/v1/models" && req.method === "GET") {
@@ -1129,7 +1166,57 @@ const server = createServer(async (req, res) => {
     return handleSettings(req, res);
   }
 
-  jsonResponse(res, 404, { error: "Not found. Endpoints: GET /v1/models, POST /v1/chat/completions, GET /health, GET /usage, GET /status, GET /logs, GET|PATCH /settings, GET|DELETE /sessions" });
+  // ── Key management API ──
+  const isAdmin = AUTH_MODE !== "multi" || authKeyName === "admin" || BIND_ADDRESS === "127.0.0.1";
+
+  if (req.url === "/api/keys" && req.method === "POST") {
+    if (!isAdmin) return jsonResponse(res, 403, { error: "Admin access required" });
+    let body = "";
+    for await (const chunk of req) body += chunk;
+    let parsed;
+    try { parsed = JSON.parse(body); } catch { return jsonResponse(res, 400, { error: "Invalid JSON" }); }
+    const name = parsed.name || `key-${Date.now()}`;
+    const newKey = createKey(name);
+    return jsonResponse(res, 201, newKey);
+  }
+
+  if (req.url === "/api/keys" && req.method === "GET") {
+    if (!isAdmin) return jsonResponse(res, 403, { error: "Admin access required" });
+    return jsonResponse(res, 200, { keys: listKeys() });
+  }
+
+  if (req.url?.startsWith("/api/keys/") && req.method === "DELETE") {
+    if (!isAdmin) return jsonResponse(res, 403, { error: "Admin access required" });
+    const idOrName = decodeURIComponent(req.url.split("/api/keys/")[1]);
+    const revoked = revokeKey(idOrName);
+    return jsonResponse(res, 200, { revoked, idOrName });
+  }
+
+  if (req.url?.startsWith("/api/usage") && req.method === "GET") {
+    if (!isAdmin) return jsonResponse(res, 403, { error: "Admin access required" });
+    const url = new URL(req.url, `http://${BIND_ADDRESS}:${PORT}`);
+    const since = url.searchParams.get("since");
+    const until = url.searchParams.get("until");
+    return jsonResponse(res, 200, {
+      byKey: getUsageByKey({ since, until }),
+      timeline: getUsageTimeline({ hours: parseInt(url.searchParams.get("hours") || "24", 10) }),
+      recent: getRecentUsage(parseInt(url.searchParams.get("limit") || "50", 10)),
+    });
+  }
+
+  // GET /dashboard — web dashboard
+  if (req.url === "/dashboard" && req.method === "GET") {
+    try {
+      const html = readFileSync(join(__dirname, "dashboard.html"), "utf8");
+      res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
+      res.end(html);
+    } catch (err) {
+      return jsonResponse(res, 500, { error: "Dashboard file not found" });
+    }
+    return;
+  }
+
+  jsonResponse(res, 404, { error: "Not found. Endpoints: GET /v1/models, POST /v1/chat/completions, GET /health, GET /usage, GET /status, GET /logs, GET|PATCH /settings, GET|DELETE /sessions, GET /dashboard, GET|POST|DELETE /api/keys, GET /api/usage" });
 });
 
 
@@ -1149,6 +1236,7 @@ function gracefulShutdown(signal) {
   // 2. Clear intervals/timers
   clearInterval(sessionCleanupInterval);
   clearInterval(authCheckInterval);
+  closeDb();
 
   // 3. Kill all active child processes
   for (const proc of activeProcesses) {
@@ -1186,8 +1274,9 @@ process.on("SIGTERM", () => gracefulShutdown("SIGTERM"));
 process.on("SIGINT", () => gracefulShutdown("SIGINT"));
 
 // ── Start ───────────────────────────────────────────────────────────────
-server.listen(PORT, "127.0.0.1", () => {
-  console.log(`openclaw-claude-proxy v${VERSION} listening on http://127.0.0.1:${PORT}`);
+server.listen(PORT, BIND_ADDRESS, () => {
+  const bindMsg = BIND_ADDRESS === "0.0.0.0" ? `http://0.0.0.0:${PORT} (LAN mode)` : `http://127.0.0.1:${PORT}`;
+  console.log(`openclaw-claude-proxy v${VERSION} listening on ${bindMsg}`);
   console.log(`Architecture: on-demand spawning (no pool)`);
   console.log(`Models: ${MODELS.map((m) => m.id).join(", ")}`);
   console.log(`Claude binary: ${CLAUDE}`);
@@ -1198,6 +1287,8 @@ server.listen(PORT, "127.0.0.1", () => {
   if (SYSTEM_PROMPT) console.log(`System prompt: "${SYSTEM_PROMPT.slice(0, 80)}..."`);
   if (MCP_CONFIG) console.log(`MCP config: ${MCP_CONFIG}`);
   console.log(`Auth: ${PROXY_API_KEY ? "enabled (PROXY_API_KEY set)" : "disabled (no PROXY_API_KEY)"}`);
+  console.log(`Auth mode: ${AUTH_MODE}${AUTH_MODE === "shared" ? " (PROXY_API_KEY)" : AUTH_MODE === "multi" ? " (per-user keys)" : " (open)"}`);
+  console.log(`Bind: ${BIND_ADDRESS}${BIND_ADDRESS === "0.0.0.0" ? " ⚠ LAN-accessible" : ""}`);
   console.log(`---`);
   console.log(`Coexistence: This proxy does NOT conflict with Claude Code interactive mode.`);
   console.log(`  OCP uses: localhost:${PORT} (HTTP) → claude -p (per-request process)`);
