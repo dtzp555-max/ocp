@@ -57,62 +57,109 @@ curl http://127.0.0.1:3456/v1/models
 
 ## LAN Mode — Share with Family
 
-OCP can serve your entire household from a single machine.
+OCP can serve your entire household from a single machine. One Claude Pro/Max subscription, shared across all devices on your network.
 
-### Enable LAN Access
+```
+Wife's laptop   ──┐
+Son's iPad      ───┼──→ OCP :3456 (your Mac) ──→ Claude subscription
+Your Pi server  ───┤
+Your desktop    ──┘
+```
 
+### Step 1: Enable LAN Access
+
+**Quick start (temporary, until restart):**
 ```bash
-# Set bind address and restart
 export CLAUDE_BIND=0.0.0.0
+export CLAUDE_AUTH_MODE=multi    # per-user keys
+export OCP_ADMIN_KEY=your-secret-admin-key
 ocp restart
 ```
 
-Or permanently via setup:
+**Permanent (survives reboot):**
 ```bash
 node setup.mjs --bind 0.0.0.0 --auth-mode multi
 ```
 
-### Auth Modes
+Then set your admin key in the launchd/systemd environment, or save it to a file:
+```bash
+echo "your-secret-admin-key" > ~/.ocp/admin-key
+chmod 600 ~/.ocp/admin-key
+```
 
-| Mode | Env | Description |
-|------|-----|-------------|
-| `none` | `CLAUDE_AUTH_MODE=none` | Open access (trusted network) |
-| `shared` | `CLAUDE_AUTH_MODE=shared` | Single key via `PROXY_API_KEY` |
-| `multi` | `CLAUDE_AUTH_MODE=multi` | Per-user keys with usage tracking |
-
-### Multi-Key Setup
+### Step 2: Create Keys for Family Members
 
 ```bash
-# Create keys for family members
+# Set admin key for CLI (or save to ~/.ocp/admin-key)
+export OCP_ADMIN_KEY=your-secret-admin-key
+
+# Create a key for each person/device
 ocp keys add wife-laptop
+#  ✓ Key created for "wife-laptop"
+#    API Key: ocp_xDYzOB9ZKYzn...
+#    Copy this key now — you won't see it again.
+
 ocp keys add son-ipad
+ocp keys add pi-server
+```
 
-# List keys
-ocp keys
+### Step 3: Share Connection Info
 
-# View per-key usage
+Run `ocp lan` to see your IP and ready-to-share instructions:
+
+```
+$ ocp lan
+OCP LAN Setup
+─────────────────────────────────────
+  Your IP: 192.168.1.100
+  Port:    3456
+
+  For IDE users, set:
+    OPENAI_BASE_URL=http://192.168.1.100:3456/v1
+    OPENAI_API_KEY=<their-key>
+
+  Dashboard: http://192.168.1.100:3456/dashboard
+
+  Status: ✓ LAN-accessible
+```
+
+Give each family member their key and these two settings:
+```bash
+export OPENAI_BASE_URL=http://192.168.1.100:3456/v1
+export OPENAI_API_KEY=ocp_<their-key>
+```
+
+### Step 4: Monitor Usage
+
+```bash
+# Per-key usage stats
 ocp usage --by-key
+#  Key                  Reqs   OK  Err  Avg Time
+#  wife-laptop             5    5    0      8.0s
+#  son-ipad                3    3    0      6.2s
 
-# Revoke a key
-ocp keys revoke son-ipad
+# Manage keys
+ocp keys              # List all keys
+ocp keys revoke son-ipad   # Revoke a key
 ```
 
-### Family Member Setup
+**Web Dashboard:** Open `http://<your-ip>:3456/dashboard` in any browser for real-time monitoring — per-key usage, request history, plan utilization, and system health. No login needed.
 
-Give your family member these settings for their IDE:
+### Auth Modes
 
-```
-OPENAI_BASE_URL=http://<your-ip>:3456/v1
-OPENAI_API_KEY=ocp_<their-key>
-```
+| Mode | Env | Use Case |
+|------|-----|----------|
+| `none` | `CLAUDE_AUTH_MODE=none` | Trusted home network, no auth needed |
+| `shared` | `CLAUDE_AUTH_MODE=shared` + `PROXY_API_KEY=xxx` | Everyone shares one key |
+| `multi` | `CLAUDE_AUTH_MODE=multi` + `OCP_ADMIN_KEY=xxx` | Per-person keys with usage tracking (recommended) |
 
-Run `ocp lan` to see your IP and connection guide.
+### Important Notes
 
-### Web Dashboard
-
-Access the usage dashboard at: `http://<your-ip>:3456/dashboard`
-
-Shows real-time stats: per-key usage, request history, plan utilization, and system health.
+- All users share your Claude Pro/Max **rate limits** (5h session + 7d weekly)
+- `ocp usage` shows how much quota remains
+- Keys are stored in `~/.ocp/ocp.db` (SQLite, zero external dependencies)
+- Admin key is required for key management API endpoints
+- The dashboard (`/dashboard`) and health check (`/health`) are always public
 
 ## Built-in Usage Monitoring
 
@@ -144,8 +191,13 @@ Proxy: up 6h 32m | 23 reqs | 0 err | 0 timeout
 
 ```
 ocp usage              Plan usage limits & model stats
+ocp usage --by-key     Per-key usage breakdown (LAN mode)
 ocp status             Quick overview
 ocp health             Proxy diagnostics
+ocp keys               List all API keys (multi mode)
+ocp keys add <name>    Create a new API key
+ocp keys revoke <name> Revoke an API key
+ocp lan                Show LAN connection info & IP
 ocp settings           View tunable settings
 ocp settings <k> <v>   Update a setting at runtime
 ocp logs [N] [level]   Recent logs (default: 20, error)
@@ -219,6 +271,10 @@ OCP translates OpenAI-compatible `/v1/chat/completions` requests into `claude -p
 | `/settings` | GET/PATCH | View or update settings at runtime |
 | `/logs` | GET | Recent log entries (`?n=20&level=error`) |
 | `/sessions` | GET/DELETE | List or clear active sessions |
+| `/dashboard` | GET | Web dashboard (always public) |
+| `/api/keys` | GET/POST | List or create API keys (admin only) |
+| `/api/keys/:id` | DELETE | Revoke an API key (admin only) |
+| `/api/usage` | GET | Per-key usage stats (`?since=&until=&hours=&limit=`) |
 
 ## OpenClaw Integration
 
@@ -300,6 +356,9 @@ If you installed OCP before v3.1.0, the auto-start service used names that OpenC
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `CLAUDE_PROXY_PORT` | `3456` | Listen port |
+| `CLAUDE_BIND` | `127.0.0.1` | Bind address (`0.0.0.0` for LAN access) |
+| `CLAUDE_AUTH_MODE` | `none` | Auth mode: `none`, `shared`, or `multi` |
+| `OCP_ADMIN_KEY` | *(unset)* | Admin key for key management (multi mode) |
 | `CLAUDE_BIN` | *(auto-detect)* | Path to claude binary |
 | `CLAUDE_TIMEOUT` | `600000` | Request timeout (ms, default: 10 min) |
 | `CLAUDE_MAX_CONCURRENT` | `8` | Max concurrent claude processes |
@@ -307,13 +366,17 @@ If you installed OCP before v3.1.0, the auto-start service used names that OpenC
 | `CLAUDE_SESSION_TTL` | `3600000` | Session expiry (ms, default: 1 hour) |
 | `CLAUDE_ALLOWED_TOOLS` | `Bash,Read,...,Agent` | Comma-separated tools to pre-approve |
 | `CLAUDE_SKIP_PERMISSIONS` | `false` | Bypass all permission checks |
-| `PROXY_API_KEY` | *(unset)* | Bearer token for API authentication |
+| `PROXY_API_KEY` | *(unset)* | Bearer token for shared-mode authentication |
 
 ## Security
 
-- **Localhost only** — binds to `127.0.0.1`, not exposed to the network
-- **Bearer token auth (optional)** — set `PROXY_API_KEY` to require auth
+- **Localhost by default** — binds to `127.0.0.1`; set `CLAUDE_BIND=0.0.0.0` to enable LAN access
+- **3-tier auth** — `none` (trusted network), `shared` (single key), `multi` (per-user keys with usage tracking)
+- **Timing-safe key comparison** — prevents timing attacks on API keys and admin keys
+- **Admin-only key management** — creating, listing, and revoking keys requires the admin key
+- **Public endpoints** — `/health` and `/dashboard` are always accessible without auth
 - **No API keys needed** — authentication goes through Claude CLI's OAuth session
+- **Keys stored locally** — `~/.ocp/ocp.db` (SQLite), never sent to external services
 - **Auto-start** — launchd (macOS) / systemd (Linux)
 
 ## License
