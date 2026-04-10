@@ -85,7 +85,9 @@
 <script>
 const BASE = window.location.origin;
 const headers = {};
-const storedToken = localStorage.getItem("ocp_token");
+const urlToken = new URLSearchParams(window.location.search).get("token");
+const storedToken = urlToken || localStorage.getItem("ocp_token");
+if (urlToken) { localStorage.setItem("ocp_token", urlToken); history.replaceState(null, "", "/dashboard"); }
 if (storedToken) headers["Authorization"] = `Bearer ${storedToken}`;
 
 async function api(path) {

@@ -1039,7 +1039,8 @@ const server = createServer(async (req, res) => {
   if (req.method === "OPTIONS") { res.writeHead(204); res.end(); return; }
 
   // 3-mode auth: none | shared | multi
-  const isPublicEndpoint = req.url === "/health" || req.url === "/dashboard";
+  const pathname = req.url.split("?")[0];
+  const isPublicEndpoint = pathname === "/health" || pathname === "/dashboard";
   let authKeyName = "local";
   let authKeyId = null;
 
@@ -1217,7 +1218,7 @@ const server = createServer(async (req, res) => {
   }
 
   // GET /dashboard — web dashboard
-  if (req.url === "/dashboard" && req.method === "GET") {
+  if (pathname === "/dashboard" && req.method === "GET") {
     try {
       const html = readFileSync(join(__dirname, "dashboard.html"), "utf8");
       res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
