@@ -1,6 +1,6 @@
 # OCP — Open Claude Proxy
 
-> **Status: Stable (v3.4.0)** — Feature-complete. Bug fixes only.
+> **Status: Stable (v3.5.0)** — Feature-complete. Bug fixes only.
 
 > **Already paying for Claude Pro/Max? Use your subscription as an OpenAI-compatible API — $0 extra cost.**
 
@@ -29,9 +29,34 @@ Any tool that accepts `OPENAI_BASE_URL` works with OCP:
 | **OpenClaw** | `setup.mjs` auto-configures |
 | **Any OpenAI client** | Set base URL to `http://127.0.0.1:3456/v1` |
 
-## Quick Start
+## Installation
+
+OCP has two roles: **Server** (runs the proxy, needs Claude CLI) and **Client** (connects to a server, zero dependencies).
+
+```
+┌─ Server (always-on device) ─────────────────────────────┐
+│  Mac mini / NAS / Raspberry Pi / Desktop                │
+│  Claude CLI + OCP server → bound to 0.0.0.0:3456       │
+└───────────────────────┬─────────────────────────────────┘
+                        │ LAN
+    ┌───────────────────┼───────────────────┐
+    ▼                   ▼                   ▼
+ Laptop             Phone/Tablet        Pi / Server
+ (client)           (browser)           (client)
+```
+
+---
+
+### Server Setup
+
+> **Recommended:** Install OCP on a device that stays powered on — Mac mini, NAS, Raspberry Pi, or a desktop that doesn't sleep. This ensures all clients always have access.
+
+**Prerequisites:**
+- Node.js 18+
+- [Claude CLI](https://docs.anthropic.com/en/docs/claude-cli) installed and authenticated (`claude auth login`)
 
 ```bash
+# 1. Clone and run setup
 git clone https://github.com/dtzp555-max/ocp.git
 cd ocp
 node setup.mjs
@@ -41,59 +66,23 @@ The setup script will:
 1. Verify Claude CLI is installed and authenticated
 2. Start the proxy on port 3456
 3. Install auto-start (launchd on macOS, systemd on Linux)
+4. Symlink `ocp` to `/usr/local/bin` for CLI access
 
-Then point your IDE to the proxy:
-
+**Single-machine use** — just set your IDE to use the proxy:
 ```bash
 export OPENAI_BASE_URL=http://127.0.0.1:3456/v1
 ```
 
-### Verify
-
+**LAN mode** — share with other devices on your network:
 ```bash
-curl http://127.0.0.1:3456/v1/models
-# Returns: claude-opus-4-6, claude-sonnet-4-6, claude-haiku-4
-```
-
-## LAN Mode — Share with Family
-
-OCP can serve your entire household from a single machine. One Claude Pro/Max subscription, shared across all devices on your network.
-
-```
-Wife's laptop   ──┐
-Son's iPad      ───┼──→ OCP :3456 (your Mac) ──→ Claude subscription
-Your Pi server  ───┤
-Your desktop    ──┘
-```
-
-### Step 1: Enable LAN Access
-
-**Quick start (temporary, until restart):**
-```bash
-export CLAUDE_BIND=0.0.0.0
-export CLAUDE_AUTH_MODE=multi    # per-user keys
-export OCP_ADMIN_KEY=your-secret-admin-key
-ocp restart
-```
-
-**Permanent (survives reboot):**
-```bash
+# Enable LAN access with per-user auth (recommended)
 node setup.mjs --bind 0.0.0.0 --auth-mode multi
 ```
 
-Then set your admin key in the launchd/systemd environment, or save it to a file:
+Then create API keys for each person/device:
 ```bash
-echo "your-secret-admin-key" > ~/.ocp/admin-key
-chmod 600 ~/.ocp/admin-key
-```
-
-### Step 2: Create Keys for Family Members
-
-```bash
-# Set admin key for CLI (or save to ~/.ocp/admin-key)
 export OCP_ADMIN_KEY=your-secret-admin-key
 
-# Create a key for each person/device
 ocp keys add wife-laptop
 #  ✓ Key created for "wife-laptop"
 #    API Key: ocp_xDYzOB9ZKYzn...
@@ -103,33 +92,72 @@ ocp keys add son-ipad
 ocp keys add pi-server
 ```
 
-### Step 3: Share Connection Info
+Run `ocp lan` to see your IP and ready-to-share instructions.
 
-Run `ocp lan` to see your IP and ready-to-share instructions:
-
-```
-$ ocp lan
-OCP LAN Setup
-─────────────────────────────────────
-  Your IP: 192.168.1.100
-  Port:    3456
-
-  For IDE users, set:
-    OPENAI_BASE_URL=http://192.168.1.100:3456/v1
-    OPENAI_API_KEY=<their-key>
-
-  Dashboard: http://192.168.1.100:3456/dashboard
-
-  Status: ✓ LAN-accessible
-```
-
-Give each family member their key and these two settings:
+**Verify:**
 ```bash
-export OPENAI_BASE_URL=http://192.168.1.100:3456/v1
-export OPENAI_API_KEY=ocp_<their-key>
+curl http://127.0.0.1:3456/v1/models
+# Returns: claude-opus-4-6, claude-sonnet-4-6, claude-haiku-4
 ```
 
-### Step 4: Monitor Usage
+---
+
+### Client Setup
+
+> Clients do **not** need to install Node.js, Claude CLI, or the OCP repo. Only `curl` and `python3` are required (pre-installed on most Linux/Mac systems).
+
+**One-command setup** — download the lightweight `ocp-connect` script:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/dtzp555-max/ocp/main/ocp-connect -o ocp-connect
+chmod +x ocp-connect
+./ocp-connect <server-ip> --key <your-api-key>
+```
+
+Or as a one-liner (no file saved):
+```bash
+curl -fsSL https://raw.githubusercontent.com/dtzp555-max/ocp/main/ocp-connect | bash -s -- <server-ip> --key <your-api-key>
+```
+
+Example:
+```
+$ ./ocp-connect 192.168.1.100 --key ocp_xDYzOB9ZKYzn
+
+OCP Connect
+─────────────────────────────────────
+  Remote: http://192.168.1.100:3456
+
+  Checking connectivity...
+  ✓ Connected
+
+  Remote OCP v3.5.0  (auth: multi)
+
+  Testing API access...
+  ✓ API accessible (3 models available)
+
+  Written to /home/user/.bashrc:
+    OPENAI_BASE_URL=http://192.168.1.100:3456/v1
+    OPENAI_API_KEY=ocp_xDYz...
+
+  Running smoke test...
+  ✓ Smoke test passed: OK
+
+  Done. Reload your shell to apply:
+    source /home/user/.bashrc
+```
+
+After running, reload your shell (`source ~/.bashrc` or `source ~/.zshrc`) and your IDE will automatically use the remote OCP.
+
+**Manual setup** — if you prefer not to use the script:
+```bash
+export OPENAI_BASE_URL=http://<server-ip>:3456/v1
+export OPENAI_API_KEY=ocp_<your-key>
+```
+Add these lines to `~/.bashrc` or `~/.zshrc` to persist across sessions.
+
+---
+
+### Monitoring (Server-side)
 
 ```bash
 # Per-key usage stats
@@ -143,7 +171,9 @@ ocp keys              # List all keys
 ocp keys revoke son-ipad   # Revoke a key
 ```
 
-**Web Dashboard:** Open `http://<your-ip>:3456/dashboard` in any browser for real-time monitoring — per-key usage, request history, plan utilization, and system health. No login needed.
+**Web Dashboard:** Open `http://<server-ip>:3456/dashboard` in any browser for real-time monitoring — per-key usage, request history, plan utilization, and system health.
+
+![OCP Dashboard](docs/images/dashboard.png)
 
 ### Auth Modes
 
@@ -197,6 +227,7 @@ ocp health             Proxy diagnostics
 ocp keys               List all API keys (multi mode)
 ocp keys add <name>    Create a new API key
 ocp keys revoke <name> Revoke an API key
+ocp connect <ip>       One-command LAN client setup
 ocp lan                Show LAN connection info & IP
 ocp settings           View tunable settings
 ocp settings <k> <v>   Update a setting at runtime

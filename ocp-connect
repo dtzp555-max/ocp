@@ -1,0 +1,227 @@
+#!/usr/bin/env bash
+# ocp-connect — Lightweight client script to connect to a remote OCP instance
+# No dependencies beyond curl and python3 (available on most Linux/Mac systems)
+#
+# Install:
+#   curl -fsSL https://raw.githubusercontent.com/dtzp555-max/ocp/main/ocp-connect -o ocp-connect
+#   chmod +x ocp-connect
+#
+# Or run directly:
+#   curl -fsSL https://raw.githubusercontent.com/dtzp555-max/ocp/main/ocp-connect | bash -s -- <host-ip> --key <key>
+#
+set -euo pipefail
+
+show_help() {
+  cat <<'EOF'
+ocp-connect — Connect this machine to a remote OCP (Open Claude Proxy)
+
+Configures OPENAI_BASE_URL and OPENAI_API_KEY in your shell rc file
+so tools like Claude Code, Cline, Aider, etc. point to the remote OCP.
+
+Usage:
+  ocp-connect <host-ip> [options]
+
+Options:
+  --port PORT      Port OCP listens on (default: 3456)
+  --key  API_KEY   API key (prompted interactively if remote requires auth)
+  --help, -h       Show this help
+
+Examples:
+  ocp-connect 192.168.1.10
+  ocp-connect 192.168.1.10 --port 8080
+  ocp-connect 192.168.1.10 --key ocp_abc123
+
+What it does:
+  1. Tests connectivity to the remote OCP
+  2. Verifies your API key (if auth is enabled)
+  3. Writes OPENAI_BASE_URL and OPENAI_API_KEY to ~/.bashrc or ~/.zshrc
+  4. Runs a smoke test to confirm everything works
+
+After running, reload your shell:  source ~/.bashrc  (or ~/.zshrc)
+EOF
+}
+
+main() {
+  local host="" port=3456 key=""
+
+  # Parse args
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --port)  port="${2:?'--port requires a value'}"; shift 2 ;;
+      --key)   key="${2:?'--key requires a value'}"; shift 2 ;;
+      --help|-h) show_help; exit 0 ;;
+      -*)      echo "Unknown option: $1"; show_help; exit 1 ;;
+      *)       host="$1"; shift ;;
+    esac
+  done
+
+  if [[ -z "$host" ]]; then
+    echo "Error: host IP is required."
+    echo ""
+    show_help
+    exit 1
+  fi
+
+  if ! [[ "$host" =~ ^[a-zA-Z0-9._-]+$ ]]; then
+    echo "Error: invalid host '$host'"
+    exit 1
+  fi
+
+  # Check dependencies
+  for cmd in curl python3; do
+    if ! command -v "$cmd" &>/dev/null; then
+      echo "Error: '$cmd' is required but not found."
+      exit 1
+    fi
+  done
+
+  local base_url="http://$host:$port"
+
+  echo "OCP Connect"
+  echo "─────────────────────────────────────"
+  echo "  Remote: $base_url"
+  echo ""
+
+  # Step 1: Test connectivity via /health
+  echo "  Checking connectivity..."
+  local health_json
+  health_json=$(curl -sf --max-time 10 "$base_url/health" 2>/dev/null) || {
+    echo "  ✗ Cannot reach $base_url/health"
+    echo "    Make sure OCP is running on $host and bound to 0.0.0.0 (LAN mode)."
+    exit 1
+  }
+  echo "  ✓ Connected"
+  echo ""
+
+  # Step 2: Show remote info
+  local remote_version auth_mode
+  remote_version=$(echo "$health_json" | python3 -c "import sys,json; d=json.loads(sys.stdin.read()); print(d.get('version','?'))" 2>/dev/null || echo "?")
+  auth_mode=$(echo "$health_json" | python3 -c "import sys,json; d=json.loads(sys.stdin.read()); print(d.get('authMode','none'))" 2>/dev/null || echo "none")
+
+  echo "  Remote OCP v$remote_version  (auth: $auth_mode)"
+  echo ""
+
+  # Step 3: Determine if key is needed
+  if [[ "$auth_mode" != "none" && -z "$key" ]]; then
+    echo "  Remote requires authentication."
+    echo "  Ask the OCP admin to run:  ocp keys add <name>"
+    printf "  Enter API key (or press Enter to skip): "
+    read -rs key </dev/tty
+    echo
+    if [[ -z "$key" ]]; then
+      echo ""
+      echo "  ✗ No key provided — cannot connect to an auth-required remote without a key."
+      exit 1
+    fi
+  fi
+
+  # Step 4: Test API access via /v1/models
+  echo "  Testing API access..."
+  local models_out models_ok=0
+  if [[ -n "$key" ]]; then
+    models_out=$(curl -sf --max-time 10 \
+      -H "Authorization: Bearer $key" \
+      "$base_url/v1/models" 2>/dev/null) && models_ok=1
+  else
+    models_out=$(curl -sf --max-time 10 "$base_url/v1/models" 2>/dev/null) && models_ok=1
+  fi
+
+  if [[ $models_ok -eq 0 ]]; then
+    echo "  ✗ API access failed — key may be invalid or revoked."
+    exit 1
+  fi
+  local model_count
+  model_count=$(echo "$models_out" | python3 -c "import sys,json; print(len(json.loads(sys.stdin.read()).get('data',[])))" 2>/dev/null || echo "?")
+  echo "  ✓ API accessible ($model_count models available)"
+  echo ""
+
+  # Step 5: Detect shell rc file
+  local rc_file
+  if [[ "${SHELL:-}" == */zsh ]]; then
+    rc_file="$HOME/.zshrc"
+  elif [[ "${SHELL:-}" == */fish ]]; then
+    echo "  Note: fish shell detected. Writing to ~/.bashrc — add to fish config manually."
+    rc_file="$HOME/.bashrc"
+  else
+    rc_file="$HOME/.bashrc"
+  fi
+
+  # Step 6: Remove any previously written OCP LAN lines (idempotent)
+  if [[ -f "$rc_file" ]]; then
+    local tmp_rc
+    tmp_rc=$(mktemp)
+    if python3 - "$rc_file" "$tmp_rc" <<'PYEOF'
+import sys
+src, dst = sys.argv[1], sys.argv[2]
+lines = open(src).readlines()
+out = []
+skip = False
+for line in lines:
+    s = line.rstrip('\n')
+    if s == '# OCP LAN (added by ocp connect)':
+        skip = True
+        continue
+    if skip and (s == '' or s.startswith('export OPENAI_BASE_URL=') or s.startswith('export OPENAI_API_KEY=')):
+        continue
+    skip = False
+    out.append(line)
+open(dst, 'w').writelines(out)
+PYEOF
+    then
+      cp "$tmp_rc" "$rc_file"
+    fi
+    rm -f "$tmp_rc"
+  fi
+
+  # Step 7: Append new config
+  {
+    echo ""
+    echo "# OCP LAN (added by ocp connect)"
+    echo "export OPENAI_BASE_URL=$base_url/v1"
+    if [[ -n "$key" ]]; then
+      echo "export OPENAI_API_KEY=$key"
+    fi
+  } >> "$rc_file"
+
+  echo "  Written to $rc_file:"
+  echo "    OPENAI_BASE_URL=$base_url/v1"
+  if [[ -n "$key" ]]; then
+    echo "    OPENAI_API_KEY=${key:0:8}..."
+  fi
+  echo ""
+
+  # Step 8: Quick smoke test
+  echo "  Running smoke test..."
+  # Pick the first available model from /v1/models
+  local smoke_model
+  smoke_model=$(echo "$models_out" | python3 -c "import sys,json; d=json.loads(sys.stdin.read()); print(d['data'][0]['id'])" 2>/dev/null || echo "claude-haiku-4-5-20251001")
+  local chat_payload="{\"model\":\"$smoke_model\",\"messages\":[{\"role\":\"user\",\"content\":\"Reply with OK only.\"}],\"max_tokens\":10}"
+  local chat_out chat_ok=0
+  if [[ -n "$key" ]]; then
+    chat_out=$(curl -sf --max-time 30 \
+      -H "Authorization: Bearer $key" \
+      -H "Content-Type: application/json" \
+      -d "$chat_payload" \
+      "$base_url/v1/chat/completions" 2>/dev/null) && chat_ok=1
+  else
+    chat_out=$(curl -sf --max-time 30 \
+      -H "Content-Type: application/json" \
+      -d "$chat_payload" \
+      "$base_url/v1/chat/completions" 2>/dev/null) && chat_ok=1
+  fi
+
+  if [[ $chat_ok -eq 1 ]]; then
+    local reply
+    reply=$(echo "$chat_out" | python3 -c "import sys,json; d=json.loads(sys.stdin.read()); print(d['choices'][0]['message']['content'].strip())" 2>/dev/null || echo "(response received)")
+    echo "  ✓ Smoke test passed: $reply"
+  else
+    echo "  ⚠ Smoke test failed (proxy is reachable but chat completion did not succeed)."
+    echo "    The env vars have still been written. Check the remote OCP logs."
+  fi
+
+  echo ""
+  echo "  Done. Reload your shell to apply:"
+  echo "    source $rc_file"
+}
+
+main "$@"

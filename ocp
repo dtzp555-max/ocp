@@ -329,6 +329,203 @@ else:
   esac
 }
 
+# ── connect ─────────────────────────────────────────────────────────────
+cmd_connect_help() {
+  cat <<'EOF'
+ocp connect — Connect this machine to a remote OCP as a LAN client
+
+Configures OPENAI_BASE_URL (and optionally OPENAI_API_KEY) in your shell
+rc file so tools like Claude Code point to a remote OCP instance.
+
+Usage:
+  ocp connect <host-ip> [--port PORT] [--key API_KEY]
+
+Arguments:
+  host-ip          IP address of the machine running OCP
+  --port PORT      Port OCP listens on (default: 3456)
+  --key API_KEY    API key to use (prompted if remote requires auth)
+
+Examples:
+  ocp connect 192.168.1.10
+  ocp connect 192.168.1.10 --port 8080
+  ocp connect 192.168.1.10 --key sk-abc123
+EOF
+}
+
+cmd_connect() {
+  local host="" port=3456 key=""
+
+  # Parse args
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --port)  port="${2:?'--port requires a value'}"; shift 2 ;;
+      --key)   key="${2:?'--key requires a value'}"; shift 2 ;;
+      --help|-h) cmd_connect_help; return 0 ;;
+      -*)      echo "Unknown option: $1"; cmd_connect_help; return 1 ;;
+      *)       host="$1"; shift ;;
+    esac
+  done
+
+  if [[ -z "$host" ]]; then
+    echo "Error: host IP is required."
+    echo ""
+    cmd_connect_help
+    return 1
+  fi
+
+  if ! [[ "$host" =~ ^[a-zA-Z0-9._-]+$ ]]; then
+    echo "Error: invalid host '$host'"
+    return 1
+  fi
+
+  local base_url="http://$host:$port"
+
+  echo "OCP Connect"
+  echo "─────────────────────────────────────"
+  echo "  Remote: $base_url"
+  echo ""
+
+  # Step 1: Test connectivity via /health
+  echo "  Checking connectivity..."
+  local health_json
+  health_json=$(curl -sf --max-time 10 "$base_url/health" 2>/dev/null) || {
+    echo "  ✗ Cannot reach $base_url/health"
+    echo "    Make sure OCP is running on $host and bound to 0.0.0.0 (LAN mode)."
+    return 1
+  }
+  echo "  ✓ Connected"
+  echo ""
+
+  # Step 2: Show remote info
+  local remote_version auth_mode
+  remote_version=$(echo "$health_json" | python3 -c "import sys,json; d=json.loads(sys.stdin.read()); print(d.get('version','?'))" 2>/dev/null || echo "?")
+  auth_mode=$(echo "$health_json" | python3 -c "import sys,json; d=json.loads(sys.stdin.read()); print(d.get('authMode','none'))" 2>/dev/null || echo "none")
+
+  echo "  Remote OCP v$remote_version  (auth: $auth_mode)"
+  echo ""
+
+  # Step 3: Determine if key is needed
+  local needs_key=0
+  if [[ "$auth_mode" != "none" ]]; then
+    needs_key=1
+  fi
+
+  if [[ $needs_key -eq 1 && -z "$key" ]]; then
+    echo "  Remote requires authentication."
+    echo "  Ask the admin to run:  ocp keys add <name>"
+    printf "  Enter API key (or press Enter to skip): "
+    read -rs key </dev/tty
+    echo
+    if [[ -z "$key" ]]; then
+      echo ""
+      echo "  ✗ No key provided — cannot connect to an auth-required remote without a key."
+      return 1
+    fi
+  fi
+
+  # Step 4: Test API access via /v1/models
+  echo "  Testing API access..."
+  local models_out models_ok=0
+  if [[ -n "$key" ]]; then
+    models_out=$(curl -sf --max-time 10 \
+      -H "Authorization: Bearer $key" \
+      "$base_url/v1/models" 2>/dev/null) && models_ok=1
+  else
+    models_out=$(curl -sf --max-time 10 "$base_url/v1/models" 2>/dev/null) && models_ok=1
+  fi
+
+  if [[ $models_ok -eq 0 ]]; then
+    echo "  ✗ API access failed — key may be invalid or revoked."
+    return 1
+  fi
+  local model_count
+  model_count=$(echo "$models_out" | python3 -c "import sys,json; print(len(json.loads(sys.stdin.read()).get('data',[])))" 2>/dev/null || echo "?")
+  echo "  ✓ API accessible ($model_count models available)"
+  echo ""
+
+  # Step 5: Detect shell rc file
+  local rc_file
+  if [[ "${SHELL:-}" == */zsh ]]; then
+    rc_file="$HOME/.zshrc"
+  else
+    rc_file="$HOME/.bashrc"
+  fi
+
+  # Step 6: Remove any previously written OCP LAN lines
+  if [[ -f "$rc_file" ]]; then
+    local tmp_rc
+    tmp_rc=$(mktemp)
+    if python3 - "$rc_file" "$tmp_rc" <<'PYEOF'
+import sys
+src, dst = sys.argv[1], sys.argv[2]
+lines = open(src).readlines()
+out = []
+skip = False
+for line in lines:
+    s = line.rstrip('\n')
+    if s == '# OCP LAN (added by ocp connect)':
+        skip = True
+        continue
+    if skip and (s == '' or s.startswith('export OPENAI_BASE_URL=') or s.startswith('export OPENAI_API_KEY=')):
+        continue
+    skip = False
+    out.append(line)
+open(dst, 'w').writelines(out)
+PYEOF
+    then
+      cp "$tmp_rc" "$rc_file"
+    fi
+    rm -f "$tmp_rc"
+  fi
+
+  # Step 7: Append new config
+  {
+    echo ""
+    echo "# OCP LAN (added by ocp connect)"
+    echo "export OPENAI_BASE_URL=$base_url/v1"
+    if [[ -n "$key" ]]; then
+      echo "export OPENAI_API_KEY=$key"
+    fi
+  } >> "$rc_file"
+
+  echo "  Written to $rc_file:"
+  echo "    OPENAI_BASE_URL=$base_url/v1"
+  if [[ -n "$key" ]]; then
+    echo "    OPENAI_API_KEY=${key:0:8}..."
+  fi
+  echo ""
+
+  # Step 8: Quick smoke test — send a minimal chat completion
+  echo "  Running smoke test..."
+  local chat_payload='{"model":"claude-haiku-4-5-20251001","messages":[{"role":"user","content":"Reply with OK only."}],"max_tokens":10}'
+  local chat_out chat_ok=0
+  if [[ -n "$key" ]]; then
+    chat_out=$(curl -sf --max-time 30 \
+      -H "Authorization: Bearer $key" \
+      -H "Content-Type: application/json" \
+      -d "$chat_payload" \
+      "$base_url/v1/chat/completions" 2>/dev/null) && chat_ok=1
+  else
+    chat_out=$(curl -sf --max-time 30 \
+      -H "Content-Type: application/json" \
+      -d "$chat_payload" \
+      "$base_url/v1/chat/completions" 2>/dev/null) && chat_ok=1
+  fi
+
+  if [[ $chat_ok -eq 1 ]]; then
+    local reply
+    reply=$(echo "$chat_out" | python3 -c "import sys,json; d=json.loads(sys.stdin.read()); print(d['choices'][0]['message']['content'].strip())" 2>/dev/null || echo "(response received)")
+    echo "  ✓ Smoke test passed: $reply"
+  else
+    echo "  ⚠ Smoke test failed (proxy is reachable but chat completion did not succeed)."
+    echo "    The env vars have still been written. Check the remote OCP logs."
+  fi
+
+  echo ""
+  echo "  Done. Reload your shell to apply:"
+  echo "    source $rc_file"
+}
+
 # ── lan ─────────────────────────────────────────────────────────────────
 cmd_lan_help() {
   cat <<'EOF'
@@ -609,6 +806,7 @@ Commands:
   clear              Clear all sessions
   keys               Manage API keys (add/list/revoke)
   lan                LAN mode setup guide
+  connect <ip>       Connect to a remote OCP (sets env vars in rc file)
   restart            Restart proxy
   restart gateway    Restart gateway
   update             Update OCP to latest version
@@ -653,6 +851,7 @@ case "$subcmd" in
   clear)    cmd_clear ;;
   keys)     cmd_keys "${1:-}" "${2:-}" ;;
   lan)      cmd_lan ;;
+  connect)  cmd_connect "$@" ;;
   restart)  cmd_restart "${1:-}" ;;
   update)   cmd_update "${1:-}" ;;
   *)        echo "Unknown command: $subcmd"; echo ""; cmd_help; exit 1 ;;

@@ -1123,6 +1123,7 @@ const server = createServer(async (req, res) => {
       uptimeHuman: `${Math.floor(uptimeMs / 3600000)}h ${Math.floor((uptimeMs % 3600000) / 60000)}m`,
       claudeBinary: CLAUDE,
       claudeBinaryOk: binaryOk,
+      authMode: AUTH_MODE,
       auth: authStatus,
       config: {
         timeout: TIMEOUT,
