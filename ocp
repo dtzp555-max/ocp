@@ -8,6 +8,23 @@ set -euo pipefail
 
 PROXY="http://127.0.0.1:3456"
 
+# Auth header for multi-key mode: reads from OCP_ADMIN_KEY env or ~/.ocp/admin-key file
+_AUTH_HEADER=""
+if [[ -n "${OCP_ADMIN_KEY:-}" ]]; then
+  _AUTH_HEADER="-H \"Authorization: Bearer $OCP_ADMIN_KEY\""
+elif [[ -f "$HOME/.ocp/admin-key" ]]; then
+  _AUTH_HEADER="-H \"Authorization: Bearer $(cat "$HOME/.ocp/admin-key")\""
+fi
+
+# Wrapper: curl with optional auth
+_curl() {
+  if [[ -n "$_AUTH_HEADER" ]]; then
+    eval curl "$_AUTH_HEADER" "$@"
+  else
+    curl "$@"
+  fi
+}
+
 _json() { python3 -m json.tool 2>/dev/null || cat; }
 
 _bar() {
@@ -39,7 +56,7 @@ EOF
 cmd_usage() {
   if [[ "${1:-}" == "--by-key" ]]; then
     local data
-    data=$(curl -sf --max-time 15 "$PROXY/api/usage" 2>&1) || { echo "Error: proxy unreachable or usage API not available"; exit 1; }
+    data=$(_curl -sf --max-time 15 "$PROXY/api/usage" 2>&1) || { echo "Error: proxy unreachable or usage API not available"; exit 1; }
     echo "$data" | python3 -c "
 import sys, json
 d = json.loads(sys.stdin.read())
@@ -260,7 +277,7 @@ cmd_keys() {
     add)
       if [[ -z "${2:-}" ]]; then echo "Usage: ocp keys add <name>"; return 1; fi
       local result
-      result=$(curl -sf --max-time 5 -X POST "$PROXY/api/keys" \
+      result=$(_curl -sf --max-time 5 -X POST "$PROXY/api/keys" \
         -H "Content-Type: application/json" \
         -d "{\"name\": \"$2\"}" 2>&1) || { echo "Error: proxy unreachable or unauthorized"; exit 1; }
       echo "$result" | python3 -c "
@@ -279,7 +296,7 @@ else:
       ;;
     revoke)
       if [[ -z "${2:-}" ]]; then echo "Usage: ocp keys revoke <name|id>"; return 1; fi
-      curl -sf --max-time 5 -X DELETE "$PROXY/api/keys/$2" | python3 -c "
+      _curl -sf --max-time 5 -X DELETE "$PROXY/api/keys/$2" | python3 -c "
 import sys, json
 d = json.loads(sys.stdin.read())
 if d.get('revoked'):
@@ -292,7 +309,7 @@ else:
       cmd_keys_help
       ;;
     "")
-      curl -sf --max-time 5 "$PROXY/api/keys" | python3 -c "
+      _curl -sf --max-time 5 "$PROXY/api/keys" | python3 -c "
 import sys, json
 d = json.loads(sys.stdin.read())
 keys = d.get('keys', [])
@@ -326,7 +343,7 @@ EOF
 
 cmd_lan() {
   local ip
-  ip=$(ipconfig getifaddr en0 2>/dev/null || hostname -I 2>/dev/null | awk '{print $1}')
+  ip=$(ipconfig getifaddr en0 2>/dev/null || ipconfig getifaddr en1 2>/dev/null || hostname -I 2>/dev/null | awk '{print $1}' || echo "unknown")
   local port=3456
 
   echo "OCP LAN Setup"
