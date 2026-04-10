@@ -1039,7 +1039,7 @@ const server = createServer(async (req, res) => {
   if (req.method === "OPTIONS") { res.writeHead(204); res.end(); return; }
 
   // 3-mode auth: none | shared | multi
-  const isPublicEndpoint = req.url === "/health";
+  const isPublicEndpoint = req.url === "/health" || req.url === "/dashboard";
   let authKeyName = "local";
   let authKeyId = null;
 
