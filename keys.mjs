@@ -1,5 +1,6 @@
 // keys.mjs — API key management and usage tracking for OCP LAN mode
-import Database from "better-sqlite3";
+// Uses Node.js built-in SQLite (node:sqlite) — zero external dependencies.
+import { DatabaseSync } from "node:sqlite";
 import { randomBytes } from "node:crypto";
 import { join } from "node:path";
 import { mkdirSync } from "node:fs";
@@ -13,9 +14,9 @@ let db;
 
 export function getDb() {
   if (!db) {
-    db = new Database(DB_PATH);
-    db.pragma("journal_mode = WAL");
-    db.pragma("foreign_keys = ON");
+    db = new DatabaseSync(DB_PATH);
+    db.exec("PRAGMA journal_mode = WAL");
+    db.exec("PRAGMA foreign_keys = ON");
     initSchema();
   }
   return db;
