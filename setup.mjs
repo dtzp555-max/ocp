@@ -36,6 +36,8 @@ const DEFAULT_MODEL = opt("default-model", "opus"); // opus | sonnet | haiku
 const DRY_RUN = flag("dry-run");
 const SKIP_START = flag("no-start");
 const PROVIDER_NAME = opt("provider-name", "claude-local");
+const BIND_ADDRESS = opt("bind", "127.0.0.1");
+const AUTH_MODE_CONFIG = opt("auth-mode", "none");
 
 const MODEL_ID_MAP = {
   opus: "claude-opus-4-6",
@@ -363,6 +365,10 @@ if (!DRY_RUN) {
   <dict>
     <key>CLAUDE_PROXY_PORT</key>
     <string>${PORT}</string>
+    <key>CLAUDE_BIND</key>
+    <string>${BIND_ADDRESS}</string>
+    <key>CLAUDE_AUTH_MODE</key>
+    <string>${AUTH_MODE_CONFIG}</string>
   </dict>
   <key>RunAtLoad</key>
   <true/>
@@ -399,6 +405,8 @@ After=network.target
 [Service]
 ExecStart=${nodeBin} ${serverPath}
 Environment=CLAUDE_PROXY_PORT=${PORT}
+Environment=CLAUDE_BIND=${BIND_ADDRESS}
+Environment=CLAUDE_AUTH_MODE=${AUTH_MODE_CONFIG}
 Restart=always
 RestartSec=5
 StandardOutput=append:${logPath}
