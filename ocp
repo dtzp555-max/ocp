@@ -8,6 +8,23 @@ set -euo pipefail
 
 PROXY="http://127.0.0.1:3456"
 
+# Auth header for multi-key mode: reads from OCP_ADMIN_KEY env or ~/.ocp/admin-key file
+_AUTH_HEADER=""
+if [[ -n "${OCP_ADMIN_KEY:-}" ]]; then
+  _AUTH_HEADER="-H \"Authorization: Bearer $OCP_ADMIN_KEY\""
+elif [[ -f "$HOME/.ocp/admin-key" ]]; then
+  _AUTH_HEADER="-H \"Authorization: Bearer $(cat "$HOME/.ocp/admin-key")\""
+fi
+
+# Wrapper: curl with optional auth
+_curl() {
+  if [[ -n "$_AUTH_HEADER" ]]; then
+    eval curl "$_AUTH_HEADER" "$@"
+  else
+    curl "$@"
+  fi
+}
+
 _json() { python3 -m json.tool 2>/dev/null || cat; }
 
 _bar() {
@@ -29,11 +46,36 @@ Displays current session utilization, weekly limits, extra usage status,
 and proxy request statistics. Data is fetched from the Anthropic API
 via a minimal probe call (cached for 5 minutes).
 
-Usage: ocp usage
+Usage: ocp usage [--by-key]
+
+Options:
+  --by-key    Show per-key usage statistics
 EOF
 }
 
 cmd_usage() {
+  if [[ "${1:-}" == "--by-key" ]]; then
+    local data
+    data=$(_curl -sf --max-time 15 "$PROXY/api/usage" 2>&1) || { echo "Error: proxy unreachable or usage API not available"; exit 1; }
+    echo "$data" | python3 -c "
+import sys, json
+d = json.loads(sys.stdin.read())
+by_key = d.get('byKey', [])
+if not by_key:
+    print('No usage data yet.')
+else:
+    print('Usage by Key')
+    print('─────────────────────────────────────────────────────────────────')
+    hdr = f'  {\"Key\":<20} {\"Reqs\":>5} {\"OK\":>4} {\"Err\":>4} {\"Avg Time\":>9} {\"Last Request\":<20}'
+    print(hdr)
+    print('  ' + '─' * (len(hdr) - 2))
+    for k in by_key:
+        avg_t = f'{k[\"avg_elapsed_ms\"]/1000:.1f}s' if k['avg_elapsed_ms'] else '-'
+        print(f'  {k[\"key_name\"]:<20} {k[\"requests\"]:>5} {k[\"successes\"]:>4} {k[\"errors\"]:>4} {avg_t:>9} {k[\"last_request\"]:<20}')
+"
+    return
+  fi
+
   local data
   data=$(curl -sf --max-time 15 "$PROXY/usage" 2>&1) || { echo "Error: proxy unreachable"; exit 1; }
 
@@ -211,6 +253,121 @@ cmd_clear() {
   local count
   count=$(echo "$result" | python3 -c "import sys,json; print(json.loads(sys.stdin.read())['cleared'])")
   echo "Cleared $count sessions."
+}
+
+# ── keys ────────────────────────────────────────────────────────────────
+cmd_keys_help() {
+  cat <<'EOF'
+ocp keys — Manage API keys (multi-key auth mode)
+
+Usage:
+  ocp keys                     List all keys
+  ocp keys add <name>          Create a new key
+  ocp keys revoke <name|id>    Revoke a key
+
+Examples:
+  ocp keys add wife-laptop
+  ocp keys add son-ipad
+  ocp keys revoke wife-laptop
+EOF
+}
+
+cmd_keys() {
+  case "${1:-}" in
+    add)
+      if [[ -z "${2:-}" ]]; then echo "Usage: ocp keys add <name>"; return 1; fi
+      local result
+      result=$(_curl -sf --max-time 5 -X POST "$PROXY/api/keys" \
+        -H "Content-Type: application/json" \
+        -d "{\"name\": \"$2\"}" 2>&1) || { echo "Error: proxy unreachable or unauthorized"; exit 1; }
+      echo "$result" | python3 -c "
+import sys, json
+d = json.loads(sys.stdin.read())
+if 'key' in d:
+    print(f'✓ Key created for \"{d[\"name\"]}\"')
+    print(f'')
+    print(f'  API Key: {d[\"key\"]}')
+    print(f'')
+    print(f'  Copy this key now — you won\\'t see it again.')
+    print(f'  Configure in IDE: OPENAI_API_KEY={d[\"key\"]}')
+else:
+    print(f'✗ {d.get(\"error\", \"Unknown error\")}')
+"
+      ;;
+    revoke)
+      if [[ -z "${2:-}" ]]; then echo "Usage: ocp keys revoke <name|id>"; return 1; fi
+      _curl -sf --max-time 5 -X DELETE "$PROXY/api/keys/$2" | python3 -c "
+import sys, json
+d = json.loads(sys.stdin.read())
+if d.get('revoked'):
+    print(f'✓ Key \"{d[\"idOrName\"]}\" revoked.')
+else:
+    print(f'✗ Key not found or already revoked.')
+"
+      ;;
+    --help|-h)
+      cmd_keys_help
+      ;;
+    "")
+      _curl -sf --max-time 5 "$PROXY/api/keys" | python3 -c "
+import sys, json
+d = json.loads(sys.stdin.read())
+keys = d.get('keys', [])
+if not keys:
+    print('No API keys configured.')
+    print('Create one: ocp keys add <name>')
+else:
+    print('API Keys')
+    print('─────────────────────────────────────────────────')
+    for k in keys:
+        status = '✗ revoked' if k['revoked'] else '✓ active'
+        print(f'  {k[\"name\"]:<20} {k[\"keyPreview\"]:<20} {status}  {k[\"created_at\"]}')
+" 2>/dev/null || { echo "Error: proxy unreachable or key management not available"; exit 1; }
+      ;;
+    *)
+      echo "Unknown subcommand: $1"; cmd_keys_help; return 1 ;;
+  esac
+}
+
+# ── lan ─────────────────────────────────────────────────────────────────
+cmd_lan_help() {
+  cat <<'EOF'
+ocp lan — Quick LAN mode setup guide
+
+Shows current network configuration and connection instructions
+for other devices on the same network.
+
+Usage: ocp lan
+EOF
+}
+
+cmd_lan() {
+  local ip
+  ip=$(ipconfig getifaddr en0 2>/dev/null || ipconfig getifaddr en1 2>/dev/null || hostname -I 2>/dev/null | awk '{print $1}' || echo "unknown")
+  local port=3456
+
+  echo "OCP LAN Setup"
+  echo "─────────────────────────────────────"
+  echo ""
+  echo "  Your IP: $ip"
+  echo "  Port:    $port"
+  echo ""
+  echo "  For IDE users, set:"
+  echo "    OPENAI_BASE_URL=http://$ip:$port/v1"
+  echo "    OPENAI_API_KEY=<your-key>    (if auth enabled)"
+  echo ""
+  echo "  Dashboard: http://$ip:$port/dashboard"
+  echo ""
+
+  if curl -sf --max-time 2 "http://$ip:$port/health" > /dev/null 2>&1; then
+    echo "  Status: ✓ LAN-accessible"
+  else
+    echo "  Status: ✗ Not LAN-accessible (bound to localhost only)"
+    echo ""
+    echo "  To enable LAN mode, set env var and restart:"
+    echo "    CLAUDE_BIND=0.0.0.0"
+    echo "    ocp restart"
+  fi
 }
 
 # ── restart ──────────────────────────────────────────────────────────────
@@ -442,7 +599,7 @@ ocp — OpenClaw Proxy CLI
 Usage: ocp <command> [args]
 
 Commands:
-  usage              Plan usage limits
+  usage              Plan usage limits (--by-key for per-key stats)
   status             Quick overview (usage + health)
   health             Proxy diagnostics
   settings           View or update tunable settings
@@ -450,6 +607,8 @@ Commands:
   models             Available models
   sessions           Active sessions
   clear              Clear all sessions
+  keys               Manage API keys (add/list/revoke)
+  lan                LAN mode setup guide
   restart            Restart proxy
   restart gateway    Restart gateway
   update             Update OCP to latest version
@@ -484,7 +643,7 @@ for arg in "$@"; do
 done
 
 case "$subcmd" in
-  usage)    cmd_usage ;;
+  usage)    cmd_usage "${1:-}" ;;
   status)   cmd_status ;;
   health)   cmd_health ;;
   settings) cmd_settings "${1:-}" "${2:-}" ;;
@@ -492,6 +651,8 @@ case "$subcmd" in
   models)   cmd_models ;;
   sessions) cmd_sessions ;;
   clear)    cmd_clear ;;
+  keys)     cmd_keys "${1:-}" "${2:-}" ;;
+  lan)      cmd_lan ;;
   restart)  cmd_restart "${1:-}" ;;
   update)   cmd_update "${1:-}" ;;
   *)        echo "Unknown command: $subcmd"; echo ""; cmd_help; exit 1 ;;
