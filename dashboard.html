@@ -1,0 +1,245 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>OCP Dashboard</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; background: #0f172a; color: #e2e8f0; padding: 1.5rem; }
+  h1 { font-size: 1.5rem; margin-bottom: 1rem; color: #38bdf8; }
+  h2 { font-size: 1.1rem; margin: 1.5rem 0 0.5rem; color: #94a3b8; }
+  .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 1rem; margin-bottom: 1.5rem; }
+  .card { background: #1e293b; border-radius: 8px; padding: 1rem; }
+  .card .label { font-size: 0.75rem; color: #64748b; text-transform: uppercase; }
+  .card .value { font-size: 1.5rem; font-weight: 700; margin-top: 0.25rem; }
+  .card .sub { font-size: 0.8rem; color: #94a3b8; margin-top: 0.25rem; }
+  table { width: 100%; border-collapse: collapse; margin-top: 0.5rem; }
+  th, td { text-align: left; padding: 0.5rem 0.75rem; border-bottom: 1px solid #334155; font-size: 0.85rem; }
+  th { color: #64748b; font-weight: 600; }
+  .tag { display: inline-block; padding: 2px 8px; border-radius: 4px; font-size: 0.75rem; }
+  .tag-ok { background: #065f46; color: #6ee7b7; }
+  .tag-err { background: #7f1d1d; color: #fca5a5; }
+  .btn { background: #2563eb; color: white; border: none; padding: 0.5rem 1rem; border-radius: 6px; cursor: pointer; font-size: 0.85rem; }
+  .btn:hover { background: #1d4ed8; }
+  .btn-sm { padding: 0.25rem 0.5rem; font-size: 0.75rem; }
+  .btn-danger { background: #dc2626; }
+  .btn-danger:hover { background: #b91c1c; }
+  input { background: #1e293b; border: 1px solid #334155; color: #e2e8f0; padding: 0.4rem 0.75rem; border-radius: 6px; font-size: 0.85rem; }
+  .flex { display: flex; gap: 0.5rem; align-items: center; }
+  .mono { font-family: "SF Mono", "Fira Code", monospace; font-size: 0.8rem; }
+  .bar-bg { background: #334155; border-radius: 4px; height: 8px; overflow: hidden; margin-top: 0.5rem; }
+  .bar-fill { height: 100%; border-radius: 4px; transition: width 0.5s; }
+  .bar-blue { background: #3b82f6; }
+  .bar-amber { background: #f59e0b; }
+  .bar-red { background: #ef4444; }
+  #refresh-indicator { font-size: 0.75rem; color: #475569; }
+  .section { margin-bottom: 2rem; }
+</style>
+</head>
+<body>
+
+<div class="flex" style="justify-content: space-between; margin-bottom: 1.5rem;">
+  <h1>OCP Dashboard</h1>
+  <div class="flex">
+    <span id="refresh-indicator"></span>
+    <button class="btn btn-sm" onclick="refreshAll()">Refresh</button>
+  </div>
+</div>
+
+<div class="grid" id="status-cards"></div>
+
+<div class="section">
+  <h2>Plan Usage</h2>
+  <div class="grid" id="plan-cards"></div>
+</div>
+
+<div class="section">
+  <h2>Usage by Key</h2>
+  <table id="key-usage-table">
+    <thead><tr><th>Key</th><th>Requests</th><th>OK</th><th>Err</th><th>Avg Time</th><th>Last Request</th></tr></thead>
+    <tbody></tbody>
+  </table>
+</div>
+
+<div class="section" id="key-mgmt-section" style="display:none">
+  <h2>API Keys</h2>
+  <div class="flex" style="margin-bottom: 0.75rem;">
+    <input type="text" id="new-key-name" placeholder="Key name (e.g. wife-laptop)">
+    <button class="btn btn-sm" onclick="addKey()">Create Key</button>
+  </div>
+  <table id="keys-table">
+    <thead><tr><th>Name</th><th>Key</th><th>Created</th><th>Status</th><th></th></tr></thead>
+    <tbody></tbody>
+  </table>
+</div>
+
+<div class="section">
+  <h2>Recent Requests</h2>
+  <table id="recent-table">
+    <thead><tr><th>Time</th><th>Key</th><th>Model</th><th>Prompt</th><th>Response</th><th>Time</th><th>Status</th></tr></thead>
+    <tbody></tbody>
+  </table>
+</div>
+
+<script>
+const BASE = window.location.origin;
+const headers = {};
+const storedToken = localStorage.getItem("ocp_token");
+if (storedToken) headers["Authorization"] = `Bearer ${storedToken}`;
+
+async function api(path) {
+  const resp = await fetch(BASE + path, { headers });
+  if (resp.status === 401 || resp.status === 403) {
+    const token = prompt("Enter your OCP admin key:");
+    if (token) {
+      localStorage.setItem("ocp_token", token);
+      headers["Authorization"] = `Bearer ${token}`;
+      return api(path);
+    }
+  }
+  return resp.json();
+}
+
+async function apiPost(path, body) {
+  const resp = await fetch(BASE + path, {
+    method: "POST", headers: { ...headers, "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+  return resp.json();
+}
+
+async function apiDelete(path) {
+  const resp = await fetch(BASE + path, { method: "DELETE", headers });
+  return resp.json();
+}
+
+function fmtTime(ms) {
+  if (!ms) return "-";
+  return ms > 1000 ? (ms/1000).toFixed(1) + "s" : Math.round(ms) + "ms";
+}
+
+function fmtChars(n) {
+  if (!n) return "-";
+  return n > 1000 ? (n/1000).toFixed(0) + "K" : String(n);
+}
+
+function barColor(pct) {
+  if (pct >= 80) return "bar-red";
+  if (pct >= 50) return "bar-amber";
+  return "bar-blue";
+}
+
+async function refreshStatus() {
+  const data = await api("/status");
+  const p = data.proxy || {};
+  const r = data.requests || {};
+
+  document.getElementById("status-cards").innerHTML = `
+    <div class="card"><div class="label">Status</div><div class="value"><span class="tag ${p.status === 'ok' ? 'tag-ok' : 'tag-err'}">${p.status || '?'}</span></div><div class="sub">v${p.version || '?'}</div></div>
+    <div class="card"><div class="label">Uptime</div><div class="value">${p.uptime || '?'}</div></div>
+    <div class="card"><div class="label">Requests</div><div class="value">${r.total || 0}</div><div class="sub">${r.active || 0} active</div></div>
+    <div class="card"><div class="label">Errors</div><div class="value">${r.errors || 0}</div><div class="sub">${r.timeouts || 0} timeouts</div></div>
+    <div class="card"><div class="label">Sessions</div><div class="value">${p.activeSessions || 0}</div></div>
+  `;
+
+  const plan = data.plan;
+  if (plan && typeof plan === 'object' && !plan.error) {
+    const s = plan.currentSession || {};
+    const w = plan.weeklyLimits?.allModels || {};
+    const sPct = Math.round((s.utilization || 0) * 100);
+    const wPct = Math.round((w.utilization || 0) * 100);
+    document.getElementById("plan-cards").innerHTML = `
+      <div class="card">
+        <div class="label">Session (5h)</div>
+        <div class="value">${s.percent || '?'}</div>
+        <div class="bar-bg"><div class="bar-fill ${barColor(sPct)}" style="width:${sPct}%"></div></div>
+        <div class="sub">Resets in ${s.resetsIn || '?'}</div>
+      </div>
+      <div class="card">
+        <div class="label">Weekly (7d)</div>
+        <div class="value">${w.percent || '?'}</div>
+        <div class="bar-bg"><div class="bar-fill ${barColor(wPct)}" style="width:${wPct}%"></div></div>
+        <div class="sub">Resets in ${w.resetsIn || '?'}</div>
+      </div>
+    `;
+  }
+}
+
+async function refreshUsage() {
+  try {
+    const data = await api("/api/usage");
+    const tbody = document.querySelector("#key-usage-table tbody");
+    tbody.innerHTML = (data.byKey || []).map(k => `
+      <tr>
+        <td>${k.key_name}</td>
+        <td>${k.requests}</td>
+        <td>${k.successes}</td>
+        <td>${k.errors}</td>
+        <td>${fmtTime(k.avg_elapsed_ms)}</td>
+        <td class="mono">${k.last_request || '-'}</td>
+      </tr>
+    `).join("") || '<tr><td colspan="6" style="color:#475569">No usage data yet</td></tr>';
+
+    const rtbody = document.querySelector("#recent-table tbody");
+    rtbody.innerHTML = (data.recent || []).slice(0, 20).map(r => `
+      <tr>
+        <td class="mono">${r.created_at?.slice(11, 19) || '?'}</td>
+        <td>${r.key_name}</td>
+        <td>${r.model}</td>
+        <td>${fmtChars(r.prompt_chars)}</td>
+        <td>${fmtChars(r.response_chars)}</td>
+        <td>${fmtTime(r.elapsed_ms)}</td>
+        <td><span class="tag ${r.success ? 'tag-ok' : 'tag-err'}">${r.success ? 'ok' : 'err'}</span></td>
+      </tr>
+    `).join("") || '<tr><td colspan="7" style="color:#475569">No requests yet</td></tr>';
+  } catch(e) {
+    console.warn("Usage API not available:", e);
+  }
+}
+
+async function refreshKeys() {
+  try {
+    const data = await api("/api/keys");
+    document.getElementById("key-mgmt-section").style.display = "";
+    const tbody = document.querySelector("#keys-table tbody");
+    tbody.innerHTML = (data.keys || []).map(k => `
+      <tr>
+        <td>${k.name}</td>
+        <td class="mono">${k.keyPreview}</td>
+        <td class="mono">${k.created_at}</td>
+        <td><span class="tag ${k.revoked ? 'tag-err' : 'tag-ok'}">${k.revoked ? 'revoked' : 'active'}</span></td>
+        <td>${k.revoked ? '' : `<button class="btn btn-sm btn-danger" onclick="revokeKeyUI('${k.name}')">Revoke</button>`}</td>
+      </tr>
+    `).join("");
+  } catch(e) { /* not admin */ }
+}
+
+async function addKey() {
+  const name = document.getElementById("new-key-name").value.trim();
+  if (!name) return alert("Enter a key name");
+  const result = await apiPost("/api/keys", { name });
+  if (result.key) {
+    alert("New API Key (copy it now — you won't see it again):\n\n" + result.key);
+    document.getElementById("new-key-name").value = "";
+    refreshKeys();
+  }
+}
+
+async function revokeKeyUI(name) {
+  if (!confirm(`Revoke key "${name}"?`)) return;
+  await apiDelete(`/api/keys/${encodeURIComponent(name)}`);
+  refreshKeys();
+}
+
+async function refreshAll() {
+  document.getElementById("refresh-indicator").textContent = "Refreshing...";
+  await Promise.all([refreshStatus(), refreshUsage(), refreshKeys()]);
+  document.getElementById("refresh-indicator").textContent = `Updated ${new Date().toLocaleTimeString()}`;
+}
+
+refreshAll();
+setInterval(refreshAll, 30000);
+</script>
+</body>
+</html>
