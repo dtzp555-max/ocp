@@ -63,9 +63,9 @@ export function listKeys() {
   const d = getDb();
   return d.prepare(
     "SELECT id, key, name, created_at, revoked FROM api_keys ORDER BY created_at DESC"
-  ).all().map(k => ({
-    ...k,
-    keyPreview: k.key.slice(0, 8) + "..." + k.key.slice(-4),
+  ).all().map(({ key, ...rest }) => ({
+    ...rest,
+    keyPreview: key.slice(0, 8) + "..." + key.slice(-4),
   }));
 }
 

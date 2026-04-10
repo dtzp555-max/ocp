@@ -97,6 +97,10 @@ const BIND_ADDRESS = process.env.CLAUDE_BIND || "127.0.0.1";
 const AUTH_MODE = process.env.CLAUDE_AUTH_MODE || (PROXY_API_KEY ? "shared" : "none");
 const ADMIN_KEY = process.env.OCP_ADMIN_KEY || "";
 
+if (AUTH_MODE === "shared" && !PROXY_API_KEY) {
+  console.warn("WARNING: AUTH_MODE=shared but PROXY_API_KEY is not set — all requests will pass unauthenticated");
+}
+
 const VERSION = _pkg.version;
 const START_TIME = Date.now();
 
@@ -573,7 +577,7 @@ function callClaudeStreaming(model, messages, conversationId, res, authInfo = {}
 
     if (code !== 0) {
       recordModelError(cliModel, false);
-      recordUsage({ keyId: authInfo.keyId, keyName: authInfo.keyName, model, promptChars: 0, responseChars: 0, elapsedMs: elapsed, success: false });
+      try { recordUsage({ keyId: authInfo.keyId, keyName: authInfo.keyName, model, promptChars: messages.reduce((a, m) => a + (typeof m.content === "string" ? m.content.length : JSON.stringify(m.content).length), 0), responseChars: 0, elapsedMs: elapsed, success: false }); } catch (e) { logEvent("error", "usage_record_failed", { error: e.message }); }
       logEvent("error", "claude_exit", { model: cliModel, code, signal: signal || "none", elapsed, stderr: stderr.slice(0, 300) });
       trackError(stderr.slice(0, 300) || `claude exit ${code}`);
       handleSessionFailure();
@@ -591,7 +595,7 @@ function callClaudeStreaming(model, messages, conversationId, res, authInfo = {}
     } else {
       recordModelSuccess(cliModel, elapsed);
       breakerRecordSuccess(cliModel);
-      recordUsage({ keyId: authInfo.keyId, keyName: authInfo.keyName, model, promptChars: messages.reduce((a, m) => a + (typeof m.content === "string" ? m.content.length : JSON.stringify(m.content).length), 0), responseChars: totalChars, elapsedMs: elapsed, success: true });
+      try { recordUsage({ keyId: authInfo.keyId, keyName: authInfo.keyName, model, promptChars: messages.reduce((a, m) => a + (typeof m.content === "string" ? m.content.length : JSON.stringify(m.content).length), 0), responseChars: totalChars, elapsedMs: elapsed, success: true }); } catch (e) { logEvent("error", "usage_record_failed", { error: e.message }); }
       logEvent("info", "claude_ok", { model: cliModel, chars: totalChars, elapsed, session: convId ? convId.slice(0, 12) + "..." : "none" });
 
       if (!headersSent) ensureHeaders();
@@ -1010,9 +1014,9 @@ async function handleChatCompletions(req, res) {
     const content = await callClaude(model, messages, conversationId);
     const id = `chatcmpl-${randomUUID()}`;
     completionResponse(res, id, model, content);
-    recordUsage({ keyId: req._authKeyId, keyName: req._authKeyName, model, promptChars, responseChars: content.length, elapsedMs: Date.now() - t0Usage, success: true });
+    try { recordUsage({ keyId: req._authKeyId, keyName: req._authKeyName, model, promptChars, responseChars: content.length, elapsedMs: Date.now() - t0Usage, success: true }); } catch (e) { logEvent("error", "usage_record_failed", { error: e.message }); }
   } catch (err) {
-    recordUsage({ keyId: req._authKeyId, keyName: req._authKeyName, model, promptChars, responseChars: 0, elapsedMs: Date.now() - t0Usage, success: false });
+    try { recordUsage({ keyId: req._authKeyId, keyName: req._authKeyName, model, promptChars, responseChars: 0, elapsedMs: Date.now() - t0Usage, success: false }); } catch (e) { logEvent("error", "usage_record_failed", { error: e.message }); }
     console.error(`[proxy] error: ${err.message}`);
     if (res.headersSent || res.writableEnded || res.destroyed) {
       try { res.end(); } catch {}
@@ -1029,7 +1033,7 @@ const server = createServer(async (req, res) => {
   // Dynamic CORS: allow localhost and LAN origins
   const origin = req.headers["origin"] || "";
   const isAllowedOrigin = /^https?:\/\/(127\.0\.0\.1|localhost|192\.168\.\d+\.\d+|172\.(1[6-9]|2\d|3[01])\.\d+\.\d+|10\.\d+\.\d+\.\d+)(:\d+)?$/.test(origin);
-  res.setHeader("Access-Control-Allow-Origin", isAllowedOrigin ? origin : "*");
+  res.setHeader("Access-Control-Allow-Origin", isAllowedOrigin ? origin : `http://127.0.0.1:${PORT}`);
   res.setHeader("Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS, PATCH");
   res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization, X-Session-Id, X-Conversation-Id");
   if (req.method === "OPTIONS") { res.writeHead(204); res.end(); return; }
@@ -1056,9 +1060,16 @@ const server = createServer(async (req, res) => {
       if (!token) {
         return jsonResponse(res, 401, { error: { message: "Unauthorized: Bearer token required", type: "auth_error" } });
       }
-      if (ADMIN_KEY && token === ADMIN_KEY) {
-        authKeyName = "admin";
-      } else {
+      let isAdminToken = false;
+      if (ADMIN_KEY) {
+        const adminBuf = Buffer.from(ADMIN_KEY);
+        const tokenBuf2 = Buffer.from(token);
+        if (adminBuf.length === tokenBuf2.length && timingSafeEqual(adminBuf, tokenBuf2)) {
+          authKeyName = "admin";
+          isAdminToken = true;
+        }
+      }
+      if (!isAdminToken) {
         const keyInfo = validateKey(token);
         if (!keyInfo) {
           return jsonResponse(res, 401, { error: { message: "Unauthorized: invalid or revoked API key", type: "auth_error" } });
@@ -1167,7 +1178,7 @@ const server = createServer(async (req, res) => {
   }
 
   // ── Key management API ──
-  const isAdmin = AUTH_MODE !== "multi" || authKeyName === "admin" || BIND_ADDRESS === "127.0.0.1";
+  const isAdmin = AUTH_MODE !== "multi" || authKeyName === "admin";
 
   if (req.url === "/api/keys" && req.method === "POST") {
     if (!isAdmin) return jsonResponse(res, 403, { error: "Admin access required" });
@@ -1199,8 +1210,8 @@ const server = createServer(async (req, res) => {
     const until = url.searchParams.get("until");
     return jsonResponse(res, 200, {
       byKey: getUsageByKey({ since, until }),
-      timeline: getUsageTimeline({ hours: parseInt(url.searchParams.get("hours") || "24", 10) }),
-      recent: getRecentUsage(parseInt(url.searchParams.get("limit") || "50", 10)),
+      timeline: getUsageTimeline({ hours: Math.min(parseInt(url.searchParams.get("hours") || "24", 10), 720) }),
+      recent: getRecentUsage(Math.min(parseInt(url.searchParams.get("limit") || "50", 10), 500)),
     });
   }
 
