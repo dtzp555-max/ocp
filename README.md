@@ -303,6 +303,22 @@ Add to `~/.openclaw/openclaw.json`:
 
 Restart: `openclaw gateway restart`
 
+### Telegram / Discord Usage
+
+After installing the gateway plugin, use `/ocp` slash commands in your chat:
+
+```
+/ocp status        — Quick overview
+/ocp usage         — Plan usage limits & model stats
+/ocp models        — Available models
+/ocp health        — Proxy diagnostics
+/ocp keys          — List all API keys (multi mode)
+/ocp keys add <name>   — Create a new key
+/ocp keys revoke <name> — Revoke a key
+```
+
+> **Note:** Terminal CLI uses `ocp <command>`, Telegram/Discord uses `/ocp <command>`.
+
 ## Troubleshooting
 
 ### Requests fail with exit 143 / SIGTERM after ~60 seconds
