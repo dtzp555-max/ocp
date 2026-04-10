@@ -1,6 +1,6 @@
 # OCP — Open Claude Proxy
 
-> **Status: Stable (v3.3.1)** — Feature-complete. Bug fixes only.
+> **Status: Stable (v3.4.0)** — Feature-complete. Bug fixes only.
 
 > **Already paying for Claude Pro/Max? Use your subscription as an OpenAI-compatible API — $0 extra cost.**
 
@@ -54,6 +54,65 @@ export OPENAI_BASE_URL=http://127.0.0.1:3456/v1
 curl http://127.0.0.1:3456/v1/models
 # Returns: claude-opus-4-6, claude-sonnet-4-6, claude-haiku-4
 ```
+
+## LAN Mode — Share with Family
+
+OCP can serve your entire household from a single machine.
+
+### Enable LAN Access
+
+```bash
+# Set bind address and restart
+export CLAUDE_BIND=0.0.0.0
+ocp restart
+```
+
+Or permanently via setup:
+```bash
+node setup.mjs --bind 0.0.0.0 --auth-mode multi
+```
+
+### Auth Modes
+
+| Mode | Env | Description |
+|------|-----|-------------|
+| `none` | `CLAUDE_AUTH_MODE=none` | Open access (trusted network) |
+| `shared` | `CLAUDE_AUTH_MODE=shared` | Single key via `PROXY_API_KEY` |
+| `multi` | `CLAUDE_AUTH_MODE=multi` | Per-user keys with usage tracking |
+
+### Multi-Key Setup
+
+```bash
+# Create keys for family members
+ocp keys add wife-laptop
+ocp keys add son-ipad
+
+# List keys
+ocp keys
+
+# View per-key usage
+ocp usage --by-key
+
+# Revoke a key
+ocp keys revoke son-ipad
+```
+
+### Family Member Setup
+
+Give your family member these settings for their IDE:
+
+```
+OPENAI_BASE_URL=http://<your-ip>:3456/v1
+OPENAI_API_KEY=ocp_<their-key>
+```
+
+Run `ocp lan` to see your IP and connection guide.
+
+### Web Dashboard
+
+Access the usage dashboard at: `http://<your-ip>:3456/dashboard`
+
+Shows real-time stats: per-key usage, request history, plan utilization, and system health.
 
 ## Built-in Usage Monitoring
 
