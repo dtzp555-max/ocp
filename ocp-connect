@@ -103,15 +103,21 @@ main() {
 
   # Step 3: Determine if key is needed
   if [[ "$auth_mode" != "none" && -z "$key" ]]; then
-    echo "  Remote requires authentication."
-    echo "  Ask the OCP admin to run:  ocp keys add <name>"
-    printf "  Enter API key (or press Enter to skip): "
-    read -rs key </dev/tty
-    echo
-    if [[ -z "$key" ]]; then
+    # Try anonymous access first (zero-config: server may allow it)
+    if curl -sf --max-time 5 "$base_url/v1/models" >/dev/null 2>&1; then
+      echo "  Server allows anonymous access — no key needed."
       echo ""
-      echo "  ✗ No key provided — cannot connect to an auth-required remote without a key."
-      exit 1
+    else
+      echo "  Remote requires authentication."
+      echo "  Ask the OCP admin to run:  ocp keys add <name>"
+      printf "  Enter API key (or press Enter to skip): "
+      read -rs key </dev/tty
+      echo
+      if [[ -z "$key" ]]; then
+        echo ""
+        echo "  ✗ No key provided — cannot connect to an auth-required remote without a key."
+        exit 1
+      fi
     fi
   fi
 

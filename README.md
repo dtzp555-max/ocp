@@ -1,6 +1,6 @@
 # OCP — Open Claude Proxy
 
-> **Status: Stable (v3.5.0)** — Feature-complete. Bug fixes only.
+> **Status: Stable (v3.5.1)** — Feature-complete. Bug fixes only.
 
 > **Already paying for Claude Pro/Max? Use your subscription as an OpenAI-compatible API — $0 extra cost.**
 
@@ -111,17 +111,22 @@ curl http://127.0.0.1:3456/v1/models
 ```bash
 curl -fsSL https://raw.githubusercontent.com/dtzp555-max/ocp/main/ocp-connect -o ocp-connect
 chmod +x ocp-connect
+./ocp-connect <server-ip>
+```
+
+If the server requires a key, pass it with `--key`:
+```bash
 ./ocp-connect <server-ip> --key <your-api-key>
 ```
 
 Or as a one-liner (no file saved):
 ```bash
-curl -fsSL https://raw.githubusercontent.com/dtzp555-max/ocp/main/ocp-connect | bash -s -- <server-ip> --key <your-api-key>
+curl -fsSL https://raw.githubusercontent.com/dtzp555-max/ocp/main/ocp-connect | bash -s -- <server-ip>
 ```
 
 Example:
 ```
-$ ./ocp-connect 192.168.1.100 --key ocp_xDYzOB9ZKYzn
+$ ./ocp-connect 192.168.1.100
 
 OCP Connect
 ─────────────────────────────────────
@@ -130,14 +135,15 @@ OCP Connect
   Checking connectivity...
   ✓ Connected
 
-  Remote OCP v3.5.0  (auth: multi)
+  Remote OCP v3.5.1  (auth: multi)
+
+  Server allows anonymous access — no key needed.
 
   Testing API access...
   ✓ API accessible (3 models available)
 
   Written to /home/user/.bashrc:
     OPENAI_BASE_URL=http://192.168.1.100:3456/v1
-    OPENAI_API_KEY=ocp_xDYz...
 
   Running smoke test...
   ✓ Smoke test passed: OK
