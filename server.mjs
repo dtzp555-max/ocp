@@ -664,7 +664,7 @@ function completionResponse(res, id, model, content) {
 // Caches the result for 5 minutes to avoid excessive API calls.
 
 let usageCache = { data: null, fetchedAt: 0 };
-const USAGE_CACHE_TTL = 300000; // 5 min
+const USAGE_CACHE_TTL = 900000; // 15 min
 const OAUTH_CLIENT_ID = "9d1c250a-e61b-44d9-88ed-5944d1962f5e";
 const OAUTH_TOKEN_URL = "https://platform.claude.com/v1/oauth/token";
 const OAUTH_BETA_HEADER = "oauth-2025-04-20";
@@ -853,6 +853,9 @@ async function handleUsage(_req, res) {
     data = await fetchUsageFromApi();
     if (!data.error) {
       usageCache = { data, fetchedAt: now };
+    } else if (usageCache.data) {
+      // Fallback to stale cache on error (e.g. 429 rate limit)
+      data = { ...usageCache.data, _stale: true, _fetchError: data.error };
     }
   }
   // Always attach live model stats and proxy stats (not cached)
@@ -922,7 +925,11 @@ async function handleStatus(_req, res) {
     usage = usageCache.data;
   } else {
     usage = await fetchUsageFromApi();
-    if (!usage.error) usageCache = { data: usage, fetchedAt: now };
+    if (!usage.error) {
+      usageCache = { data: usage, fetchedAt: now };
+    } else if (usageCache.data) {
+      usage = { ...usageCache.data, _stale: true };
+    }
   }
 
   // Auth
