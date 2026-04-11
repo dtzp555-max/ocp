@@ -419,6 +419,7 @@ If you installed OCP before v3.1.0, the auto-start service used names that OpenC
 | `CLAUDE_SESSION_TTL` | `3600000` | Session expiry (ms, default: 1 hour) |
 | `CLAUDE_ALLOWED_TOOLS` | `Bash,Read,...,Agent` | Comma-separated tools to pre-approve |
 | `CLAUDE_SKIP_PERMISSIONS` | `false` | Bypass all permission checks |
+| `CLAUDE_NO_CONTEXT` | `false` | Suppress CLAUDE.md and auto-memory injection (pure API mode) |
 | `PROXY_API_KEY` | *(unset)* | Bearer token for shared-mode authentication |
 
 ## Security

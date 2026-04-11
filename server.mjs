@@ -94,6 +94,7 @@ const BREAKER_COOLDOWN = parseInt(process.env.CLAUDE_BREAKER_COOLDOWN || "120000
 const BREAKER_WINDOW = parseInt(process.env.CLAUDE_BREAKER_WINDOW || "300000", 10);
 const BREAKER_HALF_OPEN_MAX = parseInt(process.env.CLAUDE_BREAKER_HALF_OPEN_MAX || "2", 10);
 const BIND_ADDRESS = process.env.CLAUDE_BIND || "127.0.0.1";
+const NO_CONTEXT = process.env.CLAUDE_NO_CONTEXT === "true";
 const AUTH_MODE = process.env.CLAUDE_AUTH_MODE || (PROXY_API_KEY ? "shared" : "none");
 const ADMIN_KEY = process.env.OCP_ADMIN_KEY || "";
 
@@ -415,6 +416,12 @@ function spawnClaudeProcess(model, messages, conversationId) {
   delete env.ANTHROPIC_API_KEY;
   delete env.ANTHROPIC_BASE_URL;
   delete env.ANTHROPIC_AUTH_TOKEN;
+
+  // Pure API mode: suppress Claude Code context injection while preserving OAuth auth
+  if (NO_CONTEXT) {
+    env.CLAUDE_CODE_DISABLE_CLAUDE_MDS = "1";
+    env.CLAUDE_CODE_DISABLE_AUTO_MEMORY = "1";
+  }
 
   const proc = spawn(CLAUDE, cliArgs, { env, stdio: ["pipe", "pipe", "pipe"] });
   activeProcesses.add(proc);
@@ -1367,6 +1374,7 @@ server.listen(PORT, BIND_ADDRESS, () => {
   console.log(`Auth: ${PROXY_API_KEY ? "enabled (PROXY_API_KEY set)" : "disabled (no PROXY_API_KEY)"}`);
   console.log(`Auth mode: ${AUTH_MODE}${AUTH_MODE === "shared" ? " (PROXY_API_KEY)" : AUTH_MODE === "multi" ? " (per-user keys)" : " (open)"}`);
   console.log(`Bind: ${BIND_ADDRESS}${BIND_ADDRESS === "0.0.0.0" ? " ⚠ LAN-accessible" : ""}`);
+  if (NO_CONTEXT) console.log(`Context: suppressed (CLAUDE_NO_CONTEXT=true — no CLAUDE.md, no auto-memory)`);
   console.log(`---`);
   console.log(`Coexistence: This proxy does NOT conflict with Claude Code interactive mode.`);
   console.log(`  OCP uses: localhost:${PORT} (HTTP) → claude -p (per-request process)`);
