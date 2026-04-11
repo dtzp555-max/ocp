@@ -1046,11 +1046,26 @@ const server = createServer(async (req, res) => {
   let authKeyName = isLocalhost ? "local" : "remote";
   let authKeyId = null;
 
-  if (!isPublicEndpoint && !isLocalhost) {
+  if (!isPublicEndpoint) {
     const auth = req.headers["authorization"] || "";
     const token = auth.startsWith("Bearer ") ? auth.slice(7) : "";
 
-    if (AUTH_MODE === "shared") {
+    if (isLocalhost) {
+      // Localhost always allowed — try to identify key if provided, but never reject
+      if (token) {
+        if (ADMIN_KEY) {
+          const adminBuf = Buffer.from(ADMIN_KEY);
+          const tokenBuf = Buffer.from(token);
+          if (adminBuf.length === tokenBuf.length && timingSafeEqual(adminBuf, tokenBuf)) {
+            authKeyName = "admin";
+          }
+        }
+        if (authKeyName !== "admin") {
+          const keyInfo = validateKey(token);
+          if (keyInfo) { authKeyName = keyInfo.name; authKeyId = keyInfo.id; }
+        }
+      }
+    } else if (AUTH_MODE === "shared") {
       if (PROXY_API_KEY) {
         const tokenBuf = Buffer.from(token);
         const keyBuf = Buffer.from(PROXY_API_KEY);
@@ -1060,25 +1075,27 @@ const server = createServer(async (req, res) => {
         authKeyName = "shared";
       }
     } else if (AUTH_MODE === "multi") {
-      if (!token) {
-        return jsonResponse(res, 401, { error: { message: "Unauthorized: Bearer token required", type: "auth_error" } });
-      }
-      let isAdminToken = false;
-      if (ADMIN_KEY) {
-        const adminBuf = Buffer.from(ADMIN_KEY);
-        const tokenBuf2 = Buffer.from(token);
-        if (adminBuf.length === tokenBuf2.length && timingSafeEqual(adminBuf, tokenBuf2)) {
-          authKeyName = "admin";
-          isAdminToken = true;
+      // If a token is provided, validate it; if not, allow as anonymous
+      if (token) {
+        let isAdminToken = false;
+        if (ADMIN_KEY) {
+          const adminBuf = Buffer.from(ADMIN_KEY);
+          const tokenBuf2 = Buffer.from(token);
+          if (adminBuf.length === tokenBuf2.length && timingSafeEqual(adminBuf, tokenBuf2)) {
+            authKeyName = "admin";
+            isAdminToken = true;
+          }
         }
-      }
-      if (!isAdminToken) {
-        const keyInfo = validateKey(token);
-        if (!keyInfo) {
-          return jsonResponse(res, 401, { error: { message: "Unauthorized: invalid or revoked API key", type: "auth_error" } });
+        if (!isAdminToken) {
+          const keyInfo = validateKey(token);
+          if (!keyInfo) {
+            return jsonResponse(res, 401, { error: { message: "Unauthorized: invalid or revoked API key", type: "auth_error" } });
+          }
+          authKeyName = keyInfo.name;
+          authKeyId = keyInfo.id;
         }
-        authKeyName = keyInfo.name;
-        authKeyId = keyInfo.id;
+      } else {
+        authKeyName = "anonymous";
       }
     }
   }
@@ -1182,7 +1199,7 @@ const server = createServer(async (req, res) => {
   }
 
   // ── Key management API ──
-  const isAdmin = AUTH_MODE !== "multi" || authKeyName === "admin";
+  const isAdmin = AUTH_MODE !== "multi" || authKeyName === "admin" || isLocalhost;
 
   if (req.url === "/api/keys" && req.method === "POST") {
     if (!isAdmin) return jsonResponse(res, 403, { error: "Admin access required" });
