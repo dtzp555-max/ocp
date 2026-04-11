@@ -1041,10 +1041,12 @@ const server = createServer(async (req, res) => {
   // 3-mode auth: none | shared | multi
   const pathname = req.url.split("?")[0];
   const isPublicEndpoint = pathname === "/health" || pathname === "/dashboard";
-  let authKeyName = "local";
+  const remoteAddr = req.socket.remoteAddress || "";
+  const isLocalhost = remoteAddr === "127.0.0.1" || remoteAddr === "::1" || remoteAddr === "::ffff:127.0.0.1";
+  let authKeyName = isLocalhost ? "local" : "remote";
   let authKeyId = null;
 
-  if (!isPublicEndpoint) {
+  if (!isPublicEndpoint && !isLocalhost) {
     const auth = req.headers["authorization"] || "";
     const token = auth.startsWith("Bearer ") ? auth.slice(7) : "";
 
