@@ -11,7 +11,7 @@
 #
 set -euo pipefail
 
-OCP_CONNECT_VERSION="1.1.0"
+OCP_CONNECT_VERSION="1.2.0"
 
 show_version() {
   echo "ocp-connect $OCP_CONNECT_VERSION"
@@ -347,31 +347,94 @@ for m in d.get('data',[]):
   # --- Other IDEs: print manual instructions ---
   local other_ides_shown=false
 
-  # Detect Cline (VS Code extension)
-  if [[ -d "$HOME/.vscode/extensions" ]] && ls "$HOME/.vscode/extensions/" 2>/dev/null | grep -qi cline; then
-    if ! $other_ides_shown; then
-      echo "  Other IDEs detected:"
-      other_ides_shown=true
-    fi
-    echo "    • Cline: Settings → OPENAI_BASE_URL = $base_url/v1"
+  # Collect VS Code extension list once (reused by Cline and Continue.dev checks)
+  local _vscode_exts=""
+  if command -v code &>/dev/null; then
+    _vscode_exts=$(code --list-extensions 2>/dev/null || true)
+  fi
+  if [[ -z "$_vscode_exts" && -d "$HOME/.vscode/extensions" ]]; then
+    _vscode_exts=$(ls "$HOME/.vscode/extensions/" 2>/dev/null || true)
   fi
 
-  # Detect Continue.dev
-  if [[ -f "$HOME/.continue/config.json" ]]; then
-    if ! $other_ides_shown; then
-      echo "  Other IDEs detected:"
-      other_ides_shown=true
-    fi
-    echo "    • Continue.dev: ~/.continue/config.json → apiBase: \"$base_url/v1\""
+  # Extract model IDs from /v1/models response for use in hints
+  local _model_ids
+  _model_ids=$(echo "$models_out" | python3 -c "
+import sys,json
+try:
+    d=json.loads(sys.stdin.read())
+    print(', '.join(m['id'] for m in d.get('data', [])))
+except Exception:
+    print('claude-sonnet-4-6, claude-opus-4-6, claude-haiku-4-5-20251001')
+" 2>/dev/null || echo "claude-sonnet-4-6, claude-opus-4-6, claude-haiku-4-5-20251001")
+
+  # Key display: truncate if longer than 16 chars to avoid screenshot leakage,
+  # show explicit "(none)" in anonymous mode so users don't paste blank fields.
+  local _key_display
+  if [[ -z "$key" ]]; then
+    _key_display="(none — anonymous mode; most external IDEs require a non-empty API Key)"
+  elif [[ ${#key} -gt 16 ]]; then
+    _key_display="${key:0:8}...${key: -4}"
+  else
+    _key_display="$key"
   fi
 
-  # Detect Cursor
-  if command -v cursor &>/dev/null || [[ -d "$HOME/.cursor" ]]; then
+  # Detect Cline (VS Code extension saoudrizwan.claude-dev, see issue #12)
+  if echo "$_vscode_exts" | grep -qiE 'cline|saoudrizwan\.claude-dev'; then
     if ! $other_ides_shown; then
       echo "  Other IDEs detected:"
       other_ides_shown=true
     fi
-    echo "    • Cursor: Settings → OpenAI Base URL = $base_url/v1"
+    echo "    • Cline: VSCode → Cline panel → Settings → API Provider = \"OpenAI Compatible\""
+    echo "        Base URL: $base_url/v1"
+    echo "        API Key:  $_key_display"
+    echo "        Model ID: $_model_ids"
+  fi
+
+  # Detect Continue.dev (extension ID continue.continue or config file, see issue #12)
+  if echo "$_vscode_exts" | grep -qi 'continue\.continue' \
+     || [[ -f "$HOME/.continue/config.yaml" ]] \
+     || [[ -f "$HOME/.continue/config.json" ]]; then
+    if ! $other_ides_shown; then
+      echo "  Other IDEs detected:"
+      other_ides_shown=true
+    fi
+    echo "    • Continue.dev: edit ~/.continue/config.yaml — add under \`models:\` (top-level key):"
+    echo "        models:"
+    echo "          - name: OCP Sonnet"
+    echo "            provider: openai"
+    echo "            model: claude-sonnet-4-6"
+    echo "            apiBase: $base_url/v1"
+    echo "            apiKey: $_key_display"
+    echo "        (other model IDs: $_model_ids)"
+  fi
+
+  # Detect Cursor (command, ~/.cursor dir, or /Applications/Cursor.app, see issue #12)
+  if command -v cursor &>/dev/null \
+     || [[ -d "$HOME/.cursor" ]] \
+     || [[ -d "/Applications/Cursor.app" ]]; then
+    if ! $other_ides_shown; then
+      echo "  Other IDEs detected:"
+      other_ides_shown=true
+    fi
+    echo "    • Cursor: Cmd+Shift+P → 'Cursor Settings' → Models →"
+    echo "        OpenAI API Key:           $_key_display"
+    echo "        Override OpenAI Base URL: $base_url/v1"
+    echo "        Custom OpenAI Models:     $_model_ids"
+  fi
+
+  # Detect opencode (https://opencode.ai, SST team CLI, see issue #12)
+  if command -v opencode &>/dev/null \
+     || [[ -x "$HOME/.opencode/bin/opencode" ]] \
+     || [[ -d "$HOME/.local/share/opencode" ]]; then
+    if ! $other_ides_shown; then
+      echo "  Other IDEs detected:"
+      other_ides_shown=true
+    fi
+    echo "    • opencode: not yet auto-configured by ocp-connect (PR follow-up)."
+    echo "        Run \`opencode providers login openai\` and provide:"
+    echo "          Base URL: $base_url/v1"
+    echo "          API Key:  $_key_display"
+    echo "        Available model IDs: $_model_ids"
   fi
 
   if $other_ides_shown; then
