@@ -222,6 +222,23 @@ ocp keys revoke son-ipad   # Revoke a key
 | `shared` | `CLAUDE_AUTH_MODE=shared` + `PROXY_API_KEY=xxx` | Everyone shares one key |
 | `multi` | `CLAUDE_AUTH_MODE=multi` + `OCP_ADMIN_KEY=xxx` | Per-person keys with usage tracking (recommended) |
 
+### Anonymous Access (optional)
+
+In `multi` mode, the admin can designate a single well-known "anonymous" key that bypasses `validateKey()` and grants public read/write access. This is useful for letting LAN users (or clients like OpenClaw multi-agent setups) connect without individual per-user keys.
+
+**Enable**:
+
+```bash
+export PROXY_ANONYMOUS_KEY=ocp_public_anon   # or any string of your choice
+ocp start                                    # or however you start the server
+```
+
+**Client side**: the anonymous key value is exposed via `GET /health` as the field `anonymousKey` (null when not set). Clients like `ocp-connect` can auto-discover and use it, so the end user doesn't need to get a personal key from the admin.
+
+**Security note**: setting this env var is an **opt-in** to public access — anyone who can reach your OCP endpoint can use it, up to any rate limits you configure. Don't enable this on internet-exposed OCP instances without additional protection.
+
+**Not a secret**: because `/health` is an unauthenticated endpoint, the anonymous key is **publicly readable** by anyone who can reach the server. That is intentional — the key exists so clients can self-configure without out-of-band coordination. Treat it as a convenience handle, not as an access credential.
+
 ### Important Notes
 
 - All users share your Claude Pro/Max **rate limits** (5h session + 7d weekly)
