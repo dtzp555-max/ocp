@@ -11,6 +11,12 @@
 #
 set -euo pipefail
 
+OCP_CONNECT_VERSION="1.1.0"
+
+show_version() {
+  echo "ocp-connect $OCP_CONNECT_VERSION"
+}
+
 show_help() {
   cat <<'EOF'
 ocp-connect — Connect this machine to a remote OCP (Open Claude Proxy)
@@ -24,6 +30,7 @@ Usage:
 Options:
   --port PORT      Port OCP listens on (default: 3456)
   --key  API_KEY   API key (prompted interactively if remote requires auth)
+  --version        Print version and exit
   --help, -h       Show this help
 
 Examples:
@@ -36,7 +43,8 @@ What it does:
   2. Verifies your API key (if auth is enabled)
   3. Writes OPENAI_BASE_URL and OPENAI_API_KEY to ~/.bashrc or ~/.zshrc
   4. Sets system-level env vars (launchctl on macOS, systemd on Linux)
-  5. Detects and configures IDEs (OpenClaw, Cline, Continue.dev, Cursor)
+  5. Configures OpenClaw automatically; prints setup hints for other IDEs
+     (Cline, Continue.dev, Cursor — manual configuration required)
   6. Runs a smoke test to confirm everything works
 
 After running, reload your shell:  source ~/.bashrc  (or ~/.zshrc)
@@ -60,14 +68,14 @@ configure_ides() {
     echo ""
     printf "  Configure OpenClaw to use this OCP? [Y/n] "
     local oc_answer
-    read -r oc_answer </dev/tty 2>/dev/null || oc_answer="y"
+    { read -r oc_answer </dev/tty; } 2>/dev/null || oc_answer="y"
     oc_answer="${oc_answer:-y}"
 
     if [[ "$oc_answer" =~ ^[Yy]$ ]]; then
       # Ask for provider name
       printf "  Provider name (models show as <name>/model-id) [ocp]: "
       local provider_name
-      read -r provider_name </dev/tty 2>/dev/null || provider_name=""
+      { read -r provider_name </dev/tty; } 2>/dev/null || provider_name=""
       provider_name="${provider_name:-ocp}"
       # Sanitize: only allow alphanumeric, dash, underscore
       provider_name=$(echo "$provider_name" | tr -cd 'a-zA-Z0-9_-')
@@ -81,7 +89,7 @@ configure_ides() {
       echo ""
       printf "  Choice [1]: "
       local priority_choice
-      read -r priority_choice </dev/tty 2>/dev/null || priority_choice="1"
+      { read -r priority_choice </dev/tty; } 2>/dev/null || priority_choice="1"
       priority_choice="${priority_choice:-1}"
 
       echo ""
@@ -222,6 +230,90 @@ if priority == "1":
 with open(config_path, "w") as f:
     json.dump(config, f, indent=2, ensure_ascii=False)
     f.write("\n")
+
+# === B1 fix: seed per-agent auth-profiles.json for OpenClaw multi-agent setups ===
+# OpenClaw's per-agent auth loader reads <agentDir>/auth-profiles.json (NOT the
+# root openclaw.json's auth.profiles section). Without a real key in each agent's
+# agentDir, OpenClaw rejects the lane with "No API key found for provider X".
+# See https://github.com/dtzp555-max/ocp/issues/12 for the full investigation.
+_seeded = []
+_failed = []
+_skipped_anonymous = []
+_profile_key = provider_name + ":default"
+# OpenClaw stores per-agent auth in <openclaw_root>/agents/<id>/agent/ when
+# the agent has no explicit `agentDir` field — derive that path so the
+# default `main` agent (which never sets agentDir) is also seeded.
+_openclaw_root = os.path.dirname(config_path)
+for _agent in config.get("agents", {}).get("list", []):
+    _agent_dir = _agent.get("agentDir")
+    if not _agent_dir:
+        _agent_id = _agent.get("id")
+        if not _agent_id:
+            continue
+        _agent_dir = os.path.join(_openclaw_root, "agents", _agent_id, "agent")
+    if not api_key:
+        # Anonymous mode is incompatible with OpenClaw per-agent auth (empty key
+        # is dropped by OpenClaw's pi-auth-credentials). Per OCP issue #12 §14
+        # decision: take Path C (require --key for OpenClaw multi-agent setups).
+        _skipped_anonymous.append(_agent_dir)
+        continue
+    _profiles_path = os.path.join(_agent_dir, "auth-profiles.json")
+    try:
+        os.makedirs(_agent_dir, exist_ok=True)
+    except OSError as _e:
+        _failed.append((_profiles_path, "mkdir: " + str(_e)))
+        continue
+    if os.path.exists(_profiles_path):
+        try:
+            with open(_profiles_path) as _f:
+                _ap = json.load(_f)
+        except json.JSONDecodeError:
+            # Corrupted JSON — back up and rebuild from scratch.
+            _bak = _profiles_path + ".bak"
+            try:
+                os.rename(_profiles_path, _bak)
+                print(f"    ⚠ {_profiles_path} was corrupt; backed up to {_bak}")
+            except OSError:
+                pass
+            _ap = {"version": 1, "profiles": {}}
+        except OSError as _e:
+            # Read failure (permissions, disk) — skip to AVOID clobbering
+            # the user's existing profile (which may hold other providers' keys).
+            _failed.append((_profiles_path, "read: " + str(_e)))
+            continue
+    else:
+        _ap = {"version": 1, "profiles": {}}
+    _ap.setdefault("version", 1)
+    _ap.setdefault("profiles", {})
+    _ap["profiles"][_profile_key] = {
+        "type": "api_key",
+        "provider": provider_name,
+        "key": api_key
+    }
+    try:
+        with open(_profiles_path, "w") as _f:
+            json.dump(_ap, _f, indent=2, ensure_ascii=False)
+            _f.write("\n")
+        os.chmod(_profiles_path, 0o600)
+        _seeded.append(_profiles_path)
+    except OSError as _e:
+        _failed.append((_profiles_path, "write: " + str(_e)))
+
+# Report — all three sections are independent (mixed scenarios are surfaced).
+if _seeded:
+    print(f"    ✓ Per-agent auth profile seeded ({len(_seeded)}):")
+    for _p in _seeded:
+        print(f"      • {_p}")
+if _failed:
+    print(f"    ⚠ Per-agent auth profile FAILED ({len(_failed)}):")
+    for _p, _err in _failed:
+        print(f"      • {_p}: {_err}")
+    print("      OpenClaw will report \"No API key found\" for the failed agents.")
+    print("      Fix the underlying error (permissions / disk) and re-run ocp-connect.")
+if _skipped_anonymous:
+    print(f"    ⚠ OpenClaw multi-agent mode detected ({len(_skipped_anonymous)} agents).")
+    print("      Anonymous mode does not work for OpenClaw per-agent auth.")
+    print("      Re-run with: ocp-connect <host> --key ocp_xxx")
 PYEOF
 
       if [[ $py_ok -eq 1 ]]; then
@@ -295,6 +387,7 @@ main() {
     case "$1" in
       --port)  port="${2:?'--port requires a value'}"; shift 2 ;;
       --key)   key="${2:?'--key requires a value'}"; shift 2 ;;
+      --version) show_version; exit 0 ;;
       --help|-h) show_help; exit 0 ;;
       -*)      echo "Unknown option: $1"; show_help; exit 1 ;;
       *)       host="$1"; shift ;;
@@ -323,7 +416,7 @@ main() {
 
   local base_url="http://$host:$port"
 
-  echo "OCP Connect"
+  echo "OCP Connect v$OCP_CONNECT_VERSION"
   echo "─────────────────────────────────────"
   echo "  Remote: $base_url"
   echo ""
@@ -357,11 +450,12 @@ main() {
       echo "  Remote requires authentication."
       echo "  Ask the OCP admin to run:  ocp keys add <name>"
       printf "  Enter API key (or press Enter to skip): "
-      read -rs key </dev/tty
+      { read -rs key </dev/tty; } 2>/dev/null || key=""
       echo
       if [[ -z "$key" ]]; then
         echo ""
         echo "  ✗ No key provided — cannot connect to an auth-required remote without a key."
+        echo "    Use:  ocp-connect $host --key <key>"
         exit 1
       fi
     fi
@@ -509,6 +603,9 @@ PYEOF
     local reply
     reply=$(echo "$chat_out" | python3 -c "import sys,json; d=json.loads(sys.stdin.read()); print(d['choices'][0]['message']['content'].strip())" 2>/dev/null || echo "(response received)")
     echo "  ✓ Smoke test passed: $reply"
+    echo "    Note: smoke test only verifies OCP is reachable and the key is valid."
+    echo "    It does not verify your IDE/agent end-to-end. To verify OpenClaw works,"
+    echo "    restart it (\`openclaw gateway restart\`) and send a test message to your bot."
   else
     echo "  ⚠ Smoke test failed (proxy is reachable but chat completion did not succeed)."
     echo "    The env vars have still been written. Check the remote OCP logs."
