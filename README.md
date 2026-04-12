@@ -391,51 +391,24 @@ After installing the gateway plugin, use `/ocp` slash commands in your chat:
 
 ## Troubleshooting
 
-### Requests fail with exit 143 / SIGTERM after ~60 seconds
-
-**Symptom:** Claude returns errors or stops responding after about 60 seconds, especially during tool use (Bash, Read, etc.).
-
-**Cause:** OpenClaw's gateway has a default `idleTimeoutSeconds` of 60 seconds. When Claude calls tools, the token stream pauses while the tool executes — if that takes longer than 60s, the gateway kills the connection.
-
-**Fix:** `setup.mjs` (v3.2.1+) sets this automatically. If you installed an older version, add this to `~/.openclaw/openclaw.json`:
-
-```json
-{
-  "agents": {
-    "defaults": {
-      "llm": {
-        "idleTimeoutSeconds": 0
-      }
-    }
-  }
-}
-```
-
-Then restart: `openclaw gateway restart`
-
-### Agents stuck in "typing" but never respond
-
-Usually caused by stuck sessions from previous timeout errors. Fix:
+### Requests fail or agents stuck
 
 ```bash
-# Clear all sessions
+# Clear sessions and restart
 ocp clear
-
-# Restart both services
 ocp restart
+
+# If using OpenClaw gateway
 openclaw gateway restart
 ```
 
-If that doesn't help, manually clear the session store:
+### Usage shows "unknown"
+
+Usually caused by an expired Claude CLI session. Fix:
 ```bash
-# Find and reset stuck Telegram sessions
-cat ~/.openclaw/agents/main/sessions/sessions.json
-# Remove entries with "telegram" channel, then restart gateway
+claude auth login
+ocp restart
 ```
-
-## Upgrading from v3.0.x
-
-If you installed OCP before v3.1.0, the auto-start service used names that OpenClaw's gateway detected as conflicting (`ai.openclaw.proxy` on macOS, `openclaw-proxy` on Linux). Running `node setup.mjs` or `ocp update` will automatically migrate to the new neutral names.
 
 ## Environment Variables
 
