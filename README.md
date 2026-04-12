@@ -1,6 +1,6 @@
 # OCP — Open Claude Proxy
 
-> **Status: Stable (v3.6.0)** — Feature-complete. Bug fixes only.
+> **Status: Stable (v3.7.0)** — Feature-complete. Bug fixes only.
 
 > **Already paying for Claude Pro/Max? Use your subscription as an OpenAI-compatible API — $0 extra cost.**
 
@@ -114,6 +114,12 @@ chmod +x ocp-connect
 ./ocp-connect <server-ip>
 ```
 
+**Zero-config** — when the server admin has set `PROXY_ANONYMOUS_KEY` (see [Anonymous Access](#anonymous-access-optional) below), just pass the server IP and nothing else. `ocp-connect` reads the anonymous key from `/health` and uses it automatically:
+
+```bash
+./ocp-connect <server-ip>
+```
+
 If the server requires a key, pass it with `--key`:
 ```bash
 ./ocp-connect <server-ip> --key <your-api-key>
@@ -128,16 +134,17 @@ Example:
 ```
 $ ./ocp-connect 192.168.1.100
 
-OCP Connect
+OCP Connect v1.3.0
 ─────────────────────────────────────
   Remote: http://192.168.1.100:3456
 
   Checking connectivity...
   ✓ Connected
 
-  Remote OCP v3.6.0  (auth: multi)
+  Remote OCP v3.7.0  (auth: multi)
 
-  Server allows anonymous access — no key needed.
+  ⓘ Using server-advertised anonymous key: ocp_publ...n_v1
+    (set by admin via PROXY_ANONYMOUS_KEY; see issue #12 §14 Path A)
 
   Testing API access...
   ✓ API accessible (3 models available)
@@ -163,18 +170,25 @@ OCP Connect
 
   Choice [1]: 1
 
+  Writing OpenClaw config...
+    ✓ Per-agent auth profile seeded (2):
+      • ~/.openclaw/agents/main/agent/auth-profiles.json
+      • ~/.openclaw/agents/macbook_bot/agent/auth-profiles.json
   ✓ OpenClaw configured
     Provider: ocp
     Models:
       • ocp/claude-opus-4-6
       • ocp/claude-sonnet-4-6
-      • ocp/claude-haiku-4
+      • ocp/claude-haiku-4-5-20251001
     Priority: PRIMARY (default model)
 
     Restart OpenClaw to apply: openclaw gateway restart
 
   Running smoke test...
   ✓ Smoke test passed: OK
+    Note: smoke test only verifies OCP is reachable and the key is valid.
+    It does not verify your IDE/agent end-to-end. To verify OpenClaw works,
+    restart it (`openclaw gateway restart`) and send a test message to your bot.
 
   Done. Reload your shell to apply:
     source ~/.zshrc
@@ -183,7 +197,9 @@ OCP Connect
 The script automatically:
 - Writes env vars to all relevant shell rc files (`.bashrc`, `.zshrc`)
 - Sets system-level env vars (`launchctl setenv` on macOS, `environment.d` on Linux)
-- Detects and configures IDEs (OpenClaw, Cline, Continue.dev, Cursor)
+- **Auto-discovers anonymous key** from `/health.anonymousKey` when no `--key` given (v1.3.0+, requires server v3.7.0+)
+- Configures OpenClaw automatically (including per-agent `auth-profiles.json` for multi-agent setups)
+- Detects Cline, Continue.dev, Cursor, and opencode, and prints setup hints (manual configuration required for these IDEs)
 
 On macOS, `launchctl setenv` vars reset on reboot — re-run `ocp-connect` after restart.
 
@@ -344,7 +360,7 @@ OCP translates OpenAI-compatible `/v1/chat/completions` requests into `claude -p
 |----------|-------|
 | `claude-opus-4-6` | Most capable, slower |
 | `claude-sonnet-4-6` | Good balance of speed/quality |
-| `claude-haiku-4` | Fastest, lightweight |
+| `claude-haiku-4-5-20251001` | Fastest, lightweight |
 
 ## API Endpoints
 
@@ -444,6 +460,7 @@ ocp restart
 | `CLAUDE_SKIP_PERMISSIONS` | `false` | Bypass all permission checks |
 | `CLAUDE_NO_CONTEXT` | `false` | Suppress CLAUDE.md and auto-memory injection (pure API mode) |
 | `PROXY_API_KEY` | *(unset)* | Bearer token for shared-mode authentication |
+| `PROXY_ANONYMOUS_KEY` | *(unset)* | Well-known anonymous key allowlist (multi mode). When set, this exact string bypasses `validateKey()` and grants public access. Exposed via `/health.anonymousKey` so clients auto-discover. See [Anonymous Access](#anonymous-access-optional). |
 
 ## Security
 
