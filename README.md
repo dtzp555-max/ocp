@@ -1,6 +1,6 @@
 # OCP — Open Claude Proxy
 
-> **Status: Stable (v3.5.2)** — Feature-complete. Bug fixes only.
+> **Status: Stable (v3.6.0)** — Feature-complete. Bug fixes only.
 
 > **Already paying for Claude Pro/Max? Use your subscription as an OpenAI-compatible API — $0 extra cost.**
 
@@ -135,7 +135,7 @@ OCP Connect
   Checking connectivity...
   ✓ Connected
 
-  Remote OCP v3.5.2  (auth: multi)
+  Remote OCP v3.6.0  (auth: multi)
 
   Server allows anonymous access — no key needed.
 
