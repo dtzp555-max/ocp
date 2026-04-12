@@ -311,7 +311,7 @@ if _failed:
     print("      OpenClaw will report \"No API key found\" for the failed agents.")
     print("      Fix the underlying error (permissions / disk) and re-run ocp-connect.")
 if _skipped_anonymous:
-    print(f"    ⚠ OpenClaw multi-agent mode detected ({len(_skipped_anonymous)} agents with agentDir).")
+    print(f"    ⚠ OpenClaw multi-agent mode detected ({len(_skipped_anonymous)} agents).")
     print("      Anonymous mode does not work for OpenClaw per-agent auth.")
     print("      Re-run with: ocp-connect <host> --key ocp_xxx")
 PYEOF
