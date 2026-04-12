@@ -152,7 +152,7 @@ OCP Connect
     source /home/user/.bashrc
 ```
 
-After running, reload your shell (`source ~/.bashrc` or `source ~/.zshrc`) and your IDE will automatically use the remote OCP.
+After running, reload your shell (`source ~/.bashrc` or `source ~/.zshrc`). On macOS, the script also sets `launchctl setenv` so GUI apps and daemons can see the env vars immediately (resets on reboot — re-run `ocp-connect` after restart).
 
 **Manual setup** — if you prefer not to use the script:
 ```bash
