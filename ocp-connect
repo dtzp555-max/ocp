@@ -11,7 +11,7 @@
 #
 set -euo pipefail
 
-OCP_CONNECT_VERSION="1.2.0"
+OCP_CONNECT_VERSION="1.3.0"
 
 show_version() {
   echo "ocp-connect $OCP_CONNECT_VERSION"
@@ -449,7 +449,9 @@ main() {
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --port)  port="${2:?'--port requires a value'}"; shift 2 ;;
-      --key)   key="${2:?'--key requires a value'}"; shift 2 ;;
+      --key)   key="${2:?'--key requires a value'}"
+               [[ -z "$key" ]] && { echo "Error: --key cannot be empty (omit --key entirely for anonymous mode)"; exit 1; }
+               shift 2 ;;
       --version) show_version; exit 0 ;;
       --help|-h) show_help; exit 0 ;;
       -*)      echo "Unknown option: $1"; show_help; exit 1 ;;
@@ -502,6 +504,33 @@ main() {
 
   echo "  Remote OCP v$remote_version  (auth: $auth_mode)"
   echo ""
+
+  # Step 2.5: auto-discover anonymous key from /health (issue #12 §14 Path A).
+  # When the OCP admin set PROXY_ANONYMOUS_KEY, the server advertises it via
+  # /health.anonymousKey. If the user didn't pass --key, use it automatically so
+  # `ocp-connect <host>` works zero-config for OpenClaw multi-agent setups.
+  if [[ -z "$key" ]]; then
+    local anon_key
+    anon_key=$(echo "$health_json" | python3 -c "
+import sys, json
+try:
+    d = json.loads(sys.stdin.read())
+    k = d.get('anonymousKey')
+except Exception:
+    k = None
+print(k if k else '')
+" 2>/dev/null || echo "")
+    if [[ -n "$anon_key" ]]; then
+      key="$anon_key"
+      local _anon_display="$anon_key"
+      if [[ ${#anon_key} -gt 16 ]]; then
+        _anon_display="${anon_key:0:8}...${anon_key: -4}"
+      fi
+      echo "  ⓘ Using server-advertised anonymous key: $_anon_display"
+      echo "    (set by admin via PROXY_ANONYMOUS_KEY; see issue #12 §14 Path A)"
+      echo ""
+    fi
+  fi
 
   # Step 3: Determine if key is needed
   if [[ "$auth_mode" != "none" && -z "$key" ]]; then
