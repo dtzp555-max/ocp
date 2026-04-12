@@ -1,6 +1,6 @@
 # OCP — Open Claude Proxy
 
-> **Status: Stable (v3.5.1)** — Feature-complete. Bug fixes only.
+> **Status: Stable (v3.5.2)** — Feature-complete. Bug fixes only.
 
 > **Already paying for Claude Pro/Max? Use your subscription as an OpenAI-compatible API — $0 extra cost.**
 
@@ -135,24 +135,57 @@ OCP Connect
   Checking connectivity...
   ✓ Connected
 
-  Remote OCP v3.5.1  (auth: multi)
+  Remote OCP v3.5.2  (auth: multi)
 
   Server allows anonymous access — no key needed.
 
   Testing API access...
   ✓ API accessible (3 models available)
 
-  Written to /home/user/.bashrc:
+  Shell config:
+    ✓ .bashrc
+    ✓ .zshrc
     OPENAI_BASE_URL=http://192.168.1.100:3456/v1
+
+  System-level (launchctl):
+    ✓ OPENAI_BASE_URL set for GUI apps and daemons
+
+  IDE Configuration
+  ─────────────────────────────────────
+  Detected: OpenClaw (~/.openclaw/openclaw.json)
+
+  Configure OpenClaw to use this OCP? [Y/n] y
+  Provider name (models show as <name>/model-id) [ocp]: ocp
+
+  How should OCP models be configured?
+    1) Primary — use OCP by default, keep existing models as backup
+    2) Backup  — keep current primary, add OCP as additional option
+
+  Choice [1]: 1
+
+  ✓ OpenClaw configured
+    Provider: ocp
+    Models:
+      • ocp/claude-opus-4-6
+      • ocp/claude-sonnet-4-6
+      • ocp/claude-haiku-4
+    Priority: PRIMARY (default model)
+
+    Restart OpenClaw to apply: openclaw gateway restart
 
   Running smoke test...
   ✓ Smoke test passed: OK
 
   Done. Reload your shell to apply:
-    source /home/user/.bashrc
+    source ~/.zshrc
 ```
 
-After running, reload your shell (`source ~/.bashrc` or `source ~/.zshrc`). On macOS, the script also sets `launchctl setenv` so GUI apps and daemons can see the env vars immediately (resets on reboot — re-run `ocp-connect` after restart).
+The script automatically:
+- Writes env vars to all relevant shell rc files (`.bashrc`, `.zshrc`)
+- Sets system-level env vars (`launchctl setenv` on macOS, `environment.d` on Linux)
+- Detects and configures IDEs (OpenClaw, Cline, Continue.dev, Cursor)
+
+On macOS, `launchctl setenv` vars reset on reboot — re-run `ocp-connect` after restart.
 
 **Manual setup** — if you prefer not to use the script:
 ```bash

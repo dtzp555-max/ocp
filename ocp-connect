@@ -35,10 +35,256 @@ What it does:
   1. Tests connectivity to the remote OCP
   2. Verifies your API key (if auth is enabled)
   3. Writes OPENAI_BASE_URL and OPENAI_API_KEY to ~/.bashrc or ~/.zshrc
-  4. Runs a smoke test to confirm everything works
+  4. Sets system-level env vars (launchctl on macOS, systemd on Linux)
+  5. Detects and configures IDEs (OpenClaw, Cline, Continue.dev, Cursor)
+  6. Runs a smoke test to confirm everything works
 
 After running, reload your shell:  source ~/.bashrc  (or ~/.zshrc)
 EOF
+}
+
+configure_ides() {
+  local base_url="$1" key="$2" models_out="$3"
+
+  # --- OpenClaw ---
+  local oc_config="$HOME/.openclaw/openclaw.json"
+  local oc_found=false
+  if command -v openclaw &>/dev/null || [[ -f "$oc_config" ]]; then
+    oc_found=true
+  fi
+
+  if $oc_found; then
+    echo "  IDE Configuration"
+    echo "  ─────────────────────────────────────"
+    echo "  Detected: OpenClaw ($oc_config)"
+    echo ""
+    printf "  Configure OpenClaw to use this OCP? [Y/n] "
+    local oc_answer
+    read -r oc_answer </dev/tty 2>/dev/null || oc_answer="y"
+    oc_answer="${oc_answer:-y}"
+
+    if [[ "$oc_answer" =~ ^[Yy]$ ]]; then
+      # Ask for provider name
+      printf "  Provider name (models show as <name>/model-id) [ocp]: "
+      local provider_name
+      read -r provider_name </dev/tty 2>/dev/null || provider_name=""
+      provider_name="${provider_name:-ocp}"
+      # Sanitize: only allow alphanumeric, dash, underscore
+      provider_name=$(echo "$provider_name" | tr -cd 'a-zA-Z0-9_-')
+      [[ -z "$provider_name" ]] && provider_name="ocp"
+
+      # Ask for priority
+      echo ""
+      echo "  How should OCP models be configured?"
+      echo "    1) Primary — use OCP by default, keep existing models as backup"
+      echo "    2) Backup  — keep current primary, add OCP as additional option"
+      echo ""
+      printf "  Choice [1]: "
+      local priority_choice
+      read -r priority_choice </dev/tty 2>/dev/null || priority_choice="1"
+      priority_choice="${priority_choice:-1}"
+
+      echo ""
+      echo "  Writing OpenClaw config..."
+
+      # Use python3 to safely manipulate JSON
+      local py_ok=0
+      python3 - "$oc_config" "$base_url" "$key" "$provider_name" "$priority_choice" "$models_out" <<'PYEOF' && py_ok=1
+import sys, json, os
+
+config_path = sys.argv[1]
+base_url = sys.argv[2]
+api_key = sys.argv[3]
+provider_name = sys.argv[4]
+priority = sys.argv[5]  # "1" = primary, "2" = backup
+models_json_str = sys.argv[6]
+
+# Parse models from OCP /v1/models response
+try:
+    models_data = json.loads(models_json_str)
+    model_ids = [m["id"] for m in models_data.get("data", [])]
+except:
+    model_ids = ["claude-opus-4-6", "claude-sonnet-4-6", "claude-haiku-4"]
+
+# Build provider entry
+provider = {
+    "baseUrl": base_url + "/v1",
+    "api": "openai-completions",
+    "authHeader": bool(api_key),
+    "models": []
+}
+
+# Model metadata mapping (prefix match for versioned IDs like claude-haiku-4-5-20251001)
+model_meta = {
+    "claude-opus-4": {"name": "Claude Opus (OCP)", "reasoning": True, "maxTokens": 16384},
+    "claude-sonnet-4": {"name": "Claude Sonnet (OCP)", "reasoning": True, "maxTokens": 16384},
+    "claude-haiku-4": {"name": "Claude Haiku (OCP)", "reasoning": False, "maxTokens": 8192},
+}
+
+def get_model_meta(mid):
+    """Match model metadata by prefix."""
+    for prefix, meta in sorted(model_meta.items(), key=lambda x: -len(x[0])):
+        if mid.startswith(prefix):
+            return meta
+    return {"name": mid + " (OCP)", "reasoning": False, "maxTokens": 8192}
+
+for mid in model_ids:
+    meta = get_model_meta(mid)
+    provider["models"].append({
+        "id": mid,
+        "name": meta["name"],
+        "reasoning": meta["reasoning"],
+        "input": ["text"],
+        "cost": {"input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0},
+        "contextWindow": 200000,
+        "maxTokens": meta["maxTokens"]
+    })
+
+# Load or create config
+if os.path.exists(config_path):
+    with open(config_path, "r") as f:
+        config = json.load(f)
+else:
+    os.makedirs(os.path.dirname(config_path), exist_ok=True)
+    config = {}
+
+# Ensure models.providers exists
+config.setdefault("models", {})
+config["models"].setdefault("mode", "merge")
+config["models"].setdefault("providers", {})
+
+# Remove any previous OCP provider with the same name
+config["models"]["providers"][provider_name] = provider
+
+# Set up auth profile if key is provided
+if api_key:
+    config.setdefault("auth", {})
+    config["auth"].setdefault("profiles", {})
+    config["auth"]["profiles"][provider_name + ":default"] = {
+        "provider": provider_name,
+        "mode": "api_key"
+    }
+
+# Configure agent defaults — add model aliases
+config.setdefault("agents", {})
+config["agents"].setdefault("defaults", {})
+config["agents"]["defaults"].setdefault("models", {})
+
+# Build alias map (prefix match)
+alias_prefixes = {
+    "claude-opus-4": "Claude Opus",
+    "claude-sonnet-4": "Claude Sonnet",
+    "claude-haiku-4": "Claude Haiku",
+}
+
+for mid in model_ids:
+    full_id = provider_name + "/" + mid
+    alias = mid  # fallback
+    for prefix, name in sorted(alias_prefixes.items(), key=lambda x: -len(x[0])):
+        if mid.startswith(prefix):
+            alias = name
+            break
+    config["agents"]["defaults"]["models"][full_id] = {"alias": alias}
+
+# Handle primary/backup
+if priority == "1":
+    # OCP as primary — pick the best model (prefer sonnet for daily use)
+    primary_model = provider_name + "/claude-sonnet-4-6" if "claude-sonnet-4-6" in model_ids else provider_name + "/" + model_ids[0]
+    config["agents"]["defaults"].setdefault("model", {})
+    config["agents"]["defaults"]["model"]["primary"] = primary_model
+    # Keep existing fallbacks
+    config["agents"]["defaults"]["model"].setdefault("fallbacks", [])
+
+# If backup (priority == "2"), don't change the primary — just add models to the list
+
+# Update agent list entries that use old provider name patterns
+# (only update if agents.list exists and has entries using old OCP-like providers)
+if "list" in config.get("agents", {}):
+    for agent in config["agents"]["list"]:
+        agent_model = agent.get("model", {})
+        if priority == "1" and agent_model.get("primary", "").startswith("claude-local/"):
+            # Migrate from claude-local to new provider
+            old_model_id = agent_model["primary"].split("/", 1)[1]
+            if old_model_id in model_ids:
+                agent_model["primary"] = provider_name + "/" + old_model_id
+        # Also update subagents if they use claude-local
+        sub = agent.get("subagents", config["agents"]["defaults"].get("subagents", {}))
+        # Don't modify subagents in agent entries — they inherit from defaults
+
+# Update defaults subagents model if using claude-local
+if priority == "1":
+    sub = config["agents"]["defaults"].get("subagents", {})
+    if sub.get("model", "").startswith("claude-local/"):
+        old_id = sub["model"].split("/", 1)[1]
+        if old_id in model_ids:
+            sub["model"] = provider_name + "/" + old_id
+
+with open(config_path, "w") as f:
+    json.dump(config, f, indent=2, ensure_ascii=False)
+    f.write("\n")
+PYEOF
+
+      if [[ $py_ok -eq 1 ]]; then
+        echo "  ✓ OpenClaw configured"
+        echo "    Provider: $provider_name"
+        echo "    Models:"
+        # List models from the already-fetched models_out
+        echo "$models_out" | python3 -c "
+import sys,json
+d=json.loads(sys.stdin.read())
+pn='$provider_name'
+for m in d.get('data',[]):
+    print('      • ' + pn + '/' + m['id'])
+" 2>/dev/null
+        if [[ "$priority_choice" == "1" ]]; then
+          echo "    Priority: PRIMARY (default model)"
+        else
+          echo "    Priority: BACKUP (available in model selector)"
+        fi
+        echo ""
+        echo "    Restart OpenClaw to apply: openclaw gateway restart"
+      else
+        echo "  ⚠ Failed to write OpenClaw config. You can configure it manually."
+      fi
+    else
+      echo "  Skipped OpenClaw configuration."
+    fi
+    echo ""
+  fi
+
+  # --- Other IDEs: print manual instructions ---
+  local other_ides_shown=false
+
+  # Detect Cline (VS Code extension)
+  if [[ -d "$HOME/.vscode/extensions" ]] && ls "$HOME/.vscode/extensions/" 2>/dev/null | grep -qi cline; then
+    if ! $other_ides_shown; then
+      echo "  Other IDEs detected:"
+      other_ides_shown=true
+    fi
+    echo "    • Cline: Settings → OPENAI_BASE_URL = $base_url/v1"
+  fi
+
+  # Detect Continue.dev
+  if [[ -f "$HOME/.continue/config.json" ]]; then
+    if ! $other_ides_shown; then
+      echo "  Other IDEs detected:"
+      other_ides_shown=true
+    fi
+    echo "    • Continue.dev: ~/.continue/config.json → apiBase: \"$base_url/v1\""
+  fi
+
+  # Detect Cursor
+  if command -v cursor &>/dev/null || [[ -d "$HOME/.cursor" ]]; then
+    if ! $other_ides_shown; then
+      echo "  Other IDEs detected:"
+      other_ides_shown=true
+    fi
+    echo "    • Cursor: Settings → OpenAI Base URL = $base_url/v1"
+  fi
+
+  if $other_ides_shown; then
+    echo ""
+  fi
 }
 
 main() {
@@ -235,6 +481,9 @@ PYEOF
     echo "    Applies to systemd user services after re-login."
   fi
   echo ""
+
+  # Step 7c: Interactive IDE configuration
+  configure_ides "$base_url" "$key" "$models_out"
 
   # Step 8: Quick smoke test
   echo "  Running smoke test..."
