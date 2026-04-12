@@ -97,6 +97,10 @@ const BIND_ADDRESS = process.env.CLAUDE_BIND || "127.0.0.1";
 const NO_CONTEXT = process.env.CLAUDE_NO_CONTEXT === "true";
 const AUTH_MODE = process.env.CLAUDE_AUTH_MODE || (PROXY_API_KEY ? "shared" : "none");
 const ADMIN_KEY = process.env.OCP_ADMIN_KEY || "";
+const PROXY_ANONYMOUS_KEY = process.env.PROXY_ANONYMOUS_KEY || "";
+if (PROXY_ANONYMOUS_KEY && AUTH_MODE !== "multi") {
+  console.warn("WARNING: PROXY_ANONYMOUS_KEY is set but AUTH_MODE is not 'multi' — anonymous key will be ignored");
+}
 
 if (AUTH_MODE === "shared" && !PROXY_API_KEY) {
   console.warn("WARNING: AUTH_MODE=shared but PROXY_API_KEY is not set — all requests will pass unauthenticated");
@@ -1120,7 +1124,15 @@ const server = createServer(async (req, res) => {
             authKeyName = "admin";
           }
         }
-        if (authKeyName !== "admin") {
+        if (authKeyName !== "admin" && PROXY_ANONYMOUS_KEY) {
+          // anonymous allowlist (issue #12 §14 Path A) — same check as multi branch
+          const anonBuf = Buffer.from(PROXY_ANONYMOUS_KEY);
+          const tokenBufA = Buffer.from(token);
+          if (anonBuf.length === tokenBufA.length && timingSafeEqual(anonBuf, tokenBufA)) {
+            authKeyName = "anonymous";
+          }
+        }
+        if (authKeyName !== "admin" && authKeyName !== "anonymous") {
           const keyInfo = validateKey(token);
           if (keyInfo) { authKeyName = keyInfo.name; authKeyId = keyInfo.id; }
         }
@@ -1146,7 +1158,17 @@ const server = createServer(async (req, res) => {
             isAdminToken = true;
           }
         }
-        if (!isAdminToken) {
+        // === NEW: anonymous allowlist (issue #12 §14 Path A) ===
+        let isAnonymousToken = false;
+        if (!isAdminToken && PROXY_ANONYMOUS_KEY) {
+          const anonBuf = Buffer.from(PROXY_ANONYMOUS_KEY);
+          const tokenBuf3 = Buffer.from(token);
+          if (anonBuf.length === tokenBuf3.length && timingSafeEqual(anonBuf, tokenBuf3)) {
+            authKeyName = "anonymous";
+            isAnonymousToken = true;
+          }
+        }
+        if (!isAdminToken && !isAnonymousToken) {
           const keyInfo = validateKey(token);
           if (!keyInfo) {
             return jsonResponse(res, 401, { error: { message: "Unauthorized: invalid or revoked API key", type: "auth_error" } });
@@ -1204,6 +1226,7 @@ const server = createServer(async (req, res) => {
       claudeBinary: CLAUDE,
       claudeBinaryOk: binaryOk,
       authMode: AUTH_MODE,
+      anonymousKey: PROXY_ANONYMOUS_KEY || null,
       auth: authStatus,
       config: {
         timeout: TIMEOUT,
