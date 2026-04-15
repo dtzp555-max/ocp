@@ -9,7 +9,8 @@
   },
   "scripts": {
     "start": "node server.mjs",
-    "setup": "node setup.mjs"
+    "setup": "node setup.mjs",
+    "traffic": "node scripts/github-traffic.mjs"
   },
   "keywords": [
     "openclaw",
