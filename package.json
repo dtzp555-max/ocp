@@ -1,6 +1,6 @@
 {
   "name": "openclaw-claude-proxy",
-  "version": "3.7.0",
+  "version": "3.8.0",
   "description": "OCP (Open Claude Proxy) — use your Claude Pro/Max subscription as an OpenAI-compatible API for any IDE. Works with Cline, OpenCode, Aider, Continue.dev, OpenClaw, and more.",
   "type": "module",
   "bin": {
