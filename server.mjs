@@ -33,7 +33,7 @@ import { readFileSync, accessSync, constants } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 import { homedir } from "node:os";
-import { validateKey, recordUsage, getUsageByKey, getUsageTimeline, getRecentUsage, createKey, listKeys, revokeKey, closeDb } from "./keys.mjs";
+import { validateKey, recordUsage, getUsageByKey, getUsageTimeline, getRecentUsage, createKey, listKeys, revokeKey, closeDb, checkQuota, updateKeyQuota, getKeyQuota, findKey, cacheHash, getCachedResponse, setCachedResponse, clearCache, getCacheStats } from "./keys.mjs";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const _pkg = JSON.parse(readFileSync(join(__dirname, "package.json"), "utf8"));
@@ -98,6 +98,7 @@ const NO_CONTEXT = process.env.CLAUDE_NO_CONTEXT === "true";
 const AUTH_MODE = process.env.CLAUDE_AUTH_MODE || (PROXY_API_KEY ? "shared" : "none");
 const ADMIN_KEY = process.env.OCP_ADMIN_KEY || "";
 const PROXY_ANONYMOUS_KEY = process.env.PROXY_ANONYMOUS_KEY || "";
+let CACHE_TTL = parseInt(process.env.CLAUDE_CACHE_TTL || "0", 10); // 0 = disabled, value in ms
 if (PROXY_ANONYMOUS_KEY && AUTH_MODE !== "multi") {
   console.warn("WARNING: PROXY_ANONYMOUS_KEY is set but AUTH_MODE is not 'multi' — anonymous key will be ignored");
 }
@@ -176,6 +177,16 @@ const sessionCleanupInterval = setInterval(() => {
     }
   }
 }, 60000);
+
+// Cache cleanup: remove expired entries every 10 minutes
+const cacheCleanupInterval = setInterval(() => {
+  if (CACHE_TTL > 0) {
+    try {
+      const cleaned = clearCache(CACHE_TTL);
+      if (cleaned > 0) logEvent("info", "cache_cleanup", { expired: cleaned });
+    } catch (e) { logEvent("error", "cache_cleanup_failed", { error: e.message }); }
+  }
+}, 600000);
 
 // ── Active child process tracking ────────────────────────────────────────
 const activeProcesses = new Set();
@@ -548,6 +559,7 @@ function callClaudeStreaming(model, messages, conversationId, res, authInfo = {}
   let stderr = "";
   let headersSent = false;
   let totalChars = 0;
+  let cachedContent = ""; // accumulate for cache write-back
 
   function ensureHeaders() {
     if (headersSent || res.writableEnded || res.destroyed) return false;
@@ -569,6 +581,7 @@ function callClaudeStreaming(model, messages, conversationId, res, authInfo = {}
     markFirstByte();
     const text = d.toString();
     totalChars += text.length;
+    if (CACHE_TTL > 0) cachedContent += text;
 
     if (!ensureHeaders()) return;
 
@@ -608,6 +621,10 @@ function callClaudeStreaming(model, messages, conversationId, res, authInfo = {}
       breakerRecordSuccess(cliModel);
       try { recordUsage({ keyId: authInfo.keyId, keyName: authInfo.keyName, model, promptChars: messages.reduce((a, m) => a + (typeof m.content === "string" ? m.content.length : JSON.stringify(m.content).length), 0), responseChars: totalChars, elapsedMs: elapsed, success: true }); } catch (e) { logEvent("error", "usage_record_failed", { error: e.message }); }
       logEvent("info", "claude_ok", { model: cliModel, chars: totalChars, elapsed, session: convId ? convId.slice(0, 12) + "..." : "none" });
+      // Cache write-back for streaming
+      if (CACHE_TTL > 0 && authInfo.cacheHash) {
+        try { setCachedResponse(authInfo.cacheHash, model, cachedContent); } catch (e) { logEvent("error", "cache_write_failed", { error: e.message }); }
+      }
 
       if (!headersSent) ensureHeaders();
       if (!res.writableEnded && !res.destroyed) {
@@ -969,6 +986,7 @@ const SETTINGS_SCHEMA = {
   maxConcurrent:    { type: "number", min: 1, max: 32, unit: "", desc: "Max concurrent claude processes" },
   sessionTTL:       { type: "number", min: 60000, max: 86400000, unit: "ms", desc: "Session idle expiry" },
   maxPromptChars:   { type: "number", min: 10000, max: 1000000, unit: "chars", desc: "Prompt truncation limit" },
+  cacheTTL:         { type: "number", min: 0, max: 86400000, unit: "ms", desc: "Response cache TTL (0 = disabled)" },
 };
 
 function getSettings() {
@@ -977,6 +995,7 @@ function getSettings() {
     maxConcurrent:    { value: MAX_CONCURRENT, ...SETTINGS_SCHEMA.maxConcurrent },
     sessionTTL:       { value: SESSION_TTL, ...SETTINGS_SCHEMA.sessionTTL },
     maxPromptChars:   { value: MAX_PROMPT_CHARS, ...SETTINGS_SCHEMA.maxPromptChars },
+    cacheTTL:         { value: CACHE_TTL, ...SETTINGS_SCHEMA.cacheTTL },
   };
 }
 
@@ -991,6 +1010,7 @@ function applySettingUpdate(key, value) {
     case "maxConcurrent":    MAX_CONCURRENT = value; break;
     case "sessionTTL":       SESSION_TTL = value; break;
     case "maxPromptChars":   MAX_PROMPT_CHARS = value; break;
+    case "cacheTTL":         CACHE_TTL = value; break;
     default: return `${key}: not implemented`;
   }
   logEvent("info", "setting_changed", { key, value });
@@ -1067,9 +1087,54 @@ async function handleChatCompletions(req, res) {
 
   if (!messages?.length) return jsonResponse(res, 400, { error: "messages required" });
 
+  // Quota check — only for identified per-key users (not anonymous/admin/local)
+  if (req._authKeyId) {
+    let exceeded;
+    try { exceeded = checkQuota(req._authKeyId, req._authKeyName); } catch (e) { logEvent("error", "quota_check_failed", { error: e.message }); exceeded = null; }
+    if (exceeded) {
+      logEvent("warn", "quota_exceeded", { keyId: req._authKeyId, keyName: req._authKeyName, period: exceeded.period, limit: exceeded.limit, used: exceeded.used });
+      return jsonResponse(res, 429, {
+        error: {
+          message: `Quota exceeded: ${exceeded.used}/${exceeded.limit} requests (${exceeded.period}). Resets ${exceeded.resetsIn}.`,
+          type: "quota_exceeded",
+          quota: exceeded,
+        },
+      });
+    }
+  }
+
+  // Cache check (only when cache is enabled and no active conversation/session)
+  if (CACHE_TTL > 0 && !conversationId) {
+    const hash = cacheHash(model, messages, { temperature: parsed.temperature, max_tokens: parsed.max_tokens, top_p: parsed.top_p });
+    req._cacheHash = hash; // store for later write-back
+    try {
+      const cached = getCachedResponse(hash, CACHE_TTL);
+      if (cached) {
+        logEvent("info", "cache_hit", { model, hash: hash.slice(0, 12), hits: cached.hits });
+        if (stream) {
+          // Simulate streaming for cached response
+          const id = `chatcmpl-${randomUUID()}`;
+          const created = Math.floor(Date.now() / 1000);
+          res.writeHead(200, { "Content-Type": "text/event-stream", "Cache-Control": "no-cache", "Connection": "keep-alive" });
+          sendSSE(res, { id, object: "chat.completion.chunk", created, model, choices: [{ index: 0, delta: { role: "assistant" }, finish_reason: null }] });
+          sendSSE(res, { id, object: "chat.completion.chunk", created, model, choices: [{ index: 0, delta: { content: cached.response }, finish_reason: null }] });
+          sendSSE(res, { id, object: "chat.completion.chunk", created, model, choices: [{ index: 0, delta: {}, finish_reason: "stop" }] });
+          res.write("data: [DONE]\n\n");
+          res.end();
+          return;
+        } else {
+          const id = `chatcmpl-${randomUUID()}`;
+          return completionResponse(res, id, model, cached.response);
+        }
+      }
+    } catch (e) {
+      logEvent("error", "cache_check_failed", { error: e.message });
+    }
+  }
+
   if (stream) {
     // Real streaming: pipe stdout from claude process directly as SSE chunks
-    return callClaudeStreaming(model, messages, conversationId, res, { keyId: req._authKeyId, keyName: req._authKeyName });
+    return callClaudeStreaming(model, messages, conversationId, res, { keyId: req._authKeyId, keyName: req._authKeyName, cacheHash: req._cacheHash });
   }
 
   const t0Usage = Date.now();
@@ -1078,6 +1143,10 @@ async function handleChatCompletions(req, res) {
     const content = await callClaude(model, messages, conversationId);
     const id = `chatcmpl-${randomUUID()}`;
     completionResponse(res, id, model, content);
+    // Write to cache
+    if (CACHE_TTL > 0 && req._cacheHash) {
+      try { setCachedResponse(req._cacheHash, model, content); } catch (e) { logEvent("error", "cache_write_failed", { error: e.message }); }
+    }
     try { recordUsage({ keyId: req._authKeyId, keyName: req._authKeyName, model, promptChars, responseChars: content.length, elapsedMs: Date.now() - t0Usage, success: true }); } catch (e) { logEvent("error", "usage_record_failed", { error: e.message }); }
   } catch (err) {
     try { recordUsage({ keyId: req._authKeyId, keyName: req._authKeyName, model, promptChars, responseChars: 0, elapsedMs: Date.now() - t0Usage, success: false }); } catch (e) { logEvent("error", "usage_record_failed", { error: e.message }); }
@@ -1300,11 +1369,48 @@ const server = createServer(async (req, res) => {
     return jsonResponse(res, 200, { keys: listKeys() });
   }
 
-  if (req.url?.startsWith("/api/keys/") && req.method === "DELETE") {
+  if (req.url?.startsWith("/api/keys/") && !req.url.includes("/quota") && req.method === "DELETE") {
     if (!isAdmin) return jsonResponse(res, 403, { error: "Admin access required" });
     const idOrName = decodeURIComponent(req.url.split("/api/keys/")[1]);
     const revoked = revokeKey(idOrName);
     return jsonResponse(res, 200, { revoked, idOrName });
+  }
+
+  // PATCH /api/keys/:id/quota — set quota for a key
+  // Body: { "daily": 100, "weekly": 500, "monthly": 2000 }  (null = unlimited)
+  if (req.url?.match(/^\/api\/keys\/[^/]+\/quota$/) && req.method === "PATCH") {
+    if (!isAdmin) return jsonResponse(res, 403, { error: "Admin access required" });
+    const idOrName = decodeURIComponent(req.url.split("/api/keys/")[1].replace("/quota", ""));
+    let body = "";
+    for await (const chunk of req) { body += chunk; if (body.length > 10000) return jsonResponse(res, 413, { error: "Body too large" }); }
+    let quotaBody;
+    try { quotaBody = JSON.parse(body); } catch { return jsonResponse(res, 400, { error: "Invalid JSON" }); }
+    // Validate quota values: must be positive integers or null
+    const quotaFields = {};
+    for (const k of ["daily", "weekly", "monthly"]) {
+      if (k in quotaBody) {
+        const v = quotaBody[k];
+        if (v !== null && (!Number.isInteger(v) || v < 0)) {
+          return jsonResponse(res, 400, { error: `${k} must be a positive integer or null` });
+        }
+        quotaFields[k] = v;
+      }
+    }
+    if (Object.keys(quotaFields).length === 0) return jsonResponse(res, 400, { error: "Provide at least one of: daily, weekly, monthly" });
+    const updated = updateKeyQuota(idOrName, quotaFields);
+    if (!updated) return jsonResponse(res, 404, { error: "Key not found" });
+    logEvent("info", "quota_updated", { idOrName, ...quotaFields });
+    return jsonResponse(res, 200, { ok: true, idOrName, quota: quotaFields });
+  }
+
+  // GET /api/keys/:id/quota — get quota + current usage for a key
+  if (req.url?.match(/^\/api\/keys\/[^/]+\/quota$/) && req.method === "GET") {
+    if (!isAdmin) return jsonResponse(res, 403, { error: "Admin access required" });
+    const idOrName = decodeURIComponent(req.url.split("/api/keys/")[1].replace("/quota", ""));
+    const keyRow = findKey(idOrName);
+    if (!keyRow) return jsonResponse(res, 404, { error: "Key not found" });
+    const quota = getKeyQuota(keyRow.id);
+    return jsonResponse(res, 200, { keyId: keyRow.id, quota });
   }
 
   if (req.url?.startsWith("/api/usage") && req.method === "GET") {
@@ -1319,6 +1425,20 @@ const server = createServer(async (req, res) => {
     });
   }
 
+  // GET /cache/stats — cache statistics
+  if (pathname === "/cache/stats" && req.method === "GET") {
+    if (!isAdmin) return jsonResponse(res, 403, { error: "Admin access required" });
+    return jsonResponse(res, 200, getCacheStats());
+  }
+
+  // DELETE /cache — clear cache
+  if (pathname === "/cache" && req.method === "DELETE") {
+    if (!isAdmin) return jsonResponse(res, 403, { error: "Admin access required" });
+    const cleared = clearCache();
+    logEvent("info", "cache_cleared", { entries: cleared });
+    return jsonResponse(res, 200, { cleared });
+  }
+
   // GET /dashboard — web dashboard
   if (pathname === "/dashboard" && req.method === "GET") {
     try {
@@ -1331,7 +1451,7 @@ const server = createServer(async (req, res) => {
     return;
   }
 
-  jsonResponse(res, 404, { error: "Not found. Endpoints: GET /v1/models, POST /v1/chat/completions, GET /health, GET /usage, GET /status, GET /logs, GET|PATCH /settings, GET|DELETE /sessions, GET /dashboard, GET|POST|DELETE /api/keys, GET /api/usage" });
+  jsonResponse(res, 404, { error: "Not found. Endpoints: GET /v1/models, POST /v1/chat/completions, GET /health, GET /usage, GET /status, GET /logs, GET|PATCH /settings, GET|DELETE /sessions, GET /dashboard, GET|POST|DELETE /api/keys, GET|PATCH /api/keys/:id/quota, GET /api/usage, GET /cache/stats, DELETE /cache" });
 });
 
 
@@ -1351,6 +1471,7 @@ function gracefulShutdown(signal) {
   // 2. Clear intervals/timers
   clearInterval(sessionCleanupInterval);
   clearInterval(authCheckInterval);
+  clearInterval(cacheCleanupInterval);
   closeDb();
 
   // 3. Kill all active child processes
@@ -1405,6 +1526,8 @@ server.listen(PORT, BIND_ADDRESS, () => {
   console.log(`Auth mode: ${AUTH_MODE}${AUTH_MODE === "shared" ? " (PROXY_API_KEY)" : AUTH_MODE === "multi" ? " (per-user keys)" : " (open)"}`);
   console.log(`Bind: ${BIND_ADDRESS}${BIND_ADDRESS === "0.0.0.0" ? " ⚠ LAN-accessible" : ""}`);
   if (NO_CONTEXT) console.log(`Context: suppressed (CLAUDE_NO_CONTEXT=true — no CLAUDE.md, no auto-memory)`);
+  if (CACHE_TTL > 0) console.log(`Cache: enabled (TTL=${CACHE_TTL / 1000}s)`);
+  else console.log(`Cache: disabled (set CLAUDE_CACHE_TTL to enable)`);
   console.log(`---`);
   console.log(`Coexistence: This proxy does NOT conflict with Claude Code interactive mode.`);
   console.log(`  OCP uses: localhost:${PORT} (HTTP) → claude -p (per-request process)`);
