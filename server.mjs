@@ -37,6 +37,7 @@ import { validateKey, recordUsage, getUsageByKey, getUsageTimeline, getRecentUsa
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const _pkg = JSON.parse(readFileSync(join(__dirname, "package.json"), "utf8"));
+const modelsConfig = JSON.parse(readFileSync(join(__dirname, "models.json"), "utf8"));
 
 // ── Resolve claude binary ───────────────────────────────────────────────
 // Priority: CLAUDE_BIN env > well-known paths > which lookup
@@ -145,25 +146,14 @@ const _BREAKER_DISABLED_NOTE = "disabled";
 
 // ── Model mapping ───────────────────────────────────────────────────────
 // Maps request model IDs and aliases to canonical claude CLI model IDs.
-const MODEL_MAP = {
-  "claude-opus-4-7": "claude-opus-4-7",
-  "claude-opus-4-6": "claude-opus-4-6",
-  "claude-sonnet-4-6": "claude-sonnet-4-6",
-  "claude-haiku-4-5-20251001": "claude-haiku-4-5-20251001",
-  "claude-opus-4": "claude-opus-4-7",
-  "claude-haiku-4": "claude-haiku-4-5-20251001",
-  "claude-haiku-4-5": "claude-haiku-4-5-20251001",
-  "opus": "claude-opus-4-7",
-  "sonnet": "claude-sonnet-4-6",
-  "haiku": "claude-haiku-4-5-20251001",
-};
+// Derived from models.json (single source of truth).
+const MODEL_MAP = Object.fromEntries([
+  ...modelsConfig.models.map(m => [m.id, m.id]),
+  ...Object.entries(modelsConfig.aliases),
+  ...Object.entries(modelsConfig.legacyAliases),
+]);
 
-const MODELS = [
-  { id: "claude-opus-4-7", name: "Claude Opus 4.7" },
-  { id: "claude-opus-4-6", name: "Claude Opus 4.6" },
-  { id: "claude-sonnet-4-6", name: "Claude Sonnet 4.6" },
-  { id: "claude-haiku-4-5-20251001", name: "Claude Haiku 4.5" },
-];
+const MODELS = modelsConfig.models.map(m => ({ id: m.id, name: m.displayName }));
 
 // ── Session management ──────────────────────────────────────────────────
 // Maps conversation IDs (from caller) to Claude CLI session UUIDs.

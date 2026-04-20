@@ -39,49 +39,25 @@ const PROVIDER_NAME = opt("provider-name", "claude-local");
 const BIND_ADDRESS = opt("bind", "127.0.0.1");
 const AUTH_MODE_CONFIG = opt("auth-mode", "none");
 
-const MODEL_ID_MAP = {
-  opus: "claude-opus-4-6",
-  sonnet: "claude-sonnet-4-6",
-  haiku: "claude-haiku-4",
-};
+// ── Models: derived from models.json (single source of truth) ──────────
+const modelsConfig = JSON.parse(readFileSync(join(__dirname, "models.json"), "utf-8"));
+
+const MODEL_ID_MAP = modelsConfig.aliases;
 const DEFAULT_MODEL_ID = MODEL_ID_MAP[DEFAULT_MODEL] || MODEL_ID_MAP.opus;
 
-// ── Models to register ──────────────────────────────────────────────────
-const MODELS = [
-  {
-    id: "claude-opus-4-6",
-    name: "Claude Opus 4.6 (via CLI)",
-    reasoning: true,
-    input: ["text"],
-    cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-    contextWindow: 200000,
-    maxTokens: 16384,
-  },
-  {
-    id: "claude-sonnet-4-6",
-    name: "Claude Sonnet 4.6 (via CLI)",
-    reasoning: true,
-    input: ["text"],
-    cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-    contextWindow: 200000,
-    maxTokens: 16384,
-  },
-  {
-    id: "claude-haiku-4",
-    name: "Claude Haiku 4 (via CLI)",
-    reasoning: false,
-    input: ["text"],
-    cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-    contextWindow: 200000,
-    maxTokens: 8192,
-  },
-];
+const MODELS = modelsConfig.models.map(m => ({
+  id: m.id,
+  name: m.openclawName,
+  reasoning: m.reasoning,
+  input: ["text"],
+  cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+  contextWindow: m.contextWindow,
+  maxTokens: m.maxTokens,
+}));
 
-const MODEL_ALIASES = {
-  [`${PROVIDER_NAME}/claude-opus-4-6`]: { alias: "Claude Opus 4.6" },
-  [`${PROVIDER_NAME}/claude-sonnet-4-6`]: { alias: "Claude Sonnet 4.6" },
-  [`${PROVIDER_NAME}/claude-haiku-4`]: { alias: "Claude Haiku 4" },
-};
+const MODEL_ALIASES = Object.fromEntries(
+  modelsConfig.models.map(m => [`${PROVIDER_NAME}/${m.id}`, { alias: m.displayName }])
+);
 
 // ── Helpers ─────────────────────────────────────────────────────────────
 function log(msg) { console.log(`  ✓ ${msg}`); }
@@ -269,7 +245,7 @@ console.log(`
 ║                                                              ║
 ║  Provider: ${PROVIDER_NAME.padEnd(44)}║
 ║  Port:     ${String(PORT).padEnd(44)}║
-║  Models:   claude-opus-4-6, claude-sonnet-4-6, claude-haiku-4║
+║  Models:   ${`see models.json (${MODELS.length} available)`.padEnd(44)}║
 ║  Default:  ${DEFAULT_MODEL_ID.padEnd(44)}║
 ║                                                              ║
 ║  Start proxy:                                                ║
