@@ -770,7 +770,16 @@ cmd_update() {
     echo "  ✓ Plugin synced to $ext_dir"
   fi
 
-  # 3. Restart proxy
+  # 3. Sync OpenClaw registry from models.json (non-fatal)
+  if command -v node >/dev/null 2>&1 && [[ -f "$script_dir/scripts/sync-openclaw.mjs" ]]; then
+    echo ""
+    echo "  Syncing OpenClaw registry..."
+    if ! node "$script_dir/scripts/sync-openclaw.mjs" 2>&1 | sed 's/^/  /'; then
+      echo "  ⚠ OpenClaw sync failed (non-fatal, continuing)"
+    fi
+  fi
+
+  # 4. Restart proxy
   echo ""
   echo "  Restarting proxy..."
   cmd_restart > /dev/null 2>&1
