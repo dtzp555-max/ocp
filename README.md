@@ -139,7 +139,7 @@ OCP Connect v1.3.0
   Checking connectivity...
   ✓ Connected
 
-  Remote OCP v3.8.0  (auth: multi)
+  Remote OCP v3.9.0  (auth: multi)
 
   ⓘ Using server-advertised anonymous key: ocp_publ...n_v1
     (set by admin via PROXY_ANONYMOUS_KEY; see issue #12 §14 Path A)
@@ -195,7 +195,7 @@ OCP Connect v1.3.0
 The script automatically:
 - Writes env vars to all relevant shell rc files (`.bashrc`, `.zshrc`)
 - Sets system-level env vars (`launchctl setenv` on macOS, `environment.d` on Linux)
-- **Auto-discovers anonymous key** from `/health.anonymousKey` when no `--key` given (v1.3.0+, requires server v3.8.0+)
+- **Auto-discovers anonymous key** from `/health.anonymousKey` when no `--key` given (v1.3.0+, requires server v3.9.0+)
 - Configures OpenClaw automatically (including per-agent `auth-profiles.json` for multi-agent setups)
 - Detects Cline, Continue.dev, Cursor, and opencode, and prints setup hints (manual configuration required for these IDEs)
 
