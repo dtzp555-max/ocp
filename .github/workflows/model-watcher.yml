@@ -1,0 +1,66 @@
+name: Model Watcher
+on:
+  schedule:
+    - cron: '0 3 * * *'  # daily 03:00 UTC
+  workflow_dispatch:
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: '20' }
+      - name: Fetch /v1/models
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        run: |
+          curl -sS https://api.anthropic.com/v1/models \
+            -H "x-api-key: $ANTHROPIC_API_KEY" \
+            -H "anthropic-version: 2023-06-01" \
+            -o /tmp/models.json
+      - name: Diff against MODEL_MAP
+        run: node scripts/diff-models.mjs /tmp/models.json server.mjs > /tmp/diff.json
+      - name: Check if changes needed
+        id: check
+        run: |
+          ADDED=$(jq '.added | length' /tmp/diff.json)
+          REMOVED=$(jq '.removed | length' /tmp/diff.json)
+          echo "added=$ADDED" >> $GITHUB_OUTPUT
+          echo "removed=$REMOVED" >> $GITHUB_OUTPUT
+          if [ "$ADDED" -gt 0 ]; then echo "has_changes=true" >> $GITHUB_OUTPUT; fi
+      - name: Patch server.mjs
+        if: steps.check.outputs.has_changes == 'true'
+        run: node scripts/patch-server-mjs.mjs /tmp/diff.json server.mjs
+      - name: Save diff artifact
+        if: steps.check.outputs.has_changes == 'true'
+        run: cp /tmp/diff.json model-diff.json
+      - name: Open PR
+        if: steps.check.outputs.has_changes == 'true'
+        uses: peter-evans/create-pull-request@v6
+        with:
+          branch: auto/model-watcher
+          commit-message: 'feat(models): auto-detected new model(s) from /v1/models'
+          title: 'feat(models): auto-detected new Claude model(s)'
+          body: |
+            Automated PR from model-watcher.
+
+            **Source**: `https://api.anthropic.com/v1/models` (snapshot attached as `model-diff.json`)
+
+            ### Added (auto-applied)
+            See diff — `MODEL_MAP` and `MODELS` updated.
+
+            ### ⚠️ Human decisions required
+            - [ ] Bump short alias `opus` / `sonnet` / `haiku` to new version?
+            - [ ] Deprecate any model in `removed` list?
+            - [ ] Version bump (minor if additive, major if removing)
+
+            ### Alignment evidence
+            Per ALIGNMENT.md Rule on model registry: this PR sources ids from Anthropic's official `/v1/models` endpoint.
+          labels: |
+            automation
+            models
+          delete-branch: true
