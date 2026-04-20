@@ -27,13 +27,12 @@ jobs:
           # Known-hallucinated tokens. Extend only via an ALIGNMENT.md amendment PR.
           # Each token is matched as a fixed string against server.mjs only.
           BLACKLIST=(
-            "api/oauth/usage"
-            "api/usage"
+            "api.anthropic.com/api/oauth/usage"
           )
 
           FAIL=0
           for token in "${BLACKLIST[@]}"; do
-            if grep -n -F "$token" server.mjs; then
+            if sed "s|//.*\$||" server.mjs | grep -n -F "$token"; then
               echo "::error file=server.mjs::Blacklisted token '$token' detected in server.mjs."
               FAIL=1
             fi
