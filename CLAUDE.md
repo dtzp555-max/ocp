@@ -56,3 +56,36 @@ The full iron rules are at `~/.claude/CC_DEV_IRON_RULES.md` (symlinked from the 
 ## Project-level escalation
 
 If a design decision cannot be resolved by reference to `cli.js` and `ALIGNMENT.md`, escalate to Tao (老大) via `/cc-chat` rather than guessing. Silent guessing is what produced the 2026-04-11 drift.
+
+---
+
+## Release kit overlay (CC 开发铁律 第五律 5.5)
+
+This project's overlay per iron rule v1.4's 5.5. Machine-checkable declaration.
+
+```yaml
+release_kit:
+  version_source: package.json
+  changelog: CHANGELOG.md
+  release_channel:
+    type: github-release
+    tag_format: v{semver}
+    auto_create_on_tag_push: true   # via .github/workflows/release.yml
+  docs_source: README.md
+  resource_lists:
+    - name: Available Models table
+      location: README.md § "Available Models"
+      source_of_truth: models.json
+    - name: API Endpoints table
+      location: README.md § "API Endpoints"
+    - name: Environment Variables table
+      location: README.md § "Environment Variables"
+  new_feature_doc_expectations:
+    - new CLI subcommand → README § "All Commands" + usage example
+    - new env var → README § "Environment Variables" table
+    - new auto-sync / hook → dedicated §, must document trigger + manual invocation + opt-out + any bootstrap quirk
+    - new endpoint → README § "API Endpoints" table + any relevant Config/Troubleshooting §
+    - new file / SPOT / schema → Architecture or contributor § with link
+  bootstrap_quirk_policy:
+    - any one-time migration quirk → README § "Troubleshooting"
+```
