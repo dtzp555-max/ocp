@@ -375,6 +375,34 @@ ocp update --check
 ocp update
 ```
 
+`ocp update` runs (in order): `git pull` → `npm install` → plugin sync → **OpenClaw model registry sync** (v3.11.0+) → proxy restart → health check.
+
+### OpenClaw Auto-Sync (v3.11.0+)
+
+Whenever the model list in [`models.json`](./models.json) changes, `ocp update` automatically reconciles your OpenClaw config so the model dropdown stays in sync — no more "I upgraded OCP but my Telegram bot still shows the old models" surprises.
+
+**What gets synced** (and only this — all other config keys are preserved):
+- `models.providers."claude-local".models` in `~/.openclaw/openclaw.json`
+- `agents.defaults.models["claude-local/*"]` aliases
+
+**Safety**:
+- Timestamped backup written before every change: `~/.openclaw/openclaw.json.bak.<ms>`
+- Idempotent — already-in-sync runs are a no-op (no backup, no rewrite)
+- Non-fatal — sync failure does NOT abort `ocp update`; `/v1/models` still works
+- Skips silently if OpenClaw is not installed (`~/.openclaw/openclaw.json` missing)
+
+**Manual trigger** (e.g. after fixing a hand-edited config, or for the one-time v3.10.0→v3.11.0 bootstrap quirk):
+```bash
+node ~/ocp/scripts/sync-openclaw.mjs
+node ~/ocp/scripts/sync-openclaw.mjs --quiet   # silent unless changes
+```
+
+**Opt-out**: `ocp update` only invokes the sync if `node` and `scripts/sync-openclaw.mjs` are both present. Removing the script disables auto-sync; the rest of `ocp update` still works.
+
+**One-time bootstrap caveat (v3.10.0 → v3.11.0 only)**: the first `ocp update` to v3.11.0 runs the *old* `cmd_update` already loaded into your shell, so the new sync hook does NOT fire on this single jump. Run `node ~/ocp/scripts/sync-openclaw.mjs` once manually. Every future update from v3.11.0+ syncs automatically.
+
+**Other IDEs** (Cline / Aider / Cursor / opencode) query `/v1/models` live, so they pick up new models on the next request — no sync needed. Continue.dev users edit their own `config.json` model id manually.
+
 ### Runtime Settings (No Restart Needed)
 
 ```
@@ -438,7 +466,16 @@ OCP translates OpenAI-compatible `/v1/chat/completions` requests into `claude -p
 | `claude-sonnet-4-6` | Good balance of speed/quality (default for `sonnet` alias) |
 | `claude-haiku-4-5-20251001` | Fastest, lightweight (default for `haiku` alias) |
 
-The canonical list lives in [`models.json`](./models.json). Adding a new model is a one-file edit; `ocp update` then auto-syncs every connected IDE (OpenClaw via `scripts/sync-openclaw.mjs`; other IDEs query `/v1/models` live).
+The canonical list lives in [`models.json`](./models.json) — the single source of truth as of v3.11.0. Both `server.mjs` (the `/v1/models` endpoint) and `setup.mjs` (the OpenClaw registration) derive from it. Adding a new model is now a one-file edit:
+
+```bash
+# 1. Edit models.json — add an entry
+# 2. Bump version, commit, tag, push
+# 3. Users get it on next `ocp update`:
+#    - OpenClaw: auto-synced via scripts/sync-openclaw.mjs
+#    - Cline / Aider / Cursor / opencode: live /v1/models, picks up immediately
+#    - Continue.dev: user edits their own config.json
+```
 
 ## API Endpoints
 
@@ -524,6 +561,27 @@ Usually caused by an expired Claude CLI session. Fix:
 claude auth login
 ocp restart
 ```
+
+### Startup log warns "OpenClaw registry out of sync"
+
+On boot, OCP compares OpenClaw's registered models against [`models.json`](./models.json) and warns if they drift. Cause: someone (or an OpenClaw upgrade) modified `~/.openclaw/openclaw.json` and removed entries OCP expects. Fix:
+
+```bash
+node ~/ocp/scripts/sync-openclaw.mjs
+```
+
+This is read-only at startup; the warning never blocks the gateway from running.
+
+### OpenClaw shows old models after `ocp update` (v3.10→v3.11 only)
+
+One-time bootstrap quirk for the v3.10.0 → v3.11.0 jump only — the running shell had the old `cmd_update` cached. Run once manually:
+
+```bash
+node ~/ocp/scripts/sync-openclaw.mjs
+openclaw gateway restart   # so OpenClaw re-reads the config
+```
+
+Future `ocp update` invocations sync automatically.
 
 ## Environment Variables
 
