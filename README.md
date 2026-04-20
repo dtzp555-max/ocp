@@ -95,7 +95,7 @@ Run `ocp lan` to see your IP and ready-to-share instructions.
 **Verify:**
 ```bash
 curl http://127.0.0.1:3456/v1/models
-# Returns: claude-opus-4-6, claude-sonnet-4-6, claude-haiku-4
+# Returns: claude-opus-4-7, claude-opus-4-6, claude-sonnet-4-6, claude-haiku-4-5-20251001
 ```
 
 ---
@@ -139,13 +139,13 @@ OCP Connect v1.3.0
   Checking connectivity...
   ✓ Connected
 
-  Remote OCP v3.10.0  (auth: multi)
+  Remote OCP v3.11.0  (auth: multi)
 
   ⓘ Using server-advertised anonymous key: ocp_publ...n_v1
     (set by admin via PROXY_ANONYMOUS_KEY; see issue #12 §14 Path A)
 
   Testing API access...
-  ✓ API accessible (3 models available)
+  ✓ API accessible (4 models available)
 
   Shell config:
     ✓ .bashrc
@@ -175,6 +175,7 @@ OCP Connect v1.3.0
   ✓ OpenClaw configured
     Provider: ocp
     Models:
+      • ocp/claude-opus-4-7
       • ocp/claude-opus-4-6
       • ocp/claude-sonnet-4-6
       • ocp/claude-haiku-4-5-20251001
@@ -432,9 +433,12 @@ OCP translates OpenAI-compatible `/v1/chat/completions` requests into `claude -p
 
 | Model ID | Notes |
 |----------|-------|
-| `claude-opus-4-6` | Most capable, slower |
-| `claude-sonnet-4-6` | Good balance of speed/quality |
-| `claude-haiku-4-5-20251001` | Fastest, lightweight |
+| `claude-opus-4-7` | Most capable (default for `opus` alias) |
+| `claude-opus-4-6` | Previous Opus, retained for pinning |
+| `claude-sonnet-4-6` | Good balance of speed/quality (default for `sonnet` alias) |
+| `claude-haiku-4-5-20251001` | Fastest, lightweight (default for `haiku` alias) |
+
+The canonical list lives in [`models.json`](./models.json). Adding a new model is a one-file edit; `ocp update` then auto-syncs every connected IDE (OpenClaw via `scripts/sync-openclaw.mjs`; other IDEs query `/v1/models` live).
 
 ## API Endpoints
 
@@ -460,7 +464,8 @@ OCP translates OpenAI-compatible `/v1/chat/completions` requests into `claude -p
 
 OCP was originally built for [OpenClaw](https://github.com/openclaw/openclaw) and includes deep integration:
 
-- **`setup.mjs`** auto-configures the `claude-local` provider in `openclaw.json`
+- **`setup.mjs`** auto-configures the `claude-local` provider in `openclaw.json` at install time
+- **`ocp update`** auto-syncs the `claude-local` model registry from `models.json` (v3.11.0+) — no more stale model dropdowns after upgrades
 - **Gateway plugin** registers `/ocp` as a native slash command in Telegram/Discord
 - **Multi-agent** — 8 concurrent requests sharing one subscription
 - **No conflicts** — uses neutral service names (`dev.ocp.proxy` / `ocp-proxy`) that don't trigger OpenClaw's gateway-like service detection
