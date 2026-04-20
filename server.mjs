@@ -680,25 +680,42 @@ function completionResponse(res, id, model, content) {
 }
 
 // ── Plan usage probe ────────────────────────────────────────────────────
-// Uses the dedicated /api/oauth/usage endpoint (same as Claude Code CLI)
-// with Bearer auth + anthropic-beta header. Auto-refreshes expired tokens.
-// Caches the result for 5 minutes to avoid excessive API calls.
+// ── Plan usage probe ────────────────────────────────────────────────────
+// ALIGNMENT: mirrors Claude Code cli.js vE4 rate-limit header extraction.
+// DO NOT switch endpoints without grepping "anthropic-ratelimit-unified" in cli.js.
+// 2026-04-11 b87992f drift lesson: /api/oauth/usage is a hallucinated endpoint.
+// See ALIGNMENT.md for full history.
+//
+// Reads OAuth token (keychain / Linux credentials / CLAUDE_CODE_OAUTH_TOKEN env)
+// and makes a minimal /v1/messages request to capture anthropic-ratelimit-unified-*
+// headers. Caches the result for 5 minutes.
 
 let usageCache = { data: null, fetchedAt: 0 };
-const USAGE_CACHE_TTL = 900000; // 15 min
+const USAGE_CACHE_TTL = 5 * 60 * 1000; // 5 min
 const OAUTH_CLIENT_ID = "9d1c250a-e61b-44d9-88ed-5944d1962f5e";
 const OAUTH_TOKEN_URL = "https://platform.claude.com/v1/oauth/token";
-const OAUTH_BETA_HEADER = "oauth-2025-04-20";
+
+// Refresh backoff state — exponential 60s → 3600s.
+// Prevents tight loops hammering the token endpoint after a failure
+// (lesson from pre-fix session that burned through rate-limit in seconds).
+const OAUTH_REFRESH_MIN_BACKOFF = 60 * 1000;
+const OAUTH_REFRESH_MAX_BACKOFF = 3600 * 1000;
+let oauthRefreshBackoff = { nextAttemptAt: 0, currentDelay: OAUTH_REFRESH_MIN_BACKOFF };
 
 function getOAuthCredentials() {
-  // Try Linux file-based credentials first
+  // 1. Env var fallback — highest precedence for explicit overrides.
+  if (process.env.CLAUDE_CODE_OAUTH_TOKEN) {
+    return { accessToken: process.env.CLAUDE_CODE_OAUTH_TOKEN };
+  }
+
+  // 2. Linux file-based credentials
   try {
     const credPath = join(homedir(), ".claude", ".credentials.json");
     const creds = JSON.parse(readFileSync(credPath, "utf8"));
     if (creds?.claudeAiOauth?.accessToken) return creds.claudeAiOauth;
   } catch { /* fall through to macOS keychain */ }
 
-  // Try macOS keychain (both label formats)
+  // 3. macOS keychain (both label formats)
   for (const label of ["claude-code-credentials", "Claude Code-credentials"]) {
     try {
       const raw = execFileSync("security", [
@@ -712,6 +729,13 @@ function getOAuthCredentials() {
 }
 
 async function refreshOAuthToken(refreshToken) {
+  const now = Date.now();
+  if (now < oauthRefreshBackoff.nextAttemptAt) {
+    logEvent("info", "oauth_refresh_backoff_skip", {
+      waitMs: oauthRefreshBackoff.nextAttemptAt - now,
+    });
+    return null;
+  }
   try {
     const resp = await fetch(OAUTH_TOKEN_URL, {
       method: "POST",
@@ -725,13 +749,34 @@ async function refreshOAuthToken(refreshToken) {
     });
     if (!resp.ok) {
       const body = await resp.text();
-      logEvent("warn", "oauth_refresh_failed", { status: resp.status, body: body.slice(0, 200) });
+      // Exponential backoff on failure
+      oauthRefreshBackoff.nextAttemptAt = Date.now() + oauthRefreshBackoff.currentDelay;
+      oauthRefreshBackoff.currentDelay = Math.min(
+        oauthRefreshBackoff.currentDelay * 2,
+        OAUTH_REFRESH_MAX_BACKOFF,
+      );
+      logEvent("warn", "oauth_refresh_failed", {
+        status: resp.status,
+        body: body.slice(0, 200),
+        nextBackoffMs: oauthRefreshBackoff.currentDelay,
+      });
       return null;
     }
     const data = await resp.json();
+    // Reset backoff on success
+    oauthRefreshBackoff.currentDelay = OAUTH_REFRESH_MIN_BACKOFF;
+    oauthRefreshBackoff.nextAttemptAt = 0;
     return data.access_token || null;
   } catch (err) {
-    logEvent("warn", "oauth_refresh_error", { error: err.message });
+    oauthRefreshBackoff.nextAttemptAt = Date.now() + oauthRefreshBackoff.currentDelay;
+    oauthRefreshBackoff.currentDelay = Math.min(
+      oauthRefreshBackoff.currentDelay * 2,
+      OAUTH_REFRESH_MAX_BACKOFF,
+    );
+    logEvent("warn", "oauth_refresh_error", {
+      error: err.message,
+      nextBackoffMs: oauthRefreshBackoff.currentDelay,
+    });
     return null;
   }
 }
@@ -739,73 +784,88 @@ async function refreshOAuthToken(refreshToken) {
 async function fetchUsageFromApi() {
   const creds = getOAuthCredentials();
   if (!creds?.accessToken) {
-    return { error: "No OAuth token found in keychain" };
+    return { error: "No OAuth token found (keychain / ~/.claude/.credentials.json / CLAUDE_CODE_OAUTH_TOKEN)" };
   }
 
   let token = creds.accessToken;
 
-  // Check if token looks expired (5 min buffer, same as Claude Code)
-  if (creds.expiresAt && Date.now() + 300000 >= creds.expiresAt) {
-    if (creds.refreshToken) {
-      logEvent("info", "oauth_token_expired_refreshing");
-      const newToken = await refreshOAuthToken(creds.refreshToken);
-      if (newToken) token = newToken;
-    }
+  // Pre-emptive refresh if token looks expired (5 min buffer, same as Claude Code)
+  if (creds.expiresAt && Date.now() + 300000 >= creds.expiresAt && creds.refreshToken) {
+    logEvent("info", "oauth_token_expired_refreshing");
+    const newToken = await refreshOAuthToken(creds.refreshToken);
+    if (newToken) token = newToken;
   }
 
+  // Minimal /v1/messages request — we only need the response headers.
+  // Mirrors Claude Code cli.js vE4: headers anthropic-ratelimit-unified-{5h,7d}-{utilization,reset}.
+  const body = JSON.stringify({
+    model: "claude-haiku-4-5-20251001",
+    max_tokens: 1,
+    messages: [{ role: "user", content: "." }],
+  });
+
   const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), 10000);
+  const timeout = setTimeout(() => controller.abort(), 15000);
+
+  const doFetch = (bearerToken) => fetch("https://api.anthropic.com/v1/messages", {
+    method: "POST",
+    headers: {
+      "x-api-key": bearerToken,
+      "anthropic-version": "2023-06-01",
+      "Content-Type": "application/json",
+    },
+    body,
+    signal: controller.signal,
+  });
 
   try {
-    const resp = await fetch("https://api.anthropic.com/api/oauth/usage", {
-      method: "GET",
-      headers: {
-        "Authorization": `Bearer ${token}`,
-        "anthropic-beta": OAUTH_BETA_HEADER,
-        "Content-Type": "application/json",
-      },
-      signal: controller.signal,
-    });
-    clearTimeout(timeout);
+    let resp = await doFetch(token);
 
-    if (!resp.ok) {
-      // If 401, try refreshing token once
-      if (resp.status === 401 && creds.refreshToken) {
-        logEvent("info", "oauth_usage_401_refreshing");
-        const newToken = await refreshOAuthToken(creds.refreshToken);
-        if (newToken) {
-          const retryResp = await fetch("https://api.anthropic.com/api/oauth/usage", {
-            method: "GET",
-            headers: {
-              "Authorization": `Bearer ${newToken}`,
-              "anthropic-beta": OAUTH_BETA_HEADER,
-              "Content-Type": "application/json",
-            },
-          });
-          if (retryResp.ok) {
-            const retryData = await retryResp.json();
-            return parseUsageResponse(retryData);
-          }
-        }
-        return { error: `Usage API auth failed after refresh (${resp.status})` };
+    // 401 → try a single refresh-and-retry
+    if (resp.status === 401 && creds.refreshToken) {
+      logEvent("info", "oauth_usage_401_refreshing");
+      const newToken = await refreshOAuthToken(creds.refreshToken);
+      if (newToken) {
+        token = newToken;
+        resp = await doFetch(token);
       }
-      return { error: `Usage API returned ${resp.status}` };
     }
 
-    const data = await resp.json();
-    return parseUsageResponse(data);
+    clearTimeout(timeout);
+
+    // Extract all rate-limit headers (we do not need the response body)
+    const rl = {};
+    for (const [k, v] of resp.headers) {
+      if (k.startsWith("anthropic-ratelimit")) rl[k] = v;
+    }
+
+    if (!resp.ok && Object.keys(rl).length === 0) {
+      return { error: `Usage API returned ${resp.status} with no rate-limit headers` };
+    }
+
+    return parseRateLimitHeaders(rl);
   } catch (err) {
     clearTimeout(timeout);
     return { error: `Failed to fetch usage: ${err.message}` };
   }
 }
 
-function parseUsageResponse(data) {
+function parseRateLimitHeaders(rl) {
   const now = Date.now();
 
-  function formatReset(isoStr) {
-    if (!isoStr) return "unknown";
-    const diff = new Date(isoStr).getTime() - now;
+  const session5hUtil = parseFloat(rl["anthropic-ratelimit-unified-5h-utilization"] || "0");
+  const session5hReset = parseInt(rl["anthropic-ratelimit-unified-5h-reset"] || "0", 10);
+  const weekly7dUtil = parseFloat(rl["anthropic-ratelimit-unified-7d-utilization"] || "0");
+  const weekly7dReset = parseInt(rl["anthropic-ratelimit-unified-7d-reset"] || "0", 10);
+  const overageStatus = rl["anthropic-ratelimit-unified-overage-status"] || "unknown";
+  const overageDisabledReason = rl["anthropic-ratelimit-unified-overage-disabled-reason"] || "";
+  const status = rl["anthropic-ratelimit-unified-status"] || "unknown";
+  const representativeClaim = rl["anthropic-ratelimit-unified-representative-claim"] || "";
+  const fallbackPct = parseFloat(rl["anthropic-ratelimit-unified-fallback-percentage"] || "0");
+
+  function formatReset(epochSec) {
+    if (!epochSec) return "unknown";
+    const diff = epochSec * 1000 - now;
     if (diff <= 0) return "now";
     const h = Math.floor(diff / 3600000);
     const m = Math.floor((diff % 3600000) / 60000);
@@ -816,42 +876,38 @@ function parseUsageResponse(data) {
     return h > 0 ? `${h}h ${m}m` : `${m}m`;
   }
 
-  function resetDay(isoStr) {
-    if (!isoStr) return "";
-    const d = new Date(isoStr);
+  function resetDay(epochSec) {
+    if (!epochSec) return "";
+    const d = new Date(epochSec * 1000);
     return d.toLocaleDateString("en-US", { weekday: "short", month: "short", day: "numeric", hour: "numeric", minute: "2-digit" });
   }
 
-  const fiveHour = data.five_hour || {};
-  const sevenDay = data.seven_day || {};
-  const extraUsage = data.extra_usage || {};
-
   return {
-    status: "active",
+    status,
     fetchedAt: new Date(now).toISOString(),
     plan: {
       currentSession: {
-        utilization: (fiveHour.utilization || 0) / 100,
-        percent: `${Math.round(fiveHour.utilization || 0)}%`,
-        resetsIn: formatReset(fiveHour.resets_at),
-        resetsAt: fiveHour.resets_at || null,
-        resetsAtHuman: resetDay(fiveHour.resets_at),
+        utilization: session5hUtil,
+        percent: `${Math.round(session5hUtil * 100)}%`,
+        resetsIn: formatReset(session5hReset),
+        resetsAt: session5hReset ? new Date(session5hReset * 1000).toISOString() : null,
+        resetsAtHuman: resetDay(session5hReset),
       },
       weeklyLimits: {
         allModels: {
-          utilization: (sevenDay.utilization || 0) / 100,
-          percent: `${Math.round(sevenDay.utilization || 0)}%`,
-          resetsIn: formatReset(sevenDay.resets_at),
-          resetsAt: sevenDay.resets_at || null,
-          resetsAtHuman: resetDay(sevenDay.resets_at),
+          utilization: weekly7dUtil,
+          percent: `${Math.round(weekly7dUtil * 100)}%`,
+          resetsIn: formatReset(weekly7dReset),
+          resetsAt: weekly7dReset ? new Date(weekly7dReset * 1000).toISOString() : null,
+          resetsAtHuman: resetDay(weekly7dReset),
         },
       },
       extraUsage: {
-        status: extraUsage.is_enabled ? "enabled" : "disabled",
-        monthlyLimit: extraUsage.monthly_limit,
-        usedCredits: extraUsage.used_credits,
-        utilization: extraUsage.utilization,
+        status: overageStatus,
+        disabledReason: overageDisabledReason || undefined,
       },
+      representativeClaim,
+      fallbackPercentage: fallbackPct,
     },
     proxy: {
       totalRequests: stats.totalRequests,
@@ -861,7 +917,7 @@ function parseUsageResponse(data) {
       uptime: `${Math.floor((now - START_TIME) / 3600000)}h ${Math.floor(((now - START_TIME) % 3600000) / 60000)}m`,
     },
     models: getModelStatsSnapshot(),
-    _raw: data,
+    _raw: rl,
   };
 }
 
