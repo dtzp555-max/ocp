@@ -810,8 +810,9 @@ async function fetchUsageFromApi() {
   const doFetch = (bearerToken) => fetch("https://api.anthropic.com/v1/messages", {
     method: "POST",
     headers: {
-      "x-api-key": bearerToken,
+      "Authorization": `Bearer ${bearerToken}`,
       "anthropic-version": "2023-06-01",
+      "anthropic-beta": "oauth-2025-04-20",
       "Content-Type": "application/json",
     },
     body,
