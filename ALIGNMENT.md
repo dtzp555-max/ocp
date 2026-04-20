@@ -60,7 +60,7 @@ On 2026-04-11, commit `b87992f` ("fix: use dedicated /api/oauth/usage endpoint f
 
 **Root cause:** LLM hallucination accepted without `grep cli.js` verification, compounded by the absence of a CI blacklist and the absence of this constitution.
 
-**Fix commit:** `<to be filled when repair PR lands>`
+**Fix commit:** `fd7973a` (PR #21 — restored header-based `/usage`); follow-up `01e260c` (PR #24 — OAuth Bearer header correction)
 
 **Lesson codified:** Rules 1, 2, and 5 of this document; the CI blacklist in `.github/workflows/alignment.yml`; and the PR template evidence section exist to make the 2026-04-11 drift structurally impossible to repeat.
 
