@@ -38,3 +38,10 @@ Reviewers: this section is for you, not the author. Do not approve until every b
 - `ALIGNMENT.md` Rule(s) invoked: <!-- e.g. Rule 3 -->
 - Related issue / prior PR: <!-- #NNN -->
 - Historical lesson reference (if relevant): <!-- e.g. 2026-04-11 drift, b87992f -->
+
+### User-visible change self-check (铁律第五律 5.3)
+
+- [ ] This PR has user-visible changes → README has corresponding documentation (paste diff link or line range)
+- [ ] This PR has no user-visible changes → stated "no user-visible change" in summary above
+
+Reviewers: if "user-visible" is checked but README diff is empty, block merge (per 5.3 reviewer gate).
