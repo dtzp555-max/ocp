@@ -1,0 +1,124 @@
+name: Alignment Guardrail
+
+on:
+  pull_request:
+    paths:
+      - 'server.mjs'
+      - '.github/workflows/alignment.yml'
+
+jobs:
+  blacklist:
+    name: server.mjs blacklist (hard fail)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Scan server.mjs for hallucinated tokens
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [ ! -f server.mjs ]; then
+            echo "server.mjs not found; nothing to scan."
+            exit 0
+          fi
+
+          # Known-hallucinated tokens. Extend only via an ALIGNMENT.md amendment PR.
+          # Each token is matched as a fixed string against server.mjs only.
+          BLACKLIST=(
+            "api/oauth/usage"
+            "api/usage"
+          )
+
+          FAIL=0
+          for token in "${BLACKLIST[@]}"; do
+            if grep -n -F "$token" server.mjs; then
+              echo "::error file=server.mjs::Blacklisted token '$token' detected in server.mjs."
+              FAIL=1
+            fi
+          done
+
+          if [ "$FAIL" -ne 0 ]; then
+            cat <<'EOF'
+
+          ============================================================
+          ALIGNMENT GUARDRAIL FAILURE
+          ============================================================
+          server.mjs contains a token on the OCP alignment blacklist.
+
+          These tokens were introduced by LLM hallucinations and do
+          not appear in cli.js at any shipped Claude Code version.
+          See ALIGNMENT.md -> "Historical Lesson: The 2026-04-11 Drift"
+          (commit b87992f) for the full incident record.
+
+          Required action:
+            1. Remove the token from server.mjs.
+            2. grep the reference cli.js for the operation you
+               intended and cite the real line numbers.
+            3. See ALIGNMENT.md Rules 1, 2, and 5.
+
+          Do not add allowlist entries to this workflow without an
+          amendment PR to ALIGNMENT.md (see Amendment Procedure).
+          ============================================================
+          EOF
+            exit 1
+          fi
+
+          echo "Blacklist scan clean."
+
+  commit-citation:
+    name: commit message citation (soft check)
+    runs-on: ubuntu-latest
+    # Soft check: reports a warning but does not block merge. Reviewers
+    # are expected to enforce per CLAUDE.md. Escalate to hard-fail via
+    # an ALIGNMENT.md amendment if drift recurs.
+    continue-on-error: true
+    steps:
+      - name: Checkout full history
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Scan PR commits for uncited assertions
+        shell: bash
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+
+          if [ -z "${BASE_SHA:-}" ] || [ -z "${HEAD_SHA:-}" ]; then
+            echo "No PR context; skipping."
+            exit 0
+          fi
+
+          # Collect commit messages in range.
+          MSGS="$(git log --format=%B "${BASE_SHA}..${HEAD_SHA}")"
+
+          # Look for assertions of the form "Claude Code uses ..." or
+          # "cli.js uses ..." (case-insensitive). For each hit, require
+          # a citation in the same commit message in one of the forms:
+          #   cli.js:NNNN         (line-number citation)
+          #   cli.js vE4 <name>   (version + function-name citation)
+          # Absence of a citation is a soft finding.
+
+          WARN=0
+          # Split log into per-commit blocks for precise matching.
+          git log --format="%H" "${BASE_SHA}..${HEAD_SHA}" | while read -r sha; do
+            BODY="$(git log -1 --format=%B "$sha")"
+            if echo "$BODY" | grep -E -i -q '(claude[[:space:]]+code|cli\.js)[[:space:]]+uses'; then
+              if echo "$BODY" | grep -E -q '(cli\.js:[0-9]+|cli\.js[[:space:]]+v[A-Za-z0-9]+[[:space:]]+[A-Za-z_][A-Za-z0-9_]*)'; then
+                echo "OK  $sha: assertion cited."
+              else
+                echo "::warning::Commit $sha asserts 'Claude Code uses ...' or 'cli.js uses ...' but does not cite a cli.js line number or versioned function name. See CLAUDE.md -> Commit message conventions."
+                WARN=1
+              fi
+            fi
+          done
+
+          if [ "$WARN" -ne 0 ]; then
+            echo "Soft check raised warnings. Reviewer: please enforce per CLAUDE.md."
+          else
+            echo "Commit citation soft check clean."
+          fi
