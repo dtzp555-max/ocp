@@ -29,7 +29,7 @@
 import { createServer } from "node:http";
 import { spawn, execFileSync } from "node:child_process";
 import { randomUUID, timingSafeEqual } from "node:crypto";
-import { readFileSync, accessSync, constants } from "node:fs";
+import { readFileSync, accessSync, existsSync, constants } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 import { homedir } from "node:os";
@@ -1577,4 +1577,22 @@ server.listen(PORT, BIND_ADDRESS, () => {
   console.log(`  OCP uses: localhost:${PORT} (HTTP) → claude -p (per-request process)`);
   console.log(`  CC uses:  MCP protocol (in-process) → persistent session`);
   console.log(`  Both can run simultaneously on the same machine.`);
+
+  // Passive OpenClaw registry drift check (non-fatal, read-only).
+  // Emits a console.warn only. No network/endpoint surface change. No
+  // Claude-CLI-call boundary touched — cli.js citation N/A (ALIGNMENT.md Rule 2).
+  try {
+    const openclawCfg = join(homedir(), ".openclaw", "openclaw.json");
+    if (existsSync(openclawCfg)) {
+      const cfg = JSON.parse(readFileSync(openclawCfg, "utf-8"));
+      const registered = cfg?.models?.providers?.["claude-local"]?.models ?? [];
+      const expected = modelsConfig.models.map(m => m.id);
+      const registeredIds = new Set(registered.map(r => r.id));
+      const missing = expected.filter(id => !registeredIds.has(id));
+      if (missing.length > 0) {
+        console.warn(`⚠ OpenClaw registry out of sync (missing: ${missing.join(", ")})`);
+        console.warn(`  Run: node ${__dirname}/scripts/sync-openclaw.mjs`);
+      }
+    }
+  } catch { /* ignore — best-effort */ }
 });
