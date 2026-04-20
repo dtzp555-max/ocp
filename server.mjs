@@ -930,9 +930,6 @@ async function handleUsage(_req, res) {
     data = await fetchUsageFromApi();
     if (!data.error) {
       usageCache = { data, fetchedAt: now };
-    } else if (usageCache.data) {
-      // Fallback to stale cache on error (e.g. 429 rate limit)
-      data = { ...usageCache.data, _stale: true, _fetchError: data.error };
     }
   }
   // Always attach live model stats and proxy stats (not cached)
@@ -1004,8 +1001,6 @@ async function handleStatus(_req, res) {
     usage = await fetchUsageFromApi();
     if (!usage.error) {
       usageCache = { data: usage, fetchedAt: now };
-    } else if (usageCache.data) {
-      usage = { ...usageCache.data, _stale: true };
     }
   }
 
