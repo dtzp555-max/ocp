@@ -146,18 +146,20 @@ const _BREAKER_DISABLED_NOTE = "disabled";
 // ── Model mapping ───────────────────────────────────────────────────────
 // Maps request model IDs and aliases to canonical claude CLI model IDs.
 const MODEL_MAP = {
+  "claude-opus-4-7": "claude-opus-4-7",
   "claude-opus-4-6": "claude-opus-4-6",
   "claude-sonnet-4-6": "claude-sonnet-4-6",
   "claude-haiku-4-5-20251001": "claude-haiku-4-5-20251001",
-  "claude-opus-4": "claude-opus-4-6",
+  "claude-opus-4": "claude-opus-4-7",
   "claude-haiku-4": "claude-haiku-4-5-20251001",
   "claude-haiku-4-5": "claude-haiku-4-5-20251001",
-  "opus": "claude-opus-4-6",
+  "opus": "claude-opus-4-7",
   "sonnet": "claude-sonnet-4-6",
   "haiku": "claude-haiku-4-5-20251001",
 };
 
 const MODELS = [
+  { id: "claude-opus-4-7", name: "Claude Opus 4.7" },
   { id: "claude-opus-4-6", name: "Claude Opus 4.6" },
   { id: "claude-sonnet-4-6", name: "Claude Sonnet 4.6" },
   { id: "claude-haiku-4-5-20251001", name: "Claude Haiku 4.5" },
