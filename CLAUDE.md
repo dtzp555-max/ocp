@@ -1,3 +1,6 @@
+@AGENTS.md
+@~/.cc-rules/AGENTS.md
+
 # OCP Project Session Instructions
 
 > **WARNING — READ BEFORE WRITING ANY CODE IN THIS REPO**
