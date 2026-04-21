@@ -444,6 +444,15 @@ function spawnClaudeProcess(model, messages, conversationId) {
     stats.activeRequests--;
   }
 
+  // Guarantee slot release on ANY exit path (normal close, error, timeout kill,
+  // SIGKILL escalation). The 'exit' event fires before 'close' and runs even
+  // if stdio pipes stay open. Fixes #37: the timeout path called
+  // proc.kill('SIGTERM') without decrementing the concurrency counter, so a
+  // stuck subprocess that ignored SIGTERM could leak its slot until (or
+  // beyond) the SIGKILL escalation actually reaped it. cleanup() is idempotent
+  // so this listener is safe alongside the existing 'close'/'error' paths.
+  proc.once("exit", cleanup);
+
   function handleSessionFailure() {
     if (sessionInfo?.resume && conversationId) {
       console.warn(`[session] resume failed for ${conversationId.slice(0, 12)}..., removing stale session`);
