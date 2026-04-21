@@ -1,5 +1,10 @@
 # Changelog
 
+## v3.11.1 — 2026-04-21
+
+### Fixes
+- Concurrency slot leak on subprocess timeout (#37). The request-timeout handler called `proc.kill("SIGTERM")` without decrementing `stats.activeRequests`. A subprocess stuck in a syscall that ignored SIGTERM would hold its slot until (or beyond) the 5s SIGKILL escalation actually reaped it. Slot release is now wired to `proc.once("exit", cleanup)` so every termination path — normal close, error, SIGTERM, SIGKILL — releases the slot exactly once.
+
 ## v3.11.0 — 2026-04-20
 
 ### Features
