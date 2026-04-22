@@ -45,3 +45,12 @@ Reviewers: this section is for you, not the author. Do not approve until every b
 - [ ] This PR has no user-visible changes → stated "no user-visible change" in summary above
 
 Reviewers: if "user-visible" is checked but README diff is empty, block merge (per 5.3 reviewer gate).
+
+### Privacy self-check (for PUBLIC repos) — Iron Rule adjacent
+
+- [ ] This PR does not introduce real names, nicknames, or handles that identify specific individuals. All references use role-based terms (`project maintainer`, `contributor`, `user`, `reviewer`).
+- [ ] This PR does not introduce literal personal paths (`/Users/<username>/`, `/home/<username>/`). Uses `$HOME/` or `~/` instead.
+- [ ] This PR does not introduce personal machine hostnames. Uses role-based names or generic descriptors.
+- [ ] This PR does not introduce personal email addresses beyond automated placeholders like `noreply@<vendor>.com`.
+
+Reviewers: if any of the above is violated and the repo is PUBLIC, block merge and request scrub.
