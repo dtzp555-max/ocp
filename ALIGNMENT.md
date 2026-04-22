@@ -44,7 +44,7 @@ OCP (Open Claude Proxy) is a **proxy layer** for the Claude Code CLI. It forward
 - **Claude Code version under audit:** `2.1.89`
 - **`cli.js` SHA-256:** `a9950ef6407fdc750bddb673852485500387e524a99d42385cb81e7d17128e01`
 - **Audit date:** `2026-04-20`
-- **Auditor:** `Tao Deng`
+- **Auditor:** `project maintainer`
 
 The audit pin is updated once per year (see Annual Alignment Audit) and whenever a drift incident forces a re-verification.
 

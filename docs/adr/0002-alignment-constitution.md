@@ -2,7 +2,7 @@
 
 - **Date**: 2026-04-20
 - **Status**: Accepted
-- **Authors**: Tao Deng, Claude Opus 4.7 (drafting)
+- **Authors**: project maintainer (with AI drafting assistance)
 - **Related**: PR #20, commit 2853088; supersedes implicit "keep the proxy honest" discipline
 
 ## Context
@@ -37,7 +37,7 @@ Supporting mechanisms:
 - `CLAUDE.md` enshrines hard requirements for `server.mjs` PRs: `cli.js` citation, CI blacklist pass, independent reviewer who opens `cli.js` at the cited lines.
 - `.github/workflows/alignment.yml` greps `server.mjs` on every PR for the known-hallucinated token set (`api/oauth/usage`, `api/usage`, et al.) and fails the build on any hit.
 - `.github/PULL_REQUEST_TEMPLATE.md` makes the `cli.js` citation and the reviewer's cli.js-opened confirmation mandatory fields.
-- A bootstrap audit pin: Claude Code `2.1.89`, `cli.js` SHA-256 `a9950ef6407fdc750bddb673852485500387e524a99d42385cb81e7d17128e01`, auditor Tao Deng, date 2026-04-20. The pin is refreshed annually on 11 April (the drift anniversary) or on any re-verification event.
+- A bootstrap audit pin: Claude Code `2.1.89`, `cli.js` SHA-256 `a9950ef6407fdc750bddb673852485500387e524a99d42385cb81e7d17128e01`, auditor: project maintainer, date 2026-04-20. The pin is refreshed annually on 11 April (the drift anniversary) or on any re-verification event.
 - A documented Historical Lesson section in `ALIGNMENT.md` that names the drift commits by SHA, so the incident cannot be rewritten or quietly forgotten.
 
 ## Consequences
@@ -63,7 +63,7 @@ Supporting mechanisms:
 
 ## Alternatives considered
 
-**(a) Pure human discipline — no CI, no template, no ADR.** Tao would simply commit to grepping `cli.js` on every change, and reviewers would commit to verifying. Rejected: the 2026-04-11 drift already happened under exactly this regime. Tao is meticulous, and the drift still shipped. Social discipline alone cannot prevent LLM hallucination from slipping through, especially when the LLM's output is superficially plausible.
+**(a) Pure human discipline — no CI, no template, no ADR.** the maintainer would simply commit to grepping `cli.js` on every change, and reviewers would commit to verifying. Rejected: the 2026-04-11 drift already happened under exactly this regime. the maintainer is meticulous, and the drift still shipped. Social discipline alone cannot prevent LLM hallucination from slipping through, especially when the LLM's output is superficially plausible.
 
 **(b) Automatic `cli.js` diff on every PR.** A CI step that diffs `server.mjs`'s network surface against a parsed `cli.js` AST, blocking on any mismatch. Rejected as too fragile: `cli.js` v2.1.90+ ships as a minified/obfuscated binary, making AST-level grep invalid without an unofficial unbundling step. Any such pipeline becomes a maintenance burden on Anthropic's release cadence, and would routinely false-positive. The blacklist approach is lower-precision but dramatically more robust.
 

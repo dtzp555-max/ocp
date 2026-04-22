@@ -45,6 +45,6 @@ work-state file.
 
 This constitution is subordinate to `AGENTS.md` for project-specific memory policy
 and to CC 开发铁律 for development discipline. Amendments require a PR reviewed by
-the project maintainer (Tao Deng).
+the project maintainer.
 
 **Version**: 1.0.0 | **Ratified**: 2026-04-21 | **Last Amended**: 2026-04-21
