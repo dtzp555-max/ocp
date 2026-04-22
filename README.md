@@ -83,7 +83,7 @@ export OCP_ADMIN_KEY=your-secret-admin-key
 
 ocp keys add wife-laptop
 #  ✓ Key created for "wife-laptop"
-#    API Key: ocp_xDYzOB9ZKYzn...
+#    API Key: ocp_example12345abcde...
 #    Copy this key now — you won't see it again.
 
 ocp keys add son-ipad
