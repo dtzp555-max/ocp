@@ -2,7 +2,7 @@
 
 - **Date**: 2026-04-20
 - **Status**: Accepted
-- **Authors**: Tao Deng, Claude Opus 4.7 (drafting)
+- **Authors**: project maintainer (with AI drafting assistance)
 - **Related**: PR #31, commit 5ef163a; builds on ADR 0003
 
 ## Context

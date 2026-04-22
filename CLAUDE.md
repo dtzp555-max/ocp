@@ -35,7 +35,7 @@ This repo operates under the CC Development Iron Rules (CC 开发铁律) v1.3. T
 - **Iron Rule 11 (Incremental Diff Review).** Non-trivial work is split into the minimum reviewable unit — one PR per layer per severity. `ALIGNMENT.md`, `CLAUDE.md`, the PR template, and the CI workflow are therefore shipped as the same constitutional PR (they are one layer: governance), but any subsequent `server.mjs` remediation lands as its own PR.
 - **Iron Rule 12 (Pre-Brainstorm Prior-Art Search).** Before proposing any new endpoint or header, search GitHub, Anthropic docs, and the `cli.js` bundle. For OCP specifically, the `cli.js` grep is the decisive search: if it does not hit, Rule 2 of the constitution applies.
 
-The full iron rules are at `~/.claude/CC_DEV_IRON_RULES.md` (symlinked from the cc-rules repo on Tao's workstations). Load them into session context with `/cc-rules` when needed.
+The full iron rules are at `~/.claude/CC_DEV_IRON_RULES.md` (symlinked from the cc-rules repo on the maintainer's workstations). Load them into session context with `/cc-rules` when needed.
 
 ---
 
@@ -58,7 +58,7 @@ The full iron rules are at `~/.claude/CC_DEV_IRON_RULES.md` (symlinked from the 
 
 ## Project-level escalation
 
-If a design decision cannot be resolved by reference to `cli.js` and `ALIGNMENT.md`, escalate to Tao (老大) via `/cc-chat` rather than guessing. Silent guessing is what produced the 2026-04-11 drift.
+If a design decision cannot be resolved by reference to `cli.js` and `ALIGNMENT.md`, escalate to the project maintainer via `/cc-chat` rather than guessing. Silent guessing is what produced the 2026-04-11 drift.
 
 ---
 
