@@ -25,6 +25,7 @@
  *   CLAUDE_BREAKER_WINDOW        — sliding window duration in ms (default: 300000 = 5min)
  *   CLAUDE_BREAKER_HALF_OPEN_MAX — max concurrent probes in half-open state (default: 2)
  *   PROXY_API_KEY                — Bearer token for API auth (optional)
+ *   CLAUDE_HEARTBEAT_INTERVAL    — SSE heartbeat interval in ms on streaming path (default: 0 = disabled)
  */
 import { createServer } from "node:http";
 import { spawn, execFileSync } from "node:child_process";
@@ -94,6 +95,7 @@ const BREAKER_THRESHOLD = parseInt(process.env.CLAUDE_BREAKER_THRESHOLD || "6", 
 const BREAKER_COOLDOWN = parseInt(process.env.CLAUDE_BREAKER_COOLDOWN || "120000", 10);
 const BREAKER_WINDOW = parseInt(process.env.CLAUDE_BREAKER_WINDOW || "300000", 10);
 const BREAKER_HALF_OPEN_MAX = parseInt(process.env.CLAUDE_BREAKER_HALF_OPEN_MAX || "2", 10);
+const HEARTBEAT_INTERVAL = parseInt(process.env.CLAUDE_HEARTBEAT_INTERVAL || "0", 10);
 const BIND_ADDRESS = process.env.CLAUDE_BIND || "127.0.0.1";
 const NO_CONTEXT = process.env.CLAUDE_NO_CONTEXT === "true";
 const AUTH_MODE = process.env.CLAUDE_AUTH_MODE || (PROXY_API_KEY ? "shared" : "none");
@@ -542,6 +544,33 @@ function callClaude(model, messages, conversationId) {
   });
 }
 
+// ── SSE heartbeat (opt-in idle watchdog) ────────────────────────────────
+// Emits `: keepalive\n\n` SSE comment frames during silent windows on the
+// streaming response. Design: docs/superpowers/specs/2026-04-25-47-sse-heartbeat-design.md
+// This is a downstream liveness hint only — it MUST NOT be able to abort
+// or time out a request. That discipline is load-bearing: v2.2-v2.5's
+// first-byte/adaptive-tier timeouts "repeatedly killed valid requests"
+// (see server.mjs top-of-file comment and commit 3843ec8).
+function startHeartbeat(res, intervalMs, sessionId) {
+  if (!intervalMs || intervalMs <= 0) return { reset: () => {}, stop: () => {} };
+  let handle = null;
+  let hasFired = false;
+  const onFire = () => {
+    if (res.writableEnded || res.destroyed) return;
+    res.write(": keepalive\n\n");
+    if (!hasFired) {
+      hasFired = true;
+      logEvent("info", "heartbeat_active", { session: sessionId, intervalMs });
+    }
+    handle = setTimeout(onFire, intervalMs);
+  };
+  handle = setTimeout(onFire, intervalMs);
+  return {
+    reset: () => { if (handle) { clearTimeout(handle); handle = setTimeout(onFire, intervalMs); } },
+    stop:  () => { if (handle) { clearTimeout(handle); handle = null; } },
+  };
+}
+
 // ── Call claude CLI (real streaming) ─────────────────────────────────────
 // Pipes stdout from the claude process directly to SSE chunks as they arrive.
 // Each data chunk becomes a proper SSE event with delta content in real time.
@@ -563,12 +592,14 @@ function callClaudeStreaming(model, messages, conversationId, res, authInfo = {}
   let cachedContent = ""; // accumulate for cache write-back
 
   function ensureHeaders() {
-    if (headersSent || res.writableEnded || res.destroyed) return false;
+    if (res.writableEnded || res.destroyed) return false;
+    if (headersSent) return true;
     headersSent = true;
     res.writeHead(200, {
       "Content-Type": "text/event-stream",
       "Cache-Control": "no-cache",
       "Connection": "keep-alive",
+      "X-Accel-Buffering": "no",
     });
     // Send initial role chunk
     sendSSE(res, {
@@ -577,6 +608,15 @@ function callClaudeStreaming(model, messages, conversationId, res, authInfo = {}
     });
     return true;
   }
+
+  // D4 (spec 2026-04-25): eagerly send SSE headers post-spawn so the
+  // heartbeat started in the next statement (Task 1.3) covers the
+  // pre-first-byte silent window. Behavior change: the `code !== 0`
+  // before-first-byte branch at server.mjs:610-611 becomes effectively
+  // unreachable in the common case — the post-headers SSE-stop path
+  // (612-619) handles it instead.
+  ensureHeaders();
+  const hb = startHeartbeat(res, HEARTBEAT_INTERVAL, convId);
 
   proc.stdout.on("data", (d) => {
     markFirstByte();
@@ -590,13 +630,14 @@ function callClaudeStreaming(model, messages, conversationId, res, authInfo = {}
     sendSSE(res, {
       id, object: "chat.completion.chunk", created, model,
       choices: [{ index: 0, delta: { content: text }, finish_reason: null }],
-    });
+    }, hb);
   });
 
   proc.stderr.on("data", (d) => (stderr += d));
 
   proc.on("close", (code, signal) => {
     activeProcesses.delete(proc);
+    hb.stop();
     cleanup();
     const elapsed = Date.now() - t0;
 
@@ -613,7 +654,7 @@ function callClaudeStreaming(model, messages, conversationId, res, authInfo = {}
         sendSSE(res, {
           id, object: "chat.completion.chunk", created, model,
           choices: [{ index: 0, delta: {}, finish_reason: "stop" }],
-        });
+        }, hb);
         res.write("data: [DONE]\n\n");
         res.end();
       }
@@ -632,7 +673,7 @@ function callClaudeStreaming(model, messages, conversationId, res, authInfo = {}
         sendSSE(res, {
           id, object: "chat.completion.chunk", created, model,
           choices: [{ index: 0, delta: {}, finish_reason: "stop" }],
-        });
+        }, hb);
         res.write("data: [DONE]\n\n");
         res.end();
       }
@@ -641,6 +682,7 @@ function callClaudeStreaming(model, messages, conversationId, res, authInfo = {}
 
   proc.on("error", (err) => {
     console.error(`[claude] spawn error: ${err.message}`);
+    hb.stop();
     cleanup();
     trackError(err.message);
     handleSessionFailure();
@@ -653,6 +695,7 @@ function callClaudeStreaming(model, messages, conversationId, res, authInfo = {}
 
   // If client disconnects, kill the process to free resources
   res.on("close", () => {
+    hb.stop();
     if (!proc.killed) {
       try { proc.kill("SIGTERM"); } catch {}
     }
@@ -666,7 +709,8 @@ function jsonResponse(res, status, data) {
   res.end(JSON.stringify(data));
 }
 
-function sendSSE(res, data) {
+function sendSSE(res, data, hb) {
+  hb?.reset();
   res.write(`data: ${JSON.stringify(data)}\n\n`);
 }
 
@@ -1168,7 +1212,7 @@ async function handleChatCompletions(req, res) {
           // Simulate streaming for cached response
           const id = `chatcmpl-${randomUUID()}`;
           const created = Math.floor(Date.now() / 1000);
-          res.writeHead(200, { "Content-Type": "text/event-stream", "Cache-Control": "no-cache", "Connection": "keep-alive" });
+          res.writeHead(200, { "Content-Type": "text/event-stream", "Cache-Control": "no-cache", "Connection": "keep-alive", "X-Accel-Buffering": "no" });
           sendSSE(res, { id, object: "chat.completion.chunk", created, model, choices: [{ index: 0, delta: { role: "assistant" }, finish_reason: null }] });
           sendSSE(res, { id, object: "chat.completion.chunk", created, model, choices: [{ index: 0, delta: { content: cached.response }, finish_reason: null }] });
           sendSSE(res, { id, object: "chat.completion.chunk", created, model, choices: [{ index: 0, delta: {}, finish_reason: "stop" }] });

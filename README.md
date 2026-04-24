@@ -593,6 +593,7 @@ Future `ocp update` invocations sync automatically.
 | `OCP_ADMIN_KEY` | *(unset)* | Admin key for key management (multi mode) |
 | `CLAUDE_BIN` | *(auto-detect)* | Path to claude binary |
 | `CLAUDE_TIMEOUT` | `600000` | Request timeout (ms, default: 10 min) |
+| `CLAUDE_HEARTBEAT_INTERVAL` | `0` | Streaming SSE keepalive interval (ms). `0` = disabled. See "Streaming heartbeat" section. |
 | `CLAUDE_MAX_CONCURRENT` | `8` | Max concurrent claude processes |
 | `CLAUDE_MAX_PROMPT_CHARS` | `150000` | Prompt truncation limit (chars) |
 | `CLAUDE_SESSION_TTL` | `3600000` | Session expiry (ms, default: 1 hour) |
@@ -602,6 +603,16 @@ Future `ocp update` invocations sync automatically.
 | `CLAUDE_NO_CONTEXT` | `false` | Suppress CLAUDE.md and auto-memory injection (pure API mode) |
 | `PROXY_API_KEY` | *(unset)* | Bearer token for shared-mode authentication |
 | `PROXY_ANONYMOUS_KEY` | *(unset)* | Well-known anonymous key allowlist (multi mode). When set, this exact string bypasses `validateKey()` and grants public access. Exposed via `/health.anonymousKey` so clients auto-discover. See [Anonymous Access](#anonymous-access-optional). |
+
+### Streaming heartbeat
+
+When `CLAUDE_HEARTBEAT_INTERVAL` is set to a positive integer (milliseconds), OCP emits an SSE comment frame (`: keepalive\n\n`) on streaming responses whenever the stream has been idle for that duration. The timer resets on every real chunk, so heartbeats only fire during genuine silent windows (for example, Claude CLI tool-use pauses of 30s–5min, or a long "processing large contexts" delay before the first token).
+
+Use cases: downstream HTTP clients or load balancers with idle-connection timeouts that would otherwise abort a slow-but-alive request. `CLAUDE_HEARTBEAT_INTERVAL=30000` (30s) is a reasonable starting value if your downstream has a 60s idle timeout.
+
+Heartbeats are inert SSE comment lines — conforming SSE clients ignore them. If your downstream client's SSE parser crashes on comment frames, leave this disabled (the default) and file an issue so we can consider an alternate frame format.
+
+OCP also sends `X-Accel-Buffering: no` on SSE responses so nginx-default proxy buffering does not hold heartbeats in an upstream buffer.
 
 ## Security
 
