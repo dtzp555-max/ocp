@@ -592,7 +592,8 @@ function callClaudeStreaming(model, messages, conversationId, res, authInfo = {}
   let cachedContent = ""; // accumulate for cache write-back
 
   function ensureHeaders() {
-    if (headersSent || res.writableEnded || res.destroyed) return false;
+    if (res.writableEnded || res.destroyed) return false;
+    if (headersSent) return true;
     headersSent = true;
     res.writeHead(200, {
       "Content-Type": "text/event-stream",
