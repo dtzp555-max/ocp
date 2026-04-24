@@ -614,6 +614,7 @@ function callClaudeStreaming(model, messages, conversationId, res, authInfo = {}
   // unreachable in the common case — the post-headers SSE-stop path
   // (612-619) handles it instead.
   ensureHeaders();
+  const hb = startHeartbeat(res, HEARTBEAT_INTERVAL, convId);
 
   proc.stdout.on("data", (d) => {
     markFirstByte();
@@ -627,13 +628,14 @@ function callClaudeStreaming(model, messages, conversationId, res, authInfo = {}
     sendSSE(res, {
       id, object: "chat.completion.chunk", created, model,
       choices: [{ index: 0, delta: { content: text }, finish_reason: null }],
-    });
+    }, hb);
   });
 
   proc.stderr.on("data", (d) => (stderr += d));
 
   proc.on("close", (code, signal) => {
     activeProcesses.delete(proc);
+    hb.stop();
     cleanup();
     const elapsed = Date.now() - t0;
 
@@ -650,7 +652,7 @@ function callClaudeStreaming(model, messages, conversationId, res, authInfo = {}
         sendSSE(res, {
           id, object: "chat.completion.chunk", created, model,
           choices: [{ index: 0, delta: {}, finish_reason: "stop" }],
-        });
+        }, hb);
         res.write("data: [DONE]\n\n");
         res.end();
       }
@@ -669,7 +671,7 @@ function callClaudeStreaming(model, messages, conversationId, res, authInfo = {}
         sendSSE(res, {
           id, object: "chat.completion.chunk", created, model,
           choices: [{ index: 0, delta: {}, finish_reason: "stop" }],
-        });
+        }, hb);
         res.write("data: [DONE]\n\n");
         res.end();
       }
@@ -678,6 +680,7 @@ function callClaudeStreaming(model, messages, conversationId, res, authInfo = {}
 
   proc.on("error", (err) => {
     console.error(`[claude] spawn error: ${err.message}`);
+    hb.stop();
     cleanup();
     trackError(err.message);
     handleSessionFailure();
@@ -690,6 +693,7 @@ function callClaudeStreaming(model, messages, conversationId, res, authInfo = {}
 
   // If client disconnects, kill the process to free resources
   res.on("close", () => {
+    hb.stop();
     if (!proc.killed) {
       try { proc.kill("SIGTERM"); } catch {}
     }
@@ -703,7 +707,8 @@ function jsonResponse(res, status, data) {
   res.end(JSON.stringify(data));
 }
 
-function sendSSE(res, data) {
+function sendSSE(res, data, hb) {
+  hb?.reset();
   res.write(`data: ${JSON.stringify(data)}\n\n`);
 }
 
