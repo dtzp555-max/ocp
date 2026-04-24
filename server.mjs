@@ -25,6 +25,7 @@
  *   CLAUDE_BREAKER_WINDOW        — sliding window duration in ms (default: 300000 = 5min)
  *   CLAUDE_BREAKER_HALF_OPEN_MAX — max concurrent probes in half-open state (default: 2)
  *   PROXY_API_KEY                — Bearer token for API auth (optional)
+ *   CLAUDE_HEARTBEAT_INTERVAL    — SSE heartbeat interval in ms on streaming path (default: 0 = disabled)
  */
 import { createServer } from "node:http";
 import { spawn, execFileSync } from "node:child_process";
@@ -94,6 +95,7 @@ const BREAKER_THRESHOLD = parseInt(process.env.CLAUDE_BREAKER_THRESHOLD || "6", 
 const BREAKER_COOLDOWN = parseInt(process.env.CLAUDE_BREAKER_COOLDOWN || "120000", 10);
 const BREAKER_WINDOW = parseInt(process.env.CLAUDE_BREAKER_WINDOW || "300000", 10);
 const BREAKER_HALF_OPEN_MAX = parseInt(process.env.CLAUDE_BREAKER_HALF_OPEN_MAX || "2", 10);
+const HEARTBEAT_INTERVAL = parseInt(process.env.CLAUDE_HEARTBEAT_INTERVAL || "0", 10);
 const BIND_ADDRESS = process.env.CLAUDE_BIND || "127.0.0.1";
 const NO_CONTEXT = process.env.CLAUDE_NO_CONTEXT === "true";
 const AUTH_MODE = process.env.CLAUDE_AUTH_MODE || (PROXY_API_KEY ? "shared" : "none");
@@ -540,6 +542,33 @@ function callClaude(model, messages, conversationId) {
       reject(err);
     });
   });
+}
+
+// ── SSE heartbeat (opt-in idle watchdog) ────────────────────────────────
+// Emits `: keepalive\n\n` SSE comment frames during silent windows on the
+// streaming response. Design: docs/superpowers/specs/2026-04-25-47-sse-heartbeat-design.md
+// This is a downstream liveness hint only — it MUST NOT be able to abort
+// or time out a request. That discipline is load-bearing: v2.2-v2.5's
+// first-byte/adaptive-tier timeouts "repeatedly killed valid requests"
+// (see server.mjs top-of-file comment and commit 3843ec8).
+function startHeartbeat(res, intervalMs, sessionId) {
+  if (!intervalMs || intervalMs <= 0) return { reset: () => {}, stop: () => {} };
+  let handle = null;
+  let hasFired = false;
+  const onFire = () => {
+    if (res.writableEnded || res.destroyed) return;
+    res.write(": keepalive\n\n");
+    if (!hasFired) {
+      hasFired = true;
+      logEvent("info", "heartbeat_active", { session: sessionId, intervalMs });
+    }
+    handle = setTimeout(onFire, intervalMs);
+  };
+  handle = setTimeout(onFire, intervalMs);
+  return {
+    reset: () => { if (handle) { clearTimeout(handle); handle = setTimeout(onFire, intervalMs); } },
+    stop:  () => { if (handle) { clearTimeout(handle); handle = null; } },
+  };
 }
 
 // ── Call claude CLI (real streaming) ─────────────────────────────────────
