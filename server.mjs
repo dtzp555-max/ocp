@@ -598,6 +598,7 @@ function callClaudeStreaming(model, messages, conversationId, res, authInfo = {}
       "Content-Type": "text/event-stream",
       "Cache-Control": "no-cache",
       "Connection": "keep-alive",
+      "X-Accel-Buffering": "no",
     });
     // Send initial role chunk
     sendSSE(res, {
@@ -1210,7 +1211,7 @@ async function handleChatCompletions(req, res) {
           // Simulate streaming for cached response
           const id = `chatcmpl-${randomUUID()}`;
           const created = Math.floor(Date.now() / 1000);
-          res.writeHead(200, { "Content-Type": "text/event-stream", "Cache-Control": "no-cache", "Connection": "keep-alive" });
+          res.writeHead(200, { "Content-Type": "text/event-stream", "Cache-Control": "no-cache", "Connection": "keep-alive", "X-Accel-Buffering": "no" });
           sendSSE(res, { id, object: "chat.completion.chunk", created, model, choices: [{ index: 0, delta: { role: "assistant" }, finish_reason: null }] });
           sendSSE(res, { id, object: "chat.completion.chunk", created, model, choices: [{ index: 0, delta: { content: cached.response }, finish_reason: null }] });
           sendSSE(res, { id, object: "chat.completion.chunk", created, model, choices: [{ index: 0, delta: {}, finish_reason: "stop" }] });
