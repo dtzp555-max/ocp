@@ -607,6 +607,14 @@ function callClaudeStreaming(model, messages, conversationId, res, authInfo = {}
     return true;
   }
 
+  // D4 (spec 2026-04-25): eagerly send SSE headers post-spawn so the
+  // heartbeat started in the next statement (Task 1.3) covers the
+  // pre-first-byte silent window. Behavior change: the `code !== 0`
+  // before-first-byte branch at server.mjs:610-611 becomes effectively
+  // unreachable in the common case — the post-headers SSE-stop path
+  // (612-619) handles it instead.
+  ensureHeaders();
+
   proc.stdout.on("data", (d) => {
     markFirstByte();
     const text = d.toString();
