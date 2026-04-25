@@ -4,6 +4,10 @@ description: Execute the implementation plan by processing and executing all tas
 argument-hint: "Optional implementation guidance or task filter"
 user-invocable: true
 disable-model-invocation: false
+compatibility: "Requires spec-kit project structure with .specify/ directory"
+metadata:
+  author: github-spec-kit
+  source: claude:templates/commands/implement.md
 ---
 
 ## User Input

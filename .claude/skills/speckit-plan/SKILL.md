@@ -4,6 +4,10 @@ description: Execute the implementation planning workflow using the plan templat
 argument-hint: "Optional guidance for the planning phase"
 user-invocable: true
 disable-model-invocation: false
+compatibility: "Requires spec-kit project structure with .specify/ directory"
+metadata:
+  author: github-spec-kit
+  source: claude:templates/commands/plan.md
 ---
 
 ## User Input

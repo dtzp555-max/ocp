@@ -4,6 +4,10 @@ description: Convert existing tasks into actionable, dependency-ordered GitHub i
 argument-hint: "Optional filter or label for GitHub issues"
 user-invocable: true
 disable-model-invocation: false
+compatibility: "Requires spec-kit project structure with .specify/ directory"
+metadata:
+  author: github-spec-kit
+  source: claude:templates/commands/taskstoissues.md
 ---
 
 ## User Input
