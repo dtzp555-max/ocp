@@ -165,9 +165,18 @@ const sessions = new Map(); // conversationId → { uuid, messageCount, lastUsed
 const sessionCleanupInterval = setInterval(() => {
   const now = Date.now();
   for (const [id, s] of sessions) {
-    if (now - s.lastUsed > SESSION_TTL) {
+    const idleMs = now - s.lastUsed;
+    const ageMs = s.firstSeen ? now - s.firstSeen : null;
+    if (idleMs > SESSION_TTL) {
       sessions.delete(id);
-      console.log(`[session] expired ${id.slice(0, 12)}... (idle ${Math.round((now - s.lastUsed) / 60000)}m)`);
+      console.log(`[session] expired ${id.slice(0, 12)}... (idle ${Math.round(idleMs / 60000)}m)`);
+      logEvent("info", "session_expired", { conversationId: id.slice(0, 12) + "...", idleMs, ageMs });
+    } else if (ageMs !== null && ageMs > 4 * SESSION_TTL) {
+      // #42 evidence-gathering: a session whose firstSeen is more than 4× TTL old
+      // but whose lastUsed keeps getting bumped (never idle long enough to expire)
+      // is the suspected bug. Log without action so the pattern can be confirmed
+      // in /logs. Do NOT enforce an absolute age cap here speculatively.
+      logEvent("warn", "session_long_lived", { conversationId: id.slice(0, 12) + "...", idleMs, ageMs });
     }
   }
 }, 60000);
@@ -406,7 +415,8 @@ function spawnClaudeProcess(model, messages, conversationId) {
 
   } else if (conversationId) {
     const uuid = randomUUID();
-    sessions.set(conversationId, { uuid, messageCount: messages.length, lastUsed: Date.now(), model: cliModel });
+    const now = Date.now();
+    sessions.set(conversationId, { uuid, messageCount: messages.length, firstSeen: now, lastUsed: now, model: cliModel });
     sessionInfo = { uuid, resume: false };
     stats.sessionMisses++;
     prompt = messagesToPrompt(messages);
@@ -458,7 +468,13 @@ function spawnClaudeProcess(model, messages, conversationId) {
   function handleSessionFailure() {
     if (sessionInfo?.resume && conversationId) {
       console.warn(`[session] resume failed for ${conversationId.slice(0, 12)}..., removing stale session`);
+      logEvent("warn", "session_failure", { mode: "resume", conversationId: conversationId.slice(0, 12) + "...", action: "deleted" });
       sessions.delete(conversationId);
+    } else if (sessionInfo && !sessionInfo.resume && conversationId) {
+      // #41 evidence-gathering: session-create failures currently leave a stale entry
+      // in the sessions map. Log without action so the staleness pattern can be
+      // confirmed in /logs before any code change. Do NOT delete here speculatively.
+      logEvent("warn", "session_failure", { mode: "create", conversationId: conversationId.slice(0, 12) + "...", action: "kept" });
     }
   }
 
