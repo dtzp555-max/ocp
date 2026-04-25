@@ -4,6 +4,10 @@ description: Create or update the project constitution from interactive or provi
 argument-hint: "Principles or values for the project constitution"
 user-invocable: true
 disable-model-invocation: false
+compatibility: "Requires spec-kit project structure with .specify/ directory"
+metadata:
+  author: github-spec-kit
+  source: claude:templates/commands/constitution.md
 ---
 
 ## User Input

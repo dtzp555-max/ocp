@@ -4,6 +4,10 @@ description: Generate an actionable, dependency-ordered tasks.md for the feature
 argument-hint: "Optional task generation constraints"
 user-invocable: true
 disable-model-invocation: false
+compatibility: "Requires spec-kit project structure with .specify/ directory"
+metadata:
+  author: github-spec-kit
+  source: claude:templates/commands/tasks.md
 ---
 
 ## User Input
