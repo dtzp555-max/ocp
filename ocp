@@ -604,7 +604,7 @@ cmd_restart() {
       self_r="${BASH_SOURCE[0]}"
       while [[ -L "$self_r" ]]; do self_r="$(readlink "$self_r")"; done
       script_dir="$(cd "$(dirname "$self_r")" && pwd)"
-      nohup node "$script_dir/server.mjs" >> "$HOME/.ocp/logs/proxy.log" 2>&1 &
+      DISABLE_AUTOUPDATER=1 nohup node "$script_dir/server.mjs" >> "$HOME/.ocp/logs/proxy.log" 2>&1 &
     fi
     sleep 3
     if curl -sf --max-time 5 "$PROXY/health" > /dev/null 2>&1; then
