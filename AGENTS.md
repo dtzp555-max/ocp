@@ -36,7 +36,9 @@ Runtime: Node.js (ESM, `.mjs` throughout). No build step. No bundler. `server.mj
 - `ALIGNMENT.md` — the constitution. Binding for any `server.mjs` change. See ADR 0002.
 - `.github/workflows/alignment.yml` — CI blacklist grep; fails the build on known-hallucinated tokens.
 - `CLAUDE.md` — Claude-Code-specific session instructions + release_kit overlay (Iron Rule 5.5).
-- `docs/adr/` — Architecture Decision Records. Read these before proposing governance or SPOT changes.
+- `docs/adr/` — Architecture Decision Records. Read these before proposing governance or SPOT changes. See `docs/adr/README.md` for the index.
+- `docs/superpowers/plans/` — active spec-kit plans. `docs/superpowers/plans/shipped/` archives plans that have been delivered (don't propose changes against shipped plans — they're history). `docs/superpowers/specs/` holds long-lived design documents that other code references (e.g., the SSE heartbeat design referenced from `server.mjs`).
+- `memory/constitution.md` — spec-kit's project constitution (its standard `memory/` location). Distinct from `~/.cc-rules/memory/` (cross-machine personal memory) and from this repo's `ALIGNMENT.md` (the OCP code-level constitution).
 
 ---
 
@@ -66,7 +68,7 @@ A fresh session picking up OCP work should read, in order:
 2. `ALIGNMENT.md` — constitution; non-optional.
 3. `CLAUDE.md` — tool-specific instructions and release_kit overlay.
 4. `docs/adr/` — most recent ADRs first; they explain why the current structure exists.
-5. Any active spec under `docs/superpowers/specs/*/tasks.md` (if present).
+5. Any active plan under `docs/superpowers/plans/` (excluding `shipped/` which is the archive).
 6. `~/.cc-rules/memory/auto/MEMORY.md` — cross-machine memory index.
 
 Only after these should the session touch code.

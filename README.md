@@ -55,8 +55,10 @@ Any tool that accepts `OPENAI_BASE_URL` works with OCP:
 | **OpenCode** | `OPENAI_BASE_URL=http://127.0.0.1:3456/v1` |
 | **Aider** | `aider --openai-api-base http://127.0.0.1:3456/v1` |
 | **Continue.dev** | config.json → `apiBase: "http://127.0.0.1:3456/v1"` |
-| **OpenClaw** | `setup.mjs` auto-configures |
+| **OpenClaw** [^openclaw] | `setup.mjs` auto-configures |
 | **Any OpenAI client** | Set base URL to `http://127.0.0.1:3456/v1` |
+
+[^openclaw]: **OpenClaw** is an IDE-agnostic AI coding agent (sibling project to OCP). When OCP runs on the same machine, OpenClaw can use it as a local provider — see `scripts/sync-openclaw.mjs` and ADR 0004.
 
 ## Installation
 
@@ -128,6 +130,17 @@ Run `ocp lan` to see your IP and ready-to-share instructions.
 curl http://127.0.0.1:3456/v1/models
 # Returns: claude-opus-4-7, claude-opus-4-6, claude-sonnet-4-6, claude-haiku-4-5-20251001
 ```
+
+---
+
+### Uninstall
+
+```bash
+# From the cloned repo
+node uninstall.mjs
+```
+
+Removes the launchd (macOS) or systemd (Linux) auto-start entry. Handles both legacy (`ai.openclaw.proxy` / `openclaw-proxy`) and current (`dev.ocp.proxy` / `ocp-proxy`) service names. Does not delete `~/.openclaw/`, `~/.ocp/`, or the cloned repo — remove those manually if desired.
 
 ---
 
@@ -645,6 +658,26 @@ Heartbeats are inert SSE comment lines — conforming SSE clients ignore them. I
 
 OCP also sends `X-Accel-Buffering: no` on SSE responses so nginx-default proxy buffering does not hold heartbeats in an upstream buffer.
 
+## Repository Layout
+
+Top-level files a contributor or operator may need to know:
+
+| Path | Role |
+|------|------|
+| `server.mjs` | The proxy itself; every request path lives here. Governed by `ALIGNMENT.md`. |
+| `setup.mjs` | First-time installer — verifies Claude CLI, patches OpenClaw config, installs auto-start. |
+| `uninstall.mjs` | Reverses the launchd / systemd auto-start install. |
+| `keys.mjs` | API-key management module (multi-mode auth: create/list/revoke, quotas, usage tracking). |
+| `models.json` | Single source of truth for model IDs, aliases, context windows. See ADR 0003. |
+| `ocp` / `ocp-connect` | User-facing CLI wrappers (server-side / client-side respectively). |
+| `dashboard.html` | Static dashboard served from `/dashboard`. |
+| `scripts/sync-openclaw.mjs` | Idempotent OpenClaw registry sync invoked by `ocp update`. See ADR 0004. |
+| `.claude/skills/` | Project-specific Claude Code skills. |
+| `ocp-plugin/` | OpenClaw gateway plugin (optional installation). |
+| `docs/adr/` | Architecture Decision Records. Read these before proposing governance or SPOT changes — see [`docs/adr/README.md`](docs/adr/README.md). |
+| `ALIGNMENT.md` | The constitution. Binding for any `server.mjs` change. |
+| `AGENTS.md` / `CLAUDE.md` | Agent and Claude-Code-specific session instructions. |
+
 ## Security
 
 - **Localhost by default** — binds to `127.0.0.1`; set `CLAUDE_BIND=0.0.0.0` to enable LAN access
@@ -670,4 +703,4 @@ If you want to contribute: read `ALIGNMENT.md` first, search `cli.js` for the op
 
 ## License
 
-MIT
+MIT — see [`LICENSE`](LICENSE).
