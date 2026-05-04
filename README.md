@@ -83,7 +83,7 @@ OCP has two roles: **Server** (runs the proxy, needs Claude CLI) and **Client** 
 > **Recommended:** Install OCP on a device that stays powered on — Mac mini, NAS, Raspberry Pi, or a desktop that doesn't sleep. This ensures all clients always have access.
 
 **Prerequisites:**
-- Node.js 18+
+- Node.js 22.5+ (Node 23+ recommended — `node:sqlite` is fully stable without flags from 23.0; on 22.5–22.x it works behind `--experimental-sqlite`)
 - [Claude CLI](https://docs.anthropic.com/en/docs/claude-cli) installed and authenticated (`claude auth login`)
 
 ```bash
