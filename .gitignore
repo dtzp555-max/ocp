@@ -1,0 +1,15 @@
+# Runtime artifacts
+logs/
+*.log
+
+# Dependencies
+node_modules/
+
+# Environment files
+.env
+.env.*
+
+# Editor / OS scratch
+.DS_Store
+*.swp
+*~
