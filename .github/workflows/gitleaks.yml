@@ -1,0 +1,32 @@
+name: gitleaks
+
+# Secret scanning gate. Runs on every PR (any branch) and every push to main.
+# Configuration is read from the repo-root `.gitleaks.toml` automatically.
+# Hard-fails the build on any detected leak — public repo, no tolerance.
+#
+# To extend the allowlist (e.g. a new known-safe placeholder), edit
+# `.gitleaks.toml`. Do not add `continue-on-error` here without an explicit
+# governance decision.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  scan:
+    name: gitleaks scan (hard fail)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout (full history)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Run gitleaks
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
