@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 /**
- * openclaw-claude-proxy setup
+ * OCP (Open Claude Proxy) setup
  *
  * Automatically configures OpenClaw to use Claude CLI as a model provider.
  * Run: node setup.mjs [--port 3456] [--default-model opus|sonnet|haiku] [--dry-run]
@@ -217,7 +217,7 @@ const logDir = join(OPENCLAW_DIR, "logs");
 if (!existsSync(logDir)) mkdirSync(logDir, { recursive: true });
 
 const startSh = `#!/bin/bash
-# Start openclaw-claude-proxy if not already running
+# Start OCP (Open Claude Proxy) if not already running
 PORT=\${CLAUDE_PROXY_PORT:-${PORT}}
 if ! lsof -i :\$PORT -sTCP:LISTEN &>/dev/null; then
   unset CLAUDECODE
