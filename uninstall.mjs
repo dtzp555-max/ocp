@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 /**
- * openclaw-claude-proxy uninstaller
+ * OCP (Open Claude Proxy) uninstaller
  *
  * Stops and removes the launchd (macOS) or systemd (Linux) auto-start entry.
  * Handles both legacy (ai.openclaw.proxy / openclaw-proxy) and current
