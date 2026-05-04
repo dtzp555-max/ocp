@@ -14,6 +14,37 @@ OpenClaw       ───┘
 
 One proxy. Multiple IDEs. All models. **$0 API cost.**
 
+## Why OCP?
+
+There are several Claude proxy projects. OCP picks a specific lane: **align tightly with what `cli.js` actually does, observe + multiplex what's already there, don't extend the protocol.** Concretely:
+
+- **SSE heartbeat on streaming** ([v3.12.0](https://github.com/dtzp555-max/ocp/releases/tag/v3.12.0), opt-in via `CLAUDE_HEARTBEAT_INTERVAL`). Long Claude reasoning or tool-use pauses can sit silent for minutes; downstream load balancers and reverse proxies often kill the connection at 60s idle. OCP emits an SSE comment frame during silent windows so the connection stays alive without polluting the response. ([PR #49](https://github.com/dtzp555-max/ocp/pull/49))
+- **Alignment constitution + CI guardrail.** [`ALIGNMENT.md`](./ALIGNMENT.md) is the binding spec: every endpoint OCP exposes must correspond to something `cli.js` actually does, with a line-number citation. The [`alignment.yml`](./.github/workflows/alignment.yml) workflow auto-blocks PRs that introduce known-hallucinated tokens (`api/oauth/usage`, `api/usage`, etc). Hard to drift, even with LLM-assisted contributions.
+- **`models.json` single source of truth** (v3.11.0). Adding a model is one file edit; both `/v1/models` and the OpenClaw bootstrap derive from it. No more drift between server and installer. ([PR #30](https://github.com/dtzp555-max/ocp/pull/30))
+- **Multi anonymous-key distribution** (v3.7.0). Share one OCP instance with friends/family/devices without exposing your OAuth session — each gets a per-user key, with usage tracking and revocation.
+- **Per-key quota + response cache** (v3.8.0). Daily/weekly/monthly request limits per key. Optional SHA-256 prompt cache for development loops. ([PR #18](https://github.com/dtzp555-max/ocp/pull/18))
+- **`ocp-connect` IDE auto-config.** Detects Claude Code, Cursor, Cline, Continue.dev, opencode, and OpenClaw on the client machine and configures them in one command.
+
+### Comparison
+
+OCP and the alternatives serve adjacent but distinct needs. Pick the one that fits your use case:
+
+| Feature | OCP | claude-code-router | anthropic-proxy |
+|---|---|---|---|
+| Forwards Claude Code subscription as OpenAI API | yes | yes | yes |
+| Routes to multiple model backends (OpenAI, Gemini, etc.) | no | yes | partial |
+| SSE heartbeat for long reasoning | yes (opt-in) | no | no |
+| Per-key quota + LAN multi-user keys | yes | no | no |
+| Response cache | yes (opt-in) | no | no |
+| OpenClaw / IDE auto-config | yes | no | no |
+| Model-routing rules / model-switching | no | yes | no |
+| GitHub stars / ecosystem size | small | large | mid |
+| Governance discipline (CI-enforced alignment with cli.js) | yes | n/a | n/a |
+
+**Plain English**: `claude-code-router` is the routing-and-switching power tool — pick it if you want to mix Anthropic, OpenAI, Gemini, and local models behind one endpoint. `anthropic-proxy` is the minimal forwarder. **OCP focuses on disciplined `cli.js`-aligned forwarding plus subscription multiplexing** — pick it if you want to share one Claude Pro/Max subscription across IDEs, devices, and people, with LAN auth, quotas, and a governance contract that prevents endpoint drift.
+
+OCP is single-maintainer + LLM-assisted, currently pre-1.0. It runs the maintainer's daily Claude Code workflow. If something breaks, [open an issue](https://github.com/dtzp555-max/ocp/issues).
+
 ## Supported Tools
 
 Any tool that accepts `OPENAI_BASE_URL` works with OCP:
@@ -624,6 +655,18 @@ OCP also sends `X-Accel-Buffering: no` on SSE responses so nginx-default proxy b
 - **No API keys needed** — authentication goes through Claude CLI's OAuth session
 - **Keys stored locally** — `~/.ocp/ocp.db` (SQLite), never sent to external services
 - **Auto-start** — launchd (macOS) / systemd (Linux)
+
+## Governance
+
+OCP runs under a small set of binding documents so contributions stay aligned with what `cli.js` actually does, not what an LLM thinks it does:
+
+- **[`ALIGNMENT.md`](./ALIGNMENT.md)** — the constitution. Every endpoint OCP exposes must correspond to something `cli.js` actually does, with a line-number citation. Background in [ADR 0002](./docs/adr/0002-alignment-constitution.md).
+- **[`.github/workflows/alignment.yml`](./.github/workflows/alignment.yml)** — CI guardrail. Greps `server.mjs` for known-hallucinated tokens and fails the build on any hit. Not suppressible without an `ALIGNMENT.md` amendment PR.
+- **[`AGENTS.md`](./AGENTS.md)** — guidelines any AI coding agent (Claude Code / Cursor / Copilot / Codex / Gemini) should read before touching this repo.
+- **[`models.json`](./models.json)** — single source of truth for the model registry. See [ADR 0003](./docs/adr/0003-models-json-spot.md).
+- **[`docs/adr/`](./docs/adr/)** — architecture decision records explaining why current structure exists.
+
+If you want to contribute: read `ALIGNMENT.md` first, search `cli.js` for the operation you're proposing, and cite the line number in your PR.
 
 ## License
 
