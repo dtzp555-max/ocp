@@ -1,0 +1,41 @@
+name: Tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test-features:
+    name: test-features.mjs (smoke)
+    runs-on: ubuntu-latest
+
+    # `test-features.mjs` is self-contained — it runs assertions against the
+    # `keys.mjs` DB layer using a throwaway test database. It does NOT need a
+    # live claude CLI or a running OCP server. So this job runs as a hard
+    # check on every push / PR.
+    #
+    # If a future expansion of the suite adds tests that DO require a live
+    # claude CLI or a running OCP server, mark those steps `continue-on-error:
+    # true` (or split them into a separate job) — CI must not be flaky on
+    # things outside the contributor's machine.
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          # Node 24 ships `node:sqlite` as stable. The test imports keys.mjs,
+          # which uses `import { DatabaseSync } from "node:sqlite"`.
+          # Node 22 also works with `--experimental-sqlite`, but we run on 24
+          # to keep the CI step simple and to match what released OCP runs on.
+          node-version: '24'
+
+      # OCP has zero runtime npm dependencies (package-lock.json shows only
+      # the project's own package and zero external entries). No install
+      # step needed — `node:*` modules are built into Node 24.
+
+      - name: Run test-features.mjs
+        run: npm test

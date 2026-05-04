@@ -22,7 +22,7 @@ Runtime: Node.js (ESM, `.mjs` throughout). No build step. No bundler. `server.mj
 - `models.json` as the single source of truth for model metadata
 - GitHub Actions for CI (`alignment.yml`, `release.yml`)
 - `gh` CLI assumed for PR creation and release automation
-- No TypeScript. No test framework beyond `test-features.mjs`. Keep dependencies minimal.
+- No TypeScript. No test framework beyond `test-features.mjs` (run via `npm test`; CI workflow `.github/workflows/test.yml`). Keep dependencies minimal.
 
 ---
 

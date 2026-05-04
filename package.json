@@ -9,7 +9,8 @@
   },
   "scripts": {
     "start": "node server.mjs",
-    "setup": "node setup.mjs"
+    "setup": "node setup.mjs",
+    "test": "node test-features.mjs"
   },
   "keywords": [
     "openclaw",
