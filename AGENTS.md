@@ -43,7 +43,7 @@ Runtime: Node.js (ESM, `.mjs` throughout). No build step. No bundler. `server.mj
 ## Project-specific constraints
 
 - **`ALIGNMENT.md` is binding.** Any PR touching `server.mjs` must cite `cli.js:NNNN` (or `cli.js vE4 <functionName>`) in the commit body and PR description. See `CLAUDE.md` § "Hard requirements for `server.mjs` changes" and ADR 0002.
-- **Alignment CI is not suppressible.** The `alignment.yml` workflow greps `server.mjs` for known-hallucinated tokens (including `api/oauth/usage`, `api/usage`). Adding to the blacklist is fine; removing entries requires an `ALIGNMENT.md` amendment PR.
+- **Alignment CI is not suppressible.** The `alignment.yml` workflow greps `server.mjs` for known-hallucinated tokens (currently blocking `api.anthropic.com/api/oauth/usage`). Adding new tokens is done via PR amendment to `alignment.yml`; removing entries requires an `ALIGNMENT.md` amendment PR.
 - **No self-approval.** Implementation author cannot merge their own PR (Iron Rule 10). A fresh-context reviewer must open `cli.js` at the cited lines and confirm in the review comment.
 - **`models.json` is the only place to add/edit models.** Do not touch `MODEL_MAP` or `MODELS` arrays directly in `server.mjs` or `setup.mjs`. See ADR 0003.
 - **OpenClaw boundary.** `scripts/sync-openclaw.mjs` only writes `models.providers["claude-local"].models` and `agents.defaults.models["claude-local/*"]` in `~/.openclaw/openclaw.json`. Do not expand scope. See ADR 0004.

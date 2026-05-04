@@ -22,7 +22,7 @@
 Every PR that modifies `server.mjs` must satisfy all three of the following. A PR missing any one of them is blocked from merge.
 
 1. **`cli.js` citation.** The commit message and PR body declare the corresponding `cli.js` function name and line number range, using the format `cli.js:NNNN` or `cli.js vE4 <functionName>`. If `cli.js` does not perform the operation, the PR must state this explicitly and justify scope under `ALIGNMENT.md` Rule 2 (in practice, this almost always means the PR should be closed).
-2. **CI blacklist pass.** The `alignment.yml` workflow must pass. The workflow greps `server.mjs` for known-hallucinated tokens (including `api/oauth/usage` and `api/usage`) and fails the build on any hit. Do not suppress the workflow. Do not add allowlist entries without an amendment PR to `ALIGNMENT.md`.
+2. **CI blacklist pass.** The `alignment.yml` workflow must pass. The workflow greps `server.mjs` for known-hallucinated tokens (currently blocking `api.anthropic.com/api/oauth/usage`) and fails the build on any hit. New tokens are added via PR amendment to `alignment.yml`; removing entries requires an `ALIGNMENT.md` amendment PR. Do not suppress the workflow.
 3. **Independent reviewer (Iron Rule 10).** The implementation author may not self-approve. A separate reviewer — human or a subagent spawned with a fresh context — must read the diff, verify the `cli.js` citation by opening `cli.js` at the cited lines, and explicitly approve. A review comment that does not confirm the `cli.js` citation was checked is not a valid approval.
 
 ---
