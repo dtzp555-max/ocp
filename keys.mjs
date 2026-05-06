@@ -292,9 +292,13 @@ export function getKeyQuota(keyId) {
 
 // ── Response cache ──
 
-// Generate a cache key from model + messages + request params that affect output
+// Generate a cache key from model + messages + request params that affect output.
+// opts.keyId isolates per-API-key cache pools (v2 hash format).
+// When keyId is absent/null/empty, falls back to "anon" (shared anonymous pool).
 export function cacheHash(model, messages, opts = {}) {
+  const keyId = opts.keyId || "anon";
   const h = createHash("sha256");
+  h.update(`v2|k:${keyId}|`);
   h.update(model);
   if (opts.temperature != null) h.update(`t:${opts.temperature}`);
   if (opts.max_tokens != null) h.update(`mt:${opts.max_tokens}`);
@@ -304,6 +308,22 @@ export function cacheHash(model, messages, opts = {}) {
     h.update(typeof m.content === "string" ? m.content : JSON.stringify(m.content));
   }
   return h.digest("hex");
+}
+
+// Check whether any message (or content part) carries an Anthropic cache_control field.
+// If true, OCP should skip its own cache to avoid interfering with prompt-caching intent.
+export function hasCacheControl(messages) {
+  for (const m of messages || []) {
+    if (m && typeof m === "object") {
+      if (m.cache_control) return true;
+      if (Array.isArray(m.content)) {
+        for (const part of m.content) {
+          if (part && typeof part === "object" && part.cache_control) return true;
+        }
+      }
+    }
+  }
+  return false;
 }
 
 // Look up a cached response. Returns { response, hits } or null.
