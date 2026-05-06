@@ -3,7 +3,7 @@
  * Integration test for Quota + Cache features.
  * Tests database layer functions directly — no server needed.
  */
-import { getDb, createKey, listKeys, validateKey, recordUsage, checkQuota, updateKeyQuota, getKeyQuota, findKey, cacheHash, getCachedResponse, setCachedResponse, clearCache, getCacheStats, closeDb, hasCacheControl } from "./keys.mjs";
+import { getDb, createKey, listKeys, validateKey, recordUsage, checkQuota, updateKeyQuota, getKeyQuota, findKey, cacheHash, getCachedResponse, setCachedResponse, clearCache, getCacheStats, closeDb, hasCacheControl, singleflight, getInflightStats } from "./keys.mjs";
 import { createHash } from "node:crypto";
 import { strict as assert } from "node:assert";
 import { unlinkSync } from "node:fs";
@@ -353,6 +353,106 @@ test("D3: chunked replay uses Array.from — multibyte codepoints stay intact", 
     }
   }
 });
+
+// ── PR-B Singleflight tests (async) ──
+async function asyncTest(name, fn) {
+  try {
+    await fn();
+    passed++;
+    console.log(`  ✓ ${name}`);
+  } catch (e) {
+    failed++;
+    console.log(`  ✗ ${name}: ${e.message}`);
+  }
+}
+
+async function runSingleflightTests() {
+  console.log("\nPR-B Singleflight:");
+
+  // 1. Basic dedup: 10 concurrent calls with same hash execute fn only once.
+  await asyncTest("basic dedup: 10 concurrent callers execute fn only once", async () => {
+    let callCount = 0;
+    const fn = () => new Promise(resolve => {
+      callCount++;
+      setTimeout(() => resolve("result-A"), 20);
+    });
+    const results = await Promise.all(Array.from({ length: 10 }, () => singleflight("sf-dedup-1", fn)));
+    assert.equal(callCount, 1, `fn called ${callCount} times, expected 1`);
+    assert.ok(results.every(r => r === "result-A"), "all 10 callers should receive the same return value");
+  });
+
+  // 2. Failure fan-out: all followers reject when leader rejects.
+  await asyncTest("failure fan-out: all followers reject with leader error", async () => {
+    let callCount = 0;
+    const fn = () => new Promise((_, reject) => {
+      callCount++;
+      setTimeout(() => reject(new Error("upstream-fail")), 20);
+    });
+    const promises = Array.from({ length: 10 }, () => singleflight("sf-fail-1", fn));
+    const results = await Promise.allSettled(promises);
+    assert.equal(callCount, 1, `fn called ${callCount} times, expected 1`);
+    assert.ok(results.every(r => r.status === "rejected"), "all 10 should be rejected");
+    assert.ok(results.every(r => r.reason?.message === "upstream-fail"), "all should share the same error message");
+  });
+
+  // 3a. Map cleanup after success: inflight count returns to 0 after promise resolves.
+  await asyncTest("map cleanup after success: inflight=0 after promise settles", async () => {
+    const fn = () => new Promise(resolve => setTimeout(() => resolve("done"), 10));
+    await singleflight("sf-cleanup-ok", fn);
+    const stats = getInflightStats();
+    assert.equal(stats.inflight, 0, `expected inflight=0 after settlement, got ${stats.inflight}`);
+  });
+
+  // 3b. Map cleanup after failure: inflight count returns to 0 after promise rejects.
+  await asyncTest("map cleanup after failure: inflight=0 after promise rejects", async () => {
+    const fn = () => new Promise((_, reject) => setTimeout(() => reject(new Error("fail")), 10));
+    try { await singleflight("sf-cleanup-fail", fn); } catch {}
+    const stats = getInflightStats();
+    assert.equal(stats.inflight, 0, `expected inflight=0 after rejection, got ${stats.inflight}`);
+  });
+
+  // 4. Different hashes don't share: two parallel calls with distinct hashes both execute.
+  await asyncTest("different hashes do not share a singleflight entry", async () => {
+    let countA = 0;
+    let countB = 0;
+    const fnA = () => new Promise(resolve => { countA++; setTimeout(() => resolve("A"), 20); });
+    const fnB = () => new Promise(resolve => { countB++; setTimeout(() => resolve("B"), 20); });
+    const [rA, rB] = await Promise.all([singleflight("sf-hash-A", fnA), singleflight("sf-hash-B", fnB)]);
+    assert.equal(countA, 1);
+    assert.equal(countB, 1);
+    assert.equal(rA, "A");
+    assert.equal(rB, "B");
+  });
+
+  // 5. getInflightStats shape: returns { inflight: number, requesters: number }.
+  await asyncTest("getInflightStats returns correct shape", async () => {
+    // Verify shape against a settled state (inflight=0 is still the right shape).
+    const stats = getInflightStats();
+    assert.equal(typeof stats.inflight, "number", "inflight should be a number");
+    assert.equal(typeof stats.requesters, "number", "requesters should be a number");
+    // Also verify live counts: start a pending fn, check inflight>0, then resolve.
+    const { promise: blocker, resolve: resolveBlocker } = Promise.withResolvers();
+    const fn = () => blocker;
+    const p = singleflight("sf-stats-shape", fn);
+    const liveStats = getInflightStats();
+    assert.ok(liveStats.inflight >= 1, `expected inflight>=1, got ${liveStats.inflight}`);
+    resolveBlocker("ok");
+    await p;
+  });
+
+  // 6. Sequential calls don't share: singleflight is for concurrent dedup only.
+  await asyncTest("sequential calls with same hash each execute fn independently", async () => {
+    let callCount = 0;
+    const fn = () => new Promise(resolve => { callCount++; setTimeout(() => resolve(callCount), 10); });
+    const r1 = await singleflight("sf-sequential", fn);
+    const r2 = await singleflight("sf-sequential", fn);
+    assert.equal(callCount, 2, `fn should have been called twice, got ${callCount}`);
+    assert.equal(r1, 1);
+    assert.equal(r2, 2);
+  });
+}
+
+await runSingleflightTests();
 
 // ── Cleanup ──
 closeDb();

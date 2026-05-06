@@ -371,6 +371,36 @@ export function getCacheStats() {
   return { entries: total, totalHits, sizeBytes };
 }
 
+// ── Singleflight stampede protection ──
+
+// In-memory singleflight Map: hash → { promise, requesters }
+// Deduplicates concurrent identical cache-miss flows so only one upstream call runs.
+// Per ADR 0005 / spec D4: in-process scope only (single Node process per host).
+const inflightMap = new Map();
+
+export function singleflight(hash, fn) {
+  const existing = inflightMap.get(hash);
+  if (existing) {
+    existing.requesters++;
+    return existing.promise;
+  }
+  // Wrap fn() in Promise.resolve().then() so synchronous throws don't escape.
+  const promise = Promise.resolve().then(fn).finally(() => {
+    inflightMap.delete(hash);
+  });
+  inflightMap.set(hash, { promise, requesters: 1 });
+  return promise;
+}
+
+export function getInflightStats() {
+  let totalRequesters = 0;
+  for (const entry of inflightMap.values()) totalRequesters += entry.requesters;
+  return {
+    inflight: inflightMap.size,
+    requesters: totalRequesters,
+  };
+}
+
 // Find a key by id or name (returns { id, name } or null)
 export function findKey(idOrName) {
   const d = getDb();
