@@ -1,0 +1,14 @@
+title = "OCP gitleaks configuration"
+
+[allowlist]
+description = "OCP known-safe allowlist"
+regexes = [
+  # Public OAuth client ID for Claude Code PKCE flow (constant, not a secret)
+  '''9d1c250a-e61b-44d9-88ed-5944d1962f5e''',
+  # OCP README API key placeholder example
+  '''ocp_(example|XXX+|xxxx+)''',
+]
+paths = [
+  # Old plan doc with test-admin-123 placeholders
+  '''docs/superpowers/plans/2026-04-10-lan-mode\.md''',
+]

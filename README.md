@@ -1,7 +1,5 @@
 # OCP — Open Claude Proxy
 
-> **Status: Stable (v3.7.0)** — Feature-complete. Bug fixes only.
-
 > **Already paying for Claude Pro/Max? Use your subscription as an OpenAI-compatible API — $0 extra cost.**
 
 OCP turns your Claude Pro/Max subscription into a standard OpenAI-compatible API on localhost. Any tool that speaks the OpenAI protocol can use it — no separate API key, no extra billing.
@@ -16,6 +14,37 @@ OpenClaw       ───┘
 
 One proxy. Multiple IDEs. All models. **$0 API cost.**
 
+## Why OCP?
+
+There are several Claude proxy projects. OCP picks a specific lane: **align tightly with what `cli.js` actually does, observe + multiplex what's already there, don't extend the protocol.** Concretely:
+
+- **SSE heartbeat on streaming** ([v3.12.0](https://github.com/dtzp555-max/ocp/releases/tag/v3.12.0), opt-in via `CLAUDE_HEARTBEAT_INTERVAL`). Long Claude reasoning or tool-use pauses can sit silent for minutes; downstream load balancers and reverse proxies often kill the connection at 60s idle. OCP emits an SSE comment frame during silent windows so the connection stays alive without polluting the response. ([PR #49](https://github.com/dtzp555-max/ocp/pull/49))
+- **Alignment constitution + CI guardrail.** [`ALIGNMENT.md`](./ALIGNMENT.md) is the binding spec: every endpoint OCP exposes must correspond to something `cli.js` actually does, with a line-number citation. The [`alignment.yml`](./.github/workflows/alignment.yml) workflow auto-blocks PRs that introduce known-hallucinated tokens (`api/oauth/usage`, `api/usage`, etc). Hard to drift, even with LLM-assisted contributions.
+- **`models.json` single source of truth** (v3.11.0). Adding a model is one file edit; both `/v1/models` and the OpenClaw bootstrap derive from it. No more drift between server and installer. ([PR #30](https://github.com/dtzp555-max/ocp/pull/30))
+- **Multi anonymous-key distribution** (v3.7.0). Share one OCP instance with friends/family/devices without exposing your OAuth session — each gets a per-user key, with usage tracking and revocation.
+- **Per-key quota + response cache** (v3.8.0). Daily/weekly/monthly request limits per key. Optional SHA-256 prompt cache for development loops. ([PR #18](https://github.com/dtzp555-max/ocp/pull/18))
+- **`ocp-connect` IDE auto-config.** Detects Claude Code, Cursor, Cline, Continue.dev, opencode, and OpenClaw on the client machine and configures them in one command.
+
+### Comparison
+
+OCP and the alternatives serve adjacent but distinct needs. Pick the one that fits your use case:
+
+| Feature | OCP | claude-code-router | anthropic-proxy |
+|---|---|---|---|
+| Forwards Claude Code subscription as OpenAI API | yes | yes | yes |
+| Routes to multiple model backends (OpenAI, Gemini, etc.) | no | yes | partial |
+| SSE heartbeat for long reasoning | yes (opt-in) | no | no |
+| Per-key quota + LAN multi-user keys | yes | no | no |
+| Response cache | yes (opt-in) | no | no |
+| OpenClaw / IDE auto-config | yes | no | no |
+| Model-routing rules / model-switching | no | yes | no |
+| GitHub stars / ecosystem size | small | large | mid |
+| Governance discipline (CI-enforced alignment with cli.js) | yes | n/a | n/a |
+
+**Plain English**: `claude-code-router` is the routing-and-switching power tool — pick it if you want to mix Anthropic, OpenAI, Gemini, and local models behind one endpoint. `anthropic-proxy` is the minimal forwarder. **OCP focuses on disciplined `cli.js`-aligned forwarding plus subscription multiplexing** — pick it if you want to share one Claude Pro/Max subscription across IDEs, devices, and people, with LAN auth, quotas, and a governance contract that prevents endpoint drift.
+
+OCP is single-maintainer + LLM-assisted, currently pre-1.0. It runs the maintainer's daily Claude Code workflow. If something breaks, [open an issue](https://github.com/dtzp555-max/ocp/issues).
+
 ## Supported Tools
 
 Any tool that accepts `OPENAI_BASE_URL` works with OCP:
@@ -26,8 +55,10 @@ Any tool that accepts `OPENAI_BASE_URL` works with OCP:
 | **OpenCode** | `OPENAI_BASE_URL=http://127.0.0.1:3456/v1` |
 | **Aider** | `aider --openai-api-base http://127.0.0.1:3456/v1` |
 | **Continue.dev** | config.json → `apiBase: "http://127.0.0.1:3456/v1"` |
-| **OpenClaw** | `setup.mjs` auto-configures |
+| **OpenClaw** [^openclaw] | `setup.mjs` auto-configures |
 | **Any OpenAI client** | Set base URL to `http://127.0.0.1:3456/v1` |
+
+[^openclaw]: **OpenClaw** is an IDE-agnostic AI coding agent (sibling project to OCP). When OCP runs on the same machine, OpenClaw can use it as a local provider — see `scripts/sync-openclaw.mjs` and ADR 0004.
 
 ## Installation
 
@@ -52,7 +83,7 @@ OCP has two roles: **Server** (runs the proxy, needs Claude CLI) and **Client** 
 > **Recommended:** Install OCP on a device that stays powered on — Mac mini, NAS, Raspberry Pi, or a desktop that doesn't sleep. This ensures all clients always have access.
 
 **Prerequisites:**
-- Node.js 18+
+- Node.js 22.5+ (Node 23+ recommended — `node:sqlite` is fully stable without flags from 23.0; on 22.5–22.x it works behind `--experimental-sqlite`)
 - [Claude CLI](https://docs.anthropic.com/en/docs/claude-cli) installed and authenticated (`claude auth login`)
 
 ```bash
@@ -85,7 +116,7 @@ export OCP_ADMIN_KEY=your-secret-admin-key
 
 ocp keys add wife-laptop
 #  ✓ Key created for "wife-laptop"
-#    API Key: ocp_xDYzOB9ZKYzn...
+#    API Key: ocp_example12345abcde...
 #    Copy this key now — you won't see it again.
 
 ocp keys add son-ipad
@@ -97,8 +128,19 @@ Run `ocp lan` to see your IP and ready-to-share instructions.
 **Verify:**
 ```bash
 curl http://127.0.0.1:3456/v1/models
-# Returns: claude-opus-4-6, claude-sonnet-4-6, claude-haiku-4
+# Returns: claude-opus-4-7, claude-opus-4-6, claude-sonnet-4-6, claude-haiku-4-5-20251001
 ```
+
+---
+
+### Uninstall
+
+```bash
+# From the cloned repo
+node uninstall.mjs
+```
+
+Removes the launchd (macOS) or systemd (Linux) auto-start entry. Handles both legacy (`ai.openclaw.proxy` / `openclaw-proxy`) and current (`dev.ocp.proxy` / `ocp-proxy`) service names. Does not delete `~/.openclaw/`, `~/.ocp/`, or the cloned repo — remove those manually if desired.
 
 ---
 
@@ -141,13 +183,13 @@ OCP Connect v1.3.0
   Checking connectivity...
   ✓ Connected
 
-  Remote OCP v3.7.0  (auth: multi)
+  Remote OCP v3.11.0  (auth: multi)
 
   ⓘ Using server-advertised anonymous key: ocp_publ...n_v1
     (set by admin via PROXY_ANONYMOUS_KEY; see issue #12 §14 Path A)
 
   Testing API access...
-  ✓ API accessible (3 models available)
+  ✓ API accessible (4 models available)
 
   Shell config:
     ✓ .bashrc
@@ -177,6 +219,7 @@ OCP Connect v1.3.0
   ✓ OpenClaw configured
     Provider: ocp
     Models:
+      • ocp/claude-opus-4-7
       • ocp/claude-opus-4-6
       • ocp/claude-sonnet-4-6
       • ocp/claude-haiku-4-5-20251001
@@ -197,7 +240,7 @@ OCP Connect v1.3.0
 The script automatically:
 - Writes env vars to all relevant shell rc files (`.bashrc`, `.zshrc`)
 - Sets system-level env vars (`launchctl setenv` on macOS, `environment.d` on Linux)
-- **Auto-discovers anonymous key** from `/health.anonymousKey` when no `--key` given (v1.3.0+, requires server v3.7.0+)
+- **Auto-discovers anonymous key** from `/health.anonymousKey` when no `--key` given (v1.3.0+, requires server v3.10.0+)
 - Configures OpenClaw automatically (including per-agent `auth-profiles.json` for multi-agent setups)
 - Detects Cline, Continue.dev, Cursor, and opencode, and prints setup hints (manual configuration required for these IDEs)
 
@@ -254,6 +297,46 @@ ocp start                                    # or however you start the server
 **Security note**: setting this env var is an **opt-in** to public access — anyone who can reach your OCP endpoint can use it, up to any rate limits you configure. Don't enable this on internet-exposed OCP instances without additional protection.
 
 **Not a secret**: because `/health` is an unauthenticated endpoint, the anonymous key is **publicly readable** by anyone who can reach the server. That is intentional — the key exists so clients can self-configure without out-of-band coordination. Treat it as a convenience handle, not as an access credential.
+
+### Per-Key Quota (Budget Control)
+
+Prevent any single user from exhausting your subscription. Set daily, weekly, or monthly request limits per API key:
+
+```bash
+# Set a daily limit of 50 requests for a key
+curl -X PATCH http://127.0.0.1:3456/api/keys/wife-laptop/quota \
+  -H "Authorization: Bearer $OCP_ADMIN_KEY" \
+  -d '{"daily": 50}'
+
+# Set multiple limits at once
+curl -X PATCH http://127.0.0.1:3456/api/keys/son-ipad/quota \
+  -H "Authorization: Bearer $OCP_ADMIN_KEY" \
+  -d '{"daily": 20, "weekly": 100}'
+
+# Check current quota + usage
+curl http://127.0.0.1:3456/api/keys/wife-laptop/quota
+# → { "daily": { "limit": 50, "used": 12 }, "weekly": { "limit": null, "used": 34 }, ... }
+
+# Remove a limit (set to null)
+curl -X PATCH http://127.0.0.1:3456/api/keys/wife-laptop/quota \
+  -d '{"daily": null}'
+```
+
+When a key exceeds its quota, OCP returns HTTP 429 with a structured error:
+```json
+{
+  "error": {
+    "message": "Quota exceeded: 50/50 requests (daily). Resets 6h 12m.",
+    "type": "quota_exceeded",
+    "quota": { "period": "daily", "limit": 50, "used": 50, "resetsIn": "6h 12m" }
+  }
+}
+```
+
+- `null` = unlimited (default for all keys)
+- Only successful requests count toward quota
+- Admin and anonymous users are never subject to quotas
+- PATCH is a partial update — omitted fields are left unchanged
 
 ### Important Notes
 
@@ -336,6 +419,34 @@ ocp update --check
 ocp update
 ```
 
+`ocp update` runs (in order): `git pull` → `npm install` → plugin sync → **OpenClaw model registry sync** (v3.11.0+) → proxy restart → health check.
+
+### OpenClaw Auto-Sync (v3.11.0+)
+
+Whenever the model list in [`models.json`](./models.json) changes, `ocp update` automatically reconciles your OpenClaw config so the model dropdown stays in sync — no more "I upgraded OCP but my Telegram bot still shows the old models" surprises.
+
+**What gets synced** (and only this — all other config keys are preserved):
+- `models.providers."claude-local".models` in `~/.openclaw/openclaw.json`
+- `agents.defaults.models["claude-local/*"]` aliases
+
+**Safety**:
+- Timestamped backup written before every change: `~/.openclaw/openclaw.json.bak.<ms>`
+- Idempotent — already-in-sync runs are a no-op (no backup, no rewrite)
+- Non-fatal — sync failure does NOT abort `ocp update`; `/v1/models` still works
+- Skips silently if OpenClaw is not installed (`~/.openclaw/openclaw.json` missing)
+
+**Manual trigger** (e.g. after fixing a hand-edited config, or for the one-time v3.10.0→v3.11.0 bootstrap quirk):
+```bash
+node ~/ocp/scripts/sync-openclaw.mjs
+node ~/ocp/scripts/sync-openclaw.mjs --quiet   # silent unless changes
+```
+
+**Opt-out**: `ocp update` only invokes the sync if `node` and `scripts/sync-openclaw.mjs` are both present. Removing the script disables auto-sync; the rest of `ocp update` still works.
+
+**One-time bootstrap caveat (v3.10.0 → v3.11.0 only)**: the first `ocp update` to v3.11.0 runs the *old* `cmd_update` already loaded into your shell, so the new sync hook does NOT fire on this single jump. Run `node ~/ocp/scripts/sync-openclaw.mjs` once manually. Every future update from v3.11.0+ syncs automatically.
+
+**Other IDEs** (Cline / Aider / Cursor / opencode) query `/v1/models` live, so they pick up new models on the next request — no sync needed. Continue.dev users edit their own `config.json` model id manually.
+
 ### Runtime Settings (No Restart Needed)
 
 ```
@@ -345,6 +456,42 @@ $ ocp settings maxPromptChars 200000
 $ ocp settings maxConcurrent 4
 ✓ maxConcurrent = 4
 ```
+
+## Response Cache
+
+OCP can cache responses to avoid redundant Claude CLI calls for identical prompts. This is useful during development when the same prompt is sent repeatedly.
+
+**Enable** by setting `CLAUDE_CACHE_TTL` (in milliseconds):
+
+```bash
+# Cache responses for 5 minutes
+export CLAUDE_CACHE_TTL=300000
+
+# Or update at runtime (no restart)
+ocp settings cacheTTL 300000
+```
+
+**How it works:**
+- Cache key = SHA-256 of `model` + `messages` + `temperature` + `max_tokens` + `top_p`
+- Cache hits return instantly — no Claude CLI process spawned
+- Works for both streaming and non-streaming requests
+- Multi-turn conversations (with `session_id`) are never cached
+- Expired entries are cleaned up automatically every 10 minutes
+
+**Management:**
+```bash
+# View cache stats
+curl http://127.0.0.1:3456/cache/stats
+# → { "entries": 42, "totalHits": 156, "sizeBytes": 284000 }
+
+# Clear all cached responses
+curl -X DELETE http://127.0.0.1:3456/cache
+
+# Disable cache at runtime
+ocp settings cacheTTL 0
+```
+
+Cache is **disabled by default** (`CLAUDE_CACHE_TTL=0`). All data is stored locally in `~/.ocp/ocp.db`.
 
 ## How It Works
 
@@ -358,9 +505,21 @@ OCP translates OpenAI-compatible `/v1/chat/completions` requests into `claude -p
 
 | Model ID | Notes |
 |----------|-------|
-| `claude-opus-4-6` | Most capable, slower |
-| `claude-sonnet-4-6` | Good balance of speed/quality |
-| `claude-haiku-4-5-20251001` | Fastest, lightweight |
+| `claude-opus-4-7` | Most capable (default for `opus` alias) |
+| `claude-opus-4-6` | Previous Opus, retained for pinning |
+| `claude-sonnet-4-6` | Good balance of speed/quality (default for `sonnet` alias) |
+| `claude-haiku-4-5-20251001` | Fastest, lightweight (default for `haiku` alias) |
+
+The canonical list lives in [`models.json`](./models.json) — the single source of truth as of v3.11.0. Both `server.mjs` (the `/v1/models` endpoint) and `setup.mjs` (the OpenClaw registration) derive from it. Adding a new model is now a one-file edit:
+
+```bash
+# 1. Edit models.json — add an entry
+# 2. Bump version, commit, tag, push
+# 3. Users get it on next `ocp update`:
+#    - OpenClaw: auto-synced via scripts/sync-openclaw.mjs
+#    - Cline / Aider / Cursor / opencode: live /v1/models, picks up immediately
+#    - Continue.dev: user edits their own config.json
+```
 
 ## API Endpoints
 
@@ -377,13 +536,17 @@ OCP translates OpenAI-compatible `/v1/chat/completions` requests into `claude -p
 | `/dashboard` | GET | Web dashboard (always public) |
 | `/api/keys` | GET/POST | List or create API keys (admin only) |
 | `/api/keys/:id` | DELETE | Revoke an API key (admin only) |
+| `/api/keys/:id/quota` | GET/PATCH | View or set per-key quota (admin only) |
 | `/api/usage` | GET | Per-key usage stats (`?since=&until=&hours=&limit=`) |
+| `/cache/stats` | GET | Cache statistics (admin only) |
+| `/cache` | DELETE | Clear response cache (admin only) |
 
 ## OpenClaw Integration
 
 OCP was originally built for [OpenClaw](https://github.com/openclaw/openclaw) and includes deep integration:
 
-- **`setup.mjs`** auto-configures the `claude-local` provider in `openclaw.json`
+- **`setup.mjs`** auto-configures the `claude-local` provider in `openclaw.json` at install time
+- **`ocp update`** auto-syncs the `claude-local` model registry from `models.json` (v3.11.0+) — no more stale model dropdowns after upgrades
 - **Gateway plugin** registers `/ocp` as a native slash command in Telegram/Discord
 - **Multi-agent** — 8 concurrent requests sharing one subscription
 - **No conflicts** — uses neutral service names (`dev.ocp.proxy` / `ocp-proxy`) that don't trigger OpenClaw's gateway-like service detection
@@ -443,6 +606,27 @@ claude auth login
 ocp restart
 ```
 
+### Startup log warns "OpenClaw registry out of sync"
+
+On boot, OCP compares OpenClaw's registered models against [`models.json`](./models.json) and warns if they drift. Cause: someone (or an OpenClaw upgrade) modified `~/.openclaw/openclaw.json` and removed entries OCP expects. Fix:
+
+```bash
+node ~/ocp/scripts/sync-openclaw.mjs
+```
+
+This is read-only at startup; the warning never blocks the gateway from running.
+
+### OpenClaw shows old models after `ocp update` (v3.10→v3.11 only)
+
+One-time bootstrap quirk for the v3.10.0 → v3.11.0 jump only — the running shell had the old `cmd_update` cached. Run once manually:
+
+```bash
+node ~/ocp/scripts/sync-openclaw.mjs
+openclaw gateway restart   # so OpenClaw re-reads the config
+```
+
+Future `ocp update` invocations sync automatically.
+
 ## Environment Variables
 
 | Variable | Default | Description |
@@ -453,14 +637,46 @@ ocp restart
 | `OCP_ADMIN_KEY` | *(unset)* | Admin key for key management (multi mode) |
 | `CLAUDE_BIN` | *(auto-detect)* | Path to claude binary |
 | `CLAUDE_TIMEOUT` | `600000` | Request timeout (ms, default: 10 min) |
+| `CLAUDE_HEARTBEAT_INTERVAL` | `0` | Streaming SSE keepalive interval (ms). `0` = disabled. See "Streaming heartbeat" section. |
 | `CLAUDE_MAX_CONCURRENT` | `8` | Max concurrent claude processes |
 | `CLAUDE_MAX_PROMPT_CHARS` | `150000` | Prompt truncation limit (chars) |
 | `CLAUDE_SESSION_TTL` | `3600000` | Session expiry (ms, default: 1 hour) |
+| `CLAUDE_CACHE_TTL` | `0` | Response cache TTL (ms, 0 = disabled). Set to e.g. `300000` for 5-min cache |
 | `CLAUDE_ALLOWED_TOOLS` | `Bash,Read,...,Agent` | Comma-separated tools to pre-approve |
 | `CLAUDE_SKIP_PERMISSIONS` | `false` | Bypass all permission checks |
 | `CLAUDE_NO_CONTEXT` | `false` | Suppress CLAUDE.md and auto-memory injection (pure API mode) |
 | `PROXY_API_KEY` | *(unset)* | Bearer token for shared-mode authentication |
 | `PROXY_ANONYMOUS_KEY` | *(unset)* | Well-known anonymous key allowlist (multi mode). When set, this exact string bypasses `validateKey()` and grants public access. Exposed via `/health.anonymousKey` so clients auto-discover. See [Anonymous Access](#anonymous-access-optional). |
+
+### Streaming heartbeat
+
+When `CLAUDE_HEARTBEAT_INTERVAL` is set to a positive integer (milliseconds), OCP emits an SSE comment frame (`: keepalive\n\n`) on streaming responses whenever the stream has been idle for that duration. The timer resets on every real chunk, so heartbeats only fire during genuine silent windows (for example, Claude CLI tool-use pauses of 30s–5min, or a long "processing large contexts" delay before the first token).
+
+Use cases: downstream HTTP clients or load balancers with idle-connection timeouts that would otherwise abort a slow-but-alive request. `CLAUDE_HEARTBEAT_INTERVAL=30000` (30s) is a reasonable starting value if your downstream has a 60s idle timeout.
+
+Heartbeats are inert SSE comment lines — conforming SSE clients ignore them. If your downstream client's SSE parser crashes on comment frames, leave this disabled (the default) and file an issue so we can consider an alternate frame format.
+
+OCP also sends `X-Accel-Buffering: no` on SSE responses so nginx-default proxy buffering does not hold heartbeats in an upstream buffer.
+
+## Repository Layout
+
+Top-level files a contributor or operator may need to know:
+
+| Path | Role |
+|------|------|
+| `server.mjs` | The proxy itself; every request path lives here. Governed by `ALIGNMENT.md`. |
+| `setup.mjs` | First-time installer — verifies Claude CLI, patches OpenClaw config, installs auto-start. |
+| `uninstall.mjs` | Reverses the launchd / systemd auto-start install. |
+| `keys.mjs` | API-key management module (multi-mode auth: create/list/revoke, quotas, usage tracking). |
+| `models.json` | Single source of truth for model IDs, aliases, context windows. See ADR 0003. |
+| `ocp` / `ocp-connect` | User-facing CLI wrappers (server-side / client-side respectively). |
+| `dashboard.html` | Static dashboard served from `/dashboard`. |
+| `scripts/sync-openclaw.mjs` | Idempotent OpenClaw registry sync invoked by `ocp update`. See ADR 0004. |
+| `.claude/skills/` | Project-specific Claude Code skills. |
+| `ocp-plugin/` | OpenClaw gateway plugin (optional installation). |
+| `docs/adr/` | Architecture Decision Records. Read these before proposing governance or SPOT changes — see [`docs/adr/README.md`](docs/adr/README.md). |
+| `ALIGNMENT.md` | The constitution. Binding for any `server.mjs` change. |
+| `AGENTS.md` / `CLAUDE.md` | Agent and Claude-Code-specific session instructions. |
 
 ## Security
 
@@ -473,6 +689,18 @@ ocp restart
 - **Keys stored locally** — `~/.ocp/ocp.db` (SQLite), never sent to external services
 - **Auto-start** — launchd (macOS) / systemd (Linux)
 
+## Governance
+
+OCP runs under a small set of binding documents so contributions stay aligned with what `cli.js` actually does, not what an LLM thinks it does:
+
+- **[`ALIGNMENT.md`](./ALIGNMENT.md)** — the constitution. Every endpoint OCP exposes must correspond to something `cli.js` actually does, with a line-number citation. Background in [ADR 0002](./docs/adr/0002-alignment-constitution.md).
+- **[`.github/workflows/alignment.yml`](./.github/workflows/alignment.yml)** — CI guardrail. Greps `server.mjs` for known-hallucinated tokens and fails the build on any hit. Not suppressible without an `ALIGNMENT.md` amendment PR.
+- **[`AGENTS.md`](./AGENTS.md)** — guidelines any AI coding agent (Claude Code / Cursor / Copilot / Codex / Gemini) should read before touching this repo.
+- **[`models.json`](./models.json)** — single source of truth for the model registry. See [ADR 0003](./docs/adr/0003-models-json-spot.md).
+- **[`docs/adr/`](./docs/adr/)** — architecture decision records explaining why current structure exists.
+
+If you want to contribute: read `ALIGNMENT.md` first, search `cli.js` for the operation you're proposing, and cite the line number in your PR.
+
 ## License
 
-MIT
+MIT — see [`LICENSE`](LICENSE).

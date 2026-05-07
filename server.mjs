@@ -25,18 +25,20 @@
  *   CLAUDE_BREAKER_WINDOW        — sliding window duration in ms (default: 300000 = 5min)
  *   CLAUDE_BREAKER_HALF_OPEN_MAX — max concurrent probes in half-open state (default: 2)
  *   PROXY_API_KEY                — Bearer token for API auth (optional)
+ *   CLAUDE_HEARTBEAT_INTERVAL    — SSE heartbeat interval in ms on streaming path (default: 0 = disabled)
  */
 import { createServer } from "node:http";
 import { spawn, execFileSync } from "node:child_process";
 import { randomUUID, timingSafeEqual } from "node:crypto";
-import { readFileSync, accessSync, constants } from "node:fs";
+import { readFileSync, accessSync, existsSync, constants } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 import { homedir } from "node:os";
-import { validateKey, recordUsage, getUsageByKey, getUsageTimeline, getRecentUsage, createKey, listKeys, revokeKey, closeDb } from "./keys.mjs";
+import { validateKey, recordUsage, getUsageByKey, getUsageTimeline, getRecentUsage, createKey, listKeys, revokeKey, closeDb, checkQuota, updateKeyQuota, getKeyQuota, findKey, cacheHash, getCachedResponse, setCachedResponse, clearCache, getCacheStats, hasCacheControl } from "./keys.mjs";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const _pkg = JSON.parse(readFileSync(join(__dirname, "package.json"), "utf8"));
+const modelsConfig = JSON.parse(readFileSync(join(__dirname, "models.json"), "utf8"));
 
 // ── Resolve claude binary ───────────────────────────────────────────────
 // Priority: CLAUDE_BIN env > well-known paths > which lookup
@@ -93,11 +95,13 @@ const BREAKER_THRESHOLD = parseInt(process.env.CLAUDE_BREAKER_THRESHOLD || "6", 
 const BREAKER_COOLDOWN = parseInt(process.env.CLAUDE_BREAKER_COOLDOWN || "120000", 10);
 const BREAKER_WINDOW = parseInt(process.env.CLAUDE_BREAKER_WINDOW || "300000", 10);
 const BREAKER_HALF_OPEN_MAX = parseInt(process.env.CLAUDE_BREAKER_HALF_OPEN_MAX || "2", 10);
+const HEARTBEAT_INTERVAL = parseInt(process.env.CLAUDE_HEARTBEAT_INTERVAL || "0", 10);
 const BIND_ADDRESS = process.env.CLAUDE_BIND || "127.0.0.1";
 const NO_CONTEXT = process.env.CLAUDE_NO_CONTEXT === "true";
 const AUTH_MODE = process.env.CLAUDE_AUTH_MODE || (PROXY_API_KEY ? "shared" : "none");
 const ADMIN_KEY = process.env.OCP_ADMIN_KEY || "";
 const PROXY_ANONYMOUS_KEY = process.env.PROXY_ANONYMOUS_KEY || "";
+let CACHE_TTL = parseInt(process.env.CLAUDE_CACHE_TTL || "0", 10); // 0 = disabled, value in ms
 if (PROXY_ANONYMOUS_KEY && AUTH_MODE !== "multi") {
   console.warn("WARNING: PROXY_ANONYMOUS_KEY is set but AUTH_MODE is not 'multi' — anonymous key will be ignored");
 }
@@ -144,23 +148,14 @@ const _BREAKER_DISABLED_NOTE = "disabled";
 
 // ── Model mapping ───────────────────────────────────────────────────────
 // Maps request model IDs and aliases to canonical claude CLI model IDs.
-const MODEL_MAP = {
-  "claude-opus-4-6": "claude-opus-4-6",
-  "claude-sonnet-4-6": "claude-sonnet-4-6",
-  "claude-haiku-4-5-20251001": "claude-haiku-4-5-20251001",
-  "claude-opus-4": "claude-opus-4-6",
-  "claude-haiku-4": "claude-haiku-4-5-20251001",
-  "claude-haiku-4-5": "claude-haiku-4-5-20251001",
-  "opus": "claude-opus-4-6",
-  "sonnet": "claude-sonnet-4-6",
-  "haiku": "claude-haiku-4-5-20251001",
-};
+// Derived from models.json (single source of truth).
+const MODEL_MAP = Object.fromEntries([
+  ...modelsConfig.models.map(m => [m.id, m.id]),
+  ...Object.entries(modelsConfig.aliases),
+  ...Object.entries(modelsConfig.legacyAliases),
+]);
 
-const MODELS = [
-  { id: "claude-opus-4-6", name: "Claude Opus 4.6" },
-  { id: "claude-sonnet-4-6", name: "Claude Sonnet 4.6" },
-  { id: "claude-haiku-4-5-20251001", name: "Claude Haiku 4.5" },
-];
+const MODELS = modelsConfig.models.map(m => ({ id: m.id, name: m.displayName }));
 
 // ── Session management ──────────────────────────────────────────────────
 // Maps conversation IDs (from caller) to Claude CLI session UUIDs.
@@ -170,12 +165,31 @@ const sessions = new Map(); // conversationId → { uuid, messageCount, lastUsed
 const sessionCleanupInterval = setInterval(() => {
   const now = Date.now();
   for (const [id, s] of sessions) {
-    if (now - s.lastUsed > SESSION_TTL) {
+    const idleMs = now - s.lastUsed;
+    const ageMs = s.firstSeen ? now - s.firstSeen : null;
+    if (idleMs > SESSION_TTL) {
       sessions.delete(id);
-      console.log(`[session] expired ${id.slice(0, 12)}... (idle ${Math.round((now - s.lastUsed) / 60000)}m)`);
+      console.log(`[session] expired ${id.slice(0, 12)}... (idle ${Math.round(idleMs / 60000)}m)`);
+      logEvent("info", "session_expired", { conversationId: id.slice(0, 12) + "...", idleMs, ageMs });
+    } else if (ageMs !== null && ageMs > 4 * SESSION_TTL) {
+      // #42 evidence-gathering: a session whose firstSeen is more than 4× TTL old
+      // but whose lastUsed keeps getting bumped (never idle long enough to expire)
+      // is the suspected bug. Log without action so the pattern can be confirmed
+      // in /logs. Do NOT enforce an absolute age cap here speculatively.
+      logEvent("warn", "session_long_lived", { conversationId: id.slice(0, 12) + "...", idleMs, ageMs });
     }
   }
 }, 60000);
+
+// Cache cleanup: remove expired entries every 10 minutes
+const cacheCleanupInterval = setInterval(() => {
+  if (CACHE_TTL > 0) {
+    try {
+      const cleaned = clearCache(CACHE_TTL);
+      if (cleaned > 0) logEvent("info", "cache_cleanup", { expired: cleaned });
+    } catch (e) { logEvent("error", "cache_cleanup_failed", { error: e.message }); }
+  }
+}, 600000);
 
 // ── Active child process tracking ────────────────────────────────────────
 const activeProcesses = new Set();
@@ -401,7 +415,8 @@ function spawnClaudeProcess(model, messages, conversationId) {
 
   } else if (conversationId) {
     const uuid = randomUUID();
-    sessions.set(conversationId, { uuid, messageCount: messages.length, lastUsed: Date.now(), model: cliModel });
+    const now = Date.now();
+    sessions.set(conversationId, { uuid, messageCount: messages.length, firstSeen: now, lastUsed: now, model: cliModel });
     sessionInfo = { uuid, resume: false };
     stats.sessionMisses++;
     prompt = messagesToPrompt(messages);
@@ -441,10 +456,25 @@ function spawnClaudeProcess(model, messages, conversationId) {
     stats.activeRequests--;
   }
 
+  // Guarantee slot release on ANY exit path (normal close, error, timeout kill,
+  // SIGKILL escalation). The 'exit' event fires before 'close' and runs even
+  // if stdio pipes stay open. Fixes #37: the timeout path called
+  // proc.kill('SIGTERM') without decrementing the concurrency counter, so a
+  // stuck subprocess that ignored SIGTERM could leak its slot until (or
+  // beyond) the SIGKILL escalation actually reaped it. cleanup() is idempotent
+  // so this listener is safe alongside the existing 'close'/'error' paths.
+  proc.once("exit", cleanup);
+
   function handleSessionFailure() {
     if (sessionInfo?.resume && conversationId) {
       console.warn(`[session] resume failed for ${conversationId.slice(0, 12)}..., removing stale session`);
+      logEvent("warn", "session_failure", { mode: "resume", conversationId: conversationId.slice(0, 12) + "...", action: "deleted" });
       sessions.delete(conversationId);
+    } else if (sessionInfo && !sessionInfo.resume && conversationId) {
+      // #41 evidence-gathering: session-create failures currently leave a stale entry
+      // in the sessions map. Log without action so the staleness pattern can be
+      // confirmed in /logs before any code change. Do NOT delete here speculatively.
+      logEvent("warn", "session_failure", { mode: "create", conversationId: conversationId.slice(0, 12) + "...", action: "kept" });
     }
   }
 
@@ -530,6 +560,33 @@ function callClaude(model, messages, conversationId) {
   });
 }
 
+// ── SSE heartbeat (opt-in idle watchdog) ────────────────────────────────
+// Emits `: keepalive\n\n` SSE comment frames during silent windows on the
+// streaming response. Design: docs/superpowers/specs/2026-04-25-47-sse-heartbeat-design.md
+// This is a downstream liveness hint only — it MUST NOT be able to abort
+// or time out a request. That discipline is load-bearing: v2.2-v2.5's
+// first-byte/adaptive-tier timeouts "repeatedly killed valid requests"
+// (see server.mjs top-of-file comment and commit 3843ec8).
+function startHeartbeat(res, intervalMs, sessionId) {
+  if (!intervalMs || intervalMs <= 0) return { reset: () => {}, stop: () => {} };
+  let handle = null;
+  let hasFired = false;
+  const onFire = () => {
+    if (res.writableEnded || res.destroyed) return;
+    res.write(": keepalive\n\n");
+    if (!hasFired) {
+      hasFired = true;
+      logEvent("info", "heartbeat_active", { session: sessionId, intervalMs });
+    }
+    handle = setTimeout(onFire, intervalMs);
+  };
+  handle = setTimeout(onFire, intervalMs);
+  return {
+    reset: () => { if (handle) { clearTimeout(handle); handle = setTimeout(onFire, intervalMs); } },
+    stop:  () => { if (handle) { clearTimeout(handle); handle = null; } },
+  };
+}
+
 // ── Call claude CLI (real streaming) ─────────────────────────────────────
 // Pipes stdout from the claude process directly to SSE chunks as they arrive.
 // Each data chunk becomes a proper SSE event with delta content in real time.
@@ -548,14 +605,17 @@ function callClaudeStreaming(model, messages, conversationId, res, authInfo = {}
   let stderr = "";
   let headersSent = false;
   let totalChars = 0;
+  let cachedContent = ""; // accumulate for cache write-back
 
   function ensureHeaders() {
-    if (headersSent || res.writableEnded || res.destroyed) return false;
+    if (res.writableEnded || res.destroyed) return false;
+    if (headersSent) return true;
     headersSent = true;
     res.writeHead(200, {
       "Content-Type": "text/event-stream",
       "Cache-Control": "no-cache",
       "Connection": "keep-alive",
+      "X-Accel-Buffering": "no",
     });
     // Send initial role chunk
     sendSSE(res, {
@@ -565,10 +625,20 @@ function callClaudeStreaming(model, messages, conversationId, res, authInfo = {}
     return true;
   }
 
+  // D4 (spec 2026-04-25): eagerly send SSE headers post-spawn so the
+  // heartbeat started in the next statement (Task 1.3) covers the
+  // pre-first-byte silent window. Behavior change: the `code !== 0`
+  // before-first-byte branch at server.mjs:610-611 becomes effectively
+  // unreachable in the common case — the post-headers SSE-stop path
+  // (612-619) handles it instead.
+  ensureHeaders();
+  const hb = startHeartbeat(res, HEARTBEAT_INTERVAL, convId);
+
   proc.stdout.on("data", (d) => {
     markFirstByte();
     const text = d.toString();
     totalChars += text.length;
+    if (CACHE_TTL > 0) cachedContent += text;
 
     if (!ensureHeaders()) return;
 
@@ -576,13 +646,14 @@ function callClaudeStreaming(model, messages, conversationId, res, authInfo = {}
     sendSSE(res, {
       id, object: "chat.completion.chunk", created, model,
       choices: [{ index: 0, delta: { content: text }, finish_reason: null }],
-    });
+    }, hb);
   });
 
   proc.stderr.on("data", (d) => (stderr += d));
 
   proc.on("close", (code, signal) => {
     activeProcesses.delete(proc);
+    hb.stop();
     cleanup();
     const elapsed = Date.now() - t0;
 
@@ -599,7 +670,7 @@ function callClaudeStreaming(model, messages, conversationId, res, authInfo = {}
         sendSSE(res, {
           id, object: "chat.completion.chunk", created, model,
           choices: [{ index: 0, delta: {}, finish_reason: "stop" }],
-        });
+        }, hb);
         res.write("data: [DONE]\n\n");
         res.end();
       }
@@ -608,13 +679,17 @@ function callClaudeStreaming(model, messages, conversationId, res, authInfo = {}
       breakerRecordSuccess(cliModel);
       try { recordUsage({ keyId: authInfo.keyId, keyName: authInfo.keyName, model, promptChars: messages.reduce((a, m) => a + (typeof m.content === "string" ? m.content.length : JSON.stringify(m.content).length), 0), responseChars: totalChars, elapsedMs: elapsed, success: true }); } catch (e) { logEvent("error", "usage_record_failed", { error: e.message }); }
       logEvent("info", "claude_ok", { model: cliModel, chars: totalChars, elapsed, session: convId ? convId.slice(0, 12) + "..." : "none" });
+      // Cache write-back for streaming
+      if (CACHE_TTL > 0 && authInfo.cacheHash) {
+        try { setCachedResponse(authInfo.cacheHash, model, cachedContent); } catch (e) { logEvent("error", "cache_write_failed", { error: e.message }); }
+      }
 
       if (!headersSent) ensureHeaders();
       if (!res.writableEnded && !res.destroyed) {
         sendSSE(res, {
           id, object: "chat.completion.chunk", created, model,
           choices: [{ index: 0, delta: {}, finish_reason: "stop" }],
-        });
+        }, hb);
         res.write("data: [DONE]\n\n");
         res.end();
       }
@@ -623,6 +698,7 @@ function callClaudeStreaming(model, messages, conversationId, res, authInfo = {}
 
   proc.on("error", (err) => {
     console.error(`[claude] spawn error: ${err.message}`);
+    hb.stop();
     cleanup();
     trackError(err.message);
     handleSessionFailure();
@@ -635,6 +711,7 @@ function callClaudeStreaming(model, messages, conversationId, res, authInfo = {}
 
   // If client disconnects, kill the process to free resources
   res.on("close", () => {
+    hb.stop();
     if (!proc.killed) {
       try { proc.kill("SIGTERM"); } catch {}
     }
@@ -648,7 +725,8 @@ function jsonResponse(res, status, data) {
   res.end(JSON.stringify(data));
 }
 
-function sendSSE(res, data) {
+function sendSSE(res, data, hb) {
+  hb?.reset();
   res.write(`data: ${JSON.stringify(data)}\n\n`);
 }
 
@@ -663,25 +741,42 @@ function completionResponse(res, id, model, content) {
 }
 
 // ── Plan usage probe ────────────────────────────────────────────────────
-// Uses the dedicated /api/oauth/usage endpoint (same as Claude Code CLI)
-// with Bearer auth + anthropic-beta header. Auto-refreshes expired tokens.
-// Caches the result for 5 minutes to avoid excessive API calls.
+// ── Plan usage probe ────────────────────────────────────────────────────
+// ALIGNMENT: mirrors Claude Code cli.js vE4 rate-limit header extraction.
+// DO NOT switch endpoints without grepping "anthropic-ratelimit-unified" in cli.js.
+// 2026-04-11 b87992f drift lesson: /api/oauth/usage is a hallucinated endpoint.
+// See ALIGNMENT.md for full history.
+//
+// Reads OAuth token (keychain / Linux credentials / CLAUDE_CODE_OAUTH_TOKEN env)
+// and makes a minimal /v1/messages request to capture anthropic-ratelimit-unified-*
+// headers. Caches the result for 5 minutes.
 
 let usageCache = { data: null, fetchedAt: 0 };
-const USAGE_CACHE_TTL = 900000; // 15 min
+const USAGE_CACHE_TTL = 5 * 60 * 1000; // 5 min
 const OAUTH_CLIENT_ID = "9d1c250a-e61b-44d9-88ed-5944d1962f5e";
 const OAUTH_TOKEN_URL = "https://platform.claude.com/v1/oauth/token";
-const OAUTH_BETA_HEADER = "oauth-2025-04-20";
+
+// Refresh backoff state — exponential 60s → 3600s.
+// Prevents tight loops hammering the token endpoint after a failure
+// (lesson from pre-fix session that burned through rate-limit in seconds).
+const OAUTH_REFRESH_MIN_BACKOFF = 60 * 1000;
+const OAUTH_REFRESH_MAX_BACKOFF = 3600 * 1000;
+let oauthRefreshBackoff = { nextAttemptAt: 0, currentDelay: OAUTH_REFRESH_MIN_BACKOFF };
 
 function getOAuthCredentials() {
-  // Try Linux file-based credentials first
+  // 1. Env var fallback — highest precedence for explicit overrides.
+  if (process.env.CLAUDE_CODE_OAUTH_TOKEN) {
+    return { accessToken: process.env.CLAUDE_CODE_OAUTH_TOKEN };
+  }
+
+  // 2. Linux file-based credentials
   try {
     const credPath = join(homedir(), ".claude", ".credentials.json");
     const creds = JSON.parse(readFileSync(credPath, "utf8"));
     if (creds?.claudeAiOauth?.accessToken) return creds.claudeAiOauth;
   } catch { /* fall through to macOS keychain */ }
 
-  // Try macOS keychain (both label formats)
+  // 3. macOS keychain (both label formats)
   for (const label of ["claude-code-credentials", "Claude Code-credentials"]) {
     try {
       const raw = execFileSync("security", [
@@ -695,6 +790,13 @@ function getOAuthCredentials() {
 }
 
 async function refreshOAuthToken(refreshToken) {
+  const now = Date.now();
+  if (now < oauthRefreshBackoff.nextAttemptAt) {
+    logEvent("info", "oauth_refresh_backoff_skip", {
+      waitMs: oauthRefreshBackoff.nextAttemptAt - now,
+    });
+    return null;
+  }
   try {
     const resp = await fetch(OAUTH_TOKEN_URL, {
       method: "POST",
@@ -708,13 +810,34 @@ async function refreshOAuthToken(refreshToken) {
     });
     if (!resp.ok) {
       const body = await resp.text();
-      logEvent("warn", "oauth_refresh_failed", { status: resp.status, body: body.slice(0, 200) });
+      // Exponential backoff on failure
+      oauthRefreshBackoff.nextAttemptAt = Date.now() + oauthRefreshBackoff.currentDelay;
+      oauthRefreshBackoff.currentDelay = Math.min(
+        oauthRefreshBackoff.currentDelay * 2,
+        OAUTH_REFRESH_MAX_BACKOFF,
+      );
+      logEvent("warn", "oauth_refresh_failed", {
+        status: resp.status,
+        body: body.slice(0, 200),
+        nextBackoffMs: oauthRefreshBackoff.currentDelay,
+      });
       return null;
     }
     const data = await resp.json();
+    // Reset backoff on success
+    oauthRefreshBackoff.currentDelay = OAUTH_REFRESH_MIN_BACKOFF;
+    oauthRefreshBackoff.nextAttemptAt = 0;
     return data.access_token || null;
   } catch (err) {
-    logEvent("warn", "oauth_refresh_error", { error: err.message });
+    oauthRefreshBackoff.nextAttemptAt = Date.now() + oauthRefreshBackoff.currentDelay;
+    oauthRefreshBackoff.currentDelay = Math.min(
+      oauthRefreshBackoff.currentDelay * 2,
+      OAUTH_REFRESH_MAX_BACKOFF,
+    );
+    logEvent("warn", "oauth_refresh_error", {
+      error: err.message,
+      nextBackoffMs: oauthRefreshBackoff.currentDelay,
+    });
     return null;
   }
 }
@@ -722,73 +845,89 @@ async function refreshOAuthToken(refreshToken) {
 async function fetchUsageFromApi() {
   const creds = getOAuthCredentials();
   if (!creds?.accessToken) {
-    return { error: "No OAuth token found in keychain" };
+    return { error: "No OAuth token found (keychain / ~/.claude/.credentials.json / CLAUDE_CODE_OAUTH_TOKEN)" };
   }
 
   let token = creds.accessToken;
 
-  // Check if token looks expired (5 min buffer, same as Claude Code)
-  if (creds.expiresAt && Date.now() + 300000 >= creds.expiresAt) {
-    if (creds.refreshToken) {
-      logEvent("info", "oauth_token_expired_refreshing");
-      const newToken = await refreshOAuthToken(creds.refreshToken);
-      if (newToken) token = newToken;
-    }
+  // Pre-emptive refresh if token looks expired (5 min buffer, same as Claude Code)
+  if (creds.expiresAt && Date.now() + 300000 >= creds.expiresAt && creds.refreshToken) {
+    logEvent("info", "oauth_token_expired_refreshing");
+    const newToken = await refreshOAuthToken(creds.refreshToken);
+    if (newToken) token = newToken;
   }
 
+  // Minimal /v1/messages request — we only need the response headers.
+  // Mirrors Claude Code cli.js vE4: headers anthropic-ratelimit-unified-{5h,7d}-{utilization,reset}.
+  const body = JSON.stringify({
+    model: "claude-haiku-4-5-20251001",
+    max_tokens: 1,
+    messages: [{ role: "user", content: "." }],
+  });
+
   const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), 10000);
+  const timeout = setTimeout(() => controller.abort(), 15000);
+
+  const doFetch = (bearerToken) => fetch("https://api.anthropic.com/v1/messages", {
+    method: "POST",
+    headers: {
+      "Authorization": `Bearer ${bearerToken}`,
+      "anthropic-version": "2023-06-01",
+      "anthropic-beta": "oauth-2025-04-20",
+      "Content-Type": "application/json",
+    },
+    body,
+    signal: controller.signal,
+  });
 
   try {
-    const resp = await fetch("https://api.anthropic.com/api/oauth/usage", {
-      method: "GET",
-      headers: {
-        "Authorization": `Bearer ${token}`,
-        "anthropic-beta": OAUTH_BETA_HEADER,
-        "Content-Type": "application/json",
-      },
-      signal: controller.signal,
-    });
-    clearTimeout(timeout);
+    let resp = await doFetch(token);
 
-    if (!resp.ok) {
-      // If 401, try refreshing token once
-      if (resp.status === 401 && creds.refreshToken) {
-        logEvent("info", "oauth_usage_401_refreshing");
-        const newToken = await refreshOAuthToken(creds.refreshToken);
-        if (newToken) {
-          const retryResp = await fetch("https://api.anthropic.com/api/oauth/usage", {
-            method: "GET",
-            headers: {
-              "Authorization": `Bearer ${newToken}`,
-              "anthropic-beta": OAUTH_BETA_HEADER,
-              "Content-Type": "application/json",
-            },
-          });
-          if (retryResp.ok) {
-            const retryData = await retryResp.json();
-            return parseUsageResponse(retryData);
-          }
-        }
-        return { error: `Usage API auth failed after refresh (${resp.status})` };
+    // 401 → try a single refresh-and-retry
+    if (resp.status === 401 && creds.refreshToken) {
+      logEvent("info", "oauth_usage_401_refreshing");
+      const newToken = await refreshOAuthToken(creds.refreshToken);
+      if (newToken) {
+        token = newToken;
+        resp = await doFetch(token);
       }
-      return { error: `Usage API returned ${resp.status}` };
     }
 
-    const data = await resp.json();
-    return parseUsageResponse(data);
+    clearTimeout(timeout);
+
+    // Extract all rate-limit headers (we do not need the response body)
+    const rl = {};
+    for (const [k, v] of resp.headers) {
+      if (k.startsWith("anthropic-ratelimit")) rl[k] = v;
+    }
+
+    if (!resp.ok && Object.keys(rl).length === 0) {
+      return { error: `Usage API returned ${resp.status} with no rate-limit headers` };
+    }
+
+    return parseRateLimitHeaders(rl);
   } catch (err) {
     clearTimeout(timeout);
     return { error: `Failed to fetch usage: ${err.message}` };
   }
 }
 
-function parseUsageResponse(data) {
+function parseRateLimitHeaders(rl) {
   const now = Date.now();
 
-  function formatReset(isoStr) {
-    if (!isoStr) return "unknown";
-    const diff = new Date(isoStr).getTime() - now;
+  const session5hUtil = parseFloat(rl["anthropic-ratelimit-unified-5h-utilization"] || "0");
+  const session5hReset = parseInt(rl["anthropic-ratelimit-unified-5h-reset"] || "0", 10);
+  const weekly7dUtil = parseFloat(rl["anthropic-ratelimit-unified-7d-utilization"] || "0");
+  const weekly7dReset = parseInt(rl["anthropic-ratelimit-unified-7d-reset"] || "0", 10);
+  const overageStatus = rl["anthropic-ratelimit-unified-overage-status"] || "unknown";
+  const overageDisabledReason = rl["anthropic-ratelimit-unified-overage-disabled-reason"] || "";
+  const status = rl["anthropic-ratelimit-unified-status"] || "unknown";
+  const representativeClaim = rl["anthropic-ratelimit-unified-representative-claim"] || "";
+  const fallbackPct = parseFloat(rl["anthropic-ratelimit-unified-fallback-percentage"] || "0");
+
+  function formatReset(epochSec) {
+    if (!epochSec) return "unknown";
+    const diff = epochSec * 1000 - now;
     if (diff <= 0) return "now";
     const h = Math.floor(diff / 3600000);
     const m = Math.floor((diff % 3600000) / 60000);
@@ -799,42 +938,38 @@ function parseUsageResponse(data) {
     return h > 0 ? `${h}h ${m}m` : `${m}m`;
   }
 
-  function resetDay(isoStr) {
-    if (!isoStr) return "";
-    const d = new Date(isoStr);
+  function resetDay(epochSec) {
+    if (!epochSec) return "";
+    const d = new Date(epochSec * 1000);
     return d.toLocaleDateString("en-US", { weekday: "short", month: "short", day: "numeric", hour: "numeric", minute: "2-digit" });
   }
 
-  const fiveHour = data.five_hour || {};
-  const sevenDay = data.seven_day || {};
-  const extraUsage = data.extra_usage || {};
-
   return {
-    status: "active",
+    status,
     fetchedAt: new Date(now).toISOString(),
     plan: {
       currentSession: {
-        utilization: (fiveHour.utilization || 0) / 100,
-        percent: `${Math.round(fiveHour.utilization || 0)}%`,
-        resetsIn: formatReset(fiveHour.resets_at),
-        resetsAt: fiveHour.resets_at || null,
-        resetsAtHuman: resetDay(fiveHour.resets_at),
+        utilization: session5hUtil,
+        percent: `${Math.round(session5hUtil * 100)}%`,
+        resetsIn: formatReset(session5hReset),
+        resetsAt: session5hReset ? new Date(session5hReset * 1000).toISOString() : null,
+        resetsAtHuman: resetDay(session5hReset),
       },
       weeklyLimits: {
         allModels: {
-          utilization: (sevenDay.utilization || 0) / 100,
-          percent: `${Math.round(sevenDay.utilization || 0)}%`,
-          resetsIn: formatReset(sevenDay.resets_at),
-          resetsAt: sevenDay.resets_at || null,
-          resetsAtHuman: resetDay(sevenDay.resets_at),
+          utilization: weekly7dUtil,
+          percent: `${Math.round(weekly7dUtil * 100)}%`,
+          resetsIn: formatReset(weekly7dReset),
+          resetsAt: weekly7dReset ? new Date(weekly7dReset * 1000).toISOString() : null,
+          resetsAtHuman: resetDay(weekly7dReset),
         },
       },
       extraUsage: {
-        status: extraUsage.is_enabled ? "enabled" : "disabled",
-        monthlyLimit: extraUsage.monthly_limit,
-        usedCredits: extraUsage.used_credits,
-        utilization: extraUsage.utilization,
+        status: overageStatus,
+        disabledReason: overageDisabledReason || undefined,
       },
+      representativeClaim,
+      fallbackPercentage: fallbackPct,
     },
     proxy: {
       totalRequests: stats.totalRequests,
@@ -844,7 +979,7 @@ function parseUsageResponse(data) {
       uptime: `${Math.floor((now - START_TIME) / 3600000)}h ${Math.floor(((now - START_TIME) % 3600000) / 60000)}m`,
     },
     models: getModelStatsSnapshot(),
-    _raw: data,
+    _raw: rl,
   };
 }
 
@@ -857,9 +992,6 @@ async function handleUsage(_req, res) {
     data = await fetchUsageFromApi();
     if (!data.error) {
       usageCache = { data, fetchedAt: now };
-    } else if (usageCache.data) {
-      // Fallback to stale cache on error (e.g. 429 rate limit)
-      data = { ...usageCache.data, _stale: true, _fetchError: data.error };
     }
   }
   // Always attach live model stats and proxy stats (not cached)
@@ -931,8 +1063,6 @@ async function handleStatus(_req, res) {
     usage = await fetchUsageFromApi();
     if (!usage.error) {
       usageCache = { data: usage, fetchedAt: now };
-    } else if (usageCache.data) {
-      usage = { ...usageCache.data, _stale: true };
     }
   }
 
@@ -969,6 +1099,7 @@ const SETTINGS_SCHEMA = {
   maxConcurrent:    { type: "number", min: 1, max: 32, unit: "", desc: "Max concurrent claude processes" },
   sessionTTL:       { type: "number", min: 60000, max: 86400000, unit: "ms", desc: "Session idle expiry" },
   maxPromptChars:   { type: "number", min: 10000, max: 1000000, unit: "chars", desc: "Prompt truncation limit" },
+  cacheTTL:         { type: "number", min: 0, max: 86400000, unit: "ms", desc: "Response cache TTL (0 = disabled)" },
 };
 
 function getSettings() {
@@ -977,6 +1108,7 @@ function getSettings() {
     maxConcurrent:    { value: MAX_CONCURRENT, ...SETTINGS_SCHEMA.maxConcurrent },
     sessionTTL:       { value: SESSION_TTL, ...SETTINGS_SCHEMA.sessionTTL },
     maxPromptChars:   { value: MAX_PROMPT_CHARS, ...SETTINGS_SCHEMA.maxPromptChars },
+    cacheTTL:         { value: CACHE_TTL, ...SETTINGS_SCHEMA.cacheTTL },
   };
 }
 
@@ -991,6 +1123,7 @@ function applySettingUpdate(key, value) {
     case "maxConcurrent":    MAX_CONCURRENT = value; break;
     case "sessionTTL":       SESSION_TTL = value; break;
     case "maxPromptChars":   MAX_PROMPT_CHARS = value; break;
+    case "cacheTTL":         CACHE_TTL = value; break;
     default: return `${key}: not implemented`;
   }
   logEvent("info", "setting_changed", { key, value });
@@ -1067,9 +1200,67 @@ async function handleChatCompletions(req, res) {
 
   if (!messages?.length) return jsonResponse(res, 400, { error: "messages required" });
 
+  // Quota check — only for identified per-key users (not anonymous/admin/local)
+  if (req._authKeyId) {
+    let exceeded;
+    try { exceeded = checkQuota(req._authKeyId, req._authKeyName); } catch (e) { logEvent("error", "quota_check_failed", { error: e.message }); exceeded = null; }
+    if (exceeded) {
+      logEvent("warn", "quota_exceeded", { keyId: req._authKeyId, keyName: req._authKeyName, period: exceeded.period, limit: exceeded.limit, used: exceeded.used });
+      return jsonResponse(res, 429, {
+        error: {
+          message: `Quota exceeded: ${exceeded.used}/${exceeded.limit} requests (${exceeded.period}). Resets ${exceeded.resetsIn}.`,
+          type: "quota_exceeded",
+          quota: exceeded,
+        },
+      });
+    }
+  }
+
+  // Cache check (only when cache is enabled and no active conversation/session)
+  if (CACHE_TTL > 0 && !conversationId) {
+    // D2: skip OCP cache entirely when messages carry cache_control annotations;
+    // the client is requesting Anthropic-side prompt caching, not OCP-layer caching.
+    if (hasCacheControl(messages)) {
+      req._cacheHash = null;
+      logEvent("info", "cache_skipped", { reason: "cache_control_present" });
+    } else {
+      // D1: include keyId in hash to isolate per-key cache pools (v2 format)
+      const hash = cacheHash(model, messages, { keyId: req._authKeyId, temperature: parsed.temperature, max_tokens: parsed.max_tokens, top_p: parsed.top_p });
+      req._cacheHash = hash; // store for later write-back
+      try {
+        const cached = getCachedResponse(hash, CACHE_TTL);
+        if (cached) {
+          logEvent("info", "cache_hit", { model, hash: hash.slice(0, 12), hits: cached.hits });
+          if (stream) {
+            // D3: replay cached content as chunked SSE stream (80 codepoints/chunk)
+            const CACHE_REPLAY_CHUNK_SIZE = 80;
+            const id = `chatcmpl-${randomUUID()}`;
+            const created = Math.floor(Date.now() / 1000);
+            res.writeHead(200, { "Content-Type": "text/event-stream", "Cache-Control": "no-cache", "Connection": "keep-alive", "X-Accel-Buffering": "no" });
+            sendSSE(res, { id, object: "chat.completion.chunk", created, model, choices: [{ index: 0, delta: { role: "assistant" }, finish_reason: null }] });
+            const codepoints = Array.from(cached.response);
+            for (let i = 0; i < codepoints.length; i += CACHE_REPLAY_CHUNK_SIZE) {
+              const chunk = codepoints.slice(i, i + CACHE_REPLAY_CHUNK_SIZE).join("");
+              sendSSE(res, { id, object: "chat.completion.chunk", created, model, choices: [{ index: 0, delta: { content: chunk }, finish_reason: null }] });
+            }
+            sendSSE(res, { id, object: "chat.completion.chunk", created, model, choices: [{ index: 0, delta: {}, finish_reason: "stop" }] });
+            res.write("data: [DONE]\n\n");
+            res.end();
+            return;
+          } else {
+            const id = `chatcmpl-${randomUUID()}`;
+            return completionResponse(res, id, model, cached.response);
+          }
+        }
+      } catch (e) {
+        logEvent("error", "cache_check_failed", { error: e.message });
+      }
+    }
+  }
+
   if (stream) {
     // Real streaming: pipe stdout from claude process directly as SSE chunks
-    return callClaudeStreaming(model, messages, conversationId, res, { keyId: req._authKeyId, keyName: req._authKeyName });
+    return callClaudeStreaming(model, messages, conversationId, res, { keyId: req._authKeyId, keyName: req._authKeyName, cacheHash: req._cacheHash });
   }
 
   const t0Usage = Date.now();
@@ -1078,6 +1269,10 @@ async function handleChatCompletions(req, res) {
     const content = await callClaude(model, messages, conversationId);
     const id = `chatcmpl-${randomUUID()}`;
     completionResponse(res, id, model, content);
+    // Write to cache
+    if (CACHE_TTL > 0 && req._cacheHash) {
+      try { setCachedResponse(req._cacheHash, model, content); } catch (e) { logEvent("error", "cache_write_failed", { error: e.message }); }
+    }
     try { recordUsage({ keyId: req._authKeyId, keyName: req._authKeyName, model, promptChars, responseChars: content.length, elapsedMs: Date.now() - t0Usage, success: true }); } catch (e) { logEvent("error", "usage_record_failed", { error: e.message }); }
   } catch (err) {
     try { recordUsage({ keyId: req._authKeyId, keyName: req._authKeyName, model, promptChars, responseChars: 0, elapsedMs: Date.now() - t0Usage, success: false }); } catch (e) { logEvent("error", "usage_record_failed", { error: e.message }); }
@@ -1300,11 +1495,48 @@ const server = createServer(async (req, res) => {
     return jsonResponse(res, 200, { keys: listKeys() });
   }
 
-  if (req.url?.startsWith("/api/keys/") && req.method === "DELETE") {
+  if (req.url?.startsWith("/api/keys/") && !req.url.includes("/quota") && req.method === "DELETE") {
     if (!isAdmin) return jsonResponse(res, 403, { error: "Admin access required" });
     const idOrName = decodeURIComponent(req.url.split("/api/keys/")[1]);
     const revoked = revokeKey(idOrName);
     return jsonResponse(res, 200, { revoked, idOrName });
+  }
+
+  // PATCH /api/keys/:id/quota — set quota for a key
+  // Body: { "daily": 100, "weekly": 500, "monthly": 2000 }  (null = unlimited)
+  if (req.url?.match(/^\/api\/keys\/[^/]+\/quota$/) && req.method === "PATCH") {
+    if (!isAdmin) return jsonResponse(res, 403, { error: "Admin access required" });
+    const idOrName = decodeURIComponent(req.url.split("/api/keys/")[1].replace("/quota", ""));
+    let body = "";
+    for await (const chunk of req) { body += chunk; if (body.length > 10000) return jsonResponse(res, 413, { error: "Body too large" }); }
+    let quotaBody;
+    try { quotaBody = JSON.parse(body); } catch { return jsonResponse(res, 400, { error: "Invalid JSON" }); }
+    // Validate quota values: must be positive integers or null
+    const quotaFields = {};
+    for (const k of ["daily", "weekly", "monthly"]) {
+      if (k in quotaBody) {
+        const v = quotaBody[k];
+        if (v !== null && (!Number.isInteger(v) || v < 0)) {
+          return jsonResponse(res, 400, { error: `${k} must be a positive integer or null` });
+        }
+        quotaFields[k] = v;
+      }
+    }
+    if (Object.keys(quotaFields).length === 0) return jsonResponse(res, 400, { error: "Provide at least one of: daily, weekly, monthly" });
+    const updated = updateKeyQuota(idOrName, quotaFields);
+    if (!updated) return jsonResponse(res, 404, { error: "Key not found" });
+    logEvent("info", "quota_updated", { idOrName, ...quotaFields });
+    return jsonResponse(res, 200, { ok: true, idOrName, quota: quotaFields });
+  }
+
+  // GET /api/keys/:id/quota — get quota + current usage for a key
+  if (req.url?.match(/^\/api\/keys\/[^/]+\/quota$/) && req.method === "GET") {
+    if (!isAdmin) return jsonResponse(res, 403, { error: "Admin access required" });
+    const idOrName = decodeURIComponent(req.url.split("/api/keys/")[1].replace("/quota", ""));
+    const keyRow = findKey(idOrName);
+    if (!keyRow) return jsonResponse(res, 404, { error: "Key not found" });
+    const quota = getKeyQuota(keyRow.id);
+    return jsonResponse(res, 200, { keyId: keyRow.id, quota });
   }
 
   if (req.url?.startsWith("/api/usage") && req.method === "GET") {
@@ -1319,6 +1551,20 @@ const server = createServer(async (req, res) => {
     });
   }
 
+  // GET /cache/stats — cache statistics
+  if (pathname === "/cache/stats" && req.method === "GET") {
+    if (!isAdmin) return jsonResponse(res, 403, { error: "Admin access required" });
+    return jsonResponse(res, 200, getCacheStats());
+  }
+
+  // DELETE /cache — clear cache
+  if (pathname === "/cache" && req.method === "DELETE") {
+    if (!isAdmin) return jsonResponse(res, 403, { error: "Admin access required" });
+    const cleared = clearCache();
+    logEvent("info", "cache_cleared", { entries: cleared });
+    return jsonResponse(res, 200, { cleared });
+  }
+
   // GET /dashboard — web dashboard
   if (pathname === "/dashboard" && req.method === "GET") {
     try {
@@ -1331,7 +1577,7 @@ const server = createServer(async (req, res) => {
     return;
   }
 
-  jsonResponse(res, 404, { error: "Not found. Endpoints: GET /v1/models, POST /v1/chat/completions, GET /health, GET /usage, GET /status, GET /logs, GET|PATCH /settings, GET|DELETE /sessions, GET /dashboard, GET|POST|DELETE /api/keys, GET /api/usage" });
+  jsonResponse(res, 404, { error: "Not found. Endpoints: GET /v1/models, POST /v1/chat/completions, GET /health, GET /usage, GET /status, GET /logs, GET|PATCH /settings, GET|DELETE /sessions, GET /dashboard, GET|POST|DELETE /api/keys, GET|PATCH /api/keys/:id/quota, GET /api/usage, GET /cache/stats, DELETE /cache" });
 });
 
 
@@ -1351,6 +1597,7 @@ function gracefulShutdown(signal) {
   // 2. Clear intervals/timers
   clearInterval(sessionCleanupInterval);
   clearInterval(authCheckInterval);
+  clearInterval(cacheCleanupInterval);
   closeDb();
 
   // 3. Kill all active child processes
@@ -1405,9 +1652,29 @@ server.listen(PORT, BIND_ADDRESS, () => {
   console.log(`Auth mode: ${AUTH_MODE}${AUTH_MODE === "shared" ? " (PROXY_API_KEY)" : AUTH_MODE === "multi" ? " (per-user keys)" : " (open)"}`);
   console.log(`Bind: ${BIND_ADDRESS}${BIND_ADDRESS === "0.0.0.0" ? " ⚠ LAN-accessible" : ""}`);
   if (NO_CONTEXT) console.log(`Context: suppressed (CLAUDE_NO_CONTEXT=true — no CLAUDE.md, no auto-memory)`);
+  if (CACHE_TTL > 0) console.log(`Cache: enabled (TTL=${CACHE_TTL / 1000}s)`);
+  else console.log(`Cache: disabled (set CLAUDE_CACHE_TTL to enable)`);
   console.log(`---`);
   console.log(`Coexistence: This proxy does NOT conflict with Claude Code interactive mode.`);
   console.log(`  OCP uses: localhost:${PORT} (HTTP) → claude -p (per-request process)`);
   console.log(`  CC uses:  MCP protocol (in-process) → persistent session`);
   console.log(`  Both can run simultaneously on the same machine.`);
+
+  // Passive OpenClaw registry drift check (non-fatal, read-only).
+  // Emits a console.warn only. No network/endpoint surface change. No
+  // Claude-CLI-call boundary touched — cli.js citation N/A (ALIGNMENT.md Rule 2).
+  try {
+    const openclawCfg = join(homedir(), ".openclaw", "openclaw.json");
+    if (existsSync(openclawCfg)) {
+      const cfg = JSON.parse(readFileSync(openclawCfg, "utf-8"));
+      const registered = cfg?.models?.providers?.["claude-local"]?.models ?? [];
+      const expected = modelsConfig.models.map(m => m.id);
+      const registeredIds = new Set(registered.map(r => r.id));
+      const missing = expected.filter(id => !registeredIds.has(id));
+      if (missing.length > 0) {
+        console.warn(`⚠ OpenClaw registry out of sync (missing: ${missing.join(", ")})`);
+        console.warn(`  Run: node ${__dirname}/scripts/sync-openclaw.mjs`);
+      }
+    }
+  } catch { /* ignore — best-effort */ }
 });

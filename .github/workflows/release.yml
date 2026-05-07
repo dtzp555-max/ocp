@@ -1,0 +1,53 @@
+name: Auto Release on Tag
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Extract version from tag
+        id: ver
+        run: echo "version=${GITHUB_REF#refs/tags/v}" >> $GITHUB_OUTPUT
+      - name: Extract CHANGELOG section
+        id: notes
+        run: |
+          VERSION="${{ steps.ver.outputs.version }}"
+          # Extract section for this version from CHANGELOG.md
+          # Pattern: "## v${VERSION}" through the next "## " or EOF
+          if [ ! -f CHANGELOG.md ]; then
+            echo "No CHANGELOG.md found; using minimal release notes"
+            echo "notes=Release v${VERSION}" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+          awk -v ver="v${VERSION}" '
+            $0 ~ "^## " ver { found=1; print; next }
+            found && /^## v/ { exit }
+            found { print }
+          ' CHANGELOG.md > /tmp/release-notes.md
+          if [ ! -s /tmp/release-notes.md ]; then
+            echo "No matching section in CHANGELOG for v${VERSION}; using minimal notes"
+            echo "Release v${VERSION}" > /tmp/release-notes.md
+          fi
+          echo "notes_file=/tmp/release-notes.md" >> $GITHUB_OUTPUT
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          if gh release view "v${{ steps.ver.outputs.version }}" >/dev/null 2>&1; then
+            echo "Release v${{ steps.ver.outputs.version }} already exists — skipping"
+            exit 0
+          fi
+          gh release create "v${{ steps.ver.outputs.version }}" \
+            --title "v${{ steps.ver.outputs.version }}" \
+            --notes-file /tmp/release-notes.md \
+            --latest

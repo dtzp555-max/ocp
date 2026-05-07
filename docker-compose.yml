@@ -1,7 +1,0 @@
-services:
-  claude-proxy:
-    build: .
-    ports:
-      - "3456:3456"
-    env_file: .env
-    restart: unless-stopped
