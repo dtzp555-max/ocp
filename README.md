@@ -706,6 +706,18 @@ OCP runs under a small set of binding documents so contributions stay aligned wi
 
 If you want to contribute: read `ALIGNMENT.md` first, search `cli.js` for the operation you're proposing, and cite the line number in your PR.
 
+## Support OCP
+
+OCP is and will always remain **free and open source**. I built it because I needed it myself, and I plan to keep maintaining it as long as the Claude Code ecosystem keeps evolving.
+
+Behind the version numbers are hundreds of hours of work that don't show up in commits: debugging across Mac / Windows / Linux machines, validating against half a dozen IDEs (Claude Code, Cursor, Cline, OpenCode, Aider, Continue.dev, OpenClaw), tracking down `cli.js` drift, OAuth refresh edge cases, SSE streaming quirks, concurrency leaks, and the occasional incident that turns into a multi-day investigation (the [2026-04-11 alignment drift](./docs/adr/0002-alignment-constitution.md), the [v3.11.1 concurrency leak](./CHANGELOG.md), the v3.12 SSE replay regression).
+
+If OCP lets you keep your Claude Pro / Max subscription powering every IDE on every machine — saving the per-token API cost you'd otherwise pay — and you'd like to chip in toward the next debugging session:
+
+- ☕ **[Buy me a coffee](https://buymeacoffee.com/dtzp555)**
+
+No paid tiers. No premium features. No "Pro" version. Donations directly fund the time it takes to keep this project saving the community money.
+
 ## License
 
 MIT — see [`LICENSE`](LICENSE).
