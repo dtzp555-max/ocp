@@ -472,17 +472,20 @@ ocp settings cacheTTL 300000
 ```
 
 **How it works:**
-- Cache key = SHA-256 of `model` + `messages` + `temperature` + `max_tokens` + `top_p`
+- Cache key = SHA-256 of `v2|<keyId or "anon">|model + messages + temperature + max_tokens + top_p`
+- **Per-key isolation** — different API keys never share cache entries; anonymous callers share one `anon` pool
 - Cache hits return instantly — no Claude CLI process spawned
-- Works for both streaming and non-streaming requests
+- **Streaming hits** are replayed as multiple SSE chunks (80 codepoints each), not one large delta — incremental render preserved
+- **`cache_control` bypass** — if a request carries an Anthropic `cache_control` annotation (top-level or nested in `content[]`), OCP skips its own cache entirely so it doesn't interfere with Anthropic-side prompt caching
+- **Singleflight stampede protection** — concurrent identical cache-miss requests share one upstream `cli.js` spawn; followers receive byte-identical responses to the leader's call. Non-streaming path only (streaming-path singleflight is a known TODO)
 - Multi-turn conversations (with `session_id`) are never cached
 - Expired entries are cleaned up automatically every 10 minutes
 
 **Management:**
 ```bash
-# View cache stats
+# View cache stats (now includes singleflight in-flight counts)
 curl http://127.0.0.1:3456/cache/stats
-# → { "entries": 42, "totalHits": 156, "sizeBytes": 284000 }
+# → { "entries": 42, "totalHits": 156, "sizeBytes": 284000, "inflight": 0, "requesters": 0 }
 
 # Clear all cached responses
 curl -X DELETE http://127.0.0.1:3456/cache
@@ -492,6 +495,8 @@ ocp settings cacheTTL 0
 ```
 
 Cache is **disabled by default** (`CLAUDE_CACHE_TTL=0`). All data is stored locally in `~/.ocp/ocp.db`.
+
+**Hash format upgrade in v3.13.0:** legacy `v1` cache rows from earlier versions don't match new `v2`-format lookups; they orphan and are reaped by the TTL cleanup interval within one window. No migration script required.
 
 ## How It Works
 
