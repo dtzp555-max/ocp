@@ -21,6 +21,7 @@ New ADRs increment from the highest existing number. Filenames are
 | [0002](0002-alignment-constitution.md) | Alignment Constitution | The `ALIGNMENT.md` constitution: why every `server.mjs` change requires `cli.js` citation + independent reviewer + CI blacklist pass. Background: the 2026-04-11 drift incident. |
 | [0003](0003-models-json-spot.md) | `models.json` as SPOT | Why model IDs / aliases / context windows live in a single JSON file (not duplicated in `server.mjs` and `setup.mjs` arrays). v3.11.0 refactor. |
 | [0004](0004-openclaw-auto-sync.md) | OpenClaw Auto-Sync | Why `scripts/sync-openclaw.mjs` runs on `ocp update`, what its scope boundary is (writes only `models.providers["claude-local"].models` and `agents.defaults.models["claude-local/*"]`), and the idempotency contract. |
+| [0005](0005-no-multi-provider.md) | No Multi-Provider | Why OCP stays single-provider (Anthropic-via-cli.js) and does not extend to OpenAI / Gemini / OpenRouter. Cost estimate: ~7 weeks for a v1 that buys neither moat nor commercial readiness. Separate commercial work starts in a separate repo. |
 
 ## When to write a new ADR
 

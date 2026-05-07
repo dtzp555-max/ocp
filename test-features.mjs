@@ -3,7 +3,8 @@
  * Integration test for Quota + Cache features.
  * Tests database layer functions directly — no server needed.
  */
-import { getDb, createKey, listKeys, validateKey, recordUsage, checkQuota, updateKeyQuota, getKeyQuota, findKey, cacheHash, getCachedResponse, setCachedResponse, clearCache, getCacheStats, closeDb } from "./keys.mjs";
+import { getDb, createKey, listKeys, validateKey, recordUsage, checkQuota, updateKeyQuota, getKeyQuota, findKey, cacheHash, getCachedResponse, setCachedResponse, clearCache, getCacheStats, closeDb, hasCacheControl } from "./keys.mjs";
+import { createHash } from "node:crypto";
 import { strict as assert } from "node:assert";
 import { unlinkSync } from "node:fs";
 import { join } from "node:path";
@@ -251,6 +252,106 @@ test("clearCache with TTL only removes old entries", () => {
 
   // Clean up
   clearCache();
+});
+
+// ── PR-A: Per-key isolation (D1), cache_control bypass (D2), chunked replay (D3) ──
+console.log("\nPR-A Cache Upgrade:");
+
+const msgsBase = [{ role: "user", content: "Shared prompt text" }];
+
+test("D1: cacheHash with two distinct keyIds produces different hashes", () => {
+  const h1 = cacheHash("sonnet", msgsBase, { keyId: "key-aaa" });
+  const h2 = cacheHash("sonnet", msgsBase, { keyId: "key-bbb" });
+  assert.notEqual(h1, h2);
+});
+
+test("D1: cacheHash with keyId=undefined and keyId='anon' produce the same hash", () => {
+  const hUndef = cacheHash("sonnet", msgsBase, { keyId: undefined });
+  const hAnon  = cacheHash("sonnet", msgsBase, { keyId: "anon" });
+  assert.equal(hUndef, hAnon);
+});
+
+test("D1: cacheHash with keyId=null and keyId='anon' produce the same hash", () => {
+  const hNull = cacheHash("sonnet", msgsBase, { keyId: null });
+  const hAnon = cacheHash("sonnet", msgsBase, { keyId: "anon" });
+  assert.equal(hNull, hAnon);
+});
+
+test("D1: v2 prefix — hash differs from a v1-style baseline (no prefix)", () => {
+  // Reproduce a v1-style hash manually to confirm v2 differs
+  const v1 = createHash("sha256")
+    .update("sonnet")
+    .update(msgsBase[0].role)
+    .update(msgsBase[0].content)
+    .digest("hex");
+  const v2 = cacheHash("sonnet", msgsBase, { keyId: "anon" });
+  assert.notEqual(v1, v2);
+});
+
+test("D1: cacheHash is reproducible for same keyId (determinism)", () => {
+  const h1 = cacheHash("sonnet", msgsBase, { keyId: "key-xyz" });
+  const h2 = cacheHash("sonnet", msgsBase, { keyId: "key-xyz" });
+  assert.equal(h1, h2);
+});
+
+test("D2: hasCacheControl returns true for top-level cache_control on message", () => {
+  const msgs = [{ role: "user", cache_control: { type: "ephemeral" }, content: "hello" }];
+  assert.equal(hasCacheControl(msgs), true);
+});
+
+test("D2: hasCacheControl returns true for nested cache_control in content array", () => {
+  const msgs = [{ role: "user", content: [{ type: "text", text: "x", cache_control: { type: "ephemeral" } }] }];
+  assert.equal(hasCacheControl(msgs), true);
+});
+
+test("D2: hasCacheControl returns false for plain string content", () => {
+  const msgs = [{ role: "user", content: "plain string" }];
+  assert.equal(hasCacheControl(msgs), false);
+});
+
+test("D2: hasCacheControl returns false for content array without cache_control", () => {
+  const msgs = [{ role: "user", content: [{ type: "text", text: "x" }] }];
+  assert.equal(hasCacheControl(msgs), false);
+});
+
+test("D2: hasCacheControl handles null/empty input gracefully", () => {
+  assert.equal(hasCacheControl(null), false);
+  assert.equal(hasCacheControl([]), false);
+  assert.equal(hasCacheControl([null, undefined]), false);
+});
+
+// D3: chunked stream replay — verify the logic by simulating what server.mjs does
+test("D3: 160-char cached response produces 2 chunks at 80 codepoints/chunk", () => {
+  const content = "a".repeat(160);
+  const CACHE_REPLAY_CHUNK_SIZE = 80;
+  const codepoints = Array.from(content);
+  const chunks = [];
+  for (let i = 0; i < codepoints.length; i += CACHE_REPLAY_CHUNK_SIZE) {
+    chunks.push(codepoints.slice(i, i + CACHE_REPLAY_CHUNK_SIZE).join(""));
+  }
+  assert.equal(chunks.length, 2);
+  assert.equal(chunks[0].length, 80);
+  assert.equal(chunks[1].length, 80);
+});
+
+test("D3: chunked replay uses Array.from — multibyte codepoints stay intact", () => {
+  // Each Chinese character is 1 codepoint but 3 UTF-8 bytes
+  const chinese = "你好世界".repeat(25); // 100 codepoints
+  const CACHE_REPLAY_CHUNK_SIZE = 80;
+  const codepoints = Array.from(chinese);
+  const chunks = [];
+  for (let i = 0; i < codepoints.length; i += CACHE_REPLAY_CHUNK_SIZE) {
+    chunks.push(codepoints.slice(i, i + CACHE_REPLAY_CHUNK_SIZE).join(""));
+  }
+  assert.equal(chunks.length, 2);
+  assert.equal(Array.from(chunks[0]).length, 80);
+  assert.equal(Array.from(chunks[1]).length, 20);
+  // Verify each character is a complete codepoint (no mojibake)
+  for (const chunk of chunks) {
+    for (const cp of Array.from(chunk)) {
+      assert.equal(cp.length <= 2, true); // surrogate pairs are length 2, single chars length 1
+    }
+  }
 });
 
 // ── Cleanup ──

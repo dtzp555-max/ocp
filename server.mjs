@@ -34,7 +34,7 @@ import { readFileSync, accessSync, existsSync, constants } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 import { homedir } from "node:os";
-import { validateKey, recordUsage, getUsageByKey, getUsageTimeline, getRecentUsage, createKey, listKeys, revokeKey, closeDb, checkQuota, updateKeyQuota, getKeyQuota, findKey, cacheHash, getCachedResponse, setCachedResponse, clearCache, getCacheStats } from "./keys.mjs";
+import { validateKey, recordUsage, getUsageByKey, getUsageTimeline, getRecentUsage, createKey, listKeys, revokeKey, closeDb, checkQuota, updateKeyQuota, getKeyQuota, findKey, cacheHash, getCachedResponse, setCachedResponse, clearCache, getCacheStats, hasCacheControl } from "./keys.mjs";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const _pkg = JSON.parse(readFileSync(join(__dirname, "package.json"), "utf8"));
@@ -1218,30 +1218,43 @@ async function handleChatCompletions(req, res) {
 
   // Cache check (only when cache is enabled and no active conversation/session)
   if (CACHE_TTL > 0 && !conversationId) {
-    const hash = cacheHash(model, messages, { temperature: parsed.temperature, max_tokens: parsed.max_tokens, top_p: parsed.top_p });
-    req._cacheHash = hash; // store for later write-back
-    try {
-      const cached = getCachedResponse(hash, CACHE_TTL);
-      if (cached) {
-        logEvent("info", "cache_hit", { model, hash: hash.slice(0, 12), hits: cached.hits });
-        if (stream) {
-          // Simulate streaming for cached response
-          const id = `chatcmpl-${randomUUID()}`;
-          const created = Math.floor(Date.now() / 1000);
-          res.writeHead(200, { "Content-Type": "text/event-stream", "Cache-Control": "no-cache", "Connection": "keep-alive", "X-Accel-Buffering": "no" });
-          sendSSE(res, { id, object: "chat.completion.chunk", created, model, choices: [{ index: 0, delta: { role: "assistant" }, finish_reason: null }] });
-          sendSSE(res, { id, object: "chat.completion.chunk", created, model, choices: [{ index: 0, delta: { content: cached.response }, finish_reason: null }] });
-          sendSSE(res, { id, object: "chat.completion.chunk", created, model, choices: [{ index: 0, delta: {}, finish_reason: "stop" }] });
-          res.write("data: [DONE]\n\n");
-          res.end();
-          return;
-        } else {
-          const id = `chatcmpl-${randomUUID()}`;
-          return completionResponse(res, id, model, cached.response);
+    // D2: skip OCP cache entirely when messages carry cache_control annotations;
+    // the client is requesting Anthropic-side prompt caching, not OCP-layer caching.
+    if (hasCacheControl(messages)) {
+      req._cacheHash = null;
+      logEvent("info", "cache_skipped", { reason: "cache_control_present" });
+    } else {
+      // D1: include keyId in hash to isolate per-key cache pools (v2 format)
+      const hash = cacheHash(model, messages, { keyId: req._authKeyId, temperature: parsed.temperature, max_tokens: parsed.max_tokens, top_p: parsed.top_p });
+      req._cacheHash = hash; // store for later write-back
+      try {
+        const cached = getCachedResponse(hash, CACHE_TTL);
+        if (cached) {
+          logEvent("info", "cache_hit", { model, hash: hash.slice(0, 12), hits: cached.hits });
+          if (stream) {
+            // D3: replay cached content as chunked SSE stream (80 codepoints/chunk)
+            const CACHE_REPLAY_CHUNK_SIZE = 80;
+            const id = `chatcmpl-${randomUUID()}`;
+            const created = Math.floor(Date.now() / 1000);
+            res.writeHead(200, { "Content-Type": "text/event-stream", "Cache-Control": "no-cache", "Connection": "keep-alive", "X-Accel-Buffering": "no" });
+            sendSSE(res, { id, object: "chat.completion.chunk", created, model, choices: [{ index: 0, delta: { role: "assistant" }, finish_reason: null }] });
+            const codepoints = Array.from(cached.response);
+            for (let i = 0; i < codepoints.length; i += CACHE_REPLAY_CHUNK_SIZE) {
+              const chunk = codepoints.slice(i, i + CACHE_REPLAY_CHUNK_SIZE).join("");
+              sendSSE(res, { id, object: "chat.completion.chunk", created, model, choices: [{ index: 0, delta: { content: chunk }, finish_reason: null }] });
+            }
+            sendSSE(res, { id, object: "chat.completion.chunk", created, model, choices: [{ index: 0, delta: {}, finish_reason: "stop" }] });
+            res.write("data: [DONE]\n\n");
+            res.end();
+            return;
+          } else {
+            const id = `chatcmpl-${randomUUID()}`;
+            return completionResponse(res, id, model, cached.response);
+          }
         }
+      } catch (e) {
+        logEvent("error", "cache_check_failed", { error: e.message });
       }
-    } catch (e) {
-      logEvent("error", "cache_check_failed", { error: e.message });
     }
   }
 
