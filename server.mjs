@@ -34,7 +34,7 @@ import { readFileSync, accessSync, existsSync, constants } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 import { homedir } from "node:os";
-import { validateKey, recordUsage, getUsageByKey, getUsageTimeline, getRecentUsage, createKey, listKeys, revokeKey, closeDb, checkQuota, updateKeyQuota, getKeyQuota, findKey, cacheHash, getCachedResponse, setCachedResponse, clearCache, getCacheStats, hasCacheControl } from "./keys.mjs";
+import { validateKey, recordUsage, getUsageByKey, getUsageTimeline, getRecentUsage, createKey, listKeys, revokeKey, closeDb, checkQuota, updateKeyQuota, getKeyQuota, findKey, cacheHash, getCachedResponse, setCachedResponse, clearCache, getCacheStats, hasCacheControl, singleflight, getInflightStats } from "./keys.mjs";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const _pkg = JSON.parse(readFileSync(join(__dirname, "package.json"), "utf8"));
@@ -590,6 +590,7 @@ function startHeartbeat(res, intervalMs, sessionId) {
 // ── Call claude CLI (real streaming) ─────────────────────────────────────
 // Pipes stdout from the claude process directly to SSE chunks as they arrive.
 // Each data chunk becomes a proper SSE event with delta content in real time.
+// TODO(cache-singleflight-stream): streaming-path singleflight is out of scope for v3.13.0; see spec D4 streaming caveat.
 function callClaudeStreaming(model, messages, conversationId, res, authInfo = {}) {
   const id = `chatcmpl-${randomUUID()}`;
   const created = Math.floor(Date.now() / 1000);
@@ -1265,14 +1266,45 @@ async function handleChatCompletions(req, res) {
 
   const t0Usage = Date.now();
   const promptChars = messages.reduce((a, m) => a + (typeof m.content === "string" ? m.content.length : JSON.stringify(m.content).length), 0);
+
+  // Non-streaming path with stampede protection: wrap the upstream call in singleflight
+  // when cache is enabled and a hash is present. Concurrent identical requests share
+  // one upstream spawn; followers receive the same promise. Streaming-path dedup is
+  // explicitly out of scope (see TODO comment above callClaudeStreaming).
+  if (CACHE_TTL > 0 && req._cacheHash) {
+    try {
+      const content = await singleflight(req._cacheHash, async () => {
+        // Re-check cache inside the singleflight: a follower that enters before the
+        // leader finishes will wait on the shared promise (not reach here), but a
+        // request that races in just after the previous singleflight cleared the map
+        // will re-read the freshly-populated cache entry here rather than spawning.
+        const recheck = getCachedResponse(req._cacheHash, CACHE_TTL);
+        if (recheck) return recheck.response;
+        const c = await callClaude(model, messages, conversationId);
+        try { setCachedResponse(req._cacheHash, model, c); } catch (e) { logEvent("error", "cache_write_failed", { error: e.message }); }
+        return c;
+      });
+      const id = `chatcmpl-${randomUUID()}`;
+      completionResponse(res, id, model, content);
+      try { recordUsage({ keyId: req._authKeyId, keyName: req._authKeyName, model, promptChars, responseChars: content.length, elapsedMs: Date.now() - t0Usage, success: true }); } catch (e) { logEvent("error", "usage_record_failed", { error: e.message }); }
+      return;
+    } catch (err) {
+      try { recordUsage({ keyId: req._authKeyId, keyName: req._authKeyName, model, promptChars, responseChars: 0, elapsedMs: Date.now() - t0Usage, success: false }); } catch (e) { logEvent("error", "usage_record_failed", { error: e.message }); }
+      console.error(`[proxy] error: ${err.message}`);
+      if (res.headersSent || res.writableEnded || res.destroyed) {
+        try { res.end(); } catch {}
+        return;
+      }
+      const safeMessage = (err.message || "Internal error").replace(/\/[\w/.\-]+/g, "[path]");
+      return jsonResponse(res, 500, { error: { message: safeMessage, type: "proxy_error" } });
+    }
+  }
+
+  // Fallback: cache disabled (CACHE_TTL=0) or no _cacheHash — original path untouched.
   try {
     const content = await callClaude(model, messages, conversationId);
     const id = `chatcmpl-${randomUUID()}`;
     completionResponse(res, id, model, content);
-    // Write to cache
-    if (CACHE_TTL > 0 && req._cacheHash) {
-      try { setCachedResponse(req._cacheHash, model, content); } catch (e) { logEvent("error", "cache_write_failed", { error: e.message }); }
-    }
     try { recordUsage({ keyId: req._authKeyId, keyName: req._authKeyName, model, promptChars, responseChars: content.length, elapsedMs: Date.now() - t0Usage, success: true }); } catch (e) { logEvent("error", "usage_record_failed", { error: e.message }); }
   } catch (err) {
     try { recordUsage({ keyId: req._authKeyId, keyName: req._authKeyName, model, promptChars, responseChars: 0, elapsedMs: Date.now() - t0Usage, success: false }); } catch (e) { logEvent("error", "usage_record_failed", { error: e.message }); }
@@ -1551,10 +1583,10 @@ const server = createServer(async (req, res) => {
     });
   }
 
-  // GET /cache/stats — cache statistics
+  // GET /cache/stats — cache statistics (entries, hits, size, inflight singleflight count)
   if (pathname === "/cache/stats" && req.method === "GET") {
     if (!isAdmin) return jsonResponse(res, 403, { error: "Admin access required" });
-    return jsonResponse(res, 200, getCacheStats());
+    return jsonResponse(res, 200, { ...getCacheStats(), ...getInflightStats() });
   }
 
   // DELETE /cache — clear cache
