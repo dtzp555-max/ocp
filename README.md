@@ -20,14 +20,15 @@ One proxy. Multiple IDEs. All models. **$0 API cost.**
 
 ## Why OCP?
 
-There are several Claude proxy projects. OCP picks a specific lane: **align tightly with what `cli.js` actually does, observe + multiplex what's already there, don't extend the protocol.** Concretely:
+There are several Claude proxy projects. OCP picks a specific lane: **align tightly with what `cli.js` actually does, observe + multiplex what's already there, don't extend the protocol.** What you get:
 
-- **SSE heartbeat on streaming** ([v3.12.0](https://github.com/dtzp555-max/ocp/releases/tag/v3.12.0), opt-in via `CLAUDE_HEARTBEAT_INTERVAL`). Long Claude reasoning or tool-use pauses can sit silent for minutes; downstream load balancers and reverse proxies often kill the connection at 60s idle. OCP emits an SSE comment frame during silent windows so the connection stays alive without polluting the response. ([PR #49](https://github.com/dtzp555-max/ocp/pull/49))
-- **Alignment constitution + CI guardrail.** [`ALIGNMENT.md`](./ALIGNMENT.md) is the binding spec: every endpoint OCP exposes must correspond to something `cli.js` actually does, with a line-number citation. The [`alignment.yml`](./.github/workflows/alignment.yml) workflow auto-blocks PRs that introduce known-hallucinated tokens (`api/oauth/usage`, `api/usage`, etc). Hard to drift, even with LLM-assisted contributions.
-- **`models.json` single source of truth** (v3.11.0). Adding a model is one file edit; both `/v1/models` and the OpenClaw bootstrap derive from it. No more drift between server and installer. ([PR #30](https://github.com/dtzp555-max/ocp/pull/30))
-- **Multi anonymous-key distribution** (v3.7.0). Share one OCP instance with friends/family/devices without exposing your OAuth session — each gets a per-user key, with usage tracking and revocation.
-- **Per-key quota + response cache** (v3.8.0). Daily/weekly/monthly request limits per key. Optional SHA-256 prompt cache for development loops. ([PR #18](https://github.com/dtzp555-max/ocp/pull/18))
-- **`ocp-connect` IDE auto-config.** Detects Claude Code, Cursor, Cline, Continue.dev, opencode, and OpenClaw on the client machine and configures them in one command.
+- **LAN multi-user keys** (v3.7.0) — share one Claude Pro/Max subscription with family, friends, or your own devices. Each user gets a per-key API token (no OAuth session leak), with independent usage tracking and one-line revocation.
+- **`ocp-connect` one-shot IDE setup** — one command on the client machine detects and configures Claude Code, Cursor, Cline, Continue.dev, OpenCode, and OpenClaw. No pasting `OPENAI_BASE_URL` six times.
+- **Response cache with per-key isolation + singleflight** (v3.13.0). Optional SHA-256 prompt cache, isolated per API key (cross-user pollution is impossible by hash construction, not by application logic), with stampede protection on concurrent identical prompts. Off by default. ([PR #65](https://github.com/dtzp555-max/ocp/pull/65), [PR #66](https://github.com/dtzp555-max/ocp/pull/66))
+- **Per-key request quotas** (v3.8.0). Daily / weekly / monthly limits per key — set a kid's iPad to 20/day, a partner's laptop to 100/week. ([PR #18](https://github.com/dtzp555-max/ocp/pull/18))
+- **SSE heartbeat for long reasoning** ([v3.12.0](https://github.com/dtzp555-max/ocp/releases/tag/v3.12.0), opt-in). If you've ever watched your IDE die at the 60s idle mark during a long Claude tool-use pause — that's nginx/Cloudflare default behavior. OCP emits an SSE comment frame to keep the connection alive without polluting the response. ([PR #49](https://github.com/dtzp555-max/ocp/pull/49))
+- **`cli.js` alignment + CI guardrail.** LLM-assisted code drifts easily — it's tempting to invent plausible-looking endpoints that `cli.js` doesn't actually use. [`ALIGNMENT.md`](./ALIGNMENT.md) is binding: every endpoint OCP exposes must cite a `cli.js` line. The [`alignment.yml`](./.github/workflows/alignment.yml) CI workflow blocks PRs that introduce known-hallucinated tokens. The payoff is boring: your setup keeps working when `cli.js` ships its next minor.
+- **`models.json` single source of truth** (v3.11.0). Adding a model is one file edit; both `/v1/models` and the OpenClaw bootstrap derive from it. ([PR #30](https://github.com/dtzp555-max/ocp/pull/30))
 
 ### Comparison
 
