@@ -1,6 +1,10 @@
 # OCP — Open Claude Proxy
 
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE) [![GitHub release](https://img.shields.io/github/v/release/dtzp555-max/ocp)](https://github.com/dtzp555-max/ocp/releases) [![Buy Me a Coffee](https://img.shields.io/badge/Buy_Me_a_Coffee-ffdd00?logo=buy-me-a-coffee&logoColor=black)](https://buymeacoffee.com/dtzp555)
+
 > **Already paying for Claude Pro/Max? Use your subscription as an OpenAI-compatible API — $0 extra cost.**
+
+*Open source from day one, used daily by my family, maintained on nights and weekends. If OCP saves you money too, you can [☕ buy me a coffee](https://buymeacoffee.com/dtzp555) — [full story below](#support-ocp).*
 
 OCP turns your Claude Pro/Max subscription into a standard OpenAI-compatible API on localhost. Any tool that speaks the OpenAI protocol can use it — no separate API key, no extra billing.
 
@@ -708,15 +712,21 @@ If you want to contribute: read `ALIGNMENT.md` first, search `cli.js` for the op
 
 ## Support OCP
 
-OCP is and will always remain **free and open source**. I built it because I needed it myself, and I plan to keep maintaining it as long as the Claude Code ecosystem keeps evolving.
+OCP has been **open source from day one** — not a freemium tool, not a commercial product turned open, just open. It will stay that way forever. No paid tiers, no premium features, no "Pro" version locked behind a paywall.
 
-Behind the version numbers are hundreds of hours of work that don't show up in commits: debugging across Mac / Windows / Linux machines, validating against half a dozen IDEs (Claude Code, Cursor, Cline, OpenCode, Aider, Continue.dev, OpenClaw), tracking down `cli.js` drift, OAuth refresh edge cases, SSE streaming quirks, concurrency leaks, and the occasional incident that turns into a multi-day investigation (the [2026-04-11 alignment drift](./docs/adr/0002-alignment-constitution.md), the [v3.11.1 concurrency leak](./CHANGELOG.md), the v3.12 SSE replay regression).
+I built it because my family and I needed it. We use OCP every day across our own machines and IDEs — keeping one Claude Pro/Max subscription powering everything, saving the per-token API cost we'd otherwise pay. It's been quietly heartwarming to hear from users online who say OCP has saved them money the same way it saves ours. That's the whole point.
 
-If OCP lets you keep your Claude Pro / Max subscription powering every IDE on every machine — saving the per-token API cost you'd otherwise pay — and you'd like to chip in toward the next debugging session:
+Behind every version are hundreds of hours that don't show up in commits: building it from scratch, adding new features as the Claude Code ecosystem evolves, debugging across Mac / Windows / Linux machines, validating against half a dozen IDEs (Claude Code, Cursor, Cline, OpenCode, Aider, Continue.dev, OpenClaw), tracking down `cli.js` drift, OAuth refresh edge cases, SSE streaming quirks, concurrency leaks, and the occasional incident that turns into a multi-day investigation (the [2026-04-11 alignment drift](./docs/adr/0002-alignment-constitution.md), the [v3.11.1 concurrency leak](./CHANGELOG.md), the v3.12 SSE replay regression).
+
+**The commitment**: this project will keep being updated, keep getting new features, and will stay open source as long as I'm able to maintain it.
+
+**Please try it.** If something breaks or could be better, [open an issue](https://github.com/dtzp555-max/ocp/issues) — feedback is genuinely what keeps the project moving.
+
+And if OCP saves you (or your team, or your family) real money and you'd like to chip in toward the next debugging session:
 
 - ☕ **[Buy me a coffee](https://buymeacoffee.com/dtzp555)**
 
-No paid tiers. No premium features. No "Pro" version. Donations directly fund the time it takes to keep this project saving the community money.
+Donations directly fund the time it takes to keep OCP saving the community money.
 
 ## License
 
