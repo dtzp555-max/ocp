@@ -30,7 +30,7 @@
 import { createServer } from "node:http";
 import { spawn, execFileSync } from "node:child_process";
 import { randomUUID, timingSafeEqual } from "node:crypto";
-import { readFileSync, accessSync, existsSync, constants } from "node:fs";
+import { readFileSync, readdirSync, accessSync, existsSync, constants } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 import { homedir } from "node:os";
@@ -41,8 +41,48 @@ const _pkg = JSON.parse(readFileSync(join(__dirname, "package.json"), "utf8"));
 const modelsConfig = JSON.parse(readFileSync(join(__dirname, "models.json"), "utf8"));
 
 // ── Resolve claude binary ───────────────────────────────────────────────
-// Priority: CLAUDE_BIN env > well-known paths > which lookup
-// Fail-fast if not found — never start with an unresolvable binary.
+// Priority: CLAUDE_BIN env > well-known paths > nvm/fnm/asdf user-local
+// installs > which lookup. Fail-fast if not found — never start with an
+// unresolvable binary.
+function _listVersionDirs(parent) {
+  try { return readdirSync(parent); } catch { return []; }
+}
+function _collectNodeManagerCandidates(home) {
+  if (!home) return [];
+  const out = [];
+
+  // nvm: $HOME/.nvm/versions/node/<version>/bin/claude
+  const nvmRoot = join(home, ".nvm/versions/node");
+  for (const v of _listVersionDirs(nvmRoot)) {
+    out.push(join(nvmRoot, v, "bin/claude"));
+  }
+  // nvm default alias: resolve $HOME/.nvm/aliases/default if it points to a version
+  try {
+    const aliasFile = join(home, ".nvm/aliases/default");
+    const aliasVer = readFileSync(aliasFile, "utf8").trim();
+    if (aliasVer) {
+      const direct = join(nvmRoot, aliasVer, "bin/claude");
+      if (!out.includes(direct)) out.unshift(direct);
+    }
+  } catch {}
+
+  // fnm: $HOME/.fnm/node-versions/<version>/installation/bin/claude
+  const fnmRoot = join(home, ".fnm/node-versions");
+  for (const v of _listVersionDirs(fnmRoot)) {
+    out.push(join(fnmRoot, v, "installation/bin/claude"));
+  }
+
+  // asdf: $HOME/.asdf/installs/nodejs/<version>/bin/claude
+  const asdfRoot = join(home, ".asdf/installs/nodejs");
+  for (const v of _listVersionDirs(asdfRoot)) {
+    out.push(join(asdfRoot, v, "bin/claude"));
+  }
+
+  // npm prefix-relocated: $HOME/.npm-global/bin/claude
+  out.push(join(home, ".npm-global/bin/claude"));
+
+  return out;
+}
 function resolveClaude() {
   if (process.env.CLAUDE_BIN) {
     try {
@@ -54,11 +94,13 @@ function resolveClaude() {
     }
   }
 
+  const home = process.env.HOME || "";
   const candidates = [
     "/opt/homebrew/bin/claude",
     "/usr/local/bin/claude",
     "/usr/bin/claude",
-    join(process.env.HOME || "", ".local/bin/claude"),
+    join(home, ".local/bin/claude"),
+    ..._collectNodeManagerCandidates(home),
   ];
   for (const p of candidates) {
     try { accessSync(p, constants.X_OK); console.warn(`[init] CLAUDE_BIN not set, resolved to ${p}`); return p; } catch {}
@@ -72,6 +114,8 @@ function resolveClaude() {
   console.error(
     "FATAL: claude binary not found.\n" +
     "  Set CLAUDE_BIN=/path/to/claude or ensure claude is in PATH.\n" +
+    "  Hint: if you use nvm/fnm/asdf, set CLAUDE_BIN to the absolute path\n" +
+    "  shown by `which claude` in your interactive shell.\n" +
     "  Checked: " + candidates.join(", ")
   );
   process.exit(1);
