@@ -185,7 +185,8 @@ The setup script will:
 1. Verify Claude CLI is installed and authenticated
 2. Start the proxy on port 3456
 3. Install auto-start (launchd on macOS, systemd on Linux)
-4. Symlink `ocp` to `/usr/local/bin` for CLI access
+
+After install the `ocp` CLI lives at `~/ocp/ocp`. To put it on your PATH, either symlink it manually (`ln -sf ~/ocp/ocp ~/.local/bin/ocp` if `~/.local/bin` is on your PATH, or `sudo ln -sf ~/ocp/ocp /usr/local/bin/ocp` for a system-wide symlink) or add an alias (`alias ocp=~/ocp/ocp`). Otherwise invoke it as `~/ocp/ocp <subcommand>`. The rest of this README assumes `ocp` is on your PATH.
 
 **Single-machine use** — just set your IDE to use the proxy:
 ```bash
@@ -395,10 +396,14 @@ In `multi` mode, the admin can designate a single well-known "anonymous" key tha
 
 **Enable**:
 
+The anonymous key is wired into the service unit (launchd plist on macOS, systemd unit on Linux) at install time. Export `PROXY_ANONYMOUS_KEY` in your shell before running `setup.mjs`, and `setup.mjs` will write it into the service unit env so the auto-started proxy picks it up:
+
 ```bash
 export PROXY_ANONYMOUS_KEY=ocp_public_anon   # or any string of your choice
-ocp start                                    # or however you start the server
+node setup.mjs --bind 0.0.0.0 --auth-mode multi
 ```
+
+If OCP is already installed without it, re-export the env var and re-run `node setup.mjs` (the installer is idempotent — it refreshes the service unit). Then `ocp restart` so the running proxy picks up the new env. Setting `PROXY_ANONYMOUS_KEY` only in your interactive shell **does not** affect the auto-started proxy — the service unit is the source of truth for its environment.
 
 **Client side**: the anonymous key value is exposed via `GET /health` as the field `anonymousKey` (null when not set). Clients like `ocp-connect` can auto-discover and use it, so the end user doesn't need to get a personal key from the admin.
 
