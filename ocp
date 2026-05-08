@@ -8,21 +8,18 @@ set -euo pipefail
 
 PROXY="http://127.0.0.1:3456"
 
-# Auth header for multi-key mode: reads from OCP_ADMIN_KEY env or ~/.ocp/admin-key file
-_AUTH_HEADER=""
+# Auth args for multi-key mode: reads from OCP_ADMIN_KEY env or ~/.ocp/admin-key file
+# Using a bash array preserves word boundaries — no eval needed.
+_AUTH_ARGS=()
 if [[ -n "${OCP_ADMIN_KEY:-}" ]]; then
-  _AUTH_HEADER="-H \"Authorization: Bearer $OCP_ADMIN_KEY\""
+  _AUTH_ARGS=(-H "Authorization: Bearer $OCP_ADMIN_KEY")
 elif [[ -f "$HOME/.ocp/admin-key" ]]; then
-  _AUTH_HEADER="-H \"Authorization: Bearer $(cat "$HOME/.ocp/admin-key")\""
+  _AUTH_ARGS=(-H "Authorization: Bearer $(cat "$HOME/.ocp/admin-key")")
 fi
 
 # Wrapper: curl with optional auth
 _curl() {
-  if [[ -n "$_AUTH_HEADER" ]]; then
-    eval curl "$_AUTH_HEADER" "$@"
-  else
-    curl "$@"
-  fi
+  curl "${_AUTH_ARGS[@]}" "$@"
 }
 
 _json() { python3 -m json.tool 2>/dev/null || cat; }
