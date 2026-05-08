@@ -582,11 +582,19 @@ print(k if k else '')
   if [[ "${SHELL:-}" == */fish ]]; then
     echo "  Note: fish shell detected. Writing to ~/.bashrc — add to fish config manually."
     rc_files+=("$HOME/.bashrc")
+  elif $is_mac; then
+    # macOS: default shell since Catalina (2019) is zsh.
+    # Always write ~/.zshrc (create if absent — zsh tolerates an empty file).
+    # Only write ~/.bashrc if it already exists (don't surprise users with new files).
+    [[ -f "$HOME/.bashrc" ]] && rc_files+=("$HOME/.bashrc")
+    # zshrc: always include on macOS; create the file if it doesn't exist yet
+    [[ -f "$HOME/.zshrc" ]] || touch "$HOME/.zshrc"
+    rc_files+=("$HOME/.zshrc")
   else
-    # Always write both on macOS (default shell is zsh but some tools source bashrc)
+    # Linux / other: write to whichever rc files already exist or match current shell
     [[ -f "$HOME/.bashrc" || "${SHELL:-}" == */bash ]] && rc_files+=("$HOME/.bashrc")
     [[ -f "$HOME/.zshrc" || "${SHELL:-}" == */zsh ]] && rc_files+=("$HOME/.zshrc")
-    # If neither exists, create for current shell
+    # If neither exists, fall back to creating one for the current shell
     [[ ${#rc_files[@]} -eq 0 ]] && rc_files+=("$HOME/.${SHELL##*/}rc")
   fi
 
@@ -705,7 +713,9 @@ PYEOF
 
   echo ""
   echo "  Done. Reload your shell to apply:"
-  echo "    source $rc_file"
+  for rc_file in "${rc_files[@]}"; do
+    echo "    source $rc_file"
+  done
 }
 
 main "$@"
