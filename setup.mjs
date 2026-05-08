@@ -39,6 +39,29 @@ const PROVIDER_NAME = opt("provider-name", "claude-local");
 const BIND_ADDRESS = opt("bind", "127.0.0.1");
 const AUTH_MODE_CONFIG = opt("auth-mode", "none");
 
+// ── Service-env injection: CLAUDE_BIN, OCP_ADMIN_KEY, PROXY_ANONYMOUS_KEY ──
+// These are read from the user's shell env at install time and written into
+// the service unit (plist / systemd) so the daemon picks them up on boot.
+
+// CLAUDE_BIN — detect at install time; omit if not found (server.mjs fallback)
+let CLAUDE_BIN_INJECT = null;
+if (process.env.CLAUDE_BIN) {
+  CLAUDE_BIN_INJECT = process.env.CLAUDE_BIN;
+} else {
+  try {
+    const detected = execSync("which claude 2>/dev/null", { encoding: "utf-8" }).trim();
+    if (detected && existsSync(detected)) {
+      CLAUDE_BIN_INJECT = detected;
+    }
+  } catch { /* which not available or claude not on PATH — omit */ }
+}
+
+// OCP_ADMIN_KEY — omit entirely when empty/unset; don't write empty string
+const OCP_ADMIN_KEY_INJECT = process.env.OCP_ADMIN_KEY || null;
+
+// PROXY_ANONYMOUS_KEY — same pattern
+const PROXY_ANON_KEY_INJECT = process.env.PROXY_ANONYMOUS_KEY || null;
+
 // ── Models: derived from models.json (single source of truth) ──────────
 const modelsConfig = JSON.parse(readFileSync(join(__dirname, "models.json"), "utf-8"));
 
@@ -286,6 +309,29 @@ banner.push(`╚═════════════════════�
 console.log("\n" + banner.join("\n") + "\n");
 
 // ── Step 7: Install auto-start on boot ──────────────────────────────────
+
+// Log service-env injection plan (shown in both dry-run and live mode)
+console.log("\n🔧 Service unit env vars to inject:\n");
+if (CLAUDE_BIN_INJECT) {
+  log(`CLAUDE_BIN: ${CLAUDE_BIN_INJECT}`);
+} else {
+  log(`CLAUDE_BIN: (not found — server.mjs will auto-detect at runtime)`);
+}
+if (OCP_ADMIN_KEY_INJECT) {
+  log(`OCP_ADMIN_KEY: injected (length: ${OCP_ADMIN_KEY_INJECT.length})`);
+} else {
+  log(`OCP_ADMIN_KEY: (unset — admin endpoints disabled)`);
+}
+if (PROXY_ANON_KEY_INJECT) {
+  log(`PROXY_ANONYMOUS_KEY: injected (set)`);
+} else {
+  log(`PROXY_ANONYMOUS_KEY: (unset — anonymous access disabled)`);
+}
+
+if (DRY_RUN) {
+  console.log("\n  [dry-run] would write service unit with above env vars\n");
+}
+
 if (!DRY_RUN) {
   console.log("\n🔄 Installing auto-start on login...\n");
 
@@ -358,7 +404,13 @@ if (!DRY_RUN) {
     <key>CLAUDE_BIND</key>
     <string>${BIND_ADDRESS}</string>
     <key>CLAUDE_AUTH_MODE</key>
-    <string>${AUTH_MODE_CONFIG}</string>
+    <string>${AUTH_MODE_CONFIG}</string>${CLAUDE_BIN_INJECT ? `
+    <key>CLAUDE_BIN</key>
+    <string>${CLAUDE_BIN_INJECT}</string>` : ""}${OCP_ADMIN_KEY_INJECT ? `
+    <key>OCP_ADMIN_KEY</key>
+    <string>${OCP_ADMIN_KEY_INJECT}</string>` : ""}${PROXY_ANON_KEY_INJECT ? `
+    <key>PROXY_ANONYMOUS_KEY</key>
+    <string>${PROXY_ANON_KEY_INJECT}</string>` : ""}
   </dict>
   <key>RunAtLoad</key>
   <true/>
@@ -396,7 +448,7 @@ After=network.target
 ExecStart=${nodeBin} ${serverPath}
 Environment=CLAUDE_PROXY_PORT=${PORT}
 Environment=CLAUDE_BIND=${BIND_ADDRESS}
-Environment=CLAUDE_AUTH_MODE=${AUTH_MODE_CONFIG}
+Environment=CLAUDE_AUTH_MODE=${AUTH_MODE_CONFIG}${CLAUDE_BIN_INJECT ? `\nEnvironment=CLAUDE_BIN=${CLAUDE_BIN_INJECT}` : ""}${OCP_ADMIN_KEY_INJECT ? `\nEnvironment=OCP_ADMIN_KEY=${OCP_ADMIN_KEY_INJECT}` : ""}${PROXY_ANON_KEY_INJECT ? `\nEnvironment=PROXY_ANONYMOUS_KEY=${PROXY_ANON_KEY_INJECT}` : ""}
 Restart=always
 RestartSec=5
 StandardOutput=append:${logPath}
