@@ -83,13 +83,96 @@ OCP has two roles: **Server** (runs the proxy, needs Claude CLI) and **Client** 
 
 ---
 
+### Quick install with AI assistance
+
+If you've got Claude Code, Cursor, or any other AI coding assistant on this machine, you can copy-paste one of these prompts and let the AI walk through the install for you. Each prompt pins the AI to the right README section, names the verification step, and forbids silent retries — so you stay in the loop.
+
+**Single-machine use** — install OCP for IDEs on this same machine only:
+
+```text
+I want to install OCP on this machine to use my Claude Pro/Max subscription
+as an OpenAI-compatible API for local IDEs.
+
+Please follow https://github.com/dtzp555-max/ocp/blob/main/README.md
+"Server Setup" → "Single-machine use" path:
+
+1. Verify prerequisites: macOS or Linux, Node.js 22.5+, git, Claude CLI
+   installed and logged in (`claude auth status`). Install missing pieces
+   using my system's package manager.
+2. git clone the repo, cd in, and run `node setup.mjs`.
+3. Verify with `curl http://127.0.0.1:3456/v1/models` (should list 4 models).
+4. Add `export OPENAI_BASE_URL=http://127.0.0.1:3456/v1` to my shell rc.
+5. Tell me to reload my shell and try a tool like Cline / Continue / Cursor.
+
+Before each step, tell me what you'll run and wait for confirmation.
+On any error, diagnose first — don't auto-retry.
+```
+
+**LAN mode (server)** — install OCP as a server so your family or multiple devices can share it:
+
+```text
+I want to install OCP on this device as a LAN server so my family and other
+devices on the network can share my Claude Pro/Max subscription.
+
+Please follow https://github.com/dtzp555-max/ocp/blob/main/README.md
+"Server Setup" → "LAN mode" path:
+
+1. Verify prerequisites: macOS or Linux (Windows not supported), Node.js
+   22.5+, git, Claude CLI installed and authenticated.
+2. Generate a strong admin key with `openssl rand -base64 32`. Save it —
+   I'll need it to manage per-user keys later.
+3. git clone https://github.com/dtzp555-max/ocp.git && cd ocp
+4. Run `node setup.mjs --bind 0.0.0.0 --auth-mode multi`.
+5. Add OCP_ADMIN_KEY to my shell rc (~/.zshrc or ~/.bashrc).
+6. Run `ocp lan` to show me the LAN IP and connect command.
+7. Optionally create example keys: `ocp keys add laptop`, `ocp keys add tablet`.
+8. Verify: `curl http://127.0.0.1:3456/v1/models` returns 4 models.
+
+Tell me each step before running it. On error, diagnose before retrying.
+```
+
+**Client connect** — configure this device to use an existing OCP server on your LAN:
+
+```text
+There's an OCP server at <SERVER_IP> on my LAN. Configure this machine to
+use it for any local IDEs (Cursor, Cline, Continue.dev, OpenCode, Claude
+Code, OpenClaw).
+
+Server IP: <SERVER_IP>
+API key (leave blank if the server has anonymous mode enabled): <OPTIONAL_KEY>
+
+Please follow https://github.com/dtzp555-max/ocp/blob/main/README.md
+"Client Setup" path:
+
+1. Download ocp-connect:
+     curl -fsSL https://raw.githubusercontent.com/dtzp555-max/ocp/main/ocp-connect -o ocp-connect
+     chmod +x ocp-connect
+2. Run `./ocp-connect <SERVER_IP>` (add `--key <KEY>` if you have one).
+3. Follow any IDE-specific manual hints it prints.
+4. Verify: `curl http://<SERVER_IP>:3456/v1/models` returns 4 models.
+5. Tell me to reload my shell + restart any IDE that was already running.
+
+Don't auto-retry on error. Tell me the failure mode first.
+```
+
+> If you'd rather do everything manually, the **Server Setup** and **Client Setup** sections below have the same steps in handbook form.
+
+---
+
 ### Server Setup
 
 > **Recommended:** Install OCP on a device that stays powered on — Mac mini, NAS, Raspberry Pi, or a desktop that doesn't sleep. This ensures all clients always have access.
 
 **Prerequisites:**
+- macOS or Linux (Windows is not supported — `setup.mjs` installs launchd / systemd auto-start)
 - Node.js 22.5+ (Node 23+ recommended — `node:sqlite` is fully stable without flags from 23.0; on 22.5–22.x it works behind `--experimental-sqlite`)
-- [Claude CLI](https://docs.anthropic.com/en/docs/claude-cli) installed and authenticated (`claude auth login`)
+- `git`
+- [Claude CLI](https://docs.anthropic.com/en/docs/claude-cli) — install and authenticate:
+  ```bash
+  npm install -g @anthropic-ai/claude-code
+  claude auth login   # prints a URL + code — open URL on any browser, sign in, paste code back
+  ```
+  Headless servers (Pi / NAS / VPS without a desktop browser): see [Headless install notes](#headless-install-notes) below.
 
 ```bash
 # 1. Clone and run setup
@@ -117,7 +200,9 @@ node setup.mjs --bind 0.0.0.0 --auth-mode multi
 
 Then create API keys for each person/device:
 ```bash
-export OCP_ADMIN_KEY=your-secret-admin-key
+# Generate a strong admin key (one-time — save it for later key management):
+export OCP_ADMIN_KEY=$(openssl rand -base64 32)
+# Add the same export line to ~/.zshrc or ~/.bashrc so it persists.
 
 ocp keys add wife-laptop
 #  ✓ Key created for "wife-laptop"
@@ -136,6 +221,22 @@ curl http://127.0.0.1:3456/v1/models
 # Returns: claude-opus-4-7, claude-opus-4-6, claude-sonnet-4-6, claude-haiku-4-5-20251001
 ```
 
+#### Headless install notes
+
+OCP is designed for always-on devices that often don't have a desktop browser — Mac mini, NAS, Raspberry Pi, cloud VPS. The Claude CLI auth flow still works headless:
+
+**Option 1 — interactive OAuth over SSH (one-shot).** `claude auth login` prints a URL + 8-digit code. Open the URL on **any** device with a browser (your laptop, phone), sign in to your Anthropic account, and paste the code back into the SSH session. No browser needed on the server itself.
+
+**Option 2 — long-lived token (auth once, no re-prompts).**
+
+```bash
+claude setup-token   # subscription-backed long-lived token
+```
+
+Same Claude subscription as Option 1; the token is stored in Claude CLI's normal config location. Useful when you'd rather not redo the OAuth flow when sessions expire.
+
+If `claude auth login` errors out with something like `cannot open browser`, you've hit the same case — fall back to either option above.
+
 ---
 
 ### Uninstall
@@ -152,6 +253,8 @@ Removes the launchd (macOS) or systemd (Linux) auto-start entry. Handles both le
 ### Client Setup
 
 > Clients do **not** need to install Node.js, Claude CLI, or the OCP repo. Only `curl` and `python3` are required (pre-installed on most Linux/Mac systems).
+>
+> **Find the server's LAN IP** by running `ocp lan` on the server machine — it prints both the IP and a ready-to-share connect command.
 
 **One-command setup** — download the lightweight `ocp-connect` script:
 
@@ -596,6 +699,37 @@ After installing the gateway plugin, use `/ocp` slash commands in your chat:
 > **Note:** Terminal CLI uses `ocp <command>`, Telegram/Discord uses `/ocp <command>`.
 
 ## Troubleshooting
+
+### Setup fails with "claude: command not found"
+
+`setup.mjs` requires the Claude CLI to be on `PATH`. Install it via the [official guide](https://docs.anthropic.com/en/docs/claude-cli), confirm with `which claude`, then run `claude auth login` before re-running `node setup.mjs`.
+
+### Setup fails with "EADDRINUSE: port 3456 already in use"
+
+Something else is already bound to port 3456 — usually an old OCP instance. Check what:
+
+```bash
+lsof -nP -iTCP:3456 -sTCP:LISTEN
+```
+
+If it's an old OCP process, stop it before re-running setup:
+
+```bash
+ocp stop                                                # if the CLI is on PATH
+launchctl bootout gui/$(id -u)/dev.ocp.proxy            # macOS launchd fallback
+sudo systemctl stop ocp-proxy                           # Linux systemd fallback
+```
+
+### Setup fails with "node: command not found" or version error
+
+OCP requires Node.js 22.5+. Install:
+
+```bash
+brew install node          # macOS
+# Linux: see https://nodejs.org/en/download for current install commands
+```
+
+Confirm with `node --version` (should be ≥ v22.5).
 
 ### Requests fail or agents stuck
 
