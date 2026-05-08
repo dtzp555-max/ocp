@@ -264,13 +264,6 @@ console.log(`
 ╚══════════════════════════════════════════════════════════════╝
 `);
 
-// ── Step 6: Optionally start ────────────────────────────────────────────
-if (!SKIP_START && !DRY_RUN) {
-  try {
-    execSync(`bash "${startPath}"`, { stdio: "inherit" });
-  } catch { /* ignore */ }
-}
-
 // ── Step 7: Install auto-start on boot ──────────────────────────────────
 if (!DRY_RUN) {
   console.log("\n🔄 Installing auto-start on login...\n");
@@ -405,4 +398,52 @@ WantedBy=default.target
   }
 
   console.log("\n✅ Auto-start installed — proxy will start automatically on login\n");
+
+  // ── Step 8: Post-install health verification ───────────────────────────
+  if (!SKIP_START) {
+    console.log("⏳ Waiting for server to bind...\n");
+    await new Promise(r => setTimeout(r, 3000));
+
+    const healthUrl = `http://127.0.0.1:${PORT}/health`;
+    let verified = false;
+    try {
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), 5000);
+      const res = await fetch(healthUrl, { signal: controller.signal });
+      clearTimeout(timer);
+
+      if (res.ok) {
+        const body = await res.json().catch(() => ({}));
+        console.log(`  ✓ Health check passed (${healthUrl})`);
+        console.log(`    version:  ${body.version ?? "unknown"}`);
+        console.log(`    authMode: ${body.authMode ?? "unknown"}`);
+
+        // Verify bind socket
+        try {
+          const bindCheck = process.platform === "linux"
+            ? execSync(`ss -tlnp 2>/dev/null | grep ':${PORT}'`, { encoding: "utf-8" }).trim()
+            : execSync(`lsof -nP -iTCP:${PORT} -sTCP:LISTEN 2>/dev/null`, { encoding: "utf-8" }).trim();
+          if (bindCheck) {
+            console.log(`    bind:     ${bindCheck.split("\n")[0]}`);
+          }
+        } catch { /* bind check is best-effort */ }
+
+        verified = true;
+      } else {
+        warn(`Health check returned HTTP ${res.status} — service may not have started cleanly`);
+      }
+    } catch (e) {
+      const isTimeout = e.name === "AbortError" || (e.cause && e.cause.code === "UND_ERR_CONNECT_TIMEOUT");
+      warn(`Health check failed: ${isTimeout ? "timeout (5s)" : e.message}`);
+    }
+
+    if (!verified) {
+      const logHint = process.platform === "linux"
+        ? "journalctl --user -u ocp-proxy -n 50"
+        : `tail -n 100 ~/.ocp/logs/proxy.log`;
+      console.error(`\n  ✗ Server did not respond on port ${PORT} within 5 seconds.`);
+      console.error(`    Check service logs:\n      ${logHint}\n`);
+      process.exit(1);
+    }
+  }
 }
