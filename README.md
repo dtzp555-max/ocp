@@ -167,7 +167,12 @@ Don't auto-retry on error. Tell me the failure mode first.
 - macOS or Linux (Windows is not supported — `setup.mjs` installs launchd / systemd auto-start)
 - Node.js 22.5+ (Node 23+ recommended — `node:sqlite` is fully stable without flags from 23.0; on 22.5–22.x it works behind `--experimental-sqlite`)
 - `git`
-- [Claude CLI](https://docs.anthropic.com/en/docs/claude-cli) installed and authenticated (`claude auth login`)
+- [Claude CLI](https://docs.anthropic.com/en/docs/claude-cli) — install and authenticate:
+  ```bash
+  npm install -g @anthropic-ai/claude-code
+  claude auth login   # prints a URL + code — open URL on any browser, sign in, paste code back
+  ```
+  Headless servers (Pi / NAS / VPS without a desktop browser): see [Headless install notes](#headless-install-notes) below.
 
 ```bash
 # 1. Clone and run setup
@@ -215,6 +220,22 @@ Run `ocp lan` to see your IP and ready-to-share instructions.
 curl http://127.0.0.1:3456/v1/models
 # Returns: claude-opus-4-7, claude-opus-4-6, claude-sonnet-4-6, claude-haiku-4-5-20251001
 ```
+
+#### Headless install notes
+
+OCP is designed for always-on devices that often don't have a desktop browser — Mac mini, NAS, Raspberry Pi, cloud VPS. The Claude CLI auth flow still works headless:
+
+**Option 1 — interactive OAuth over SSH (one-shot).** `claude auth login` prints a URL + 8-digit code. Open the URL on **any** device with a browser (your laptop, phone), sign in to your Anthropic account, and paste the code back into the SSH session. No browser needed on the server itself.
+
+**Option 2 — long-lived token (auth once, no re-prompts).**
+
+```bash
+claude setup-token   # subscription-backed long-lived token
+```
+
+Same Claude subscription as Option 1; the token is stored in Claude CLI's normal config location. Useful when you'd rather not redo the OAuth flow when sessions expire.
+
+If `claude auth login` errors out with something like `cannot open browser`, you've hit the same case — fall back to either option above.
 
 ---
 
