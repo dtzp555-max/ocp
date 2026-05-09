@@ -12,7 +12,7 @@
  *   4. Creates start.sh for easy launch
  *   5. Optionally starts the proxy
  */
-import { readFileSync, writeFileSync, existsSync, mkdirSync, unlinkSync, readdirSync } from "node:fs";
+import { readFileSync, writeFileSync, existsSync, mkdirSync, unlinkSync, readdirSync, chmodSync } from "node:fs";
 import { execSync } from "node:child_process";
 import { join, dirname } from "node:path";
 import { homedir } from "node:os";
@@ -425,7 +425,8 @@ if (!DRY_RUN) {
 `;
 
     writeFileSync(plistPath, plistXml);
-    log(`Plist written: ${plistPath}`);
+    chmodSync(plistPath, 0o600);
+    log(`Plist written: ${plistPath} (mode 600)`);
 
     // Bootout first (in case it was already loaded) then bootstrap
     try { execSync(`launchctl bootout gui/$(id -u) "${plistPath}" 2>/dev/null`); } catch { /* ignore */ }
@@ -459,7 +460,8 @@ WantedBy=default.target
 `;
 
     writeFileSync(servicePath, serviceUnit);
-    log(`Service file written: ${servicePath}`);
+    chmodSync(servicePath, 0o600);
+    log(`Service file written: ${servicePath} (mode 600)`);
 
     execSync(`systemctl --user daemon-reload`);
     execSync(`systemctl --user enable ocp-proxy`);

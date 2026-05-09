@@ -30,7 +30,7 @@
 import { createServer } from "node:http";
 import { spawn, execFileSync } from "node:child_process";
 import { randomUUID, timingSafeEqual } from "node:crypto";
-import { readFileSync, readdirSync, accessSync, existsSync, constants } from "node:fs";
+import { readFileSync, readdirSync, accessSync, existsSync, constants, chmodSync, statSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 import { homedir } from "node:os";
@@ -166,6 +166,44 @@ function logEvent(level, event, data = {}) {
     console.log(JSON.stringify(entry));
   }
 }
+
+// ── Startup file-mode reconciliation ───────────────────────────────────
+// Idempotently tightens OCP credential-bearing files to 700/600 so that
+// existing installs (created before this fix) are hardened on next restart.
+// Wrapped in try/catch — chmod failure must never crash startup.
+// Does NOT touch systemd units or launchd plists; those are managed by setup.mjs.
+function _tightenFileModesIfPossible() {
+  const ocpDir = join(homedir(), ".ocp");
+  const targets = [
+    { path: ocpDir,                      mode: 0o700, label: "~/.ocp (dir)" },
+    { path: join(ocpDir, "admin-key"),   mode: 0o600, label: "~/.ocp/admin-key" },
+    { path: join(ocpDir, "ocp.db"),      mode: 0o600, label: "~/.ocp/ocp.db" },
+  ];
+  let tightened = 0;
+  let alreadyOk = 0;
+  for (const { path, mode, label } of targets) {
+    try {
+      const st = statSync(path);
+      const current = st.mode & 0o777;
+      if (current !== mode) {
+        chmodSync(path, mode);
+        tightened++;
+      } else {
+        alreadyOk++;
+      }
+    } catch (e) {
+      if (e.code !== "ENOENT") {
+        // File exists but chmod failed (e.g. EPERM) — log and move on
+        logEvent("warn", "file_mode_tighten_failed", { path: label, error: e.message });
+      }
+      // ENOENT is fine — file doesn't exist yet
+    }
+  }
+  if (tightened > 0) {
+    logEvent("info", "file_modes_tightened", { tightened, alreadyOk });
+  }
+}
+_tightenFileModesIfPossible();
 
 // ── Circuit breaker (DISABLED) ──────────────────────────────────────────
 // Disabled: CLI proxy has its own retry logic, and the breaker was causing
