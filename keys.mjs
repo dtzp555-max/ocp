@@ -3,11 +3,13 @@
 import { DatabaseSync } from "node:sqlite";
 import { randomBytes, createHash } from "node:crypto";
 import { join } from "node:path";
-import { mkdirSync } from "node:fs";
+import { mkdirSync, chmodSync } from "node:fs";
 import { homedir } from "node:os";
 
 const OCP_DIR = join(homedir(), ".ocp");
-mkdirSync(OCP_DIR, { recursive: true });
+mkdirSync(OCP_DIR, { recursive: true, mode: 0o700 });
+// Tighten the directory mode in case it already existed with broader permissions.
+try { chmodSync(OCP_DIR, 0o700); } catch { /* ignore EPERM on pre-existing dirs */ }
 const DB_PATH = join(OCP_DIR, "ocp.db");
 
 let db;
@@ -18,6 +20,8 @@ export function getDb() {
     db.exec("PRAGMA journal_mode = WAL");
     db.exec("PRAGMA foreign_keys = ON");
     initSchema();
+    // Tighten mode on the DB file (0600) after creation / first open.
+    try { chmodSync(DB_PATH, 0o600); } catch { /* ignore — same-user access still works */ }
   }
   return db;
 }
