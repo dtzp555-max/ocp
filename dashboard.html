@@ -55,7 +55,13 @@
 </div>
 
 <div class="section">
-  <h2>Usage by Key</h2>
+  <div class="flex" style="justify-content: space-between; align-items: center;">
+    <h2 style="margin: 0;">Usage by Key</h2>
+    <label id="usage-scope-toggle" class="flex" style="display:none; gap: 0.4rem; font-size: 0.8rem; color: #94a3b8; cursor: pointer;">
+      <input type="checkbox" id="usage-show-all" style="cursor: pointer;">
+      <span>Show all keys</span>
+    </label>
+  </div>
   <table id="key-usage-table">
     <thead><tr><th>Key</th><th>Requests</th><th>OK</th><th>Err</th><th>Avg Time</th><th>Last Request</th></tr></thead>
     <tbody></tbody>
@@ -170,7 +176,8 @@ async function refreshStatus() {
 
 async function refreshUsage() {
   try {
-    const data = await api("/api/usage");
+    const showAll = localStorage.getItem("ocp_usage_show_all") === "1";
+    const data = await api(showAll ? "/api/usage?all=true" : "/api/usage");
     const tbody = document.querySelector("#key-usage-table tbody");
     tbody.innerHTML = (data.byKey || []).map(k => `
       <tr>
@@ -204,6 +211,8 @@ async function refreshKeys() {
   try {
     const data = await api("/api/keys");
     document.getElementById("key-mgmt-section").style.display = "";
+    // Admin-only "Show all keys" toggle for /api/usage scope.
+    document.getElementById("usage-scope-toggle").style.display = "flex";
     const tbody = document.querySelector("#keys-table tbody");
     tbody.innerHTML = (data.keys || []).map(k => `
       <tr>
@@ -239,6 +248,16 @@ async function refreshAll() {
   await Promise.all([refreshStatus(), refreshUsage(), refreshKeys()]);
   document.getElementById("refresh-indicator").textContent = `Updated ${new Date().toLocaleTimeString()}`;
 }
+
+// Wire "Show all keys" toggle (visibility gated to admin via refreshKeys()).
+(function setupUsageScopeToggle() {
+  const cb = document.getElementById("usage-show-all");
+  cb.checked = localStorage.getItem("ocp_usage_show_all") === "1";
+  cb.addEventListener("change", () => {
+    localStorage.setItem("ocp_usage_show_all", cb.checked ? "1" : "0");
+    refreshUsage();
+  });
+})();
 
 refreshAll();
 setInterval(refreshAll, 30000);

@@ -1616,14 +1616,45 @@ const server = createServer(async (req, res) => {
   }
 
   if (req.url?.startsWith("/api/usage") && req.method === "GET") {
-    if (!isAdmin) return jsonResponse(res, 403, { error: "Admin access required" });
+    // Least-privilege scope rules (security audit follow-up):
+    //   - non-admin authenticated key  → only own rows
+    //   - anonymous (PROXY_ANONYMOUS_KEY) → only "anonymous" rows; ?all=true ignored
+    //   - admin without ?all=true       → only own ("admin") rows
+    //   - admin with    ?all=true       → full byKey/recent (legacy behavior); audited
+    // Authenticated callers are required (anyone reaching here passed the auth gate above);
+    // remote+no-auth requests would have been rejected before this point.
     const url = new URL(req.url, `http://${BIND_ADDRESS}:${PORT}`);
     const since = url.searchParams.get("since");
     const until = url.searchParams.get("until");
+    const wantAll = url.searchParams.get("all") === "true";
+    const callerName = req._authKeyName;
+
+    // Anonymous callers may never opt into all-keys view, even if they pass ?all=true.
+    const isAnonCaller = callerName === "anonymous";
+    const fullScope = isAdmin && wantAll && !isAnonCaller;
+
+    // scopeName === null when fullScope is true (no filter); otherwise the key_name to filter by.
+    const scopeName = fullScope ? null : callerName;
+
+    if (fullScope) {
+      logEvent("info", "admin_usage_full_scope", { caller: callerName, ip: req.socket.remoteAddress || null });
+    }
+
+    const byKeyAll = getUsageByKey({ since, until });
+    const recentAll = getRecentUsage(Math.min(parseInt(url.searchParams.get("limit") || "50", 10), 500));
+    const timeline = getUsageTimeline({
+      keyName: scopeName || undefined,
+      hours: Math.min(parseInt(url.searchParams.get("hours") || "24", 10), 720),
+    });
+
+    const byKey = scopeName ? byKeyAll.filter((row) => row.key_name === scopeName) : byKeyAll;
+    const recent = scopeName ? recentAll.filter((row) => row.key_name === scopeName) : recentAll;
+
     return jsonResponse(res, 200, {
-      byKey: getUsageByKey({ since, until }),
-      timeline: getUsageTimeline({ hours: Math.min(parseInt(url.searchParams.get("hours") || "24", 10), 720) }),
-      recent: getRecentUsage(Math.min(parseInt(url.searchParams.get("limit") || "50", 10), 500)),
+      byKey,
+      timeline,
+      recent,
+      scope: { self: scopeName, all: fullScope },
     });
   }
 
