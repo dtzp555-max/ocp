@@ -202,25 +202,36 @@ const MODEL_MAP = Object.fromEntries([
 const MODELS = modelsConfig.models.map(m => ({ id: m.id, name: m.displayName }));
 
 // ── Session management ──────────────────────────────────────────────────
-// Maps conversation IDs (from caller) to Claude CLI session UUIDs.
+// Maps namespaced session keys to Claude CLI session UUIDs.
+// Key format: "${keyName}|${conversationId}" — prevents cross-key collision
+// when two callers (different API keys or anon + authenticated) use the same
+// session_id string. Anonymous callers use "anon"; admin uses "admin".
 // Enables --resume for multi-turn conversations, reducing token waste.
-const sessions = new Map(); // conversationId → { uuid, messageCount, lastUsed, model }
+const sessions = new Map(); // `${keyName}|${conversationId}` → { uuid, messageCount, lastUsed, model }
+
+// Build the namespaced key used for all sessions Map operations.
+// Returns null when conversationId is falsy (one-off requests bypass session tracking).
+function _sessionKey(conversationId, keyName) {
+  return conversationId ? `${keyName || "anon"}|${conversationId}` : null;
+}
 
 const sessionCleanupInterval = setInterval(() => {
   const now = Date.now();
   for (const [id, s] of sessions) {
     const idleMs = now - s.lastUsed;
     const ageMs = s.firstSeen ? now - s.firstSeen : null;
+    // id is "${keyName}|${conversationId}"; strip prefix for log output
+    const convIdShort = id.includes("|") ? id.slice(id.indexOf("|") + 1, id.indexOf("|") + 13) : id.slice(0, 12);
     if (idleMs > SESSION_TTL) {
       sessions.delete(id);
-      console.log(`[session] expired ${id.slice(0, 12)}... (idle ${Math.round(idleMs / 60000)}m)`);
-      logEvent("info", "session_expired", { conversationId: id.slice(0, 12) + "...", idleMs, ageMs });
+      console.log(`[session] expired ${convIdShort}... (idle ${Math.round(idleMs / 60000)}m)`);
+      logEvent("info", "session_expired", { conversationId: convIdShort + "...", idleMs, ageMs });
     } else if (ageMs !== null && ageMs > 4 * SESSION_TTL) {
       // #42 evidence-gathering: a session whose firstSeen is more than 4× TTL old
       // but whose lastUsed keeps getting bumped (never idle long enough to expire)
       // is the suspected bug. Log without action so the pattern can be confirmed
       // in /logs. Do NOT enforce an absolute age cap here speculatively.
-      logEvent("warn", "session_long_lived", { conversationId: id.slice(0, 12) + "...", idleMs, ageMs });
+      logEvent("warn", "session_long_lived", { conversationId: convIdShort + "...", idleMs, ageMs });
     }
   }
 }, 60000);
@@ -427,7 +438,7 @@ function getModelTier(cliModel) {
 // ── Spawn claude CLI (shared setup) ─────────────────────────────────────
 // Resolves session logic, builds CLI args, spawns the process, and sets up
 // timeouts. Returns context object or throws synchronously.
-function spawnClaudeProcess(model, messages, conversationId) {
+function spawnClaudeProcess(model, messages, conversationId, keyName) {
   if (stats.activeRequests >= MAX_CONCURRENT) {
     throw new Error(`concurrency limit reached (${stats.activeRequests}/${MAX_CONCURRENT})`);
   }
@@ -443,8 +454,11 @@ function spawnClaudeProcess(model, messages, conversationId) {
   let prompt;
 
   // ── Session logic ──
-  if (conversationId && sessions.has(conversationId)) {
-    const session = sessions.get(conversationId);
+  // sessionKey namespaces the Map key by keyName to prevent cross-caller collision
+  // when two callers with different API keys share the same conversationId string.
+  const sessionKey = _sessionKey(conversationId, keyName);
+  if (sessionKey && sessions.has(sessionKey)) {
+    const session = sessions.get(sessionKey);
     session.lastUsed = Date.now();
     sessionInfo = { uuid: session.uuid, resume: true };
     stats.sessionHits++;
@@ -455,17 +469,17 @@ function spawnClaudeProcess(model, messages, conversationId) {
       : "";
     session.messageCount = messages.length;
 
-    console.log(`[session] resume conv=${conversationId.slice(0, 12)}... uuid=${session.uuid.slice(0, 8)}... msgs=${messages.length} prompt_chars=${prompt.length}`);
+    console.log(`[session] resume conv=${conversationId.slice(0, 12)}... key=${keyName || "anon"} uuid=${session.uuid.slice(0, 8)}... msgs=${messages.length} prompt_chars=${prompt.length}`);
 
-  } else if (conversationId) {
+  } else if (sessionKey) {
     const uuid = randomUUID();
     const now = Date.now();
-    sessions.set(conversationId, { uuid, messageCount: messages.length, firstSeen: now, lastUsed: now, model: cliModel });
+    sessions.set(sessionKey, { uuid, messageCount: messages.length, firstSeen: now, lastUsed: now, model: cliModel });
     sessionInfo = { uuid, resume: false };
     stats.sessionMisses++;
     prompt = messagesToPrompt(messages);
 
-    console.log(`[session] new conv=${conversationId.slice(0, 12)}... uuid=${uuid.slice(0, 8)}... msgs=${messages.length}`);
+    console.log(`[session] new conv=${conversationId.slice(0, 12)}... key=${keyName || "anon"} uuid=${uuid.slice(0, 8)}... msgs=${messages.length}`);
 
   } else {
     stats.oneOffRequests++;
@@ -510,11 +524,11 @@ function spawnClaudeProcess(model, messages, conversationId) {
   proc.once("exit", cleanup);
 
   function handleSessionFailure() {
-    if (sessionInfo?.resume && conversationId) {
+    if (sessionInfo?.resume && sessionKey) {
       console.warn(`[session] resume failed for ${conversationId.slice(0, 12)}..., removing stale session`);
       logEvent("warn", "session_failure", { mode: "resume", conversationId: conversationId.slice(0, 12) + "...", action: "deleted" });
-      sessions.delete(conversationId);
-    } else if (sessionInfo && !sessionInfo.resume && conversationId) {
+      sessions.delete(sessionKey);
+    } else if (sessionInfo && !sessionInfo.resume && sessionKey) {
       // #41 evidence-gathering: session-create failures currently leave a stale entry
       // in the sessions map. Log without action so the staleness pattern can be
       // confirmed in /logs before any code change. Do NOT delete here speculatively.
@@ -557,11 +571,11 @@ function spawnClaudeProcess(model, messages, conversationId) {
 // On-demand spawning: each request spawns a fresh `claude -p` process.
 // No pool = no crash loops, no stale workers, no degraded states.
 // Stdin is written immediately so there's no 3s stdin timeout issue.
-function callClaude(model, messages, conversationId) {
+function callClaude(model, messages, conversationId, keyName) {
   return new Promise((resolve, reject) => {
     let ctx;
     try {
-      ctx = spawnClaudeProcess(model, messages, conversationId);
+      ctx = spawnClaudeProcess(model, messages, conversationId, keyName);
     } catch (err) {
       return reject(err);
     }
@@ -641,7 +655,7 @@ function callClaudeStreaming(model, messages, conversationId, res, authInfo = {}
 
   let ctx;
   try {
-    ctx = spawnClaudeProcess(model, messages, conversationId);
+    ctx = spawnClaudeProcess(model, messages, conversationId, authInfo.keyName);
   } catch (err) {
     return jsonResponse(res, 500, { error: { message: err.message, type: "proxy_error" } });
   }
@@ -1324,7 +1338,7 @@ async function handleChatCompletions(req, res) {
         // will re-read the freshly-populated cache entry here rather than spawning.
         const recheck = getCachedResponse(req._cacheHash, CACHE_TTL);
         if (recheck) return recheck.response;
-        const c = await callClaude(model, messages, conversationId);
+        const c = await callClaude(model, messages, conversationId, req._authKeyName);
         try { setCachedResponse(req._cacheHash, model, c); } catch (e) { logEvent("error", "cache_write_failed", { error: e.message }); }
         return c;
       });
@@ -1346,7 +1360,7 @@ async function handleChatCompletions(req, res) {
 
   // Fallback: cache disabled (CACHE_TTL=0) or no _cacheHash — original path untouched.
   try {
-    const content = await callClaude(model, messages, conversationId);
+    const content = await callClaude(model, messages, conversationId, req._authKeyName);
     const id = `chatcmpl-${randomUUID()}`;
     completionResponse(res, id, model, content);
     try { recordUsage({ keyId: req._authKeyId, keyName: req._authKeyName, model, promptChars, responseChars: content.length, elapsedMs: Date.now() - t0Usage, success: true }); } catch (e) { logEvent("error", "usage_record_failed", { error: e.message }); }
@@ -1480,8 +1494,10 @@ const server = createServer(async (req, res) => {
     const uptimeMs = Date.now() - START_TIME;
     const sessionList = [];
     for (const [id, s] of sessions) {
+      // id is "${keyName}|${conversationId}"; expose only the public-facing conversationId
+      const convId = id.includes("|") ? id.slice(id.indexOf("|") + 1) : id;
       sessionList.push({
-        id: id.slice(0, 12) + "...",
+        id: convId.slice(0, 12) + "...",
         model: s.model,
         messages: s.messageCount,
         idleMs: Date.now() - s.lastUsed,
@@ -1526,7 +1542,9 @@ const server = createServer(async (req, res) => {
   if (req.url === "/sessions" && req.method === "GET") {
     const list = [];
     for (const [id, s] of sessions) {
-      list.push({ id, uuid: s.uuid, model: s.model, messages: s.messageCount, lastUsed: new Date(s.lastUsed).toISOString() });
+      // id is "${keyName}|${conversationId}"; expose only the public-facing conversationId
+      const convId = id.includes("|") ? id.slice(id.indexOf("|") + 1) : id;
+      list.push({ id: convId, uuid: s.uuid, model: s.model, messages: s.messageCount, lastUsed: new Date(s.lastUsed).toISOString() });
     }
     return jsonResponse(res, 200, { sessions: list });
   }
