@@ -1,5 +1,31 @@
 # Changelog
 
+## v3.14.0 — 2026-05-10
+
+### Features (security hardening)
+
+- **Per-key session isolation** (PR #86, S1) — the `sessions` Map in `server.mjs` is now keyed by `${keyName}|${conversationId}` instead of bare `conversationId`. Before this fix, two clients using distinct API keys but the same `session_id` value (e.g. both defaulting to `"default"`) would share the same `cli.js` subprocess and conversation history, creating a cross-tenant leak path. Post-fix each (key, session) pair is isolated end-to-end, extending the per-key cache isolation shipped in v3.13.0 D1 to the session layer.
+- **On-disk credential file modes 0700/0600** (PR #87, S2) — `setup.mjs` now creates `~/.ocp` at mode 0700 and both `admin-key` and `ocp.db` at mode 0600. An idempotent `reconcileFileModes()` call in `server.mjs` startup tightens any existing installation to these modes automatically on every launch, so existing prod boxes fix themselves without manual `chmod`. Before this fix, all three files were created at the process's default umask (typically world-readable 0644 / 0755), leaving plaintext credentials readable by other local users.
+- **`/api/usage` default scope = self; admin all-keys requires `?all=true`** (PR #88, S3) — the usage endpoint now applies a least-privilege default: anonymous callers receive only their own rows, non-admin authenticated callers receive only their own rows, and admin callers receive only their own rows unless they explicitly pass `?all=true`. When `?all=true` is used, an audit log line is emitted. Before this fix, any admin-token holder could silently enumerate usage data for every key on the server.
+
+### Behavior changes
+
+- **Breaking change for admin tooling**: `/api/usage` no longer returns all-keys data by default. Existing cron jobs, dashboards, or scripts that rely on the admin token seeing all-keys output must add `?all=true` to their request URL after upgrading to v3.14.0.
+- **File mode reconcile at server startup** logs a one-line notice per path when mode is tightened (e.g. `[security] tightened ~/.ocp/ocp.db → 0600`). No action is required from the operator; the reconcile is idempotent and silent when modes are already correct.
+- **`sessions` Map key is now `${keyName}|${conversationId}` internally.** No client-visible wire change — the `session_id` field in request/response is unchanged.
+
+### Verification
+
+- Stress-test pass: 11/11 phases including S1/S2/S3 security regression checks (Phase E, I, J). 35-minute sustained run, 60 calls, 0 errors, 0 timeouts. RSS dropped 51→47 MB across the window. Per-key cache isolation, singleflight, cache_control bypass, quota enforcement, file-mode reconcile, and scope guard against escalation all verified against running code.
+
+### Governance
+
+- All three PRs (#86, #87, #88) include the explicit `cli.js`-citation-not-applicable disclaimer (per PR #75 pattern) since they are OCP-internal access-control, session-state, and file-permission changes with no corresponding `cli.js` operation to cite.
+
+### No new env vars / no public API surface change beyond the documented breaking change
+
+This release adds no new env vars or endpoints. The only externally visible change is the `/api/usage` scope guard (breaking for admin all-keys consumers; see Behavior changes above).
+
 ## v3.13.0 — 2026-05-07
 
 ### Features (cache layer hardening)
