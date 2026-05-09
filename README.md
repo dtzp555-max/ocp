@@ -392,6 +392,8 @@ ocp keys revoke son-ipad   # Revoke a key
 | `shared` | `CLAUDE_AUTH_MODE=shared` + `PROXY_API_KEY=xxx` | Everyone shares one key |
 | `multi` | `CLAUDE_AUTH_MODE=multi` + `OCP_ADMIN_KEY=xxx` | Per-person keys with usage tracking (recommended) |
 
+> **Usage scope (v3.14.0+):** `/api/usage` returns the caller's own rows by default. Admin callers must pass `?all=true` to retrieve data for all keys; doing so emits an audit log line.
+
 ### Anonymous Access (optional)
 
 In `multi` mode, the admin can designate a single well-known "anonymous" key that bypasses `validateKey()` and grants public read/write access. This is useful for letting LAN users (or clients like OpenClaw multi-agent setups) connect without individual per-user keys.
@@ -460,6 +462,7 @@ When a key exceeds its quota, OCP returns HTTP 429 with a structured error:
 - Keys are stored in `~/.ocp/ocp.db` (SQLite, zero external dependencies)
 - Admin key is required for key management API endpoints
 - The dashboard (`/dashboard`) and health check (`/health`) are always public
+- File modes for `~/.ocp` (0700), `admin-key` + `ocp.db` (0600) are auto-tightened at server startup as of v3.14.0
 
 ## Built-in Usage Monitoring
 
@@ -657,7 +660,7 @@ The canonical list lives in [`models.json`](./models.json) — the single source
 | `/api/keys` | GET/POST | List or create API keys (admin only) |
 | `/api/keys/:id` | DELETE | Revoke an API key (admin only) |
 | `/api/keys/:id/quota` | GET/PATCH | View or set per-key quota (admin only) |
-| `/api/usage` | GET | Per-key usage stats (`?since=&until=&hours=&limit=`) |
+| `/api/usage` | GET | Per-key usage stats (`?since=&until=&hours=&limit=`); returns self only by default — pass `?all=true` (admin only) for all-keys data |
 | `/cache/stats` | GET | Cache statistics (admin only) |
 | `/cache` | DELETE | Clear response cache (admin only) |
 
