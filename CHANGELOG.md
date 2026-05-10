@@ -1,5 +1,28 @@
 # Changelog
 
+## v3.16.0 — 2026-XX-XX (release date filled at tag time)
+
+### Features
+
+- **`ocp doctor --check oauth`** (PR #93) — fast path that runs only the OAuth check, skipping
+  version detection / from-version / git operations / models endpoint. ~50ms vs. full doctor's
+  ~200-500ms. Use cases: AI agent repair loops, post-`claude auth login` verify, quick health
+  gates. Help text in `cmd_doctor_help` now reflects working behaviour.
+- **`ocp update --rollback --gc`** — manually garbage-collect old upgrade snapshots.
+  Retention policy: keep last 5 snapshots OR snapshots newer than 30 days OR the single most
+  recent (always-keep safety net). `--dry-run` previews. Successful `ocp update` runs auto-GC
+  at the end of the full path; light path does not (no snapshot created there).
+
+### Behavior changes
+
+- After a successful cross-minor `ocp update`, the auto-GC emits `[gc] removed N old snapshots`
+  to stderr if any were collected. Safe to ignore; manual gc is `ocp update --rollback --gc`.
+
+### Governance
+
+- No `cli.js` citation needed (no `server.mjs` change). ALIGNMENT.md Rule 2 not engaged.
+- PR #93 (--check oauth) merged separately; this release bundles it with the GC feature.
+
 ## v3.15.1 — 2026-05-10
 
 ### Fixes

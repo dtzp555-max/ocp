@@ -719,8 +719,8 @@ test("upgrade full path executes 5 phases", async () => {
 });
 
 // ── Snapshot Tests ──
-import { writeSnapshot, readSnapshot, listSnapshots } from "./scripts/lib/snapshot.mjs";
-import { mkdtempSync, rmSync, mkdirSync as tMkdirSync, writeFileSync as testWriteFile } from "node:fs";
+import { writeSnapshot, readSnapshot, listSnapshots, gcSnapshots } from "./scripts/lib/snapshot.mjs";
+import { mkdtempSync, rmSync, mkdirSync as tMkdirSync, writeFileSync as testWriteFile, existsSync as testExistsSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join as testJoin } from "node:path";
 
@@ -841,6 +841,63 @@ test("rollback latest snapshot restores files (mockExec)", async () => {
   assert.equal(result.path, "rollback");
   assert.equal(result.executed, true);
   assert.ok(result.phases.some(p => p.name === "git-checkout"));
+});
+
+test("gcSnapshots keeps last N regardless of age", () => {
+  const root = mkdtempSync(testJoin(tmpdir(), "ocp-gc-test-"));
+  const dotOcp = testJoin(root, ".ocp");
+  tMkdirSync(dotOcp, { recursive: true });
+  for (const ts of ["2026-04-01T10:00:00Z", "2026-04-15T10:00:00Z", "2026-04-30T10:00:00Z", "2026-05-01T10:00:00Z", "2026-05-10T10:00:00Z"]) {
+    tMkdirSync(testJoin(dotOcp, `upgrade-snapshot-${ts}`));
+  }
+  const result = gcSnapshots(root, { keepCount: 3, keepDays: 0, now: new Date("2026-05-11T00:00:00Z") });
+  assert.equal(result.kept.length, 3);
+  assert.equal(result.removed.length, 2);
+  assert.ok(result.kept[0].name.includes("2026-04-30"));
+  assert.ok(result.kept[2].name.includes("2026-05-10"));
+  rmSync(root, { recursive: true, force: true });
+});
+
+test("gcSnapshots keeps snapshots newer than keepDays regardless of count", () => {
+  const root = mkdtempSync(testJoin(tmpdir(), "ocp-gc-days-"));
+  const dotOcp = testJoin(root, ".ocp");
+  tMkdirSync(dotOcp, { recursive: true });
+  for (const ts of ["2026-04-01T10:00:00Z", "2026-04-15T10:00:00Z", "2026-04-30T10:00:00Z", "2026-05-01T10:00:00Z", "2026-05-10T10:00:00Z"]) {
+    tMkdirSync(testJoin(dotOcp, `upgrade-snapshot-${ts}`));
+  }
+  // keepCount=1 but keepDays=15 means anything from after 2026-04-26 is kept too
+  const result = gcSnapshots(root, { keepCount: 1, keepDays: 15, now: new Date("2026-05-11T00:00:00Z") });
+  // Kept: 2026-04-30 (within 15 days), 2026-05-01 (within 15 days), 2026-05-10 (within 15 days)
+  assert.ok(result.kept.length >= 3);
+  // Removed: 2026-04-01, 2026-04-15
+  assert.ok(result.removed.some(s => s.name.includes("2026-04-01")));
+});
+
+test("gcSnapshots never deletes the most recent snapshot", () => {
+  const root = mkdtempSync(testJoin(tmpdir(), "ocp-gc-recent-"));
+  const dotOcp = testJoin(root, ".ocp");
+  tMkdirSync(dotOcp, { recursive: true });
+  tMkdirSync(testJoin(dotOcp, "upgrade-snapshot-2026-01-01T10:00:00Z"));
+  // Even with keepCount=0 and keepDays=0, the most recent must survive
+  const result = gcSnapshots(root, { keepCount: 0, keepDays: 0, now: new Date("2026-05-11T00:00:00Z") });
+  assert.equal(result.kept.length, 1);
+  assert.equal(result.removed.length, 0);
+  rmSync(root, { recursive: true, force: true });
+});
+
+test("gcSnapshots --dry-run reports plan without deleting", () => {
+  const root = mkdtempSync(testJoin(tmpdir(), "ocp-gc-dryrun-"));
+  const dotOcp = testJoin(root, ".ocp");
+  tMkdirSync(dotOcp, { recursive: true });
+  for (const ts of ["2026-04-01T10:00:00Z", "2026-04-15T10:00:00Z", "2026-05-10T10:00:00Z"]) {
+    tMkdirSync(testJoin(dotOcp, `upgrade-snapshot-${ts}`));
+  }
+  const result = gcSnapshots(root, { keepCount: 1, keepDays: 0, dryRun: true, now: new Date("2026-05-11T00:00:00Z") });
+  assert.equal(result.dryRun, true);
+  assert.equal(result.removed.length, 2);
+  // Files still exist
+  assert.ok(testExistsSync(testJoin(dotOcp, "upgrade-snapshot-2026-04-01T10:00:00Z")));
+  rmSync(root, { recursive: true, force: true });
 });
 
 // ── Doctor --check oauth fast path tests ──

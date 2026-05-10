@@ -709,6 +709,8 @@ Usage:
   ocp update --rollback --list        List available snapshots
   ocp update --rollback <path>        Restore a specific snapshot
   ocp update --rollback --dry-run     Preview rollback plan
+  ocp update --rollback --gc          Delete old snapshots (keep last 5, or <30 days)
+  ocp update --rollback --gc --dry-run    Preview what would be deleted
 EOF
 }
 
