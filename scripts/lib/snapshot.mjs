@@ -15,7 +15,9 @@ export function writeSnapshot({ homeDir, fromCommit, fromVersion, toVersion, ext
   const tryCopy = (src, dst) => {
     try {
       if (existsSync(src)) copyFileSync(src, dst);
-    } catch { /* swallow */ }
+    } catch (err) {
+      console.error(`[snapshot] warn: could not copy ${src} (${err.code || err.message})`);
+    }
   };
   tryCopy(join(homeDir, "Library", "LaunchAgents", "dev.ocp.proxy.plist"), join(root, "plist"));
   tryCopy(join(homeDir, ".config", "systemd", "user", "ocp-proxy.service"), join(root, "service"));

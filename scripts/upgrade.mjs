@@ -19,6 +19,7 @@ import { writeSnapshot } from "./lib/snapshot.mjs";
 export async function runUpgrade(opts = {}) {
   const dryRun = !!opts.dryRun;
   const yes = !!opts.yes;
+  // yes is reserved for Bundle 3 (fresh-install / rollback interactive gate); not used in upgrade-path here.
   const plan = [];
 
   // --- doctor pre-flight ---
@@ -69,72 +70,93 @@ export async function runUpgrade(opts = {}) {
 
 async function runFullUpgrade({ doctor, opts }) {
   const phases = [];
+  let snapshotPath = null;
   const exec = (cmd, label) => {
     if (opts.mockExec) {
       phases.push({ name: label, cmd, status: "skipped-mock" });
       return "";
     }
-    const out = execSync(cmd, { stdio: ["pipe", "pipe", "pipe"] }).toString();
-    phases.push({ name: label, cmd, status: "ok" });
-    return out;
+    try {
+      const out = execSync(cmd, { stdio: ["pipe", "pipe", "pipe"] }).toString();
+      phases.push({ name: label, cmd, status: "ok" });
+      return out;
+    } catch (err) {
+      const detail = err.stderr?.toString().trim();
+      phases.push({ name: label, cmd, status: "fail", stderr: detail });
+      throw Object.assign(
+        new Error(`phase ${label} failed: ${detail || err.message}`),
+        { phases, cmd }
+      );
+    }
   };
   const ocpDir = opts.ocpDir || join(homedir(), "ocp");
 
-  // phase 1: pre-flight (doctor already passed; just record)
-  phases.push({ name: "pre-flight", status: "ok", note: `kind=upgrade from=${doctor.current_version} to=${doctor.latest_version}` });
+  try {
+    // phase 1: pre-flight (doctor already passed; just record)
+    phases.push({ name: "pre-flight", status: "ok", note: `kind=upgrade from=${doctor.current_version} to=${doctor.latest_version}` });
 
-  // phase 2: snapshot
-  const fromCommit = opts.mockExec
-    ? "mock-commit"
-    : execSync(`git -C ${ocpDir} rev-parse HEAD`).toString().trim();
-  const snapshotPath = opts.mockExec
-    ? "/tmp/mock-snapshot"
-    : writeSnapshot({ homeDir: homedir(), fromCommit, fromVersion: doctor.current_version, toVersion: doctor.latest_version });
-  phases.push({ name: "snapshot", path: snapshotPath, status: "ok" });
+    // phase 2: snapshot
+    const fromCommit = opts.mockExec
+      ? "mock-commit"
+      : execSync(`git -C ${ocpDir} rev-parse HEAD`).toString().trim();
+    snapshotPath = opts.mockExec
+      ? "/tmp/mock-snapshot"
+      : writeSnapshot({ homeDir: homedir(), fromCommit, fromVersion: doctor.current_version, toVersion: doctor.latest_version });
+    phases.push({ name: "snapshot", path: snapshotPath, status: "ok" });
 
-  // phase 3: fetch + install
-  exec(`git -C ${ocpDir} fetch --tags --quiet`, "fetch+install");
-  exec(`git -C ${ocpDir} checkout ${doctor.latest_version}`, "fetch+install");
-  exec(`npm --prefix ${ocpDir} install --no-audit --no-fund`, "fetch+install");
+    // phase 3: fetch + install
+    exec(`git -C ${ocpDir} fetch --tags --quiet`, "fetch+install");
+    exec(`git -C ${ocpDir} checkout ${doctor.latest_version}`, "fetch+install");
+    exec(`npm --prefix ${ocpDir} install --no-audit --no-fund`, "fetch+install");
 
-  // phase 4: reconfigure
-  exec(`node ${ocpDir}/setup.mjs`, "reconfigure");
+    // phase 4: reconfigure
+    exec(`node ${ocpDir}/setup.mjs`, "reconfigure");
 
-  // phase 5: restart (heads-up note printed before invoking)
-  if (!opts.mockExec) {
-    console.error(`[heads-up] restarting OCP service in 1s — expect ~5–10s blip on requests in flight.`);
-    await new Promise(r => setTimeout(r, 1000));
-  }
-  if (process.platform === "darwin") {
-    exec(`launchctl bootout gui/$(id -u)/dev.ocp.proxy 2>/dev/null || true`, "restart");
-    exec(`launchctl bootstrap gui/$(id -u) ${join(homedir(), "Library", "LaunchAgents", "dev.ocp.proxy.plist")}`, "restart");
-  } else {
-    exec(`systemctl --user restart ocp-proxy.service`, "restart");
-  }
-
-  // phase 6: post-flight (10s budget; skipped under mockExec)
-  if (!opts.mockExec) {
-    const port = process.env.CLAUDE_PROXY_PORT || "3478";
-    let ok = false;
-    for (let i = 0; i < 10; i++) {
-      try {
-        const out = execSync(`curl -sf --max-time 2 http://127.0.0.1:${port}/health`).toString();
-        const body = JSON.parse(out);
-        if (body.auth?.ok === true) { ok = true; break; }
-      } catch { /* retry */ }
-      await new Promise(r => setTimeout(r, 1000));
+    // phase 5: restart (heads-up note printed before invoking)
+    if (!opts.mockExec) {
+      console.error(`[heads-up] restarting OCP service in 3s — expect ~5–10s blip on requests in flight.`);
+      await new Promise(r => setTimeout(r, 3000));
     }
-    if (!ok) {
-      phases.push({ name: "post-flight", status: "fail", message: "health did not return auth.ok=true within 10s" });
-      throw Object.assign(new Error("post-flight failed; run `ocp update --rollback`"), { phases, snapshotPath });
+    if (process.platform === "darwin") {
+      exec(`launchctl bootout gui/$(id -u)/dev.ocp.proxy 2>/dev/null || true`, "restart");
+      exec(`launchctl bootstrap gui/$(id -u) ${join(homedir(), "Library", "LaunchAgents", "dev.ocp.proxy.plist")}`, "restart");
+    } else {
+      exec(`systemctl --user restart ocp-proxy.service`, "restart");
     }
-    execSync(`curl -sf --max-time 3 http://127.0.0.1:${port}/v1/models > /dev/null`);
-    phases.push({ name: "post-flight", status: "ok" });
-  } else {
-    phases.push({ name: "post-flight", status: "skipped-mock" });
-  }
 
-  return { path: "upgrade", executed: true, changed: true, snapshotPath, phases };
+    // phase 6: post-flight (10s budget; skipped under mockExec)
+    if (!opts.mockExec) {
+      const port = process.env.CLAUDE_PROXY_PORT || "3478";
+      let ok = false;
+      for (let i = 0; i < 10; i++) {
+        try {
+          const out = execSync(`curl -sf --max-time 2 http://127.0.0.1:${port}/health`).toString();
+          const body = JSON.parse(out);
+          if (body.auth?.ok === true) { ok = true; break; }
+        } catch { /* retry */ }
+        await new Promise(r => setTimeout(r, 1000));
+      }
+      if (!ok) {
+        phases.push({ name: "post-flight", status: "fail", message: "health did not return auth.ok=true within 10s" });
+        throw new Error("post-flight failed");
+      }
+      execSync(`curl -sf --max-time 3 http://127.0.0.1:${port}/v1/models > /dev/null`);
+      phases.push({ name: "post-flight", status: "ok" });
+    } else {
+      phases.push({ name: "post-flight", status: "skipped-mock" });
+    }
+
+    return { path: "upgrade", executed: true, changed: true, snapshotPath, phases };
+  } catch (err) {
+    if (snapshotPath && !err.snapshotPath) {
+      Object.assign(err, {
+        snapshotPath,
+        phases,
+        hint: "Working tree may be at new version. Run `ocp update --rollback` to restore from snapshot."
+      });
+    }
+    throw err;
+  }
 }
 
 // CLI entrypoint
@@ -148,6 +170,8 @@ if (import.meta.url === `file://${process.argv[1]}`) {
     process.exit(0);
   } catch (e) {
     console.error(`✗ ${e.message}`);
+    if (e.snapshotPath) console.error(`   snapshot: ${e.snapshotPath}`);
+    if (e.hint) console.error(`   hint: ${e.hint}`);
     process.exit(1);
   }
 }

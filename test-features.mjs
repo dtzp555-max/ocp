@@ -747,6 +747,21 @@ test("listSnapshots returns sorted by ISO timestamp", () => {
   rmSync(root, { recursive: true, force: true });
 });
 
+test("upgrade error after snapshot carries snapshotPath + hint", async () => {
+  // Use mockExec=true so no real commands are run.
+  // Verify the success path returns a snapshotPath (Fix B regression guard).
+  const result = await runUpgrade({
+    yes: true,
+    dryRun: false,
+    mockExec: true,
+    mockDoctor: { ready_to_upgrade: true, next_action: { kind: "upgrade" },
+                  current_version: "v3.10.0", latest_version: "v3.14.0" }
+  });
+  assert.ok(result.snapshotPath, "successful upgrade returns snapshotPath");
+  assert.equal(result.path, "upgrade");
+  assert.equal(result.executed, true);
+});
+
 // ── Cleanup ──
 closeDb();
 
