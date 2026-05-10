@@ -1,6 +1,12 @@
 # Changelog
 
-## v3.15.0 — 2026-XX-XX (release date filled at tag time)
+## v3.15.1 — 2026-05-10
+
+### Fixes
+
+- **doctor: dynamic `latest_version` from `origin/main:package.json`** — v3.15.0 doctor used a hard-coded `latest = "v3.14.0"` fallback, which made any v3.15.0+ install report `kind = upgrade` (against a stale value). `ocp update` would then attempt `git checkout v3.14.0` — a downgrade. Doctor now fetches `git -C ~/ocp show origin/main:package.json` to determine the actual latest version; on failure (offline, fresh clone with no remote), falls back to `currentVersion` so `kind = noop` instead of recommending a downgrade.
+
+## v3.15.0 — 2026-05-10
 
 ### Features
 

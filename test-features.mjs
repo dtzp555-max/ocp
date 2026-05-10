@@ -655,6 +655,18 @@ test("doctor empty health body → fix_service (not fix_oauth)", async () => {
   assert.equal(result.next_action.kind, "fix_service");
 });
 
+test("doctor falls back to currentVersion when origin/main unreachable (no stale latest)", async () => {
+  // Use a non-existent ocpDir so git command fails; without the fix this would still
+  // hard-code v3.14.0 as latest and recommend a downgrade for a future v3.15.0+ user.
+  const result = await runDoctor({
+    skipNetwork: true,
+    mockVersion: "v3.15.0",
+    ocpDir: "/nonexistent-ocp-dir-for-test"
+  });
+  assert.equal(result.latest_version, "v3.15.0");
+  assert.equal(result.next_action.kind, "noop");
+});
+
 // ── Upgrade Tests ──
 import { runUpgrade } from "./scripts/upgrade.mjs";
 
