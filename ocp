@@ -901,6 +901,6 @@ case "$subcmd" in
   connect)  cmd_connect "$@" ;;
   restart)  cmd_restart "${1:-}" ;;
   doctor)   cmd_doctor "$@" ;;
-  update)   cmd_update "${1:-}" ;;
+  update)   cmd_update "$@" ;;
   *)        echo "Unknown command: $subcmd"; echo ""; cmd_help; exit 1 ;;
 esac
