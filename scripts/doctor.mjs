@@ -48,7 +48,19 @@ export async function runDoctor(opts = {}) {
       currentVersion = "unknown";
     }
   }
-  const latestVersion = opts.mockLatest || "v3.14.0";
+  // Resolve latest from origin/main (cheap: `git show origin/main:package.json`).
+  // Falls back to current_version when network/git unavailable, so kind = noop instead
+  // of recommending a downgrade against a stale hardcoded value.
+  let latestVersion = opts.mockLatest;
+  if (!latestVersion) {
+    try {
+      const out = execSync(`git -C ${ocpDir} show origin/main:package.json 2>/dev/null`, { stdio: ["pipe", "pipe", "pipe"] }).toString();
+      const remotePkg = JSON.parse(out);
+      latestVersion = `v${remotePkg.version}`;
+    } catch {
+      latestVersion = currentVersion;
+    }
+  }
   push("current_version", "PASS", `current=${currentVersion}`);
 
   // --- from-version supported? ---
