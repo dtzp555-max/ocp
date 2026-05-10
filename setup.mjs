@@ -13,6 +13,7 @@
  *   5. Optionally starts the proxy
  */
 import { readFileSync, writeFileSync, existsSync, mkdirSync, unlinkSync, readdirSync, chmodSync } from "node:fs";
+import { mergePlistEnv, mergeSystemdEnv } from "./scripts/lib/plist-merge.mjs";
 import { execSync } from "node:child_process";
 import { join, dirname } from "node:path";
 import { homedir } from "node:os";
@@ -424,9 +425,15 @@ if (!DRY_RUN) {
 </plist>
 `;
 
-    writeFileSync(plistPath, plistXml);
+    const existingPlist = existsSync(plistPath) ? readFileSync(plistPath, "utf8") : null;
+    const finalPlistXml = mergePlistEnv(existingPlist, plistXml);
+    writeFileSync(plistPath, finalPlistXml);
     chmodSync(plistPath, 0o600);
-    log(`Plist written: ${plistPath} (mode 600)`);
+    if (existingPlist && finalPlistXml !== plistXml) {
+      log(`Plist written: ${plistPath} (mode 600, preserved user env vars)`);
+    } else {
+      log(`Plist written: ${plistPath} (mode 600)`);
+    }
 
     // Bootout first (in case it was already loaded) then bootstrap
     try { execSync(`launchctl bootout gui/$(id -u) "${plistPath}" 2>/dev/null`); } catch { /* ignore */ }
@@ -459,9 +466,15 @@ StandardError=append:${logPath}
 WantedBy=default.target
 `;
 
-    writeFileSync(servicePath, serviceUnit);
+    const existingService = existsSync(servicePath) ? readFileSync(servicePath, "utf8") : null;
+    const finalServiceUnit = mergeSystemdEnv(existingService, serviceUnit);
+    writeFileSync(servicePath, finalServiceUnit);
     chmodSync(servicePath, 0o600);
-    log(`Service file written: ${servicePath} (mode 600)`);
+    if (existingService && finalServiceUnit !== serviceUnit) {
+      log(`Service file written: ${servicePath} (mode 600, preserved user env vars)`);
+    } else {
+      log(`Service file written: ${servicePath} (mode 600)`);
+    }
 
     execSync(`systemctl --user daemon-reload`);
     execSync(`systemctl --user enable ocp-proxy`);
