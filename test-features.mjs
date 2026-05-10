@@ -574,6 +574,71 @@ test("mergeSystemdEnv is idempotent", () => {
   assert.equal(mergeSystemdEnv(r1, SAMPLE_TEMPLATE_SYSTEMD), r1);
 });
 
+// ── Doctor JSON Contract Tests ──
+import { runDoctor } from "./scripts/doctor.mjs";
+
+console.log("\nDoctor:");
+
+test("doctor --json shape: required top-level keys", async () => {
+  const result = await runDoctor({ skipNetwork: true, mockVersion: "v3.10.0", mockLatest: "v3.14.0" });
+  for (const k of ["schema_version", "ready_to_upgrade", "current_version", "latest_version",
+                   "from_version_supported", "fail_count", "warn_count", "checks", "next_action"]) {
+    assert.ok(k in result, `missing key: ${k}`);
+  }
+  assert.equal(result.schema_version, "1");
+});
+
+test("doctor detects from-version < v3.4.0 → fresh_install", async () => {
+  const result = await runDoctor({ skipNetwork: true, mockVersion: "v3.2.0", mockLatest: "v3.14.0" });
+  assert.equal(result.from_version_supported, false);
+  assert.equal(result.next_action.kind, "fresh_install");
+  assert.ok(Array.isArray(result.next_action.ai_executable));
+  assert.ok(result.next_action.ai_executable.length > 0);
+});
+
+test("doctor next_action.kind enum is one of allowed values", async () => {
+  const result = await runDoctor({ skipNetwork: true, mockVersion: "v3.10.0", mockLatest: "v3.14.0" });
+  const ALLOWED = ["noop", "update", "upgrade", "fresh_install", "fix_oauth", "fix_service"];
+  assert.ok(ALLOWED.includes(result.next_action.kind), `kind=${result.next_action.kind} not in enum`);
+});
+
+test("doctor noop when current==latest", async () => {
+  const result = await runDoctor({ skipNetwork: true, mockVersion: "v3.14.0", mockLatest: "v3.14.0" });
+  assert.equal(result.next_action.kind, "noop");
+  assert.equal(result.ready_to_upgrade, true);
+});
+
+test("doctor patch-bump same minor → update kind", async () => {
+  const result = await runDoctor({ skipNetwork: true, mockVersion: "v3.14.0", mockLatest: "v3.14.1" });
+  assert.equal(result.next_action.kind, "update");
+});
+
+test("doctor cross-minor → upgrade kind", async () => {
+  const result = await runDoctor({ skipNetwork: true, mockVersion: "v3.10.0", mockLatest: "v3.14.0" });
+  assert.equal(result.next_action.kind, "upgrade");
+});
+
+test("doctor OAuth FAIL → fix_oauth kind", async () => {
+  const result = await runDoctor({
+    skipNetwork: false,
+    mockVersion: "v3.10.0",
+    mockLatest: "v3.14.0",
+    mockHealth: { status: 200, body: { auth: { ok: false, message: "ENOEXEC" } } }
+  });
+  assert.equal(result.next_action.kind, "fix_oauth");
+  assert.ok(result.next_action.ai_executable.some(c => c.includes("install.cjs")));
+});
+
+test("doctor service down → fix_service kind", async () => {
+  const result = await runDoctor({
+    skipNetwork: false,
+    mockVersion: "v3.10.0",
+    mockLatest: "v3.14.0",
+    mockHealth: { error: "ECONNREFUSED" }
+  });
+  assert.equal(result.next_action.kind, "fix_service");
+});
+
 // ── Cleanup ──
 closeDb();
 
