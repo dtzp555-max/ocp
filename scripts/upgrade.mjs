@@ -13,7 +13,7 @@ import { runDoctor } from "./doctor.mjs";
 import { execSync } from "node:child_process";
 import { homedir } from "node:os";
 import { join } from "node:path";
-import { existsSync, copyFileSync, mkdirSync } from "node:fs";
+import { existsSync, copyFileSync } from "node:fs";
 import { writeSnapshot, listSnapshots, readSnapshot } from "./lib/snapshot.mjs";
 
 export async function runUpgrade(opts = {}) {
@@ -180,8 +180,9 @@ async function runFreshInstall({ doctor, opts }) {
         execSync(cmd, { stdio: "inherit" });
         steps.push({ cmd, status: "ok" });
       } catch (e) {
-        steps.push({ cmd, status: "fail", error: String(e.message || e) });
-        throw Object.assign(new Error(`fresh_install step failed: ${cmd}`), { steps });
+        const detail = e.stderr?.toString().trim() || e.message;
+        steps.push({ cmd, status: "fail", error: String(detail) });
+        throw Object.assign(new Error(`fresh_install step failed: ${cmd} — ${detail}`), { steps });
       }
     }
   }
@@ -202,7 +203,7 @@ async function runRollback(opts) {
   const target = opts.snapshotPath
     ? snapshots.find(s => s.path === opts.snapshotPath)
     : snapshots[snapshots.length - 1];
-  if (!target) throw new Error(`snapshot not found: ${opts.snapshotPath}`);
+  if (!target) throw new Error(`snapshot not found: ${opts.snapshotPath} (must be inside ~/.ocp/upgrade-snapshot-*)`);
 
   const meta = opts.mockSnapshotMeta ?? readSnapshot(target.path);
   if (!meta.fromCommit) throw new Error(`snapshot ${target.path} has no from-commit.txt`);
