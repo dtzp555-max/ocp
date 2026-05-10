@@ -256,6 +256,9 @@ function runOauthOnly(opts, checks, push) {
   }
 
   const fail_count = checks.filter(c => c.level === "FAIL").length;
+  // "skipped" = --check oauth fast path intentionally omits version detection.
+  // AI agents should NOT semver-compare against current_version/latest_version when
+  // either equals "skipped"; the full path provides those fields when needed.
   return {
     schema_version: SCHEMA_VERSION,
     timestamp: new Date().toISOString(),

@@ -883,6 +883,17 @@ await asyncTest("doctor --check oauth + service down → fix_service", async () 
   assert.equal(result.fail_count, 1);
 });
 
+await asyncTest("doctor --check oauth + 200 with null body → fix_service", async () => {
+  const result = await runDoctor({
+    checkOnly: "oauth",
+    mockHealth: { status: 200, body: null }
+  });
+  const ids = result.checks.map(c => c.id);
+  assert.deepEqual(ids, ["oauth_ok"]);
+  assert.equal(result.next_action.kind, "fix_service");
+  assert.equal(result.fail_count, 1);
+});
+
 // ── Cleanup ──
 closeDb();
 
