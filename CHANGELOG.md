@@ -1,5 +1,38 @@
 # Changelog
 
+## v3.15.0 — 2026-XX-XX (release date filled at tag time)
+
+### Features
+
+- **`ocp doctor`** — health & upgrade-readiness check; primary entry for AI-driven debugging.
+  `--json` mode emits a `next_action` with `ai_executable[]` for agents to run verbatim
+  and `human_required[]` for steps requiring the user (typically only OAuth).
+- **`ocp update` cross-version path** — for cross-minor jumps (e.g. v3.10 → v3.14),
+  `ocp update` now runs doctor → snapshot → `setup.mjs` (with the plist env-merge from
+  PR #90) → service restart → post-flight `/health` + `/v1/models` verification.
+  Same-patch updates retain the existing light path; users see no change for routine
+  patch bumps.
+- **`ocp update --rollback`** — restore the most recent (or specified) upgrade snapshot.
+  Snapshots are saved to `~/.ocp/upgrade-snapshot-<ISO-ts>/` and never auto-deleted.
+- **Fresh-install routing** — `ocp update` on installations < v3.4.0 routes to a fresh-install
+  flow (with `--yes` to skip confirmation; AI agents pass this). OAuth survives via Claude
+  Code's credential store; users do not re-OAuth unless their token was independently broken.
+- **AI prompt blocks in README** — §Installation, §Upgrading, and §Troubleshooting each
+  start with a copy-paste prompt for Claude Code / Cursor / Copilot, so users can drive
+  install / setup / upgrade through their existing AI assistant.
+
+### Behavior changes
+
+- `ocp update` may take 10–30s longer when a cross-minor jump triggers the full path
+  (snapshot + post-flight). Patch bumps are unchanged.
+- Pre-v3.4.0 installs are routed to fresh-install rather than failing silently or
+  half-migrating.
+
+### Governance
+
+- No `cli.js` citation needed (no `server.mjs` change). ALIGNMENT.md Rule 2 not engaged.
+- Depends on PR #90 (plist env merge bug fix; merged before this release).
+
 ## v3.14.0 — 2026-05-10
 
 ### Features (security hardening)
