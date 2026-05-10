@@ -639,6 +639,22 @@ test("doctor service down → fix_service kind", async () => {
   assert.equal(result.next_action.kind, "fix_service");
 });
 
+test("doctor unparseable version → fresh_install", async () => {
+  const result = await runDoctor({ skipNetwork: true, mockVersion: "garbage", mockLatest: "v3.14.0" });
+  assert.equal(result.from_version_supported, false);
+  assert.equal(result.next_action.kind, "fresh_install");
+});
+
+test("doctor empty health body → fix_service (not fix_oauth)", async () => {
+  const result = await runDoctor({
+    skipNetwork: false,
+    mockVersion: "v3.10.0",
+    mockLatest: "v3.14.0",
+    mockHealth: { status: 200, body: null }
+  });
+  assert.equal(result.next_action.kind, "fix_service");
+});
+
 // ── Cleanup ──
 closeDb();
 

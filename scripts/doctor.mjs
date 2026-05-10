@@ -17,7 +17,6 @@ import { homedir } from "node:os";
 import { execSync } from "node:child_process";
 
 const SCHEMA_VERSION = "1";
-const KIND_ENUM = ["noop", "update", "upgrade", "fresh_install", "fix_oauth", "fix_service"];
 
 function semverParts(v) {
   const m = String(v).replace(/^v/, "").match(/^(\d+)\.(\d+)\.(\d+)/);
@@ -53,7 +52,7 @@ export async function runDoctor(opts = {}) {
   push("current_version", "PASS", `current=${currentVersion}`);
 
   // --- from-version supported? ---
-  const fromSupported = semverCompare(currentVersion, "v3.4.0") >= 0;
+  const fromSupported = !!semverParts(currentVersion) && semverCompare(currentVersion, "v3.4.0") >= 0;
   push("from_version_supported", fromSupported ? "PASS" : "FAIL",
        fromSupported ? "≥ v3.4.0" : `${currentVersion} < v3.4.0; in-place upgrade not supported`);
 
@@ -75,6 +74,9 @@ export async function runDoctor(opts = {}) {
     if (health.error || health.status !== 200) {
       healthOk = false;
       push("service_running", "FAIL", `service unreachable: ${health.error || `status ${health.status}`}`);
+    } else if (!health.body || typeof health.body !== "object") {
+      healthOk = false;
+      push("service_running", "FAIL", "service /health returned 200 but empty/non-JSON body");
     } else {
       push("service_running", "PASS", "service responding on /health");
       const authOk = health.body?.auth?.ok;
@@ -95,11 +97,13 @@ export async function runDoctor(opts = {}) {
     kind = "fix_service";
   } else if (!opts.skipNetwork && !oauthOk) {
     kind = "fix_oauth";
-  } else if (semverCompare(currentVersion, latestVersion) === 0) {
-    kind = "noop";
   } else {
     const cur = semverParts(currentVersion), lat = semverParts(latestVersion);
-    if (cur && lat && cur.major === lat.major && cur.minor === lat.minor) {
+    if (!cur) {
+      kind = "fresh_install";
+    } else if (semverCompare(currentVersion, latestVersion) === 0) {
+      kind = "noop";
+    } else if (lat && cur.major === lat.major && cur.minor === lat.minor) {
       kind = "update";
     } else {
       kind = "upgrade";
