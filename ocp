@@ -794,6 +794,30 @@ cmd_update() {
   echo "Done."
 }
 
+cmd_doctor_help() {
+  cat <<'EOF'
+ocp doctor — Health & upgrade-readiness check
+
+Runs a series of checks (Node version, git state, service health,
+OAuth token, plist customisation, OpenClaw provider) and emits either
+human-readable PASS/WARN/FAIL output or a JSON next_action that
+AI agents can execute.
+
+Usage:
+  ocp doctor              Human-readable output
+  ocp doctor --json       JSON for AI agents and ocp update internal use
+  ocp doctor --check oauth    Fast path: OAuth check only
+EOF
+}
+
+cmd_doctor() {
+  local script_dir self
+  self="${BASH_SOURCE[0]}"
+  while [[ -L "$self" ]]; do self="$(readlink "$self")"; done
+  script_dir="$(cd "$(dirname "$self")" && pwd)"
+  exec node "$script_dir/scripts/doctor.mjs" "$@"
+}
+
 # ── help ─────────────────────────────────────────────────────────────────
 cmd_help() {
   cat <<'EOF'
@@ -859,6 +883,7 @@ case "$subcmd" in
   lan)      cmd_lan ;;
   connect)  cmd_connect "$@" ;;
   restart)  cmd_restart "${1:-}" ;;
+  doctor)   cmd_doctor "$@" ;;
   update)   cmd_update "${1:-}" ;;
   *)        echo "Unknown command: $subcmd"; echo ""; cmd_help; exit 1 ;;
 esac
