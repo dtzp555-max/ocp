@@ -577,9 +577,9 @@ ocp update                  # smart-pick path
 ocp update --check          # show available updates, don't apply
 ocp update --dry-run        # preview plan
 ocp update --target v3.13.0 # pin a specific version
-ocp update --rollback       # restore most recent snapshot
-ocp update --rollback --list
-ocp update --rollback --dry-run
+ocp update --rollback --yes # restore most recent snapshot (--yes confirms)
+ocp update --rollback --list      # list snapshots, no mutation
+ocp update --rollback --dry-run   # preview rollback plan
 ```
 
 ### When upgrade fails
@@ -587,7 +587,7 @@ ocp update --rollback --dry-run
 `ocp update` prints a recovery line on failure. To restore from the snapshot:
 
 ```bash
-ocp update --rollback
+ocp update --rollback --yes   # --yes confirms the destructive restore
 ocp doctor
 ```
 
