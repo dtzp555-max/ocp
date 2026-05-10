@@ -14,7 +14,7 @@ import { execSync } from "node:child_process";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { existsSync, copyFileSync } from "node:fs";
-import { writeSnapshot, listSnapshots, readSnapshot } from "./lib/snapshot.mjs";
+import { writeSnapshot, listSnapshots, readSnapshot, gcSnapshots } from "./lib/snapshot.mjs";
 
 export async function runUpgrade(opts = {}) {
   const dryRun = !!opts.dryRun;
@@ -154,6 +154,16 @@ async function runFullUpgrade({ doctor, opts }) {
       phases.push({ name: "post-flight", status: "skipped-mock" });
     }
 
+    // Auto-GC old snapshots after successful upgrade (best-effort, never throws).
+    try {
+      const gc = gcSnapshots(homedir(), { keepCount: 5, keepDays: 30 });
+      if (gc.removed.length > 0) {
+        console.error(`[gc] removed ${gc.removed.length} old snapshots; kept ${gc.kept.length}`);
+      }
+    } catch (e) {
+      console.error(`[gc] warn: snapshot GC failed: ${e.message}`);
+    }
+
     return { path: "upgrade", executed: true, changed: true, snapshotPath, phases };
   } catch (err) {
     if (snapshotPath && !err.snapshotPath) {
@@ -192,6 +202,11 @@ async function runFreshInstall({ doctor, opts }) {
 async function runRollback(opts) {
   const homeDir = opts.homeDir || homedir();
   const snapshots = opts.mockSnapshots ?? listSnapshots(homeDir);
+
+  if (opts.gc) {
+    const result = gcSnapshots(homeDir, { dryRun: opts.dryRun });
+    return { path: opts.dryRun ? "rollback-gc-dry-run" : "rollback-gc", ...result };
+  }
 
   if (opts.list) {
     return { path: "rollback-list", snapshots };
@@ -295,6 +310,7 @@ if (_isMain()) {
   const yes = args.includes("--yes");
   const rollback = args.includes("--rollback");
   const list = args.includes("--list");
+  const gc = args.includes("--gc");
   const targetIdx = args.indexOf("--target");
   const target = targetIdx !== -1 ? args[targetIdx + 1] : undefined;
   // First non-flag positional after --rollback is the snapshot path
@@ -305,13 +321,17 @@ if (_isMain()) {
     if (cand && !cand.startsWith("--")) snapshotPath = cand;
   }
   try {
-    const result = await runUpgrade({ dryRun, yes, rollback, list, snapshotPath, target });
+    const result = await runUpgrade({ dryRun, yes, rollback, list, gc, snapshotPath, target });
     if (result.plan) for (const line of result.plan) console.log(line);
     if (result.phases) for (const p of result.phases) console.log(`[${p.name}] ${p.status}${p.cmd ? `: ${p.cmd}` : ""}`);
     if (result.steps) for (const s of result.steps) console.log(`  ${s.status === "ok" ? "✓" : s.status === "skipped-mock" ? "·" : "✗"} ${s.cmd}`);
     if (result.snapshots) {
       console.log(`Found ${result.snapshots.length} snapshots:`);
       for (const s of result.snapshots) console.log(`  ${s.name}`);
+    }
+    if (result.removed && result.kept) {
+      console.log(`Snapshots: kept ${result.kept.length}, ${result.dryRun ? "would remove" : "removed"} ${result.removed.length}`);
+      for (const s of result.removed) console.log(`  - ${s.name}`);
     }
     process.exit(0);
   } catch (e) {
