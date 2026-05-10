@@ -564,6 +564,16 @@ test("mergeSystemdEnv first-install returns template unchanged", () => {
   assert.equal(mergeSystemdEnv("", SAMPLE_TEMPLATE_SYSTEMD), SAMPLE_TEMPLATE_SYSTEMD);
 });
 
+test("mergePlistEnv is idempotent", () => {
+  const r1 = mergePlistEnv(SAMPLE_EXISTING_PLIST, SAMPLE_TEMPLATE_PLIST);
+  assert.equal(mergePlistEnv(r1, SAMPLE_TEMPLATE_PLIST), r1);
+});
+
+test("mergeSystemdEnv is idempotent", () => {
+  const r1 = mergeSystemdEnv(SAMPLE_EXISTING_SYSTEMD, SAMPLE_TEMPLATE_SYSTEMD);
+  assert.equal(mergeSystemdEnv(r1, SAMPLE_TEMPLATE_SYSTEMD), r1);
+});
+
 // ── Cleanup ──
 closeDb();
 

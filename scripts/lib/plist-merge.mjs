@@ -13,6 +13,7 @@ const PLIST_KV_RE = /<key>([^<]+)<\/key>\s*<string>([^<]*)<\/string>/g;
 
 export function parsePlistEnv(plistContent) {
   if (!plistContent) return {};
+  if (Buffer.isBuffer(plistContent)) plistContent = plistContent.toString("utf8");
   // Restrict to the EnvironmentVariables dict to avoid catching Label, etc.
   const envBlock = plistContent.match(/<key>EnvironmentVariables<\/key>\s*<dict>([\s\S]*?)<\/dict>/);
   if (!envBlock) return {};
@@ -52,6 +53,7 @@ const SYSTEMD_KV_RE = /^Environment=([^=]+)=(.*)$/gm;
 
 export function parseSystemdEnv(serviceContent) {
   if (!serviceContent) return {};
+  if (Buffer.isBuffer(serviceContent)) serviceContent = serviceContent.toString("utf8");
   const out = {};
   let m;
   SYSTEMD_KV_RE.lastIndex = 0;
@@ -71,6 +73,10 @@ export function mergeSystemdEnv(existing, template) {
     .filter(([k]) => !KNOWN.has(k))
     .map(([k, v]) => `Environment=${k}=${v}`);
   if (preservedLines.length === 0) return template;
+
+  // Guard: if template has no Environment= anchor, cannot inject — return template as-is.
+  // (In practice the OCP systemd template always has Environment= lines.)
+  if (!/^Environment=/m.test(template)) return template;
 
   // Inject after the last existing Environment= line in the template
   return template.replace(
