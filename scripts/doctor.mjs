@@ -178,8 +178,17 @@ export async function runDoctor(opts = {}) {
   };
 }
 
-// CLI entrypoint
-if (import.meta.url === `file://${process.argv[1]}`) {
+// CLI entrypoint — use fileURLToPath + realpath to handle symlinked install paths
+// (e.g. /tmp/ → /private/tmp/ on macOS would otherwise miss the guard).
+import { fileURLToPath } from "node:url";
+import { realpathSync } from "node:fs";
+function _isMain() {
+  if (!process.argv[1]) return false;
+  try {
+    return realpathSync(fileURLToPath(import.meta.url)) === realpathSync(process.argv[1]);
+  } catch { return false; }
+}
+if (_isMain()) {
   const wantJson = process.argv.includes("--json");
   const result = await runDoctor();
   if (wantJson) {

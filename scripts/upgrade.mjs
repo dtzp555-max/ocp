@@ -280,8 +280,16 @@ async function runRollback(opts) {
   return { path: "rollback", executed: true, changed: true, target: target.path, phases };
 }
 
-// CLI entrypoint
-if (import.meta.url === `file://${process.argv[1]}`) {
+// CLI entrypoint — use fileURLToPath + realpath to handle symlinked install paths.
+import { fileURLToPath } from "node:url";
+import { realpathSync } from "node:fs";
+function _isMain() {
+  if (!process.argv[1]) return false;
+  try {
+    return realpathSync(fileURLToPath(import.meta.url)) === realpathSync(process.argv[1]);
+  } catch { return false; }
+}
+if (_isMain()) {
   const args = process.argv.slice(2);
   const dryRun = args.includes("--dry-run");
   const yes = args.includes("--yes");
