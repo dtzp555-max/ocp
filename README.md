@@ -69,6 +69,20 @@ Any tool that accepts `OPENAI_BASE_URL` works with OCP:
 
 ## Installation
 
+The simplest path: ask your AI.
+
+  Paste this prompt to Claude Code / Cursor / Copilot:
+
+  ```
+  Install OCP for me. Read README §Manual Installation and follow it.
+  Tell me when I need to run `claude auth login`.
+  ```
+
+The AI will run `git clone`, `npm install`, `node setup.mjs`, and tell you
+when to OAuth.
+
+### Manual Installation
+
 OCP has two roles: **Server** (runs the proxy, needs Claude CLI) and **Client** (connects to a server, zero dependencies).
 
 ```
@@ -501,6 +515,7 @@ ocp keys               List all API keys (multi mode)
 ocp keys add <name>    Create a new API key
 ocp keys revoke <name> Revoke an API key
 ocp connect <ip>       One-command LAN client setup
+ocp doctor             Health & upgrade-readiness check; primary entry for AI-driven debugging. --json produces a next_action for AI agents.
 ocp lan                Show LAN connection info & IP
 ocp settings           View tunable settings
 ocp settings <k> <v>   Update a setting at runtime
@@ -527,17 +542,57 @@ ocp --help
 
 > **Cloud/Linux servers:** If `ocp: command not found`, the binary isn't in PATH. Full path: `~/.openclaw/projects/ocp/ocp`
 
-### Self-Update
+## Upgrading
+
+The simplest path: ask your AI.
+
+  Paste this prompt:
+
+  ```
+  Upgrade my OCP. Run `ocp update` and follow whatever it says.
+  If it tells me to run `claude auth login`, I'll do that.
+  ```
+
+What `ocp update` does:
+
+- **Patch bump** (e.g. `v3.14.0 → v3.14.1`):
+  light path (git pull + npm install + restart).
+- **Cross-minor** (e.g. `v3.10 → v3.14`):
+  full path: pre-flight check, snapshot, `setup.mjs` (with plist env-merge),
+  service restart, post-flight `/health` and `/v1/models` verification.
+- **Old version** (< v3.4.0):
+  fresh-install. Pre-v3.4 lacked admin-key/usage-db, so there is nothing to
+  migrate. Your OAuth token (managed by the Claude Code CLI, not OCP) is
+  preserved; you do not need to re-OAuth unless your token expired
+  separately.
+
+Snapshots are saved to `~/.ocp/upgrade-snapshot-<ISO-ts>/` and never
+auto-deleted. Clean old ones with `rm -rf ~/.ocp/upgrade-snapshot-*` once
+you're confident the upgrade is stable.
+
+### Manual upgrade — same command, no AI
 
 ```bash
-# Check if a new version is available
-ocp update --check
-
-# Pull latest, sync plugin, restart proxy — one command
-ocp update
+ocp update                  # smart-pick path
+ocp update --check          # show available updates, don't apply
+ocp update --dry-run        # preview plan
+ocp update --target v3.13.0 # pin a specific version
+ocp update --rollback --yes # restore most recent snapshot (--yes confirms)
+ocp update --rollback --list      # list snapshots, no mutation
+ocp update --rollback --dry-run   # preview rollback plan
 ```
 
-`ocp update` runs (in order): `git pull` → `npm install` → plugin sync → **OpenClaw model registry sync** (v3.11.0+) → proxy restart → health check.
+### When upgrade fails
+
+`ocp update` prints a recovery line on failure. To restore from the snapshot:
+
+```bash
+ocp update --rollback --yes   # --yes confirms the destructive restore
+ocp doctor
+```
+
+If `ocp doctor` still reports problems after rollback, open a GitHub issue
+with the snapshot path and the doctor JSON output (`ocp doctor --json`).
 
 ### OpenClaw Auto-Sync (v3.11.0+)
 
@@ -709,6 +764,21 @@ After installing the gateway plugin, use `/ocp` slash commands in your chat:
 > **Note:** Terminal CLI uses `ocp <command>`, Telegram/Discord uses `/ocp <command>`.
 
 ## Troubleshooting
+
+The simplest path: ask your AI.
+
+  Paste this prompt:
+
+  ```
+  Run `ocp doctor` and follow its `next_action`. Tell me if you hit
+  anything that needs human input.
+  ```
+
+The doctor produces a JSON `next_action` with `ai_executable[]` (commands
+the agent runs verbatim) and `human_required[]` (steps that need you,
+typically just OAuth).
+
+### Manual debugging
 
 ### Setup fails with "claude: command not found"
 

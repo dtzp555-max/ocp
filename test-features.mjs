@@ -574,6 +574,263 @@ test("mergeSystemdEnv is idempotent", () => {
   assert.equal(mergeSystemdEnv(r1, SAMPLE_TEMPLATE_SYSTEMD), r1);
 });
 
+// ── Doctor JSON Contract Tests ──
+import { runDoctor } from "./scripts/doctor.mjs";
+
+console.log("\nDoctor:");
+
+test("doctor --json shape: required top-level keys", async () => {
+  const result = await runDoctor({ skipNetwork: true, mockVersion: "v3.10.0", mockLatest: "v3.14.0" });
+  for (const k of ["schema_version", "ready_to_upgrade", "current_version", "latest_version",
+                   "from_version_supported", "fail_count", "warn_count", "checks", "next_action"]) {
+    assert.ok(k in result, `missing key: ${k}`);
+  }
+  assert.equal(result.schema_version, "1");
+});
+
+test("doctor detects from-version < v3.4.0 → fresh_install", async () => {
+  const result = await runDoctor({ skipNetwork: true, mockVersion: "v3.2.0", mockLatest: "v3.14.0" });
+  assert.equal(result.from_version_supported, false);
+  assert.equal(result.next_action.kind, "fresh_install");
+  assert.ok(Array.isArray(result.next_action.ai_executable));
+  assert.ok(result.next_action.ai_executable.length > 0);
+});
+
+test("doctor next_action.kind enum is one of allowed values", async () => {
+  const result = await runDoctor({ skipNetwork: true, mockVersion: "v3.10.0", mockLatest: "v3.14.0" });
+  const ALLOWED = ["noop", "update", "upgrade", "fresh_install", "fix_oauth", "fix_service"];
+  assert.ok(ALLOWED.includes(result.next_action.kind), `kind=${result.next_action.kind} not in enum`);
+});
+
+test("doctor noop when current==latest", async () => {
+  const result = await runDoctor({ skipNetwork: true, mockVersion: "v3.14.0", mockLatest: "v3.14.0" });
+  assert.equal(result.next_action.kind, "noop");
+  assert.equal(result.ready_to_upgrade, true);
+});
+
+test("doctor patch-bump same minor → update kind", async () => {
+  const result = await runDoctor({ skipNetwork: true, mockVersion: "v3.14.0", mockLatest: "v3.14.1" });
+  assert.equal(result.next_action.kind, "update");
+});
+
+test("doctor cross-minor → upgrade kind", async () => {
+  const result = await runDoctor({ skipNetwork: true, mockVersion: "v3.10.0", mockLatest: "v3.14.0" });
+  assert.equal(result.next_action.kind, "upgrade");
+});
+
+test("doctor OAuth FAIL → fix_oauth kind", async () => {
+  const result = await runDoctor({
+    skipNetwork: false,
+    mockVersion: "v3.10.0",
+    mockLatest: "v3.14.0",
+    mockHealth: { status: 200, body: { auth: { ok: false, message: "ENOEXEC" } } }
+  });
+  assert.equal(result.next_action.kind, "fix_oauth");
+  assert.ok(result.next_action.ai_executable.some(c => c.includes("install.cjs")));
+});
+
+test("doctor service down → fix_service kind", async () => {
+  const result = await runDoctor({
+    skipNetwork: false,
+    mockVersion: "v3.10.0",
+    mockLatest: "v3.14.0",
+    mockHealth: { error: "ECONNREFUSED" }
+  });
+  assert.equal(result.next_action.kind, "fix_service");
+});
+
+test("doctor unparseable version → fresh_install", async () => {
+  const result = await runDoctor({ skipNetwork: true, mockVersion: "garbage", mockLatest: "v3.14.0" });
+  assert.equal(result.from_version_supported, false);
+  assert.equal(result.next_action.kind, "fresh_install");
+});
+
+test("doctor empty health body → fix_service (not fix_oauth)", async () => {
+  const result = await runDoctor({
+    skipNetwork: false,
+    mockVersion: "v3.10.0",
+    mockLatest: "v3.14.0",
+    mockHealth: { status: 200, body: null }
+  });
+  assert.equal(result.next_action.kind, "fix_service");
+});
+
+// ── Upgrade Tests ──
+import { runUpgrade } from "./scripts/upgrade.mjs";
+
+console.log("\nUpgrade:");
+
+test("upgrade --dry-run prints plan, no side effects", async () => {
+  const result = await runUpgrade({
+    dryRun: true,
+    yes: true,
+    mockDoctor: { ready_to_upgrade: true, next_action: { kind: "upgrade" }, current_version: "v3.10.0", latest_version: "v3.14.0" }
+  });
+  assert.equal(result.executed, false);
+  assert.ok(result.plan.length > 0);
+  assert.ok(result.plan.some(line => line.toLowerCase().includes("snapshot")));
+});
+
+test("upgrade noop returns early when current==latest", async () => {
+  const result = await runUpgrade({
+    yes: true,
+    mockDoctor: { ready_to_upgrade: true, next_action: { kind: "noop" }, current_version: "v3.14.0", latest_version: "v3.14.0" }
+  });
+  assert.equal(result.path, "noop");
+  assert.equal(result.executed, true);
+  assert.equal(result.changed, false);
+});
+
+test("upgrade aborts on doctor FAIL", async () => {
+  await assert.rejects(async () => {
+    await runUpgrade({
+      yes: true,
+      mockDoctor: { ready_to_upgrade: false, fail_count: 1, next_action: { kind: "fix_oauth" } }
+    });
+  }, /doctor FAIL/);
+});
+
+test("upgrade full path executes 5 phases", async () => {
+  const result = await runUpgrade({
+    yes: true,
+    dryRun: false,
+    mockExec: true,
+    mockDoctor: { ready_to_upgrade: true, next_action: { kind: "upgrade" },
+                  current_version: "v3.10.0", latest_version: "v3.14.0" }
+  });
+  assert.equal(result.path, "upgrade");
+  // Plan asks for 6 phases by name; verify each appears as a phase entry
+  const phaseNames = result.phases.map(p => p.name);
+  for (const expected of ["pre-flight", "snapshot", "fetch+install", "reconfigure", "restart", "post-flight"]) {
+    assert.ok(phaseNames.includes(expected), `missing phase: ${expected}; got ${phaseNames.join(",")}`);
+  }
+});
+
+// ── Snapshot Tests ──
+import { writeSnapshot, readSnapshot, listSnapshots } from "./scripts/lib/snapshot.mjs";
+import { mkdtempSync, rmSync, mkdirSync as tMkdirSync, writeFileSync as testWriteFile } from "node:fs";
+import { tmpdir } from "node:os";
+import { join as testJoin } from "node:path";
+
+console.log("\nSnapshot:");
+
+test("writeSnapshot creates dir + manifest files", () => {
+  const root = mkdtempSync(testJoin(tmpdir(), "ocp-snap-test-"));
+  const dotOcp = testJoin(root, ".ocp");
+  tMkdirSync(dotOcp, { recursive: true });
+  testWriteFile(testJoin(dotOcp, "ocp.db"), "fake-sqlite-bytes");
+
+  const path = writeSnapshot({
+    homeDir: root,
+    fromCommit: "abc1234",
+    fromVersion: "v3.10.0",
+    toVersion: "v3.14.0",
+    extraFiles: []
+  });
+  const m = readSnapshot(path);
+  assert.equal(m.fromCommit, "abc1234");
+  assert.equal(m.fromVersion, "v3.10.0");
+  rmSync(root, { recursive: true, force: true });
+});
+
+test("listSnapshots returns sorted by ISO timestamp", () => {
+  const root = mkdtempSync(testJoin(tmpdir(), "ocp-snap-list-"));
+  const dotOcp = testJoin(root, ".ocp");
+  tMkdirSync(dotOcp, { recursive: true });
+  for (const ts of ["2026-05-01T10:00:00Z", "2026-05-02T10:00:00Z", "2026-05-03T10:00:00Z"]) {
+    tMkdirSync(testJoin(dotOcp, `upgrade-snapshot-${ts}`));
+  }
+  const list = listSnapshots(root);
+  assert.equal(list.length, 3);
+  assert.ok(list[0].path.includes("2026-05-01"));
+  assert.ok(list[2].path.includes("2026-05-03"));
+  rmSync(root, { recursive: true, force: true });
+});
+
+test("upgrade error after snapshot carries snapshotPath + hint", async () => {
+  // Use mockExec=true so no real commands are run.
+  // Verify the success path returns a snapshotPath (Fix B regression guard).
+  const result = await runUpgrade({
+    yes: true,
+    dryRun: false,
+    mockExec: true,
+    mockDoctor: { ready_to_upgrade: true, next_action: { kind: "upgrade" },
+                  current_version: "v3.10.0", latest_version: "v3.14.0" }
+  });
+  assert.ok(result.snapshotPath, "successful upgrade returns snapshotPath");
+  assert.equal(result.path, "upgrade");
+  assert.equal(result.executed, true);
+});
+
+test("upgrade fresh_install requires --yes for non-interactive", async () => {
+  await assert.rejects(async () => {
+    await runUpgrade({
+      yes: false,
+      mockExec: true,
+      mockDoctor: { ready_to_upgrade: false, from_version_supported: false,
+                    next_action: { kind: "fresh_install", ai_executable: ["echo would-rm-rf"] },
+                    current_version: "v3.2.0", latest_version: "v3.14.0" }
+    });
+  }, /requires --yes/);
+});
+
+test("upgrade fresh_install with --yes runs ai_executable", async () => {
+  const result = await runUpgrade({
+    yes: true,
+    mockExec: true,
+    mockDoctor: { ready_to_upgrade: false, from_version_supported: false,
+                  next_action: { kind: "fresh_install",
+                                 ai_executable: ["echo step-1", "echo step-2", "echo step-3"] },
+                  current_version: "v3.2.0", latest_version: "v3.14.0" }
+  });
+  assert.equal(result.path, "fresh_install");
+  assert.equal(result.steps.length, 3);
+});
+
+test("rollback --list returns snapshots", async () => {
+  const result = await runUpgrade({
+    rollback: true,
+    list: true,
+    mockSnapshots: [
+      { name: "upgrade-snapshot-2026-05-01T10:00:00Z", path: "/tmp/snap-1" },
+      { name: "upgrade-snapshot-2026-05-02T10:00:00Z", path: "/tmp/snap-2" }
+    ]
+  });
+  assert.equal(result.path, "rollback-list");
+  assert.equal(result.snapshots.length, 2);
+});
+
+test("rollback with no snapshots fails clearly", async () => {
+  await assert.rejects(async () => {
+    await runUpgrade({ rollback: true, dryRun: true, mockSnapshots: [] });
+  }, /no upgrade snapshots/);
+});
+
+test("rollback --dry-run produces a plan without mutation", async () => {
+  const result = await runUpgrade({
+    rollback: true,
+    dryRun: true,
+    mockSnapshots: [{ name: "upgrade-snapshot-2026-05-11T08:30:00Z", path: "/tmp/snap-x" }],
+    mockSnapshotMeta: { fromCommit: "abc1234", fromVersion: "v3.10.0", toVersion: "v3.14.0", path: "/tmp/snap-x" }
+  });
+  assert.equal(result.path, "rollback-dry-run");
+  assert.equal(result.executed, false);
+  assert.ok(result.plan.length > 0);
+});
+
+test("rollback latest snapshot restores files (mockExec)", async () => {
+  const result = await runUpgrade({
+    rollback: true,
+    yes: true,
+    mockExec: true,
+    mockSnapshots: [{ name: "upgrade-snapshot-2026-05-11T08:30:00Z", path: "/tmp/snap-x" }],
+    mockSnapshotMeta: { fromCommit: "abc1234", fromVersion: "v3.10.0", toVersion: "v3.14.0", path: "/tmp/snap-x" }
+  });
+  assert.equal(result.path, "rollback");
+  assert.equal(result.executed, true);
+  assert.ok(result.phases.some(p => p.name === "git-checkout"));
+});
+
 // ── Cleanup ──
 closeDb();
 

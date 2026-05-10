@@ -692,25 +692,33 @@ for e in d.get('errors', []):
 # ── update ──────────────────────────────────────────────────────────────
 cmd_update_help() {
   cat <<'EOF'
-ocp update — Update OCP to the latest version
+ocp update — Smart upgrade dispatcher
 
-Pulls the latest code from GitHub, restarts the proxy service,
-and optionally syncs the plugin to the OpenClaw extensions directory.
+Runs `ocp doctor` internally to choose the right path:
+  • Patch bump (same minor):     light path (git pull + npm install + restart)
+  • Cross-minor (e.g. v3.10→v3.14): full path with snapshot + post-flight
+  • Old version (< v3.4.0):       fresh-install (asks first; AI passes --yes)
 
 Usage:
-  ocp update             Pull latest and restart
-  ocp update --check     Check for updates without applying
+  ocp update                          Smart auto-pick path
+  ocp update --check                  Show available updates, don't apply
+  ocp update --dry-run                Preview the plan, don't mutate
+  ocp update --target v3.13.0         Pin a specific version
+  ocp update --yes                    Skip y/N prompts (AI agents pass this)
+  ocp update --rollback               Restore the most recent upgrade snapshot
+  ocp update --rollback --list        List available snapshots
+  ocp update --rollback <path>        Restore a specific snapshot
+  ocp update --rollback --dry-run     Preview rollback plan
 EOF
 }
 
 cmd_update() {
   local script_dir self
   self="${BASH_SOURCE[0]}"
-  # Resolve symlinks (e.g. ~/.local/bin/ocp → real location)
   while [[ -L "$self" ]]; do self="$(readlink "$self")"; done
   script_dir="$(cd "$(dirname "$self")" && pwd)"
 
-  # Check-only mode
+  # Pass through --check fast path (existing behaviour)
   if [[ "${1:-}" == "--check" ]]; then
     cd "$script_dir"
     git fetch origin main --quiet 2>/dev/null || true
@@ -727,71 +735,104 @@ cmd_update() {
       echo "  Status:   ✓ Up to date"
     else
       echo "  Status:   $behind commit(s) behind"
-      echo ""
       echo "  Run 'ocp update' to apply."
     fi
     return 0
   fi
 
-  echo "Updating OCP..."
-  echo ""
+  # Rollback path
+  if [[ "${1:-}" == "--rollback" ]]; then
+    shift
+    exec node "$script_dir/scripts/upgrade.mjs" --rollback "$@"
+  fi
 
-  # 1. Pull latest
+  # Doctor-driven path selection
+  local kind
+  kind=$(node "$script_dir/scripts/doctor.mjs" --json 2>/dev/null | python3 -c "import sys,json; print(json.load(sys.stdin)['next_action']['kind'])" 2>/dev/null || echo "unknown")
+
+  case "$kind" in
+    noop)
+      echo "Already at latest. Nothing to do."
+      return 0
+      ;;
+    update)
+      _cmd_update_light "$script_dir"
+      ;;
+    upgrade|fresh_install)
+      exec node "$script_dir/scripts/upgrade.mjs" "$@"
+      ;;
+    fix_oauth|fix_service)
+      echo "Pre-upgrade check failed: $kind"
+      echo "Run \`ocp doctor\` for details and ai_executable steps."
+      return 1
+      ;;
+    *)
+      echo "Unknown doctor kind: $kind. Run \`ocp doctor --json\` to inspect."
+      return 1
+      ;;
+  esac
+}
+
+# Existing light-path body extracted into a helper so cmd_update can call it conditionally.
+_cmd_update_light() {
+  local script_dir="$1"
+  echo "Updating OCP (light path)..."
   cd "$script_dir"
-  local old_ver
+  local old_ver new_ver
   old_ver=$(python3 -c "import json; print(json.load(open('package.json'))['version'])" 2>/dev/null || echo "?")
-
   echo "  Pulling latest from GitHub..."
   if ! git pull origin main --ff-only 2>&1 | sed 's/^/    /'; then
     echo "  ✗ Git pull failed. Resolve conflicts manually in: $script_dir"
     return 1
   fi
-
-  local new_ver
   new_ver=$(python3 -c "import json; print(json.load(open('package.json'))['version'])" 2>/dev/null || echo "?")
-
   if [[ "$old_ver" == "$new_ver" ]]; then
     echo "  ✓ Already at latest (v$new_ver)"
   else
     echo "  ✓ Updated v$old_ver → v$new_ver"
   fi
 
-  # 2. Sync plugin to extensions dir
+  # Sync plugin (existing logic preserved)
   local ext_dir="$HOME/.openclaw/extensions/ocp"
   if [[ -d "$ext_dir" && -d "$script_dir/ocp-plugin" ]]; then
-    echo ""
     echo "  Syncing OCP plugin..."
     cp "$script_dir/ocp-plugin/index.js" "$ext_dir/index.js" 2>/dev/null
     cp "$script_dir/ocp-plugin/package.json" "$ext_dir/package.json" 2>/dev/null
     cp "$script_dir/ocp-plugin/openclaw.plugin.json" "$ext_dir/openclaw.plugin.json" 2>/dev/null
-    echo "  ✓ Plugin synced to $ext_dir"
+    echo "  ✓ Plugin synced"
   fi
 
-  # 3. Sync OpenClaw registry from models.json (non-fatal)
   if command -v node >/dev/null 2>&1 && [[ -f "$script_dir/scripts/sync-openclaw.mjs" ]]; then
-    echo ""
     echo "  Syncing OpenClaw registry..."
-    if ! node "$script_dir/scripts/sync-openclaw.mjs" 2>&1 | sed 's/^/  /'; then
-      echo "  ⚠ OpenClaw sync failed (non-fatal, continuing)"
-    fi
+    node "$script_dir/scripts/sync-openclaw.mjs" 2>&1 | sed 's/^/    /' || echo "  ⚠ OpenClaw sync failed (non-fatal)"
   fi
 
-  # 4. Restart proxy
-  echo ""
   echo "  Restarting proxy..."
   cmd_restart > /dev/null 2>&1
-  sleep 2
+}
 
-  if curl -sf --max-time 5 "$PROXY/health" > /dev/null 2>&1; then
-    local running_ver
-    running_ver=$(curl -sf --max-time 5 "$PROXY/health" | python3 -c "import sys,json; print(json.loads(sys.stdin.read())['version'])" 2>/dev/null || echo "?")
-    echo "  ✓ Proxy running (v$running_ver)"
-  else
-    echo "  ⚠ Proxy not responding — check: ocp health"
-  fi
+cmd_doctor_help() {
+  cat <<'EOF'
+ocp doctor — Health & upgrade-readiness check
 
-  echo ""
-  echo "Done."
+Runs a series of checks (Node version, git state, service health,
+OAuth token, plist customisation, OpenClaw provider) and emits either
+human-readable PASS/WARN/FAIL output or a JSON next_action that
+AI agents can execute.
+
+Usage:
+  ocp doctor              Human-readable output
+  ocp doctor --json       JSON for AI agents and ocp update internal use
+  ocp doctor --check oauth    Fast path: OAuth check only
+EOF
+}
+
+cmd_doctor() {
+  local script_dir self
+  self="${BASH_SOURCE[0]}"
+  while [[ -L "$self" ]]; do self="$(readlink "$self")"; done
+  script_dir="$(cd "$(dirname "$self")" && pwd)"
+  exec node "$script_dir/scripts/doctor.mjs" "$@"
 }
 
 # ── help ─────────────────────────────────────────────────────────────────
@@ -859,6 +900,7 @@ case "$subcmd" in
   lan)      cmd_lan ;;
   connect)  cmd_connect "$@" ;;
   restart)  cmd_restart "${1:-}" ;;
-  update)   cmd_update "${1:-}" ;;
+  doctor)   cmd_doctor "$@" ;;
+  update)   cmd_update "$@" ;;
   *)        echo "Unknown command: $subcmd"; echo ""; cmd_help; exit 1 ;;
 esac
