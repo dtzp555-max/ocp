@@ -762,6 +762,75 @@ test("upgrade error after snapshot carries snapshotPath + hint", async () => {
   assert.equal(result.executed, true);
 });
 
+test("upgrade fresh_install requires --yes for non-interactive", async () => {
+  await assert.rejects(async () => {
+    await runUpgrade({
+      yes: false,
+      mockExec: true,
+      mockDoctor: { ready_to_upgrade: false, from_version_supported: false,
+                    next_action: { kind: "fresh_install", ai_executable: ["echo would-rm-rf"] },
+                    current_version: "v3.2.0", latest_version: "v3.14.0" }
+    });
+  }, /requires --yes/);
+});
+
+test("upgrade fresh_install with --yes runs ai_executable", async () => {
+  const result = await runUpgrade({
+    yes: true,
+    mockExec: true,
+    mockDoctor: { ready_to_upgrade: false, from_version_supported: false,
+                  next_action: { kind: "fresh_install",
+                                 ai_executable: ["echo step-1", "echo step-2", "echo step-3"] },
+                  current_version: "v3.2.0", latest_version: "v3.14.0" }
+  });
+  assert.equal(result.path, "fresh_install");
+  assert.equal(result.steps.length, 3);
+});
+
+test("rollback --list returns snapshots", async () => {
+  const result = await runUpgrade({
+    rollback: true,
+    list: true,
+    mockSnapshots: [
+      { name: "upgrade-snapshot-2026-05-01T10:00:00Z", path: "/tmp/snap-1" },
+      { name: "upgrade-snapshot-2026-05-02T10:00:00Z", path: "/tmp/snap-2" }
+    ]
+  });
+  assert.equal(result.path, "rollback-list");
+  assert.equal(result.snapshots.length, 2);
+});
+
+test("rollback with no snapshots fails clearly", async () => {
+  await assert.rejects(async () => {
+    await runUpgrade({ rollback: true, dryRun: true, mockSnapshots: [] });
+  }, /no upgrade snapshots/);
+});
+
+test("rollback --dry-run produces a plan without mutation", async () => {
+  const result = await runUpgrade({
+    rollback: true,
+    dryRun: true,
+    mockSnapshots: [{ name: "upgrade-snapshot-2026-05-11T08:30:00Z", path: "/tmp/snap-x" }],
+    mockSnapshotMeta: { fromCommit: "abc1234", fromVersion: "v3.10.0", toVersion: "v3.14.0", path: "/tmp/snap-x" }
+  });
+  assert.equal(result.path, "rollback-dry-run");
+  assert.equal(result.executed, false);
+  assert.ok(result.plan.length > 0);
+});
+
+test("rollback latest snapshot restores files (mockExec)", async () => {
+  const result = await runUpgrade({
+    rollback: true,
+    yes: true,
+    mockExec: true,
+    mockSnapshots: [{ name: "upgrade-snapshot-2026-05-11T08:30:00Z", path: "/tmp/snap-x" }],
+    mockSnapshotMeta: { fromCommit: "abc1234", fromVersion: "v3.10.0", toVersion: "v3.14.0", path: "/tmp/snap-x" }
+  });
+  assert.equal(result.path, "rollback");
+  assert.equal(result.executed, true);
+  assert.ok(result.phases.some(p => p.name === "git-checkout"));
+});
+
 // ── Cleanup ──
 closeDb();
 

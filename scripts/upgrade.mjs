@@ -13,14 +13,19 @@ import { runDoctor } from "./doctor.mjs";
 import { execSync } from "node:child_process";
 import { homedir } from "node:os";
 import { join } from "node:path";
-import { existsSync } from "node:fs";
-import { writeSnapshot } from "./lib/snapshot.mjs";
+import { existsSync, copyFileSync, mkdirSync } from "node:fs";
+import { writeSnapshot, listSnapshots, readSnapshot } from "./lib/snapshot.mjs";
 
 export async function runUpgrade(opts = {}) {
   const dryRun = !!opts.dryRun;
   const yes = !!opts.yes;
   // yes is reserved for Bundle 3 (fresh-install / rollback interactive gate); not used in upgrade-path here.
   const plan = [];
+
+  // --- rollback path (no doctor needed; snapshot is authoritative) ---
+  if (opts.rollback) {
+    return await runRollback(opts);
+  }
 
   // --- doctor pre-flight ---
   const doctor = opts.mockDoctor || await runDoctor();
@@ -64,7 +69,10 @@ export async function runUpgrade(opts = {}) {
     return await runFullUpgrade({ doctor, opts });
   }
 
-  // fresh_install + rollback land in Bundle 3.
+  if (kind === "fresh_install") {
+    return await runFreshInstall({ doctor, opts });
+  }
+
   throw new Error(`path ${kind} not yet implemented`);
 }
 
@@ -159,18 +167,148 @@ async function runFullUpgrade({ doctor, opts }) {
   }
 }
 
+async function runFreshInstall({ doctor, opts }) {
+  if (!opts.yes) {
+    throw new Error("fresh_install requires --yes for non-interactive execution (or run interactively and answer y)");
+  }
+  const steps = [];
+  for (const cmd of doctor.next_action.ai_executable) {
+    if (opts.mockExec) {
+      steps.push({ cmd, status: "skipped-mock" });
+    } else {
+      try {
+        execSync(cmd, { stdio: "inherit" });
+        steps.push({ cmd, status: "ok" });
+      } catch (e) {
+        steps.push({ cmd, status: "fail", error: String(e.message || e) });
+        throw Object.assign(new Error(`fresh_install step failed: ${cmd}`), { steps });
+      }
+    }
+  }
+  return { path: "fresh_install", executed: true, changed: true, steps };
+}
+
+async function runRollback(opts) {
+  const homeDir = opts.homeDir || homedir();
+  const snapshots = opts.mockSnapshots ?? listSnapshots(homeDir);
+
+  if (opts.list) {
+    return { path: "rollback-list", snapshots };
+  }
+  if (snapshots.length === 0) {
+    throw new Error("no upgrade snapshots found in ~/.ocp/upgrade-snapshot-*");
+  }
+
+  const target = opts.snapshotPath
+    ? snapshots.find(s => s.path === opts.snapshotPath)
+    : snapshots[snapshots.length - 1];
+  if (!target) throw new Error(`snapshot not found: ${opts.snapshotPath}`);
+
+  const meta = opts.mockSnapshotMeta ?? readSnapshot(target.path);
+  if (!meta.fromCommit) throw new Error(`snapshot ${target.path} has no from-commit.txt`);
+
+  const phases = [];
+  if (opts.dryRun) {
+    return {
+      path: "rollback-dry-run",
+      executed: false,
+      target: target.path,
+      plan: [
+        `git checkout ${meta.fromCommit}`,
+        `cp ${target.path}/plist ~/Library/LaunchAgents/dev.ocp.proxy.plist`,
+        `cp ${target.path}/db.bak ~/.ocp/ocp.db`,
+        `launchctl bootout/bootstrap`,
+        `ocp doctor`
+      ]
+    };
+  }
+
+  if (!opts.yes) throw new Error("rollback requires --yes for non-interactive execution");
+
+  const exec = (cmd, label) => {
+    if (opts.mockExec) {
+      phases.push({ name: label, cmd, status: "skipped-mock" });
+      return "";
+    }
+    try {
+      execSync(cmd, { stdio: ["pipe", "pipe", "pipe"] });
+      phases.push({ name: label, cmd, status: "ok" });
+    } catch (err) {
+      const detail = err.stderr?.toString().trim();
+      phases.push({ name: label, cmd, status: "fail", stderr: detail });
+      throw Object.assign(
+        new Error(`rollback phase ${label} failed: ${detail || err.message}`),
+        { phases, target: target.path }
+      );
+    }
+  };
+
+  const ocpDir = opts.ocpDir || join(homedir(), "ocp");
+  exec(`git -C ${ocpDir} checkout ${meta.fromCommit}`, "git-checkout");
+
+  if (!opts.mockExec) {
+    const tryCopy = (src, dst) => {
+      try {
+        if (existsSync(src)) copyFileSync(src, dst);
+      } catch (err) {
+        console.error(`[rollback] warn: could not restore ${src} → ${dst} (${err.code || err.message})`);
+      }
+    };
+    tryCopy(join(target.path, "plist"), join(homeDir, "Library", "LaunchAgents", "dev.ocp.proxy.plist"));
+    tryCopy(join(target.path, "service"), join(homeDir, ".config", "systemd", "user", "ocp-proxy.service"));
+    tryCopy(join(target.path, "db.bak"), join(homeDir, ".ocp", "ocp.db"));
+    tryCopy(join(target.path, "admin-key"), join(homeDir, ".ocp", "admin-key"));
+    phases.push({ name: "restore-files", status: "ok" });
+  } else {
+    phases.push({ name: "restore-files", status: "skipped-mock" });
+  }
+
+  exec(`npm --prefix ${ocpDir} install --no-audit --no-fund`, "npm-install");
+
+  if (!opts.mockExec) {
+    console.error(`[heads-up] restarting OCP service in 3s — expect ~5–10s blip on requests in flight.`);
+    await new Promise(r => setTimeout(r, 3000));
+  }
+  if (process.platform === "darwin") {
+    exec(`launchctl bootout gui/$(id -u)/dev.ocp.proxy 2>/dev/null || true`, "restart");
+    exec(`launchctl bootstrap gui/$(id -u) ${join(homedir(), "Library", "LaunchAgents", "dev.ocp.proxy.plist")}`, "restart");
+  } else {
+    exec(`systemctl --user restart ocp-proxy.service`, "restart");
+  }
+
+  return { path: "rollback", executed: true, changed: true, target: target.path, phases };
+}
+
 // CLI entrypoint
 if (import.meta.url === `file://${process.argv[1]}`) {
-  const dryRun = process.argv.includes("--dry-run");
-  const yes = process.argv.includes("--yes");
+  const args = process.argv.slice(2);
+  const dryRun = args.includes("--dry-run");
+  const yes = args.includes("--yes");
+  const rollback = args.includes("--rollback");
+  const list = args.includes("--list");
+  const targetIdx = args.indexOf("--target");
+  const target = targetIdx !== -1 ? args[targetIdx + 1] : undefined;
+  // First non-flag positional after --rollback is the snapshot path
+  let snapshotPath;
+  if (rollback) {
+    const rb = args.indexOf("--rollback");
+    const cand = args[rb + 1];
+    if (cand && !cand.startsWith("--")) snapshotPath = cand;
+  }
   try {
-    const result = await runUpgrade({ dryRun, yes });
+    const result = await runUpgrade({ dryRun, yes, rollback, list, snapshotPath, target });
     if (result.plan) for (const line of result.plan) console.log(line);
     if (result.phases) for (const p of result.phases) console.log(`[${p.name}] ${p.status}${p.cmd ? `: ${p.cmd}` : ""}`);
+    if (result.steps) for (const s of result.steps) console.log(`  ${s.status === "ok" ? "✓" : s.status === "skipped-mock" ? "·" : "✗"} ${s.cmd}`);
+    if (result.snapshots) {
+      console.log(`Found ${result.snapshots.length} snapshots:`);
+      for (const s of result.snapshots) console.log(`  ${s.name}`);
+    }
     process.exit(0);
   } catch (e) {
     console.error(`✗ ${e.message}`);
     if (e.snapshotPath) console.error(`   snapshot: ${e.snapshotPath}`);
+    if (e.target) console.error(`   target: ${e.target}`);
     if (e.hint) console.error(`   hint: ${e.hint}`);
     process.exit(1);
   }
