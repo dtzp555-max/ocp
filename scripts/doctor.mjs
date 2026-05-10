@@ -37,6 +37,11 @@ export async function runDoctor(opts = {}) {
   const push = (id, level, message, extra = {}) =>
     checks.push({ id, level, message, ...extra });
 
+  // --- fast path: --check oauth ---
+  if (opts.checkOnly === "oauth") {
+    return runOauthOnly(opts, checks, push);
+  }
+
   // --- version detection ---
   const ocpDir = opts.ocpDir || join(homedir(), "ocp");
   let currentVersion = opts.mockVersion;
@@ -190,6 +195,81 @@ export async function runDoctor(opts = {}) {
   };
 }
 
+function runOauthOnly(opts, checks, push) {
+  let healthOk = true, oauthOk = true;
+  let health;
+  if (opts.mockHealth !== undefined) {
+    health = opts.mockHealth;
+  } else {
+    try {
+      const port = process.env.CLAUDE_PROXY_PORT || "3478";
+      const out = execSync(`curl -sf --max-time 3 http://127.0.0.1:${port}/health`, { stdio: ["pipe", "pipe", "pipe"] }).toString();
+      health = { status: 200, body: JSON.parse(out) };
+    } catch (e) {
+      health = { error: String(e.message || e) };
+    }
+  }
+
+  if (health.error || health.status !== 200) {
+    healthOk = false;
+    push("oauth_ok", "FAIL", `service unreachable: ${health.error || `status ${health.status}`}`);
+  } else if (!health.body || typeof health.body !== "object") {
+    healthOk = false;
+    push("oauth_ok", "FAIL", "service /health returned 200 but empty/non-JSON body");
+  } else if (!health.body?.auth?.ok) {
+    oauthOk = false;
+    push("oauth_ok", "FAIL", `auth.ok=false: ${health.body?.auth?.message || "unknown"}`);
+  } else {
+    push("oauth_ok", "PASS", "OAuth token valid");
+  }
+
+  const kind = !healthOk ? "fix_service" : !oauthOk ? "fix_oauth" : "noop";
+
+  let next_action;
+  const ocpDir = opts.ocpDir || join(homedir(), "ocp");
+  if (kind === "noop") {
+    next_action = { kind, human_required: [], ai_executable: [], verify: "OAuth healthy" };
+  } else if (kind === "fix_oauth") {
+    next_action = {
+      kind,
+      human_required: [],
+      ai_executable: [
+        `cd "$(npm root -g)/@anthropic-ai/claude-code" && node install.cjs`,
+        `launchctl bootout gui/$(id -u)/dev.ocp.proxy 2>/dev/null || true`,
+        `launchctl bootstrap gui/$(id -u) ${join(homedir(), "Library", "LaunchAgents", "dev.ocp.proxy.plist")}`,
+        `${ocpDir}/ocp doctor --check oauth`
+      ],
+      verify: "ocp doctor --check oauth expects PASS",
+      reference: "~/.cc-rules/memory/learnings/ocp_claude_native_binary_postinstall.md"
+    };
+  } else {
+    next_action = {
+      kind,
+      human_required: [],
+      ai_executable: [
+        `launchctl bootout gui/$(id -u)/dev.ocp.proxy 2>/dev/null || true`,
+        `launchctl bootstrap gui/$(id -u) ${join(homedir(), "Library", "LaunchAgents", "dev.ocp.proxy.plist")}`,
+        `${ocpDir}/ocp doctor --check oauth`
+      ],
+      verify: "ocp doctor --check oauth expects service_running=PASS"
+    };
+  }
+
+  const fail_count = checks.filter(c => c.level === "FAIL").length;
+  return {
+    schema_version: SCHEMA_VERSION,
+    timestamp: new Date().toISOString(),
+    ready_to_upgrade: fail_count === 0,
+    current_version: opts.mockVersion || "skipped",
+    latest_version: opts.mockLatest || "skipped",
+    from_version_supported: true,
+    fail_count,
+    warn_count: 0,
+    checks,
+    next_action
+  };
+}
+
 // CLI entrypoint — use fileURLToPath + realpath to handle symlinked install paths
 // (e.g. /tmp/ → /private/tmp/ on macOS would otherwise miss the guard).
 import { fileURLToPath } from "node:url";
@@ -202,7 +282,9 @@ function _isMain() {
 }
 if (_isMain()) {
   const wantJson = process.argv.includes("--json");
-  const result = await runDoctor();
+  const checkIdx = process.argv.indexOf("--check");
+  const checkOnly = checkIdx !== -1 ? process.argv[checkIdx + 1] : undefined;
+  const result = await runDoctor({ checkOnly });
   if (wantJson) {
     console.log(JSON.stringify(result, null, 2));
   } else {

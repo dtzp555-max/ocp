@@ -843,6 +843,46 @@ test("rollback latest snapshot restores files (mockExec)", async () => {
   assert.ok(result.phases.some(p => p.name === "git-checkout"));
 });
 
+// ── Doctor --check oauth fast path tests ──
+console.log("\nDoctor --check oauth:");
+
+await asyncTest("doctor --check oauth runs only oauth check (skips version/from-version)", async () => {
+  const result = await runDoctor({
+    checkOnly: "oauth",
+    mockVersion: "v3.10.0",
+    mockLatest: "v3.14.0",
+    mockHealth: { status: 200, body: { auth: { ok: true, message: "authenticated" } } }
+  });
+  // Should still produce a valid result object
+  assert.equal(result.schema_version, "1");
+  // checks[] should only contain oauth_ok (no current_version, no from_version_supported)
+  const ids = result.checks.map(c => c.id);
+  assert.deepEqual(ids, ["oauth_ok"]);
+  assert.equal(result.next_action.kind, "noop");
+});
+
+await asyncTest("doctor --check oauth + OAuth FAIL → fix_oauth", async () => {
+  const result = await runDoctor({
+    checkOnly: "oauth",
+    mockHealth: { status: 200, body: { auth: { ok: false, message: "ENOEXEC" } } }
+  });
+  const ids = result.checks.map(c => c.id);
+  assert.deepEqual(ids, ["oauth_ok"]);
+  assert.equal(result.next_action.kind, "fix_oauth");
+  assert.equal(result.fail_count, 1);
+});
+
+await asyncTest("doctor --check oauth + service down → fix_service", async () => {
+  const result = await runDoctor({
+    checkOnly: "oauth",
+    mockHealth: { error: "ECONNREFUSED" }
+  });
+  const ids = result.checks.map(c => c.id);
+  assert.deepEqual(ids, ["oauth_ok"]);
+  assert.equal(result.next_action.kind, "fix_service");
+  assert.equal(result.fail_count, 1);
+});
+
 // ── Cleanup ──
 closeDb();
 
