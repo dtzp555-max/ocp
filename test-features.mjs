@@ -454,6 +454,116 @@ async function runSingleflightTests() {
 
 await runSingleflightTests();
 
+// ── Plist Env Merge Tests ──
+import { mergePlistEnv, mergeSystemdEnv } from "./scripts/lib/plist-merge.mjs";
+
+console.log("\nPlist env merge:");
+
+const SAMPLE_TEMPLATE_PLIST = `<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>dev.ocp.proxy</string>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>CLAUDE_PROXY_PORT</key>
+    <string>3478</string>
+    <key>CLAUDE_BIND</key>
+    <string>127.0.0.1</string>
+    <key>CLAUDE_AUTH_MODE</key>
+    <string>multi</string>
+  </dict>
+</dict>
+</plist>`;
+
+const SAMPLE_EXISTING_PLIST = `<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>dev.ocp.proxy</string>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>CLAUDE_PROXY_PORT</key>
+    <string>3456</string>
+    <key>CLAUDE_BIND</key>
+    <string>127.0.0.1</string>
+    <key>CLAUDE_AUTH_MODE</key>
+    <string>none</string>
+    <key>CLAUDE_HEARTBEAT_INTERVAL</key>
+    <string>2000</string>
+    <key>CLAUDE_CACHE_TTL</key>
+    <string>600</string>
+  </dict>
+</dict>
+</plist>`;
+
+test("mergePlistEnv preserves unknown user keys", () => {
+  const merged = mergePlistEnv(SAMPLE_EXISTING_PLIST, SAMPLE_TEMPLATE_PLIST);
+  assert.match(merged, /<key>CLAUDE_HEARTBEAT_INTERVAL<\/key>\s*<string>2000<\/string>/);
+  assert.match(merged, /<key>CLAUDE_CACHE_TTL<\/key>\s*<string>600<\/string>/);
+});
+
+test("mergePlistEnv overrides known template keys", () => {
+  const merged = mergePlistEnv(SAMPLE_EXISTING_PLIST, SAMPLE_TEMPLATE_PLIST);
+  assert.match(merged, /<key>CLAUDE_PROXY_PORT<\/key>\s*<string>3478<\/string>/);
+  assert.match(merged, /<key>CLAUDE_AUTH_MODE<\/key>\s*<string>multi<\/string>/);
+});
+
+test("mergePlistEnv first-install returns template unchanged when existing is null", () => {
+  const merged = mergePlistEnv(null, SAMPLE_TEMPLATE_PLIST);
+  assert.equal(merged, SAMPLE_TEMPLATE_PLIST);
+});
+
+test("mergePlistEnv first-install returns template unchanged when existing is empty", () => {
+  const merged = mergePlistEnv("", SAMPLE_TEMPLATE_PLIST);
+  assert.equal(merged, SAMPLE_TEMPLATE_PLIST);
+});
+
+const SAMPLE_TEMPLATE_SYSTEMD = `[Unit]
+Description=OCP — Open Claude Proxy
+After=network.target
+
+[Service]
+ExecStart=/usr/bin/node /home/u/ocp/server.mjs
+Environment=CLAUDE_PROXY_PORT=3478
+Environment=CLAUDE_BIND=127.0.0.1
+Environment=CLAUDE_AUTH_MODE=multi
+Restart=always
+`;
+
+const SAMPLE_EXISTING_SYSTEMD = `[Unit]
+Description=OCP — Open Claude Proxy
+After=network.target
+
+[Service]
+ExecStart=/usr/bin/node /home/u/ocp/server.mjs
+Environment=CLAUDE_PROXY_PORT=3456
+Environment=CLAUDE_BIND=127.0.0.1
+Environment=CLAUDE_AUTH_MODE=none
+Environment=CLAUDE_HEARTBEAT_INTERVAL=2000
+Environment=CLAUDE_CACHE_TTL=600
+Restart=always
+`;
+
+test("mergeSystemdEnv preserves unknown user Environment lines", () => {
+  const merged = mergeSystemdEnv(SAMPLE_EXISTING_SYSTEMD, SAMPLE_TEMPLATE_SYSTEMD);
+  assert.match(merged, /Environment=CLAUDE_HEARTBEAT_INTERVAL=2000/);
+  assert.match(merged, /Environment=CLAUDE_CACHE_TTL=600/);
+});
+
+test("mergeSystemdEnv overrides known template keys", () => {
+  const merged = mergeSystemdEnv(SAMPLE_EXISTING_SYSTEMD, SAMPLE_TEMPLATE_SYSTEMD);
+  assert.match(merged, /Environment=CLAUDE_PROXY_PORT=3478/);
+  assert.match(merged, /Environment=CLAUDE_AUTH_MODE=multi/);
+});
+
+test("mergeSystemdEnv first-install returns template unchanged", () => {
+  assert.equal(mergeSystemdEnv(null, SAMPLE_TEMPLATE_SYSTEMD), SAMPLE_TEMPLATE_SYSTEMD);
+  assert.equal(mergeSystemdEnv("", SAMPLE_TEMPLATE_SYSTEMD), SAMPLE_TEMPLATE_SYSTEMD);
+});
+
 // ── Cleanup ──
 closeDb();
 
