@@ -655,6 +655,98 @@ test("doctor empty health body → fix_service (not fix_oauth)", async () => {
   assert.equal(result.next_action.kind, "fix_service");
 });
 
+// ── Upgrade Tests ──
+import { runUpgrade } from "./scripts/upgrade.mjs";
+
+console.log("\nUpgrade:");
+
+test("upgrade --dry-run prints plan, no side effects", async () => {
+  const result = await runUpgrade({
+    dryRun: true,
+    yes: true,
+    mockDoctor: { ready_to_upgrade: true, next_action: { kind: "upgrade" }, current_version: "v3.10.0", latest_version: "v3.14.0" }
+  });
+  assert.equal(result.executed, false);
+  assert.ok(result.plan.length > 0);
+  assert.ok(result.plan.some(line => line.toLowerCase().includes("snapshot")));
+});
+
+test("upgrade noop returns early when current==latest", async () => {
+  const result = await runUpgrade({
+    yes: true,
+    mockDoctor: { ready_to_upgrade: true, next_action: { kind: "noop" }, current_version: "v3.14.0", latest_version: "v3.14.0" }
+  });
+  assert.equal(result.path, "noop");
+  assert.equal(result.executed, true);
+  assert.equal(result.changed, false);
+});
+
+test("upgrade aborts on doctor FAIL", async () => {
+  await assert.rejects(async () => {
+    await runUpgrade({
+      yes: true,
+      mockDoctor: { ready_to_upgrade: false, fail_count: 1, next_action: { kind: "fix_oauth" } }
+    });
+  }, /doctor FAIL/);
+});
+
+test("upgrade full path executes 5 phases", async () => {
+  const result = await runUpgrade({
+    yes: true,
+    dryRun: false,
+    mockExec: true,
+    mockDoctor: { ready_to_upgrade: true, next_action: { kind: "upgrade" },
+                  current_version: "v3.10.0", latest_version: "v3.14.0" }
+  });
+  assert.equal(result.path, "upgrade");
+  // Plan asks for 6 phases by name; verify each appears as a phase entry
+  const phaseNames = result.phases.map(p => p.name);
+  for (const expected of ["pre-flight", "snapshot", "fetch+install", "reconfigure", "restart", "post-flight"]) {
+    assert.ok(phaseNames.includes(expected), `missing phase: ${expected}; got ${phaseNames.join(",")}`);
+  }
+});
+
+// ── Snapshot Tests ──
+import { writeSnapshot, readSnapshot, listSnapshots } from "./scripts/lib/snapshot.mjs";
+import { mkdtempSync, rmSync, mkdirSync as tMkdirSync, writeFileSync as testWriteFile } from "node:fs";
+import { tmpdir } from "node:os";
+import { join as testJoin } from "node:path";
+
+console.log("\nSnapshot:");
+
+test("writeSnapshot creates dir + manifest files", () => {
+  const root = mkdtempSync(testJoin(tmpdir(), "ocp-snap-test-"));
+  const dotOcp = testJoin(root, ".ocp");
+  tMkdirSync(dotOcp, { recursive: true });
+  testWriteFile(testJoin(dotOcp, "ocp.db"), "fake-sqlite-bytes");
+
+  const path = writeSnapshot({
+    homeDir: root,
+    fromCommit: "abc1234",
+    fromVersion: "v3.10.0",
+    toVersion: "v3.14.0",
+    extraFiles: []
+  });
+  const m = readSnapshot(path);
+  assert.equal(m.fromCommit, "abc1234");
+  assert.equal(m.fromVersion, "v3.10.0");
+  rmSync(root, { recursive: true, force: true });
+});
+
+test("listSnapshots returns sorted by ISO timestamp", () => {
+  const root = mkdtempSync(testJoin(tmpdir(), "ocp-snap-list-"));
+  const dotOcp = testJoin(root, ".ocp");
+  tMkdirSync(dotOcp, { recursive: true });
+  for (const ts of ["2026-05-01T10:00:00Z", "2026-05-02T10:00:00Z", "2026-05-03T10:00:00Z"]) {
+    tMkdirSync(testJoin(dotOcp, `upgrade-snapshot-${ts}`));
+  }
+  const list = listSnapshots(root);
+  assert.equal(list.length, 3);
+  assert.ok(list[0].path.includes("2026-05-01"));
+  assert.ok(list[2].path.includes("2026-05-03"));
+  rmSync(root, { recursive: true, force: true });
+});
+
 // ── Cleanup ──
 closeDb();
 
