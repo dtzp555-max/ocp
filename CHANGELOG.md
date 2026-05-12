@@ -1,10 +1,32 @@
 # Changelog
 
-## v3.16.1 — 2026-05-12
+## v3.16.2 — 2026-05-12
 
-### Fixes
+### Fixes — corrects v3.16.1
 
-- **OCP plugin port lag** — `ocp-plugin/index.js` hard-coded `http://127.0.0.1:3456` while OCP server moved to 3478 in v3.14+. Result: `/ocp` slash commands in OpenClaw (e.g. `/ocp usage` from the home Telegram bot) returned "OCP error: fetch failed". Default is now `http://127.0.0.1:3478` and the plugin reads `OCP_PROXY_URL` env (full URL) or `CLAUDE_PROXY_PORT` env (port only) when set. `openclaw.plugin.json` `configSchema.proxyUrl.default` also updated and the plugin version bumped to `3.16.1`. Run `ocp update` to redeploy the plugin into `~/.openclaw/extensions/ocp/`.
+The v3.16.1 fix was directionally correct (plugin now reads env first, falls back to a hardcoded default) but **the narrative and the hardcoded default were both wrong**.
+
+What v3.16.1 said: "OCP server moved to 3478 default in v3.14+; plugin lagged at 3456."
+What is actually true:
+- **OCP server source default has been `3456` since `593d0dc` (initial release) and has never changed.** Every line in `server.mjs`, `setup.mjs`, and the `ocp` CLI still uses `3456` as the documented and code-level default.
+- The single OCP installation observed on `3478` is the maintainer's Mac mini, whose plist was rewritten with `--port 3478` during a PR #71 dogfood smoke-test accident on 2026-05-08 (see `~/.cc-rules/memory/learnings/subagent_setup_mjs_prod_host_collision.md`). The plist drift was never reconciled back to source default, and v3.16.1 incorrectly canonised the post-accident value as if it had been a release decision.
+
+This release:
+- Restores the plugin fallback to `http://127.0.0.1:3456` to match server source default.
+- Updates `openclaw.plugin.json` `configSchema.proxyUrl.default` back to `3456`.
+- Restores README §"Environment Variables" `CLAUDE_PROXY_PORT` default to `3456`.
+- Plugin reads `OCP_PROXY_URL` env (full URL) first, then `CLAUDE_PROXY_PORT` env (port only), then falls back to `3456`. Hosts whose OCP plist injects a non-default port must also inject the same `CLAUDE_PROXY_PORT` into the OpenClaw plist for the plugin to follow.
+- Maintainer's Mac mini plist was reverted from `3478` to `3456` as part of this release deploy (no source change reflects this; it was a one-host correction).
+
+### Governance
+
+- No `cli.js` citation needed (no `server.mjs` change). ALIGNMENT.md Rule 2 not engaged.
+
+## v3.16.1 — 2026-05-12 (superseded — narrative incorrect; see v3.16.2 erratum)
+
+### Fixes (as shipped — note erratum above)
+
+- **OCP plugin port lag** — `ocp-plugin/index.js` hard-coded `http://127.0.0.1:3456`. ~~While OCP server moved to 3478 in v3.14+,~~ **(corrected v3.16.2: no such move ever happened.)** The Mac mini's plist was on `3478` only as residue from a dogfood accident. Result: `/ocp` slash commands from the home Telegram bot returned "OCP error: fetch failed". v3.16.1 changed the plugin default to `3478` (wrong direction; v3.16.2 reverts to `3456`).
 
 ### Governance
 

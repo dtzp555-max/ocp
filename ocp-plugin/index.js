@@ -3,15 +3,17 @@
  * Calls the local claude-proxy and formats the response.
  *
  * Port resolution (in priority order):
- *   1. OCP_PROXY_URL env (full URL, e.g. http://10.0.0.5:3478)
+ *   1. OCP_PROXY_URL env (full URL, e.g. http://10.0.0.5:3456)
  *   2. CLAUDE_PROXY_PORT env (port only; localhost assumed)
- *   3. Fallback: http://127.0.0.1:3478 (OCP v3.14+ default)
+ *   3. Fallback: http://127.0.0.1:3456 (OCP server source default since v1.0)
  *
- * (The legacy 3456 default — pre-v3.14 — caused "OCP error: fetch failed"
- * on machines whose OCP server moved to 3478 while the plugin lagged.)
+ * If a particular host's OCP plist injects a non-default CLAUDE_PROXY_PORT,
+ * the OpenClaw launchd plist for that host must also inject the same
+ * CLAUDE_PROXY_PORT into the plugin's env, or the plugin will fall back to
+ * 3456 and miss the server.
  */
 const PROXY = process.env.OCP_PROXY_URL
-  || (process.env.CLAUDE_PROXY_PORT ? `http://127.0.0.1:${process.env.CLAUDE_PROXY_PORT}` : "http://127.0.0.1:3478");
+  || (process.env.CLAUDE_PROXY_PORT ? `http://127.0.0.1:${process.env.CLAUDE_PROXY_PORT}` : "http://127.0.0.1:3456");
 
 // Wrap output in monospace code block for Telegram/Discord alignment
 function mono(text) { return "```\n" + text + "\n```"; }

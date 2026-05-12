@@ -2,14 +2,14 @@
   "id": "ocp",
   "name": "OCP Commands",
   "description": "Slash commands for the OpenClaw Proxy — /ocp usage, /ocp settings, /ocp health, etc.",
-  "version": "3.16.1",
+  "version": "3.16.2",
   "configSchema": {
     "type": "object",
     "additionalProperties": false,
     "properties": {
       "proxyUrl": {
         "type": "string",
-        "default": "http://127.0.0.1:3478",
+        "default": "http://127.0.0.1:3456",
         "description": "URL of the Claude proxy. Overridable via OCP_PROXY_URL or CLAUDE_PROXY_PORT env."
       }
     }
