@@ -15,6 +15,7 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 import { existsSync, copyFileSync } from "node:fs";
 import { writeSnapshot, listSnapshots, readSnapshot, gcSnapshots } from "./lib/snapshot.mjs";
+import { DEFAULT_PORT } from "../lib/constants.mjs";
 
 export async function runUpgrade(opts = {}) {
   const dryRun = !!opts.dryRun;
@@ -134,7 +135,7 @@ async function runFullUpgrade({ doctor, opts }) {
 
     // phase 6: post-flight (10s budget; skipped under mockExec)
     if (!opts.mockExec) {
-      const port = process.env.CLAUDE_PROXY_PORT || "3456";
+      const port = process.env.CLAUDE_PROXY_PORT || String(DEFAULT_PORT);
       let ok = false;
       for (let i = 0; i < 10; i++) {
         try {

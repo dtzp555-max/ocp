@@ -3,7 +3,8 @@
  * OCP (Open Claude Proxy) setup
  *
  * Automatically configures OpenClaw to use Claude CLI as a model provider.
- * Run: node setup.mjs [--port 3456] [--default-model opus|sonnet|haiku] [--dry-run]
+ * Run: node setup.mjs [--port N] [--default-model opus|sonnet|haiku] [--dry-run]
+ *      (default port = DEFAULT_PORT from lib/constants.mjs)
  *
  * What it does:
  *   1. Verifies claude CLI is installed and authenticated
@@ -18,6 +19,7 @@ import { execSync } from "node:child_process";
 import { join, dirname } from "node:path";
 import { homedir } from "node:os";
 import { fileURLToPath } from "node:url";
+import { DEFAULT_PORT } from "./lib/constants.mjs";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const HOME = homedir();
@@ -32,7 +34,7 @@ const opt = (name, fallback) => {
   return i >= 0 && args[i + 1] ? args[i + 1] : fallback;
 };
 
-const PORT = parseInt(opt("port", "3456"), 10);
+const PORT = parseInt(opt("port", String(DEFAULT_PORT)), 10);
 const DEFAULT_MODEL = opt("default-model", "opus"); // opus | sonnet | haiku
 const DRY_RUN = flag("dry-run");
 const SKIP_START = flag("no-start");

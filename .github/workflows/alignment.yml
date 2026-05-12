@@ -4,6 +4,11 @@ on:
   pull_request:
     paths:
       - 'server.mjs'
+      - 'setup.mjs'
+      - 'scripts/**'
+      - 'lib/**'
+      - 'ocp'
+      - 'ocp-connect'
       - '.github/workflows/alignment.yml'
 
 jobs:
@@ -65,6 +70,80 @@ jobs:
           fi
 
           echo "Blacklist scan clean."
+
+  port-spot:
+    name: port literal SPOT (hard fail)
+    # Background: from 2026-05-08 (PR #71 dogfood accident) through 2026-05-13
+    # a hardcoded "3478" in scripts/upgrade.mjs + scripts/doctor.mjs cascaded
+    # into wrong baseUrl writes for the OpenClaw "claude-local" provider,
+    # taking out the "大内总管" Telegram agent.
+    #
+    # Rule: the only places allowed to write a literal port number in source
+    # are (a) lib/constants.mjs (the SPOT), (b) bash scripts ocp / ocp-connect
+    # (which can't import .mjs and must keep the literal in sync — flagged
+    # with a `// keep in sync with lib/constants.mjs` style comment), and
+    # (c) test-features.mjs (intentionally pins historical ports for plist /
+    # systemd parser tests). Everything else MUST import from lib/constants.mjs.
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Scan for hardcoded port literals outside SPOT
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          # Files/paths exempt from the SPOT requirement.
+          EXEMPT_REGEX='^(lib/constants\.mjs|test-features\.mjs|ocp|ocp-connect|CHANGELOG\.md|README\.md|docs/|\.github/workflows/alignment\.yml)'
+
+          # Hardcoded port literals to forbid in non-exempt source.
+          FORBIDDEN_PORTS=("3478" "3456")
+
+          FAIL=0
+          for port in "${FORBIDDEN_PORTS[@]}"; do
+            HITS="$(git ls-files | grep -E '\.(mjs|js|ts|json)$' \
+              | xargs grep -n -E "[^0-9]${port}[^0-9]" 2>/dev/null \
+              | grep -v -E "${EXEMPT_REGEX}" \
+              || true)"
+            if [ -n "$HITS" ]; then
+              echo "::error::Hardcoded port literal '${port}' found outside lib/constants.mjs:"
+              echo "$HITS"
+              FAIL=1
+            fi
+          done
+
+          if [ "$FAIL" -ne 0 ]; then
+            cat <<'EOF'
+
+          ============================================================
+          PORT LITERAL SPOT VIOLATION
+          ============================================================
+          A hardcoded TCP port literal was found in a source file
+          that should import from lib/constants.mjs instead.
+
+          Background: this rule exists because between 2026-05-08 and
+          2026-05-13 a stray hardcoded "3478" in scripts/upgrade.mjs
+          and scripts/doctor.mjs cascaded into downstream OpenClaw
+          config writes, taking out the OpenClaw Telegram agent.
+          See v3.16.3 CHANGELOG and lib/constants.mjs header comment.
+
+          Required action:
+            1. Import DEFAULT_PORT (or related constant) from
+               lib/constants.mjs instead of hardcoding the literal.
+            2. If the file genuinely cannot import .mjs (e.g. bash
+               script), add it to EXEMPT_REGEX in this workflow and
+               add a `keep in sync with lib/constants.mjs` comment
+               at the reference.
+            3. For test files that intentionally pin historical ports
+               (test-features.mjs), the regex already exempts them.
+
+          ============================================================
+          EOF
+            exit 1
+          fi
+
+          echo "Port SPOT scan clean."
 
   commit-citation:
     name: commit message citation (soft check)
