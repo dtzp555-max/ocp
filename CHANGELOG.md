@@ -1,5 +1,47 @@
 # Changelog
 
+## v3.16.4 — 2026-05-13
+
+### Refactor — port-literal SPOT + CI guardrail
+
+Closes the structural side of the port-drift cascade addressed by v3.16.2
+and v3.16.3. Those two releases reverted plist / plugin / scripts back to
+3456 line-by-line, but the underlying invitation to drift — a hardcoded
+port literal scattered across six source files — was still intact.
+
+Changes:
+
+- **New `lib/constants.mjs`** — single source of truth for shared literals.
+  Exports `DEFAULT_PORT = 3456`, `LOCAL_HOST = "127.0.0.1"`,
+  `OPENAI_API_BASE = "/v1"`, `LOCAL_PROXY_URL`.
+- **`server.mjs:127`, `setup.mjs:36`, `scripts/upgrade.mjs:137`,
+  `scripts/doctor.mjs:84` + `:205`, `scripts/sync-openclaw.mjs:73`** —
+  all replaced with imports from `lib/constants.mjs`. Behavior is
+  identical; the literal `3456` now exists in exactly one place per
+  language (`lib/constants.mjs` for `.mjs`, `ocp` + `ocp-connect` for
+  bash, `test-features.mjs` for pinned historical-port tests).
+- **`.github/workflows/alignment.yml`** — extended the path filter to
+  `setup.mjs`, `scripts/**`, `lib/**`, `ocp`, `ocp-connect`. Added a new
+  `port-spot` hard-fail job that greps for any hardcoded `3478` or `3456`
+  literal in `.mjs/.js/.ts/.json` outside the EXEMPT_REGEX (which lists
+  `lib/constants.mjs`, `test-features.mjs`, the bash CLIs, docs, and the
+  workflow itself). Any future PR re-introducing a hardcoded port
+  literal will be blocked at CI before it can cascade.
+- Doc comments in `server.mjs` env-var summary and `setup.mjs` usage
+  banner reworded so the literal `3456` no longer appears as
+  documentation text (CI grep is intentionally aggressive — it does not
+  parse comments — so doc strings reference `DEFAULT_PORT from
+  lib/constants.mjs` instead).
+
+No behavior change for any user. `CLAUDE_PROXY_PORT` env var remains
+the runtime override; the only difference is the unset-env fallback
+now flows through one shared constant.
+
+ALIGNMENT.md hard-requirements: this PR modifies `server.mjs` (one-line
+import + one literal swap, mechanical). No cli.js operation changed;
+the citation requirement does not apply. SPOT principle (Rule 2 spirit)
+is the entire motivation.
+
 ## v3.16.3 — 2026-05-13
 
 ### Fixes — completes v3.16.2 port-drift revert

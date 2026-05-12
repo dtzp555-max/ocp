@@ -9,6 +9,7 @@ import { readFileSync, writeFileSync, existsSync, copyFileSync } from "node:fs";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import { homedir } from "node:os";
+import { DEFAULT_PORT, LOCAL_HOST, OPENAI_API_BASE } from "../lib/constants.mjs";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const REPO_ROOT = join(__dirname, "..");
@@ -70,7 +71,7 @@ if (!config.models.providers) config.models.providers = {};
 if (!config.models.providers[PROVIDER_NAME]) {
   // First-time registration
   config.models.providers[PROVIDER_NAME] = {
-    baseUrl: "http://127.0.0.1:3456/v1",
+    baseUrl: `http://${LOCAL_HOST}:${DEFAULT_PORT}${OPENAI_API_BASE}`,
     api: "openai-completions",
     authHeader: false,
     models: desiredModels,

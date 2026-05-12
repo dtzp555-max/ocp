@@ -11,7 +11,7 @@
  * This matches LiteLLM, OpenAI SDK, and other major LLM proxies.
  *
  * Env vars:
- *   CLAUDE_PROXY_PORT            — listen port (default: 3456)
+ *   CLAUDE_PROXY_PORT            — listen port (default: DEFAULT_PORT from lib/constants.mjs)
  *   CLAUDE_BIN                   — path to claude binary (default: auto-detect)
  *   CLAUDE_TIMEOUT               — per-request timeout in ms (default: 600000)
  *   CLAUDE_ALLOWED_TOOLS         — comma-separated tools to allow (default: expanded set)
@@ -35,6 +35,7 @@ import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 import { homedir } from "node:os";
 import { validateKey, recordUsage, getUsageByKey, getUsageTimeline, getRecentUsage, createKey, listKeys, revokeKey, closeDb, checkQuota, updateKeyQuota, getKeyQuota, findKey, cacheHash, getCachedResponse, setCachedResponse, clearCache, getCacheStats, hasCacheControl, singleflight, getInflightStats } from "./keys.mjs";
+import { DEFAULT_PORT } from "./lib/constants.mjs";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const _pkg = JSON.parse(readFileSync(join(__dirname, "package.json"), "utf8"));
@@ -123,7 +124,7 @@ function resolveClaude() {
 
 // ── Configuration ───────────────────────────────────────────────────────
 // Settings marked with `let` can be changed at runtime via PATCH /settings.
-const PORT = parseInt(process.env.CLAUDE_PROXY_PORT || "3456", 10);
+const PORT = parseInt(process.env.CLAUDE_PROXY_PORT || String(DEFAULT_PORT), 10);
 const CLAUDE = resolveClaude();
 let TIMEOUT = parseInt(process.env.CLAUDE_TIMEOUT || "600000", 10);
 const PROXY_API_KEY = process.env.PROXY_API_KEY || "";
