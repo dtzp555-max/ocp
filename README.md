@@ -855,7 +855,8 @@ Future `ocp update` invocations sync automatically.
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `CLAUDE_PROXY_PORT` | `3456` | Listen port |
+| `CLAUDE_PROXY_PORT` | `3478` | Listen port (server-side). Also consumed by the OpenClaw `ocp-plugin` to dial the local proxy. |
+| `OCP_PROXY_URL` | *(unset)* | Plugin-side full URL override (e.g. `http://10.0.0.5:3478`). Wins over `CLAUDE_PROXY_PORT` when both are set. Read by `ocp-plugin/index.js` only — server ignores it. |
 | `CLAUDE_BIND` | `127.0.0.1` | Bind address (`0.0.0.0` for LAN access) |
 | `CLAUDE_AUTH_MODE` | `none` | Auth mode: `none`, `shared`, or `multi` |
 | `OCP_ADMIN_KEY` | *(unset)* | Admin key for key management (multi mode) |
