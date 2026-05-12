@@ -134,7 +134,7 @@ async function runFullUpgrade({ doctor, opts }) {
 
     // phase 6: post-flight (10s budget; skipped under mockExec)
     if (!opts.mockExec) {
-      const port = process.env.CLAUDE_PROXY_PORT || "3478";
+      const port = process.env.CLAUDE_PROXY_PORT || "3456";
       let ok = false;
       for (let i = 0; i < 10; i++) {
         try {
