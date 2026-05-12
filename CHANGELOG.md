@@ -1,5 +1,32 @@
 # Changelog
 
+## v3.16.3 — 2026-05-13
+
+### Fixes — completes v3.16.2 port-drift revert
+
+v3.16.2 reverted the plugin / `openclaw.plugin.json` / README / Mac mini
+plist back to `3456` (the historical source default since `593d0dc`), but
+missed three places in `scripts/` that still defaulted to `3478`. Those
+three lines were the residual cascade source: every time `ocp doctor` or
+`ocp upgrade` ran without `CLAUDE_PROXY_PORT` in the env, they probed
+`3478`, reported "OCP not responding" against a healthy 3456 instance,
+and (in the case of OpenClaw sync follow-ups on the maintainer's host)
+re-introduced 3478 into downstream config.
+
+Changes:
+
+- `scripts/upgrade.mjs:137` — default port `3478` → `3456`.
+- `scripts/doctor.mjs:84` — default port `3478` → `3456`.
+- `scripts/doctor.mjs:205` — default port `3478` → `3456`.
+
+No behavior change for users who set `CLAUDE_PROXY_PORT` explicitly; env
+still takes precedence. The fix only affects the unset-env fallback,
+which now matches `server.mjs:126` and the rest of the codebase.
+
+Test plan: existing `test-features.mjs` cases that pin
+`CLAUDE_PROXY_PORT=3478` continue to pass — they use the env path, not
+the default.
+
 ## v3.16.2 — 2026-05-12
 
 ### Fixes — corrects v3.16.1

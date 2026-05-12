@@ -81,7 +81,7 @@ export async function runDoctor(opts = {}) {
       health = opts.mockHealth;
     } else {
       try {
-        const port = process.env.CLAUDE_PROXY_PORT || "3478";
+        const port = process.env.CLAUDE_PROXY_PORT || "3456";
         const out = execSync(`curl -sf --max-time 3 http://127.0.0.1:${port}/health`, { stdio: ["pipe", "pipe", "pipe"] }).toString();
         health = { status: 200, body: JSON.parse(out) };
       } catch (e) {
@@ -202,7 +202,7 @@ function runOauthOnly(opts, checks, push) {
     health = opts.mockHealth;
   } else {
     try {
-      const port = process.env.CLAUDE_PROXY_PORT || "3478";
+      const port = process.env.CLAUDE_PROXY_PORT || "3456";
       const out = execSync(`curl -sf --max-time 3 http://127.0.0.1:${port}/health`, { stdio: ["pipe", "pipe", "pipe"] }).toString();
       health = { status: 200, body: JSON.parse(out) };
     } catch (e) {
