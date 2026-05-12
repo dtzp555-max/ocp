@@ -1,9 +1,17 @@
 /**
  * OCP Plugin — registers /ocp as a native slash command in OpenClaw gateway.
- * Calls the local claude-proxy at http://127.0.0.1:3456 and formats the response.
+ * Calls the local claude-proxy and formats the response.
+ *
+ * Port resolution (in priority order):
+ *   1. OCP_PROXY_URL env (full URL, e.g. http://10.0.0.5:3478)
+ *   2. CLAUDE_PROXY_PORT env (port only; localhost assumed)
+ *   3. Fallback: http://127.0.0.1:3478 (OCP v3.14+ default)
+ *
+ * (The legacy 3456 default — pre-v3.14 — caused "OCP error: fetch failed"
+ * on machines whose OCP server moved to 3478 while the plugin lagged.)
  */
-
-const PROXY = "http://127.0.0.1:3456";
+const PROXY = process.env.OCP_PROXY_URL
+  || (process.env.CLAUDE_PROXY_PORT ? `http://127.0.0.1:${process.env.CLAUDE_PROXY_PORT}` : "http://127.0.0.1:3478");
 
 // Wrap output in monospace code block for Telegram/Discord alignment
 function mono(text) { return "```\n" + text + "\n```"; }

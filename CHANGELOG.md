@@ -1,6 +1,16 @@
 # Changelog
 
-## v3.16.0 — 2026-XX-XX (release date filled at tag time)
+## v3.16.1 — 2026-05-12
+
+### Fixes
+
+- **OCP plugin port lag** — `ocp-plugin/index.js` hard-coded `http://127.0.0.1:3456` while OCP server moved to 3478 in v3.14+. Result: `/ocp` slash commands in OpenClaw (e.g. `/ocp usage` from the home Telegram bot) returned "OCP error: fetch failed". Default is now `http://127.0.0.1:3478` and the plugin reads `OCP_PROXY_URL` env (full URL) or `CLAUDE_PROXY_PORT` env (port only) when set. `openclaw.plugin.json` `configSchema.proxyUrl.default` also updated and the plugin version bumped to `3.16.1`. Run `ocp update` to redeploy the plugin into `~/.openclaw/extensions/ocp/`.
+
+### Governance
+
+- No `cli.js` citation needed (no `server.mjs` change). ALIGNMENT.md Rule 2 not engaged.
+
+## v3.16.0 — 2026-05-10
 
 ### Features
 
