@@ -36,6 +36,7 @@ import { dirname, join } from "node:path";
 import { homedir } from "node:os";
 import { validateKey, recordUsage, getUsageByKey, getUsageTimeline, getRecentUsage, createKey, listKeys, revokeKey, closeDb, checkQuota, updateKeyQuota, getKeyQuota, findKey, cacheHash, getCachedResponse, setCachedResponse, clearCache, getCacheStats, hasCacheControl, singleflight, getInflightStats } from "./keys.mjs";
 import { DEFAULT_PORT } from "./lib/constants.mjs";
+import { isJsonRequest, jsonSteeringInstruction, extractJson } from "./lib/json-mode.mjs";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const _pkg = JSON.parse(readFileSync(join(__dirname, "package.json"), "utf8"));
@@ -1286,7 +1287,15 @@ async function handleChatCompletions(req, res) {
 
   const messages = parsed.messages || parsed.input || [{ role: "user", content: parsed.prompt || "" }];
   const model = parsed.model || "claude-sonnet-4-6";
-  const stream = parsed.stream;
+
+  // Honor response_format / json_mode: steer toward pure JSON and force
+  // non-streaming so the reply can be fence-stripped before returning.
+  const wantsJson = isJsonRequest(parsed);
+  if (wantsJson) {
+    messages.push({ role: "system", content: jsonSteeringInstruction(parsed.response_format) });
+    logEvent("info", "json_mode_request", { model, format: parsed.response_format?.type || "json_mode" });
+  }
+  const stream = parsed.stream && !wantsJson;
 
   // Validate model against known models
   if (!VALID_MODELS.has(model)) {
@@ -1377,7 +1386,8 @@ async function handleChatCompletions(req, res) {
         // will re-read the freshly-populated cache entry here rather than spawning.
         const recheck = getCachedResponse(req._cacheHash, CACHE_TTL);
         if (recheck) return recheck.response;
-        const c = await callClaude(model, messages, conversationId, req._authKeyName);
+        const raw = await callClaude(model, messages, conversationId, req._authKeyName);
+        const c = wantsJson ? extractJson(raw) : raw;
         try { setCachedResponse(req._cacheHash, model, c); } catch (e) { logEvent("error", "cache_write_failed", { error: e.message }); }
         return c;
       });
@@ -1399,7 +1409,8 @@ async function handleChatCompletions(req, res) {
 
   // Fallback: cache disabled (CACHE_TTL=0) or no _cacheHash — original path untouched.
   try {
-    const content = await callClaude(model, messages, conversationId, req._authKeyName);
+    const raw = await callClaude(model, messages, conversationId, req._authKeyName);
+    const content = wantsJson ? extractJson(raw) : raw;
     const id = `chatcmpl-${randomUUID()}`;
     completionResponse(res, id, model, content);
     try { recordUsage({ keyId: req._authKeyId, keyName: req._authKeyName, model, promptChars, responseChars: content.length, elapsedMs: Date.now() - t0Usage, success: true }); } catch (e) { logEvent("error", "usage_record_failed", { error: e.message }); }

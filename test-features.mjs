@@ -4,6 +4,7 @@
  * Tests database layer functions directly — no server needed.
  */
 import { getDb, createKey, listKeys, validateKey, recordUsage, checkQuota, updateKeyQuota, getKeyQuota, findKey, cacheHash, getCachedResponse, setCachedResponse, clearCache, getCacheStats, closeDb, hasCacheControl, singleflight, getInflightStats } from "./keys.mjs";
+import { isJsonRequest, jsonSteeringInstruction, extractJson, firstBalancedJson } from "./lib/json-mode.mjs";
 import { createHash } from "node:crypto";
 import { strict as assert } from "node:assert";
 import { unlinkSync } from "node:fs";
@@ -949,6 +950,53 @@ await asyncTest("doctor --check oauth + 200 with null body → fix_service", asy
   assert.deepEqual(ids, ["oauth_ok"]);
   assert.equal(result.next_action.kind, "fix_service");
   assert.equal(result.fail_count, 1);
+});
+
+// ── response_format / json_mode honoring ──
+console.log("\nJSON mode:");
+
+test("isJsonRequest detects json_object", () => {
+  assert.equal(isJsonRequest({ response_format: { type: "json_object" } }), true);
+});
+test("isJsonRequest detects json_schema", () => {
+  assert.equal(isJsonRequest({ response_format: { type: "json_schema", json_schema: { schema: {} } } }), true);
+});
+test("isJsonRequest detects json_mode flag", () => {
+  assert.equal(isJsonRequest({ json_mode: true }), true);
+});
+test("isJsonRequest false for plain request", () => {
+  assert.equal(isJsonRequest({ messages: [] }), false);
+  assert.equal(isJsonRequest({ response_format: { type: "text" } }), false);
+});
+test("jsonSteeringInstruction embeds schema when provided", () => {
+  const s = jsonSteeringInstruction({ type: "json_schema", json_schema: { schema: { type: "object", required: ["facts"] } } });
+  assert.ok(s.includes("JSON Schema"));
+  assert.ok(s.includes("\"required\""));
+});
+test("jsonSteeringInstruction omits schema for json_object", () => {
+  const s = jsonSteeringInstruction({ type: "json_object" });
+  assert.ok(!s.includes("JSON Schema"));
+});
+test("extractJson unwraps ```json fences", () => {
+  assert.equal(extractJson('```json\n{"a":1}\n```'), '{"a":1}');
+});
+test("extractJson unwraps bare ``` fences", () => {
+  assert.equal(extractJson('```\n[1,2,3]\n```'), '[1,2,3]');
+});
+test("extractJson slices JSON out of surrounding prose", () => {
+  assert.equal(extractJson('Here are the facts:\n{"facts":["x"]}\nLet me know!'), '{"facts":["x"]}');
+});
+test("extractJson leaves clean JSON untouched", () => {
+  assert.equal(extractJson('{"a":1}'), '{"a":1}');
+});
+test("extractJson is string-aware (ignores brackets in strings)", () => {
+  assert.equal(extractJson('{"k":"a}b]c"}'), '{"k":"a}b]c"}');
+});
+test("extractJson returns trimmed input when no JSON present", () => {
+  assert.equal(extractJson("  no json here  "), "no json here");
+});
+test("firstBalancedJson returns null on unbalanced input", () => {
+  assert.equal(firstBalancedJson('{"a":1'), null);
 });
 
 // ── Cleanup ──
