@@ -22,6 +22,7 @@ New ADRs increment from the highest existing number. Filenames are
 | [0003](0003-models-json-spot.md) | `models.json` as SPOT | Why model IDs / aliases / context windows live in a single JSON file (not duplicated in `server.mjs` and `setup.mjs` arrays). v3.11.0 refactor. |
 | [0004](0004-openclaw-auto-sync.md) | OpenClaw Auto-Sync | Why `scripts/sync-openclaw.mjs` runs on `ocp update`, what its scope boundary is (writes only `models.providers["claude-local"].models` and `agents.defaults.models["claude-local/*"]`), and the idempotency contract. |
 | [0005](0005-no-multi-provider.md) | No Multi-Provider | Why OCP stays single-provider (Anthropic-via-cli.js) and does not extend to OpenAI / Gemini / OpenRouter. Cost estimate: ~7 weeks for a v1 that buys neither moat nor commercial readiness. Separate commercial work starts in a separate repo. |
+| [0006](0006-openai-shim-scope.md) | OpenAI Shim Scope | The Class A / Class B taxonomy. Class A endpoints (`cli.js`-mirror) keep Rules 1–5 verbatim; Class B endpoints (OCP-owned compatibility surface — `/v1/chat/completions`, `/v1/models`, admin endpoints) are anchored to OpenAI's spec (B.1) or to an authorizing ADR (B.2). Triggered by PR #99 (external `response_format` honoring). Grandfathers the existing B.2 inventory at v3.16.4. |
 
 ## When to write a new ADR
 
