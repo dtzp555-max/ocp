@@ -1,0 +1,26 @@
+{
+  "hooks": {
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/opt/ocp/.claude/hooks/inject-json-contract.sh",
+            "timeout": 5
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/opt/ocp/.claude/hooks/validate-json-output.sh",
+            "timeout": 10
+          }
+        ]
+      }
+    ]
+  }
+}

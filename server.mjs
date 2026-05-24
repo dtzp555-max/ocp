@@ -2,8 +2,12 @@
 /**
  * openclaw-claude-proxy — OpenAI-compatible proxy for Claude CLI
  *
- * Translates OpenAI chat/completions requests into `claude -p` CLI calls,
- * letting you use your Claude Pro/Max subscription as an OpenClaw model provider.
+ * Translates OpenAI chat/completions requests into Claude calls.
+ * Supports two execution modes (CLAUDE_TUI_MODE env var):
+ *   false (default) — spawns `claude -p` per request (fast, uses Agent SDK credits)
+ *   true            — runs Claude in interactive TUI mode via tmux; stays within the
+ *                     subscription (avoids the Agent SDK credit pool introduced in the
+ *                     Anthropic 2026-06-15 billing change).
  *
  * Timeout design: single CLAUDE_TIMEOUT (default 600s / 10 min).
  * No separate first-byte or idle timeout — Claude tool-use causes long pauses
@@ -36,6 +40,7 @@ import { dirname, join } from "node:path";
 import { homedir } from "node:os";
 import { validateKey, recordUsage, getUsageByKey, getUsageTimeline, getRecentUsage, createKey, listKeys, revokeKey, closeDb, checkQuota, updateKeyQuota, getKeyQuota, findKey, cacheHash, getCachedResponse, setCachedResponse, clearCache, getCacheStats, hasCacheControl, singleflight, getInflightStats } from "./keys.mjs";
 import { DEFAULT_PORT } from "./lib/constants.mjs";
+import { callClaudeTui } from "./lib/tmux-session.mjs";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const _pkg = JSON.parse(readFileSync(join(__dirname, "package.json"), "utf8"));
@@ -142,7 +147,9 @@ const BREAKER_WINDOW = parseInt(process.env.CLAUDE_BREAKER_WINDOW || "300000", 1
 const BREAKER_HALF_OPEN_MAX = parseInt(process.env.CLAUDE_BREAKER_HALF_OPEN_MAX || "2", 10);
 const HEARTBEAT_INTERVAL = parseInt(process.env.CLAUDE_HEARTBEAT_INTERVAL || "0", 10);
 const BIND_ADDRESS = process.env.CLAUDE_BIND || "127.0.0.1";
-const NO_CONTEXT = process.env.CLAUDE_NO_CONTEXT === "true";
+const NO_CONTEXT  = process.env.CLAUDE_NO_CONTEXT  === "true";
+// CLAUDE_TUI_MODE=true: route all requests through interactive TUI (no Agent SDK credits).
+const TUI_MODE    = process.env.CLAUDE_TUI_MODE    === "true";
 const AUTH_MODE = process.env.CLAUDE_AUTH_MODE || (PROXY_API_KEY ? "shared" : "none");
 const ADMIN_KEY = process.env.OCP_ADMIN_KEY || "";
 const PROXY_ANONYMOUS_KEY = process.env.PROXY_ANONYMOUS_KEY || "";
@@ -411,6 +418,32 @@ function buildCliArgs(cliModel, sessionInfo) {
   }
 
   return args;
+}
+
+
+// ── JSON mode helpers for TUI path ─────────────────────────────────────────
+function tuiSchema(parsed) {
+  const rf = parsed.response_format;
+  if (rf && rf.type === "json_schema" && rf.json_schema && rf.json_schema.schema) return rf.json_schema.schema;
+  return null;
+}
+
+function isJsonRequest(parsed) {
+  const rf = parsed.response_format;
+  if (rf && (rf.type === "json_object" || rf.type === "json_schema")) return true;
+  return parsed.json_mode === true;
+}
+
+function jsonSteeringText(parsed) {
+  const rf = parsed.response_format;
+  let instr = "OUTPUT CONTRACT: Respond with exactly one valid JSON value. " +
+    "No markdown fences, no prose, no explanations before or after. " +
+    "Your entire response must be parseable by JSON.parse().";
+  if (rf && rf.type === "json_schema" && rf.json_schema && rf.json_schema.schema) {
+    instr += " The JSON MUST conform to this JSON Schema: " +
+      JSON.stringify(rf.json_schema.schema);
+  }
+  return instr;
 }
 
 // ── Format messages to prompt text ──────────────────────────────────────
@@ -1358,6 +1391,29 @@ async function handleChatCompletions(req, res) {
 
   if (stream) {
     // Real streaming: pipe stdout from claude process directly as SSE chunks
+    if (TUI_MODE) {
+      // TUI mode: collect full result, then replay as SSE chunks (subscription billing)
+      const tuiPrompt = messagesToPrompt(messages);
+      let tuiContent;
+      try {
+        tuiContent = await callClaudeTui(tuiPrompt, { model, timeoutMs: TIMEOUT, systemPrompt: SYSTEM_PROMPT, noContext: NO_CONTEXT, jsonMode: isJsonRequest(parsed), schema: tuiSchema(parsed) });
+      } catch (err) {
+        logEvent("error", "tui_error", { model, error: err.message });
+        if (!res.headersSent) return jsonResponse(res, 500, { error: { message: err.message.replace(/\/[\w/.\-]+/g, "[path]"), type: "proxy_error" } });
+        return;
+      }
+      // Replay as SSE stream
+      const id = `chatcmpl-${randomUUID()}`;
+      const created = Math.floor(Date.now() / 1000);
+      const CHUNK = 80;
+      res.writeHead(200, { "Content-Type": "text/event-stream", "Cache-Control": "no-cache", "Connection": "keep-alive" });
+      sendSSE(res, { id, object: "chat.completion.chunk", created, model, choices: [{ index: 0, delta: { role: "assistant" }, finish_reason: null }] });
+      const pts = Array.from(tuiContent);
+      for (let i = 0; i < pts.length; i += CHUNK) sendSSE(res, { id, object: "chat.completion.chunk", created, model, choices: [{ index: 0, delta: { content: pts.slice(i, i + CHUNK).join("") }, finish_reason: null }] });
+      sendSSE(res, { id, object: "chat.completion.chunk", created, model, choices: [{ index: 0, delta: {}, finish_reason: "stop" }] });
+      res.write("data: [DONE]\n\n"); res.end();
+      return;
+    }
     return callClaudeStreaming(model, messages, conversationId, res, { keyId: req._authKeyId, keyName: req._authKeyName, cacheHash: req._cacheHash });
   }
 
@@ -1377,7 +1433,9 @@ async function handleChatCompletions(req, res) {
         // will re-read the freshly-populated cache entry here rather than spawning.
         const recheck = getCachedResponse(req._cacheHash, CACHE_TTL);
         if (recheck) return recheck.response;
-        const c = await callClaude(model, messages, conversationId, req._authKeyName);
+        const c = TUI_MODE
+          ? await callClaudeTui(messagesToPrompt(messages), { model, timeoutMs: TIMEOUT, systemPrompt: SYSTEM_PROMPT, noContext: NO_CONTEXT, jsonMode: isJsonRequest(parsed), schema: tuiSchema(parsed) })
+          : await callClaude(model, messages, conversationId, req._authKeyName);
         try { setCachedResponse(req._cacheHash, model, c); } catch (e) { logEvent("error", "cache_write_failed", { error: e.message }); }
         return c;
       });
@@ -1399,7 +1457,9 @@ async function handleChatCompletions(req, res) {
 
   // Fallback: cache disabled (CACHE_TTL=0) or no _cacheHash — original path untouched.
   try {
-    const content = await callClaude(model, messages, conversationId, req._authKeyName);
+    const content = TUI_MODE
+      ? await callClaudeTui(messagesToPrompt(messages), { model, timeoutMs: TIMEOUT, systemPrompt: SYSTEM_PROMPT, noContext: NO_CONTEXT, jsonMode: isJsonRequest(parsed), schema: tuiSchema(parsed) })
+      : await callClaude(model, messages, conversationId, req._authKeyName);
     const id = `chatcmpl-${randomUUID()}`;
     completionResponse(res, id, model, content);
     try { recordUsage({ keyId: req._authKeyId, keyName: req._authKeyName, model, promptChars, responseChars: content.length, elapsedMs: Date.now() - t0Usage, success: true }); } catch (e) { logEvent("error", "usage_record_failed", { error: e.message }); }
