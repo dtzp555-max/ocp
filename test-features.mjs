@@ -1192,6 +1192,353 @@ test("parseStreamJsonEvent: unknown event type returns null", () => {
   const result = parseStreamJsonEvent({ type: "future_event_type" }, false);
   assert.equal(result, null);
 });
+// ── Suite: streamStringAsSSE wire-format ────────────────────────────────
+// streamStringAsSSE is not exported from server.mjs (internal helper), so we
+// test the wire format contract using a local implementation with the same
+// logic.  This validates the protocol shape (role chunk → content chunks →
+// stop → [DONE]) that both the cache-hit replay and TUI streaming paths rely on.
+console.log("\nstreamStringAsSSE wire-format:");
+
+function _testSendSSE(res, data) { res.write(`data: ${JSON.stringify(data)}\n\n`); }
+
+function _testStreamStringAsSSE(res, id, model, content) {
+  const created = Math.floor(Date.now() / 1000);
+  res.writeHead(200, { "Content-Type": "text/event-stream" });
+  _testSendSSE(res, { id, object: "chat.completion.chunk", created, model, choices: [{ index: 0, delta: { role: "assistant" }, finish_reason: null }] });
+  const CHUNK = 80;
+  const codepoints = Array.from(content);
+  for (let i = 0; i < codepoints.length; i += CHUNK) {
+    _testSendSSE(res, { id, object: "chat.completion.chunk", created, model, choices: [{ index: 0, delta: { content: codepoints.slice(i, i + CHUNK).join("") }, finish_reason: null }] });
+  }
+  _testSendSSE(res, { id, object: "chat.completion.chunk", created, model, choices: [{ index: 0, delta: {}, finish_reason: "stop" }] });
+  res.write("data: [DONE]\n\n");
+  res.end();
+}
+
+function _makeFakeRes() {
+  const writes = [];
+  let headsSent = false;
+  return {
+    writes,
+    writeHead(status, headers) { headsSent = true; this._status = status; this._headers = headers; },
+    write(s) { writes.push(s); },
+    end() { this._ended = true; },
+  };
+}
+
+test("streamStringAsSSE emits role chunk + content chunks + stop + [DONE]", () => {
+  const res = _makeFakeRes();
+  const content = "hello world";
+  _testStreamStringAsSSE(res, "test-id", "claude-haiku", content);
+  assert.ok(res._status === 200, "writeHead(200) called");
+  assert.ok(res._ended, "res.end() called");
+  // First write: role delta
+  const firstEvent = JSON.parse(res.writes[0].replace(/^data: /, "").trim());
+  assert.equal(firstEvent.choices[0].delta.role, "assistant");
+  assert.equal(firstEvent.choices[0].finish_reason, null);
+  // Since content < 80 chars it fits in one chunk
+  const secondEvent = JSON.parse(res.writes[1].replace(/^data: /, "").trim());
+  assert.equal(secondEvent.choices[0].delta.content, content);
+  // Second-to-last: stop chunk
+  const stopEvent = JSON.parse(res.writes[res.writes.length - 2].replace(/^data: /, "").trim());
+  assert.equal(stopEvent.choices[0].finish_reason, "stop");
+  // Last: [DONE]
+  assert.equal(res.writes[res.writes.length - 1], "data: [DONE]\n\n");
+});
+
+test("streamStringAsSSE splits content at 80 codepoints per chunk", () => {
+  const res = _makeFakeRes();
+  const content = "x".repeat(200); // 3 chunks: 80+80+40
+  _testStreamStringAsSSE(res, "test-id-2", "claude-haiku", content);
+  // writes: [role_chunk, content_chunk_1, content_chunk_2, content_chunk_3, stop_chunk, [DONE]]
+  assert.equal(res.writes.length, 6);
+  const c1 = JSON.parse(res.writes[1].replace(/^data: /, "").trim());
+  assert.equal(c1.choices[0].delta.content.length, 80);
+  const c2 = JSON.parse(res.writes[2].replace(/^data: /, "").trim());
+  assert.equal(c2.choices[0].delta.content.length, 80);
+  const c3 = JSON.parse(res.writes[3].replace(/^data: /, "").trim());
+  assert.equal(c3.choices[0].delta.content.length, 40);
+});
+
+test("streamStringAsSSE empty content: role + stop + [DONE] only", () => {
+  const res = _makeFakeRes();
+  _testStreamStringAsSSE(res, "test-id-3", "claude-haiku", "");
+  // writes: [role_chunk, stop_chunk, [DONE]]
+  assert.equal(res.writes.length, 3);
+  const stop = JSON.parse(res.writes[1].replace(/^data: /, "").trim());
+  assert.equal(stop.choices[0].finish_reason, "stop");
+  assert.equal(res.writes[2], "data: [DONE]\n\n");
+});
+
+// ── Suite: TUI transcript reader ────────────────────────────────────────
+import { encodeCwd, transcriptPath, findTranscriptPath, parseTranscriptLines, isTerminalLine, extractLatestAssistantText, verifyEntrypoint } from "./lib/tui/transcript.mjs";
+import { readFileSync as tuiReadFileSync, mkdtempSync as tuiMkdtemp0, mkdirSync as tuiMkdir0, writeFileSync as tuiWrite0 } from "node:fs";
+import { tmpdir as tuiTmp0 } from "node:os";
+
+console.log("\nTUI transcript — path formula:");
+
+test("encodeCwd replaces every slash AND every dot with dash", () => {
+  // Verified live (claude v2.1.158): /home/u/.ocp-tui/work -> -home-u--ocp-tui-work
+  assert.equal(encodeCwd("/home/u/.ocp-tui/work"), "-home-u--ocp-tui-work");
+  assert.equal(encodeCwd("/tmp/tui-test"), "-tmp-tui-test"); // dot-free path still correct
+});
+test("transcriptPath composes HOME/.claude/projects/<enc>/<sid>.jsonl", () => {
+  assert.equal(
+    transcriptPath("/home/u", "/home/u/.ocp-tui/work", "abc-123"),
+    "/home/u/.claude/projects/-home-u--ocp-tui-work/abc-123.jsonl"
+  );
+});
+test("findTranscriptPath locates <sid>.jsonl across projects subdirs by UUID", () => {
+  const home = tuiMkdtemp0(`${tuiTmp0()}/tui-home-`);
+  const sid = "11111111-2222-3333-4444-555555555555";
+  const proj = `${home}/.claude/projects/-some--weird-encoding`;
+  tuiMkdir0(proj, { recursive: true });
+  tuiWrite0(`${proj}/${sid}.jsonl`, "{}\n");
+  assert.equal(findTranscriptPath(home, sid), `${proj}/${sid}.jsonl`);
+  assert.equal(findTranscriptPath(home, "no-such-uuid"), null);
+  assert.equal(findTranscriptPath(null, sid), null);
+});
+
+console.log("\nTUI transcript — parsing + terminal detection:");
+
+test("parseTranscriptLines skips blank + malformed/partial lines", () => {
+  const evs = parseTranscriptLines('{"a":1}\n\n{bad json\n{"b":2}\n');
+  assert.equal(evs.length, 2);
+  assert.equal(evs[1].b, 2);
+});
+test("isTerminalLine true on turn_duration", () => {
+  assert.equal(isTerminalLine({ type: "system", subtype: "turn_duration" }), true);
+});
+test("isTerminalLine true on stop_reason tool_use (message-wrapped)", () => {
+  assert.equal(isTerminalLine({ type: "assistant", message: { stop_reason: "tool_use" } }), true);
+});
+test("isTerminalLine true on stop_reason tool_use (flat)", () => {
+  assert.equal(isTerminalLine({ stop_reason: "tool_use" }), true);
+});
+test("isTerminalLine false on ordinary assistant text line", () => {
+  assert.equal(isTerminalLine({ type: "assistant", message: { content: [{ type: "text", text: "hi" }] } }), false);
+});
+test("extractLatestAssistantText concatenates text blocks of LAST assistant entry", () => {
+  const evs = [
+    { type: "assistant", message: { content: [{ type: "text", text: "first" }] } },
+    { type: "user", message: { content: "..." } },
+    { type: "assistant", message: { content: [{ type: "text", text: "A" }, { type: "thinking", thinking: "x" }, { type: "text", text: "B" }] } },
+  ];
+  assert.equal(extractLatestAssistantText(evs), "AB");
+});
+test("extractLatestAssistantText ignores thinking-only assistant entries", () => {
+  // Fixture shape: thinking block and text block are SEPARATE top-level entries sharing same msg id
+  const evs = [
+    { type: "assistant", message: { content: [{ type: "thinking", thinking: "hmm" }] } },
+    { type: "assistant", message: { content: [{ type: "text", text: "PONG" }] } },
+  ];
+  assert.equal(extractLatestAssistantText(evs), "PONG");
+});
+test("real complete fixture: parseTranscriptLines yields >0 events", () => {
+  const evs = parseTranscriptLines(tuiReadFileSync("./lib/tui/fixtures/complete-haiku.jsonl", "utf8"));
+  assert.ok(evs.length > 0, "fixture must parse to events");
+});
+test("real complete fixture: at least one isTerminalLine", () => {
+  const evs = parseTranscriptLines(tuiReadFileSync("./lib/tui/fixtures/complete-haiku.jsonl", "utf8"));
+  assert.ok(evs.some(isTerminalLine), "fixture must contain a terminal line");
+});
+test("real complete fixture: extractLatestAssistantText returns non-empty text", () => {
+  const evs = parseTranscriptLines(tuiReadFileSync("./lib/tui/fixtures/complete-haiku.jsonl", "utf8"));
+  assert.ok(extractLatestAssistantText(evs).length > 0, "fixture must yield assistant text");
+});
+test("real complete fixture: extractLatestAssistantText returns the FINAL text, not the first", () => {
+  // The fixture's first assistant text is "PONG"; it is followed by 8 later refusal
+  // turns. Pinning the exact FINAL string guards the overwrite-to-last semantic —
+  // a regression that returned the first text block would still pass a length check.
+  const evs = parseTranscriptLines(tuiReadFileSync("./lib/tui/fixtures/complete-haiku.jsonl", "utf8"));
+  assert.equal(extractLatestAssistantText(evs), "I'm moving on. If you have a genuine task, let me know.");
+});
+test("real complete fixture: verifyEntrypoint returns 'cli'", () => {
+  const evs = parseTranscriptLines(tuiReadFileSync("./lib/tui/fixtures/complete-haiku.jsonl", "utf8"));
+  assert.equal(verifyEntrypoint(evs), "cli");
+});
+
+// ── TUI transcript — polling reader (async) ──────────────────────────────
+import { readTuiTranscript } from "./lib/tui/transcript.mjs";
+import { mkdtempSync as tuiMkdtemp, writeFileSync as tuiWriteFile } from "node:fs";
+import { tmpdir as tuiTmpdir } from "node:os";
+
+console.log("\nTUI transcript — polling reader:");
+
+await asyncTest("readTuiTranscript returns assistant text when terminal marker present", async () => {
+  const dir = tuiMkdtemp(`${tuiTmpdir()}/tui-`);
+  const p = `${dir}/s.jsonl`;
+  tuiWriteFile(p, [
+    JSON.stringify({ type: "assistant", message: { content: [{ type: "text", text: "hello world" }] } }),
+    JSON.stringify({ type: "system", subtype: "turn_duration", durationMs: 1200 }),
+  ].join("\n") + "\n");
+  const out = await readTuiTranscript({ transcriptPath: p, wallclockMs: 2000, pollMs: 50 });
+  assert.equal(out, "hello world");
+});
+
+await asyncTest("readTuiTranscript honours wall-clock cap and returns partial text", async () => {
+  const dir = tuiMkdtemp(`${tuiTmpdir()}/tui-`);
+  const p = `${dir}/s.jsonl`;
+  tuiWriteFile(p, JSON.stringify({ type: "assistant", message: { content: [{ type: "text", text: "partial" }] } }) + "\n");
+  const out = await readTuiTranscript({ transcriptPath: p, wallclockMs: 300, pollMs: 50 });
+  assert.equal(out, "partial");
+});
+
+await asyncTest("readTuiTranscript throws when no text and cap elapses", async () => {
+  const dir = tuiMkdtemp(`${tuiTmpdir()}/tui-`);
+  const p = `${dir}/missing.jsonl`;
+  let threw = false;
+  try { await readTuiTranscript({ transcriptPath: p, wallclockMs: 200, pollMs: 50 }); }
+  catch { threw = true; }
+  assert.ok(threw, "must throw on empty timeout");
+});
+
+// ── TUI session reaper ───────────────────────────────────────────────────
+import { reapStaleTuiSessions, SESSION_PREFIX } from "./lib/tui/session.mjs";
+
+console.log("\nTUI session reaper:");
+
+test("SESSION_PREFIX is ocp-tui-", () => {
+  assert.equal(SESSION_PREFIX, "ocp-tui-");
+});
+
+test("reaper kills ONLY ocp-tui- sessions, never olp-tui-", () => {
+  const killed = [];
+  const fakeTmux = (args) => {
+    if (args[0] === "list-sessions") return { status: 0, stdout: "ocp-tui-aaaa\nolp-tui-bbbb\nmisc\nocp-tui-cccc\n" };
+    if (args[0] === "kill-session") { killed.push(args[args.indexOf("-t") + 1]); return { status: 0 }; }
+    return { status: 0, stdout: "" };
+  };
+  const n = reapStaleTuiSessions({ tmux: fakeTmux });
+  assert.equal(n, 2);
+  assert.equal(killed.join(","), "ocp-tui-aaaa,ocp-tui-cccc");
+  assert.ok(!killed.includes("olp-tui-bbbb"), "olp-tui-bbbb must never be killed");
+});
+
+test("reaper returns 0 when tmux status !== 0 (no server)", () => {
+  const fakeTmux = (_args) => ({ status: 1, stdout: "" });
+  const n = reapStaleTuiSessions({ tmux: fakeTmux });
+  assert.equal(n, 0);
+});
+
+test("reaper returns 0 for empty session list", () => {
+  const killed = [];
+  const fakeTmux = (args) => {
+    if (args[0] === "list-sessions") return { status: 0, stdout: "" };
+    if (args[0] === "kill-session") { killed.push(args[args.indexOf("-t") + 1]); return { status: 0 }; }
+    return { status: 0, stdout: "" };
+  };
+  const n = reapStaleTuiSessions({ tmux: fakeTmux });
+  assert.equal(n, 0);
+  assert.equal(killed.length, 0);
+});
+
+// ── TUI home preparation (scratch vs real) ───────────────────────────────
+import { prepareTuiHome, ensureTuiCwdTrusted } from "./lib/tui/session.mjs";
+import { mkdtempSync as hMkdtemp, mkdirSync as hMkdir, writeFileSync as hWrite, readFileSync as hRead, existsSync as hExists, readlinkSync as hReadlink } from "node:fs";
+import { tmpdir as hTmp } from "node:os";
+
+console.log("\nTUI home preparation:");
+
+test("prepareTuiHome scratch mode: symlinks creds, seeds onboarded config, trusts cwd, strips history", () => {
+  const realHome = hMkdtemp(`${hTmp()}/real-`);
+  hMkdir(`${realHome}/.claude`, { recursive: true });
+  hWrite(`${realHome}/.claude/.credentials.json`, '{"token":"x"}');
+  hWrite(`${realHome}/.claude.json`, JSON.stringify({ theme: "dark", projects: { "/old/secret/project": { hasTrustDialogAccepted: true } } }));
+  const tuiHome = hMkdtemp(`${hTmp()}/tui-`);
+  const cwd = `${tuiHome}/work`;
+  prepareTuiHome(realHome, tuiHome, cwd);
+  // credentials symlinked (token never copied)
+  assert.equal(hReadlink(`${tuiHome}/.claude/.credentials.json`), `${realHome}/.claude/.credentials.json`);
+  const seed = JSON.parse(hRead(`${tuiHome}/.claude.json`, "utf8"));
+  assert.equal(seed.hasCompletedOnboarding, true);
+  assert.equal(seed.theme, "dark");                                   // onboarded config carried over
+  assert.equal(seed.projects[cwd].hasTrustDialogAccepted, true);      // scratch cwd trusted
+  assert.equal(seed.projects["/old/secret/project"], undefined);      // user project history stripped
+  assert.ok(hExists(`${tuiHome}/.claude/projects`));                  // own projects dir
+});
+
+test("prepareTuiHome real mode (tuiHome===realHome): no symlink, just trusts cwd in real config", () => {
+  const realHome = hMkdtemp(`${hTmp()}/real2-`);
+  hWrite(`${realHome}/.claude.json`, JSON.stringify({ projects: {} }));
+  const cwd = `${realHome}/work`;
+  prepareTuiHome(realHome, realHome, cwd);
+  assert.ok(!hExists(`${realHome}/.claude/.credentials.json`));        // no scratch symlink created
+  const j = JSON.parse(hRead(`${realHome}/.claude.json`, "utf8"));
+  assert.equal(j.projects[cwd].hasTrustDialogAccepted, true);         // cwd trusted in real config
+});
+
+// ── resolveTuiEntrypointEnv ───────────────────────────────────────────────
+import { resolveTuiEntrypointEnv } from "./lib/tui/session.mjs";
+
+console.log("\nresolveTuiEntrypointEnv:");
+
+test("mode 'cli' sets CLAUDE_CODE_ENTRYPOINT=cli", () => {
+  const env = {};
+  resolveTuiEntrypointEnv(env, "cli");
+  assert.equal(env.CLAUDE_CODE_ENTRYPOINT, "cli");
+});
+
+test("mode 'cli' overwrites an inherited CLAUDE_CODE_ENTRYPOINT value", () => {
+  const env = { CLAUDE_CODE_ENTRYPOINT: "sdk-cli" };
+  resolveTuiEntrypointEnv(env, "cli");
+  assert.equal(env.CLAUDE_CODE_ENTRYPOINT, "cli");
+});
+
+test("mode 'auto' deletes CLAUDE_CODE_ENTRYPOINT (leaves unset)", () => {
+  const env = {};
+  resolveTuiEntrypointEnv(env, "auto");
+  assert.equal(env.CLAUDE_CODE_ENTRYPOINT, undefined);
+  assert.ok(!Object.prototype.hasOwnProperty.call(env, "CLAUDE_CODE_ENTRYPOINT"));
+});
+
+test("mode 'auto' deletes an inherited CLAUDE_CODE_ENTRYPOINT value", () => {
+  const env = { CLAUDE_CODE_ENTRYPOINT: "sdk-cli" };
+  resolveTuiEntrypointEnv(env, "auto");
+  assert.equal(env.CLAUDE_CODE_ENTRYPOINT, undefined);
+  assert.ok(!Object.prototype.hasOwnProperty.call(env, "CLAUDE_CODE_ENTRYPOINT"));
+});
+
+test("mode 'off' leaves an inherited CLAUDE_CODE_ENTRYPOINT value untouched", () => {
+  const env = { CLAUDE_CODE_ENTRYPOINT: "sdk-cli" };
+  resolveTuiEntrypointEnv(env, "off");
+  assert.equal(env.CLAUDE_CODE_ENTRYPOINT, "sdk-cli");
+});
+
+test("mode 'off' with no inherited value leaves env unchanged", () => {
+  const env = { OTHER: "x" };
+  resolveTuiEntrypointEnv(env, "off");
+  assert.equal(env.CLAUDE_CODE_ENTRYPOINT, undefined);
+  assert.equal(env.OTHER, "x");
+});
+
+test("default mode (no second arg) behaves like 'cli'", () => {
+  const env = { CLAUDE_CODE_ENTRYPOINT: "sdk-cli" };
+  resolveTuiEntrypointEnv(env);
+  assert.equal(env.CLAUDE_CODE_ENTRYPOINT, "cli");
+});
+
+// ── TUI session driver: runTuiTurn (live-only, guarded) ──────────────────
+console.log("\nTUI session driver:");
+
+if (process.env.OCP_TUI_LIVE === "1") {
+  await asyncTest("runTuiTurn drives a real interactive turn and returns text", async () => {
+    const { runTuiTurn } = await import("./lib/tui/session.mjs");
+    const out = await runTuiTurn({
+      prompt: "Reply with exactly the word PONG and nothing else.",
+      model: "claude-haiku-4-5-20251001",
+      claudeBin: process.env.OCP_TUI_CLAUDE_BIN || "claude",
+      home: process.env.HOME,
+      cwd: `${process.env.HOME}/.ocp-tui/work`,
+      wallclockMs: 120000,
+    });
+    assert.ok(/PONG/i.test(out), `expected PONG, got: ${out.slice(0, 200)}`);
+  });
+} else {
+  test("runTuiTurn (live) — SKIPPED (set OCP_TUI_LIVE=1 on PI231 to run)", () => {
+    assert.ok(true);
+  });
+}
 
 // ── Cleanup ──
 closeDb();

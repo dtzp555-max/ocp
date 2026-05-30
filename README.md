@@ -874,6 +874,11 @@ Future `ocp update` invocations sync automatically.
 | `CLAUDE_NO_CONTEXT` | `false` | Suppress CLAUDE.md and auto-memory injection (pure API mode) |
 | `PROXY_API_KEY` | *(unset)* | Bearer token for shared-mode authentication |
 | `PROXY_ANONYMOUS_KEY` | *(unset)* | Well-known anonymous key allowlist (multi mode). When set, this exact string bypasses `validateKey()` and grants public access. Exposed via `/health.anonymousKey` so clients auto-discover. See [Anonymous Access](#anonymous-access-optional). |
+| `CLAUDE_TUI_MODE` | `false` | **Opt-in.** Set to `"true"` to serve requests via interactive `claude` (no `-p` / `--output-format` → `cc_entrypoint=cli`, subscription pool). **Single-user only** — see [Subscription-pool (TUI) mode](#subscription-pool-tui-mode) for the security constraint. |
+| `CLAUDE_TUI_WALLCLOCK_MS` | `120000` | (TUI-mode) Maximum time in ms to wait for the native transcript to signal turn completion. Increase for long Opus thinking turns. |
+| `OCP_TUI_CWD` | `$HOME/.ocp-tui/work` | (TUI-mode) Scratch working directory where interactive claude sessions run. Transcripts land under `<HOME>/.claude/projects/<encoded-cwd>/`. Created automatically. |
+| `OCP_TUI_HOME` | `$HOME` (real home) | (TUI-mode) `HOME` claude runs under. Default is the operator's real home (shared credentials, existing onboarding). Set to a separate path for scratch-home isolation — see ADR 0007 for the credential-fork caveat. |
+| `OCP_TUI_ENTRYPOINT` | `cli` | (TUI-mode) Billing-classifier labeling: `cli` (default) pins `cc_entrypoint=cli` deterministically; `auto` lets claude self-classify via TTY detection; `off` leaves the inherited env untouched. Honest only when the spawn is a genuine interactive PTY — see ADR 0007. |
 
 ### Streaming heartbeat
 
@@ -884,6 +889,73 @@ Use cases: downstream HTTP clients or load balancers with idle-connection timeou
 Heartbeats are inert SSE comment lines — conforming SSE clients ignore them. If your downstream client's SSE parser crashes on comment frames, leave this disabled (the default) and file an issue so we can consider an alternate frame format.
 
 OCP also sends `X-Accel-Buffering: no` on SSE responses so nginx-default proxy buffering does not hold heartbeats in an upstream buffer.
+
+## Subscription-pool (TUI) mode
+
+> **SECURITY — read before enabling.**  
+> TUI-mode is **single-user / single-operator only**. `claude` runs with the OCP process owner's filesystem access regardless of `HOME` setting. If OCP serves multiple users or guest API keys, a guest prompt could exfiltrate files or exhaust the subscription. **Never enable `CLAUDE_TUI_MODE=true` on a multi-user OCP.**
+
+### What it is and why
+
+From 2026-06-15 Anthropic routes `claude` invocations by `cc_entrypoint`:
+
+| Launch method | `cc_entrypoint` | Billing pool |
+|---------------|-----------------|-------------|
+| `claude -p` / `--output-format` (OCP default) | `sdk-cli` | Agent SDK credit pool (~$20/mo on Pro) |
+| Interactive `claude` (no flags) | `cli` | Pro/Max subscription pool |
+
+TUI-mode lets OCP serve requests via the interactive path so they bill against the subscription pool. The response is read from claude's native JSONL session transcript once the turn is complete, then replayed to the caller as a normal OpenAI completion or chunked SSE response.
+
+### Billing-classifier labeling (`OCP_TUI_ENTRYPOINT`)
+
+`OCP_TUI_ENTRYPOINT` (default `cli`) controls how `CLAUDE_CODE_ENTRYPOINT` is set on the spawn
+environment. The default (`cli`) pins the value deterministically — immune to a stray inherited
+env var or a future stdout-redirect bug silently flipping it to `sdk-cli`. This label is honest
+**only** when the spawn is a genuine interactive PTY (tmux pane, no `-p`, stdout not redirected,
+and `tmux new-session` verified to succeed). If you need to observe the raw TTY-derived value, set
+`OCP_TUI_ENTRYPOINT=auto`. See ADR 0007 for the full rationale and governing rule.
+
+### Enabling TUI-mode (opt-in)
+
+```bash
+# Prerequisites
+mkdir -p ~/.ocp-tui/work    # one-time scratch cwd setup
+# tmux must be installed: brew install tmux  /  apt install tmux
+
+# Enable
+export CLAUDE_TUI_MODE=true
+# Optionally tune:
+export CLAUDE_TUI_WALLCLOCK_MS=180000   # 3 min cap for long Opus turns
+export OCP_TUI_CWD=$HOME/.ocp-tui/work  # default; override if needed
+export OCP_TUI_ENTRYPOINT=cli           # default; use 'auto' to observe TTY-derived value
+```
+
+Then restart OCP. At boot you will see:
+
+```
+⚠️  TUI-mode ON — single-user only; do NOT enable on a multi-user OCP ...
+  TUI-mode: ON home=/home/user cwd=/home/user/.ocp-tui/work wallclock=120000ms
+```
+
+### What changes / what doesn't
+
+- **Callers see no API change.** The response is a normal OpenAI completion object or chunked SSE — identical wire format.
+- **No real token streaming.** TUI-mode buffers the full response then replays it as chunked SSE. You will see a delay then the complete response rather than real-time tokens.
+- **Cache and singleflight work normally.** TUI-mode writes the buffered response to the cache on success; cache-hits skip the interactive turn entirely.
+- **Default path unchanged.** Unset `CLAUDE_TUI_MODE` and restart → `callClaude` / `callClaudeStreaming` are used again, byte-for-byte identical to today.
+
+### Kill-switch
+
+```bash
+unset CLAUDE_TUI_MODE
+# restart OCP
+```
+
+The stream-json path is restored immediately. No other change is needed.
+
+### Architecture and design decisions
+
+See [`docs/adr/0007-tui-interactive-mode.md`](docs/adr/0007-tui-interactive-mode.md) for the full rationale, home-strategy options, MCP-disable mechanism, coexistence rules, and the B-path (multi-tenant isolation) roadmap.
 
 ## Repository Layout
 

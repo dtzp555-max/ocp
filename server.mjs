@@ -36,6 +36,7 @@ import { dirname, join } from "node:path";
 import { homedir } from "node:os";
 import { validateKey, recordUsage, getUsageByKey, getUsageTimeline, getRecentUsage, createKey, listKeys, revokeKey, closeDb, checkQuota, updateKeyQuota, getKeyQuota, findKey, cacheHash, getCachedResponse, setCachedResponse, clearCache, getCacheStats, hasCacheControl, singleflight, getInflightStats } from "./keys.mjs";
 import { DEFAULT_PORT } from "./lib/constants.mjs";
+import { runTuiTurn, reapStaleTuiSessions } from "./lib/tui/session.mjs";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const _pkg = JSON.parse(readFileSync(join(__dirname, "package.json"), "utf8"));
@@ -278,6 +279,34 @@ const AUTH_MODE = process.env.CLAUDE_AUTH_MODE || (PROXY_API_KEY ? "shared" : "n
 const ADMIN_KEY = process.env.OCP_ADMIN_KEY || "";
 const PROXY_ANONYMOUS_KEY = process.env.PROXY_ANONYMOUS_KEY || "";
 let CACHE_TTL = parseInt(process.env.CLAUDE_CACHE_TTL || "0", 10); // 0 = disabled, value in ms
+
+// ── TUI-mode (subscription-pool bridge) — opt-in; default OFF ───────────
+// When ON: requests are served by spawning interactive `claude` (no -p / no
+// --output-format) so cc_entrypoint=cli (subscription pool). Responses are
+// buffered then replayed as chunked SSE.  Streaming is always buffered here.
+// Authority: docs/adr/0007-tui-interactive-mode.md
+// SECURITY: TUI-mode is SINGLE-USER ONLY.  Never enable on a multi-user OCP
+// (guest prompts would run claude with operator filesystem access).
+const TUI_MODE = process.env.CLAUDE_TUI_MODE === "true";
+const TUI_WALLCLOCK_MS = parseInt(process.env.CLAUDE_TUI_WALLCLOCK_MS || "120000", 10);
+const TUI_CWD  = process.env.OCP_TUI_CWD  || `${process.env.HOME}/.ocp-tui/work`;
+const TUI_HOME = process.env.OCP_TUI_HOME  || process.env.HOME;
+const TUI_ENTRYPOINT = process.env.OCP_TUI_ENTRYPOINT || "cli"; // cli|auto|off — see ADR 0007
+
+// SECURITY fail-loud: TUI-mode is incompatible with multi-user auth. Under TUI a
+// guest/anonymous prompt would run interactive claude with the OPERATOR's full
+// filesystem access (home is NOT isolation). Refuse to boot until B-path isolation
+// (tools-off + per-key ephemeral home + sandbox) lands. See ADR 0007.
+if (TUI_MODE && AUTH_MODE === "multi") {
+  console.error(
+    "FATAL: CLAUDE_TUI_MODE=true is incompatible with CLAUDE_AUTH_MODE=multi.\n" +
+    "  TUI runs interactive claude with the operator's filesystem access, so a guest/anonymous\n" +
+    "  prompt could read operator data. TUI-mode is single-user only until B-path isolation lands.\n" +
+    "  See docs/adr/0007-tui-interactive-mode.md. Refusing to start."
+  );
+  process.exit(1);
+}
+
 if (PROXY_ANONYMOUS_KEY && AUTH_MODE !== "multi") {
   console.warn("WARNING: PROXY_ANONYMOUS_KEY is set but AUTH_MODE is not 'multi' — anonymous key will be ignored");
 }
@@ -801,6 +830,37 @@ function callClaude(model, messages, conversationId, keyName) {
   });
 }
 
+// ── TUI-mode upstream (interactive claude, cc_entrypoint=cli) ───────────
+// Drop-in replacement for callClaude when TUI_MODE is ON.
+// Same signature and Promise<string> contract so all downstream
+// (singleflight → setCachedResponse → completionResponse) is unchanged.
+// System messages are rendered inline as [System] blocks by messagesToPrompt;
+// we deliberately do NOT pass --system-prompt in interactive mode to avoid any
+// flag that could perturb cc_entrypoint classification.
+// Authority: claude CLI v2.1.158 interactive mode (cc_entrypoint=cli).
+// SECURITY: A-path single-user ONLY — home is NOT isolation (see ADR 0007).
+function callClaudeTui(model, messages, _conversationId, _keyName) {
+  const cliModel = MODEL_MAP[model] || model;
+  const prompt = messagesToPrompt(messages); // includes system as [System] inline
+  recordModelRequest(cliModel, prompt.length);
+  return runTuiTurn({
+    prompt,
+    model: cliModel,
+    claudeBin: CLAUDE,
+    home: TUI_HOME,
+    realHome: process.env.HOME,
+    cwd: TUI_CWD,
+    wallclockMs: TUI_WALLCLOCK_MS,
+    entrypointMode: TUI_ENTRYPOINT,
+  }).then((text) => {
+    recordModelSuccess(cliModel, 0); // elapsed not measurable here; wallclock at reader level
+    return text;
+  }).catch((err) => {
+    recordModelError(cliModel, false);
+    throw err;
+  });
+}
+
 // ── SSE heartbeat (opt-in idle watchdog) ────────────────────────────────
 // Emits `: keepalive\n\n` SSE comment frames during silent windows on the
 // streaming response. Design: docs/superpowers/specs/2026-04-25-47-sse-heartbeat-design.md
@@ -1030,6 +1090,24 @@ function completionResponse(res, id, model, content) {
     choices: [{ index: 0, message: { role: "assistant", content }, finish_reason: "stop" }],
     usage: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 },
   });
+}
+
+// Replay a complete string as a chunked SSE stream (80 codepoints/chunk).
+// Used by: (a) cache-hit replay on the streaming path; (b) TUI-mode streaming
+// (buffered response replayed as SSE so clients get the same wire format).
+// Behaviour is byte-for-byte identical to the original inline cache-replay block.
+function streamStringAsSSE(res, id, model, content) {
+  const created = Math.floor(Date.now() / 1000);
+  res.writeHead(200, { "Content-Type": "text/event-stream", "Cache-Control": "no-cache", "Connection": "keep-alive", "X-Accel-Buffering": "no" });
+  sendSSE(res, { id, object: "chat.completion.chunk", created, model, choices: [{ index: 0, delta: { role: "assistant" }, finish_reason: null }] });
+  const CHUNK = 80;
+  const codepoints = Array.from(content);
+  for (let i = 0; i < codepoints.length; i += CHUNK) {
+    sendSSE(res, { id, object: "chat.completion.chunk", created, model, choices: [{ index: 0, delta: { content: codepoints.slice(i, i + CHUNK).join("") }, finish_reason: null }] });
+  }
+  sendSSE(res, { id, object: "chat.completion.chunk", created, model, choices: [{ index: 0, delta: {}, finish_reason: "stop" }] });
+  res.write("data: [DONE]\n\n");
+  res.end();
 }
 
 // ── Plan usage probe ────────────────────────────────────────────────────
@@ -1524,20 +1602,9 @@ async function handleChatCompletions(req, res) {
         if (cached) {
           logEvent("info", "cache_hit", { model, hash: hash.slice(0, 12), hits: cached.hits });
           if (stream) {
-            // D3: replay cached content as chunked SSE stream (80 codepoints/chunk)
-            const CACHE_REPLAY_CHUNK_SIZE = 80;
+            // D3: replay cached content as chunked SSE stream — delegated to streamStringAsSSE (DRY).
             const id = `chatcmpl-${randomUUID()}`;
-            const created = Math.floor(Date.now() / 1000);
-            res.writeHead(200, { "Content-Type": "text/event-stream", "Cache-Control": "no-cache", "Connection": "keep-alive", "X-Accel-Buffering": "no" });
-            sendSSE(res, { id, object: "chat.completion.chunk", created, model, choices: [{ index: 0, delta: { role: "assistant" }, finish_reason: null }] });
-            const codepoints = Array.from(cached.response);
-            for (let i = 0; i < codepoints.length; i += CACHE_REPLAY_CHUNK_SIZE) {
-              const chunk = codepoints.slice(i, i + CACHE_REPLAY_CHUNK_SIZE).join("");
-              sendSSE(res, { id, object: "chat.completion.chunk", created, model, choices: [{ index: 0, delta: { content: chunk }, finish_reason: null }] });
-            }
-            sendSSE(res, { id, object: "chat.completion.chunk", created, model, choices: [{ index: 0, delta: {}, finish_reason: "stop" }] });
-            res.write("data: [DONE]\n\n");
-            res.end();
+            streamStringAsSSE(res, id, model, cached.response);
             return;
           } else {
             const id = `chatcmpl-${randomUUID()}`;
@@ -1551,12 +1618,38 @@ async function handleChatCompletions(req, res) {
   }
 
   if (stream) {
-    // Real streaming: pipe stdout from claude process directly as SSE chunks
+    if (TUI_MODE) {
+      // TUI-mode: no real token stream — buffer the full turn via callClaudeTui,
+      // optionally write-back to cache, then replay as chunked SSE.
+      // Default path (TUI_MODE===false) falls through to callClaudeStreaming below,
+      // which is byte-for-byte unchanged from before this gate was added.
+      const t0TuiStream = Date.now();
+      const promptCharsTuiStream = messages.reduce((a, m) => a + (typeof m.content === "string" ? m.content.length : JSON.stringify(m.content).length), 0);
+      try {
+        const content = await callClaudeTui(model, messages, conversationId, req._authKeyName);
+        if (CACHE_TTL > 0 && req._cacheHash) {
+          try { setCachedResponse(req._cacheHash, model, content); } catch (e) { logEvent("error", "cache_write_failed", { error: e.message }); }
+        }
+        const id = `chatcmpl-${randomUUID()}`;
+        streamStringAsSSE(res, id, model, content);
+        try { recordUsage({ keyId: req._authKeyId, keyName: req._authKeyName, model, promptChars: promptCharsTuiStream, responseChars: content.length, elapsedMs: Date.now() - t0TuiStream, success: true }); } catch {}
+        return;
+      } catch (err) {
+        if (res.headersSent || res.writableEnded || res.destroyed) { try { res.end(); } catch {} return; }
+        const safeMessage = (err.message || "Internal error").replace(/\/[\w/.\-]+/g, "[path]");
+        return jsonResponse(res, 500, { error: { message: safeMessage, type: "proxy_error" } });
+      }
+    }
+    // Default: real stream-json streaming, unchanged.
     return callClaudeStreaming(model, messages, conversationId, res, { keyId: req._authKeyId, keyName: req._authKeyName, cacheHash: req._cacheHash });
   }
 
   const t0Usage = Date.now();
   const promptChars = messages.reduce((a, m) => a + (typeof m.content === "string" ? m.content.length : JSON.stringify(m.content).length), 0);
+
+  // Select upstream based on TUI_MODE flag. With TUI_MODE===false (default),
+  // upstreamCall===callClaude — identical to the pre-TUI code path.
+  const upstreamCall = TUI_MODE ? callClaudeTui : callClaude;
 
   // Non-streaming path with stampede protection: wrap the upstream call in singleflight
   // when cache is enabled and a hash is present. Concurrent identical requests share
@@ -1571,7 +1664,7 @@ async function handleChatCompletions(req, res) {
         // will re-read the freshly-populated cache entry here rather than spawning.
         const recheck = getCachedResponse(req._cacheHash, CACHE_TTL);
         if (recheck) return recheck.response;
-        const c = await callClaude(model, messages, conversationId, req._authKeyName);
+        const c = await upstreamCall(model, messages, conversationId, req._authKeyName);
         try { setCachedResponse(req._cacheHash, model, c); } catch (e) { logEvent("error", "cache_write_failed", { error: e.message }); }
         return c;
       });
@@ -1593,7 +1686,7 @@ async function handleChatCompletions(req, res) {
 
   // Fallback: cache disabled (CACHE_TTL=0) or no _cacheHash — original path untouched.
   try {
-    const content = await callClaude(model, messages, conversationId, req._authKeyName);
+    const content = await upstreamCall(model, messages, conversationId, req._authKeyName);
     const id = `chatcmpl-${randomUUID()}`;
     completionResponse(res, id, model, content);
     try { recordUsage({ keyId: req._authKeyId, keyName: req._authKeyName, model, promptChars, responseChars: content.length, elapsedMs: Date.now() - t0Usage, success: true }); } catch (e) { logEvent("error", "usage_record_failed", { error: e.message }); }
@@ -2012,6 +2105,14 @@ server.listen(PORT, BIND_ADDRESS, () => {
   if (NO_CONTEXT) console.log(`Context: suppressed (CLAUDE_NO_CONTEXT=true — no CLAUDE.md, no auto-memory)`);
   if (CACHE_TTL > 0) console.log(`Cache: enabled (TTL=${CACHE_TTL / 1000}s)`);
   else console.log(`Cache: disabled (set CLAUDE_CACHE_TTL to enable)`);
+  if (TUI_MODE) {
+    console.warn(`⚠️  TUI-mode ON — single-user only; do NOT enable on a multi-user OCP (guest prompts would run claude with operator filesystem access). See ADR 0007.`);
+    console.log(`  TUI-mode: ON home=${TUI_HOME} cwd=${TUI_CWD} wallclock=${TUI_WALLCLOCK_MS}ms`);
+    try {
+      const n = reapStaleTuiSessions();
+      if (n) logEvent("info", "tui_reaped_stale_sessions", { count: n });
+    } catch {}
+  }
   console.log(`---`);
   console.log(`Coexistence: This proxy does NOT conflict with Claude Code interactive mode.`);
   console.log(`  OCP uses: localhost:${PORT} (HTTP) → claude --output-format stream-json (per-request process)`);
