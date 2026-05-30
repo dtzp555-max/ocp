@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+## v3.17.0 — 2026-05-31
+
+### Provider — default claude invocation ported to stream-json + `--system-prompt` (Phase 6c)
+
+OCP's default (non-TUI) claude spawn moves from `claude -p --output-format text` to `claude --output-format stream-json --verbose --no-session-persistence --system-prompt <wrapper>` (no `-p`). The NDJSON event stream is parsed into the assembled response. Benefits: ~64% per-request cost reduction and anti-hallucination via `--system-prompt` tool-use suppression. Clients see no API change — the OpenAI-compatible request/response shapes are identical. Faithful port of OLP's production-verified implementation; covered by 17 new stream-json parser tests.
+
+⚠️ **Billing note:** from 2026-06-15 this default path carries `cc_entrypoint=sdk-cli` and bills against the Agent SDK credit pool. Use the new opt-in `CLAUDE_TUI_MODE` (below) to keep traffic on the Pro/Max subscription pool.
+
+---
+
 ### feat(tui): opt-in CLAUDE_TUI_MODE — serve via interactive claude (cc_entrypoint=cli / subscription pool), single-user only; default stream-json path unchanged
 
 From 2026-06-15 Anthropic routes `claude -p` / `--output-format` invocations to the Agent SDK credit pool (`cc_entrypoint=sdk-cli`). This feature adds an opt-in bridge: when `CLAUDE_TUI_MODE=true`, OCP serves each request via a real interactive `claude` session (no `-p`, no `--output-format`) so it carries `cc_entrypoint=cli` and bills against the Pro/Max subscription.
