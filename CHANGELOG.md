@@ -1,5 +1,13 @@
 # Changelog
 
+## Unreleased
+
+### Model — add claude-opus-4-8
+
+Add `claude-opus-4-8` as the newest Opus to `models.json` (index 0, newest first). Repoint `aliases.opus` from `claude-opus-4-7` to `claude-opus-4-8`. `claude-opus-4-7` remains in the list callable by literal id. `legacyAliases.claude-opus-4` left pointing at `claude-opus-4-7` (no change — legacy alias tracks the prior generation). README Available Models table and model-count references updated accordingly.
+
+---
+
 ## v3.16.4 — 2026-05-13
 
 ### Refactor — port-literal SPOT + CI guardrail

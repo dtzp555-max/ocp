@@ -951,6 +951,248 @@ await asyncTest("doctor --check oauth + 200 with null body → fix_service", asy
   assert.equal(result.fail_count, 1);
 });
 
+// ── Stream-JSON parser tests ──────────────────────────────────────────────
+// MIRRORS server.mjs parseStreamJsonLines/parseStreamJsonEvent — keep in sync.
+// Copied verbatim to avoid importing server.mjs (top-level server.listen() would
+// start a live HTTP server). The logEvent stub silences observability side-effects.
+console.log("\nStream-JSON parsers:");
+
+function logEvent() {} // stub — observability side-effect not needed in tests
+
+function parseStreamJsonLines(buffered) {
+  const lines = buffered.split("\n");
+  const remainder = lines.pop(); // last element is the incomplete trailing line
+  const events = [];
+  for (const line of lines) {
+    const trimmed = line.trim();
+    if (trimmed === "") continue;
+    try {
+      events.push(JSON.parse(trimmed));
+    } catch {
+      console.error("[claude] NDJSON parse error on line:", trimmed.slice(0, 120));
+      events.push({ type: "parse_error", raw: trimmed });
+    }
+  }
+  return { events, remainder: remainder ?? "" };
+}
+
+function parseStreamJsonEvent(event, isFirstDelta) {
+  const t = event?.type;
+
+  // system/* — first-event init + other system meta (api_retry etc.)
+  if (t === "system") return null;
+  // user — echo of user message; consumed
+  if (t === "user") return null;
+
+  // stream_event — contains nested content_block_delta
+  if (t === "stream_event") {
+    const inner = event.event ?? event;
+    if (inner?.type === "content_block_delta" && inner.delta?.type === "text_delta") {
+      return { text: inner.delta.text ?? "" };
+    }
+    // Other stream_event sub-types (content_block_start, message_delta, etc.) — consumed
+    return null;
+  }
+
+  // assistant — aggregate message (fallback when no prior content_block_delta seen)
+  // Empirically (claude CLI without --include-partial-messages, verified v2.1.104 through v2.1.158): fast/short
+  // responses may emit ONLY the aggregate assistant event, no content_block_delta events.
+  // If isFirstDelta is true, extract text here; otherwise it's a duplicate, ignore.
+  // Reference: OLP commit 65f945c (assistant-aggregate fallback, fold-in).
+  if (t === "assistant") {
+    if (isFirstDelta) {
+      const blocks = event.message?.content;
+      if (Array.isArray(blocks)) {
+        const text = blocks
+          .filter(b => b && b.type === "text" && typeof b.text === "string")
+          .map(b => b.text)
+          .join("");
+        if (text) return { text };
+      }
+    }
+    return null;
+  }
+
+  // result — terminal event
+  if (t === "result") {
+    if (event.is_error === true) {
+      return { error: event.error_message ?? event.result ?? "claude returned is_error" };
+    }
+    return { stop: true };
+  }
+
+  // rate_limit_event / usage — log for observability, don't forward
+  if (t === "rate_limit_event" || t === "usage") {
+    logEvent("info", "claude_stream_event", { type: t, data: JSON.stringify(event).slice(0, 200) });
+    return null;
+  }
+
+  // control_request — per Anthropic stream-json docs
+  if (t === "control_request") {
+    console.error("[claude] stream_json control_request event (ignored):", JSON.stringify(event).slice(0, 120));
+    return null;
+  }
+
+  // parse_error — already logged by parseStreamJsonLines
+  if (t === "parse_error") return null;
+
+  // Unknown event type — log + skip; future-proof for new claude CLI events
+  if (t !== undefined) {
+    console.error("[claude] unknown stream_json event type:", t);
+  }
+  return null;
+}
+
+// (a) content_block_delta deltas + assistant-aggregate fallback → assembled text with NO double-count
+test("parseStreamJsonEvent: stream_event content_block_delta yields text", () => {
+  const event = {
+    type: "stream_event",
+    event: { type: "content_block_delta", delta: { type: "text_delta", text: "Hello" } }
+  };
+  const result = parseStreamJsonEvent(event, true);
+  assert.deepEqual(result, { text: "Hello" });
+});
+
+test("parseStreamJsonEvent: assistant-aggregate used when isFirstDelta=true (no prior delta)", () => {
+  const event = {
+    type: "assistant",
+    message: { content: [{ type: "text", text: "Short answer." }] }
+  };
+  const result = parseStreamJsonEvent(event, true);
+  assert.deepEqual(result, { text: "Short answer." });
+});
+
+test("parseStreamJsonEvent: assistant-aggregate skipped when isFirstDelta=false (no double-count)", () => {
+  const event = {
+    type: "assistant",
+    message: { content: [{ type: "text", text: "Short answer." }] }
+  };
+  const result = parseStreamJsonEvent(event, false);
+  assert.equal(result, null);
+});
+
+test("parseStreamJsonEvent: stream_event + assistant → assembled without double-count", () => {
+  // Simulate receiving a content_block_delta first, then an assistant aggregate
+  const delta = {
+    type: "stream_event",
+    event: { type: "content_block_delta", delta: { type: "text_delta", text: "Streaming text." } }
+  };
+  const agg = {
+    type: "assistant",
+    message: { content: [{ type: "text", text: "Streaming text." }] }
+  };
+  // First event: isFirstDelta=true → yields text
+  const r1 = parseStreamJsonEvent(delta, true);
+  assert.deepEqual(r1, { text: "Streaming text." });
+  // Second event (aggregate): isFirstDelta is now false (content already emitted) → null
+  const r2 = parseStreamJsonEvent(agg, false);
+  assert.equal(r2, null);
+});
+
+// (b) aggregate-only short response → assembles correctly
+test("parseStreamJsonEvent: aggregate-only multi-block response assembles all text blocks", () => {
+  const event = {
+    type: "assistant",
+    message: {
+      content: [
+        { type: "text", text: "Part one." },
+        { type: "tool_use", id: "x" }, // non-text block — should be filtered
+        { type: "text", text: " Part two." }
+      ]
+    }
+  };
+  const result = parseStreamJsonEvent(event, true);
+  assert.deepEqual(result, { text: "Part one. Part two." });
+});
+
+// (c) JSON line split across two parseStreamJsonLines calls → partial-line buffering
+test("parseStreamJsonLines: partial line carried as remainder", () => {
+  const chunk1 = '{"type":"system","subtype":"init"}\n{"type":"stream_ev';
+  const { events: ev1, remainder: rem1 } = parseStreamJsonLines(chunk1);
+  assert.equal(ev1.length, 1);
+  assert.equal(ev1[0].type, "system");
+  assert.equal(rem1, '{"type":"stream_ev');
+
+  const chunk2 = rem1 + 'ent","event":{"type":"content_block_delta","delta":{"type":"text_delta","text":"Hi"}}}\n';
+  const { events: ev2, remainder: rem2 } = parseStreamJsonLines(chunk2);
+  assert.equal(ev2.length, 1);
+  assert.equal(ev2[0].type, "stream_event");
+  assert.equal(rem2, "");
+  // Verify the reassembled event parses through parseStreamJsonEvent correctly
+  const parsed = parseStreamJsonEvent(ev2[0], true);
+  assert.deepEqual(parsed, { text: "Hi" });
+});
+
+test("parseStreamJsonLines: empty input returns no events and empty remainder", () => {
+  const { events, remainder } = parseStreamJsonLines("");
+  assert.equal(events.length, 0);
+  assert.equal(remainder, "");
+});
+
+// (d) is_error result event → surfaces the error
+test("parseStreamJsonEvent: result is_error=true surfaces error_message", () => {
+  const event = { type: "result", is_error: true, error_message: "Rate limit hit" };
+  const result = parseStreamJsonEvent(event, false);
+  assert.deepEqual(result, { error: "Rate limit hit" });
+});
+
+test("parseStreamJsonEvent: result is_error=true falls back to result field when no error_message", () => {
+  const event = { type: "result", is_error: true, result: "error detail" };
+  const result = parseStreamJsonEvent(event, false);
+  assert.deepEqual(result, { error: "error detail" });
+});
+
+test("parseStreamJsonEvent: result is_error=true falls back to default string when no detail", () => {
+  const event = { type: "result", is_error: true };
+  const result = parseStreamJsonEvent(event, false);
+  assert.deepEqual(result, { error: "claude returned is_error" });
+});
+
+test("parseStreamJsonEvent: result is_error=false yields stop", () => {
+  const event = { type: "result", is_error: false, result: "success" };
+  const result = parseStreamJsonEvent(event, false);
+  assert.deepEqual(result, { stop: true });
+});
+
+// (e) malformed/non-JSON line → skipped without throwing
+test("parseStreamJsonLines: malformed JSON line becomes parse_error event without throwing", () => {
+  const input = '{"type":"system"}\nnot-valid-json\n{"type":"result","is_error":false}\n';
+  const { events, remainder } = parseStreamJsonLines(input);
+  assert.equal(events.length, 3);
+  assert.equal(events[0].type, "system");
+  assert.equal(events[1].type, "parse_error");
+  assert.equal(events[1].raw, "not-valid-json");
+  assert.equal(events[2].type, "result");
+});
+
+test("parseStreamJsonEvent: parse_error event returns null without throwing", () => {
+  const event = { type: "parse_error", raw: "garbage" };
+  const result = parseStreamJsonEvent(event, false);
+  assert.equal(result, null);
+});
+
+// Additional edge cases
+test("parseStreamJsonEvent: system event returns null", () => {
+  const result = parseStreamJsonEvent({ type: "system", subtype: "init" }, true);
+  assert.equal(result, null);
+});
+
+test("parseStreamJsonEvent: user event returns null", () => {
+  const result = parseStreamJsonEvent({ type: "user", message: {} }, true);
+  assert.equal(result, null);
+});
+
+test("parseStreamJsonEvent: stream_event non-text-delta (content_block_start) returns null", () => {
+  const event = { type: "stream_event", event: { type: "content_block_start", index: 0 } };
+  const result = parseStreamJsonEvent(event, true);
+  assert.equal(result, null);
+});
+
+test("parseStreamJsonEvent: unknown event type returns null", () => {
+  const result = parseStreamJsonEvent({ type: "future_event_type" }, false);
+  assert.equal(result, null);
+});
+
 // ── Cleanup ──
 closeDb();
 
