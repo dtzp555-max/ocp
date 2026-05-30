@@ -2,7 +2,7 @@
 /**
  * openclaw-claude-proxy — OpenAI-compatible proxy for Claude CLI
  *
- * Translates OpenAI chat/completions requests into `claude -p` CLI calls,
+ * Translates OpenAI chat/completions requests into `claude --output-format stream-json` CLI calls,
  * letting you use your Claude Pro/Max subscription as an OpenClaw model provider.
  *
  * Timeout design: single CLAUDE_TIMEOUT (default 600s / 10 min).
@@ -120,6 +120,136 @@ function resolveClaude() {
     "  Checked: " + candidates.join(", ")
   );
   process.exit(1);
+}
+
+// ── OCP system prompt wrapper (Phase 6c port — ADR 0009 Amendment 1 analogue) ─
+// Injected via `--system-prompt` flag, replacing claude CLI's default system
+// prompt (which normally includes cwd, OS, tool descriptions, and git status —
+// all irrelevant and potentially misleading when the model is accessed via the
+// OCP HTTP proxy).
+//
+// Authority: claude CLI v2.1.104 § --system-prompt (full default-prompt
+// replacement verified on PI231 2026-05-27 — OLP ADR 0009 Amendment 1 §
+// "OLP system prompt wrapper"; ported to OCP 2026-05-30).
+// Reference: https://github.com/dtzp555-max/olp commit 97e7d16 (Phase 6c)
+const OCP_SYSTEM_PROMPT_WRAPPER = `You are accessed via the OCP HTTP proxy. You do NOT have access to any local filesystem, working directory, shell, git status, or machine environment. Do not infer or invent such information from any context you observe. Respond only based on the conversation provided.`;
+
+// Build the full system-prompt string: OCP_SYSTEM_PROMPT_WRAPPER prepended,
+// then any system-role messages from the request appended (separated by blank line).
+// ADR 0009 Amendment 1 analogue § "OLP system prompt wrapper".
+function extractSystemPrompt(messages) {
+  const systemMessages = (messages ?? []).filter(m => m.role === "system");
+  if (systemMessages.length === 0) {
+    return OCP_SYSTEM_PROMPT_WRAPPER;
+  }
+  const clientContent = systemMessages.map(m =>
+    typeof m.content === "string" ? m.content : JSON.stringify(m.content)
+  ).join("\n\n");
+  return `${OCP_SYSTEM_PROMPT_WRAPPER}\n\n${clientContent}`;
+}
+
+// ── NDJSON line buffer parser (Phase 6c port) ─────────────────────────────
+// Splits a buffered string on newlines, returning complete parsed events
+// plus the trailing incomplete line as `remainder` for the next data chunk.
+//
+// Authority: claude CLI v2.1.104 § --output-format stream-json (each event is
+//   emitted as a newline-terminated JSON object on stdout).
+// Reference: OLP lib/providers/anthropic.mjs parseStreamJsonLines (commit 97e7d16).
+function parseStreamJsonLines(buffered) {
+  const lines = buffered.split("\n");
+  const remainder = lines.pop(); // last element is the incomplete trailing line
+  const events = [];
+  for (const line of lines) {
+    const trimmed = line.trim();
+    if (trimmed === "") continue;
+    try {
+      events.push(JSON.parse(trimmed));
+    } catch {
+      console.error("[claude] NDJSON parse error on line:", trimmed.slice(0, 120));
+      events.push({ type: "parse_error", raw: trimmed });
+    }
+  }
+  return { events, remainder: remainder ?? "" };
+}
+
+// ── NDJSON event → text content extractor (Phase 6c port) ────────────────
+// Maps claude CLI stream-json NDJSON events to { text, stop, error } signals.
+// Returns:
+//   { text: string }   — content delta to forward
+//   { stop: true }     — terminal event (emit finish_reason=stop)
+//   { error: string }  — error event (emit error stop)
+//   null               — consumed event (log/ignore)
+//
+// Authority: claude CLI v2.1.104 § --output-format stream-json.
+// Reference: OLP lib/providers/anthropic.mjs anthropicStreamJsonEventToIR (commit 97e7d16).
+//
+// @param {object} event — parsed NDJSON event
+// @param {boolean} isFirstDelta — true if no content has been yielded yet
+function parseStreamJsonEvent(event, isFirstDelta) {
+  const t = event?.type;
+
+  // system/* — first-event init + other system meta (api_retry etc.)
+  if (t === "system") return null;
+  // user — echo of user message; consumed
+  if (t === "user") return null;
+
+  // stream_event — contains nested content_block_delta
+  if (t === "stream_event") {
+    const inner = event.event ?? event;
+    if (inner?.type === "content_block_delta" && inner.delta?.type === "text_delta") {
+      return { text: inner.delta.text ?? "" };
+    }
+    // Other stream_event sub-types (content_block_start, message_delta, etc.) — consumed
+    return null;
+  }
+
+  // assistant — aggregate message (fallback when no prior content_block_delta seen)
+  // Empirically (claude CLI v2.1.104 without --include-partial-messages): fast/short
+  // responses may emit ONLY the aggregate assistant event, no content_block_delta events.
+  // If isFirstDelta is true, extract text here; otherwise it's a duplicate, ignore.
+  // Reference: OLP commit 65f945c (assistant-aggregate fallback, fold-in).
+  if (t === "assistant") {
+    if (isFirstDelta) {
+      const blocks = event.message?.content;
+      if (Array.isArray(blocks)) {
+        const text = blocks
+          .filter(b => b && b.type === "text" && typeof b.text === "string")
+          .map(b => b.text)
+          .join("");
+        if (text) return { text };
+      }
+    }
+    return null;
+  }
+
+  // result — terminal event
+  if (t === "result") {
+    if (event.is_error === true) {
+      return { error: event.error_message ?? event.result ?? "claude returned is_error" };
+    }
+    return { stop: true };
+  }
+
+  // rate_limit_event / usage — log for observability, don't forward
+  if (t === "rate_limit_event" || t === "usage") {
+    logEvent("info", "claude_stream_event", { type: t, data: JSON.stringify(event).slice(0, 200) });
+    return null;
+  }
+
+  // control_request — per Anthropic stream-json docs
+  if (t === "control_request") {
+    console.error("[claude] stream_json control_request event (ignored):", JSON.stringify(event).slice(0, 120));
+    return null;
+  }
+
+  // parse_error — already logged by parseStreamJsonLines
+  if (t === "parse_error") return null;
+
+  // Unknown event type — log + skip; future-proof for new claude CLI events
+  if (t !== undefined) {
+    console.error("[claude] unknown stream_json event type:", t);
+  }
+  return null;
 }
 
 // ── Configuration ───────────────────────────────────────────────────────
@@ -381,28 +511,34 @@ checkAuth();
 const authCheckInterval = setInterval(checkAuth, 600000);
 
 // ── Build CLI arguments ─────────────────────────────────────────────────
-function buildCliArgs(cliModel, sessionInfo) {
-  const args = ["-p", "--model", cliModel, "--output-format", "text"];
-
-  // Session handling
-  if (sessionInfo?.resume) {
-    args.push("--resume", sessionInfo.uuid);
-  } else if (sessionInfo?.uuid) {
-    args.push("--session-id", sessionInfo.uuid);
-  } else {
-    args.push("--no-session-persistence");
-  }
+// Phase 6c port (2026-05-30): removed `-p` / `--output-format text`.
+// Now uses `--output-format stream-json --verbose --no-session-persistence
+// --system-prompt <OCP_SYSTEM_PROMPT_WRAPPER + client system messages>`.
+//
+// Authority: claude CLI v2.1.104 § --output-format stream-json, § --verbose,
+//   § --no-session-persistence, § --system-prompt.
+// Reference: OLP ADR 0009 Amendment 1 + commit 97e7d16.
+//
+// Session flags (--resume, --session-id) are dropped: they are incompatible
+// with stream-json mode without -p. OCP always passes full conversation context
+// via stdin instead (messagesToPrompt), preserving multi-turn correctness.
+// CLAUDE_SYSTEM_PROMPT env var is absorbed into the system prompt via
+// extractSystemPrompt() at the caller level; APPEND_SYSTEM_PROMPT no longer used.
+// Note: ALLOWED_TOOLS / SKIP_PERMISSIONS / MCP_CONFIG are preserved as before.
+function buildCliArgs(cliModel, systemPrompt) {
+  const args = [
+    "--model", cliModel,
+    "--output-format", "stream-json",
+    "--verbose",
+    "--no-session-persistence",
+    "--system-prompt", systemPrompt,
+  ];
 
   // Permissions
   if (SKIP_PERMISSIONS) {
     args.push("--dangerously-skip-permissions");
   } else if (ALLOWED_TOOLS.length > 0) {
     args.push("--allowedTools", ...ALLOWED_TOOLS);
-  }
-
-  // System prompt
-  if (SYSTEM_PROMPT) {
-    args.push("--append-system-prompt", SYSTEM_PROMPT);
   }
 
   // MCP config
@@ -475,8 +611,15 @@ function getModelTier(cliModel) {
 }
 
 // ── Spawn claude CLI (shared setup) ─────────────────────────────────────
-// Resolves session logic, builds CLI args, spawns the process, and sets up
-// timeouts. Returns context object or throws synchronously.
+// Builds CLI args, spawns the process, and sets up timeouts.
+// Returns context object or throws synchronously.
+//
+// Phase 6c port (2026-05-30): session resume (--resume / --session-id) is
+// dropped because it is incompatible with stream-json mode without -p.
+// OCP now always passes the full serialized conversation via stdin
+// (messagesToPrompt), so multi-turn correctness is preserved without sessions.
+// The sessions Map is retained for stats/logging but no longer drives --resume.
+// Reference: OLP ADR 0009 Amendment 1 + commit 97e7d16.
 function spawnClaudeProcess(model, messages, conversationId, keyName) {
   if (stats.activeRequests >= MAX_CONCURRENT) {
     throw new Error(`concurrency limit reached (${stats.activeRequests}/${MAX_CONCURRENT})`);
@@ -489,43 +632,22 @@ function spawnClaudeProcess(model, messages, conversationId, keyName) {
   stats.activeRequests++;
   stats.totalRequests++;
 
-  let sessionInfo = null;
-  let prompt;
+  // Phase 6c: always serialize full conversation via stdin (no session resume).
+  // System messages are extracted and passed via --system-prompt; the remaining
+  // messages (user/assistant/tool) are serialized by messagesToPrompt.
+  const systemPrompt = extractSystemPrompt(messages);
 
-  // ── Session logic ──
-  // sessionKey namespaces the Map key by keyName to prevent cross-caller collision
-  // when two callers with different API keys share the same conversationId string.
-  const sessionKey = _sessionKey(conversationId, keyName);
-  if (sessionKey && sessions.has(sessionKey)) {
-    const session = sessions.get(sessionKey);
-    session.lastUsed = Date.now();
-    sessionInfo = { uuid: session.uuid, resume: true };
-    stats.sessionHits++;
+  // messagesToPrompt skips system messages now that they go via --system-prompt.
+  // Filter them out before calling to avoid double-injection.
+  const nonSystemMessages = messages.filter(m => m.role !== "system");
+  const prompt = messagesToPrompt(nonSystemMessages);
 
-    const lastUserMsg = [...messages].reverse().find((m) => m.role === "user");
-    prompt = lastUserMsg
-      ? (typeof lastUserMsg.content === "string" ? lastUserMsg.content : JSON.stringify(lastUserMsg.content))
-      : "";
-    session.messageCount = messages.length;
-
-    console.log(`[session] resume conv=${conversationId.slice(0, 12)}... key=${keyName || "anon"} uuid=${session.uuid.slice(0, 8)}... msgs=${messages.length} prompt_chars=${prompt.length}`);
-
-  } else if (sessionKey) {
-    const uuid = randomUUID();
-    const now = Date.now();
-    sessions.set(sessionKey, { uuid, messageCount: messages.length, firstSeen: now, lastUsed: now, model: cliModel });
-    sessionInfo = { uuid, resume: false };
-    stats.sessionMisses++;
-    prompt = messagesToPrompt(messages);
-
-    console.log(`[session] new conv=${conversationId.slice(0, 12)}... key=${keyName || "anon"} uuid=${uuid.slice(0, 8)}... msgs=${messages.length}`);
-
-  } else {
-    stats.oneOffRequests++;
-    prompt = messagesToPrompt(messages);
+  stats.oneOffRequests++;
+  if (conversationId) {
+    console.log(`[session] stateless conv=${conversationId.slice(0, 12)}... key=${keyName || "anon"} msgs=${messages.length} prompt_chars=${prompt.length}`);
   }
 
-  const cliArgs = buildCliArgs(cliModel, sessionInfo);
+  const cliArgs = buildCliArgs(cliModel, systemPrompt);
 
   const env = { ...process.env };
   delete env.CLAUDECODE;
@@ -563,15 +685,10 @@ function spawnClaudeProcess(model, messages, conversationId, keyName) {
   proc.once("exit", cleanup);
 
   function handleSessionFailure() {
-    if (sessionInfo?.resume && sessionKey) {
-      console.warn(`[session] resume failed for ${conversationId.slice(0, 12)}..., removing stale session`);
-      logEvent("warn", "session_failure", { mode: "resume", conversationId: conversationId.slice(0, 12) + "...", action: "deleted" });
-      sessions.delete(sessionKey);
-    } else if (sessionInfo && !sessionInfo.resume && sessionKey) {
-      // #41 evidence-gathering: session-create failures currently leave a stale entry
-      // in the sessions map. Log without action so the staleness pattern can be
-      // confirmed in /logs before any code change. Do NOT delete here speculatively.
-      logEvent("warn", "session_failure", { mode: "create", conversationId: conversationId.slice(0, 12) + "...", action: "kept" });
+    // Phase 6c: session resume (--resume/--session-id) is no longer used;
+    // OCP always passes full context via stdin. No session state to clean up.
+    if (conversationId) {
+      logEvent("warn", "session_failure", { mode: "stateless", conversationId: conversationId.slice(0, 12) + "...", action: "none" });
     }
   }
 
@@ -607,9 +724,14 @@ function spawnClaudeProcess(model, messages, conversationId, keyName) {
 }
 
 // ── Call claude CLI (non-streaming) ─────────────────────────────────────
-// On-demand spawning: each request spawns a fresh `claude -p` process.
+// On-demand spawning: each request spawns a fresh claude process.
 // No pool = no crash loops, no stale workers, no degraded states.
 // Stdin is written immediately so there's no 3s stdin timeout issue.
+//
+// Phase 6c port (2026-05-30): stdout is now NDJSON (stream-json format).
+// We accumulate full text across all content_block_delta events plus the
+// assistant-aggregate fallback, then resolve with the assembled string.
+// Reference: OLP ADR 0009 Amendment 1 + commit 97e7d16.
 function callClaude(model, messages, conversationId, keyName) {
   return new Promise((resolve, reject) => {
     let ctx;
@@ -620,12 +742,30 @@ function callClaude(model, messages, conversationId, keyName) {
     }
 
     const { proc, cliModel, conversationId: convId, t0, cleanup, handleSessionFailure, markFirstByte } = ctx;
-    let stdout = "";
+    let lineBuffer = "";
+    let assembledText = "";
+    let isFirstDelta = true;
+    let resultEventSeen = false;
     let stderr = "";
 
     proc.stdout.on("data", (d) => {
       markFirstByte();
-      stdout += d;
+      lineBuffer += d.toString();
+      const { events, remainder } = parseStreamJsonLines(lineBuffer);
+      lineBuffer = remainder;
+      for (const event of events) {
+        const parsed = parseStreamJsonEvent(event, isFirstDelta);
+        if (!parsed) continue;
+        if (parsed.text !== undefined) {
+          assembledText += parsed.text;
+          isFirstDelta = false;
+        } else if (parsed.stop) {
+          resultEventSeen = true;
+        } else if (parsed.error) {
+          // is_error result — treat as process error
+          reject(new Error(parsed.error));
+        }
+      }
     });
     proc.stderr.on("data", (d) => (stderr += d));
 
@@ -633,17 +773,19 @@ function callClaude(model, messages, conversationId, keyName) {
       activeProcesses.delete(proc);
       const elapsed = Date.now() - t0;
       cleanup();
-      if (code !== 0) {
+      // Tolerate null exit code when result event was seen (sandbox-wrap noise, same
+      // as OLP commit 2864275 — bwrap shell exits null after model completes).
+      if (code !== 0 && !resultEventSeen) {
         recordModelError(cliModel, false);
         logEvent("error", "claude_exit", { model: cliModel, code, signal: signal || "none", elapsed, stderr: stderr.slice(0, 300) });
-        trackError(stderr.slice(0, 300) || stdout.slice(0, 300) || `claude exit ${code}`);
+        trackError(stderr.slice(0, 300) || assembledText.slice(0, 300) || `claude exit ${code}`);
         handleSessionFailure();
-        reject(new Error(stderr.slice(0, 300) || stdout.slice(0, 300) || `claude exit ${code}`));
+        reject(new Error(stderr.slice(0, 300) || assembledText.slice(0, 300) || `claude exit ${code}`));
       } else {
         recordModelSuccess(cliModel, elapsed);
         breakerRecordSuccess(cliModel);
-        logEvent("info", "claude_ok", { model: cliModel, chars: stdout.length, elapsed, session: convId ? convId.slice(0, 12) + "..." : "none" });
-        resolve(stdout.trim());
+        logEvent("info", "claude_ok", { model: cliModel, chars: assembledText.length, elapsed, session: convId ? convId.slice(0, 12) + "..." : "none" });
+        resolve(assembledText);
       }
     });
 
@@ -685,9 +827,14 @@ function startHeartbeat(res, intervalMs, sessionId) {
 }
 
 // ── Call claude CLI (real streaming) ─────────────────────────────────────
-// Pipes stdout from the claude process directly to SSE chunks as they arrive.
-// Each data chunk becomes a proper SSE event with delta content in real time.
+// Pipes stdout from the claude process as SSE chunks as they arrive.
+// Each NDJSON content_block_delta text event becomes one SSE delta.
 // TODO(cache-singleflight-stream): streaming-path singleflight is out of scope for v3.13.0; see spec D4 streaming caveat.
+//
+// Phase 6c port (2026-05-30): stdout is now NDJSON (stream-json format).
+// We parse line-by-line and forward content_block_delta text events as SSE.
+// The result event triggers the stop/[DONE] sequence.
+// Reference: OLP ADR 0009 Amendment 1 + commits 97e7d16, 65f945c.
 function callClaudeStreaming(model, messages, conversationId, res, authInfo = {}) {
   const id = `chatcmpl-${randomUUID()}`;
   const created = Math.floor(Date.now() / 1000);
@@ -704,6 +851,9 @@ function callClaudeStreaming(model, messages, conversationId, res, authInfo = {}
   let headersSent = false;
   let totalChars = 0;
   let cachedContent = ""; // accumulate for cache write-back
+  let lineBuffer = "";
+  let isFirstDelta = true;
+  let resultEventSeen = false;
 
   function ensureHeaders() {
     if (res.writableEnded || res.destroyed) return false;
@@ -724,27 +874,63 @@ function callClaudeStreaming(model, messages, conversationId, res, authInfo = {}
   }
 
   // D4 (spec 2026-04-25): eagerly send SSE headers post-spawn so the
-  // heartbeat started in the next statement (Task 1.3) covers the
-  // pre-first-byte silent window. Behavior change: the `code !== 0`
-  // before-first-byte branch at server.mjs:610-611 becomes effectively
-  // unreachable in the common case — the post-headers SSE-stop path
-  // (612-619) handles it instead.
+  // heartbeat started in the next statement covers the pre-first-byte silent window.
   ensureHeaders();
   const hb = startHeartbeat(res, HEARTBEAT_INTERVAL, convId);
 
   proc.stdout.on("data", (d) => {
     markFirstByte();
-    const text = d.toString();
-    totalChars += text.length;
-    if (CACHE_TTL > 0) cachedContent += text;
+    lineBuffer += d.toString();
+    const { events, remainder } = parseStreamJsonLines(lineBuffer);
+    lineBuffer = remainder;
 
-    if (!ensureHeaders()) return;
+    for (const event of events) {
+      const parsed = parseStreamJsonEvent(event, isFirstDelta);
+      if (!parsed) continue;
 
-    // Stream each chunk as it arrives from the CLI process
-    sendSSE(res, {
-      id, object: "chat.completion.chunk", created, model,
-      choices: [{ index: 0, delta: { content: text }, finish_reason: null }],
-    }, hb);
+      if (parsed.text !== undefined) {
+        // content_block_delta text — forward as SSE delta
+        const text = parsed.text;
+        totalChars += text.length;
+        if (CACHE_TTL > 0) cachedContent += text;
+        isFirstDelta = false;
+
+        if (!ensureHeaders()) continue;
+        sendSSE(res, {
+          id, object: "chat.completion.chunk", created, model,
+          choices: [{ index: 0, delta: { content: text }, finish_reason: null }],
+        }, hb);
+
+      } else if (parsed.stop) {
+        // result event — emit stop and [DONE] immediately
+        resultEventSeen = true;
+        if (!ensureHeaders()) continue;
+        sendSSE(res, {
+          id, object: "chat.completion.chunk", created, model,
+          choices: [{ index: 0, delta: {}, finish_reason: "stop" }],
+        }, hb);
+        if (!res.writableEnded && !res.destroyed) {
+          res.write("data: [DONE]\n\n");
+          res.end();
+        }
+
+      } else if (parsed.error) {
+        // is_error result — emit error stop
+        resultEventSeen = true;
+        logEvent("error", "claude_result_error", { model: cliModel, error: parsed.error.slice(0, 200) });
+        trackError(parsed.error.slice(0, 200));
+        if (!headersSent && !res.writableEnded && !res.destroyed) {
+          jsonResponse(res, 500, { error: { message: parsed.error, type: "provider_error" } });
+        } else if (!res.writableEnded && !res.destroyed) {
+          sendSSE(res, {
+            id, object: "chat.completion.chunk", created, model,
+            choices: [{ index: 0, delta: {}, finish_reason: "stop" }],
+          }, hb);
+          res.write("data: [DONE]\n\n");
+          res.end();
+        }
+      }
+    }
   });
 
   proc.stderr.on("data", (d) => (stderr += d));
@@ -755,7 +941,9 @@ function callClaudeStreaming(model, messages, conversationId, res, authInfo = {}
     cleanup();
     const elapsed = Date.now() - t0;
 
-    if (code !== 0) {
+    // Tolerate null exit code when result event was seen (sandbox-wrap noise, same
+    // as OLP commit 2864275 — bwrap shell exits null after model completes).
+    if (code !== 0 && !resultEventSeen) {
       recordModelError(cliModel, false);
       try { recordUsage({ keyId: authInfo.keyId, keyName: authInfo.keyName, model, promptChars: messages.reduce((a, m) => a + (typeof m.content === "string" ? m.content.length : JSON.stringify(m.content).length), 0), responseChars: 0, elapsedMs: elapsed, success: false }); } catch (e) { logEvent("error", "usage_record_failed", { error: e.message }); }
       logEvent("error", "claude_exit", { model: cliModel, code, signal: signal || "none", elapsed, stderr: stderr.slice(0, 300) });
@@ -782,14 +970,18 @@ function callClaudeStreaming(model, messages, conversationId, res, authInfo = {}
         try { setCachedResponse(authInfo.cacheHash, model, cachedContent); } catch (e) { logEvent("error", "cache_write_failed", { error: e.message }); }
       }
 
-      if (!headersSent) ensureHeaders();
-      if (!res.writableEnded && !res.destroyed) {
-        sendSSE(res, {
-          id, object: "chat.completion.chunk", created, model,
-          choices: [{ index: 0, delta: {}, finish_reason: "stop" }],
-        }, hb);
-        res.write("data: [DONE]\n\n");
-        res.end();
+      // If result event already closed the response, nothing more to do.
+      // Otherwise emit a synthetic stop (version drift safety net, same as OLP).
+      if (!resultEventSeen) {
+        if (!headersSent) ensureHeaders();
+        if (!res.writableEnded && !res.destroyed) {
+          sendSSE(res, {
+            id, object: "chat.completion.chunk", created, model,
+            choices: [{ index: 0, delta: {}, finish_reason: "stop" }],
+          }, hb);
+          res.write("data: [DONE]\n\n");
+          res.end();
+        }
       }
     }
   });
@@ -1820,7 +2012,7 @@ server.listen(PORT, BIND_ADDRESS, () => {
   else console.log(`Cache: disabled (set CLAUDE_CACHE_TTL to enable)`);
   console.log(`---`);
   console.log(`Coexistence: This proxy does NOT conflict with Claude Code interactive mode.`);
-  console.log(`  OCP uses: localhost:${PORT} (HTTP) → claude -p (per-request process)`);
+  console.log(`  OCP uses: localhost:${PORT} (HTTP) → claude --output-format stream-json (per-request process)`);
   console.log(`  CC uses:  MCP protocol (in-process) → persistent session`);
   console.log(`  Both can run simultaneously on the same machine.`);
 

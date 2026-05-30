@@ -116,7 +116,7 @@ Please follow https://github.com/dtzp555-max/ocp/blob/main/README.md
    installed and logged in (`claude auth status`). Install missing pieces
    using my system's package manager.
 2. git clone the repo, cd in, and run `node setup.mjs`.
-3. Verify with `curl http://127.0.0.1:3456/v1/models` (should list 4 models).
+3. Verify with `curl http://127.0.0.1:3456/v1/models` (should list 5 models).
 4. Add `export OPENAI_BASE_URL=http://127.0.0.1:3456/v1` to my shell rc.
 5. Tell me to reload my shell and try a tool like Cline / Continue / Cursor.
 
@@ -142,7 +142,7 @@ Please follow https://github.com/dtzp555-max/ocp/blob/main/README.md
 5. Add OCP_ADMIN_KEY to my shell rc (~/.zshrc or ~/.bashrc).
 6. Run `ocp lan` to show me the LAN IP and connect command.
 7. Optionally create example keys: `ocp keys add laptop`, `ocp keys add tablet`.
-8. Verify: `curl http://127.0.0.1:3456/v1/models` returns 4 models.
+8. Verify: `curl http://127.0.0.1:3456/v1/models` returns 5 models.
 
 Tell me each step before running it. On error, diagnose before retrying.
 ```
@@ -165,7 +165,7 @@ Please follow https://github.com/dtzp555-max/ocp/blob/main/README.md
      chmod +x ocp-connect
 2. Run `./ocp-connect <SERVER_IP>` (add `--key <KEY>` if you have one).
 3. Follow any IDE-specific manual hints it prints.
-4. Verify: `curl http://<SERVER_IP>:3456/v1/models` returns 4 models.
+4. Verify: `curl http://<SERVER_IP>:3456/v1/models` returns 5 models.
 5. Tell me to reload my shell + restart any IDE that was already running.
 
 Don't auto-retry on error. Tell me the failure mode first.
@@ -235,7 +235,7 @@ Run `ocp lan` to see your IP and ready-to-share instructions.
 **Verify:**
 ```bash
 curl http://127.0.0.1:3456/v1/models
-# Returns: claude-opus-4-7, claude-opus-4-6, claude-sonnet-4-6, claude-haiku-4-5-20251001
+# Returns: claude-opus-4-8, claude-opus-4-7, claude-opus-4-6, claude-sonnet-4-6, claude-haiku-4-5-20251001
 ```
 
 #### Headless install notes
@@ -314,7 +314,7 @@ OCP Connect v1.3.0
     (set by admin via PROXY_ANONYMOUS_KEY; see issue #12 §14 Path A)
 
   Testing API access...
-  ✓ API accessible (4 models available)
+  ✓ API accessible (5 models available)
 
   Shell config:
     ✓ .bashrc
@@ -344,6 +344,7 @@ OCP Connect v1.3.0
   ✓ OpenClaw configured
     Provider: ocp
     Models:
+      • ocp/claude-opus-4-8
       • ocp/claude-opus-4-7
       • ocp/claude-opus-4-6
       • ocp/claude-sonnet-4-6
@@ -683,8 +684,9 @@ OCP translates OpenAI-compatible `/v1/chat/completions` requests into `claude -p
 
 | Model ID | Notes |
 |----------|-------|
-| `claude-opus-4-7` | Most capable (default for `opus` alias) |
-| `claude-opus-4-6` | Previous Opus, retained for pinning |
+| `claude-opus-4-8` | Most capable (default for `opus` alias) |
+| `claude-opus-4-7` | Previous Opus, retained for pinning |
+| `claude-opus-4-6` | Older Opus, retained for pinning |
 | `claude-sonnet-4-6` | Good balance of speed/quality (default for `sonnet` alias) |
 | `claude-haiku-4-5-20251001` | Fastest, lightweight (default for `haiku` alias) |
 
