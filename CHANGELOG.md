@@ -2,6 +2,20 @@
 
 ## Unreleased
 
+### feat(tui): opt-in CLAUDE_TUI_MODE — serve via interactive claude (cc_entrypoint=cli / subscription pool), single-user only; default stream-json path unchanged
+
+From 2026-06-15 Anthropic routes `claude -p` / `--output-format` invocations to the Agent SDK credit pool (`cc_entrypoint=sdk-cli`). This feature adds an opt-in bridge: when `CLAUDE_TUI_MODE=true`, OCP serves each request via a real interactive `claude` session (no `-p`, no `--output-format`) so it carries `cc_entrypoint=cli` and bills against the Pro/Max subscription.
+
+The complete string response is read from claude's native JSONL session transcript and replayed to callers as a normal OpenAI completion or chunked SSE. Clients see no API change. The default stream-json path is byte-for-byte unchanged when `CLAUDE_TUI_MODE` is unset.
+
+**Security:** single-user / single-operator only. Never enable on a multi-user OCP. See ADR 0007 and README § "Subscription-pool (TUI) mode".
+
+New env vars: `CLAUDE_TUI_MODE`, `CLAUDE_TUI_WALLCLOCK_MS`, `OCP_TUI_CWD`, `OCP_TUI_HOME`.
+New ADR: `docs/adr/0007-tui-interactive-mode.md`.
+New modules: `lib/tui/transcript.mjs`, `lib/tui/session.mjs` (shipped in preceding commits on this branch).
+
+---
+
 ### Model — add claude-opus-4-8
 
 Add `claude-opus-4-8` as the newest Opus to `models.json` (index 0, newest first). Repoint `aliases.opus` from `claude-opus-4-7` to `claude-opus-4-8`. `claude-opus-4-7` remains in the list callable by literal id. `legacyAliases.claude-opus-4` left pointing at `claude-opus-4-7` (no change — legacy alias tracks the prior generation). README Available Models table and model-count references updated accordingly.
