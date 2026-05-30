@@ -128,8 +128,8 @@ function resolveClaude() {
 // all irrelevant and potentially misleading when the model is accessed via the
 // OCP HTTP proxy).
 //
-// Authority: claude CLI v2.1.104 § --system-prompt (full default-prompt
-// replacement verified on PI231 2026-05-27 — OLP ADR 0009 Amendment 1 §
+// Authority: claude CLI § --system-prompt (ported from OLP, verified v2.1.104;
+// behavior stable through v2.1.158 — OLP ADR 0009 Amendment 1 §
 // "OLP system prompt wrapper"; ported to OCP 2026-05-30).
 // Reference: https://github.com/dtzp555-max/olp commit 97e7d16 (Phase 6c)
 const OCP_SYSTEM_PROMPT_WRAPPER = `You are accessed via the OCP HTTP proxy. You do NOT have access to any local filesystem, working directory, shell, git status, or machine environment. Do not infer or invent such information from any context you observe. Respond only based on the conversation provided.`;
@@ -152,8 +152,8 @@ function extractSystemPrompt(messages) {
 // Splits a buffered string on newlines, returning complete parsed events
 // plus the trailing incomplete line as `remainder` for the next data chunk.
 //
-// Authority: claude CLI v2.1.104 § --output-format stream-json (each event is
-//   emitted as a newline-terminated JSON object on stdout).
+// Authority: claude CLI § --output-format stream-json (ported from OLP, verified v2.1.104;
+//   behavior stable through v2.1.158; each event is a newline-terminated JSON object on stdout).
 // Reference: OLP lib/providers/anthropic.mjs parseStreamJsonLines (commit 97e7d16).
 function parseStreamJsonLines(buffered) {
   const lines = buffered.split("\n");
@@ -180,7 +180,8 @@ function parseStreamJsonLines(buffered) {
 //   { error: string }  — error event (emit error stop)
 //   null               — consumed event (log/ignore)
 //
-// Authority: claude CLI v2.1.104 § --output-format stream-json.
+// Authority: claude CLI § --output-format stream-json (ported from OLP, verified v2.1.104;
+//   behavior stable through v2.1.158).
 // Reference: OLP lib/providers/anthropic.mjs anthropicStreamJsonEventToIR (commit 97e7d16).
 //
 // @param {object} event — parsed NDJSON event
@@ -204,7 +205,7 @@ function parseStreamJsonEvent(event, isFirstDelta) {
   }
 
   // assistant — aggregate message (fallback when no prior content_block_delta seen)
-  // Empirically (claude CLI v2.1.104 without --include-partial-messages): fast/short
+  // Empirically (claude CLI without --include-partial-messages, verified v2.1.104 through v2.1.158): fast/short
   // responses may emit ONLY the aggregate assistant event, no content_block_delta events.
   // If isFirstDelta is true, extract text here; otherwise it's a duplicate, ignore.
   // Reference: OLP commit 65f945c (assistant-aggregate fallback, fold-in).
@@ -515,8 +516,9 @@ const authCheckInterval = setInterval(checkAuth, 600000);
 // Now uses `--output-format stream-json --verbose --no-session-persistence
 // --system-prompt <OCP_SYSTEM_PROMPT_WRAPPER + client system messages>`.
 //
-// Authority: claude CLI v2.1.104 § --output-format stream-json, § --verbose,
-//   § --no-session-persistence, § --system-prompt.
+// Authority: claude CLI § --output-format stream-json, § --verbose,
+//   § --no-session-persistence, § --system-prompt (ported from OLP, verified v2.1.104;
+//   behavior stable through v2.1.158).
 // Reference: OLP ADR 0009 Amendment 1 + commit 97e7d16.
 //
 // Session flags (--resume, --session-id) are dropped: they are incompatible

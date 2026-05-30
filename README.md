@@ -675,10 +675,10 @@ Cache is **disabled by default** (`CLAUDE_CACHE_TTL=0`). All data is stored loca
 ## How It Works
 
 ```
-Your IDE → OCP (localhost:3456) → claude -p CLI → Anthropic (via subscription)
+Your IDE → OCP (localhost:3456) → claude --output-format stream-json CLI → Anthropic (via subscription)
 ```
 
-OCP translates OpenAI-compatible `/v1/chat/completions` requests into `claude -p` CLI calls. Anthropic sees normal Claude Code usage — no API billing, no separate key needed.
+OCP translates OpenAI-compatible `/v1/chat/completions` requests into `claude --output-format stream-json` CLI calls. Anthropic sees normal Claude Code usage — no API billing, no separate key needed.
 
 ## Available Models
 
