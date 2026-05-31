@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+### Security
+
+- **#109 P0** — `/health` no longer advertises `PROXY_ANONYMOUS_KEY` to remote callers by default. The `anonymousKey` field is now gated behind a new `PROXY_ADVERTISE_ANON_KEY=1` opt-in env var; localhost callers are always exempt. This prevents any LAN-reachable device from harvesting a working bearer credential from the unauthenticated `/health` endpoint.
+
 ## v3.17.1 — 2026-05-31
 
 ### Fix — code-audit P1/P2 hardening

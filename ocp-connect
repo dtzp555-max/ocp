@@ -506,9 +506,11 @@ main() {
   echo ""
 
   # Step 2.5: auto-discover anonymous key from /health (issue #12 §14 Path A).
-  # When the OCP admin set PROXY_ANONYMOUS_KEY, the server advertises it via
-  # /health.anonymousKey. If the user didn't pass --key, use it automatically so
-  # `ocp-connect <host>` works zero-config for OpenClaw multi-agent setups.
+  # The server advertises anonymousKey in /health ONLY when the admin has set
+  # PROXY_ADVERTISE_ANON_KEY=1 (default off — /health is unauthenticated, so
+  # advertising exposes the shared key to any LAN-reachable device; issue #109).
+  # Localhost callers always receive it regardless. When the field is absent,
+  # ocp-connect falls back to anonymous access / interactive --key (step 3 below).
   if [[ -z "$key" ]]; then
     local anon_key
     anon_key=$(echo "$health_json" | python3 -c "

@@ -1540,6 +1540,29 @@ if (process.env.OCP_TUI_LIVE === "1") {
   });
 }
 
+// ── /health anonymousKey gate (issue #109) ──────────────────────────────────
+// MIRRORS the predicate in server.mjs (search ADVERTISE_ANON_KEY) — copied
+// verbatim to avoid importing server.mjs (top-level server.listen() would
+// start a live HTTP server, per the stream-JSON parser tests convention above).
+console.log("\n/health anonymousKey gate (issue #109):");
+
+// Replicate the gating predicate from server.mjs line ~286/1927:
+//   ...((isLocalhost || ADVERTISE_ANON_KEY) ? { anonymousKey: ... } : {})
+function shouldAdvertiseAnonKey(isLocalhost, advertise) { return isLocalhost || advertise; }
+
+test("(localhost=false, flag=false) → omit key", () => {
+  assert.equal(shouldAdvertiseAnonKey(false, false), false);
+});
+test("(localhost=true, flag=false) → include key (localhost always exempt)", () => {
+  assert.equal(shouldAdvertiseAnonKey(true, false), true);
+});
+test("(localhost=false, flag=true) → include key (opt-in set)", () => {
+  assert.equal(shouldAdvertiseAnonKey(false, true), true);
+});
+test("(localhost=true, flag=true) → include key (both true)", () => {
+  assert.equal(shouldAdvertiseAnonKey(true, true), true);
+});
+
 // ── Cleanup ──
 closeDb();
 
