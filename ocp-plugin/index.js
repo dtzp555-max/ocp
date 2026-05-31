@@ -208,31 +208,34 @@ async function cmdTest() {
 async function cmdRestart(args) {
   const target = (args || "").trim().toLowerCase();
   const { execSync } = await import("node:child_process");
+  const uid = typeof process.getuid === "function" ? process.getuid() : 501;
+  const macProxy = `launchctl kickstart -k gui/${uid}/dev.ocp.proxy`;
+  const macGateway = `launchctl kickstart -k gui/${uid}/ai.openclaw.gateway`;
   try {
     if (target === "gateway") {
-      execSync("launchctl kickstart -k gui/501/ai.openclaw.gateway", { timeout: 15000 });
+      execSync(macGateway, { timeout: 15000 });
       return "✓ Gateway restarted";
     } else if (target === "all") {
-      execSync("launchctl kickstart -k gui/501/ai.openclaw.proxy", { timeout: 15000 });
+      execSync(macProxy, { timeout: 15000 });
       // Gateway restart will kill this plugin too, so do it last
-      execSync("launchctl kickstart -k gui/501/ai.openclaw.gateway", { timeout: 15000 });
+      execSync(macGateway, { timeout: 15000 });
       return "✓ Proxy + Gateway restarted";
     } else {
-      execSync("launchctl kickstart -k gui/501/ai.openclaw.proxy", { timeout: 15000 });
+      execSync(macProxy, { timeout: 15000 });
       return "✓ Proxy restarted";
     }
   } catch (e) {
-    // Try systemd for Linux
+    // Linux: systemd user services
     try {
       if (target === "gateway") {
         execSync("systemctl --user restart openclaw-gateway", { timeout: 15000 });
         return "✓ Gateway restarted";
       } else {
-        execSync("systemctl --user restart openclaw-proxy 2>/dev/null || pkill -f 'node.*server.mjs' && sleep 2 && cd ~/.openclaw/projects/*/; node server.mjs &", { timeout: 15000, shell: true });
+        execSync("systemctl --user restart ocp-proxy", { timeout: 15000 });
         return "✓ Proxy restarted";
       }
     } catch (e2) {
-      return `✗ Restart failed: ${e2.message?.slice(0, 100)}`;
+      return `✗ Restart failed: ${e2.message?.slice(0, 100)}. Run \`ocp restart\` on the server host manually.`;
     }
   }
 }

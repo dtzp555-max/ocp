@@ -634,11 +634,12 @@ PYEOF
     {
       echo ""
       echo "# OCP LAN (added by ocp connect)"
-      echo "export OPENAI_BASE_URL=$base_url/v1"
+      echo "export OPENAI_BASE_URL='$base_url/v1'"
       if [[ -n "$key" ]]; then
-        echo "export OPENAI_API_KEY=$key"
+        echo "export OPENAI_API_KEY='$key'"
       fi
     } >> "$rc_file"
+    chmod 600 "$rc_file" 2>/dev/null || true
   done
 
   echo "  Shell config:"
@@ -671,6 +672,7 @@ PYEOF
         echo "OPENAI_API_KEY=$key"
       fi
     } > "$env_dir/ocp.conf"
+    chmod 600 "$env_dir/ocp.conf" 2>/dev/null || true
     echo ""
     echo "  System-level (systemd):"
     echo "    ✓ $env_dir/ocp.conf"

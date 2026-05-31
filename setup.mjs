@@ -65,6 +65,28 @@ const OCP_ADMIN_KEY_INJECT = process.env.OCP_ADMIN_KEY || null;
 // PROXY_ANONYMOUS_KEY — same pattern
 const PROXY_ANON_KEY_INJECT = process.env.PROXY_ANONYMOUS_KEY || null;
 
+// ── Inject-value helpers ─────────────────────────────────────────────────
+// Escape a value for safe inclusion in a plist <string>…</string> body.
+function xmlEscape(v) {
+  return String(v).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;").replace(/'/g, "&apos;");
+}
+// Validate an injected service value: no control chars (a newline would inject a
+// rogue systemd Environment= directive; other control chars corrupt the unit/plist).
+// Spaces are allowed — filesystem paths (CLAUDE_BIN) may legitimately contain them.
+function assertSafeInjectValue(name, v) {
+  if (v == null) return v;
+  if (/[\x00-\x1f]/.test(String(v))) {
+    console.error(`FATAL: ${name} contains a newline or control character — refusing to write it into the service unit.`);
+    process.exit(1);
+  }
+  return v;
+}
+
+// Validate all three INJECT values before they are written into any service unit.
+assertSafeInjectValue("CLAUDE_BIN", CLAUDE_BIN_INJECT);
+assertSafeInjectValue("OCP_ADMIN_KEY", OCP_ADMIN_KEY_INJECT);
+assertSafeInjectValue("PROXY_ANONYMOUS_KEY", PROXY_ANON_KEY_INJECT);
+
 // ── Models: derived from models.json (single source of truth) ──────────
 const modelsConfig = JSON.parse(readFileSync(join(__dirname, "models.json"), "utf-8"));
 
@@ -403,17 +425,17 @@ if (!DRY_RUN) {
   <key>EnvironmentVariables</key>
   <dict>
     <key>CLAUDE_PROXY_PORT</key>
-    <string>${PORT}</string>
+    <string>${xmlEscape(PORT)}</string>
     <key>CLAUDE_BIND</key>
-    <string>${BIND_ADDRESS}</string>
+    <string>${xmlEscape(BIND_ADDRESS)}</string>
     <key>CLAUDE_AUTH_MODE</key>
-    <string>${AUTH_MODE_CONFIG}</string>${CLAUDE_BIN_INJECT ? `
+    <string>${xmlEscape(AUTH_MODE_CONFIG)}</string>${CLAUDE_BIN_INJECT ? `
     <key>CLAUDE_BIN</key>
-    <string>${CLAUDE_BIN_INJECT}</string>` : ""}${OCP_ADMIN_KEY_INJECT ? `
+    <string>${xmlEscape(CLAUDE_BIN_INJECT)}</string>` : ""}${OCP_ADMIN_KEY_INJECT ? `
     <key>OCP_ADMIN_KEY</key>
-    <string>${OCP_ADMIN_KEY_INJECT}</string>` : ""}${PROXY_ANON_KEY_INJECT ? `
+    <string>${xmlEscape(OCP_ADMIN_KEY_INJECT)}</string>` : ""}${PROXY_ANON_KEY_INJECT ? `
     <key>PROXY_ANONYMOUS_KEY</key>
-    <string>${PROXY_ANON_KEY_INJECT}</string>` : ""}
+    <string>${xmlEscape(PROXY_ANON_KEY_INJECT)}</string>` : ""}
   </dict>
   <key>RunAtLoad</key>
   <true/>
