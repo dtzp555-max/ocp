@@ -2,6 +2,26 @@
 
 ## Unreleased
 
+## v3.17.1 — 2026-05-31
+
+### Fix — code-audit P1/P2 hardening
+
+Fixes from a multi-agent code audit (3 P1 + 5 P2, adversarially verified). The single-user default path (`AUTH_MODE=none`, no TUI) is behavior-identical.
+
+**Availability / correctness (P1):**
+- Guard `proc.stdin` against EPIPE — a fast-failing spawned `claude` (auth error, bad model, large prompt) no longer crashes the single-process daemon.
+- Add `unhandledRejection`/`uncaughtException`/`clientError` safety nets + wrap all request-body read loops — a client aborting mid-upload no longer crashes the daemon.
+- TUI transcript reader: only `turn_duration` is terminal (was also `tool_use`), which silently truncated any TUI turn that used a built-in tool.
+
+**Security gates / cache integrity (P2):**
+- `AUTH_MODE=multi`: the default spawn now passes `--disallowedTools` (Bash/Read/Write/Edit/…) so a guest prompt cannot drive operator-filesystem tools. Single-user path unchanged.
+- `/sessions` (DELETE), `/settings` (PATCH), `/logs`, `/usage`, `/status` are now admin-gated (were dispatched before the admin check).
+- Streaming path no longer caches an `is_error` response as success (cache-poisoning fix).
+- TUI fail-loud guard extended to `none`+`0.0.0.0` (unless `OCP_TUI_ALLOW_LAN=1`) and `+ PROXY_ANONYMOUS_KEY`.
+- TUI `send-keys` paste uses `-l` (literal) so a prompt equal to a tmux key token (e.g. `C-c`) is typed, not interpreted.
+
+---
+
 ## v3.17.0 — 2026-05-31
 
 ### Provider — default claude invocation ported to stream-json + `--system-prompt` (Phase 6c)
