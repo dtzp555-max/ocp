@@ -1309,11 +1309,11 @@ test("parseTranscriptLines skips blank + malformed/partial lines", () => {
 test("isTerminalLine true on turn_duration", () => {
   assert.equal(isTerminalLine({ type: "system", subtype: "turn_duration" }), true);
 });
-test("isTerminalLine true on stop_reason tool_use (message-wrapped)", () => {
-  assert.equal(isTerminalLine({ type: "assistant", message: { stop_reason: "tool_use" } }), true);
+test("isTerminalLine false on stop_reason tool_use (message-wrapped) — tool_use is mid-turn in TUI mode", () => {
+  assert.equal(isTerminalLine({ type: "assistant", message: { stop_reason: "tool_use" } }), false);
 });
-test("isTerminalLine true on stop_reason tool_use (flat)", () => {
-  assert.equal(isTerminalLine({ stop_reason: "tool_use" }), true);
+test("isTerminalLine false on stop_reason tool_use (flat) — claude continues after tool, turn not done", () => {
+  assert.equal(isTerminalLine({ stop_reason: "tool_use" }), false);
 });
 test("isTerminalLine false on ordinary assistant text line", () => {
   assert.equal(isTerminalLine({ type: "assistant", message: { content: [{ type: "text", text: "hi" }] } }), false);
