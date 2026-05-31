@@ -4,6 +4,7 @@
 
 ### Fix
 
+- **#113** — CLI/installer hardening: ocp-plugin restart uses the live uid + `dev.ocp.proxy`/`ocp-proxy` labels and drops the unsafe pkill fallback; ocp-connect quotes + chmod 600 the persisted key; setup.mjs XML-escapes and newline-validates injected service-unit secrets.
 - **#112** — Recorded OAuth-host verification against compiled cli.js v2.1.154 (ALIGNMENT Class A); usage-probe and default request model now derive from `models.json` (ADR 0003 SPOT) instead of hardcoded IDs.
 
 ### Security

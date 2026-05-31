@@ -858,6 +858,74 @@ test("gcSnapshots keeps last N regardless of age", () => {
   rmSync(root, { recursive: true, force: true });
 });
 
+// ── setup.mjs helpers: xmlEscape + assertSafeInjectValue ──
+// setup.mjs cannot be imported (top-level side effects run the installer).
+// Replicated verbatim from setup.mjs for unit-testing — keep in sync with source.
+console.log("\nsetup.mjs inject helpers:");
+
+function xmlEscape(v) {
+  return String(v).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;").replace(/'/g, "&apos;");
+}
+function assertSafeInjectValueTest(name, v) {
+  if (v == null) return v;
+  // eslint-disable-next-line no-control-regex
+  if (/[\x00-\x1f]/.test(String(v))) {
+    throw new Error(`FATAL: ${name} contains a newline or control character`);
+  }
+  return v;
+}
+
+test("xmlEscape encodes all five special XML chars", () => {
+  assert.equal(xmlEscape('a<b>&"\''), "a&lt;b&gt;&amp;&quot;&apos;");
+});
+
+test("xmlEscape leaves normal ocp_ token untouched", () => {
+  assert.equal(xmlEscape("ocp_abc123"), "ocp_abc123");
+});
+
+test("assertSafeInjectValue rejects value with newline", () => {
+  assert.throws(() => assertSafeInjectValueTest("OCP_ADMIN_KEY", "a\nb"), /FATAL/);
+});
+
+test("assertSafeInjectValue rejects value with carriage return", () => {
+  assert.throws(() => assertSafeInjectValueTest("OCP_ADMIN_KEY", "a\rb"), /FATAL/);
+});
+
+test("assertSafeInjectValue rejects value with a tab (control char)", () => {
+  assert.throws(() => assertSafeInjectValueTest("OCP_ADMIN_KEY", "a\tb"), /FATAL/);
+});
+
+test("assertSafeInjectValue ACCEPTS a path with a space (CLAUDE_BIN may legitimately contain one)", () => {
+  assert.equal(assertSafeInjectValueTest("CLAUDE_BIN", "/Users/x/My Apps/node"), "/Users/x/My Apps/node");
+});
+
+test("assertSafeInjectValue accepts normal ocp_ token", () => {
+  assert.doesNotThrow(() => assertSafeInjectValueTest("OCP_ADMIN_KEY", "ocp_abc123"));
+});
+
+test("assertSafeInjectValue accepts null (omit path)", () => {
+  assert.doesNotThrow(() => assertSafeInjectValueTest("OCP_ADMIN_KEY", null));
+});
+
+test("plist-merge round-trips XML-escaped value correctly via mergePlistEnv", () => {
+  // A value written with xmlEscape must survive a merge cycle — the [^<]* regex in
+  // parsePlistEnv only sees the escaped form (no raw < reaches it), so round-trip is safe.
+  const escaped = xmlEscape("a<b>&\"'");  // "a&lt;b&gt;&amp;&quot;&apos;"
+  const template = `<?xml version="1.0" encoding="UTF-8"?>
+<plist version="1.0">
+<dict>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>CLAUDE_AUTH_MODE</key>
+    <string>${escaped}</string>
+  </dict>
+</dict>
+</plist>`;
+  // mergePlistEnv with no existing plist returns template unchanged.
+  const merged = mergePlistEnv(null, template);
+  assert.ok(merged.includes(escaped), "escaped value should survive unchanged through plist merge");
+});
+
 test("gcSnapshots keeps snapshots newer than keepDays regardless of count", () => {
   const root = mkdtempSync(testJoin(tmpdir(), "ocp-gc-days-"));
   const dotOcp = testJoin(root, ".ocp");

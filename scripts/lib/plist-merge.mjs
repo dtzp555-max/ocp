@@ -9,6 +9,8 @@
 // No new dependencies — regex-based, plist <key>X</key><string>Y</string> shape
 // is stable enough for our hand-written templates in setup.mjs.
 
+// Note: setup.mjs XML-escapes all injected values before writing (via xmlEscape()),
+// so raw `<` / `>` / `&` never appear in plist <string> bodies — the [^<]* regex below is safe.
 const PLIST_KV_RE = /<key>([^<]+)<\/key>\s*<string>([^<]*)<\/string>/g;
 
 export function parsePlistEnv(plistContent) {
