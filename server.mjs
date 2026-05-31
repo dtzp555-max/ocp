@@ -36,6 +36,7 @@ import { dirname, join } from "node:path";
 import { homedir } from "node:os";
 import { validateKey, recordUsage, getUsageByKey, getUsageTimeline, getRecentUsage, createKey, listKeys, revokeKey, closeDb, checkQuota, updateKeyQuota, getKeyQuota, findKey, cacheHash, getCachedResponse, setCachedResponse, clearCache, getCacheStats, hasCacheControl, singleflight, getInflightStats } from "./keys.mjs";
 import { DEFAULT_PORT } from "./lib/constants.mjs";
+import { isLoopbackBind } from "./lib/net.mjs";
 import { runTuiTurn, reapStaleTuiSessions } from "./lib/tui/session.mjs";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -298,14 +299,6 @@ const TUI_WALLCLOCK_MS = parseInt(process.env.CLAUDE_TUI_WALLCLOCK_MS || "120000
 const TUI_CWD  = process.env.OCP_TUI_CWD  || `${process.env.HOME}/.ocp-tui/work`;
 const TUI_HOME = process.env.OCP_TUI_HOME  || process.env.HOME;
 const TUI_ENTRYPOINT = process.env.OCP_TUI_ENTRYPOINT || "cli"; // cli|auto|off — see ADR 0007
-
-// A bind address is "loopback" only if it cannot be reached from another host.
-// Any other address (0.0.0.0, ::, a concrete LAN/Tailscale IP, etc.) is
-// network-exposed and must trigger the TUI LAN gate. (issue #115)
-function isLoopbackBind(addr) {
-  return addr === "127.0.0.1" || addr === "::1" || addr === "localhost" ||
-         addr === "::ffff:127.0.0.1" || /^127\./.test(addr);
-}
 
 // SECURITY fail-loud: TUI-mode is incompatible with any configuration that allows
 // non-operator prompts to reach the interactive claude session. Three cases:
