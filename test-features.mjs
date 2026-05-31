@@ -1743,6 +1743,55 @@ test("models.json aliases.sonnet === 'claude-sonnet-4-6' (default-request-model 
   assert.equal(_spotModels.aliases.sonnet, "claude-sonnet-4-6");
 });
 
+// ── escapeHtml + key-name validator (issue #114) ────────────────────────────
+// Replicated verbatim from dashboard.html so tests run without a browser.
+function escapeHtml(s) {
+  return String(s ?? "").replace(/[&<>"']/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+}
+const KEY_NAME_RE = /^[A-Za-z0-9 ._-]{1,64}$/;
+
+console.log("\nescapeHtml (issue #114):");
+
+test("escapeHtml: XSS payload → &lt;img not <img", () => {
+  const out = escapeHtml('<img src=x onerror=alert(1)>');
+  assert.ok(out.includes("&lt;img"), `expected &lt;img in: ${out}`);
+  assert.ok(!out.includes("<img"), `expected no raw <img in: ${out}`);
+});
+
+test("escapeHtml: single-quote, double-quote, ampersand all escaped", () => {
+  assert.equal(escapeHtml("a'b\"c&d"), "a&#39;b&quot;c&amp;d");
+});
+
+test("escapeHtml: null → empty string", () => {
+  assert.equal(escapeHtml(null), "");
+});
+
+console.log("\nKey-name validator (issue #114):");
+
+test("KEY_NAME_RE: 'wife-laptop' → valid", () => {
+  assert.ok(KEY_NAME_RE.test("wife-laptop"));
+});
+
+test("KEY_NAME_RE: 'key-1700000000000' → valid", () => {
+  assert.ok(KEY_NAME_RE.test("key-1700000000000"));
+});
+
+test("KEY_NAME_RE: '<script>' → invalid", () => {
+  assert.ok(!KEY_NAME_RE.test("<script>"));
+});
+
+test("KEY_NAME_RE: \"a'); DROP\" → invalid", () => {
+  assert.ok(!KEY_NAME_RE.test("a'); DROP"));
+});
+
+test("KEY_NAME_RE: empty string → invalid", () => {
+  assert.ok(!KEY_NAME_RE.test(""));
+});
+
+test("KEY_NAME_RE: 65-char string → invalid", () => {
+  assert.ok(!KEY_NAME_RE.test("x".repeat(65)));
+});
+
 // ── Cleanup ──
 closeDb();
 

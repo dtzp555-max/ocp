@@ -132,6 +132,10 @@ function fmtChars(n) {
   return n > 1000 ? (n/1000).toFixed(0) + "K" : String(n);
 }
 
+function escapeHtml(s) {
+  return String(s ?? "").replace(/[&<>"']/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+}
+
 function barColor(pct) {
   if (pct >= 80) return "bar-red";
   if (pct >= 50) return "bar-amber";
@@ -181,21 +185,21 @@ async function refreshUsage() {
     const tbody = document.querySelector("#key-usage-table tbody");
     tbody.innerHTML = (data.byKey || []).map(k => `
       <tr>
-        <td>${k.key_name}</td>
+        <td>${escapeHtml(k.key_name)}</td>
         <td>${k.requests}</td>
         <td>${k.successes}</td>
         <td>${k.errors}</td>
         <td>${fmtTime(k.avg_elapsed_ms)}</td>
-        <td class="mono">${k.last_request || '-'}</td>
+        <td class="mono">${escapeHtml(k.last_request || '-')}</td>
       </tr>
     `).join("") || '<tr><td colspan="6" style="color:#475569">No usage data yet</td></tr>';
 
     const rtbody = document.querySelector("#recent-table tbody");
     rtbody.innerHTML = (data.recent || []).slice(0, 20).map(r => `
       <tr>
-        <td class="mono">${r.created_at?.slice(11, 19) || '?'}</td>
-        <td>${r.key_name}</td>
-        <td>${r.model}</td>
+        <td class="mono">${escapeHtml(r.created_at?.slice(11, 19) || '?')}</td>
+        <td>${escapeHtml(r.key_name)}</td>
+        <td>${escapeHtml(r.model)}</td>
         <td>${fmtChars(r.prompt_chars)}</td>
         <td>${fmtChars(r.response_chars)}</td>
         <td>${fmtTime(r.elapsed_ms)}</td>
@@ -216,13 +220,16 @@ async function refreshKeys() {
     const tbody = document.querySelector("#keys-table tbody");
     tbody.innerHTML = (data.keys || []).map(k => `
       <tr>
-        <td>${k.name}</td>
-        <td class="mono">${k.keyPreview}</td>
-        <td class="mono">${k.created_at}</td>
+        <td>${escapeHtml(k.name)}</td>
+        <td class="mono">${escapeHtml(k.keyPreview)}</td>
+        <td class="mono">${escapeHtml(k.created_at)}</td>
         <td><span class="tag ${k.revoked ? 'tag-err' : 'tag-ok'}">${k.revoked ? 'revoked' : 'active'}</span></td>
-        <td>${k.revoked ? '' : `<button class="btn btn-sm btn-danger" onclick="revokeKeyUI('${k.name}')">Revoke</button>`}</td>
+        <td>${k.revoked ? '' : `<button class="btn btn-sm btn-danger" data-revoke="${escapeHtml(k.name)}">Revoke</button>`}</td>
       </tr>
     `).join("");
+    tbody.querySelectorAll("button[data-revoke]").forEach(btn =>
+      btn.addEventListener("click", () => revokeKeyUI(btn.getAttribute("data-revoke")))
+    );
   } catch(e) { /* not admin */ }
 }
 
