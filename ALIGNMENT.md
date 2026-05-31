@@ -52,6 +52,26 @@ The following Rules apply to **Class A operations** (the `cli.js`-mirror surface
 
 The audit pin is updated once per year (see Annual Alignment Audit) and whenever a drift incident forces a re-verification.
 
+### OAuth token-host verification (2026-05-31)
+
+Motivating evidence: the 2026-05-31 code audit (issues #112 / #119 / #123). The OAuth bearer
+machinery is a Class A surface (Rules 1–5). Because `cli.js` now ships as a
+compiled binary, the token-refresh host was re-verified against `claude.exe` (Claude Code
+`2.1.154`) on 2026-05-31 using the compiled-binary protocol — `strings` on the Mach-O, **no
+live OAuth probe** (a `refresh_token` grant would rotate the operator's real credentials):
+
+- **Verified host:** `https://platform.claude.com/v1/oauth/token` — present in the binary
+  byte-for-byte, paired with `OAUTH_CLIENT_ID` in the same `prod` config object (matches
+  `server.mjs` `OAUTH_TOKEN_URL` / `OAUTH_CLIENT_ID`). The legacy `console.anthropic.com/v1/oauth`
+  host is absent (0 hits).
+- **Pinned wrong-host variant:** `console.anthropic.com/v1/oauth/token` is added to the
+  `alignment.yml` blacklist so a future accidental revert to the legacy host hard-fails CI.
+
+The blacklist therefore now holds two kinds of token: (1) known hallucinations (e.g.
+`api.anthropic.com/api/oauth/usage`, the 2026-04-11 drift), and (2) pinned wrong-host variants
+of a *verified* Class A endpoint. A blacklist hit means either a re-introduced hallucination
+**or** a drift to a known-wrong host — both are alignment failures under Rules 2 and 3.
+
 ---
 
 ## Historical Lesson: The 2026-04-11 Drift

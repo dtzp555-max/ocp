@@ -29,10 +29,14 @@ jobs:
             exit 0
           fi
 
-          # Known-hallucinated tokens. Extend only via an ALIGNMENT.md amendment PR.
-          # Each token is matched as a fixed string against server.mjs only.
+          # Blacklisted tokens — two kinds (see ALIGNMENT.md "OAuth token-host verification"):
+          #   (1) known LLM hallucinations (e.g. the 2026-04-11 /api/oauth/usage drift), and
+          #   (2) pinned wrong-host variants of a VERIFIED Class A endpoint (a hit means a
+          #       drift to a known-wrong host, not necessarily a hallucination).
+          # Extend only via an ALIGNMENT.md amendment PR. Matched as fixed strings vs server.mjs.
           BLACKLIST=(
             "api.anthropic.com/api/oauth/usage"
+            "console.anthropic.com/v1/oauth/token"
           )
 
           FAIL=0
@@ -51,8 +55,8 @@ jobs:
           ============================================================
           server.mjs contains a token on the OCP alignment blacklist.
 
-          These tokens were introduced by LLM hallucinations and do
-          not appear in cli.js at any shipped Claude Code version.
+          These tokens are either LLM hallucinations that never appeared in cli.js,
+          or pinned wrong-host variants of a verified Class A endpoint (a drift).
           See ALIGNMENT.md -> "Historical Lesson: The 2026-04-11 Drift"
           (commit b87992f) for the full incident record.
 
