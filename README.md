@@ -285,7 +285,7 @@ chmod +x ocp-connect
 ./ocp-connect <server-ip>
 ```
 
-**Zero-config** — when the server admin has set `PROXY_ANONYMOUS_KEY` (see [Anonymous Access](#anonymous-access-optional) below), just pass the server IP and nothing else. `ocp-connect` reads the anonymous key from `/health` and uses it automatically:
+**Zero-config** — when the server admin has set `PROXY_ANONYMOUS_KEY` *and* opted in with `PROXY_ADVERTISE_ANON_KEY=1` (see [Anonymous Access](#anonymous-access-optional) below), just pass the server IP and nothing else. `ocp-connect` reads the anonymous key from `/health` and uses it automatically. Without the opt-in, `/health` does not expose the key (issue #109); pass `--key` or rely on anonymous access instead:
 
 ```bash
 ./ocp-connect <server-ip>
@@ -370,7 +370,7 @@ OCP Connect v1.3.0
 The script automatically:
 - Writes env vars to all relevant shell rc files (`.bashrc`, `.zshrc`)
 - Sets system-level env vars (`launchctl setenv` on macOS, `environment.d` on Linux)
-- **Auto-discovers anonymous key** from `/health.anonymousKey` when no `--key` given (v1.3.0+, requires server v3.10.0+)
+- **Auto-discovers anonymous key** from `/health.anonymousKey` when no `--key` given (v1.3.0+, requires server v3.10.0+; server must also set `PROXY_ADVERTISE_ANON_KEY=1` — see [Anonymous Access](#anonymous-access-optional))
 - Configures OpenClaw automatically (including per-agent `auth-profiles.json` for multi-agent setups)
 - Detects Cline, Continue.dev, Cursor, and opencode, and prints setup hints (manual configuration required for these IDEs)
 
@@ -440,7 +440,7 @@ node setup.mjs --bind 0.0.0.0 --auth-mode multi
 
 If OCP is already installed without it, re-export the env var and re-run `node setup.mjs` (the installer is idempotent — it refreshes the service unit). Then `ocp restart` so the running proxy picks up the new env. Setting `PROXY_ANONYMOUS_KEY` only in your interactive shell **does not** affect the auto-started proxy — the service unit is the source of truth for its environment.
 
-**Client side**: the anonymous key value is exposed via `GET /health` as the field `anonymousKey` (null when not set). Clients like `ocp-connect` can auto-discover and use it, so the end user doesn't need to get a personal key from the admin.
+**Client side**: the anonymous key value is exposed via `GET /health` as the field `anonymousKey` (null when not set) **only to localhost callers** or when the admin has also set `PROXY_ADVERTISE_ANON_KEY=1` (default off — see issue #109). With that opt-in, clients like `ocp-connect` can auto-discover and use it, so the end user doesn't need to get a personal key from the admin.
 
 **Security note**: setting this env var is an **opt-in** to public access — anyone who can reach your OCP endpoint can use it, up to any rate limits you configure. Don't enable this on internet-exposed OCP instances without additional protection.
 
@@ -889,7 +889,8 @@ Future `ocp update` invocations sync automatically.
 | `CLAUDE_SKIP_PERMISSIONS` | `false` | Bypass all permission checks |
 | `CLAUDE_NO_CONTEXT` | `false` | Suppress CLAUDE.md and auto-memory injection (pure API mode) |
 | `PROXY_API_KEY` | *(unset)* | Bearer token for shared-mode authentication |
-| `PROXY_ANONYMOUS_KEY` | *(unset)* | Well-known anonymous key allowlist (multi mode). When set, this exact string bypasses `validateKey()` and grants public access. Exposed via `/health.anonymousKey` so clients auto-discover. See [Anonymous Access](#anonymous-access-optional). |
+| `PROXY_ANONYMOUS_KEY` | *(unset)* | Well-known anonymous key allowlist (multi mode). When set, this exact string bypasses `validateKey()` and grants public access. Exposed via `/health.anonymousKey` only to localhost, or to all callers when `PROXY_ADVERTISE_ANON_KEY=1`. See [Anonymous Access](#anonymous-access-optional). |
+| `PROXY_ADVERTISE_ANON_KEY` | *(unset)* | When `=1`, advertise `PROXY_ANONYMOUS_KEY` in the public `/health` body for remote zero-config discovery. Default off — `/health` is unauthenticated, so this exposes the shared key to any LAN-reachable device (issue #109). Localhost always sees it regardless. |
 | `CLAUDE_TUI_MODE` | `false` | **Opt-in.** Set to `"true"` to serve requests via interactive `claude` (no `-p` / `--output-format` → `cc_entrypoint=cli`, subscription pool). **Single-user only** — see [Subscription-pool (TUI) mode](#subscription-pool-tui-mode) for the security constraint. |
 | `CLAUDE_TUI_WALLCLOCK_MS` | `120000` | (TUI-mode) Maximum time in ms to wait for the native transcript to signal turn completion. Increase for long Opus thinking turns. |
 | `OCP_TUI_CWD` | `$HOME/.ocp-tui/work` | (TUI-mode) Scratch working directory where interactive claude sessions run. Transcripts land under `<HOME>/.claude/projects/<encoded-cwd>/`. Created automatically. |

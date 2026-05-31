@@ -278,6 +278,12 @@ const NO_CONTEXT = process.env.CLAUDE_NO_CONTEXT === "true";
 const AUTH_MODE = process.env.CLAUDE_AUTH_MODE || (PROXY_API_KEY ? "shared" : "none");
 const ADMIN_KEY = process.env.OCP_ADMIN_KEY || "";
 const PROXY_ANONYMOUS_KEY = process.env.PROXY_ANONYMOUS_KEY || "";
+// When set to "1", advertise PROXY_ANONYMOUS_KEY in the public /health body so
+// remote `ocp-connect` devices can zero-config auto-discover it (issue #12 §14 Path A).
+// Default OFF: /health is unauthenticated, so advertising hands the shared key to any
+// LAN-reachable device (issue #109 P0). Localhost callers always see it regardless,
+// since localhost is already fully trusted by the auth path.
+const ADVERTISE_ANON_KEY = process.env.PROXY_ADVERTISE_ANON_KEY === "1";
 let CACHE_TTL = parseInt(process.env.CLAUDE_CACHE_TTL || "0", 10); // 0 = disabled, value in ms
 
 // ── TUI-mode (subscription-pool bridge) — opt-in; default OFF ───────────
@@ -1918,7 +1924,7 @@ const server = createServer(async (req, res) => {
       claudeBinary: CLAUDE,
       claudeBinaryOk: binaryOk,
       authMode: AUTH_MODE,
-      anonymousKey: PROXY_ANONYMOUS_KEY || null,
+      ...((isLocalhost || ADVERTISE_ANON_KEY) ? { anonymousKey: PROXY_ANONYMOUS_KEY || null } : {}),
       auth: authStatus,
       config: {
         timeout: TIMEOUT,
