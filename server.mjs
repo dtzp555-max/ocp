@@ -144,7 +144,7 @@ function extractSystemPrompt(messages) {
     return OCP_SYSTEM_PROMPT_WRAPPER;
   }
   const clientContent = systemMessages.map(m =>
-    typeof m.content === "string" ? m.content : JSON.stringify(m.content)
+    contentToText(m.content)
   ).join("\n\n");
   return `${OCP_SYSTEM_PROMPT_WRAPPER}\n\n${clientContent}`;
 }
@@ -636,9 +636,22 @@ function buildCliArgs(cliModel, systemPrompt) {
 // This prevents runaway context from gateway-side conversation accumulation.
 let MAX_PROMPT_CHARS = parseInt(process.env.CLAUDE_MAX_PROMPT_CHARS || "150000", 10);
 
+// Flatten OpenAI content (string | array of parts) to plain text for the prompt.
+// Array content: concatenate text parts; replace non-text parts (e.g. image_url)
+// with a placeholder rather than dumping raw JSON. (issue #110)
+function contentToText(content) {
+  if (typeof content === "string") return content;
+  if (Array.isArray(content)) {
+    return content.map(p =>
+      p && p.type === "text" && typeof p.text === "string" ? p.text : "[non-text content omitted]"
+    ).join("");
+  }
+  return content == null ? "" : JSON.stringify(content);
+}
+
 function messagesToPrompt(messages) {
   const full = messages.map((m) => {
-    const text = typeof m.content === "string" ? m.content : JSON.stringify(m.content);
+    const text = contentToText(m.content);
     if (m.role === "system") return `[System] ${text}`;
     if (m.role === "assistant") return `[Assistant] ${text}`;
     return text;
@@ -1045,10 +1058,10 @@ function callClaudeStreaming(model, messages, conversationId, res, authInfo = {}
         if (!headersSent && !res.writableEnded && !res.destroyed) {
           jsonResponse(res, 500, { error: { message: errStr, type: "provider_error" } });
         } else if (!res.writableEnded && !res.destroyed) {
-          sendSSE(res, {
-            id, object: "chat.completion.chunk", created, model,
-            choices: [{ index: 0, delta: {}, finish_reason: "stop" }],
-          }, hb);
+          // Headers already sent (eager ensureHeaders) — can't send a JSON 500. Surface the
+          // failure as an SSE error frame so the client can distinguish an upstream error
+          // from a legitimately empty completion, instead of a success-looking finish_reason:"stop". (issue #110)
+          sendSSE(res, { error: { message: errStr, type: "provider_error" } }, hb);
           res.write("data: [DONE]\n\n");
           res.end();
         }
@@ -1070,7 +1083,7 @@ function callClaudeStreaming(model, messages, conversationId, res, authInfo = {}
     // never record success or write cache for an errored response.
     if ((code !== 0 && !resultEventSeen) || errored) {
       recordModelError(cliModel, false);
-      try { recordUsage({ keyId: authInfo.keyId, keyName: authInfo.keyName, model, promptChars: messages.reduce((a, m) => a + (typeof m.content === "string" ? m.content.length : JSON.stringify(m.content).length), 0), responseChars: 0, elapsedMs: elapsed, success: false }); } catch (e) { logEvent("error", "usage_record_failed", { error: e.message }); }
+      try { recordUsage({ keyId: authInfo.keyId, keyName: authInfo.keyName, model, promptChars: messages.reduce((a, m) => a + contentToText(m.content).length, 0), responseChars: 0, elapsedMs: elapsed, success: false }); } catch (e) { logEvent("error", "usage_record_failed", { error: e.message }); }
       logEvent("error", "claude_exit", { model: cliModel, code, signal: signal || "none", elapsed, errored, stderr: stderr.slice(0, 300) });
       trackError(stderr.slice(0, 300) || `claude exit ${code}`);
       handleSessionFailure();
@@ -1080,17 +1093,17 @@ function callClaudeStreaming(model, messages, conversationId, res, authInfo = {}
       if (!headersSent && !res.writableEnded && !res.destroyed) {
         jsonResponse(res, 500, { error: { message: stderr.slice(0, 300) || `claude exit ${code}`, type: "proxy_error" } });
       } else if (!res.writableEnded && !res.destroyed) {
-        sendSSE(res, {
-          id, object: "chat.completion.chunk", created, model,
-          choices: [{ index: 0, delta: {}, finish_reason: "stop" }],
-        }, hb);
+        // Headers already sent — surface the failure as an SSE error frame instead of a
+        // success-looking finish_reason:"stop", so the client can tell the upstream crashed
+        // rather than returned empty. (issue #110 — sibling of the parsed.error branch above.)
+        sendSSE(res, { error: { message: stderr.slice(0, 300) || `claude exit ${code}`, type: "proxy_error" } }, hb);
         res.write("data: [DONE]\n\n");
         res.end();
       }
     } else {
       recordModelSuccess(cliModel, elapsed);
       breakerRecordSuccess(cliModel);
-      try { recordUsage({ keyId: authInfo.keyId, keyName: authInfo.keyName, model, promptChars: messages.reduce((a, m) => a + (typeof m.content === "string" ? m.content.length : JSON.stringify(m.content).length), 0), responseChars: totalChars, elapsedMs: elapsed, success: true }); } catch (e) { logEvent("error", "usage_record_failed", { error: e.message }); }
+      try { recordUsage({ keyId: authInfo.keyId, keyName: authInfo.keyName, model, promptChars: messages.reduce((a, m) => a + contentToText(m.content).length, 0), responseChars: totalChars, elapsedMs: elapsed, success: true }); } catch (e) { logEvent("error", "usage_record_failed", { error: e.message }); }
       logEvent("info", "claude_ok", { model: cliModel, chars: totalChars, elapsed, session: convId ? convId.slice(0, 12) + "..." : "none" });
       // Cache write-back for streaming — only on true success (not errored)
       if (CACHE_TTL > 0 && authInfo.cacheHash) {
@@ -1647,7 +1660,9 @@ async function handleChatCompletions(req, res) {
   // Session ID: from request body, header, or null (one-off)
   const conversationId = parsed.session_id || parsed.conversation_id || req.headers["x-session-id"] || req.headers["x-conversation-id"] || null;
 
-  if (!messages?.length) return jsonResponse(res, 400, { error: "messages required" });
+  if (!Array.isArray(messages) || messages.length === 0) {
+    return jsonResponse(res, 400, { error: { message: "'messages' must be a non-empty array", type: "invalid_request_error" } });
+  }
 
   // Quota check — only for identified per-key users (not anonymous/admin/local)
   if (req._authKeyId) {
@@ -1703,7 +1718,7 @@ async function handleChatCompletions(req, res) {
       // Default path (TUI_MODE===false) falls through to callClaudeStreaming below,
       // which is byte-for-byte unchanged from before this gate was added.
       const t0TuiStream = Date.now();
-      const promptCharsTuiStream = messages.reduce((a, m) => a + (typeof m.content === "string" ? m.content.length : JSON.stringify(m.content).length), 0);
+      const promptCharsTuiStream = messages.reduce((a, m) => a + contentToText(m.content).length, 0);
       try {
         const content = await callClaudeTui(model, messages, conversationId, req._authKeyName);
         if (CACHE_TTL > 0 && req._cacheHash) {
@@ -1724,7 +1739,7 @@ async function handleChatCompletions(req, res) {
   }
 
   const t0Usage = Date.now();
-  const promptChars = messages.reduce((a, m) => a + (typeof m.content === "string" ? m.content.length : JSON.stringify(m.content).length), 0);
+  const promptChars = messages.reduce((a, m) => a + contentToText(m.content).length, 0);
 
   // Select upstream based on TUI_MODE flag. With TUI_MODE===false (default),
   // upstreamCall===callClaude — identical to the pre-TUI code path.

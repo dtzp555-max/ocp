@@ -1563,6 +1563,66 @@ test("(localhost=true, flag=true) → include key (both true)", () => {
   assert.equal(shouldAdvertiseAnonKey(true, true), true);
 });
 
+// ── contentToText helper tests (issue #110) ──────────────────────────────────
+// MIRRORS server.mjs contentToText — copied verbatim to avoid importing server.mjs
+// (top-level server.listen() would start a live HTTP server).
+// Keep in sync with the definition in server.mjs above messagesToPrompt.
+console.log("\ncontentToText helper (issue #110):");
+
+function contentToText(content) {
+  if (typeof content === "string") return content;
+  if (Array.isArray(content)) {
+    return content.map(p =>
+      p && p.type === "text" && typeof p.text === "string" ? p.text : "[non-text content omitted]"
+    ).join("");
+  }
+  return content == null ? "" : JSON.stringify(content);
+}
+
+test("contentToText: string input returned unchanged", () => {
+  assert.equal(contentToText("hello"), "hello");
+});
+
+test("contentToText: array of text parts concatenated", () => {
+  assert.equal(
+    contentToText([{ type: "text", text: "hello" }, { type: "text", text: " world" }]),
+    "hello world"
+  );
+});
+
+test("contentToText: non-text part (image_url) replaced with placeholder", () => {
+  assert.equal(
+    contentToText([{ type: "image_url", image_url: { url: "https://example.com/img.png" } }]),
+    "[non-text content omitted]"
+  );
+});
+
+test("contentToText: empty array returns empty string", () => {
+  assert.equal(contentToText([]), "");
+});
+
+test("contentToText: null returns empty string", () => {
+  assert.equal(contentToText(null), "");
+});
+
+// ── messages guard predicate truth-table (issue #110) ────────────────────────
+// Mirrors the guard at server.mjs line ~1650: Array.isArray(x) && x.length > 0
+console.log("\nmessages guard predicate (issue #110):");
+
+function isValidMessages(x) { return Array.isArray(x) && x.length > 0; }
+
+test("messages guard: string 'x' → invalid (non-array)", () => {
+  assert.equal(isValidMessages("x"), false);
+});
+
+test("messages guard: empty array [] → invalid", () => {
+  assert.equal(isValidMessages([]), false);
+});
+
+test("messages guard: [{role:'user',content:'hi'}] → valid", () => {
+  assert.equal(isValidMessages([{ role: "user", content: "hi" }]), true);
+});
+
 // ── Cleanup ──
 closeDb();
 
