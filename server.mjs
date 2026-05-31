@@ -2048,6 +2048,9 @@ const server = createServer(async (req, res) => {
     let parsed;
     try { parsed = JSON.parse(body); } catch { return jsonResponse(res, 400, { error: "Invalid JSON" }); }
     const name = parsed.name || `key-${Date.now()}`;
+    if (!/^[A-Za-z0-9 ._-]{1,64}$/.test(name)) {
+      return jsonResponse(res, 400, { error: { message: "Invalid key name: 1-64 chars of letters, digits, space, dot, underscore, hyphen", type: "invalid_request_error" } });
+    }
     const newKey = createKey(name);
     return jsonResponse(res, 201, newKey);
   }
