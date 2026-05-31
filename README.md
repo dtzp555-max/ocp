@@ -486,6 +486,8 @@ When a key exceeds its quota, OCP returns HTTP 429 with a structured error:
 - Admin and anonymous users are never subject to quotas
 - PATCH is a partial update — omitted fields are left unchanged
 
+> **Note:** quotas are best-effort. Under concurrent bursts a key can exceed its cap by up to the server's max-concurrency (default 8), and cache hits are not counted toward quota. They cap budgets for cooperative family use, not adversarial abuse.
+
 ### Important Notes
 
 - All users share your Claude Pro/Max **rate limits** (5h session + 7d weekly)

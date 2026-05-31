@@ -819,7 +819,12 @@ function spawnClaudeProcess(model, messages, conversationId, keyName) {
     }
   }, TIMEOUT);
 
-  return { proc, cliModel, conversationId, t0, cleanup, handleSessionFailure, markFirstByte };
+  // Clear ONLY the request timer (not the slot accounting) when the response has
+  // semantically completed (result/[DONE]) but the child hasn't exited yet — prevents
+  // a spurious post-success timeout. cleanup() (on exit) still clears it idempotently. (issue #111)
+  function clearOverallTimer() { clearTimeout(overallTimer); }
+
+  return { proc, cliModel, conversationId, t0, cleanup, clearOverallTimer, handleSessionFailure, markFirstByte };
 }
 
 // ── Call claude CLI (non-streaming) ─────────────────────────────────────
@@ -973,10 +978,10 @@ function callClaudeStreaming(model, messages, conversationId, res, authInfo = {}
   try {
     ctx = spawnClaudeProcess(model, messages, conversationId, authInfo.keyName);
   } catch (err) {
-    return jsonResponse(res, 500, { error: { message: err.message, type: "proxy_error" } });
+    return jsonResponse(res, 500, { error: { message: sanitizeError(err.message), type: "proxy_error" } });
   }
 
-  const { proc, cliModel, conversationId: convId, t0, cleanup, handleSessionFailure, markFirstByte } = ctx;
+  const { proc, cliModel, conversationId: convId, t0, cleanup, clearOverallTimer, handleSessionFailure, markFirstByte } = ctx;
   let stderr = "";
   let headersSent = false;
   let totalChars = 0;
@@ -1047,6 +1052,7 @@ function callClaudeStreaming(model, messages, conversationId, res, authInfo = {}
           res.write("data: [DONE]\n\n");
           res.end();
         }
+        clearOverallTimer();
 
       } else if (parsed.error) {
         // is_error result — emit error stop; do NOT set resultEventSeen (that would
@@ -1056,12 +1062,12 @@ function callClaudeStreaming(model, messages, conversationId, res, authInfo = {}
         logEvent("error", "claude_result_error", { model: cliModel, error: errStr.slice(0, 200) });
         trackError(errStr.slice(0, 200));
         if (!headersSent && !res.writableEnded && !res.destroyed) {
-          jsonResponse(res, 500, { error: { message: errStr, type: "provider_error" } });
+          jsonResponse(res, 500, { error: { message: sanitizeError(errStr), type: "provider_error" } });
         } else if (!res.writableEnded && !res.destroyed) {
           // Headers already sent (eager ensureHeaders) — can't send a JSON 500. Surface the
           // failure as an SSE error frame so the client can distinguish an upstream error
           // from a legitimately empty completion, instead of a success-looking finish_reason:"stop". (issue #110)
-          sendSSE(res, { error: { message: errStr, type: "provider_error" } }, hb);
+          sendSSE(res, { error: { message: sanitizeError(errStr), type: "provider_error" } }, hb);
           res.write("data: [DONE]\n\n");
           res.end();
         }
@@ -1091,12 +1097,12 @@ function callClaudeStreaming(model, messages, conversationId, res, authInfo = {}
       // If the error was already sent inline (parsed.error branch above), the
       // response may be writableEnded — nothing more to send.
       if (!headersSent && !res.writableEnded && !res.destroyed) {
-        jsonResponse(res, 500, { error: { message: stderr.slice(0, 300) || `claude exit ${code}`, type: "proxy_error" } });
+        jsonResponse(res, 500, { error: { message: sanitizeError(stderr.slice(0, 300) || `claude exit ${code}`), type: "proxy_error" } });
       } else if (!res.writableEnded && !res.destroyed) {
         // Headers already sent — surface the failure as an SSE error frame instead of a
         // success-looking finish_reason:"stop", so the client can tell the upstream crashed
         // rather than returned empty. (issue #110 — sibling of the parsed.error branch above.)
-        sendSSE(res, { error: { message: stderr.slice(0, 300) || `claude exit ${code}`, type: "proxy_error" } }, hb);
+        sendSSE(res, { error: { message: sanitizeError(stderr.slice(0, 300) || `claude exit ${code}`), type: "proxy_error" } }, hb);
         res.write("data: [DONE]\n\n");
         res.end();
       }
@@ -1133,7 +1139,7 @@ function callClaudeStreaming(model, messages, conversationId, res, authInfo = {}
     trackError(err.message);
     handleSessionFailure();
     if (!headersSent && !res.writableEnded && !res.destroyed) {
-      jsonResponse(res, 500, { error: { message: err.message, type: "proxy_error" } });
+      jsonResponse(res, 500, { error: { message: sanitizeError(err.message), type: "proxy_error" } });
     } else if (!res.writableEnded && !res.destroyed) {
       res.end();
     }
@@ -1142,10 +1148,25 @@ function callClaudeStreaming(model, messages, conversationId, res, authInfo = {}
   // If client disconnects, kill the process to free resources
   res.on("close", () => {
     hb.stop();
-    if (!proc.killed) {
+    // Only escalate when the child is still alive. On the normal-success path res.end()
+    // also fires "close", but the child has usually already exited — skip the spurious
+    // SIGTERM and the 5s kill-timer entirely (a post-exit proc.once("exit") never fires,
+    // so the timer would otherwise leak a closure over proc for 5s per request). (issue #111)
+    if (!proc.killed && proc.exitCode === null && proc.signalCode === null) {
       try { proc.kill("SIGTERM"); } catch {}
+      // Mirror the overallTimer escalation (server.mjs ~818): a SIGTERM-resistant child would
+      // otherwise hold its concurrency slot until the request timeout — #37 on the disconnect path. (issue #111)
+      const killTimer = setTimeout(() => { try { proc.kill("SIGKILL"); } catch {} }, 5000);
+      killTimer.unref();
+      proc.once("exit", () => clearTimeout(killTimer));
     }
   });
+}
+
+// Strip absolute filesystem paths from an error message before sending it to a client.
+// claude error_message / stderr routinely embed home-dir / credential-file paths. (issue #111)
+function sanitizeError(msg) {
+  return String(msg || "Internal error").replace(/\/[\w/.\-]+/g, "[path]");
 }
 
 // ── Response helpers ────────────────────────────────────────────────────
@@ -1664,6 +1685,11 @@ async function handleChatCompletions(req, res) {
     return jsonResponse(res, 400, { error: { message: "'messages' must be a non-empty array", type: "invalid_request_error" } });
   }
 
+  // NOTE: quota is best-effort / eventually-consistent. The gate reads the recorded count
+  // at entry and records only after the upstream completes, so concurrent requests at the
+  // boundary can overshoot the cap by up to MAX_CONCURRENT, and cache hits (served before
+  // recordUsage) are not counted. This is internal family rate-limiting, not a payment
+  // boundary — bounded overshoot is acceptable. (issue #111)
   // Quota check — only for identified per-key users (not anonymous/admin/local)
   if (req._authKeyId) {
     let exceeded;
@@ -1730,8 +1756,7 @@ async function handleChatCompletions(req, res) {
         return;
       } catch (err) {
         if (res.headersSent || res.writableEnded || res.destroyed) { try { res.end(); } catch {} return; }
-        const safeMessage = (err.message || "Internal error").replace(/\/[\w/.\-]+/g, "[path]");
-        return jsonResponse(res, 500, { error: { message: safeMessage, type: "proxy_error" } });
+        return jsonResponse(res, 500, { error: { message: sanitizeError(err.message), type: "proxy_error" } });
       }
     }
     // Default: real stream-json streaming, unchanged.
@@ -1773,8 +1798,7 @@ async function handleChatCompletions(req, res) {
         try { res.end(); } catch {}
         return;
       }
-      const safeMessage = (err.message || "Internal error").replace(/\/[\w/.\-]+/g, "[path]");
-      return jsonResponse(res, 500, { error: { message: safeMessage, type: "proxy_error" } });
+      return jsonResponse(res, 500, { error: { message: sanitizeError(err.message), type: "proxy_error" } });
     }
   }
 
@@ -1792,8 +1816,7 @@ async function handleChatCompletions(req, res) {
       return;
     }
     // Sanitize error: strip internal file paths before sending to client
-    const safeMessage = (err.message || "Internal error").replace(/\/[\w/.\-]+/g, "[path]");
-    jsonResponse(res, 500, { error: { message: safeMessage, type: "proxy_error" } });
+    jsonResponse(res, 500, { error: { message: sanitizeError(err.message), type: "proxy_error" } });
   }
 }
 
