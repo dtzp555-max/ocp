@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+### Fix
+
+- **#112** — Recorded OAuth-host verification against compiled cli.js v2.1.154 (ALIGNMENT Class A); usage-probe and default request model now derive from `models.json` (ADR 0003 SPOT) instead of hardcoded IDs.
+
 ### Security
 
 - **#109 P0** — `/health` no longer advertises `PROXY_ANONYMOUS_KEY` to remote callers by default. The `anonymousKey` field is now gated behind a new `PROXY_ADVERTISE_ANON_KEY=1` opt-in env var; localhost callers are always exempt. This prevents any LAN-reachable device from harvesting a working bearer credential from the unauthenticated `/health` endpoint.

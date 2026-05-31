@@ -1222,6 +1222,12 @@ function streamStringAsSSE(res, id, model, content) {
 
 let usageCache = { data: null, fetchedAt: 0 };
 const USAGE_CACHE_TTL = 5 * 60 * 1000; // 5 min
+// ALIGNMENT (Class A — OAuth bearer machinery). Verified against the compiled cli.js
+// (claude.exe v2.1.154) on 2026-05-31 via `strings`: both OAUTH_CLIENT_ID and
+// OAUTH_TOKEN_URL appear in the binary byte-for-byte; the legacy host
+// console.anthropic.com/v1/oauth is absent (0 hits). Re-verify on cli.js major bumps
+// using the compiled-binary protocol (strings on the Mach-O/ELF; no live OAuth probe —
+// a refresh-token grant would rotate the operator's real credentials). (issue #112)
 const OAUTH_CLIENT_ID = "9d1c250a-e61b-44d9-88ed-5944d1962f5e";
 const OAUTH_TOKEN_URL = "https://platform.claude.com/v1/oauth/token";
 
@@ -1329,7 +1335,7 @@ async function fetchUsageFromApi() {
   // Minimal /v1/messages request — we only need the response headers.
   // Mirrors Claude Code cli.js vE4: headers anthropic-ratelimit-unified-{5h,7d}-{utilization,reset}.
   const body = JSON.stringify({
-    model: "claude-haiku-4-5-20251001",
+    model: modelsConfig.aliases.haiku,
     max_tokens: 1,
     messages: [{ role: "user", content: "." }],
   });
@@ -1670,7 +1676,7 @@ async function handleChatCompletions(req, res) {
   try { parsed = JSON.parse(body); } catch { return jsonResponse(res, 400, { error: "Invalid JSON" }); }
 
   const messages = parsed.messages || parsed.input || [{ role: "user", content: parsed.prompt || "" }];
-  const model = parsed.model || "claude-sonnet-4-6";
+  const model = parsed.model || modelsConfig.aliases.sonnet;
   const stream = parsed.stream;
 
   // Validate model against known models
