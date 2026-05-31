@@ -1654,6 +1654,27 @@ test("sanitizeError: multiple paths all stripped", () => {
   assert.ok(result.includes("[path]"), `expected [path] in: ${result}`);
 });
 
+// ── models.json SPOT wiring (issue #112) ────────────────────────────────────
+// Asserts that the alias values used by server.mjs (usage probe + default model)
+// match the expected IDs. A future alias rename that silently breaks these
+// code paths is caught here.
+import { readFileSync as spotReadFileSync } from "node:fs";
+import { fileURLToPath as spotFileURLToPath } from "node:url";
+import { dirname as spotDirname, join as spotJoin } from "node:path";
+
+console.log("\nmodels.json SPOT aliases (issue #112):");
+
+const _spotDir = spotDirname(spotFileURLToPath(import.meta.url));
+const _spotModels = JSON.parse(spotReadFileSync(spotJoin(_spotDir, "models.json"), "utf8"));
+
+test("models.json aliases.haiku === 'claude-haiku-4-5-20251001' (usage-probe SPOT)", () => {
+  assert.equal(_spotModels.aliases.haiku, "claude-haiku-4-5-20251001");
+});
+
+test("models.json aliases.sonnet === 'claude-sonnet-4-6' (default-request-model SPOT)", () => {
+  assert.equal(_spotModels.aliases.sonnet, "claude-sonnet-4-6");
+});
+
 // ── Cleanup ──
 closeDb();
 
