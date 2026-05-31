@@ -1623,6 +1623,37 @@ test("messages guard: [{role:'user',content:'hi'}] → valid", () => {
   assert.equal(isValidMessages([{ role: "user", content: "hi" }]), true);
 });
 
+// ── sanitizeError helper (issue #111) ────────────────────────────────────
+// Replicated verbatim from server.mjs (cannot import server.mjs).
+// The SIGKILL-escalation and timer changes are process-lifecycle and are not
+// unit-testable here (no live-server harness).
+console.log("\nsanitizeError (issue #111):");
+
+function sanitizeError(msg) {
+  return String(msg || "Internal error").replace(/\/[\w/.\-]+/g, "[path]");
+}
+
+test("sanitizeError: strips home-dir path from message", () => {
+  const result = sanitizeError("failed at /Users/foo/.claude/creds.json");
+  assert.ok(result.includes("[path]"), `expected [path] in: ${result}`);
+  assert.ok(!result.includes("/Users/foo"), `expected /Users/foo stripped, got: ${result}`);
+});
+
+test("sanitizeError: null input returns 'Internal error'", () => {
+  assert.equal(sanitizeError(null), "Internal error");
+});
+
+test("sanitizeError: message with no path passes through unchanged", () => {
+  assert.equal(sanitizeError("no path here"), "no path here");
+});
+
+test("sanitizeError: multiple paths all stripped", () => {
+  const result = sanitizeError("err /a/b and /c/d");
+  assert.ok(!result.includes("/a/b"), `expected /a/b stripped, got: ${result}`);
+  assert.ok(!result.includes("/c/d"), `expected /c/d stripped, got: ${result}`);
+  assert.ok(result.includes("[path]"), `expected [path] in: ${result}`);
+});
+
 // ── Cleanup ──
 closeDb();
 
