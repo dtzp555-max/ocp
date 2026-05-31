@@ -50,6 +50,10 @@ OCP and the alternatives serve adjacent but distinct needs. Pick the one that fi
 
 **Plain English**: `claude-code-router` is the routing-and-switching power tool — pick it if you want to mix Anthropic, OpenAI, Gemini, and local models behind one endpoint. `anthropic-proxy` is the minimal forwarder. **OCP focuses on disciplined `cli.js`-aligned forwarding plus subscription multiplexing** — pick it if you want to share one Claude Pro/Max subscription across IDEs, devices, and people, with LAN auth, quotas, and a governance contract that prevents endpoint drift.
 
+### Related: OLP — Open LLM Proxy
+
+OCP is Claude-only by design. If you want to spread across **multiple LLM providers** (not just Claude), see the sibling project **[OLP — Open LLM Proxy](https://github.com/dtzp555-max/olp)**: the same spawn-the-provider-CLI approach, but across several provider CLIs behind one OpenAI-compatible endpoint, with intelligent fallback chains. It grew out of OCP in response to Anthropic's 2026-06-15 billing split — the idea being to spread subscription/quota risk across more than one provider. OCP remains the focused, Claude-only option; OLP is the multi-provider one.
+
 OCP is single-maintainer + LLM-assisted, currently pre-1.0. It runs the maintainer's daily Claude Code workflow. If something breaks, [open an issue](https://github.com/dtzp555-max/ocp/issues).
 
 ## Supported Tools
@@ -405,9 +409,21 @@ ocp keys revoke son-ipad   # Revoke a key
 |------|-----|----------|
 | `none` | `CLAUDE_AUTH_MODE=none` | Trusted home network, no auth needed |
 | `shared` | `CLAUDE_AUTH_MODE=shared` + `PROXY_API_KEY=xxx` | Everyone shares one key |
-| `multi` | `CLAUDE_AUTH_MODE=multi` + `OCP_ADMIN_KEY=xxx` | Per-person keys with usage tracking (recommended) |
+| `multi` | `CLAUDE_AUTH_MODE=multi` + `OCP_ADMIN_KEY=xxx` | Per-person keys for usage tracking + quotas (trusted users only — see Deployment model below) |
 
 > **Usage scope (v3.14.0+):** `/api/usage` returns the caller's own rows by default. Admin callers must pass `?all=true` to retrieve data for all keys; doing so emits an audit log line.
+
+### Deployment model & security (read this)
+
+**What OCP is built for today: single-user, multi-IDE.** Run OCP as a server on one machine and point all of *your own* IDEs/devices at it — one Claude Pro/Max subscription, used everywhere. This is the primary, solid use case.
+
+**Sharing with family / a team — honest limits.** You *can* share OCP on a LAN, but be clear about what the auth modes do and don't give you:
+
+- The per-key modes (`shared` / `multi`) give per-key **usage tracking, quotas, and cache separation** — useful for seeing who used what and capping budgets.
+- They do **not** give a **security isolation boundary**. The spawned `claude` runs with the **operator's filesystem access** and is *not* sandboxed per key. **Only share with people you fully trust, on a trusted network.**
+- For simple trusted family sharing, the easiest setup is a single shared **anonymous key** (see [Anonymous Access](#anonymous-access-optional)) — no per-person separation, same trust assumption.
+
+**Real per-user isolation (sandboxed, multi-tenant-safe) is planned for after 2026-06-15** — per-key ephemeral home + tool lockdown + an OS sandbox. Until then, treat a multi-user OCP as a *trusted-group convenience*, not a security boundary. (This is also why `CLAUDE_TUI_MODE` is single-user-only — see [Subscription-pool (TUI) mode](#subscription-pool-tui-mode).)
 
 ### Anonymous Access (optional)
 
