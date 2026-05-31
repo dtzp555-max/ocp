@@ -148,8 +148,8 @@ async function refreshStatus() {
   const r = data.requests || {};
 
   document.getElementById("status-cards").innerHTML = `
-    <div class="card"><div class="label">Status</div><div class="value"><span class="tag ${p.status === 'ok' ? 'tag-ok' : 'tag-err'}">${p.status || '?'}</span></div><div class="sub">v${p.version || '?'}</div></div>
-    <div class="card"><div class="label">Uptime</div><div class="value">${p.uptime || '?'}</div></div>
+    <div class="card"><div class="label">Status</div><div class="value"><span class="tag ${p.status === 'ok' ? 'tag-ok' : 'tag-err'}">${escapeHtml(p.status || '?')}</span></div><div class="sub">v${escapeHtml(p.version || '?')}</div></div>
+    <div class="card"><div class="label">Uptime</div><div class="value">${escapeHtml(p.uptime || '?')}</div></div>
     <div class="card"><div class="label">Requests</div><div class="value">${r.total || 0}</div><div class="sub">${r.active || 0} active</div></div>
     <div class="card"><div class="label">Errors</div><div class="value">${r.errors || 0}</div><div class="sub">${r.timeouts || 0} timeouts</div></div>
     <div class="card"><div class="label">Sessions</div><div class="value">${p.activeSessions || 0}</div></div>
@@ -164,15 +164,15 @@ async function refreshStatus() {
     document.getElementById("plan-cards").innerHTML = `
       <div class="card">
         <div class="label">Session (5h)</div>
-        <div class="value">${s.percent || '?'}</div>
+        <div class="value">${escapeHtml(s.percent || '?')}</div>
         <div class="bar-bg"><div class="bar-fill ${barColor(sPct)}" style="width:${sPct}%"></div></div>
-        <div class="sub">Resets in ${s.resetsIn || '?'}</div>
+        <div class="sub">Resets in ${escapeHtml(s.resetsIn || '?')}</div>
       </div>
       <div class="card">
         <div class="label">Weekly (7d)</div>
-        <div class="value">${w.percent || '?'}</div>
+        <div class="value">${escapeHtml(w.percent || '?')}</div>
         <div class="bar-bg"><div class="bar-fill ${barColor(wPct)}" style="width:${wPct}%"></div></div>
-        <div class="sub">Resets in ${w.resetsIn || '?'}</div>
+        <div class="sub">Resets in ${escapeHtml(w.resetsIn || '?')}</div>
       </div>
     `;
   }
