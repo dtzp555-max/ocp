@@ -1,15 +1,38 @@
 # Changelog
 
-## Unreleased
+## v3.18.0 — 2026-06-01
 
-### Fix
-
-- **#113** — CLI/installer hardening: ocp-plugin restart uses the live uid + `dev.ocp.proxy`/`ocp-proxy` labels and drops the unsafe pkill fallback; ocp-connect quotes + chmod 600 the persisted key; setup.mjs XML-escapes and newline-validates injected service-unit secrets.
-- **#112** — Recorded OAuth-host verification against compiled cli.js v2.1.154 (ALIGNMENT Class A); usage-probe and default request model now derive from `models.json` (ADR 0003 SPOT) instead of hardcoded IDs.
+Hardening release from a multi-agent code audit (1 P0 + 14 P2 + 2 P3 findings, each adversarially verified and independently reviewed) plus three follow-ups (#123–#125). Every change shipped as its own PR with a fresh-context reviewer (Iron Rule 10). The single-user default path (`AUTH_MODE=none`, no TUI) is behavior-identical **except** the `/health` change in #109.
 
 ### Security
 
-- **#109 P0** — `/health` no longer advertises `PROXY_ANONYMOUS_KEY` to remote callers by default. The `anonymousKey` field is now gated behind a new `PROXY_ADVERTISE_ANON_KEY=1` opt-in env var; localhost callers are always exempt. This prevents any LAN-reachable device from harvesting a working bearer credential from the unauthenticated `/health` endpoint.
+- **#109 (P0)** — `/health` no longer advertises `PROXY_ANONYMOUS_KEY` to remote callers by default. The `anonymousKey` field is gated behind a new `PROXY_ADVERTISE_ANON_KEY=1` opt-in env var; localhost callers are always exempt. Prevents any LAN-reachable device from harvesting a working, quota-spending bearer credential from the unauthenticated `/health` endpoint. **Behavior change:** `ocp-connect` zero-config Path A now requires the server to set `PROXY_ADVERTISE_ANON_KEY=1`; otherwise pass `--key` or use anonymous access.
+- **#114** — Dashboard escapes all DB-sourced strings (key names, usage rows) before `innerHTML`; the revoke button uses a `data-` attribute + listener instead of an inline `onclick` a quote could break out of; `POST /api/keys` validates key names server-side (`[A-Za-z0-9 ._-]{1,64}`).
+- **#124** — Dashboard status/plan summary cards escaped too (uniform defense-in-depth over all `innerHTML` sinks).
+- **#111** — Streaming error paths strip filesystem paths from claude error text / stderr before sending them to clients (`sanitizeError`), matching the non-streaming path.
+
+### Reliability / correctness
+
+- **#110** — Non-array `messages` is rejected with a 400 (was silently hanging the connection until socket timeout); OpenAI array `content` is flattened into the prompt instead of dumped as raw JSON; a streamed upstream error now emits an SSE `error` frame instead of a success-looking `finish_reason:"stop"`.
+- **#111** — `res.on("close")` escalates SIGTERM→SIGKILL on client disconnect (closes a narrow re-occurrence of the #37 concurrency-slot leak on the hottest exit path); `overallTimer` is cleared on semantic completion so a slow-exiting child can't record a spurious post-success timeout; per-key quota is documented as best-effort (bounded overshoot ≤ `MAX_CONCURRENT`, cache hits uncounted).
+- **#113** — CLI/installer hardening: `ocp-plugin` restart uses the live uid + `dev.ocp.proxy`/`ocp-proxy` labels and drops the unsafe `pkill` fallback; `ocp-connect` quotes + `chmod 600`s the persisted key; `setup.mjs` XML-escapes and newline-validates injected service-unit secrets.
+
+### Alignment / governance
+
+- **#112** — OAuth token-refresh host (`platform.claude.com/v1/oauth/token`) re-verified against the compiled cli.js v2.1.154 (`strings`, no live probe) and recorded in `ALIGNMENT.md`; usage-probe and default request model now derive from `models.json` (ADR 0003 SPOT) instead of hardcoded IDs.
+- **#123** — The legacy `console.anthropic.com/v1/oauth/token` host is pinned in the `alignment.yml` blacklist so a future OAuth-host drift hard-fails CI; the blacklist now documents its dual purpose (known hallucinations + pinned wrong-host variants of a verified Class A endpoint).
+
+### TUI
+
+- **#115** — The TUI LAN gate refuses any non-loopback bind (not just literal `0.0.0.0`); the achieved `cc_entrypoint` is asserted each turn and a `tui_entrypoint_mismatch` warning is logged on a silent degrade to the metered sdk-cli pool.
+
+### Refactor
+
+- **#125** — `isLoopbackBind` extracted to `lib/net.mjs`, shared by `server.mjs` and the test suite (was duplicated via a copy-paste mirror).
+
+### New environment variables
+
+- `PROXY_ADVERTISE_ANON_KEY` — opt-in (default off); advertise `PROXY_ANONYMOUS_KEY` on the public `/health` body for remote zero-config discovery (#109).
 
 ## v3.17.1 — 2026-05-31
 
