@@ -843,7 +843,7 @@ function callClaude(model, messages, conversationId, keyName) {
           resultEventSeen = true;
         } else if (parsed.error) {
           // is_error result — treat as process error
-          reject(new Error(parsed.error));
+          reject(new Error(String(parsed.error)));
         }
       }
     });
@@ -1033,10 +1033,11 @@ function callClaudeStreaming(model, messages, conversationId, res, authInfo = {}
         // is_error result — emit error stop; do NOT set resultEventSeen (that would
         // cause the close handler to record success + write cache). Set errored instead.
         errored = true;
-        logEvent("error", "claude_result_error", { model: cliModel, error: parsed.error.slice(0, 200) });
-        trackError(parsed.error.slice(0, 200));
+        const errStr = String(parsed.error);
+        logEvent("error", "claude_result_error", { model: cliModel, error: errStr.slice(0, 200) });
+        trackError(errStr.slice(0, 200));
         if (!headersSent && !res.writableEnded && !res.destroyed) {
-          jsonResponse(res, 500, { error: { message: parsed.error, type: "provider_error" } });
+          jsonResponse(res, 500, { error: { message: errStr, type: "provider_error" } });
         } else if (!res.writableEnded && !res.destroyed) {
           sendSSE(res, {
             id, object: "chat.completion.chunk", created, model,
