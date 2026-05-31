@@ -4,6 +4,7 @@
  * Tests database layer functions directly — no server needed.
  */
 import { getDb, createKey, listKeys, validateKey, recordUsage, checkQuota, updateKeyQuota, getKeyQuota, findKey, cacheHash, getCachedResponse, setCachedResponse, clearCache, getCacheStats, closeDb, hasCacheControl, singleflight, getInflightStats } from "./keys.mjs";
+import { isLoopbackBind } from "./lib/net.mjs";
 import { createHash } from "node:crypto";
 import { strict as assert } from "node:assert";
 import { unlinkSync } from "node:fs";
@@ -1798,16 +1799,9 @@ test("KEY_NAME_RE: 65-char string → invalid", () => {
   assert.ok(!KEY_NAME_RE.test("x".repeat(65)));
 });
 
-// ── isLoopbackBind helper (issue #115) ──────────────────────────────────────
-// MIRRORS server.mjs isLoopbackBind — copied verbatim to avoid importing server.mjs
-// (top-level server.listen() would start a live HTTP server).
-// Keep in sync with the definition in server.mjs above the TUI gate block.
+// ── isLoopbackBind helper (issue #115, extracted to lib/net.mjs via #125) ──────
+// Tests the imported lib/net.mjs helper — the real shared definition used by server.mjs.
 console.log("\nisLoopbackBind helper (issue #115):");
-
-function isLoopbackBind(addr) {
-  return addr === "127.0.0.1" || addr === "::1" || addr === "localhost" ||
-         addr === "::ffff:127.0.0.1" || /^127\./.test(addr);
-}
 
 test("isLoopbackBind: '127.0.0.1' → true", () => {
   assert.equal(isLoopbackBind("127.0.0.1"), true);
