@@ -1438,10 +1438,11 @@ await asyncTest("readTuiTranscript returns assistant text when terminal marker p
   const p = `${dir}/s.jsonl`;
   tuiWriteFile(p, [
     JSON.stringify({ type: "assistant", message: { content: [{ type: "text", text: "hello world" }] } }),
-    JSON.stringify({ type: "system", subtype: "turn_duration", durationMs: 1200 }),
+    JSON.stringify({ type: "system", subtype: "turn_duration", durationMs: 1200, entrypoint: "cli" }),
   ].join("\n") + "\n");
   const out = await readTuiTranscript({ transcriptPath: p, wallclockMs: 2000, pollMs: 50 });
-  assert.equal(out, "hello world");
+  assert.equal(out.text, "hello world");
+  assert.equal(out.entrypoint, "cli");
 });
 
 await asyncTest("readTuiTranscript honours wall-clock cap and returns partial text", async () => {
@@ -1449,7 +1450,12 @@ await asyncTest("readTuiTranscript honours wall-clock cap and returns partial te
   const p = `${dir}/s.jsonl`;
   tuiWriteFile(p, JSON.stringify({ type: "assistant", message: { content: [{ type: "text", text: "partial" }] } }) + "\n");
   const out = await readTuiTranscript({ transcriptPath: p, wallclockMs: 300, pollMs: 50 });
-  assert.equal(out, "partial");
+  assert.equal(out.text, "partial");
+});
+
+await asyncTest("readTuiTranscript against real fixture: entrypoint is 'cli'", async () => {
+  const out = await readTuiTranscript({ transcriptPath: "./lib/tui/fixtures/complete-haiku.jsonl", wallclockMs: 2000, pollMs: 50 });
+  assert.equal(out.entrypoint, "cli");
 });
 
 await asyncTest("readTuiTranscript throws when no text and cap elapses", async () => {
@@ -1600,7 +1606,7 @@ if (process.env.OCP_TUI_LIVE === "1") {
       cwd: `${process.env.HOME}/.ocp-tui/work`,
       wallclockMs: 120000,
     });
-    assert.ok(/PONG/i.test(out), `expected PONG, got: ${out.slice(0, 200)}`);
+    assert.ok(/PONG/i.test(out.text), `expected PONG, got: ${out.text.slice(0, 200)}`);
   });
 } else {
   test("runTuiTurn (live) — SKIPPED (set OCP_TUI_LIVE=1 on PI231 to run)", () => {
@@ -1790,6 +1796,42 @@ test("KEY_NAME_RE: empty string → invalid", () => {
 
 test("KEY_NAME_RE: 65-char string → invalid", () => {
   assert.ok(!KEY_NAME_RE.test("x".repeat(65)));
+});
+
+// ── isLoopbackBind helper (issue #115) ──────────────────────────────────────
+// MIRRORS server.mjs isLoopbackBind — copied verbatim to avoid importing server.mjs
+// (top-level server.listen() would start a live HTTP server).
+// Keep in sync with the definition in server.mjs above the TUI gate block.
+console.log("\nisLoopbackBind helper (issue #115):");
+
+function isLoopbackBind(addr) {
+  return addr === "127.0.0.1" || addr === "::1" || addr === "localhost" ||
+         addr === "::ffff:127.0.0.1" || /^127\./.test(addr);
+}
+
+test("isLoopbackBind: '127.0.0.1' → true", () => {
+  assert.equal(isLoopbackBind("127.0.0.1"), true);
+});
+test("isLoopbackBind: '::1' → true", () => {
+  assert.equal(isLoopbackBind("::1"), true);
+});
+test("isLoopbackBind: 'localhost' → true", () => {
+  assert.equal(isLoopbackBind("localhost"), true);
+});
+test("isLoopbackBind: '127.0.0.5' → true (127.x.x.x range)", () => {
+  assert.equal(isLoopbackBind("127.0.0.5"), true);
+});
+test("isLoopbackBind: '0.0.0.0' → false (any-interface)", () => {
+  assert.equal(isLoopbackBind("0.0.0.0"), false);
+});
+test("isLoopbackBind: '192.168.1.5' → false (LAN IP)", () => {
+  assert.equal(isLoopbackBind("192.168.1.5"), false);
+});
+test("isLoopbackBind: '::' → false (IPv6 any-interface)", () => {
+  assert.equal(isLoopbackBind("::"), false);
+});
+test("isLoopbackBind: '100.64.0.1' → false (Tailscale IP)", () => {
+  assert.equal(isLoopbackBind("100.64.0.1"), false);
 });
 
 // ── Cleanup ──
