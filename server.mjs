@@ -299,12 +299,20 @@ const TUI_CWD  = process.env.OCP_TUI_CWD  || `${process.env.HOME}/.ocp-tui/work`
 const TUI_HOME = process.env.OCP_TUI_HOME  || process.env.HOME;
 const TUI_ENTRYPOINT = process.env.OCP_TUI_ENTRYPOINT || "cli"; // cli|auto|off — see ADR 0007
 
+// A bind address is "loopback" only if it cannot be reached from another host.
+// Any other address (0.0.0.0, ::, a concrete LAN/Tailscale IP, etc.) is
+// network-exposed and must trigger the TUI LAN gate. (issue #115)
+function isLoopbackBind(addr) {
+  return addr === "127.0.0.1" || addr === "::1" || addr === "localhost" ||
+         addr === "::ffff:127.0.0.1" || /^127\./.test(addr);
+}
+
 // SECURITY fail-loud: TUI-mode is incompatible with any configuration that allows
 // non-operator prompts to reach the interactive claude session. Three cases:
 //   1. AUTH_MODE=multi — guest/anonymous keys can submit prompts.
-//   2. BIND_ADDRESS=0.0.0.0 — server is LAN-exposed; any LAN peer can send prompts
-//      unless per-request trust is in place. Override with OCP_TUI_ALLOW_LAN=1
-//      ONLY if you have a separate network-layer trust (firewall, VPN).
+//   2. a non-loopback BIND_ADDRESS — server is network-exposed; any reachable peer
+//      can send prompts unless per-request trust is in place. Override with
+//      OCP_TUI_ALLOW_LAN=1 ONLY if you have a separate network-layer trust (firewall, VPN).
 //   3. PROXY_ANONYMOUS_KEY set — anonymous callers can submit prompts without a key.
 // In all three cases TUI runs interactive claude with the OPERATOR's full filesystem
 // access — home is NOT isolation. Refuse to boot. See ADR 0007.
@@ -317,11 +325,11 @@ if (TUI_MODE && AUTH_MODE === "multi") {
   );
   process.exit(1);
 }
-if (TUI_MODE && BIND_ADDRESS === "0.0.0.0" && process.env.OCP_TUI_ALLOW_LAN !== "1") {
+if (TUI_MODE && !isLoopbackBind(BIND_ADDRESS) && process.env.OCP_TUI_ALLOW_LAN !== "1") {
   console.error(
-    "FATAL: CLAUDE_TUI_MODE=true with CLAUDE_BIND=0.0.0.0 is unsafe.\n" +
-    "  TUI runs interactive claude with operator filesystem access; LAN-exposed without\n" +
-    "  per-request isolation means any LAN peer could drive the operator's claude session.\n" +
+    `FATAL: CLAUDE_TUI_MODE=true with a non-loopback CLAUDE_BIND (${BIND_ADDRESS}) is unsafe.\n` +
+    "  TUI runs interactive claude with operator filesystem access; network-exposed without\n" +
+    "  per-request isolation means any reachable peer could drive the operator's claude session.\n" +
     "  Either bind to 127.0.0.1 (default) or set OCP_TUI_ALLOW_LAN=1 if you have a\n" +
     "  separate network-layer trust (firewall/VPN). See docs/adr/0007-tui-interactive-mode.md."
   );
@@ -925,8 +933,14 @@ function callClaudeTui(model, messages, _conversationId, _keyName) {
     cwd: TUI_CWD,
     wallclockMs: TUI_WALLCLOCK_MS,
     entrypointMode: TUI_ENTRYPOINT,
-  }).then((text) => {
+  }).then(({ text, entrypoint }) => {
     recordModelSuccess(cliModel, 0); // elapsed not measurable here; wallclock at reader level
+    // Assert the subscription-pool classification. TUI exists to keep cc_entrypoint=cli
+    // (subscription pool); a silent degrade to sdk-cli (metered Agent SDK pool) would still
+    // return text but cost money — warn loudly so it's visible. (issue #115)
+    if (TUI_ENTRYPOINT === "cli" && entrypoint !== "cli") {
+      logEvent("warn", "tui_entrypoint_mismatch", { expected: "cli", got: entrypoint, model: cliModel });
+    }
     return text;
   }).catch((err) => {
     recordModelError(cliModel, false);
