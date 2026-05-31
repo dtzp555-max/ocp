@@ -293,16 +293,40 @@ const TUI_CWD  = process.env.OCP_TUI_CWD  || `${process.env.HOME}/.ocp-tui/work`
 const TUI_HOME = process.env.OCP_TUI_HOME  || process.env.HOME;
 const TUI_ENTRYPOINT = process.env.OCP_TUI_ENTRYPOINT || "cli"; // cli|auto|off — see ADR 0007
 
-// SECURITY fail-loud: TUI-mode is incompatible with multi-user auth. Under TUI a
-// guest/anonymous prompt would run interactive claude with the OPERATOR's full
-// filesystem access (home is NOT isolation). Refuse to boot until B-path isolation
-// (tools-off + per-key ephemeral home + sandbox) lands. See ADR 0007.
+// SECURITY fail-loud: TUI-mode is incompatible with any configuration that allows
+// non-operator prompts to reach the interactive claude session. Three cases:
+//   1. AUTH_MODE=multi — guest/anonymous keys can submit prompts.
+//   2. BIND_ADDRESS=0.0.0.0 — server is LAN-exposed; any LAN peer can send prompts
+//      unless per-request trust is in place. Override with OCP_TUI_ALLOW_LAN=1
+//      ONLY if you have a separate network-layer trust (firewall, VPN).
+//   3. PROXY_ANONYMOUS_KEY set — anonymous callers can submit prompts without a key.
+// In all three cases TUI runs interactive claude with the OPERATOR's full filesystem
+// access — home is NOT isolation. Refuse to boot. See ADR 0007.
 if (TUI_MODE && AUTH_MODE === "multi") {
   console.error(
     "FATAL: CLAUDE_TUI_MODE=true is incompatible with CLAUDE_AUTH_MODE=multi.\n" +
     "  TUI runs interactive claude with the operator's filesystem access, so a guest/anonymous\n" +
     "  prompt could read operator data. TUI-mode is single-user only until B-path isolation lands.\n" +
     "  See docs/adr/0007-tui-interactive-mode.md. Refusing to start."
+  );
+  process.exit(1);
+}
+if (TUI_MODE && BIND_ADDRESS === "0.0.0.0" && process.env.OCP_TUI_ALLOW_LAN !== "1") {
+  console.error(
+    "FATAL: CLAUDE_TUI_MODE=true with CLAUDE_BIND=0.0.0.0 is unsafe.\n" +
+    "  TUI runs interactive claude with operator filesystem access; LAN-exposed without\n" +
+    "  per-request isolation means any LAN peer could drive the operator's claude session.\n" +
+    "  Either bind to 127.0.0.1 (default) or set OCP_TUI_ALLOW_LAN=1 if you have a\n" +
+    "  separate network-layer trust (firewall/VPN). See docs/adr/0007-tui-interactive-mode.md."
+  );
+  process.exit(1);
+}
+if (TUI_MODE && PROXY_ANONYMOUS_KEY) {
+  console.error(
+    "FATAL: CLAUDE_TUI_MODE=true with PROXY_ANONYMOUS_KEY set is unsafe.\n" +
+    "  TUI runs interactive claude with operator filesystem access; anonymous callers\n" +
+    "  could drive the operator's claude session without a named key.\n" +
+    "  Remove PROXY_ANONYMOUS_KEY or disable TUI-mode. See docs/adr/0007-tui-interactive-mode.md."
   );
   process.exit(1);
 }
@@ -566,7 +590,27 @@ function buildCliArgs(cliModel, systemPrompt) {
   ];
 
   // Permissions
-  if (SKIP_PERMISSIONS) {
+  // ADR 0007 B-path: in multi-tenant mode, suppress operator-FS tools so a guest
+  // prompt cannot drive Bash/Read/Write/Edit/etc. on the operator's filesystem.
+  // For AUTH_MODE !== "multi" (none/shared — single-operator/trusted), preserve
+  // existing behaviour unchanged.
+  if (AUTH_MODE === "multi") {
+    // Disallow the full operator-FS + web + agent surface. "--disallowedTools" may
+    // be repeated; claude accepts multiple occurrences (TUI path already uses it).
+    args.push(
+      "--disallowedTools", "Bash",
+      "--disallowedTools", "Read",
+      "--disallowedTools", "Write",
+      "--disallowedTools", "Edit",
+      "--disallowedTools", "Glob",
+      "--disallowedTools", "Grep",
+      "--disallowedTools", "WebFetch",
+      "--disallowedTools", "WebSearch",
+      "--disallowedTools", "Agent",
+      "--disallowedTools", "mcp__*",
+    );
+    // Do NOT push --allowedTools in multi mode.
+  } else if (SKIP_PERMISSIONS) {
     args.push("--dangerously-skip-permissions");
   } else if (ALLOWED_TOOLS.length > 0) {
     args.push("--allowedTools", ...ALLOWED_TOOLS);
@@ -729,6 +773,11 @@ function spawnClaudeProcess(model, messages, conversationId, keyName) {
       console.log(`[claude] first-byte model=${cliModel} elapsed=${Date.now() - t0}ms`);
     }
   }
+
+  // Guard stdin writes against EPIPE (child may close stdin before we finish
+  // writing, e.g. early exit on bad model). The ChildProcess "error" event is on
+  // the spawned process, NOT on the stdin Writable — it does not catch this.
+  proc.stdin.on("error", (e) => logEvent("warn", "stdin_write_error", { error: e.message }));
 
   // Write prompt to stdin immediately
   proc.stdin.write(prompt);
@@ -916,6 +965,10 @@ function callClaudeStreaming(model, messages, conversationId, res, authInfo = {}
   let lineBuffer = "";
   let isFirstDelta = true;
   let resultEventSeen = false;
+  // Separate flag for is_error result — must NOT be conflated with resultEventSeen.
+  // If errored===true the close handler must not cache the response or record success
+  // (mirrors callClaude which rejects and never caches on is_error).
+  let errored = false;
 
   function ensureHeaders() {
     if (res.writableEnded || res.destroyed) return false;
@@ -977,8 +1030,9 @@ function callClaudeStreaming(model, messages, conversationId, res, authInfo = {}
         }
 
       } else if (parsed.error) {
-        // is_error result — emit error stop
-        resultEventSeen = true;
+        // is_error result — emit error stop; do NOT set resultEventSeen (that would
+        // cause the close handler to record success + write cache). Set errored instead.
+        errored = true;
         logEvent("error", "claude_result_error", { model: cliModel, error: parsed.error.slice(0, 200) });
         trackError(parsed.error.slice(0, 200));
         if (!headersSent && !res.writableEnded && !res.destroyed) {
@@ -1005,13 +1059,17 @@ function callClaudeStreaming(model, messages, conversationId, res, authInfo = {}
 
     // Tolerate null exit code when result event was seen (sandbox-wrap noise, same
     // as OLP commit 2864275 — bwrap shell exits null after model completes).
-    if (code !== 0 && !resultEventSeen) {
+    // Also route to the error path when errored===true (is_error result received):
+    // never record success or write cache for an errored response.
+    if ((code !== 0 && !resultEventSeen) || errored) {
       recordModelError(cliModel, false);
       try { recordUsage({ keyId: authInfo.keyId, keyName: authInfo.keyName, model, promptChars: messages.reduce((a, m) => a + (typeof m.content === "string" ? m.content.length : JSON.stringify(m.content).length), 0), responseChars: 0, elapsedMs: elapsed, success: false }); } catch (e) { logEvent("error", "usage_record_failed", { error: e.message }); }
-      logEvent("error", "claude_exit", { model: cliModel, code, signal: signal || "none", elapsed, stderr: stderr.slice(0, 300) });
+      logEvent("error", "claude_exit", { model: cliModel, code, signal: signal || "none", elapsed, errored, stderr: stderr.slice(0, 300) });
       trackError(stderr.slice(0, 300) || `claude exit ${code}`);
       handleSessionFailure();
 
+      // If the error was already sent inline (parsed.error branch above), the
+      // response may be writableEnded — nothing more to send.
       if (!headersSent && !res.writableEnded && !res.destroyed) {
         jsonResponse(res, 500, { error: { message: stderr.slice(0, 300) || `claude exit ${code}`, type: "proxy_error" } });
       } else if (!res.writableEnded && !res.destroyed) {
@@ -1027,7 +1085,7 @@ function callClaudeStreaming(model, messages, conversationId, res, authInfo = {}
       breakerRecordSuccess(cliModel);
       try { recordUsage({ keyId: authInfo.keyId, keyName: authInfo.keyName, model, promptChars: messages.reduce((a, m) => a + (typeof m.content === "string" ? m.content.length : JSON.stringify(m.content).length), 0), responseChars: totalChars, elapsedMs: elapsed, success: true }); } catch (e) { logEvent("error", "usage_record_failed", { error: e.message }); }
       logEvent("info", "claude_ok", { model: cliModel, chars: totalChars, elapsed, session: convId ? convId.slice(0, 12) + "..." : "none" });
-      // Cache write-back for streaming
+      // Cache write-back for streaming — only on true success (not errored)
       if (CACHE_TTL > 0 && authInfo.cacheHash) {
         try { setCachedResponse(authInfo.cacheHash, model, cachedContent); } catch (e) { logEvent("error", "cache_write_failed", { error: e.message }); }
       }
@@ -1507,9 +1565,16 @@ async function handleSettings(req, res) {
 
   // PATCH
   let body = "";
-  for await (const chunk of req) {
-    body += chunk;
-    if (body.length > 10000) return jsonResponse(res, 413, { error: "Body too large" });
+  try {
+    for await (const chunk of req) {
+      body += chunk;
+      if (body.length > 10000) return jsonResponse(res, 413, { error: "Body too large" });
+    }
+  } catch (e) {
+    if (!res.headersSent && !res.writableEnded) {
+      try { return jsonResponse(res, 400, { error: { message: "request aborted", type: "invalid_request_error" } }); } catch {}
+    }
+    return;
   }
   let updates;
   try { updates = JSON.parse(body); } catch { return jsonResponse(res, 400, { error: "Invalid JSON" }); }
@@ -1546,11 +1611,18 @@ const VALID_MODELS = new Set(Object.keys(MODEL_MAP));
 
 async function handleChatCompletions(req, res) {
   let body = "";
-  for await (const chunk of req) {
-    body += chunk;
-    if (body.length > MAX_BODY_SIZE) {
-      return jsonResponse(res, 413, { error: { message: "Request body too large (max 5MB)", type: "invalid_request_error" } });
+  try {
+    for await (const chunk of req) {
+      body += chunk;
+      if (body.length > MAX_BODY_SIZE) {
+        return jsonResponse(res, 413, { error: { message: "Request body too large (max 5MB)", type: "invalid_request_error" } });
+      }
     }
+  } catch (e) {
+    if (!res.headersSent && !res.writableEnded) {
+      try { return jsonResponse(res, 400, { error: { message: "request aborted", type: "invalid_request_error" } }); } catch {}
+    }
+    return;
   }
 
   let parsed;
@@ -1796,6 +1868,12 @@ const server = createServer(async (req, res) => {
   req._authKeyName = authKeyName;
   req._authKeyId = authKeyId;
 
+  // isAdmin computed here (early, before any admin-gated handler) so that
+  // DELETE /sessions, GET /logs, GET /usage, GET /status, PATCH /settings
+  // can all gate on it.  Localhost and explicit admin key are always admin;
+  // in multi-tenant mode only the "admin" named key qualifies.
+  const isAdmin = AUTH_MODE !== "multi" || authKeyName === "admin" || isLocalhost;
+
   // GET /v1/models
   if (req.url === "/v1/models" && req.method === "GET") {
     return jsonResponse(res, 200, {
@@ -1857,15 +1935,17 @@ const server = createServer(async (req, res) => {
     });
   }
 
-  // DELETE /sessions — clear all sessions
+  // DELETE /sessions — clear all sessions (mutating; admin only)
   if (req.url === "/sessions" && req.method === "DELETE") {
+    if (!isAdmin) return jsonResponse(res, 403, { error: { message: "admin only", type: "auth_error" } });
     const count = sessions.size;
     sessions.clear();
     return jsonResponse(res, 200, { cleared: count });
   }
 
-  // GET /sessions — list active sessions
+  // GET /sessions — list active sessions (operator data; admin only)
   if (req.url === "/sessions" && req.method === "GET") {
+    if (!isAdmin) return jsonResponse(res, 403, { error: { message: "admin only", type: "auth_error" } });
     const list = [];
     for (const [id, s] of sessions) {
       // id is "${keyName}|${conversationId}"; expose only the public-facing conversationId
@@ -1875,34 +1955,45 @@ const server = createServer(async (req, res) => {
     return jsonResponse(res, 200, { sessions: list });
   }
 
-  // GET /usage — fetch plan usage limits from Anthropic API
+  // GET /usage — fetches plan usage from Anthropic API with operator token; admin only
   if (req.url === "/usage" && req.method === "GET") {
+    if (!isAdmin) return jsonResponse(res, 403, { error: { message: "admin only", type: "auth_error" } });
     return handleUsage(req, res);
   }
 
-  // GET /logs — recent proxy log entries (errors and key events)
+  // GET /logs — recent proxy log entries (errors and key events); admin only
   if (req.url?.startsWith("/logs") && req.method === "GET") {
+    if (!isAdmin) return jsonResponse(res, 403, { error: { message: "admin only", type: "auth_error" } });
     return handleLogs(req, res);
   }
 
-  // GET /status — combined usage + health summary
+  // GET /status — combined usage + health summary; uses operator token; admin only
   if (req.url === "/status" && req.method === "GET") {
+    if (!isAdmin) return jsonResponse(res, 403, { error: { message: "admin only", type: "auth_error" } });
     return handleStatus(req, res);
   }
 
-  // GET /settings — view current tunable settings
-  // PATCH /settings — update settings at runtime (JSON body)
+  // GET /settings — view current tunable settings (admin only)
+  // PATCH /settings — update settings at runtime (JSON body; admin only, mutating)
   if (req.url === "/settings" && (req.method === "GET" || req.method === "PATCH")) {
+    if (!isAdmin) return jsonResponse(res, 403, { error: { message: "admin only", type: "auth_error" } });
     return handleSettings(req, res);
   }
 
   // ── Key management API ──
-  const isAdmin = AUTH_MODE !== "multi" || authKeyName === "admin" || isLocalhost;
+  // (isAdmin is computed early in the request handler, before the admin-gated routes)
 
   if (req.url === "/api/keys" && req.method === "POST") {
     if (!isAdmin) return jsonResponse(res, 403, { error: "Admin access required" });
     let body = "";
-    for await (const chunk of req) body += chunk;
+    try {
+      for await (const chunk of req) { body += chunk; if (body.length > 10000) return jsonResponse(res, 413, { error: "Body too large" }); }
+    } catch (e) {
+      if (!res.headersSent && !res.writableEnded) {
+        try { return jsonResponse(res, 400, { error: { message: "request aborted", type: "invalid_request_error" } }); } catch {}
+      }
+      return;
+    }
     let parsed;
     try { parsed = JSON.parse(body); } catch { return jsonResponse(res, 400, { error: "Invalid JSON" }); }
     const name = parsed.name || `key-${Date.now()}`;
@@ -1928,7 +2019,14 @@ const server = createServer(async (req, res) => {
     if (!isAdmin) return jsonResponse(res, 403, { error: "Admin access required" });
     const idOrName = decodeURIComponent(req.url.split("/api/keys/")[1].replace("/quota", ""));
     let body = "";
-    for await (const chunk of req) { body += chunk; if (body.length > 10000) return jsonResponse(res, 413, { error: "Body too large" }); }
+    try {
+      for await (const chunk of req) { body += chunk; if (body.length > 10000) return jsonResponse(res, 413, { error: "Body too large" }); }
+    } catch (e) {
+      if (!res.headersSent && !res.writableEnded) {
+        try { return jsonResponse(res, 400, { error: { message: "request aborted", type: "invalid_request_error" } }); } catch {}
+      }
+      return;
+    }
     let quotaBody;
     try { quotaBody = JSON.parse(body); } catch { return jsonResponse(res, 400, { error: "Invalid JSON" }); }
     // Validate quota values: must be positive integers or null
@@ -2031,6 +2129,20 @@ const server = createServer(async (req, res) => {
   jsonResponse(res, 404, { error: "Not found. Endpoints: GET /v1/models, POST /v1/chat/completions, GET /health, GET /usage, GET /status, GET /logs, GET|PATCH /settings, GET|DELETE /sessions, GET /dashboard, GET|POST|DELETE /api/keys, GET|PATCH /api/keys/:id/quota, GET /api/usage, GET /cache/stats, DELETE /cache" });
 });
 
+
+// ── Process-level safety nets ────────────────────────────────────────────
+// Prevent unhandled async rejections and synchronous exceptions from crashing
+// the daemon. Each registers once at module level so they are installed before
+// the first request arrives. These are global no-ops on the happy path.
+process.on("unhandledRejection", (e) =>
+  logEvent("error", "unhandled_rejection", { error: e && e.message ? e.message : String(e) })
+);
+process.on("uncaughtException", (e) =>
+  logEvent("error", "uncaught_exception", { error: e && e.message ? e.message : String(e) })
+);
+// Destroy the socket on low-level HTTP parse errors so broken connections
+// don't accumulate as open file descriptors.
+server.on("clientError", (err, socket) => { try { socket.destroy(); } catch {} });
 
 // ── Graceful shutdown ────────────────────────────────────────────────────
 let shuttingDown = false;
