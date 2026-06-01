@@ -961,6 +961,7 @@ Then restart OCP. At boot you will see:
 - **Callers see no API change.** The response is a normal OpenAI completion object or chunked SSE — identical wire format.
 - **No real token streaming.** TUI-mode buffers the full response then replays it as chunked SSE. You will see a delay then the complete response rather than real-time tokens.
 - **Cache and singleflight work normally.** TUI-mode writes the buffered response to the cache on success; cache-hits skip the interactive turn entirely.
+- **The host's `CLAUDE.md` / auto-memory is never injected.** OCP is a proxy — the proxied client (OpenClaw / your IDE) owns its own context and memory. TUI-mode always runs `claude` with `CLAUDE_CODE_DISABLE_CLAUDE_MDS` + `CLAUDE_CODE_DISABLE_AUTO_MEMORY`, so a `CLAUDE.md` on the OCP host can never leak into proxied turns (verified live; see #4). Built-in tool schemas + the interactive system prompt remain (the inherent ~20–35K context floor of interactive mode); MCP is hard-disabled.
 - **Default path unchanged.** Unset `CLAUDE_TUI_MODE` and restart → `callClaude` / `callClaudeStreaming` are used again, byte-for-byte identical to today.
 
 ### Kill-switch
