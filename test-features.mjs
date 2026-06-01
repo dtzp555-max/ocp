@@ -1478,12 +1478,32 @@ await asyncTest("readTuiTranscript throws when no text and cap elapses", async (
 });
 
 // ── TUI session reaper ───────────────────────────────────────────────────
-import { reapStaleTuiSessions, SESSION_PREFIX } from "./lib/tui/session.mjs";
+import { reapStaleTuiSessions, SESSION_PREFIX, buildTuiCmd } from "./lib/tui/session.mjs";
 
 console.log("\nTUI session reaper:");
 
 test("SESSION_PREFIX is ocp-tui-", () => {
   assert.equal(SESSION_PREFIX, "ocp-tui-");
+});
+
+console.log("\nTUI command construction (proxy-purity / #4):");
+
+test("buildTuiCmd suppresses host CLAUDE.md + auto-memory (proxy purity, #4)", () => {
+  const cmd = buildTuiCmd("/usr/bin/claude", "claude-haiku", "sid-1", "/home/u", "cli");
+  // OCP is a proxy: the host's CLAUDE.md / auto-memory must never leak into the proxied turn.
+  assert.ok(/(^| )CLAUDE_CODE_DISABLE_CLAUDE_MDS=1( |$)/.test(cmd), "must disable CLAUDE.md injection");
+  assert.ok(/(^| )CLAUDE_CODE_DISABLE_AUTO_MEMORY=1( |$)/.test(cmd), "must disable auto-memory injection");
+});
+
+test("buildTuiCmd keeps version pin + entrypoint label + MCP wall", () => {
+  const cli = buildTuiCmd("/usr/bin/claude", "m", "sid-2", "/home/u", "cli");
+  assert.ok(cli.includes("DISABLE_AUTOUPDATER=1"), "version pin retained");
+  assert.ok(cli.includes("CLAUDE_CODE_ENTRYPOINT=cli"), "cli mode labels the subscription pool");
+  assert.ok(cli.includes("--strict-mcp-config") && cli.includes('mcp__*'), "MCP wall retained");
+  // 'auto' mode must NOT pin the entrypoint (claude self-classifies via TTY).
+  const auto = buildTuiCmd("/usr/bin/claude", "m", "sid-3", "/home/u", "auto");
+  assert.ok(!/CLAUDE_CODE_ENTRYPOINT=/.test(auto), "auto mode leaves entrypoint unset");
+  assert.ok(/-u CLAUDE_CODE_ENTRYPOINT/.test(auto), "auto mode unsets any inherited entrypoint");
 });
 
 test("reaper kills ONLY ocp-tui- sessions, never olp-tui-", () => {
