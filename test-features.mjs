@@ -1387,6 +1387,15 @@ test("isTerminalLine false on stop_reason tool_use (flat) — claude continues a
 test("isTerminalLine false on ordinary assistant text line", () => {
   assert.equal(isTerminalLine({ type: "assistant", message: { content: [{ type: "text", text: "hi" }] } }), false);
 });
+// issue #130 cloud/server-side: claude builds (e.g. 2.1.114) that DON'T emit
+// turn_duration mark turn-end via assistant message.stop_reason — must be terminal.
+test("isTerminalLine true on assistant stop_reason end_turn (version-robust, e.g. 2.1.114)", () => {
+  assert.equal(isTerminalLine({ type: "assistant", message: { stop_reason: "end_turn", content: [{ type: "text", text: "ok" }] } }), true);
+});
+test("isTerminalLine true on assistant stop_reason stop_sequence / max_tokens", () => {
+  assert.equal(isTerminalLine({ type: "assistant", message: { stop_reason: "stop_sequence" } }), true);
+  assert.equal(isTerminalLine({ type: "assistant", message: { stop_reason: "max_tokens" } }), true);
+});
 test("extractLatestAssistantText concatenates text blocks of LAST assistant entry", () => {
   const evs = [
     { type: "assistant", message: { content: [{ type: "text", text: "first" }] } },
@@ -1614,6 +1623,66 @@ if (process.env.OCP_TUI_LIVE === "1") {
     assert.ok(true);
   });
 }
+
+// ── TUI readiness / paste-verify predicates (issue #130) ────────────────────
+// Replicates tuiInputReady, tuiPromptLanded verbatim from lib/tui/session.mjs.
+// Keep in sync with the definitions there.
+function _tuiInputReady(pane) {
+  return /\? for shortcuts/.test(pane);
+}
+function _tuiPromptLanded(pane, prompt) {
+  const flatPane = pane.replace(/\s+/g, " ");
+  if (flatPane.includes("[Pasted text")) return true;
+  const firstLine = String(prompt).split("\n").map(s => s.trim()).find(Boolean) || "";
+  const needle = firstLine.replace(/\s+/g, " ").slice(0, 24);
+  return needle.length >= 3 && flatPane.includes(needle);
+}
+
+// Real captured pane samples (empirically confirmed via live capture-pane on PI231,
+// claude v2.1.114 and v2.1.159). Source: issue #130 spec.
+const TUI_READY_PANE = `❯ Try "how does <filepath> work?"
+  ? for shortcuts · ← for agents`;
+
+const TUI_LANDED_PANE = `❯ Reply with exactly: PONG_TEST
+  ? for shortcuts · ← for agents`;
+
+// Welcome splash shown before input bar is rendered — no `? for shortcuts`.
+const TUI_BOOT_PANE = `╭─ Claude Code v2.1.114 ─ Welcome back Tao! ─╮\n│ Tips for getting started │`;
+
+console.log("\nTUI readiness + paste-verify predicates (issue #130):");
+
+test("tuiInputReady(READY_PANE) === true  (input bar rendered)", () => {
+  assert.equal(_tuiInputReady(TUI_READY_PANE), true);
+});
+test("tuiInputReady(LANDED_PANE) === true  (input bar still present after paste)", () => {
+  assert.equal(_tuiInputReady(TUI_LANDED_PANE), true);
+});
+test("tuiInputReady(BOOT_PANE) === false  (welcome splash, no input bar yet)", () => {
+  assert.equal(_tuiInputReady(TUI_BOOT_PANE), false);
+});
+
+test("tuiPromptLanded(READY_PANE, 'Reply with exactly: PONG_TEST') === false  (still placeholder)", () => {
+  assert.equal(_tuiPromptLanded(TUI_READY_PANE, "Reply with exactly: PONG_TEST"), false);
+});
+test("tuiPromptLanded(LANDED_PANE, 'Reply with exactly: PONG_TEST') === true  (prompt prefix visible)", () => {
+  assert.equal(_tuiPromptLanded(TUI_LANDED_PANE, "Reply with exactly: PONG_TEST"), true);
+});
+test("tuiPromptLanded(READY_PANE, 'ping') === false  (needle <3 chars, placeholder present)", () => {
+  assert.equal(_tuiPromptLanded(TUI_READY_PANE, "ping"), false);
+});
+test("tuiPromptLanded('❯ ping\\n  ? for shortcuts', 'ping') === true  (needle present, no placeholder)", () => {
+  assert.equal(_tuiPromptLanded("❯ ping\n  ? for shortcuts", "ping"), true);
+});
+// issue #130 root cause: a big bracketed paste shows "[Pasted text #N +M lines]" — must be landed.
+test("tuiPromptLanded(bracketed-paste pane, big prompt) === true", () => {
+  assert.equal(_tuiPromptLanded("❯ [Pasted text #1 +301 lines]\n  ? for shortcuts", "[System] Context 0."), true);
+});
+// issue #130 false-positive guard: the EMPTY placeholder uses a CURLY quote (“) and randomized
+// example text — the old placeholder-gone heuristic wrongly reported landed=true here, so Enter
+// fired into an empty box. Must be FALSE (no positive signal: not [Pasted text], prompt not shown).
+test("tuiPromptLanded(curly-quote placeholder, big prompt) === false  (no false-positive)", () => {
+  assert.equal(_tuiPromptLanded("❯ Try “how do I log an error?”\n  ? for shortcuts", "[System] Context 0."), false);
+});
 
 // ── /health anonymousKey gate (issue #109) ──────────────────────────────────
 // MIRRORS the predicate in server.mjs (search ADVERTISE_ANON_KEY) — copied
