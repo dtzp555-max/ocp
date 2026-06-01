@@ -1,5 +1,14 @@
 # Changelog
 
+## v3.19.0 — 2026-06-02
+
+TUI-mode reliability + proxy-purity release. Two fixes diagnosed and verified live on both test hosts (PI231 / Oracle, claude 2.1.104 / 2.1.114), each its own PR with a fresh-context reviewer (Iron Rule 10), then an adversarial multi-host test battery (0 hangs / 0 crashes / 0 injection / 0 leaks). The default path (`CLAUDE_TUI_MODE` unset) is byte-for-byte unchanged.
+
+### TUI
+
+- **#130** — Fixed the "stuck typing" hang on large multi-line prompts. Three root causes: (1) terminal-turn detection only recognized `{system, turn_duration}`, which older claude builds (e.g. 2.1.114) don't emit → the reader ran to the wallclock and returned partial text; now also accepts an `assistant` line with a final `stop_reason` (`end_turn`/`stop_sequence`/`max_tokens`), while `tool_use` stays non-terminal. (2) Large prompts pasted via `send-keys -l` delivered embedded newlines as separate Enter events → the prompt never landed; now uses `tmux load-buffer` + `paste-buffer -p` (bracketed paste, atomic). (3) The paste-landed check false-positived on claude's empty curly-quote placeholder → Enter fired into an empty box; now positive-signal-only (`[Pasted text]` / prompt text) with a readiness/paste-verify poll + fast-fail (deterministic ~5s error instead of a 120s wallclock hang).
+- **#4** — TUI-mode never injects the host's `CLAUDE.md` / auto-memory into proxied turns. OCP is a proxy: the proxied client (OpenClaw / an IDE) owns its own context and memory. `buildTuiCmd` now always sets `CLAUDE_CODE_DISABLE_CLAUDE_MDS` + `CLAUDE_CODE_DISABLE_AUTO_MEMORY` (unconditional — proxy purity is not an opt-in). Verified live with a marker `CLAUDE.md`: obeyed by the proxied turn before the fix, blocked after, on both hosts. Residual host-context vectors (managed-policy / `settings.json` / output-styles) tracked in #133. The env is delivered via an `env`-prefix on the tmux pane command (tmux does not forward the spawning process's environment, and `new-session -e` requires tmux ≥3.2 while the cloud host runs 2.7).
+
 ## v3.18.0 — 2026-06-01
 
 Hardening release from a multi-agent code audit (1 P0 + 14 P2 + 2 P3 findings, each adversarially verified and independently reviewed) plus three follow-ups (#123–#125). Every change shipped as its own PR with a fresh-context reviewer (Iron Rule 10). The single-user default path (`AUTH_MODE=none`, no TUI) is behavior-identical **except** the `/health` change in #109.
