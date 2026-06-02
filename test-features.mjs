@@ -1506,6 +1506,50 @@ test("buildTuiCmd keeps version pin + entrypoint label + MCP wall", () => {
   assert.ok(/-u CLAUDE_CODE_ENTRYPOINT/.test(auto), "auto mode unsets any inherited entrypoint");
 });
 
+test("buildTuiCmd OCP_TUI_FULL_TOOLS=1 grants -p-equivalent tool surface (single-user opt-in)", () => {
+  const save = { ...process.env };
+  const restore = () => {
+    for (const k of ["OCP_TUI_FULL_TOOLS", "CLAUDE_SKIP_PERMISSIONS", "CLAUDE_MCP_CONFIG", "CLAUDE_ALLOWED_TOOLS"]) {
+      if (k in save) process.env[k] = save[k]; else delete process.env[k];
+    }
+  };
+  try {
+    // default (gate off) keeps the MCP wall, no --allowedTools
+    delete process.env.OCP_TUI_FULL_TOOLS;
+    const off = buildTuiCmd("/usr/bin/claude", "m", "s", "/home/u", "cli");
+    assert.ok(off.includes("--strict-mcp-config") && !off.includes("--allowedTools"), "gate off = MCP wall");
+
+    // gate on: --allowedTools (default set incl Bash), MCP wall dropped
+    process.env.OCP_TUI_FULL_TOOLS = "1";
+    delete process.env.CLAUDE_SKIP_PERMISSIONS;
+    delete process.env.CLAUDE_MCP_CONFIG;
+    delete process.env.CLAUDE_ALLOWED_TOOLS;
+    const full = buildTuiCmd("/usr/bin/claude", "m", "s", "/home/u", "cli");
+    assert.ok(full.includes("--allowedTools") && full.includes("Bash"), "full-tools grants --allowedTools incl Bash");
+    assert.ok(!full.includes("--strict-mcp-config") && !/--disallowedTools/.test(full), "full-tools drops the MCP wall");
+
+    // skip-permissions supersedes --allowedTools
+    process.env.CLAUDE_SKIP_PERMISSIONS = "true";
+    const skip = buildTuiCmd("/usr/bin/claude", "m", "s", "/home/u", "cli");
+    assert.ok(skip.includes("--dangerously-skip-permissions") && !skip.includes("--allowedTools"), "skip-permissions honored");
+
+    // mcp-config threaded through
+    delete process.env.CLAUDE_SKIP_PERMISSIONS;
+    process.env.CLAUDE_MCP_CONFIG = "/tmp/mcp.json";
+    const mcp = buildTuiCmd("/usr/bin/claude", "m", "s", "/home/u", "cli");
+    assert.ok(/--mcp-config '\/tmp\/mcp.json'/.test(mcp), "mcp-config passed through (shq'd)");
+
+    // operator-supplied scoped tool specifiers must be shell-quoted (no injection via ()*~)
+    delete process.env.CLAUDE_MCP_CONFIG;
+    process.env.CLAUDE_ALLOWED_TOOLS = "Bash(npm run test:*),Read";
+    const scoped = buildTuiCmd("/usr/bin/claude", "m", "s", "/home/u", "cli");
+    assert.ok(scoped.includes("'Bash(npm run test:*)'"), "scoped tool tokens are shq'd in the shell string");
+    assert.ok(!/--allowedTools Bash\(npm/.test(scoped), "scoped token must NOT appear unquoted");
+  } finally {
+    restore();
+  }
+});
+
 test("reaper kills ONLY ocp-tui- sessions, never olp-tui-", () => {
   const killed = [];
   const fakeTmux = (args) => {
