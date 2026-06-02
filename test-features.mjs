@@ -1538,6 +1538,13 @@ test("buildTuiCmd OCP_TUI_FULL_TOOLS=1 grants -p-equivalent tool surface (single
     process.env.CLAUDE_MCP_CONFIG = "/tmp/mcp.json";
     const mcp = buildTuiCmd("/usr/bin/claude", "m", "s", "/home/u", "cli");
     assert.ok(/--mcp-config '\/tmp\/mcp.json'/.test(mcp), "mcp-config passed through (shq'd)");
+
+    // operator-supplied scoped tool specifiers must be shell-quoted (no injection via ()*~)
+    delete process.env.CLAUDE_MCP_CONFIG;
+    process.env.CLAUDE_ALLOWED_TOOLS = "Bash(npm run test:*),Read";
+    const scoped = buildTuiCmd("/usr/bin/claude", "m", "s", "/home/u", "cli");
+    assert.ok(scoped.includes("'Bash(npm run test:*)'"), "scoped tool tokens are shq'd in the shell string");
+    assert.ok(!/--allowedTools Bash\(npm/.test(scoped), "scoped token must NOT appear unquoted");
   } finally {
     restore();
   }
