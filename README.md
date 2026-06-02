@@ -898,6 +898,7 @@ Future `ocp update` invocations sync automatically.
 | `OCP_TUI_CWD` | `$HOME/.ocp-tui/work` | (TUI-mode) Scratch working directory where interactive claude sessions run. Transcripts land under `<HOME>/.claude/projects/<encoded-cwd>/`. Created automatically. |
 | `OCP_TUI_HOME` | `$HOME` (real home) | (TUI-mode) `HOME` claude runs under. Default is the operator's real home (shared credentials, existing onboarding). Set to a separate path for scratch-home isolation — see ADR 0007 for the credential-fork caveat. |
 | `OCP_TUI_ENTRYPOINT` | `cli` | (TUI-mode) Billing-classifier labeling: `cli` (default) pins `cc_entrypoint=cli` deterministically; `auto` lets claude self-classify via TTY detection; `off` leaves the inherited env untouched. Honest only when the spawn is a genuine interactive PTY — see ADR 0007. |
+| `OCP_TUI_FULL_TOOLS` | *(unset)* | (TUI-mode, **single-user only**) When `=1`, grant the interactive session the **same tool surface as the `-p` path** — `--allowedTools` (+ optional `--mcp-config` / `--dangerously-skip-permissions`, read from `CLAUDE_ALLOWED_TOOLS` / `CLAUDE_MCP_CONFIG` / `CLAUDE_SKIP_PERMISSIONS`) — instead of the default MCP-walled, built-in-tools-only set. Lets a trusted single-operator TUI deployment run a **tool-using / MCP agent** (e.g. an OpenClaw assistant) on the subscription pool. Safe to enable only because TUI refuses to boot under `AUTH_MODE=multi`, so it can never widen a guest's tool surface. See [Subscription-pool (TUI) mode](#subscription-pool-tui-mode) and ADR 0007. |
 
 ### Streaming heartbeat
 
