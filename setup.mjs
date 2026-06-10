@@ -141,18 +141,26 @@ try {
 }
 
 // Check claude auth (quick test)
-try {
-  const out = execSync('claude -p --output-format text --no-session-persistence -- "ping"', {
-    encoding: "utf-8",
-    timeout: 30000,
-    env: { ...process.env, CLAUDECODE: undefined, ANTHROPIC_API_KEY: undefined, ANTHROPIC_BASE_URL: undefined, ANTHROPIC_AUTH_TOKEN: undefined },
-  }).trim();
-  if (out.length > 0) {
-    log(`Claude CLI authenticated (test response: "${out.slice(0, 40)}...")`);
+// NOTE: This probe uses `claude -p` (sdk-cli spawn). After the 2026-06-15 Anthropic billing
+// split, every `claude -p` call draws from the Agent SDK credit pool rather than the
+// Pro/Max subscription. Re-running setup after 6/15 will consume one metered credit.
+// Set OCP_SKIP_AUTH_TEST=1 to skip this probe (auth is still validated at first real request).
+if (process.env.OCP_SKIP_AUTH_TEST === "1") {
+  warn("OCP_SKIP_AUTH_TEST=1 — skipping claude auth probe (will be validated at first request).");
+} else {
+  try {
+    const out = execSync('claude -p --output-format text --no-session-persistence -- "ping"', {
+      encoding: "utf-8",
+      timeout: 30000,
+      env: { ...process.env, CLAUDECODE: undefined, ANTHROPIC_API_KEY: undefined, ANTHROPIC_BASE_URL: undefined, ANTHROPIC_AUTH_TOKEN: undefined },
+    }).trim();
+    if (out.length > 0) {
+      log(`Claude CLI authenticated (test response: "${out.slice(0, 40)}...")`);
+    }
+  } catch (e) {
+    warn(`Claude CLI auth test failed: ${e.message.slice(0, 100)}`);
+    warn("Make sure you're logged in: claude login");
   }
-} catch (e) {
-  warn(`Claude CLI auth test failed: ${e.message.slice(0, 100)}`);
-  warn("Make sure you're logged in: claude login");
 }
 
 // Check openclaw config (optional — OCP runs standalone without OpenClaw)
