@@ -1,5 +1,32 @@
 # Changelog
 
+## v3.20.0 — 2026-06-10
+
+TUI-mode billing-safety hardening for the 2026-06-15 Anthropic billing split. A 5-dimension multi-agent audit (adversarial verification + live tests on all three hosts — PI231 / Oracle / Mac mini, claude 2.1.104 / 2.1.114 / 2.1.170) found the TUI subscription-pool path could silently bill the metered Agent SDK pool or poison the cache under realistic failure modes. Three PRs, each with a fresh-context reviewer (Iron Rule 10) and CI; the default path (`CLAUDE_TUI_MODE` unset) is byte-for-byte unchanged.
+
+### TUI — honesty & cache correctness (#137)
+
+- **C-1** — `callClaudeTui` now throws on a claude-CLI auth-failure banner (e.g. `Please run /login · API Error: 401 …`, `Failed to authenticate. API Error: 401 …`) instead of returning it as a real answer, so it is never cached, singleflight-shared, or counted as a model success. Conservative detector (whole trimmed text ≤100 chars + `API Error: 4xx` + auth keyword + no code/quote char); overridable via `CLAUDE_TUI_ERROR_PATTERNS`. Live-reproduced on PI231.
+- **C-2** — `readTuiTranscript` distinguishes a complete turn from a wallclock-truncated partial (`truncated` flag); `callClaudeTui` throws `tui_wallclock_truncated` so a partial is never cached or counted as success.
+- **C-3** — `verifyEntrypoint` reads the `entrypoint` field from any transcript line, not just `{system, turn_duration}` — some claude builds emit zero turn_duration lines (live-confirmed on Oracle's claude 2.1.114), which previously left the billing-drift assertion blind on those builds.
+- **C-4 (paste)** — short prompts (e.g. `hi`) could never pass paste-landing detection; threshold lowered. Live-reproduced on PI231.
+
+### TUI — concurrency & observability (#139)
+
+- **Concurrency** — `OCP_TUI_MAX_CONCURRENT` (default 2) bounds concurrent interactive `claude` boots via a queuing semaphore (`lib/tui/semaphore.mjs`); the slot is released on throw so honesty-gate / spawn failures never leak it; bounded wait-queue → `tui_queue_full` (503). Independent of the global `MAX_CONCURRENT` (8) — a TUI turn is a heavy per-request cold-boot of tmux+claude + up to 120s wallclock.
+- **Observability** — additive `/health` `tui` block (`enabled` / `entrypointMode` / `lastEntrypoint` / `entrypointMismatches` / `inflight` / `maxConcurrent`) so an operator can poll for a silent `sdk-cli` metered-pool drift (the audit's top risk) instead of grepping journald. Authorized by the ADR 0007 PR-B amendment under the ALIGNMENT grandfather provision (additive, behaviour-preserving — every pre-existing `/health` field unchanged).
+
+### Operations (#138)
+
+- `docs/runbooks/615-canary.md` — the 2026-06-15 credit-balance canary: quiesce, read the Agent SDK credit balance (manual — no programmatic API exists for that pool; OCP's `/usage` headers are subscription rate-limit data, not the credit pool), one TUI canary turn, confirm `entrypoint:cli` in the transcript, green/red decision tree, periodic auto-mode self-classification mini-canary.
+- `docs/runbooks/tui-flip-rollback.md` — flip/rollback per deployment (systemd `daemon-reload`; launchd `bootout`/`bootstrap`, not `kickstart -k`).
+- `setup.mjs` auth quick-test gated behind `OCP_SKIP_AUTH_TEST=1` (the `claude -p` probe draws from the metered Agent SDK pool after 6/15).
+
+### New environment variables
+
+- `OCP_TUI_MAX_CONCURRENT` — max concurrent interactive TUI turns (default 2) (#139).
+- `OCP_SKIP_AUTH_TEST` — skip the `claude -p` auth probe in `setup.mjs` (default off) (#138).
+
 ## v3.19.0 — 2026-06-02
 
 TUI-mode reliability + proxy-purity release. Two fixes diagnosed and verified live on both test hosts (PI231 / Oracle, claude 2.1.104 / 2.1.114), each its own PR with a fresh-context reviewer (Iron Rule 10), then an adversarial multi-host test battery (0 hangs / 0 crashes / 0 injection / 0 leaks). The default path (`CLAUDE_TUI_MODE` unset) is byte-for-byte unchanged.
