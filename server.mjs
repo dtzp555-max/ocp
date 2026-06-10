@@ -19,7 +19,8 @@
  *   CLAUDE_SYSTEM_PROMPT         — system prompt appended to all requests
  *   CLAUDE_MCP_CONFIG            — path to MCP server config JSON file
  *   CLAUDE_SESSION_TTL           — session TTL in ms (default: 3600000 = 1h)
- *   CLAUDE_MAX_CONCURRENT        — max concurrent claude processes (default: 8)
+ *   CLAUDE_MAX_CONCURRENT        — max concurrent claude processes, -p/stream-json path (default: 8)
+ *   OCP_TUI_MAX_CONCURRENT       — max concurrent interactive TUI turns, TUI-mode path (default: 2)
  *   CLAUDE_BREAKER_THRESHOLD     — failures in window before circuit opens (default: 6)
  *   CLAUDE_BREAKER_COOLDOWN      — base ms to wait before retrying after circuit opens (default: 120000)
  *   CLAUDE_BREAKER_WINDOW        — sliding window duration in ms (default: 300000 = 5min)
@@ -39,6 +40,7 @@ import { DEFAULT_PORT } from "./lib/constants.mjs";
 import { isLoopbackBind } from "./lib/net.mjs";
 import { runTuiTurn, reapStaleTuiSessions } from "./lib/tui/session.mjs";
 import { detectTuiUpstreamError } from "./lib/tui/transcript.mjs";
+import { TuiSemaphore, recordTuiEntrypoint, buildTuiHealthBlock } from "./lib/tui/semaphore.mjs";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const _pkg = JSON.parse(readFileSync(join(__dirname, "package.json"), "utf8"));
@@ -300,6 +302,22 @@ const TUI_WALLCLOCK_MS = parseInt(process.env.CLAUDE_TUI_WALLCLOCK_MS || "120000
 const TUI_CWD  = process.env.OCP_TUI_CWD  || `${process.env.HOME}/.ocp-tui/work`;
 const TUI_HOME = process.env.OCP_TUI_HOME  || process.env.HOME;
 const TUI_ENTRYPOINT = process.env.OCP_TUI_ENTRYPOINT || "cli"; // cli|auto|off — see ADR 0007
+// Independent concurrency bound for the TUI path (audit C-4). Default 2: a TUI turn is
+// HEAVY (per-request cold-boot of a tmux+claude session + up to TUI_WALLCLOCK_MS=120s of
+// wallclock), so a small host (e.g. a Pi 4 serving a family) cannot run many at once
+// without OOM + multiplied subscription rate-limit pressure. This is NOT the global
+// MAX_CONCURRENT gate (that lives in spawnClaudeProcess, the -p/stream-json path, which
+// callClaudeTui never reaches). See ADR 0007 PR-B amendment + lib/tui/semaphore.mjs.
+const TUI_MAX_CONCURRENT = parseInt(process.env.OCP_TUI_MAX_CONCURRENT || "2", 10);
+const tuiSemaphore = new TuiSemaphore(TUI_MAX_CONCURRENT);
+// Operator-visible TUI drift surface (audit C-5). lastEntrypoint + entrypointMismatches
+// let the operator poll /health to catch a silent metered-pool drift (the audit's top
+// risk: after the 6/15 flip a TTY-loss could flip cc_entrypoint cli→sdk-cli and drain
+// metered credits invisibly — the warning currently only reaches journald).
+const tuiStats = {
+  lastEntrypoint: null,      // last observed cc_entrypoint from the transcript ("cli" | "sdk-cli" | null)
+  entrypointMismatches: 0,   // count of cli-expected-but-got-other turns
+};
 
 // SECURITY fail-loud: TUI-mode is incompatible with any configuration that allows
 // non-operator prompts to reach the interactive claude session. Three cases:
@@ -918,7 +936,11 @@ function callClaudeTui(model, messages, _conversationId, _keyName) {
   const cliModel = MODEL_MAP[model] || model;
   const prompt = messagesToPrompt(messages); // includes system as [System] inline
   recordModelRequest(cliModel, prompt.length);
-  return runTuiTurn({
+  // C-4: gate the heavy interactive boot behind the TUI semaphore. run() acquires a slot
+  // (queuing if all are busy, up to maxQueue), then releases in a finally so any throw from
+  // runTuiTurn (tmux spawn failure, paste-not-landed) OR from the honesty gates below
+  // (truncation / error banner) can NEVER leak a slot. tuiSemaphore.inflight feeds /health.
+  return tuiSemaphore.run(() => runTuiTurn({
     prompt,
     model: cliModel,
     claudeBin: CLAUDE,
@@ -955,14 +977,19 @@ function callClaudeTui(model, messages, _conversationId, _keyName) {
     // Assert the subscription-pool classification. TUI exists to keep cc_entrypoint=cli
     // (subscription pool); a silent degrade to sdk-cli (metered Agent SDK pool) would still
     // return text but cost money — warn loudly so it's visible. (issue #115)
-    if (TUI_ENTRYPOINT === "cli" && entrypoint !== "cli") {
+    // C-5: also surface the observation on /health. recordTuiEntrypoint sets lastEntrypoint
+    // unconditionally (operators can poll it to confirm cli) and increments
+    // entrypointMismatches when expected=cli but observed≠cli — the same condition the
+    // journald warning already covers — so a silent metered-pool drift is visible on /health
+    // without tailing logs.
+    if (recordTuiEntrypoint(tuiStats, entrypoint, TUI_ENTRYPOINT)) {
       logEvent("warn", "tui_entrypoint_mismatch", { expected: "cli", got: entrypoint, model: cliModel });
     }
     return text;
   }).catch((err) => {
     recordModelError(cliModel, false);
     throw err;
-  });
+  }));
 }
 
 // ── SSE heartbeat (opt-in idle watchdog) ────────────────────────────────
@@ -2014,6 +2041,17 @@ const server = createServer(async (req, res) => {
       circuitBreaker: "disabled",
       sessions: sessionList,
       recentErrors: recentErrors.slice(-5),
+      // ── TUI observability (audit C-5) — ADDITIVE block (ADR 0007 PR-B amendment) ──
+      // /health is a grandfathered B.2 endpoint (ADR 0006). This block is NEW fields only;
+      // every existing field above is byte-identical → behaviour-preserving for existing
+      // consumers per ALIGNMENT.md's grandfather provision. When TUI_MODE is off the block
+      // still appears with enabled:false (cheap, harmless) so the shape is stable.
+      // entrypointMismatches/lastEntrypoint exist so an operator can poll /health to catch a
+      // silent metered-pool drift (the audit's top risk after the 6/15 billing flip).
+      tui: buildTuiHealthBlock(
+        { enabled: TUI_MODE, entrypointMode: TUI_ENTRYPOINT, maxConcurrent: TUI_MAX_CONCURRENT },
+        tuiStats, tuiSemaphore,
+      ),
     });
   }
 
@@ -2304,7 +2342,7 @@ server.listen(PORT, BIND_ADDRESS, () => {
   else console.log(`Cache: disabled (set CLAUDE_CACHE_TTL to enable)`);
   if (TUI_MODE) {
     console.warn(`⚠️  TUI-mode ON — single-user only; do NOT enable on a multi-user OCP (guest prompts would run claude with operator filesystem access). See ADR 0007.`);
-    console.log(`  TUI-mode: ON home=${TUI_HOME} cwd=${TUI_CWD} wallclock=${TUI_WALLCLOCK_MS}ms`);
+    console.log(`  TUI-mode: ON home=${TUI_HOME} cwd=${TUI_CWD} wallclock=${TUI_WALLCLOCK_MS}ms maxConcurrent=${TUI_MAX_CONCURRENT}`);
     try {
       const n = reapStaleTuiSessions();
       if (n) logEvent("info", "tui_reaped_stale_sessions", { count: n });

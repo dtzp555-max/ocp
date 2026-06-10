@@ -139,6 +139,101 @@ B-path is **deferred** and is not implemented in this ADR. Until B-path lands, T
 
 ---
 
+## Observability and concurrency (PR-B amendment)
+
+**Date:** 2026-06-10
+**Status:** Accepted — amends ADR 0007.
+**Motivation:** the post-PR-A code audit, findings C-4 (P1) and C-5 (P1).
+
+### C-4 — independent concurrency bound for the TUI path
+
+The global `MAX_CONCURRENT` gate lives in `spawnClaudeProcess()` (the `-p` / stream-json
+path). `callClaudeTui()` never calls `spawnClaudeProcess` — it calls `runTuiTurn()`, which
+cold-boots a full interactive `claude` inside a fresh tmux session. So the TUI path had **no**
+concurrency bound: N concurrent TUI requests spawned N simultaneous cold-boot tmux+claude
+processes. On a small host (e.g. a Pi 4 serving a family) a burst of ~5 is an OOM risk and
+also multiplies subscription rate-limit pressure.
+
+PR-B adds an **independent** limiter for the TUI path (`lib/tui/semaphore.mjs`,
+`TuiSemaphore`):
+
+- **`OCP_TUI_MAX_CONCURRENT`, default `2`.** Rationale: a TUI turn is heavy — a per-request
+  cold-boot of tmux+claude plus up to `CLAUDE_TUI_WALLCLOCK_MS` (120 s) of wallclock — so a
+  small host cannot run many at once. `2` is the conservative default that keeps a Pi-class
+  host alive under a family burst while still allowing some overlap. It is deliberately **not**
+  the same knob as `MAX_CONCURRENT` (default 8): the two pools have different shapes (a
+  stream-json spawn is cheap and fast; a TUI turn is a heavy cold-boot + long wallclock), so
+  coupling them would mis-size one of the two paths.
+- **Queue, don't reject.** The limiter **queues** (awaits a slot), mirroring the spirit of
+  `MAX_CONCURRENT` — requests are not dropped on contention. To bound memory against a runaway
+  client, the wait queue itself is capped (`maxQueue`, default 32× the limit); when the queue
+  is full `run()` rejects with `tui_queue_full`, surfaced as a 503 — deterministic backpressure
+  rather than silent OOM.
+- **Slot released in a `finally`.** `TuiSemaphore.run(fn)` releases the slot in a `finally`, so
+  any throw — PR-A's honesty gates (`tui_wallclock_truncated`, `tui_upstream_error`), a
+  `tui_paste_not_landed`, or a `tui_spawn_failed` — can never leak a slot.
+
+This limiter has **zero effect when `TUI_MODE` is off**: `callClaudeTui` is never reached, so
+the semaphore is never entered. The default stream-json path is untouched.
+
+### C-5 — operator-visible drift surface on `/health` (additive)
+
+The `tui_entrypoint_mismatch` warning only reached journald. After the 2026-06-15 flip, a
+silent `sdk-cli` drift (the documented top risk in this ADR — a lost TTY flipping the
+self-classification to the metered Agent SDK pool) would drain metered credits **invisibly**.
+PR-B adds a `tui` block to the `/health` JSON response so an operator can poll it:
+
+```
+tui: {
+  enabled:              <TUI_MODE>,
+  entrypointMode:       <OCP_TUI_ENTRYPOINT>,   // cli | auto | off
+  lastEntrypoint:       <last observed cc_entrypoint, e.g. "cli", or null>,
+  entrypointMismatches: <count of cli-expected-but-got-other turns>,
+  inflight:             <current concurrent TUI turns>,
+  queued:               <turns waiting for a slot>,
+  maxConcurrent:        <OCP_TUI_MAX_CONCURRENT>
+}
+```
+
+`lastEntrypoint` is recorded and `entrypointMismatches` incremented inside `callClaudeTui` in
+the same mismatch branch that already emits the journald warning (via `recordTuiEntrypoint`).
+`inflight` / `queued` / `maxConcurrent` come from the C-4 semaphore. When `TUI_MODE` is off the
+block still appears with `enabled:false` (cheap, harmless) so the response shape is stable for
+consumers regardless of mode.
+
+### ALIGNMENT authorization for the `/health` change
+
+`/health` is a **grandfathered B.2 endpoint** under ADR 0006, frozen at its v3.16.4 behaviour.
+`ALIGNMENT.md`'s grandfather provision states: *"Any change to the contract (request shape,
+response shape, semantics) of a grandfathered B.2 endpoint is treated as a new authorization
+request and requires either a behaviour-preserving refactor PR or its own ADR."*
+
+This amendment **is** that authorization. The argument:
+
+- The change is **additive**: it adds one new top-level field (`tui`) containing only new
+  sub-fields. **No existing `/health` field is changed, renamed, removed, or re-typed**, and no
+  existing semantics change. Existing `/health` consumers (the dashboard, `ocp-connect`,
+  monitoring) read the fields they already read and are unaffected — the change is
+  **behaviour-preserving** for them, which is exactly the bar the grandfather provision sets for
+  a non-ADR contract change.
+- The TUI observability surface is an **intrinsic part of the TUI feature** whose authorizing
+  authority is **this ADR (0007)**, not a brand-new B.2 endpoint. We are not adding a new B.2
+  endpoint or a new method (which would each require their own fresh ADR under the New Class B
+  endpoint procedure) — we are extending the response of an existing grandfathered endpoint with
+  fields that report state owned by an ADR-0007 feature. ADR 0007 is the natural home for that
+  authority, and this amendment records it explicitly.
+- `cli.js` does not perform this operation — `/health` is OCP-owned (Class B), so no `cli.js`
+  citation applies; the citation is this ADR + ADR 0006 (grandfathered B.2) per
+  `ALIGNMENT.md`'s Class B citation requirement.
+
+### `OCP_TUI_MAX_CONCURRENT` summary
+
+| Env var | Default | Meaning |
+|---|---|---|
+| `OCP_TUI_MAX_CONCURRENT` | `2` | Max concurrent interactive TUI turns. Independent of `CLAUDE_MAX_CONCURRENT` (the stream-json path). Excess turns queue (bounded); a full queue yields a 503. |
+
+---
+
 ## Consequences
 
 ### Positive
