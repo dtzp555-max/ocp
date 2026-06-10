@@ -898,6 +898,7 @@ Future `ocp update` invocations sync automatically.
 | `OCP_TUI_CWD` | `$HOME/.ocp-tui/work` | (TUI-mode) Scratch working directory where interactive claude sessions run. Transcripts land under `<HOME>/.claude/projects/<encoded-cwd>/`. Created automatically. |
 | `OCP_TUI_HOME` | `$HOME` (real home) | (TUI-mode) `HOME` claude runs under. Default is the operator's real home (shared credentials, existing onboarding). Set to a separate path for scratch-home isolation — see ADR 0007 for the credential-fork caveat. |
 | `OCP_TUI_ENTRYPOINT` | `cli` | (TUI-mode) Billing-classifier labeling: `cli` (default) pins `cc_entrypoint=cli` deterministically; `auto` lets claude self-classify via TTY detection; `off` leaves the inherited env untouched. Honest only when the spawn is a genuine interactive PTY — see ADR 0007. |
+| `OCP_SKIP_AUTH_TEST` | *(unset)* | When `=1`, skip the `claude -p` auth probe during `setup.mjs`. After 2026-06-15 this probe draws from the Agent SDK credit pool; set this to avoid burning a metered credit on re-installs or `ocp update` runs. Auth is validated at the first real request. |
 | `OCP_TUI_FULL_TOOLS` | *(unset)* | (TUI-mode, **single-user only**) When `=1`, grant the interactive session the **same tool surface as the `-p` path** — `--allowedTools` (+ optional `--mcp-config` / `--dangerously-skip-permissions`, read from `CLAUDE_ALLOWED_TOOLS` / `CLAUDE_MCP_CONFIG` / `CLAUDE_SKIP_PERMISSIONS`) — instead of the default MCP-walled, built-in-tools-only set. Lets a trusted single-operator TUI deployment run a **tool-using / MCP agent** (e.g. an OpenClaw assistant) on the subscription pool. Safe because TUI **refuses to boot under `AUTH_MODE=multi`** (hard exit) — no guest key can ever reach the TUI path, so this gate cannot expose tools to an untrusted caller. (Under `AUTH_MODE=shared` + `OCP_TUI_ALLOW_LAN=1`, anyone holding the single shared key reaches it — that is the existing TUI trust model, unchanged.) See [Subscription-pool (TUI) mode](#subscription-pool-tui-mode) and ADR 0007. |
 
 ### Streaming heartbeat
@@ -973,6 +974,13 @@ unset CLAUDE_TUI_MODE
 ```
 
 The stream-json path is restored immediately. No other change is needed.
+
+### 2026-06-15 operator checklist
+
+Every host serving traffic must be flipped to TUI-mode **and** canary-verified before 2026-06-15, or it will bill the metered Agent SDK credit pool instead of the subscription.
+
+- **[Flip/rollback runbook](docs/runbooks/tui-flip-rollback.md)** — how to set `CLAUDE_TUI_MODE=true` on systemd (Linux) and launchd (macOS) hosts. Covers the `daemon-reload` requirement (systemd) and the `bootout`+`bootstrap` cycle requirement (launchd — `launchctl kickstart -k` does not reload plist env).
+- **[615-canary runbook](docs/runbooks/615-canary.md)** — after each flip, run one quiesced request and compare the Agent SDK credit balance before and after. `entrypoint:cli` in the transcript (the `cc_entrypoint` billing classifier) is necessary but not sufficient — only a stable credit balance confirms the subscription pool is being used. Balance check is a manual step (no known programmatic API for the Agent SDK credit pool balance).
 
 ### Architecture and design decisions
 
