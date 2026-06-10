@@ -1851,6 +1851,147 @@ test("default mode (no second arg) behaves like 'cli'", () => {
   assert.equal(env.CLAUDE_CODE_ENTRYPOINT, "cli");
 });
 
+// ── TUI concurrency limiter + drift observability (PR-B: audit C-4 / C-5) ──
+import { TuiSemaphore, recordTuiEntrypoint, buildTuiHealthBlock } from "./lib/tui/semaphore.mjs";
+
+console.log("\nTUI concurrency limiter (C-4):");
+
+const deferred = () => { let resolve, reject; const p = new Promise((res, rej) => { resolve = res; reject = rej; }); return { p, resolve, reject }; };
+
+await asyncTest("limit=1 serializes two overlapping calls (second waits for the first)", async () => {
+  const sem = new TuiSemaphore(1);
+  const order = [];
+  const g1 = deferred();
+  // First task acquires the only slot and blocks on g1.
+  const t1 = sem.run(async () => { order.push("t1-start"); await g1.p; order.push("t1-end"); });
+  await new Promise((r) => setImmediate(r)); // let t1 acquire
+  assert.equal(sem.inflight, 1, "t1 holds the only slot");
+  // Second task must QUEUE — it has not started yet.
+  const t2 = sem.run(async () => { order.push("t2-start"); });
+  await new Promise((r) => setImmediate(r));
+  assert.equal(sem.queued, 1, "t2 is queued, not running");
+  assert.deepEqual(order, ["t1-start"], "t2 has not started while t1 holds the slot");
+  // Release t1 → t2 runs.
+  g1.resolve();
+  await t1; await t2;
+  assert.deepEqual(order, ["t1-start", "t1-end", "t2-start"], "t2 ran only after t1 finished");
+  assert.equal(sem.inflight, 0, "all slots released");
+  assert.equal(sem.queued, 0, "queue drained");
+});
+
+await asyncTest("limit=2 allows two concurrent, queues the third", async () => {
+  const sem = new TuiSemaphore(2);
+  const g = [deferred(), deferred(), deferred()];
+  const started = [];
+  const tasks = g.map((d, i) => sem.run(async () => { started.push(i); await d.p; }));
+  await new Promise((r) => setImmediate(r));
+  assert.equal(sem.inflight, 2, "exactly 2 run concurrently");
+  assert.equal(sem.queued, 1, "the third is queued");
+  assert.deepEqual(started.sort(), [0, 1], "only the first two started");
+  g.forEach((d) => d.resolve());
+  await Promise.all(tasks);
+  assert.equal(sem.inflight, 0);
+});
+
+await asyncTest("slot is RELEASED on throw (finally) — a rejecting task never leaks its slot", async () => {
+  const sem = new TuiSemaphore(1);
+  await assert.rejects(sem.run(async () => { throw new Error("boom"); }), /boom/);
+  assert.equal(sem.inflight, 0, "throwing task released its slot");
+  // Prove the slot is reusable: a subsequent task acquires immediately.
+  let ran = false;
+  await sem.run(async () => { ran = true; });
+  assert.equal(ran, true);
+  assert.equal(sem.inflight, 0);
+});
+
+await asyncTest("wait queue is bounded — run() rejects with tui_queue_full when full (backpressure, not OOM)", async () => {
+  const sem = new TuiSemaphore(1, { maxQueue: 1 });
+  const g1 = deferred();
+  const t1 = sem.run(async () => { await g1.p; });          // holds the slot
+  await new Promise((r) => setImmediate(r));
+  const t2 = sem.run(async () => {});                        // fills the 1-deep queue
+  await new Promise((r) => setImmediate(r));
+  assert.equal(sem.queued, 1, "queue is full");
+  await assert.rejects(sem.run(async () => {}), /tui_queue_full/, "third request rejects");
+  g1.resolve();
+  await t1; await t2;
+  assert.equal(sem.inflight, 0);
+});
+
+console.log("\nTUI drift observability (C-5):");
+
+test("recordTuiEntrypoint: observed 'cli' is NOT a mismatch and sets lastEntrypoint", () => {
+  const ts = { lastEntrypoint: null, entrypointMismatches: 0 };
+  const mism = recordTuiEntrypoint(ts, "cli", "cli");
+  assert.equal(mism, false);
+  assert.equal(ts.lastEntrypoint, "cli");
+  assert.equal(ts.entrypointMismatches, 0);
+});
+
+test("recordTuiEntrypoint: expected cli but observed 'sdk-cli' increments the mismatch counter (drift)", () => {
+  const ts = { lastEntrypoint: null, entrypointMismatches: 0 };
+  assert.equal(recordTuiEntrypoint(ts, "sdk-cli", "cli"), true);
+  assert.equal(ts.lastEntrypoint, "sdk-cli");
+  assert.equal(ts.entrypointMismatches, 1);
+  // A second drift increments again (counter accumulates across turns).
+  assert.equal(recordTuiEntrypoint(ts, "sdk-cli", "cli"), true);
+  assert.equal(ts.entrypointMismatches, 2);
+});
+
+test("recordTuiEntrypoint: null observation → lastEntrypoint null, counts as mismatch when expected cli", () => {
+  const ts = { lastEntrypoint: "cli", entrypointMismatches: 0 };
+  assert.equal(recordTuiEntrypoint(ts, null, "cli"), true);
+  assert.equal(ts.lastEntrypoint, null);
+  assert.equal(ts.entrypointMismatches, 1);
+});
+
+test("recordTuiEntrypoint: non-cli expected mode (auto) never counts a mismatch", () => {
+  const ts = { lastEntrypoint: null, entrypointMismatches: 0 };
+  assert.equal(recordTuiEntrypoint(ts, "sdk-cli", "auto"), false);
+  assert.equal(ts.lastEntrypoint, "sdk-cli");
+  assert.equal(ts.entrypointMismatches, 0);
+});
+
+test("buildTuiHealthBlock: shape + live counters (the additive /health tui block)", () => {
+  const sem = new TuiSemaphore(2);
+  const ts = { lastEntrypoint: "cli", entrypointMismatches: 3 };
+  const block = buildTuiHealthBlock(
+    { enabled: true, entrypointMode: "cli", maxConcurrent: 2 }, ts, sem);
+  assert.deepEqual(Object.keys(block).sort(),
+    ["enabled", "entrypointMismatches", "entrypointMode", "inflight", "lastEntrypoint", "maxConcurrent", "queued"]);
+  assert.equal(block.enabled, true);
+  assert.equal(block.entrypointMode, "cli");
+  assert.equal(block.lastEntrypoint, "cli");
+  assert.equal(block.entrypointMismatches, 3);
+  assert.equal(block.inflight, 0);
+  assert.equal(block.queued, 0);
+  assert.equal(block.maxConcurrent, 2);
+});
+
+test("buildTuiHealthBlock: TUI off → enabled:false but block still present (stable shape)", () => {
+  const sem = new TuiSemaphore(2);
+  const ts = { lastEntrypoint: null, entrypointMismatches: 0 };
+  const block = buildTuiHealthBlock(
+    { enabled: false, entrypointMode: "cli", maxConcurrent: 2 }, ts, sem);
+  assert.equal(block.enabled, false);
+  assert.equal(block.lastEntrypoint, null);
+  assert.equal(block.entrypointMismatches, 0);
+});
+
+await asyncTest("buildTuiHealthBlock reflects live inflight/queued while turns are in flight", async () => {
+  const sem = new TuiSemaphore(1);
+  const ts = { lastEntrypoint: null, entrypointMismatches: 0 };
+  const g1 = deferred();
+  const t1 = sem.run(async () => { await g1.p; });
+  const t2 = sem.run(async () => {}); // queued behind t1
+  await new Promise((r) => setImmediate(r));
+  const block = buildTuiHealthBlock({ enabled: true, entrypointMode: "cli", maxConcurrent: 1 }, ts, sem);
+  assert.equal(block.inflight, 1, "one turn in flight");
+  assert.equal(block.queued, 1, "one turn queued");
+  g1.resolve();
+  await t1; await t2;
+});
+
 // ── TUI session driver: runTuiTurn (live-only, guarded) ──────────────────
 console.log("\nTUI session driver:");
 

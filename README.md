@@ -725,7 +725,7 @@ The canonical list lives in [`models.json`](./models.json) — the single source
 |----------|--------|-------------|
 | `/v1/models` | GET | List available models |
 | `/v1/chat/completions` | POST | Chat completion (streaming + non-streaming) |
-| `/health` | GET | Comprehensive health check |
+| `/health` | GET | Comprehensive health check (includes a `tui` block for TUI-mode drift/concurrency monitoring) |
 | `/usage` | GET | Plan usage limits + per-model stats |
 | `/status` | GET | Combined overview (usage + health) |
 | `/settings` | GET/PATCH | View or update settings at runtime |
@@ -898,6 +898,7 @@ Future `ocp update` invocations sync automatically.
 | `OCP_TUI_CWD` | `$HOME/.ocp-tui/work` | (TUI-mode) Scratch working directory where interactive claude sessions run. Transcripts land under `<HOME>/.claude/projects/<encoded-cwd>/`. Created automatically. |
 | `OCP_TUI_HOME` | `$HOME` (real home) | (TUI-mode) `HOME` claude runs under. Default is the operator's real home (shared credentials, existing onboarding). Set to a separate path for scratch-home isolation — see ADR 0007 for the credential-fork caveat. |
 | `OCP_TUI_ENTRYPOINT` | `cli` | (TUI-mode) Billing-classifier labeling: `cli` (default) pins `cc_entrypoint=cli` deterministically; `auto` lets claude self-classify via TTY detection; `off` leaves the inherited env untouched. Honest only when the spawn is a genuine interactive PTY — see ADR 0007. |
+| `OCP_TUI_MAX_CONCURRENT` | `2` | (TUI-mode) Max concurrent interactive TUI turns. **Independent** of `CLAUDE_MAX_CONCURRENT` (which bounds the `-p`/stream-json path; TUI never uses it). A TUI turn is heavy (per-request cold-boot of tmux+claude + up to `CLAUDE_TUI_WALLCLOCK_MS` wallclock), so the default is low to keep small hosts (e.g. a Pi 4) alive under a burst. Excess turns **queue** (bounded); a full queue yields a 503. See ADR 0007 PR-B amendment. |
 | `OCP_SKIP_AUTH_TEST` | *(unset)* | When `=1`, skip the `claude -p` auth probe during `setup.mjs`. After 2026-06-15 this probe draws from the Agent SDK credit pool; set this to avoid burning a metered credit on re-installs or `ocp update` runs. Auth is validated at the first real request. |
 | `OCP_TUI_FULL_TOOLS` | *(unset)* | (TUI-mode, **single-user only**) When `=1`, grant the interactive session the **same tool surface as the `-p` path** — `--allowedTools` (+ optional `--mcp-config` / `--dangerously-skip-permissions`, read from `CLAUDE_ALLOWED_TOOLS` / `CLAUDE_MCP_CONFIG` / `CLAUDE_SKIP_PERMISSIONS`) — instead of the default MCP-walled, built-in-tools-only set. Lets a trusted single-operator TUI deployment run a **tool-using / MCP agent** (e.g. an OpenClaw assistant) on the subscription pool. Safe because TUI **refuses to boot under `AUTH_MODE=multi`** (hard exit) — no guest key can ever reach the TUI path, so this gate cannot expose tools to an untrusted caller. (Under `AUTH_MODE=shared` + `OCP_TUI_ALLOW_LAN=1`, anyone holding the single shared key reaches it — that is the existing TUI trust model, unchanged.) See [Subscription-pool (TUI) mode](#subscription-pool-tui-mode) and ADR 0007. |
 
@@ -965,6 +966,25 @@ Then restart OCP. At boot you will see:
 - **Cache and singleflight work normally.** TUI-mode writes the buffered response to the cache on success; cache-hits skip the interactive turn entirely.
 - **The host's `CLAUDE.md` / auto-memory is never injected.** OCP is a proxy — the proxied client (OpenClaw / your IDE) owns its own context and memory. TUI-mode always runs `claude` with `CLAUDE_CODE_DISABLE_CLAUDE_MDS` + `CLAUDE_CODE_DISABLE_AUTO_MEMORY`, so a `CLAUDE.md` on the OCP host can never leak into proxied turns (verified live; see #4). Built-in tool schemas + the interactive system prompt remain (the inherent ~20–35K context floor of interactive mode); MCP is hard-disabled.
 - **Default path unchanged.** Unset `CLAUDE_TUI_MODE` and restart → `callClaude` / `callClaudeStreaming` are used again, byte-for-byte identical to today.
+- **Concurrency is bounded separately.** TUI turns are heavy (per-request cold-boot + long wallclock), so the TUI path has its own limiter — `OCP_TUI_MAX_CONCURRENT` (default `2`), independent of `CLAUDE_MAX_CONCURRENT`. Excess turns queue; a full queue returns a 503. Tune it up only on a host that can run more interactive `claude` sessions at once.
+
+### Monitoring drift via `/health`
+
+`GET /health` includes a `tui` block so you can poll for a silent billing-pool drift (the top risk after the 6/15 flip — a lost TTY flipping `cc_entrypoint` from `cli` to the metered `sdk-cli` pool would still return answers but burn metered credits). The block is **always present** (with `enabled:false` when TUI-mode is off):
+
+```jsonc
+"tui": {
+  "enabled": true,             // CLAUDE_TUI_MODE === "true"
+  "entrypointMode": "cli",     // OCP_TUI_ENTRYPOINT (cli | auto | off)
+  "lastEntrypoint": "cli",     // last cc_entrypoint observed in a transcript, or null
+  "entrypointMismatches": 0,   // count of cli-expected-but-got-other turns — ALERT if this climbs
+  "inflight": 1,               // TUI turns running right now
+  "queued": 0,                 // TUI turns waiting for a concurrency slot
+  "maxConcurrent": 2           // OCP_TUI_MAX_CONCURRENT
+}
+```
+
+Alert on `entrypointMismatches > 0` (or `lastEntrypoint !== "cli"`): it means a turn drew from the metered Agent SDK pool instead of the subscription. `inflight` / `queued` show how close the TUI path is to its concurrency cap.
 
 ### Kill-switch
 
