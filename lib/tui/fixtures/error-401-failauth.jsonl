@@ -1,0 +1,2 @@
+{"type":"user","entrypoint":"cli","cwd":"/tmp/tui-test","sessionId":"bbbb2222-3333-4444-5555-666677778888","version":"2.1.104","message":{"role":"user","content":[{"type":"text","text":"What is 2 + 2?"}]}}
+{"type":"assistant","entrypoint":"cli","cwd":"/tmp/tui-test","sessionId":"bbbb2222-3333-4444-5555-666677778888","version":"2.1.104","message":{"role":"assistant","model":"claude-haiku-4-5-20251001","stop_reason":"end_turn","content":[{"type":"text","text":"Failed to authenticate. API Error: 401 Invalid authentication credentials"}]}}

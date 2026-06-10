@@ -1,0 +1,2 @@
+{"type":"user","entrypoint":"cli","cwd":"/tmp/tui-test","sessionId":"bbbb1111-2222-3333-4444-555566667777","version":"2.1.104","message":{"role":"user","content":[{"type":"text","text":"Say PONG and nothing else."}]}}
+{"type":"assistant","entrypoint":"cli","cwd":"/tmp/tui-test","sessionId":"bbbb1111-2222-3333-4444-555566667777","version":"2.1.104","message":{"role":"assistant","model":"claude-haiku-4-5-20251001","stop_reason":"end_turn","content":[{"type":"text","text":"PONG"}]}}

@@ -38,6 +38,7 @@ import { validateKey, recordUsage, getUsageByKey, getUsageTimeline, getRecentUsa
 import { DEFAULT_PORT } from "./lib/constants.mjs";
 import { isLoopbackBind } from "./lib/net.mjs";
 import { runTuiTurn, reapStaleTuiSessions } from "./lib/tui/session.mjs";
+import { detectTuiUpstreamError } from "./lib/tui/transcript.mjs";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const _pkg = JSON.parse(readFileSync(join(__dirname, "package.json"), "utf8"));
@@ -926,7 +927,30 @@ function callClaudeTui(model, messages, _conversationId, _keyName) {
     cwd: TUI_CWD,
     wallclockMs: TUI_WALLCLOCK_MS,
     entrypointMode: TUI_ENTRYPOINT,
-  }).then(({ text, entrypoint }) => {
+  }).then(({ text, entrypoint, truncated }) => {
+    // ── Honesty gates (issue #133) ─ run BEFORE recordModelSuccess / cache write-back.
+    // A throw here propagates to the .catch below (recordModelError + reject), so the
+    // result never reaches the downstream setCachedResponse / singleflight / SUCCESS path.
+
+    // C-2: the wall-clock cap hit with partial text and NO terminal marker — the turn
+    // is INCOMPLETE. Returning the cut-off prefix would cache it and report it as
+    // finish_reason:stop (a truncated answer served as a complete one). Reject instead.
+    if (truncated) {
+      logEvent("error", "tui_wallclock_truncated", { model: cliModel, chars: (text || "").length, wallclockMs: TUI_WALLCLOCK_MS });
+      throw new Error("tui_wallclock_truncated: turn hit the wall-clock cap before completing; partial text dropped");
+    }
+
+    // C-1: the interactive claude CLI renders in-session errors (expired/invalid
+    // credentials, transient API failure) as ordinary assistant text. Returning that
+    // banner would cache an error AS an answer and record a model SUCCESS. Detect a
+    // known error banner (anchored whole-text match — see detectTuiUpstreamError) and
+    // reject so it does NOT enter the cache and the client gets a 5xx.
+    const banner = detectTuiUpstreamError(text);
+    if (banner) {
+      logEvent("error", "tui_upstream_error", { model: cliModel, banner: banner.slice(0, 200) });
+      throw new Error("tui_upstream_error: claude CLI returned an in-session error banner instead of an answer");
+    }
+
     recordModelSuccess(cliModel, 0); // elapsed not measurable here; wallclock at reader level
     // Assert the subscription-pool classification. TUI exists to keep cc_entrypoint=cli
     // (subscription pool); a silent degrade to sdk-cli (metered Agent SDK pool) would still

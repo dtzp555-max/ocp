@@ -1340,7 +1340,7 @@ test("streamStringAsSSE empty content: role + stop + [DONE] only", () => {
 });
 
 // ── Suite: TUI transcript reader ────────────────────────────────────────
-import { encodeCwd, transcriptPath, findTranscriptPath, parseTranscriptLines, isTerminalLine, extractLatestAssistantText, verifyEntrypoint } from "./lib/tui/transcript.mjs";
+import { encodeCwd, transcriptPath, findTranscriptPath, parseTranscriptLines, isTerminalLine, extractLatestAssistantText, verifyEntrypoint, detectTuiUpstreamError } from "./lib/tui/transcript.mjs";
 import { readFileSync as tuiReadFileSync, mkdtempSync as tuiMkdtemp0, mkdirSync as tuiMkdir0, writeFileSync as tuiWrite0 } from "node:fs";
 import { tmpdir as tuiTmp0 } from "node:os";
 
@@ -1436,6 +1436,173 @@ test("real complete fixture: verifyEntrypoint returns 'cli'", () => {
   assert.equal(verifyEntrypoint(evs), "cli");
 });
 
+// ── C-3 (#133): verifyEntrypoint is version-robust ───────────────────────
+// Some claude builds do NOT emit a turn_duration line; entrypoint lives on
+// ordinary lines on BOTH emitting and non-emitting builds. Reading ONLY
+// turn_duration made the server.mjs tui_entrypoint_mismatch assertion get null
+// every turn on non-emitting builds. verifyEntrypoint must fall back to ANY line.
+console.log("\nTUI transcript — verifyEntrypoint version-robustness (C-3, #133):");
+
+test("verifyEntrypoint PREFERS the turn_duration line's entrypoint", () => {
+  // turn_duration says "cli"; an earlier ordinary line says "sdk-cli" — the
+  // authoritative turn_duration value must win, not last-writer-wins on the fallback.
+  const evs = [
+    { type: "assistant", entrypoint: "sdk-cli", message: { content: [{ type: "text", text: "x" }] } },
+    { type: "system", subtype: "turn_duration", entrypoint: "cli" },
+  ];
+  assert.equal(verifyEntrypoint(evs), "cli");
+});
+test("verifyEntrypoint falls back to entrypoint on an ordinary assistant line when no turn_duration", () => {
+  const evs = [
+    { type: "user", entrypoint: "cli", message: { content: "hi" } },
+    { type: "assistant", entrypoint: "cli", message: { stop_reason: "end_turn", content: [{ type: "text", text: "ok" }] } },
+  ];
+  assert.equal(verifyEntrypoint(evs), "cli");
+});
+test("verifyEntrypoint returns null when NO line carries an entrypoint", () => {
+  const evs = [
+    { type: "assistant", message: { stop_reason: "end_turn", content: [{ type: "text", text: "ok" }] } },
+  ];
+  assert.equal(verifyEntrypoint(evs), null);
+});
+test("real no-turn_duration fixture: verifyEntrypoint still resolves 'cli' (was null before C-3)", () => {
+  const evs = parseTranscriptLines(tuiReadFileSync("./lib/tui/fixtures/no-turn-duration.jsonl", "utf8"));
+  // Sanity: the fixture genuinely lacks a turn_duration line (so this exercises the fallback).
+  assert.ok(!evs.some((e) => e && e.type === "system" && e.subtype === "turn_duration"), "fixture must NOT emit turn_duration");
+  assert.equal(verifyEntrypoint(evs), "cli");
+});
+
+// ── C-1 (#133): honest AUTH-FAILURE banner detection ─────────────────────
+// The interactive claude CLI renders in-session errors as ordinary assistant text.
+// C-1 catches the R-1 case: expired/invalid creds, where EVERY turn returns the same
+// one-line auth-failure banner and OCP would cache it as a real answer. The detector
+// is deliberately NARROW/conservative: a false-positive (killing a real long answer
+// that merely DISCUSSES an API error) costs the user a missing answer + a double-burn
+// retry, which is worse than the rare false-negative (caching one transient error for
+// the 5-min TTL). Signal = ALL of: SHORT whole-message (≤100; live samples 69/73) AND
+// "API Error: 4xx" AND an auth keyword (authenticat | /login | credential) AND NO
+// backtick/quote char. When unsure → PASS. The earlier generalised rule
+// (^<short-prefix>?API Error:\d{3}.*$) was TOO BROAD: its unbounded .* tail killed
+// legit long answers; this block encodes the full narrowed matrix.
+console.log("\nTUI transcript — auth-failure banner detection (C-1, #133):");
+
+// ---- Required matrix: MUST detect (kill) ----
+test("C-1 KILL: live /login 401 auth banner", () => {
+  const banner = "Please run /login · API Error: 401 Invalid authentication credentials";
+  assert.equal(detectTuiUpstreamError(banner), banner);
+});
+test("C-1 KILL: live 'Failed to authenticate.' 401 banner variant", () => {
+  // Second real PI231 banner: a different short auth-failure prefix before the same
+  // "API Error: 4xx" core. Still short, still 4xx, still has 'authenticate'/'credentials'.
+  const banner = "Failed to authenticate. API Error: 401 Invalid authentication credentials";
+  assert.equal(detectTuiUpstreamError(banner), banner);
+});
+
+// ---- Required matrix: MUST NOT kill (pass) ----
+test("C-1 PASS: long answer discussing a 500 (not 4xx, too long)", () => {
+  // The exact false-positive the over-broad .* rule produced. 166 chars; 5xx.
+  const legit = "API Error: 500 happened because the server was overloaded. To fix this, retry with exponential backoff and verify your rate limits before resending the request again.";
+  assert.equal(detectTuiUpstreamError(legit), null);
+});
+test("C-1 PASS: long answer with 'API Error: 401 details' (too long, no auth keyword)", () => {
+  // 142 chars; the literal word 'authenticate'/'credential'/'/login' never appears, and
+  // it is far over the length cap — rejected on length AND keyword.
+  const legit = "Failed to parse the config. Here are the API Error: 401 details you asked about: the token expired and must be refreshed before the next call.";
+  assert.equal(detectTuiUpstreamError(legit), null);
+});
+test("C-1 PASS: 'To debug a 401 … API Error: 401 Unauthorized' (no auth keyword)", () => {
+  // 91 chars (short!) and 4xx, but 'Unauthorized' is authoriz-, not authenticat-, and
+  // there is no /login or credential — the auth-keyword signal rejects it.
+  const legit = "To debug a 401: the server returns API Error: 401 Unauthorized, then you refresh the token.";
+  assert.equal(detectTuiUpstreamError(legit), null);
+});
+test("C-1 PASS: handler answer logging 'API Error: 503' (not 4xx)", () => {
+  const legit = "Here is the handler you asked for. It logs the string API Error: 503 on failure and retries.";
+  assert.equal(detectTuiUpstreamError(legit), null);
+});
+test("C-1 PASS: short instructional answer quoting `API Error: 401` + /login (has backtick)", () => {
+  // 75 chars: short, 4xx, has '/login' — passes signals 1-3. Rejected ONLY by the
+  // backtick/quote constraint: it QUOTES the error in code formatting, it is not the banner.
+  const legit = "You'll see `API Error: 401` when your token expires — run /login to fix it.";
+  assert.equal(detectTuiUpstreamError(legit), null);
+});
+test("C-1 PASS: bare HTTP-status sentence (no 'API Error:' core)", () => {
+  assert.equal(detectTuiUpstreamError("HTTP 401 means unauthorized."), null);
+});
+test("C-1 PASS: plain unrelated answer", () => {
+  assert.equal(detectTuiUpstreamError("The capital of France is Paris."), null);
+});
+
+// ---- Supporting / regression coverage ----
+test("C-1 PASS: transient 5xx banner is NOT detected (narrowed to 4xx auth only)", () => {
+  // The old rule flagged any 3-digit code; the narrowed detector is 4xx-only by design
+  // (5xx is transient/server-side, not the R-1 auth case). Accepted false-negative.
+  assert.equal(detectTuiUpstreamError("API Error: 500 Internal Server Error"), null);
+});
+test("C-1 PASS: bare 4xx with no auth keyword is NOT detected", () => {
+  // 'API Error: 403 Forbidden' alone — 4xx and short, but no authenticat/login/credential.
+  assert.equal(detectTuiUpstreamError("API Error: 403 Forbidden"), null);
+});
+test("detectTuiUpstreamError trims surrounding whitespace before matching", () => {
+  const out = detectTuiUpstreamError("\n\n  Please run /login · API Error: 401 credential boom  \n");
+  assert.equal(out, "Please run /login · API Error: 401 credential boom");
+});
+test("detectTuiUpstreamError is case-insensitive on the banner keywords", () => {
+  // lower-cased: /login + api error: 401 + 'credential' keyword, short, no code char.
+  assert.ok(detectTuiUpstreamError("please run /login · api error: 401 bad credential") !== null);
+});
+test("detectTuiUpstreamError does NOT match prose that mentions an API error mid-paragraph (#133 regression guard)", () => {
+  // A long, legit answer that merely discusses an API error — rejected on length alone.
+  const para = "When integrating with the upstream service you may occasionally hit an API Error: 401 response if the bearer token has lapsed; the recommended remediation is to re-run the login flow and retry the request with a fresh credential, after which the 401 should clear.";
+  assert.equal(detectTuiUpstreamError(para), null);
+});
+test("detectTuiUpstreamError does NOT match a long plain-text auth answer with NO code chars (length cap is load-bearing)", () => {
+  // 226 chars, no backtick/quote, has 4xx + /login + credential + authenticate — passes
+  // signals 2-4. ONLY the length cap rejects it. Guards against dropping the cap.
+  const para = "If you call the endpoint without a bearer token the API Error: 401 response tells you the credential is missing; just authenticate again with /login and the request will succeed on the next attempt without any further changes.";
+  assert.equal(detectTuiUpstreamError(para), null);
+});
+test("detectTuiUpstreamError returns null on empty / whitespace / non-string", () => {
+  assert.equal(detectTuiUpstreamError(""), null);
+  assert.equal(detectTuiUpstreamError("   \n  "), null);
+  assert.equal(detectTuiUpstreamError(null), null);
+  assert.equal(detectTuiUpstreamError(undefined), null);
+  assert.equal(detectTuiUpstreamError(42), null);
+});
+test("detectTuiUpstreamError respects CLAUDE_TUI_ERROR_PATTERNS override (custom banner)", () => {
+  // Override with a single custom pattern; the default 401 banner no longer matches,
+  // but the custom one does (anchored whole-text).
+  assert.equal(detectTuiUpstreamError("Please run /login · API Error: 401 x", "Session expired, please re-auth"), null);
+  assert.equal(detectTuiUpstreamError("Session expired, please re-auth", "Session expired, please re-auth"), "Session expired, please re-auth");
+});
+test("detectTuiUpstreamError with an empty override disables detection (escape hatch)", () => {
+  assert.equal(detectTuiUpstreamError("API Error: 500 boom", ""), null);
+  assert.equal(detectTuiUpstreamError("API Error: 500 boom", "   "), null);
+});
+test("detectTuiUpstreamError override accepts '||'-separated patterns", () => {
+  const raw = "First banner||Second banner";
+  assert.equal(detectTuiUpstreamError("First banner", raw), "First banner");
+  assert.equal(detectTuiUpstreamError("Second banner", raw), "Second banner");
+  assert.equal(detectTuiUpstreamError("Third", raw), null);
+});
+test("real error fixture: latest assistant text IS the banner and detectTuiUpstreamError flags it", () => {
+  const evs = parseTranscriptLines(tuiReadFileSync("./lib/tui/fixtures/error-401.jsonl", "utf8"));
+  const text = extractLatestAssistantText(evs);
+  assert.equal(text, "Please run /login · API Error: 401 Invalid authentication credentials");
+  assert.ok(detectTuiUpstreamError(text) !== null, "error fixture's final turn must be flagged as an upstream error");
+});
+test("real error fixture (Failed-to-authenticate variant): final turn is flagged (#133 runtime gap)", () => {
+  const evs = parseTranscriptLines(tuiReadFileSync("./lib/tui/fixtures/error-401-failauth.jsonl", "utf8"));
+  const text = extractLatestAssistantText(evs);
+  assert.equal(text, "Failed to authenticate. API Error: 401 Invalid authentication credentials");
+  assert.ok(detectTuiUpstreamError(text) !== null, "Failed-to-authenticate banner must be flagged as an upstream error");
+});
+test("real complete fixture: final answer is NOT flagged as an upstream error", () => {
+  const evs = parseTranscriptLines(tuiReadFileSync("./lib/tui/fixtures/complete-haiku.jsonl", "utf8"));
+  const text = extractLatestAssistantText(evs);
+  assert.equal(detectTuiUpstreamError(text), null);
+});
+
 // ── TUI transcript — polling reader (async) ──────────────────────────────
 import { readTuiTranscript } from "./lib/tui/transcript.mjs";
 import { mkdtempSync as tuiMkdtemp, writeFileSync as tuiWriteFile } from "node:fs";
@@ -1455,12 +1622,30 @@ await asyncTest("readTuiTranscript returns assistant text when terminal marker p
   assert.equal(out.entrypoint, "cli");
 });
 
-await asyncTest("readTuiTranscript honours wall-clock cap and returns partial text", async () => {
+// C-2 (#133): the terminal-marker path must signal a COMPLETE turn.
+await asyncTest("readTuiTranscript signals truncated:false when a terminal marker is hit (complete turn)", async () => {
   const dir = tuiMkdtemp(`${tuiTmpdir()}/tui-`);
   const p = `${dir}/s.jsonl`;
+  tuiWriteFile(p, [
+    JSON.stringify({ type: "assistant", message: { content: [{ type: "text", text: "done" }] } }),
+    JSON.stringify({ type: "system", subtype: "turn_duration", durationMs: 1200, entrypoint: "cli" }),
+  ].join("\n") + "\n");
+  const out = await readTuiTranscript({ transcriptPath: p, wallclockMs: 2000, pollMs: 50 });
+  assert.equal(out.truncated, false);
+});
+
+// C-2 (#133): cap-with-partial-text must be DISTINGUISHABLE from a complete turn.
+// Previously both returned {text, entrypoint} identically and the partial was cached
+// + returned as finish_reason:stop. The cap path now returns truncated:true so the
+// caller (callClaudeTui) can throw instead of serving a cut-off answer.
+await asyncTest("readTuiTranscript honours wall-clock cap and flags partial text truncated:true", async () => {
+  const dir = tuiMkdtemp(`${tuiTmpdir()}/tui-`);
+  const p = `${dir}/s.jsonl`;
+  // No terminal marker → reader will spin to the cap then return the partial.
   tuiWriteFile(p, JSON.stringify({ type: "assistant", message: { content: [{ type: "text", text: "partial" }] } }) + "\n");
   const out = await readTuiTranscript({ transcriptPath: p, wallclockMs: 300, pollMs: 50 });
   assert.equal(out.text, "partial");
+  assert.equal(out.truncated, true);
 });
 
 await asyncTest("readTuiTranscript against real fixture: entrypoint is 'cli'", async () => {
@@ -1699,7 +1884,7 @@ function _tuiPromptLanded(pane, prompt) {
   if (flatPane.includes("[Pasted text")) return true;
   const firstLine = String(prompt).split("\n").map(s => s.trim()).find(Boolean) || "";
   const needle = firstLine.replace(/\s+/g, " ").slice(0, 24);
-  return needle.length >= 3 && flatPane.includes(needle);
+  return needle.length >= 2 && flatPane.includes(needle); // C-4 (#133): 3 → 2 (see lib/tui/session.mjs)
 }
 
 // Real captured pane samples (empirically confirmed via live capture-pane on PI231,
@@ -1731,11 +1916,22 @@ test("tuiPromptLanded(READY_PANE, 'Reply with exactly: PONG_TEST') === false  (s
 test("tuiPromptLanded(LANDED_PANE, 'Reply with exactly: PONG_TEST') === true  (prompt prefix visible)", () => {
   assert.equal(_tuiPromptLanded(TUI_LANDED_PANE, "Reply with exactly: PONG_TEST"), true);
 });
-test("tuiPromptLanded(READY_PANE, 'ping') === false  (needle <3 chars, placeholder present)", () => {
+test("tuiPromptLanded(READY_PANE, 'ping') === false  (prompt text absent from placeholder pane)", () => {
   assert.equal(_tuiPromptLanded(TUI_READY_PANE, "ping"), false);
 });
 test("tuiPromptLanded('❯ ping\\n  ? for shortcuts', 'ping') === true  (needle present, no placeholder)", () => {
   assert.equal(_tuiPromptLanded("❯ ping\n  ? for shortcuts", "ping"), true);
+});
+// C-4 (#133): short prompts (1–2 char first line) MUST be able to land. Threshold
+// lowered 3 → 2. A 2-char prompt ("hi") present in the pane now lands instead of
+// 5s-failing with tui_paste_not_landed every time (live-reproduced: "hi").
+test("tuiPromptLanded('❯ hi\\n  ? for shortcuts', 'hi') === true  (2-char prompt lands — C-4)", () => {
+  assert.equal(_tuiPromptLanded("❯ hi\n  ? for shortcuts", "hi"), true);
+});
+// False-positive guard for the lowered threshold: a 2-char needle ABSENT from the
+// still-empty placeholder pane must NOT land (no spurious Enter into an empty box).
+test("tuiPromptLanded(READY_PANE, 'hi') === false  (2-char prompt not yet visible — no false positive)", () => {
+  assert.equal(_tuiPromptLanded(TUI_READY_PANE, "hi"), false);
 });
 // issue #130 root cause: a big bracketed paste shows "[Pasted text #N +M lines]" — must be landed.
 test("tuiPromptLanded(bracketed-paste pane, big prompt) === true", () => {
