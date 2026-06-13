@@ -1,7 +1,7 @@
 # ADR 0007 — TUI Interactive Mode (subscription-pool bridge)
 
 **Date:** 2026-05-31
-**Status:** Accepted — amended by PR-4 (entrypoint hardening)
+**Status:** Accepted — amended by PR-4 (entrypoint hardening), PR-B (observability + concurrency), PR-C (env-token auth + defunct-reaping), PR-D (credential-isolated home — corrects PR-C)
 **Deciders:** project maintainer
 **Authority:** claude CLI v2.1.158 interactive mode — verified live on the test host that sessions launched without `-p` / `--output-format` carry `cc_entrypoint=cli` (subscription pool), not `cc_entrypoint=sdk-cli` (Agent SDK credit pool). Mechanism verified on cli.js v2.1.104; live-confirmed on v2.1.158.
 
@@ -98,12 +98,16 @@ When `CLAUDE_TUI_MODE` is unset (the default), no code path touches `callClaudeT
 
 Unset `CLAUDE_TUI_MODE` (or set it to any value other than `"true"`) → stream-json path restored immediately on next restart.
 
-### Home strategy (real-home default)
+### Home strategy
 
-`TUI_HOME = OCP_TUI_HOME || HOME` (defaults to the operator's real home).
+> **Superseded by the PR-D amendment below for the env-token case.** As of PR-D, `TUI_HOME`
+> is computed by `resolveTuiHome()`: when `CLAUDE_CODE_OAUTH_TOKEN` is set (and `OCP_TUI_HOME`
+> is unset) the default is a **credential-free scratch home**, not the real home. The
+> descriptions below remain accurate for the **no-env-token** case and the **explicit
+> `OCP_TUI_HOME` override** case.
 
-- **Real-home (default, `OCP_TUI_HOME` unset):** claude runs with the operator's own `~/.claude/` — shared credentials, existing onboarding, no OAuth fork risk. `ensureTuiCwdTrusted` seeds the trust record for the scratch cwd in the real `~/.claude.json` (atomic write).
-- **Scratch-home opt-in (`OCP_TUI_HOME=<path>`):** a dedicated `HOME` that symlinks `~/.claude/.credentials.json` from the real home (token is never copied) and seeds a stripped `~/.claude.json` (no project history, trusts only the scratch cwd). **Caveat:** claude rewrites `.credentials.json` on OAuth token refresh, replacing the symlink with a regular file — this forks the credentials. Use scratch-home only with a dedicated OAuth or for ephemeral testing.
+- **Real-home (default when NO env token, `OCP_TUI_HOME` unset):** claude runs with the operator's own `~/.claude/` — shared credentials, existing onboarding, no OAuth fork risk. `ensureTuiCwdTrusted` seeds the trust record for the scratch cwd in the real `~/.claude.json` (atomic write).
+- **Scratch-home opt-in (`OCP_TUI_HOME=<path>`, no env token):** a dedicated `HOME` that symlinks `~/.claude/.credentials.json` from the real home (token is never copied) and seeds a stripped `~/.claude.json` (no project history, trusts only the scratch cwd). **Caveat:** claude rewrites `.credentials.json` on OAuth token refresh, replacing the symlink with a regular file — this forks the credentials. Use this legacy symlink mode only with a dedicated OAuth or for ephemeral testing. (The PR-D env-token mode avoids this caveat entirely — no credentials file to fork.)
 
 ### Working directory
 
@@ -231,6 +235,79 @@ This amendment **is** that authorization. The argument:
 | Env var | Default | Meaning |
 |---|---|---|
 | `OCP_TUI_MAX_CONCURRENT` | `2` | Max concurrent interactive TUI turns. Independent of `CLAUDE_MAX_CONCURRENT` (the stream-json path). Excess turns queue (bounded); a full queue yields a 503. |
+
+---
+
+## Authentication + defunct-reaping (PR-C amendment)
+
+**Date:** 2026-06-13
+**Status:** Accepted — amends ADR 0007.
+**Motivation:** the PI231 production incident — TUI-mode returned `Please run /login · API Error: 401` for days; re-login never stuck.
+
+### How the TUI `claude` authenticates
+
+The spawned interactive `claude` obtains its OAuth bearer in one of two ways, in this order of preference:
+
+1. **`CLAUDE_CODE_OAUTH_TOKEN` in env (PREFERRED).** If the env var is set on the OCP process, `buildTuiCmd` adds `CLAUDE_CODE_OAUTH_TOKEN=<shq-escaped token>` to the pane command's `env` prefix. claude then authenticates via this long-lived token and **never touches the credentials-refresh path**. This is the stable mode — it is exactly how the oracle and Mac-mini hosts already run (and how `server.mjs`'s own `getOAuthCredentials()` takes the same env at highest precedence). cli.js is **not** the authority here: this is a Class B, OCP-owned TUI spawn — see the Class B citation below.
+2. **`<HOME>/.claude/.credentials.json` (FALLBACK).** When the env var is unset, claude falls back to the credentials file and its short-lived access token, renewing via the single-use refresh token.
+
+The token MUST be set explicitly in `buildTuiCmd` because **tmux does not forward the parent process's environment to the pane** (verified live 2026-06-01 — the same reason the whole env is delivered as an `env` prefix). A token sitting in the OCP process env is invisible to the pane unless `buildTuiCmd` re-emits it.
+
+### Why the fallback path corrupts (the PI231 incident)
+
+When the env token is absent, every per-request spawn drives claude through the credentials.json refresh path. OAuth refresh tokens are **single-use / rotating**: a refresh consumes the old refresh token and writes a new one. The per-request `kill-session` teardown can race / interrupt claude mid-rotation, and over many spawn+kill cycles the refresh token ended up an **empty string** — at which point renewal is impossible and the host returns a permanent 401. Re-login writes a fresh token, but the next spawn re-corrupts it. **Proof the env-token fix works:** on the broken PI231 host, `CLAUDE_CODE_OAUTH_TOKEN=<oat01 token> claude -p ...` returned a real answer *despite* the corrupt credentials.json (control without the env token = 401).
+
+**Operator guidance:** set `CLAUDE_CODE_OAUTH_TOKEN` on any TUI-mode host. The credentials.json fallback is retained only for hosts that intentionally rely on it; it is not recommended for a long-running TUI deployment.
+
+**Security note:** with the token in the pane command, it is visible in `ps`. This is acceptable for the **single-user A-path** (it mirrors the existing plaintext-token practice for `server.mjs`), and the **multi-user B-path is already refused at boot** (`CLAUDE_TUI_MODE=true` + `AUTH_MODE=multi` is a hard FATAL), so a guest can never reach this spawn.
+
+### Defunct `<claude>` reaping
+
+The connected leak: the pane's `claude` process is a child of the long-lived **tmux server** daemon, not of the OCP node process (`tmux new-session -d` returns the instant the server forks the pane). Node can therefore never `waitpid()`/reap it — a SIGKILL still needs the *parent* (the tmux server) to reap. `kill-session` destroys the session but leaves the pane's `claude` (and its grandchildren) as `<defunct>` zombies that only the server reaps; over 30 days on PI231 this accumulated to **25 defunct `<claude>`** (a live `tmux kill-server` dropped it 25→3).
+
+The node-reachable action that *actually reaps* — rather than merely re-signalling — is to stop the tmux server: on server exit the kernel reparents survivors to init (PID 1), which reaps them. `reapStaleTuiSessions` therefore, after killing our own `ocp-tui-*` sessions, issues `kill-server` **only when no foreign session of any prefix remains** (coexistence: never disrupt a co-hosted `olp-tui-*` instance). This runs at boot (existing) and now on a 15-min periodic interval gated on TUI-mode and on the TUI path being idle (`inflight === 0 && queued === 0`) so a live turn's pane is never torn down. Residual: a request whose pane is created in the narrow window between the idle-check and `kill-server` would fail cleanly via the existing honesty gates (rare; documented in the server comment).
+
+### ALIGNMENT authorization (Class B)
+
+Both changes are **Class B** (OCP-owned TUI spawn). `cli.js` does not perform either operation — there is no `cli.js` analogue for "how the TUI pane authenticates" or "reaping tmux-server-owned zombies"; this surface is authorized by **this ADR (0007)** per `ALIGNMENT.md`'s Class B citation requirement. No Class A wire surface, no endpoint shape, no `alignment.yml` blacklist token, and no `models.json` entry is touched.
+
+---
+
+## Credential-isolated home for env-token auth (PR-D amendment)
+
+**Date:** 2026-06-13
+**Status:** Accepted — amends ADR 0007. **Corrects** the PR-C rationale and the original "Home strategy" section's scratch-home caveat.
+**Motivation:** PR-C's env-token passing alone did **not** fix the PI231 401. Decisive live evidence (claude 2.1.104, PI231):
+
+| Condition | Result |
+|---|---|
+| env token passed + a broken `~/.claude/.credentials.json` present | **401** (`Please run /login · API Error: 401`) |
+| env token passed + `credentials.json` moved aside | **works** (real answer) |
+
+### Corrected root cause
+
+**Interactive `claude` PREFERS `~/.claude/.credentials.json` over the `CLAUDE_CODE_OAUTH_TOKEN` env var.** A stale/corrupt `credentials.json` therefore **shadows** the env token. (This is *unlike* `-p` mode, where the env token wins — which is why `server.mjs`'s own `getOAuthCredentials()` is unaffected and why PR-C's premise looked sufficient.) So passing the token (PR-C, `buildTuiCmd`) is **necessary but insufficient**: the TUI `claude` must additionally run in a HOME that has **no `credentials.json`**, so the env token is the only credential and is authoritative.
+
+This also fixes the original incident at the **root**, more completely than PR-C claimed: with no `credentials.json` in the home, claude never runs the token-refresh path at all, so the single-use refresh token can never be rotated — and therefore never corrupted — by the spawn+`kill-session` cycle. The 25-zombie / empty-refresh-token failure mode becomes structurally impossible, not merely avoided.
+
+### Decision
+
+When `CLAUDE_CODE_OAUTH_TOKEN` is set, the TUI `claude` runs in a **credential-free scratch home** by default:
+
+- `resolveTuiHome({ realHome, configuredHome, envTokenSet })` (exported from `lib/tui/session.mjs`, pure) decides the home:
+  - **`OCP_TUI_HOME` set** → that path (explicit override, back-compat — an operator who configured it keeps exactly that home).
+  - **else env token set** → `<realHome>/.ocp-tui/home` — a dedicated scratch home seeded with a minimal `.claude.json` (`hasCompletedOnboarding=true` + trust **only** the scratch cwd) and its own `projects/` dir, and **deliberately NO `.credentials.json`** (no symlink, no copy).
+  - **else (no env token)** → the operator's real home — **byte-for-byte the pre-fix behaviour** for hosts that intentionally rely on `credentials.json`.
+- `prepareTuiHome(realHome, tuiHome, cwd, { envTokenMode })` gates the credential handling: in `envTokenMode` it creates the scratch `projects/` dir and seeds the minimal trusted `.claude.json` but **never** creates the credentials symlink. `runTuiTurn` sets `envTokenMode = !!CLAUDE_CODE_OAUTH_TOKEN && ehome !== realHome`.
+- `readTuiTranscript` reads from the **same** home claude runs under (`ehome`), so transcripts land under `<scratch home>/.claude/projects/` and `findTranscriptPath` globs them there — the home is threaded through consistently. (We chose scratch-`HOME` over `CLAUDE_CONFIG_DIR`: the binary supports `CLAUDE_CONFIG_DIR`, but it relocates the transcript root to `<CONFIG_DIR>/projects/` rather than `<HOME>/.claude/projects/`, which would fork the transcript-resolution rule across modes for no benefit. The scratch-HOME lever reuses the existing, tested `prepareTuiHome`/`ehome` plumbing.)
+
+### This RESOLVES — not reintroduces — the scratch-home caveat
+
+The original "Home strategy" section and PR-C's `prepareTuiHome` comment warned that scratch-home is unsafe because *claude rewrites a **symlinked** `.credentials.json` on token refresh → forks/corrupts the OAuth credentials*. **That caveat does not apply to env-token mode**: there is no `credentials.json` in the home to fork, and claude never refreshes (it uses the long-lived env token), so there is no rotation and no corruption. The fork risk was inherent to the *symlink* approach; removing the credentials file entirely removes the risk. The legacy symlink mode is retained **only** for an operator who explicitly sets `OCP_TUI_HOME` without an env token, and its caveat is preserved for exactly that path.
+
+### ALIGNMENT authorization (Class B)
+
+**Class B** (OCP-owned TUI spawn). `cli.js` has no analogue for the TUI pane's auth/home strategy; authorized by **this ADR (0007)** per `ALIGNMENT.md`'s Class B citation requirement. `server.mjs` is touched only to compute `TUI_HOME` via `resolveTuiHome()` (TUI wiring) and to surface the auth mode in the boot log — no Class A wire surface, no endpoint shape, no `alignment.yml` blacklist token, and no `models.json` entry is touched.
 
 ---
 

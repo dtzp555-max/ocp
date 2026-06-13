@@ -1691,6 +1691,52 @@ test("buildTuiCmd keeps version pin + entrypoint label + MCP wall", () => {
   assert.ok(/-u CLAUDE_CODE_ENTRYPOINT/.test(auto), "auto mode unsets any inherited entrypoint");
 });
 
+// CLAUDE_CODE_OAUTH_TOKEN passthrough (PI231 401 incident): tmux doesn't forward the parent
+// env to the pane, so the token must be set explicitly on the pane command or the TUI claude
+// falls back to credentials.json (whose refresh token gets corrupted by the spawn/kill cycle).
+test("buildTuiCmd passes CLAUDE_CODE_OAUTH_TOKEN when the env is set (shq-escaped)", () => {
+  const save = process.env.CLAUDE_CODE_OAUTH_TOKEN;
+  try {
+    process.env.CLAUDE_CODE_OAUTH_TOKEN = "sk-ant-oat01-abc123";
+    const cmd = buildTuiCmd("/usr/bin/claude", "m", "sid-tok", "/home/u", "cli");
+    // shq wraps in single quotes; a plain token renders as 'token'.
+    assert.ok(cmd.includes("CLAUDE_CODE_OAUTH_TOKEN='sk-ant-oat01-abc123'"),
+      "token must be set on the pane command, shq-escaped");
+  } finally {
+    if (save === undefined) delete process.env.CLAUDE_CODE_OAUTH_TOKEN;
+    else process.env.CLAUDE_CODE_OAUTH_TOKEN = save;
+  }
+});
+
+test("buildTuiCmd does NOT add CLAUDE_CODE_OAUTH_TOKEN when the env is unset", () => {
+  const save = process.env.CLAUDE_CODE_OAUTH_TOKEN;
+  try {
+    delete process.env.CLAUDE_CODE_OAUTH_TOKEN;
+    const cmd = buildTuiCmd("/usr/bin/claude", "m", "sid-notok", "/home/u", "cli");
+    assert.ok(!/CLAUDE_CODE_OAUTH_TOKEN/.test(cmd),
+      "no token added when env unset (credentials.json-only hosts unaffected)");
+  } finally {
+    if (save === undefined) delete process.env.CLAUDE_CODE_OAUTH_TOKEN;
+    else process.env.CLAUDE_CODE_OAUTH_TOKEN = save;
+  }
+});
+
+test("buildTuiCmd shq-escapes a token containing shell metacharacters (no injection)", () => {
+  const save = process.env.CLAUDE_CODE_OAUTH_TOKEN;
+  try {
+    // A token with a single quote must be escaped via the '\'' idiom so it can't break out
+    // of the shell string tmux runs via sh -c.
+    process.env.CLAUDE_CODE_OAUTH_TOKEN = "tok'; rm -rf /;'";
+    const cmd = buildTuiCmd("/usr/bin/claude", "m", "sid-inj", "/home/u", "cli");
+    assert.ok(cmd.includes(`CLAUDE_CODE_OAUTH_TOKEN='tok'\\''; rm -rf /;'\\'''`),
+      "single quote must be shq-escaped, not left bare");
+    assert.ok(!/CLAUDE_CODE_OAUTH_TOKEN=tok'; rm/.test(cmd), "raw unescaped token must NOT appear");
+  } finally {
+    if (save === undefined) delete process.env.CLAUDE_CODE_OAUTH_TOKEN;
+    else process.env.CLAUDE_CODE_OAUTH_TOKEN = save;
+  }
+});
+
 test("buildTuiCmd OCP_TUI_FULL_TOOLS=1 grants -p-equivalent tool surface (single-user opt-in)", () => {
   const save = { ...process.env };
   const restore = () => {
@@ -1766,6 +1812,41 @@ test("reaper returns 0 for empty session list", () => {
   assert.equal(killed.length, 0);
 });
 
+// Defunct-zombie reaping (PI231 incident): the pane's claude is a child of the tmux server,
+// so only kill-server actually reaps it. We kill-server ONLY when no foreign session remains.
+console.log("\nTUI defunct-zombie reaping (kill-server):");
+
+test("reaper kill-servers when the server is ours-only (flush defunct claude zombies)", () => {
+  const calls = [];
+  const fakeTmux = (args) => {
+    calls.push(args.join(" "));
+    if (args[0] === "list-sessions") return { status: 0, stdout: "ocp-tui-aaaa\nocp-tui-bbbb\n" };
+    return { status: 0, stdout: "" };
+  };
+  const n = reapStaleTuiSessions({ tmux: fakeTmux });
+  assert.equal(n, 2, "killed both of our sessions");
+  assert.ok(calls.includes("kill-server"), "kill-server fired — reaps the defunct backlog");
+});
+
+test("reaper does NOT kill-server when a foreign (non-ocp) session remains (coexistence)", () => {
+  const calls = [];
+  const fakeTmux = (args) => {
+    calls.push(args.join(" "));
+    if (args[0] === "list-sessions") return { status: 0, stdout: "ocp-tui-aaaa\nolp-tui-bbbb\n" };
+    return { status: 0, stdout: "" };
+  };
+  const n = reapStaleTuiSessions({ tmux: fakeTmux });
+  assert.equal(n, 1, "killed only our own session");
+  assert.ok(!calls.includes("kill-server"), "kill-server MUST NOT fire — would disrupt olp-tui-*");
+});
+
+test("reaper does NOT kill-server when there is no server (status !== 0)", () => {
+  const calls = [];
+  const fakeTmux = (args) => { calls.push(args.join(" ")); return { status: 1, stdout: "" }; };
+  reapStaleTuiSessions({ tmux: fakeTmux });
+  assert.ok(!calls.includes("kill-server"), "no server → no kill-server (early return)");
+});
+
 // ── TUI home preparation (scratch vs real) ───────────────────────────────
 import { prepareTuiHome, ensureTuiCwdTrusted } from "./lib/tui/session.mjs";
 import { mkdtempSync as hMkdtemp, mkdirSync as hMkdir, writeFileSync as hWrite, readFileSync as hRead, existsSync as hExists, readlinkSync as hReadlink } from "node:fs";
@@ -1799,6 +1880,53 @@ test("prepareTuiHome real mode (tuiHome===realHome): no symlink, just trusts cwd
   assert.ok(!hExists(`${realHome}/.claude/.credentials.json`));        // no scratch symlink created
   const j = JSON.parse(hRead(`${realHome}/.claude.json`, "utf8"));
   assert.equal(j.projects[cwd].hasTrustDialogAccepted, true);         // cwd trusted in real config
+});
+
+// ── PR-D: env-token-only credential-isolated home (PI231 401 root fix) ──────
+// Interactive claude PREFERS ~/.claude/.credentials.json over CLAUDE_CODE_OAUTH_TOKEN, so a
+// stale/corrupt credentials.json SHADOWS the env token (proven live on PI231 — env token +
+// broken creds = 401; env token + creds moved aside = works). The fix runs the TUI claude in
+// a home with NO credentials.json so the env token is authoritative (and no refresh ever
+// happens → the single-use token can't be corrupted by the spawn+kill cycle).
+test("prepareTuiHome env-token mode: NO credentials.json (no symlink, no copy), .claude.json seeded", () => {
+  const realHome = hMkdtemp(`${hTmp()}/realT-`);
+  hMkdir(`${realHome}/.claude`, { recursive: true });
+  hWrite(`${realHome}/.claude/.credentials.json`, '{"token":"real-oauth"}');  // real creds DO exist…
+  hWrite(`${realHome}/.claude.json`, JSON.stringify({ theme: "dark", oauthAccount: { uuid: "secret" }, projects: { "/old/secret": { hasTrustDialogAccepted: true } } }));
+  const tuiHome = hMkdtemp(`${hTmp()}/scratchT-`);
+  const cwd = `${tuiHome}/work`;
+  prepareTuiHome(realHome, tuiHome, cwd, { envTokenMode: true });
+  // …but the scratch home has NO credentials file at all — neither symlink nor copy.
+  assert.ok(!hExists(`${tuiHome}/.claude/.credentials.json`), "env-token home must have NO .credentials.json (the whole point — no shadowing, no refresh)");
+  // .claude.json IS seeded: onboarding complete + ONLY the scratch cwd trusted (no dialog hang).
+  const seed = JSON.parse(hRead(`${tuiHome}/.claude.json`, "utf8"));
+  assert.equal(seed.hasCompletedOnboarding, true, "onboarding pre-completed → no onboarding dialog");
+  assert.equal(seed.projects[cwd].hasTrustDialogAccepted, true, "scratch cwd pre-trusted → no trust dialog");
+  // Minimal config: the credential-isolated home does NOT inherit the operator's account state.
+  assert.equal(seed.theme, undefined, "env-token home is minimal — real config not copied in");
+  assert.equal(seed.oauthAccount, undefined, "real account state not carried into the isolated home");
+  assert.equal(seed.projects["/old/secret"], undefined, "operator project history not carried in");
+  assert.ok(hExists(`${tuiHome}/.claude/projects`), "own projects/ dir for transcripts under the same home");
+});
+
+console.log("\nresolveTuiHome (env-token credential isolation, PR-D):");
+import { resolveTuiHome, DEFAULT_TUI_SCRATCH_HOME } from "./lib/tui/session.mjs";
+
+test("resolveTuiHome: env token set + OCP_TUI_HOME unset → credential-free scratch home", () => {
+  const h = resolveTuiHome({ realHome: "/home/u", configuredHome: undefined, envTokenSet: true });
+  assert.equal(h, DEFAULT_TUI_SCRATCH_HOME("/home/u"));
+  assert.equal(h, "/home/u/.ocp-tui/home");
+  assert.notEqual(h, "/home/u", "must NOT be the real home — real home has the shadowing credentials.json");
+});
+
+test("resolveTuiHome: env token UNSET → real home (legacy credentials.json path, unchanged)", () => {
+  const h = resolveTuiHome({ realHome: "/home/u", configuredHome: undefined, envTokenSet: false });
+  assert.equal(h, "/home/u", "no env token → real home, byte-for-byte the pre-fix behaviour");
+});
+
+test("resolveTuiHome: explicit OCP_TUI_HOME wins regardless of env token (back-compat)", () => {
+  assert.equal(resolveTuiHome({ realHome: "/home/u", configuredHome: "/custom/home", envTokenSet: true }), "/custom/home");
+  assert.equal(resolveTuiHome({ realHome: "/home/u", configuredHome: "/custom/home", envTokenSet: false }), "/custom/home");
 });
 
 // ── resolveTuiEntrypointEnv ───────────────────────────────────────────────
