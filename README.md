@@ -128,11 +128,12 @@ Before each step, tell me what you'll run and wait for confirmation.
 On any error, diagnose first — don't auto-retry.
 ```
 
-**LAN mode (server)** — install OCP as a server so your family or multiple devices can share it:
+**LAN mode (server)** — install OCP as a server so your own devices on the LAN can reach it (Claude Pro/Max are per-user accounts — review Anthropic's Usage Policy before extending access to other people):
 
 ```text
-I want to install OCP on this device as a LAN server so my family and other
-devices on the network can share my Claude Pro/Max subscription.
+I want to install OCP on this device as a LAN server so my own devices on the
+network can reach my Claude Pro/Max subscription through a local
+OpenAI-compatible endpoint.
 
 Please follow https://github.com/dtzp555-max/ocp/blob/main/README.md
 "Server Setup" → "LAN mode" path:
@@ -422,6 +423,7 @@ ocp keys revoke son-ipad   # Revoke a key
 - The per-key modes (`shared` / `multi`) give per-key **usage tracking, quotas, and cache separation** — useful for seeing who used what and capping budgets.
 - They do **not** give a **security isolation boundary**. The spawned `claude` runs with the **operator's filesystem access** and is *not* sandboxed per key. **Only share with people you fully trust, on a trusted network.**
 - For simple trusted family sharing, the easiest setup is a single shared **anonymous key** (see [Anonymous Access](#anonymous-access-optional)) — no per-person separation, same trust assumption.
+- **Account terms are your call.** Claude Pro/Max are *per-user* accounts, and Anthropic's Usage Policy governs who may use them. OCP is a localhost protocol adapter for your own tools and devices — it does not change your account terms, and whether any particular sharing setup complies with the Usage Policy is the account holder's responsibility. Review it before extending access to other people.
 
 **Real per-user isolation (sandboxed, multi-tenant-safe) is planned for after 2026-06-15** — per-key ephemeral home + tool lockdown + an OS sandbox. Until then, treat a multi-user OCP as a *trusted-group convenience*, not a security boundary. (This is also why `CLAUDE_TUI_MODE` is single-user-only — see [Subscription-pool (TUI) mode](#subscription-pool-tui-mode).)
 
