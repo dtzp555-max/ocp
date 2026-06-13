@@ -495,6 +495,28 @@ const cacheCleanupInterval = setInterval(() => {
   }
 }, 600000);
 
+// TUI defunct-session reap (periodic): the boot reap (below) only fires once, but a
+// long-lived host (PI231 ran 30 days without restart) accumulates defunct `<claude>`
+// zombies between restarts — the pane's claude is a child of the tmux server, not node,
+// so only the server can reap it (see reapStaleTuiSessions). We sweep every 15 min, but
+// ONLY when the TUI path is fully idle: reapStaleTuiSessions may `kill-server`, which would
+// tear down a live turn's pane, so we skip the sweep while any turn is inflight or queued.
+// RESIDUAL (documented, accepted): a brand-new request whose pane is created in the narrow
+// window between this idle-check and kill-server would have its pane torn down and fail the
+// turn cleanly via runTuiTurn's existing honesty gates (rare; the boot reap is the primary
+// mechanism and the 15-min cadence makes the window negligible).
+// Gated on TUI_MODE — zero effect (no kill-server, no list-sessions) when TUI is off.
+// cli.js does NOT perform this operation (Class B, OCP-owned TUI spawn) — see ADR 0007.
+const TUI_REAP_INTERVAL_MS = 15 * 60 * 1000;
+const tuiReapInterval = TUI_MODE ? setInterval(() => {
+  if (tuiSemaphore.inflight > 0 || tuiSemaphore.queued > 0) return; // a turn is live — defer
+  try {
+    const n = reapStaleTuiSessions();
+    if (n) logEvent("info", "tui_reaped_stale_sessions", { count: n, trigger: "periodic" });
+  } catch (e) { logEvent("error", "tui_periodic_reap_failed", { error: e.message }); }
+}, TUI_REAP_INTERVAL_MS) : null;
+if (tuiReapInterval && typeof tuiReapInterval.unref === "function") tuiReapInterval.unref();
+
 // ── Active child process tracking ────────────────────────────────────────
 const activeProcesses = new Set();
 
@@ -2284,6 +2306,7 @@ function gracefulShutdown(signal) {
   clearInterval(sessionCleanupInterval);
   clearInterval(authCheckInterval);
   clearInterval(cacheCleanupInterval);
+  if (tuiReapInterval) clearInterval(tuiReapInterval);
   closeDb();
 
   // 3. Kill all active child processes

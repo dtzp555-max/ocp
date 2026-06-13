@@ -234,6 +234,41 @@ This amendment **is** that authorization. The argument:
 
 ---
 
+## Authentication + defunct-reaping (PR-C amendment)
+
+**Date:** 2026-06-13
+**Status:** Accepted — amends ADR 0007.
+**Motivation:** the PI231 production incident — TUI-mode returned `Please run /login · API Error: 401` for days; re-login never stuck.
+
+### How the TUI `claude` authenticates
+
+The spawned interactive `claude` obtains its OAuth bearer in one of two ways, in this order of preference:
+
+1. **`CLAUDE_CODE_OAUTH_TOKEN` in env (PREFERRED).** If the env var is set on the OCP process, `buildTuiCmd` adds `CLAUDE_CODE_OAUTH_TOKEN=<shq-escaped token>` to the pane command's `env` prefix. claude then authenticates via this long-lived token and **never touches the credentials-refresh path**. This is the stable mode — it is exactly how the oracle and Mac-mini hosts already run (and how `server.mjs`'s own `getOAuthCredentials()` takes the same env at highest precedence). cli.js is **not** the authority here: this is a Class B, OCP-owned TUI spawn — see the Class B citation below.
+2. **`<HOME>/.claude/.credentials.json` (FALLBACK).** When the env var is unset, claude falls back to the credentials file and its short-lived access token, renewing via the single-use refresh token.
+
+The token MUST be set explicitly in `buildTuiCmd` because **tmux does not forward the parent process's environment to the pane** (verified live 2026-06-01 — the same reason the whole env is delivered as an `env` prefix). A token sitting in the OCP process env is invisible to the pane unless `buildTuiCmd` re-emits it.
+
+### Why the fallback path corrupts (the PI231 incident)
+
+When the env token is absent, every per-request spawn drives claude through the credentials.json refresh path. OAuth refresh tokens are **single-use / rotating**: a refresh consumes the old refresh token and writes a new one. The per-request `kill-session` teardown can race / interrupt claude mid-rotation, and over many spawn+kill cycles the refresh token ended up an **empty string** — at which point renewal is impossible and the host returns a permanent 401. Re-login writes a fresh token, but the next spawn re-corrupts it. **Proof the env-token fix works:** on the broken PI231 host, `CLAUDE_CODE_OAUTH_TOKEN=<oat01 token> claude -p ...` returned a real answer *despite* the corrupt credentials.json (control without the env token = 401).
+
+**Operator guidance:** set `CLAUDE_CODE_OAUTH_TOKEN` on any TUI-mode host. The credentials.json fallback is retained only for hosts that intentionally rely on it; it is not recommended for a long-running TUI deployment.
+
+**Security note:** with the token in the pane command, it is visible in `ps`. This is acceptable for the **single-user A-path** (it mirrors the existing plaintext-token practice for `server.mjs`), and the **multi-user B-path is already refused at boot** (`CLAUDE_TUI_MODE=true` + `AUTH_MODE=multi` is a hard FATAL), so a guest can never reach this spawn.
+
+### Defunct `<claude>` reaping
+
+The connected leak: the pane's `claude` process is a child of the long-lived **tmux server** daemon, not of the OCP node process (`tmux new-session -d` returns the instant the server forks the pane). Node can therefore never `waitpid()`/reap it — a SIGKILL still needs the *parent* (the tmux server) to reap. `kill-session` destroys the session but leaves the pane's `claude` (and its grandchildren) as `<defunct>` zombies that only the server reaps; over 30 days on PI231 this accumulated to **25 defunct `<claude>`** (a live `tmux kill-server` dropped it 25→3).
+
+The node-reachable action that *actually reaps* — rather than merely re-signalling — is to stop the tmux server: on server exit the kernel reparents survivors to init (PID 1), which reaps them. `reapStaleTuiSessions` therefore, after killing our own `ocp-tui-*` sessions, issues `kill-server` **only when no foreign session of any prefix remains** (coexistence: never disrupt a co-hosted `olp-tui-*` instance). This runs at boot (existing) and now on a 15-min periodic interval gated on TUI-mode and on the TUI path being idle (`inflight === 0 && queued === 0`) so a live turn's pane is never torn down. Residual: a request whose pane is created in the narrow window between the idle-check and `kill-server` would fail cleanly via the existing honesty gates (rare; documented in the server comment).
+
+### ALIGNMENT authorization (Class B)
+
+Both changes are **Class B** (OCP-owned TUI spawn). `cli.js` does not perform either operation — there is no `cli.js` analogue for "how the TUI pane authenticates" or "reaping tmux-server-owned zombies"; this surface is authorized by **this ADR (0007)** per `ALIGNMENT.md`'s Class B citation requirement. No Class A wire surface, no endpoint shape, no `alignment.yml` blacklist token, and no `models.json` entry is touched.
+
+---
+
 ## Consequences
 
 ### Positive
