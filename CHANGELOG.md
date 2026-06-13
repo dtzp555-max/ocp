@@ -1,5 +1,18 @@
 # Changelog
 
+## v3.20.1 — 2026-06-13
+
+TUI-mode auth hardening: fixes the recurring `Please run /login · API Error: 401` (the PI231 incident) and reaps leaked defunct `claude` sessions. ([#141](https://github.com/dtzp555-max/ocp/pull/141))
+
+### Fixed
+
+- **TUI 401 / credential corruption (#141)** — interactive `claude` prefers `~/.claude/.credentials.json` over the `CLAUDE_CODE_OAUTH_TOKEN` env var (unlike `-p` mode, where the env token wins). OCP TUI's per-request spawn + `kill-session` cycle raced claude's single-use refresh-token rotation, corrupting the refresh token to an empty string → permanent 401 that `claude /login` couldn't fix (each new spawn re-corrupted it). This bit Linux/file-based hosts specifically (macOS reads credentials from the Keychain, so Mac mini was immune). **Fix:** when `CLAUDE_CODE_OAUTH_TOKEN` is set, the TUI claude now runs in a credential-free scratch HOME (`<HOME>/.ocp-tui/home`, overridable by `OCP_TUI_HOME`) seeded with onboarding + cwd-trust but **no `.credentials.json`**, so the env token is the only credential and claude never runs the refresh path. Recurrence-proof — a later `claude login` can no longer break TUI. Also: `buildTuiCmd` passes `CLAUDE_CODE_OAUTH_TOKEN` to the spawn, and `reapStaleTuiSessions` reaps defunct `claude` sessions (tmux-server-owned zombies) via `kill-server` when no foreign session remains, plus a 15-min idle-gated periodic reap. When the env token is unset, behaviour is byte-for-byte unchanged (real-home + credentials.json). Two independent fresh-context reviewers (Iron Rule 10) + a live PI231 portability test (works with a corrupt credentials.json present). Authorized by the ADR 0007 PR-D amendment (Class B).
+
+### Environment variables
+
+- `CLAUDE_CODE_OAUTH_TOKEN` — when set on a TUI host, TUI authenticates via this long-lived token in a credential-isolated home (recommended; immune to credentials.json corruption).
+- `OCP_TUI_HOME` — overrides the TUI scratch home; if you previously pointed it at your real home, unset it to get the credential-isolated default.
+
 ## v3.20.0 — 2026-06-10
 
 TUI-mode billing-safety hardening for the 2026-06-15 Anthropic billing split. A 5-dimension multi-agent audit (adversarial verification + live tests on all three hosts — PI231 / Oracle / Mac mini, claude 2.1.104 / 2.1.114 / 2.1.170) found the TUI subscription-pool path could silently bill the metered Agent SDK pool or poison the cache under realistic failure modes. Three PRs, each with a fresh-context reviewer (Iron Rule 10) and CI; the default path (`CLAUDE_TUI_MODE` unset) is byte-for-byte unchanged.
