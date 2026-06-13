@@ -1882,6 +1882,53 @@ test("prepareTuiHome real mode (tuiHome===realHome): no symlink, just trusts cwd
   assert.equal(j.projects[cwd].hasTrustDialogAccepted, true);         // cwd trusted in real config
 });
 
+// ── PR-D: env-token-only credential-isolated home (PI231 401 root fix) ──────
+// Interactive claude PREFERS ~/.claude/.credentials.json over CLAUDE_CODE_OAUTH_TOKEN, so a
+// stale/corrupt credentials.json SHADOWS the env token (proven live on PI231 — env token +
+// broken creds = 401; env token + creds moved aside = works). The fix runs the TUI claude in
+// a home with NO credentials.json so the env token is authoritative (and no refresh ever
+// happens → the single-use token can't be corrupted by the spawn+kill cycle).
+test("prepareTuiHome env-token mode: NO credentials.json (no symlink, no copy), .claude.json seeded", () => {
+  const realHome = hMkdtemp(`${hTmp()}/realT-`);
+  hMkdir(`${realHome}/.claude`, { recursive: true });
+  hWrite(`${realHome}/.claude/.credentials.json`, '{"token":"real-oauth"}');  // real creds DO exist…
+  hWrite(`${realHome}/.claude.json`, JSON.stringify({ theme: "dark", oauthAccount: { uuid: "secret" }, projects: { "/old/secret": { hasTrustDialogAccepted: true } } }));
+  const tuiHome = hMkdtemp(`${hTmp()}/scratchT-`);
+  const cwd = `${tuiHome}/work`;
+  prepareTuiHome(realHome, tuiHome, cwd, { envTokenMode: true });
+  // …but the scratch home has NO credentials file at all — neither symlink nor copy.
+  assert.ok(!hExists(`${tuiHome}/.claude/.credentials.json`), "env-token home must have NO .credentials.json (the whole point — no shadowing, no refresh)");
+  // .claude.json IS seeded: onboarding complete + ONLY the scratch cwd trusted (no dialog hang).
+  const seed = JSON.parse(hRead(`${tuiHome}/.claude.json`, "utf8"));
+  assert.equal(seed.hasCompletedOnboarding, true, "onboarding pre-completed → no onboarding dialog");
+  assert.equal(seed.projects[cwd].hasTrustDialogAccepted, true, "scratch cwd pre-trusted → no trust dialog");
+  // Minimal config: the credential-isolated home does NOT inherit the operator's account state.
+  assert.equal(seed.theme, undefined, "env-token home is minimal — real config not copied in");
+  assert.equal(seed.oauthAccount, undefined, "real account state not carried into the isolated home");
+  assert.equal(seed.projects["/old/secret"], undefined, "operator project history not carried in");
+  assert.ok(hExists(`${tuiHome}/.claude/projects`), "own projects/ dir for transcripts under the same home");
+});
+
+console.log("\nresolveTuiHome (env-token credential isolation, PR-D):");
+import { resolveTuiHome, DEFAULT_TUI_SCRATCH_HOME } from "./lib/tui/session.mjs";
+
+test("resolveTuiHome: env token set + OCP_TUI_HOME unset → credential-free scratch home", () => {
+  const h = resolveTuiHome({ realHome: "/home/u", configuredHome: undefined, envTokenSet: true });
+  assert.equal(h, DEFAULT_TUI_SCRATCH_HOME("/home/u"));
+  assert.equal(h, "/home/u/.ocp-tui/home");
+  assert.notEqual(h, "/home/u", "must NOT be the real home — real home has the shadowing credentials.json");
+});
+
+test("resolveTuiHome: env token UNSET → real home (legacy credentials.json path, unchanged)", () => {
+  const h = resolveTuiHome({ realHome: "/home/u", configuredHome: undefined, envTokenSet: false });
+  assert.equal(h, "/home/u", "no env token → real home, byte-for-byte the pre-fix behaviour");
+});
+
+test("resolveTuiHome: explicit OCP_TUI_HOME wins regardless of env token (back-compat)", () => {
+  assert.equal(resolveTuiHome({ realHome: "/home/u", configuredHome: "/custom/home", envTokenSet: true }), "/custom/home");
+  assert.equal(resolveTuiHome({ realHome: "/home/u", configuredHome: "/custom/home", envTokenSet: false }), "/custom/home");
+});
+
 // ── resolveTuiEntrypointEnv ───────────────────────────────────────────────
 import { resolveTuiEntrypointEnv } from "./lib/tui/session.mjs";
 

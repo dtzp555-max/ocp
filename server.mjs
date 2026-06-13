@@ -38,7 +38,7 @@ import { homedir } from "node:os";
 import { validateKey, recordUsage, getUsageByKey, getUsageTimeline, getRecentUsage, createKey, listKeys, revokeKey, closeDb, checkQuota, updateKeyQuota, getKeyQuota, findKey, cacheHash, getCachedResponse, setCachedResponse, clearCache, getCacheStats, hasCacheControl, singleflight, getInflightStats } from "./keys.mjs";
 import { DEFAULT_PORT } from "./lib/constants.mjs";
 import { isLoopbackBind } from "./lib/net.mjs";
-import { runTuiTurn, reapStaleTuiSessions } from "./lib/tui/session.mjs";
+import { runTuiTurn, reapStaleTuiSessions, resolveTuiHome } from "./lib/tui/session.mjs";
 import { detectTuiUpstreamError } from "./lib/tui/transcript.mjs";
 import { TuiSemaphore, recordTuiEntrypoint, buildTuiHealthBlock } from "./lib/tui/semaphore.mjs";
 
@@ -300,7 +300,20 @@ let CACHE_TTL = parseInt(process.env.CLAUDE_CACHE_TTL || "0", 10); // 0 = disabl
 const TUI_MODE = process.env.CLAUDE_TUI_MODE === "true";
 const TUI_WALLCLOCK_MS = parseInt(process.env.CLAUDE_TUI_WALLCLOCK_MS || "120000", 10);
 const TUI_CWD  = process.env.OCP_TUI_CWD  || `${process.env.HOME}/.ocp-tui/work`;
-const TUI_HOME = process.env.OCP_TUI_HOME  || process.env.HOME;
+// HOME the interactive claude runs under. resolveTuiHome() decides:
+//   - OCP_TUI_HOME set            → that path (explicit override, back-compat).
+//   - else CLAUDE_CODE_OAUTH_TOKEN set → a CREDENTIAL-FREE scratch home
+//     (<HOME>/.ocp-tui/home) with NO .credentials.json, so the env token is the only
+//     credential and is authoritative — interactive claude otherwise PREFERS a
+//     credentials.json over the env var, so a stale one shadows the token (proven live on
+//     PI231) and a refresh on it can corrupt the single-use token. See ADR 0007 PR-D.
+//   - else (no env token)         → the operator's real home (legacy credentials.json path,
+//     byte-for-byte unchanged for hosts that intentionally rely on credentials.json).
+const TUI_HOME = resolveTuiHome({
+  realHome:       process.env.HOME,
+  configuredHome: process.env.OCP_TUI_HOME,
+  envTokenSet:    !!process.env.CLAUDE_CODE_OAUTH_TOKEN,
+});
 const TUI_ENTRYPOINT = process.env.OCP_TUI_ENTRYPOINT || "cli"; // cli|auto|off — see ADR 0007
 // Independent concurrency bound for the TUI path (audit C-4). Default 2: a TUI turn is
 // HEAVY (per-request cold-boot of a tmux+claude session + up to TUI_WALLCLOCK_MS=120s of
@@ -2365,7 +2378,10 @@ server.listen(PORT, BIND_ADDRESS, () => {
   else console.log(`Cache: disabled (set CLAUDE_CACHE_TTL to enable)`);
   if (TUI_MODE) {
     console.warn(`⚠️  TUI-mode ON — single-user only; do NOT enable on a multi-user OCP (guest prompts would run claude with operator filesystem access). See ADR 0007.`);
-    console.log(`  TUI-mode: ON home=${TUI_HOME} cwd=${TUI_CWD} wallclock=${TUI_WALLCLOCK_MS}ms maxConcurrent=${TUI_MAX_CONCURRENT}`);
+    const tuiAuth = process.env.CLAUDE_CODE_OAUTH_TOKEN
+      ? (TUI_HOME === process.env.HOME ? "env-token (real home — unset OCP_TUI_HOME for credential isolation)" : "env-token (credential-isolated home — no credentials.json)")
+      : "credentials.json (no CLAUDE_CODE_OAUTH_TOKEN — see Troubleshooting #401)";
+    console.log(`  TUI-mode: ON home=${TUI_HOME} cwd=${TUI_CWD} auth=${tuiAuth} wallclock=${TUI_WALLCLOCK_MS}ms maxConcurrent=${TUI_MAX_CONCURRENT}`);
     try {
       const n = reapStaleTuiSessions();
       if (n) logEvent("info", "tui_reaped_stale_sessions", { count: n });

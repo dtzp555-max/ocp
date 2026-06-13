@@ -873,18 +873,21 @@ Future `ocp update` invocations sync automatically.
 
 ### TUI-mode returns `Please run /login · API Error: 401` (re-login doesn't stick)
 
-A long-running TUI-mode host can get stuck returning a permanent 401 that re-login cannot fix. Root cause: when `CLAUDE_CODE_OAUTH_TOKEN` is **unset**, the interactive `claude` authenticates via `~/.claude/.credentials.json`, whose single-use OAuth refresh token can be corrupted (ending up an empty string) by the per-request spawn + `kill-session` teardown racing claude's token rotation. Re-login writes a fresh token, but the next spawn re-corrupts it.
+A long-running TUI-mode host can get stuck returning a permanent 401 that re-login cannot fix.
 
-Fix: set `CLAUDE_CODE_OAUTH_TOKEN` on the OCP host (then restart — on systemd `daemon-reload`, on launchd `bootout`+`bootstrap`; `kickstart -k` does **not** reload env). The TUI `claude` then authenticates via the stable long-lived token and never touches credentials.json. Verify the env reached the process:
+**Root cause (two layers):** interactive `claude` **prefers `~/.claude/.credentials.json` over the `CLAUDE_CODE_OAUTH_TOKEN` env var** (this is *unlike* the `-p` path, where the env token wins). So (a) a stale/corrupt `credentials.json` **shadows** the env token — passing the token is not enough on its own; and (b) when claude does use `credentials.json`, its single-use OAuth refresh token can be corrupted (ending up an empty string) by the per-request spawn + `kill-session` teardown racing claude's token rotation. Re-login writes a fresh token, but the next spawn re-corrupts it. Proven live on PI231: *env token passed + broken `credentials.json` present → 401; env token passed + `credentials.json` moved aside → works.*
+
+**Fix:** set `CLAUDE_CODE_OAUTH_TOKEN` on the OCP host and leave `OCP_TUI_HOME` **unset**. OCP then runs the TUI `claude` in a **credential-isolated home** (`$HOME/.ocp-tui/home`) that has **no `credentials.json`** at all, so the env token is the only credential (authoritative — nothing shadows it) and claude never runs the refresh path (so the single-use token can't be corrupted). Then restart — on systemd `daemon-reload`, on launchd `bootout`+`bootstrap`; `kickstart -k` does **not** reload env. Verify the env reached the process and the boot log shows the isolated home:
 
 ```bash
 # Linux (systemd): confirm the token is in the service env
 tr '\0' '\n' < /proc/$(pgrep -f server.mjs | head -1)/environ | grep CLAUDE_CODE_OAUTH_TOKEN
-# Re-login once to repair the credentials file (belt-and-braces), then it stays unused:
-claude /login
+# Boot log should read: TUI-mode: ON home=$HOME/.ocp-tui/home ... auth=env-token (credential-isolated home — no credentials.json)
 ```
 
-See [Subscription-pool (TUI) mode](#subscription-pool-tui-mode) and ADR 0007 PR-C amendment.
+> If you previously set `OCP_TUI_HOME` to the real home (or any home that contains a `credentials.json`), **unset it** so the credential-isolated default takes effect — otherwise the shadowing `credentials.json` remains in play.
+
+See [Subscription-pool (TUI) mode](#subscription-pool-tui-mode) and ADR 0007 PR-C / PR-D amendments.
 
 ## Environment Variables
 
@@ -909,10 +912,10 @@ See [Subscription-pool (TUI) mode](#subscription-pool-tui-mode) and ADR 0007 PR-
 | `PROXY_ANONYMOUS_KEY` | *(unset)* | Well-known anonymous key allowlist (multi mode). When set, this exact string bypasses `validateKey()` and grants public access. Exposed via `/health.anonymousKey` only to localhost, or to all callers when `PROXY_ADVERTISE_ANON_KEY=1`. See [Anonymous Access](#anonymous-access-optional). |
 | `PROXY_ADVERTISE_ANON_KEY` | *(unset)* | When `=1`, advertise `PROXY_ANONYMOUS_KEY` in the public `/health` body for remote zero-config discovery. Default off — `/health` is unauthenticated, so this exposes the shared key to any LAN-reachable device (issue #109). Localhost always sees it regardless. |
 | `CLAUDE_TUI_MODE` | `false` | **Opt-in.** Set to `"true"` to serve requests via interactive `claude` (no `-p` / `--output-format` → `cc_entrypoint=cli`, subscription pool). **Single-user only** — see [Subscription-pool (TUI) mode](#subscription-pool-tui-mode) for the security constraint. |
-| `CLAUDE_CODE_OAUTH_TOKEN` | *(unset)* | OAuth bearer token (highest-precedence credential source). **Recommended for TUI-mode hosts:** when set, the interactive `claude` authenticates via this long-lived token and never touches `~/.claude/.credentials.json`, avoiding the refresh-token corruption that caused a permanent `Please run /login` 401 on a long-running TUI host (see [Subscription-pool (TUI) mode](#subscription-pool-tui-mode) and ADR 0007). The token appears in the pane command (ps-visible) — acceptable for the single-user A-path; the multi-user B-path is refused at boot. |
+| `CLAUDE_CODE_OAUTH_TOKEN` | *(unset)* | OAuth bearer token (highest-precedence credential source for the `-p` path). **Recommended for TUI-mode hosts:** when set (and `OCP_TUI_HOME` unset), OCP runs the interactive `claude` in a **credential-isolated home** (`$HOME/.ocp-tui/home`, no `credentials.json`) so this long-lived token is the only credential and is authoritative — interactive `claude` otherwise *prefers* `~/.claude/.credentials.json` over the env var, so a stale one shadows the token and its single-use refresh token gets corrupted by the spawn/teardown cycle (the permanent `Please run /login` 401 — see [Subscription-pool (TUI) mode](#subscription-pool-tui-mode) and ADR 0007 PR-D). The token appears in the pane command (ps-visible) — acceptable for the single-user A-path; the multi-user B-path is refused at boot. |
 | `CLAUDE_TUI_WALLCLOCK_MS` | `120000` | (TUI-mode) Maximum time in ms to wait for the native transcript to signal turn completion. Increase for long Opus thinking turns. |
 | `OCP_TUI_CWD` | `$HOME/.ocp-tui/work` | (TUI-mode) Scratch working directory where interactive claude sessions run. Transcripts land under `<HOME>/.claude/projects/<encoded-cwd>/`. Created automatically. |
-| `OCP_TUI_HOME` | `$HOME` (real home) | (TUI-mode) `HOME` claude runs under. Default is the operator's real home (shared credentials, existing onboarding). Set to a separate path for scratch-home isolation — see ADR 0007 for the credential-fork caveat. |
+| `OCP_TUI_HOME` | *(auto)* | (TUI-mode) `HOME` claude runs under. **When unset, OCP picks it for you:** if `CLAUDE_CODE_OAUTH_TOKEN` is set → a **credential-isolated** scratch home `$HOME/.ocp-tui/home` (no `credentials.json`, env-token auth — **recommended**); if no env token → the operator's real home (legacy shared `credentials.json`). Setting this to an **explicit** path overrides the auto-default. The credential handling at that path still follows the env token: **with** the env token it is credential-free (env-token auth, no `credentials.json` written); **without** the env token (and the path ≠ real home) it uses the legacy symlinked-credentials scratch mode, which carries the credential-fork caveat — see ADR 0007. |
 | `OCP_TUI_ENTRYPOINT` | `cli` | (TUI-mode) Billing-classifier labeling: `cli` (default) pins `cc_entrypoint=cli` deterministically; `auto` lets claude self-classify via TTY detection; `off` leaves the inherited env untouched. Honest only when the spawn is a genuine interactive PTY — see ADR 0007. |
 | `OCP_TUI_MAX_CONCURRENT` | `2` | (TUI-mode) Max concurrent interactive TUI turns. **Independent** of `CLAUDE_MAX_CONCURRENT` (which bounds the `-p`/stream-json path; TUI never uses it). A TUI turn is heavy (per-request cold-boot of tmux+claude + up to `CLAUDE_TUI_WALLCLOCK_MS` wallclock), so the default is low to keep small hosts (e.g. a Pi 4) alive under a burst. Excess turns **queue** (bounded); a full queue yields a 503. See ADR 0007 PR-B amendment. |
 | `OCP_SKIP_AUTH_TEST` | *(unset)* | When `=1`, skip the `claude -p` auth probe during `setup.mjs`. After 2026-06-15 this probe draws from the Agent SDK credit pool; set this to avoid burning a metered credit on re-installs or `ocp update` runs. Auth is validated at the first real request. |
@@ -962,22 +965,27 @@ mkdir -p ~/.ocp-tui/work    # one-time scratch cwd setup
 
 # Enable
 export CLAUDE_TUI_MODE=true
-# STRONGLY RECOMMENDED on a TUI host — authenticate via the long-lived OAuth token
-# so the interactive claude never touches ~/.claude/.credentials.json (whose single-use
-# refresh token can get corrupted by the per-request spawn/teardown cycle → permanent
-# "Please run /login" 401). See the auth note below + ADR 0007.
+# STRONGLY RECOMMENDED on a TUI host — authenticate via the long-lived OAuth token.
+# With this set (and OCP_TUI_HOME left UNSET), OCP runs the interactive claude in a
+# credential-isolated home ($HOME/.ocp-tui/home, no credentials.json), so the env token
+# is the only credential and is authoritative. This both stops a stale credentials.json
+# from shadowing the token AND ends the refresh-token corruption that caused a permanent
+# "Please run /login" 401 (no credentials file → claude never runs the refresh path).
+# See the auth note below + ADR 0007 PR-D.
 export CLAUDE_CODE_OAUTH_TOKEN=sk-ant-oat01-...
 # Optionally tune:
 export CLAUDE_TUI_WALLCLOCK_MS=180000   # 3 min cap for long Opus turns
 export OCP_TUI_CWD=$HOME/.ocp-tui/work  # default; override if needed
 export OCP_TUI_ENTRYPOINT=cli           # default; use 'auto' to observe TTY-derived value
+# Do NOT set OCP_TUI_HOME for the recommended setup — leaving it unset is what enables
+# the credential-isolated home. Set it only to opt into the legacy symlinked-creds mode.
 ```
 
-Then restart OCP. At boot you will see:
+Then restart OCP. At boot you will see (with the env token set, isolated home auto-selected):
 
 ```
 ⚠️  TUI-mode ON — single-user only; do NOT enable on a multi-user OCP ...
-  TUI-mode: ON home=/home/user cwd=/home/user/.ocp-tui/work wallclock=120000ms
+  TUI-mode: ON home=/home/user/.ocp-tui/home cwd=/home/user/.ocp-tui/work auth=env-token (credential-isolated home — no credentials.json) wallclock=120000ms maxConcurrent=2
 ```
 
 ### What changes / what doesn't
@@ -986,7 +994,7 @@ Then restart OCP. At boot you will see:
 - **No real token streaming.** TUI-mode buffers the full response then replays it as chunked SSE. You will see a delay then the complete response rather than real-time tokens.
 - **Cache and singleflight work normally.** TUI-mode writes the buffered response to the cache on success; cache-hits skip the interactive turn entirely.
 - **The host's `CLAUDE.md` / auto-memory is never injected.** OCP is a proxy — the proxied client (OpenClaw / your IDE) owns its own context and memory. TUI-mode always runs `claude` with `CLAUDE_CODE_DISABLE_CLAUDE_MDS` + `CLAUDE_CODE_DISABLE_AUTO_MEMORY`, so a `CLAUDE.md` on the OCP host can never leak into proxied turns (verified live; see #4). Built-in tool schemas + the interactive system prompt remain (the inherent ~20–35K context floor of interactive mode); MCP is hard-disabled.
-- **Authenticate via `CLAUDE_CODE_OAUTH_TOKEN` (recommended).** tmux does not forward the parent process's env to the pane, so OCP sets the token explicitly on the spawned `claude` when `CLAUDE_CODE_OAUTH_TOKEN` is present. With the token set, the interactive `claude` authenticates via the stable long-lived token and **never touches `~/.claude/.credentials.json`**. Without it, claude falls back to credentials.json, whose single-use OAuth refresh token can be corrupted by the per-request spawn + `kill-session` teardown racing claude's token rotation — on a long-running host this produced a permanent `Please run /login · API Error: 401` that re-login could not fix (the next spawn re-corrupted it). Setting the token mirrors how the stable hosts already run. (The token is then visible in `ps` on the pane command — acceptable for the single-user A-path; the multi-user B-path is refused at boot.) See ADR 0007 PR-C amendment.
+- **Authenticate via `CLAUDE_CODE_OAUTH_TOKEN` in a credential-isolated home (recommended).** tmux does not forward the parent process's env to the pane, so OCP sets the token explicitly on the spawned `claude` when `CLAUDE_CODE_OAUTH_TOKEN` is present. But passing the token is **not enough on its own**: interactive `claude` *prefers* `~/.claude/.credentials.json` over the env var (unlike the `-p` path), so a stale `credentials.json` would shadow the token. With the env token set and `OCP_TUI_HOME` unset, OCP therefore runs claude in a **credential-isolated home** (`$HOME/.ocp-tui/home`) that has **no `credentials.json`** — so the env token is the only credential and is authoritative, and claude never runs the token-refresh path (so the single-use refresh token can't be corrupted by the spawn/teardown cycle). On a long-running host the credentials.json path produced a permanent `Please run /login · API Error: 401` that re-login could not fix (the next spawn re-corrupted it); the isolated home ends that at the root. Transcripts land under the same isolated home, so the answer-reader is unaffected. Without the env token, claude falls back to the real home's `credentials.json` (byte-for-byte the previous behaviour). (The token is visible in `ps` on the pane command — acceptable for the single-user A-path; the multi-user B-path is refused at boot.) See ADR 0007 PR-C / PR-D amendments.
 - **Stale tmux sessions are reaped.** The pane's `claude` is a child of the tmux server (not OCP), so OCP cannot reap it directly; `claude` zombies can otherwise accumulate as `<defunct>` over a long-running host. OCP reaps them at boot and on a 15-min idle sweep by issuing `tmux kill-server` — but **only when no foreign tmux session remains** (it never disrupts a co-hosted `olp-tui-*` instance). See ADR 0007 PR-C amendment.
 - **Default path unchanged.** Unset `CLAUDE_TUI_MODE` and restart → `callClaude` / `callClaudeStreaming` are used again, byte-for-byte identical to today.
 - **Concurrency is bounded separately.** TUI turns are heavy (per-request cold-boot + long wallclock), so the TUI path has its own limiter — `OCP_TUI_MAX_CONCURRENT` (default `2`), independent of `CLAUDE_MAX_CONCURRENT`. Excess turns queue; a full queue returns a 503. Tune it up only on a host that can run more interactive `claude` sessions at once.
