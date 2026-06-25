@@ -2046,6 +2046,45 @@ await asyncTest("wait queue is bounded — run() rejects with tui_queue_full whe
   assert.equal(sem.inflight, 0);
 });
 
+console.log("\n-p concurrency wait-queue (FIX ⑥ — same TuiSemaphore reused for the -p path):");
+
+// server.mjs reuses TuiSemaphore as `claudeSemaphore = new TuiSemaphore(MAX_CONCURRENT,
+// { maxQueue: CLAUDE_MAX_QUEUE })` and wraps acquire()/release() in acquireClaudeSlot(). These
+// tests assert the contract that the 429-mapping depends on: requests beyond the limit QUEUE
+// (not reject), only an overflow past the queue rejects (→ HTTP 429 in server.mjs), and a
+// released slot is reusable (the #37/#40 slot-leak guard — no leak on normal completion).
+await asyncTest("FIX ⑥: requests beyond MAX_CONCURRENT queue, not reject (limit=1, queue=1)", async () => {
+  const sem = new TuiSemaphore(1, { maxQueue: 1 });   // mirrors CLAUDE_MAX_CONCURRENT=1, CLAUDE_MAX_QUEUE=1
+  const g1 = deferred();
+  const inflightP = sem.run(async () => { await g1.p; });   // request 1 — holds the only slot
+  await new Promise((r) => setImmediate(r));
+  assert.equal(sem.inflight, 1, "req1 inflight");
+  const queuedP = sem.run(async () => {});                  // request 2 — WAITS (queued), does NOT reject
+  await new Promise((r) => setImmediate(r));
+  assert.equal(sem.queued, 1, "req2 queued (waits), not rejected → would be served, not 429");
+  // request 3 — queue full → reject (server.mjs maps this single case to 429 + Retry-After)
+  await assert.rejects(sem.run(async () => {}), /tui_queue_full|queue/, "req3 overflows → reject (→429)");
+  g1.resolve();
+  await inflightP; await queuedP;
+  assert.equal(sem.inflight, 0, "all slots released after drain (no leak)");
+  assert.equal(sem.queued, 0, "queue fully drained");
+});
+
+await asyncTest("FIX ⑥: slot released on normal completion is immediately reusable (no #37/#40 leak)", async () => {
+  const sem = new TuiSemaphore(1, { maxQueue: 16 });   // mirrors default CLAUDE_MAX_QUEUE=16
+  for (let i = 0; i < 5; i++) {
+    await sem.run(async () => { /* a normal, completing turn */ });
+    assert.equal(sem.inflight, 0, `slot released after turn ${i}`);
+  }
+  // Prove the limit still binds after many acquire/release cycles.
+  const g = deferred();
+  const held = sem.run(async () => { await g.p; });
+  await new Promise((r) => setImmediate(r));
+  assert.equal(sem.inflight, 1, "limit still enforced after reuse cycles");
+  g.resolve(); await held;
+  assert.equal(sem.inflight, 0);
+});
+
 console.log("\nTUI drift observability (C-5):");
 
 test("recordTuiEntrypoint: observed 'cli' is NOT a mismatch and sets lastEntrypoint", () => {
