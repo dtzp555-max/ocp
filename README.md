@@ -31,6 +31,7 @@ There are several Claude proxy projects. OCP picks a specific lane: **align tigh
 - **SSE heartbeat for long reasoning** ([v3.12.0](https://github.com/dtzp555-max/ocp/releases/tag/v3.12.0), opt-in). If you've ever watched your IDE die at the 60s idle mark during a long Claude tool-use pause — that's nginx/Cloudflare default behavior. OCP emits an SSE comment frame to keep the connection alive without polluting the response. ([PR #49](https://github.com/dtzp555-max/ocp/pull/49))
 - **`cli.js` alignment + CI guardrail.** LLM-assisted code drifts easily — it's tempting to invent plausible-looking endpoints that `cli.js` doesn't actually use. [`ALIGNMENT.md`](./ALIGNMENT.md) is binding: every endpoint OCP exposes must cite a `cli.js` line. The [`alignment.yml`](./.github/workflows/alignment.yml) CI workflow blocks PRs that introduce known-hallucinated tokens. The payoff is boring: your setup keeps working when `cli.js` ships its next minor.
 - **`models.json` single source of truth** (v3.11.0). Adding a model is one file edit; both `/v1/models` and the OpenClaw bootstrap derive from it. ([PR #30](https://github.com/dtzp555-max/ocp/pull/30))
+- **Drives the official CLI as-is, no binary patching.** OCP spawns the official `claude` CLI (or hosts it in an interactive tmux pane for TUI mode) — it does not extract OAuth tokens from memory, patch the binary, or invent protocol extensions. Traffic therefore looks like genuine Claude Code to Anthropic's classifiers (`cc_entrypoint=cli`). See `ALIGNMENT.md` for why this constraint is load-bearing.
 
 ### Comparison
 
@@ -423,7 +424,7 @@ ocp keys revoke son-ipad   # Revoke a key
 - The per-key modes (`shared` / `multi`) give per-key **usage tracking, quotas, and cache separation** — useful for seeing who used what and capping budgets.
 - They do **not** give a **security isolation boundary**. The spawned `claude` runs with the **operator's filesystem access** and is *not* sandboxed per key. **Only share with people you fully trust, on a trusted network.**
 - For simple trusted family sharing, the easiest setup is a single shared **anonymous key** (see [Anonymous Access](#anonymous-access-optional)) — no per-person separation, same trust assumption.
-- **Account terms are your call.** Claude Pro/Max are *per-user* accounts, and Anthropic's Usage Policy governs who may use them. OCP is a localhost protocol adapter for your own tools and devices — it does not change your account terms, and whether any particular sharing setup complies with the Usage Policy is the account holder's responsibility. Review it before extending access to other people.
+- **Account terms and ToS — read before sharing with others.** Claude Pro/Max are *per-user* accounts. Pooling a single subscription across **multiple distinct people** may violate Anthropic's Consumer Terms of Service and risk account suspension by the abuse classifier. The defensible framing is **"one person, your own devices"** — sharing with friends or a team is not. OCP does not change your account terms, and whether any particular sharing setup complies with the ToS is the account holder's responsibility. Review Anthropic's Usage Policy before extending access to other people.
 
 **Real per-user isolation (sandboxed, multi-tenant-safe) is planned for after 2026-06-15** — per-key ephemeral home + tool lockdown + an OS sandbox. Until then, treat a multi-user OCP as a *trusted-group convenience*, not a security boundary. (This is also why `CLAUDE_TUI_MODE` is single-user-only — see [Subscription-pool (TUI) mode](#subscription-pool-tui-mode).)
 
@@ -699,6 +700,14 @@ Your IDE → OCP (localhost:3456) → claude --output-format stream-json CLI →
 ```
 
 OCP translates OpenAI-compatible `/v1/chat/completions` requests into `claude --output-format stream-json` CLI calls. Anthropic sees normal Claude Code usage — no API billing, no separate key needed.
+
+### Client-tools boundary
+
+OCP is a **text-prompt bridge** to the official `claude` CLI. It does **not** pass through OpenAI `tools`/`functions` payloads or Anthropic `tool_use` blocks to the client. Clients (Cline, Cursor, OpenClaw, etc.) pointed at OCP receive **assistant TEXT only** — they never get `tool_calls` to execute locally.
+
+Any tool use happens server-side, under the `--allowedTools` set configured on the OCP host. In default mode (no `CLAUDE_NO_CONTEXT`), the `claude` CLI's own built-in tools are available to the model; in TUI mode, the operator controls the tool surface via `OCP_TUI_FULL_TOOLS`. Either way, the tools run under the operator's credentials on the server, and the client sees only the final text output.
+
+**Client-local tool execution is not supported by design.** Supporting it would require bypassing the `claude` CLI to call the raw Anthropic API directly — that is a different product, and is out of scope per `ALIGNMENT.md` (every OCP endpoint must correspond to something `cli.js` actually does).
 
 ## Available Models
 
