@@ -20,7 +20,10 @@
  *   CLAUDE_MCP_CONFIG            — path to MCP server config JSON file
  *   CLAUDE_SESSION_TTL           — session TTL in ms (default: 3600000 = 1h)
  *   CLAUDE_MAX_CONCURRENT        — max concurrent claude processes, -p/stream-json path (default: 8)
+ *   CLAUDE_MAX_QUEUE             — max requests waiting for a -p slot before HTTP 429 (default: 16)
  *   OCP_TUI_MAX_CONCURRENT       — max concurrent interactive TUI turns, TUI-mode path (default: 2)
+ *   OCP_SPAWN_REAL_HOME          — "1" forces the -p spawn to use the real HOME (disables the
+ *                                  latency spawn-home isolation; default: isolated when a token exists)
  *   CLAUDE_BREAKER_THRESHOLD     — failures in window before circuit opens (default: 6)
  *   CLAUDE_BREAKER_COOLDOWN      — base ms to wait before retrying after circuit opens (default: 120000)
  *   CLAUDE_BREAKER_WINDOW        — sliding window duration in ms (default: 300000 = 5min)
@@ -31,7 +34,7 @@
 import { createServer } from "node:http";
 import { spawn, execFileSync } from "node:child_process";
 import { randomUUID, timingSafeEqual } from "node:crypto";
-import { readFileSync, readdirSync, accessSync, existsSync, constants, chmodSync, statSync } from "node:fs";
+import { readFileSync, readdirSync, accessSync, existsSync, constants, chmodSync, statSync, mkdirSync, writeFileSync, rmSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 import { homedir } from "node:os";
@@ -279,6 +282,12 @@ const BREAKER_HALF_OPEN_MAX = parseInt(process.env.CLAUDE_BREAKER_HALF_OPEN_MAX 
 const HEARTBEAT_INTERVAL = parseInt(process.env.CLAUDE_HEARTBEAT_INTERVAL || "0", 10);
 const BIND_ADDRESS = process.env.CLAUDE_BIND || "127.0.0.1";
 const NO_CONTEXT = process.env.CLAUDE_NO_CONTEXT === "true";
+// Kill-switch for the FIX-③ default-path spawn-home isolation (see resolveSpawnHome /
+// spawnHomeMode below). When "1", the -p/stream-json spawn always runs in the operator's
+// real HOME with no cwd override — byte-for-byte the pre-isolation behaviour — even if an
+// OAuth token is resolvable. Provided as an escape hatch in case a host depends on the real
+// HOME's claude config for the spawned process.
+const SPAWN_REAL_HOME = process.env.OCP_SPAWN_REAL_HOME === "1";
 const AUTH_MODE = process.env.CLAUDE_AUTH_MODE || (PROXY_API_KEY ? "shared" : "none");
 const ADMIN_KEY = process.env.OCP_ADMIN_KEY || "";
 const PROXY_ANONYMOUS_KEY = process.env.PROXY_ANONYMOUS_KEY || "";
@@ -331,6 +340,68 @@ const tuiStats = {
   lastEntrypoint: null,      // last observed cc_entrypoint from the transcript ("cli" | "sdk-cli" | null)
   entrypointMismatches: 0,   // count of cli-expected-but-got-other turns
 };
+
+// ── FIX ③ (latency): default-path (-p / stream-json) spawn-home isolation ──────────────
+// PROBLEM (measured, not theoretical): OCP's default spawn inherits the operator's real HOME
+// (loading the global ~/.claude — plugins, skills, hooks) and runs with cwd=~/ocp (loading the
+// project CLAUDE.md / skills) on EVERY request. Pure Anthropic API floor for haiku "hi" ≈ 1–2s;
+// the same claude CLI spawned in the operator's real HOME/cwd ≈ 10–28s; a clean minimal HOME +
+// CLAUDE_CODE_OAUTH_TOKEN ≈ 3–7s and authenticates fine. So the heavy global config is pure
+// per-request latency tax with no proxy benefit (a proxy must NOT leak the host's context into
+// the proxied turn — same rationale as NO_CONTEXT / the TUI path's CLAUDE_MDS suppression).
+//
+// FIX: when an OAuth token is resolvable, run the default spawn under a CREDENTIAL-FREE minimal
+// scratch HOME (`<realHome>/.ocp/spawn-home`) with cwd = that same neutral dir, and pass the
+// resolved token via CLAUDE_CODE_OAUTH_TOKEN so the env token is authoritative. This MIRRORS the
+// TUI path's resolveTuiHome() env-token mode (lib/tui/session.mjs): for `-p`, the env token wins
+// over a credentials.json (the opposite of interactive claude), so credential isolation is not
+// even strictly required for auth here, but a credential-FREE home is still the right shape —
+// nothing to refresh, nothing to corrupt, no heavy config to load.
+//
+// SAFETY: if NO token is resolvable → fall back to the real HOME with no cwd override (zero
+// regression). OCP_SPAWN_REAL_HOME=1 forces that legacy behaviour even when a token exists.
+// The scratch home holds NO .credentials.json / NO settings.json / NO plugins — it is created
+// minimal and (re)cleaned of any settings.json on prepare.
+const SPAWN_HOME_DIR = `${process.env.HOME}/.ocp/spawn-home`;
+
+// Idempotently prepare the minimal scratch HOME. Creates the dir if missing and removes any
+// settings.json that might have crept in, so the spawned claude loads no host settings/plugins.
+// Best-effort: a failure here degrades toward "dir may be missing", which spawn() tolerates by
+// erroring loudly — never a silent auth/credential corruption (there are no credentials here).
+function prepareSpawnHome(dir = SPAWN_HOME_DIR) {
+  try {
+    mkdirSync(`${dir}/.claude`, { recursive: true });
+    // Belt-and-braces: ensure no settings.json/plugins leak in (this home is fully ours).
+    for (const f of [`${dir}/.claude/settings.json`, `${dir}/.claude/settings.local.json`]) {
+      try { if (existsSync(f)) rmSync(f, { force: true }); } catch { /* best effort */ }
+    }
+  } catch { /* best effort — spawn will surface a hard error if the dir is truly unusable */ }
+}
+
+// Resolve the default-spawn HOME-isolation decision ONCE, lazily + memoized (so it runs after
+// getOAuthCredentials is defined regardless of source order, and the token probe happens at most
+// once). Returns { isolated, home, token } where:
+//   - isolated:true  → spawn under SPAWN_HOME_DIR with cwd=SPAWN_HOME_DIR + the env token.
+//   - isolated:false → legacy real-HOME spawn, no cwd override (no token, or kill-switch on).
+// NEVER logs/returns the token verbatim to any caller that logs; spawnClaudeProcess uses it only
+// to populate the spawn env. token is null when isolation is off.
+let _spawnHomeMode = null;
+function getSpawnHomeMode() {
+  if (_spawnHomeMode) return _spawnHomeMode;
+  if (SPAWN_REAL_HOME) {
+    _spawnHomeMode = { isolated: false, home: null, token: null, reason: "kill-switch (OCP_SPAWN_REAL_HOME=1)" };
+    return _spawnHomeMode;
+  }
+  let token = null;
+  try { token = getOAuthCredentials()?.accessToken || null; } catch { token = null; }
+  if (token) {
+    prepareSpawnHome(SPAWN_HOME_DIR);
+    _spawnHomeMode = { isolated: true, home: SPAWN_HOME_DIR, token, reason: "oauth token resolved" };
+  } else {
+    _spawnHomeMode = { isolated: false, home: null, token: null, reason: "no oauth token resolvable" };
+  }
+  return _spawnHomeMode;
+}
 
 // SECURITY fail-loud: TUI-mode is incompatible with any configuration that allows
 // non-operator prompts to reach the interactive claude session. Three cases:
@@ -810,7 +881,25 @@ function spawnClaudeProcess(model, messages, conversationId, keyName) {
     env.CLAUDE_CODE_DISABLE_AUTO_MEMORY = "1";
   }
 
-  const proc = spawn(CLAUDE, cliArgs, { env, stdio: ["pipe", "pipe", "pipe"] });
+  // FIX ③ (latency): default-path spawn-home isolation. When a token is resolvable (and the
+  // OCP_SPAWN_REAL_HOME kill-switch is off), run claude under a credential-free minimal HOME
+  // with cwd = that same neutral dir, so it loads NONE of the operator's global ~/.claude
+  // (plugins/skills/hooks) or the ~/ocp project CLAUDE.md/skills — the measured 10–28s → 3–7s
+  // latency win. The env token is authoritative for `-p` (unlike interactive claude). When no
+  // token is resolvable, falls back to real HOME + inherited cwd (zero regression). See
+  // getSpawnHomeMode() / prepareSpawnHome() above. The DISABLE_CLAUDE_MDS / AUTO_MEMORY flags
+  // are set unconditionally in isolated mode (belt-and-braces; mirrors the TUI path).
+  const spawnHome = getSpawnHomeMode();
+  const spawnOpts = { env, stdio: ["pipe", "pipe", "pipe"] };
+  if (spawnHome.isolated) {
+    env.HOME = spawnHome.home;
+    env.CLAUDE_CODE_OAUTH_TOKEN = spawnHome.token; // env token is authoritative for -p
+    env.CLAUDE_CODE_DISABLE_CLAUDE_MDS = "1";
+    env.CLAUDE_CODE_DISABLE_AUTO_MEMORY = "1";
+    spawnOpts.cwd = spawnHome.home; // neutral cwd: no project CLAUDE.md/skills
+  }
+
+  const proc = spawn(CLAUDE, cliArgs, spawnOpts);
   activeProcesses.add(proc);
 
   const t0 = Date.now();
@@ -2076,6 +2165,21 @@ const server = createServer(async (req, res) => {
       circuitBreaker: "disabled",
       sessions: sessionList,
       recentErrors: recentErrors.slice(-5),
+      // ── FIX ③ spawn-home isolation surface — ADDITIVE (default -p/stream-json path) ──
+      // Lets the operator confirm the latency-fix isolation is active without inspecting logs.
+      // NEVER includes the token. mode: "isolated-scratch-home" | "real-home". home is the
+      // scratch HOME path when isolated (null otherwise). For TUI_MODE the -p path is unused,
+      // so report it as disabled.
+      spawn: (() => {
+        if (TUI_MODE) return { mode: "tui (default -p path unused)", isolated: false, home: null };
+        const shm = getSpawnHomeMode();
+        return {
+          mode: shm.isolated ? "isolated-scratch-home" : "real-home",
+          isolated: shm.isolated,
+          home: shm.isolated ? shm.home : null,
+          reason: shm.reason,
+        };
+      })(),
       // ── TUI observability (audit C-5) — ADDITIVE block (ADR 0007 PR-B amendment) ──
       // /health is a grandfathered B.2 endpoint (ADR 0006). This block is NEW fields only;
       // every existing field above is byte-identical → behaviour-preserving for existing
@@ -2376,6 +2480,15 @@ server.listen(PORT, BIND_ADDRESS, () => {
   if (NO_CONTEXT) console.log(`Context: suppressed (CLAUDE_NO_CONTEXT=true — no CLAUDE.md, no auto-memory)`);
   if (CACHE_TTL > 0) console.log(`Cache: enabled (TTL=${CACHE_TTL / 1000}s)`);
   else console.log(`Cache: disabled (set CLAUDE_CACHE_TTL to enable)`);
+  // FIX ③: announce default-path (-p/stream-json) spawn-home isolation mode (never logs the token).
+  if (!TUI_MODE) {
+    const shm = getSpawnHomeMode();
+    if (shm.isolated) {
+      console.log(`Spawn home: isolated-scratch-home (${shm.home}, cwd-neutral, env-token auth) — fast path`);
+    } else {
+      console.log(`Spawn home: real-home (${shm.reason}) — set CLAUDE_CODE_OAUTH_TOKEN for the isolated fast path`);
+    }
+  }
   if (TUI_MODE) {
     console.warn(`⚠️  TUI-mode ON — single-user only; do NOT enable on a multi-user OCP (guest prompts would run claude with operator filesystem access). See ADR 0007.`);
     const tuiAuth = process.env.CLAUDE_CODE_OAUTH_TOKEN
