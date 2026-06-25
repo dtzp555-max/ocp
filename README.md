@@ -844,6 +844,29 @@ ocp restart
 openclaw gateway restart
 ```
 
+### Env var change (e.g. `CLAUDE_BIND`, `CLAUDE_CODE_OAUTH_TOKEN`) doesn't take effect after restart
+
+On **macOS**, `ocp restart` does a full `launchctl bootout` + `bootstrap` of the agent, which **re-reads the plist `EnvironmentVariables`** — so an env change you made (in `~/Library/LaunchAgents/dev.ocp.proxy.plist`) actually takes effect:
+
+```bash
+ocp restart
+```
+
+This is deliberate: the older `launchctl kickstart -k` only re-execs the process and **reuses launchd's cached environment**, so plist env edits would be silently ignored. If you ever restart the agent by hand, use bootout+bootstrap, not `kickstart -k`:
+
+```bash
+launchctl bootout   gui/$(id -u)/dev.ocp.proxy 2>/dev/null
+launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/dev.ocp.proxy.plist
+```
+
+Verify the new value reached the running process:
+
+```bash
+ps -E -p "$(launchctl print gui/$(id -u)/dev.ocp.proxy 2>/dev/null | awk '/pid =/{print $3}')" | tr ' ' '\n' | grep CLAUDE_
+```
+
+On **Linux**, `systemctl --user restart` already re-reads the unit's `EnvironmentFile`, so no special handling is needed.
+
 ### Usage shows "unknown"
 
 Usually caused by an expired Claude CLI session. Fix:
