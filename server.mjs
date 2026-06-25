@@ -20,7 +20,10 @@
  *   CLAUDE_MCP_CONFIG            — path to MCP server config JSON file
  *   CLAUDE_SESSION_TTL           — session TTL in ms (default: 3600000 = 1h)
  *   CLAUDE_MAX_CONCURRENT        — max concurrent claude processes, -p/stream-json path (default: 8)
+ *   CLAUDE_MAX_QUEUE             — max requests waiting for a -p slot before HTTP 429 (default: 16)
  *   OCP_TUI_MAX_CONCURRENT       — max concurrent interactive TUI turns, TUI-mode path (default: 2)
+ *   OCP_SPAWN_REAL_HOME          — "1" forces the -p spawn to use the real HOME (disables the
+ *                                  latency spawn-home isolation; default: isolated when a token exists)
  *   CLAUDE_BREAKER_THRESHOLD     — failures in window before circuit opens (default: 6)
  *   CLAUDE_BREAKER_COOLDOWN      — base ms to wait before retrying after circuit opens (default: 120000)
  *   CLAUDE_BREAKER_WINDOW        — sliding window duration in ms (default: 300000 = 5min)
@@ -31,7 +34,7 @@
 import { createServer } from "node:http";
 import { spawn, execFileSync } from "node:child_process";
 import { randomUUID, timingSafeEqual } from "node:crypto";
-import { readFileSync, readdirSync, accessSync, existsSync, constants, chmodSync, statSync } from "node:fs";
+import { readFileSync, readdirSync, accessSync, existsSync, constants, chmodSync, statSync, mkdirSync, writeFileSync, rmSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 import { homedir } from "node:os";
@@ -272,6 +275,15 @@ const SYSTEM_PROMPT = process.env.CLAUDE_SYSTEM_PROMPT || "";
 const MCP_CONFIG = process.env.CLAUDE_MCP_CONFIG || "";
 let SESSION_TTL = parseInt(process.env.CLAUDE_SESSION_TTL || "3600000", 10);
 let MAX_CONCURRENT = parseInt(process.env.CLAUDE_MAX_CONCURRENT || "8", 10);
+// FIX ⑥ (concurrency): bound on requests WAITING for a -p concurrency slot. Beyond
+// MAX_CONCURRENT, requests queue (up to CLAUDE_MAX_QUEUE) instead of being rejected; when the
+// queue is ALSO full, the request gets HTTP 429 + Retry-After (not an opaque 500). See
+// claudeSemaphore / acquireClaudeSlot below.
+const CLAUDE_MAX_QUEUE = parseInt(process.env.CLAUDE_MAX_QUEUE || "16", 10);
+// Retry-After seconds advertised on a 429 backpressure response. A claude turn is typically a
+// few seconds to tens of seconds; a small constant nudge keeps well-behaved clients from
+// hammering while the queue drains.
+const CLAUDE_QUEUE_RETRY_AFTER = parseInt(process.env.CLAUDE_QUEUE_RETRY_AFTER || "5", 10);
 const BREAKER_THRESHOLD = parseInt(process.env.CLAUDE_BREAKER_THRESHOLD || "6", 10);
 const BREAKER_COOLDOWN = parseInt(process.env.CLAUDE_BREAKER_COOLDOWN || "120000", 10);
 const BREAKER_WINDOW = parseInt(process.env.CLAUDE_BREAKER_WINDOW || "300000", 10);
@@ -279,6 +291,12 @@ const BREAKER_HALF_OPEN_MAX = parseInt(process.env.CLAUDE_BREAKER_HALF_OPEN_MAX 
 const HEARTBEAT_INTERVAL = parseInt(process.env.CLAUDE_HEARTBEAT_INTERVAL || "0", 10);
 const BIND_ADDRESS = process.env.CLAUDE_BIND || "127.0.0.1";
 const NO_CONTEXT = process.env.CLAUDE_NO_CONTEXT === "true";
+// Kill-switch for the FIX-③ default-path spawn-home isolation (see resolveSpawnHome /
+// spawnHomeMode below). When "1", the -p/stream-json spawn always runs in the operator's
+// real HOME with no cwd override — byte-for-byte the pre-isolation behaviour — even if an
+// OAuth token is resolvable. Provided as an escape hatch in case a host depends on the real
+// HOME's claude config for the spawned process.
+const SPAWN_REAL_HOME = process.env.OCP_SPAWN_REAL_HOME === "1";
 const AUTH_MODE = process.env.CLAUDE_AUTH_MODE || (PROXY_API_KEY ? "shared" : "none");
 const ADMIN_KEY = process.env.OCP_ADMIN_KEY || "";
 const PROXY_ANONYMOUS_KEY = process.env.PROXY_ANONYMOUS_KEY || "";
@@ -331,6 +349,116 @@ const tuiStats = {
   lastEntrypoint: null,      // last observed cc_entrypoint from the transcript ("cli" | "sdk-cli" | null)
   entrypointMismatches: 0,   // count of cli-expected-but-got-other turns
 };
+
+// ── FIX ③ (latency): default-path (-p / stream-json) spawn-home isolation ──────────────
+// PROBLEM (measured, not theoretical): OCP's default spawn inherits the operator's real HOME
+// (loading the global ~/.claude — plugins, skills, hooks) and runs with cwd=~/ocp (loading the
+// project CLAUDE.md / skills) on EVERY request. Pure Anthropic API floor for haiku "hi" ≈ 1–2s;
+// the same claude CLI spawned in the operator's real HOME/cwd ≈ 10–28s; a clean minimal HOME +
+// CLAUDE_CODE_OAUTH_TOKEN ≈ 3–7s and authenticates fine. So the heavy global config is pure
+// per-request latency tax with no proxy benefit (a proxy must NOT leak the host's context into
+// the proxied turn — same rationale as NO_CONTEXT / the TUI path's CLAUDE_MDS suppression).
+//
+// FIX: when an OAuth token is resolvable, run the default spawn under a CREDENTIAL-FREE minimal
+// scratch HOME (`<realHome>/.ocp/spawn-home`) with cwd = that same neutral dir, and pass the
+// resolved token via CLAUDE_CODE_OAUTH_TOKEN so the env token is authoritative. This MIRRORS the
+// TUI path's resolveTuiHome() env-token mode (lib/tui/session.mjs): for `-p`, the env token wins
+// over a credentials.json (the opposite of interactive claude), so credential isolation is not
+// even strictly required for auth here, but a credential-FREE home is still the right shape —
+// nothing to refresh, nothing to corrupt, no heavy config to load.
+//
+// SAFETY: if NO token is resolvable → fall back to the real HOME with no cwd override (zero
+// regression). OCP_SPAWN_REAL_HOME=1 forces that legacy behaviour even when a token exists.
+// The scratch home holds NO .credentials.json / NO settings.json / NO plugins — it is created
+// minimal and (re)cleaned of any settings.json on prepare.
+const SPAWN_HOME_DIR = `${process.env.HOME}/.ocp/spawn-home`;
+
+// Idempotently prepare the minimal scratch HOME. Creates the dir if missing and removes any
+// settings.json that might have crept in, so the spawned claude loads no host settings/plugins.
+// Best-effort: a failure here degrades toward "dir may be missing", which spawn() tolerates by
+// erroring loudly — never a silent auth/credential corruption (there are no credentials here).
+function prepareSpawnHome(dir = SPAWN_HOME_DIR) {
+  try {
+    mkdirSync(`${dir}/.claude`, { recursive: true });
+    // Belt-and-braces: ensure no settings.json/plugins leak in (this home is fully ours).
+    for (const f of [`${dir}/.claude/settings.json`, `${dir}/.claude/settings.local.json`]) {
+      try { if (existsSync(f)) rmSync(f, { force: true }); } catch { /* best effort */ }
+    }
+  } catch { /* best effort — spawn will surface a hard error if the dir is truly unusable */ }
+}
+
+// Resolve the default-spawn HOME-isolation decision ONCE, lazily + memoized (so it runs after
+// getOAuthCredentials is defined regardless of source order, and the token probe happens at most
+// once). Returns { isolated, home, token } where:
+//   - isolated:true  → spawn under SPAWN_HOME_DIR with cwd=SPAWN_HOME_DIR + the env token.
+//   - isolated:false → legacy real-HOME spawn, no cwd override (no token, or kill-switch on).
+// NEVER logs/returns the token verbatim to any caller that logs; spawnClaudeProcess uses it only
+// to populate the spawn env. token is null when isolation is off.
+let _spawnHomeMode = null;
+function getSpawnHomeMode() {
+  if (_spawnHomeMode) return _spawnHomeMode;
+  if (SPAWN_REAL_HOME) {
+    _spawnHomeMode = { isolated: false, home: null, token: null, reason: "kill-switch (OCP_SPAWN_REAL_HOME=1)" };
+    return _spawnHomeMode;
+  }
+  let token = null;
+  try { token = getOAuthCredentials()?.accessToken || null; } catch { token = null; }
+  if (token) {
+    prepareSpawnHome(SPAWN_HOME_DIR);
+    _spawnHomeMode = { isolated: true, home: SPAWN_HOME_DIR, token, reason: "oauth token resolved" };
+  } else {
+    _spawnHomeMode = { isolated: false, home: null, token: null, reason: "no oauth token resolvable" };
+  }
+  return _spawnHomeMode;
+}
+
+// ── FIX ⑥ (concurrency): bounded wait-queue for the -p / stream-json path ──────────────
+// PROBLEM (proven): spawnClaudeProcess used `if (activeRequests >= MAX_CONCURRENT) throw` →
+// the client got an opaque 500 AND the rejection was NOT counted in stats (a 15-concurrent
+// stress run returned 7×500 while /health stats.errors stayed 0). The TUI path already has a
+// bounded-queue semaphore (TuiSemaphore); the -p path did not.
+//
+// FIX: requests beyond MAX_CONCURRENT WAIT on this semaphore (up to CLAUDE_MAX_QUEUE) instead of
+// being rejected. Only when the queue is ALSO full do we reject — with HTTP 429 + Retry-After
+// (deterministic backpressure), a distinct `concurrency_queue_full` log, and a stats.queueRejections
+// counter that shows up on /health. The slot is released on EVERY exit path via the existing
+// idempotent cleanup() (proc exit/close/error/timeout) — the #37/#40 slot-leak guard.
+const claudeSemaphore = new TuiSemaphore(MAX_CONCURRENT, { maxQueue: CLAUDE_MAX_QUEUE });
+
+// Tagged error so callers can map this single overflow case to HTTP 429 (every OTHER throw stays
+// a 500). Carries retryAfter for the Retry-After header.
+class ConcurrencyOverflowError extends Error {
+  constructor(message) { super(message); this.name = "ConcurrencyOverflowError"; this.httpStatus = 429; this.retryAfter = CLAUDE_QUEUE_RETRY_AFTER; }
+}
+
+// Acquire a -p concurrency slot, queuing if all are busy (up to CLAUDE_MAX_QUEUE). Resolves to a
+// release() fn that MUST be called exactly once on every exit path (wired into ctx.cleanup()).
+// Rejects with ConcurrencyOverflowError when the wait-queue is full. Increments stats.queued while
+// waiting (decremented on acquire) and stats.queueRejections on overflow.
+async function acquireClaudeSlot() {
+  stats.queued = claudeSemaphore.queued + 1; // reflect this waiter before we (maybe) block
+  try {
+    await claudeSemaphore.acquire();
+  } catch (e) {
+    stats.queued = claudeSemaphore.queued;
+    stats.queueRejections++;
+    logEvent("warn", "concurrency_queue_full", {
+      limit: claudeSemaphore.limit, maxQueue: claudeSemaphore.maxQueue,
+      inflight: claudeSemaphore.inflight, queued: claudeSemaphore.queued,
+    });
+    throw new ConcurrencyOverflowError(
+      `backpressure: concurrency limit (${claudeSemaphore.limit}) reached and wait queue ` +
+      `(${claudeSemaphore.maxQueue}) is full — retry shortly`);
+  }
+  stats.queued = claudeSemaphore.queued;
+  let released = false;
+  return function releaseClaudeSlot() {
+    if (released) return; // idempotent — cleanup() may be reached via multiple proc events
+    released = true;
+    claudeSemaphore.release();
+    stats.queued = claudeSemaphore.queued;
+  };
+}
 
 // SECURITY fail-loud: TUI-mode is incompatible with any configuration that allows
 // non-operator prompts to reach the interactive claude session. Three cases:
@@ -542,6 +670,8 @@ const stats = {
   sessionHits: 0,
   sessionMisses: 0,
   oneOffRequests: 0,
+  queued: 0,           // current requests waiting for a -p concurrency slot (FIX ⑥)
+  queueRejections: 0,  // total requests rejected with HTTP 429 because the wait-queue was full (FIX ⑥)
 };
 const recentErrors = []; // last 20 errors
 
@@ -769,11 +899,14 @@ function getModelTier(cliModel) {
 // (messagesToPrompt), so multi-turn correctness is preserved without sessions.
 // The sessions Map is retained for stats/logging but no longer drives --resume.
 // Reference: OLP ADR 0009 Amendment 1 + commit 97e7d16.
-function spawnClaudeProcess(model, messages, conversationId, keyName) {
-  if (stats.activeRequests >= MAX_CONCURRENT) {
-    throw new Error(`concurrency limit reached (${stats.activeRequests}/${MAX_CONCURRENT})`);
-  }
-
+// FIX ⑥: concurrency is now bounded by the claudeSemaphore via acquireClaudeSlot(), which the
+// caller MUST await before calling this, passing the resulting release fn as `releaseSlot`. The
+// old `if (activeRequests >= MAX_CONCURRENT) throw` gate (→ opaque 500, uncounted) is GONE: at
+// most MAX_CONCURRENT callers hold a slot when they reach here, so this spawn is always within
+// budget. releaseSlot is wired into the idempotent cleanup() so the slot is freed on EVERY exit
+// path (close/error/timeout/abort). Back-compat: releaseSlot defaults to a no-op so any future
+// internal caller that does its own gating still works.
+function spawnClaudeProcess(model, messages, conversationId, keyName, releaseSlot = () => {}) {
   const cliModel = MODEL_MAP[model] || model;
 
   // Circuit breaker: disabled (see comment at top of breaker section)
@@ -810,7 +943,25 @@ function spawnClaudeProcess(model, messages, conversationId, keyName) {
     env.CLAUDE_CODE_DISABLE_AUTO_MEMORY = "1";
   }
 
-  const proc = spawn(CLAUDE, cliArgs, { env, stdio: ["pipe", "pipe", "pipe"] });
+  // FIX ③ (latency): default-path spawn-home isolation. When a token is resolvable (and the
+  // OCP_SPAWN_REAL_HOME kill-switch is off), run claude under a credential-free minimal HOME
+  // with cwd = that same neutral dir, so it loads NONE of the operator's global ~/.claude
+  // (plugins/skills/hooks) or the ~/ocp project CLAUDE.md/skills — the measured 10–28s → 3–7s
+  // latency win. The env token is authoritative for `-p` (unlike interactive claude). When no
+  // token is resolvable, falls back to real HOME + inherited cwd (zero regression). See
+  // getSpawnHomeMode() / prepareSpawnHome() above. The DISABLE_CLAUDE_MDS / AUTO_MEMORY flags
+  // are set unconditionally in isolated mode (belt-and-braces; mirrors the TUI path).
+  const spawnHome = getSpawnHomeMode();
+  const spawnOpts = { env, stdio: ["pipe", "pipe", "pipe"] };
+  if (spawnHome.isolated) {
+    env.HOME = spawnHome.home;
+    env.CLAUDE_CODE_OAUTH_TOKEN = spawnHome.token; // env token is authoritative for -p
+    env.CLAUDE_CODE_DISABLE_CLAUDE_MDS = "1";
+    env.CLAUDE_CODE_DISABLE_AUTO_MEMORY = "1";
+    spawnOpts.cwd = spawnHome.home; // neutral cwd: no project CLAUDE.md/skills
+  }
+
+  const proc = spawn(CLAUDE, cliArgs, spawnOpts);
   activeProcesses.add(proc);
 
   const t0 = Date.now();
@@ -822,6 +973,10 @@ function spawnClaudeProcess(model, messages, conversationId, keyName) {
     cleaned = true;
     clearTimeout(overallTimer);
     stats.activeRequests--;
+    // FIX ⑥: free the concurrency slot for a queued waiter. releaseSlot is itself idempotent,
+    // and cleanup() is guarded by `cleaned`, so the slot is released exactly once on the first
+    // exit path reached (proc 'exit' fires before 'close'; 'error' covers spawn failure).
+    try { releaseSlot(); } catch { /* never let release throw out of cleanup */ }
   }
 
   // Guarantee slot release on ANY exit path (normal close, error, timeout kill,
@@ -891,12 +1046,18 @@ function spawnClaudeProcess(model, messages, conversationId, keyName) {
 // We accumulate full text across all content_block_delta events plus the
 // assistant-aggregate fallback, then resolve with the assembled string.
 // Reference: OLP ADR 0009 Amendment 1 + commit 97e7d16.
-function callClaude(model, messages, conversationId, keyName) {
+async function callClaude(model, messages, conversationId, keyName) {
+  // FIX ⑥: acquire a concurrency slot first (queues up to CLAUDE_MAX_QUEUE; rejects with a
+  // ConcurrencyOverflowError → 429 when the queue is full). The release fn is passed into the
+  // spawn so the idempotent cleanup() frees it on every exit path. If the spawn itself throws
+  // synchronously (before cleanup is wired), release here so the slot never leaks.
+  const releaseSlot = await acquireClaudeSlot();
   return new Promise((resolve, reject) => {
     let ctx;
     try {
-      ctx = spawnClaudeProcess(model, messages, conversationId, keyName);
+      ctx = spawnClaudeProcess(model, messages, conversationId, keyName, releaseSlot);
     } catch (err) {
+      releaseSlot();
       return reject(err);
     }
 
@@ -1063,14 +1224,28 @@ function startHeartbeat(res, intervalMs, sessionId) {
 // We parse line-by-line and forward content_block_delta text events as SSE.
 // The result event triggers the stop/[DONE] sequence.
 // Reference: OLP ADR 0009 Amendment 1 + commits 97e7d16, 65f945c.
-function callClaudeStreaming(model, messages, conversationId, res, authInfo = {}) {
+async function callClaudeStreaming(model, messages, conversationId, res, authInfo = {}) {
   const id = `chatcmpl-${randomUUID()}`;
   const created = Math.floor(Date.now() / 1000);
 
+  // FIX ⑥: acquire a concurrency slot first (queues up to CLAUDE_MAX_QUEUE). On overflow, surface
+  // HTTP 429 + Retry-After (NOT 500). Release is wired into cleanup() for every exit path; if the
+  // spawn throws synchronously before cleanup is wired, release here.
+  let releaseSlot;
+  try {
+    releaseSlot = await acquireClaudeSlot();
+  } catch (err) {
+    if (err instanceof ConcurrencyOverflowError) {
+      return jsonResponse(res, 429, { error: { message: sanitizeError(err.message), type: "rate_limit_error" } }, { "Retry-After": String(err.retryAfter) });
+    }
+    return jsonResponse(res, 500, { error: { message: sanitizeError(err.message), type: "proxy_error" } });
+  }
+
   let ctx;
   try {
-    ctx = spawnClaudeProcess(model, messages, conversationId, authInfo.keyName);
+    ctx = spawnClaudeProcess(model, messages, conversationId, authInfo.keyName, releaseSlot);
   } catch (err) {
+    releaseSlot();
     return jsonResponse(res, 500, { error: { message: sanitizeError(err.message), type: "proxy_error" } });
   }
 
@@ -1263,10 +1438,21 @@ function sanitizeError(msg) {
 }
 
 // ── Response helpers ────────────────────────────────────────────────────
-function jsonResponse(res, status, data) {
+function jsonResponse(res, status, data, extraHeaders = null) {
   if (res.headersSent || res.writableEnded || res.destroyed) return;
-  res.writeHead(status, { "Content-Type": "application/json" });
+  // extraHeaders is optional + additive (e.g. Retry-After on a 429); Content-Type always wins.
+  res.writeHead(status, { ...(extraHeaders || {}), "Content-Type": "application/json" });
   res.end(JSON.stringify(data));
+}
+
+// FIX ⑥: map an upstream error to the right HTTP response. A ConcurrencyOverflowError (the
+// wait-queue was full) becomes HTTP 429 + Retry-After + rate_limit_error; every other error
+// stays a 500 proxy_error (byte-for-byte the pre-fix behaviour for non-overflow errors).
+function respondUpstreamError(res, err) {
+  if (err instanceof ConcurrencyOverflowError) {
+    return jsonResponse(res, 429, { error: { message: sanitizeError(err.message), type: "rate_limit_error" } }, { "Retry-After": String(err.retryAfter) });
+  }
+  return jsonResponse(res, 500, { error: { message: sanitizeError(err.message), type: "proxy_error" } });
 }
 
 function sendSSE(res, data, hb) {
@@ -1688,7 +1874,9 @@ function applySettingUpdate(key, value) {
 
   switch (key) {
     case "timeout":          TIMEOUT = value; break;
-    case "maxConcurrent":    MAX_CONCURRENT = value; break;
+    // FIX ⑥: keep the -p wait-queue semaphore's limit in sync with the runtime MAX_CONCURRENT
+    // so a /settings change to maxConcurrent actually changes how many claude procs run at once.
+    case "maxConcurrent":    MAX_CONCURRENT = value; claudeSemaphore.limit = Math.max(1, value); break;
     case "sessionTTL":       SESSION_TTL = value; break;
     case "maxPromptChars":   MAX_PROMPT_CHARS = value; break;
     case "cacheTTL":         CACHE_TTL = value; break;
@@ -1897,7 +2085,7 @@ async function handleChatCompletions(req, res) {
         try { res.end(); } catch {}
         return;
       }
-      return jsonResponse(res, 500, { error: { message: sanitizeError(err.message), type: "proxy_error" } });
+      return respondUpstreamError(res, err);
     }
   }
 
@@ -1914,8 +2102,9 @@ async function handleChatCompletions(req, res) {
       try { res.end(); } catch {}
       return;
     }
-    // Sanitize error: strip internal file paths before sending to client
-    jsonResponse(res, 500, { error: { message: sanitizeError(err.message), type: "proxy_error" } });
+    // Sanitize error: strip internal file paths before sending to client.
+    // FIX ⑥: ConcurrencyOverflowError → 429 + Retry-After; all other errors → 500 (unchanged).
+    respondUpstreamError(res, err);
   }
 }
 
@@ -2076,6 +2265,31 @@ const server = createServer(async (req, res) => {
       circuitBreaker: "disabled",
       sessions: sessionList,
       recentErrors: recentErrors.slice(-5),
+      // ── FIX ③ spawn-home isolation surface — ADDITIVE (default -p/stream-json path) ──
+      // Lets the operator confirm the latency-fix isolation is active without inspecting logs.
+      // NEVER includes the token. mode: "isolated-scratch-home" | "real-home". home is the
+      // scratch HOME path when isolated (null otherwise). For TUI_MODE the -p path is unused,
+      // so report it as disabled.
+      spawn: (() => {
+        if (TUI_MODE) return { mode: "tui (default -p path unused)", isolated: false, home: null };
+        const shm = getSpawnHomeMode();
+        return {
+          mode: shm.isolated ? "isolated-scratch-home" : "real-home",
+          isolated: shm.isolated,
+          home: shm.isolated ? shm.home : null,
+          reason: shm.reason,
+        };
+      })(),
+      // ── FIX ⑥ -p concurrency wait-queue surface — ADDITIVE ──
+      // inflight/queued are live; queueRejections is cumulative (also in stats.queueRejections).
+      // Lets the operator see backpressure instead of guessing from opaque 500s.
+      concurrency: {
+        maxConcurrent: MAX_CONCURRENT,
+        maxQueue: claudeSemaphore.maxQueue,
+        inflight: claudeSemaphore.inflight,
+        queued: claudeSemaphore.queued,
+        queueRejections: stats.queueRejections,
+      },
       // ── TUI observability (audit C-5) — ADDITIVE block (ADR 0007 PR-B amendment) ──
       // /health is a grandfathered B.2 endpoint (ADR 0006). This block is NEW fields only;
       // every existing field above is byte-identical → behaviour-preserving for existing
@@ -2364,7 +2578,7 @@ server.listen(PORT, BIND_ADDRESS, () => {
   console.log(`Architecture: on-demand spawning (no pool)`);
   console.log(`Models: ${MODELS.map((m) => m.id).join(", ")}`);
   console.log(`Claude binary: ${CLAUDE}`);
-  console.log(`Timeout: ${TIMEOUT / 1000}s | Max concurrent: ${MAX_CONCURRENT}`);
+  console.log(`Timeout: ${TIMEOUT / 1000}s | Max concurrent: ${MAX_CONCURRENT} | Queue: ${CLAUDE_MAX_QUEUE} (429 on overflow)`);
   console.log(`Circuit breaker: disabled`);
   console.log(`Tools: ${SKIP_PERMISSIONS ? "all (skip-permissions)" : ALLOWED_TOOLS.join(", ")}`);
   console.log(`Sessions: TTL=${SESSION_TTL / 1000}s`);
@@ -2376,6 +2590,15 @@ server.listen(PORT, BIND_ADDRESS, () => {
   if (NO_CONTEXT) console.log(`Context: suppressed (CLAUDE_NO_CONTEXT=true — no CLAUDE.md, no auto-memory)`);
   if (CACHE_TTL > 0) console.log(`Cache: enabled (TTL=${CACHE_TTL / 1000}s)`);
   else console.log(`Cache: disabled (set CLAUDE_CACHE_TTL to enable)`);
+  // FIX ③: announce default-path (-p/stream-json) spawn-home isolation mode (never logs the token).
+  if (!TUI_MODE) {
+    const shm = getSpawnHomeMode();
+    if (shm.isolated) {
+      console.log(`Spawn home: isolated-scratch-home (${shm.home}, cwd-neutral, env-token auth) — fast path`);
+    } else {
+      console.log(`Spawn home: real-home (${shm.reason}) — set CLAUDE_CODE_OAUTH_TOKEN for the isolated fast path`);
+    }
+  }
   if (TUI_MODE) {
     console.warn(`⚠️  TUI-mode ON — single-user only; do NOT enable on a multi-user OCP (guest prompts would run claude with operator filesystem access). See ADR 0007.`);
     const tuiAuth = process.env.CLAUDE_CODE_OAUTH_TOKEN

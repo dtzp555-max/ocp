@@ -573,7 +573,26 @@ Usage:
   ocp restart            Restart the Claude proxy service
   ocp restart gateway    Restart the OpenClaw gateway
                          (briefly disconnects all Telegram/Discord bots)
+
+Note (macOS): restart does a full launchctl bootout + bootstrap, NOT
+`kickstart -k`. bootout+bootstrap re-reads the plist's EnvironmentVariables,
+so an env change you made (e.g. CLAUDE_BIND, CLAUDE_CODE_OAUTH_TOKEN) actually
+takes effect. `kickstart -k` only re-execs the process and reuses launchd's
+cached env, so env edits would be silently ignored. (Linux systemctl already
+re-reads its EnvironmentFile on restart.)
 EOF
+}
+
+# macOS only: reload a launchd agent via bootout + bootstrap so plist
+# EnvironmentVariables are re-read (kickstart -k would reuse the cached env).
+# Args: <uid> <label> <plist-path>. Returns 0 iff bootstrap succeeds.
+_launchd_reload() {
+  local uid="$1" label="$2" plist="$3"
+  [[ -f "$plist" ]] || return 1
+  # bootout may legitimately fail if the agent is not currently loaded — that's fine,
+  # we only require the subsequent bootstrap to succeed (the load that re-reads env).
+  launchctl bootout "gui/$uid/$label" 2>/dev/null || true
+  launchctl bootstrap "gui/$uid" "$plist" 2>/dev/null
 }
 
 cmd_restart() {
@@ -582,12 +601,14 @@ cmd_restart() {
     openclaw gateway restart 2>&1
   else
     echo "Restarting proxy..."
-    # Try current service name, then legacy, then manual restart
+    # Try current service name, then legacy, then manual restart.
+    # macOS: bootout+bootstrap (re-reads plist EnvironmentVariables — see cmd_restart_help).
+    # Linux: systemctl --user restart already re-reads its EnvironmentFile.
     local uid
     uid=$(id -u)
-    if launchctl kickstart -k "gui/$uid/dev.ocp.proxy" 2>/dev/null; then
+    if _launchd_reload "$uid" "dev.ocp.proxy" "$HOME/Library/LaunchAgents/dev.ocp.proxy.plist"; then
       true
-    elif launchctl kickstart -k "gui/$uid/ai.openclaw.proxy" 2>/dev/null; then
+    elif _launchd_reload "$uid" "ai.openclaw.proxy" "$HOME/Library/LaunchAgents/ai.openclaw.proxy.plist"; then
       true
     elif systemctl --user restart ocp-proxy 2>/dev/null; then
       true

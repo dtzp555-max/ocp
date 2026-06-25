@@ -844,6 +844,29 @@ ocp restart
 openclaw gateway restart
 ```
 
+### Env var change (e.g. `CLAUDE_BIND`, `CLAUDE_CODE_OAUTH_TOKEN`) doesn't take effect after restart
+
+On **macOS**, `ocp restart` does a full `launchctl bootout` + `bootstrap` of the agent, which **re-reads the plist `EnvironmentVariables`** — so an env change you made (in `~/Library/LaunchAgents/dev.ocp.proxy.plist`) actually takes effect:
+
+```bash
+ocp restart
+```
+
+This is deliberate: the older `launchctl kickstart -k` only re-execs the process and **reuses launchd's cached environment**, so plist env edits would be silently ignored. If you ever restart the agent by hand, use bootout+bootstrap, not `kickstart -k`:
+
+```bash
+launchctl bootout   gui/$(id -u)/dev.ocp.proxy 2>/dev/null
+launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/dev.ocp.proxy.plist
+```
+
+Verify the new value reached the running process:
+
+```bash
+ps -E -p "$(launchctl print gui/$(id -u)/dev.ocp.proxy 2>/dev/null | awk '/pid =/{print $3}')" | tr ' ' '\n' | grep CLAUDE_
+```
+
+On **Linux**, `systemctl --user restart` already re-reads the unit's `EnvironmentFile`, so no special handling is needed.
+
 ### Usage shows "unknown"
 
 Usually caused by an expired Claude CLI session. Fix:
@@ -903,7 +926,9 @@ See [Subscription-pool (TUI) mode](#subscription-pool-tui-mode) and ADR 0007 PR-
 | `CLAUDE_BIN` | *(auto-detect)* | Path to claude binary |
 | `CLAUDE_TIMEOUT` | `600000` | Request timeout (ms, default: 10 min) |
 | `CLAUDE_HEARTBEAT_INTERVAL` | `0` | Streaming SSE keepalive interval (ms). `0` = disabled. See "Streaming heartbeat" section. |
-| `CLAUDE_MAX_CONCURRENT` | `8` | Max concurrent claude processes |
+| `CLAUDE_MAX_CONCURRENT` | `8` | Max concurrent claude processes (`-p`/stream-json path) |
+| `CLAUDE_MAX_QUEUE` | `16` | Max requests **waiting** for a `-p` concurrency slot. Beyond `CLAUDE_MAX_CONCURRENT`, requests queue (up to this cap) instead of being rejected; when the queue is **also** full, the request gets `HTTP 429` + `Retry-After` (not an opaque 500). Surfaced on `/health.concurrency` + `/health.stats.queueRejections`. |
+| `CLAUDE_QUEUE_RETRY_AFTER` | `5` | Seconds advertised in the `Retry-After` header on a `-p` concurrency-overflow `429`. |
 | `CLAUDE_MAX_PROMPT_CHARS` | `150000` | Prompt truncation limit (chars) |
 | `CLAUDE_SESSION_TTL` | `3600000` | Session expiry (ms, default: 1 hour) |
 | `CLAUDE_CACHE_TTL` | `0` | Response cache TTL (ms, 0 = disabled). Set to e.g. `300000` for 5-min cache |
@@ -915,6 +940,7 @@ See [Subscription-pool (TUI) mode](#subscription-pool-tui-mode) and ADR 0007 PR-
 | `PROXY_ADVERTISE_ANON_KEY` | *(unset)* | When `=1`, advertise `PROXY_ANONYMOUS_KEY` in the public `/health` body for remote zero-config discovery. Default off — `/health` is unauthenticated, so this exposes the shared key to any LAN-reachable device (issue #109). Localhost always sees it regardless. |
 | `CLAUDE_TUI_MODE` | `false` | **Opt-in.** Set to `"true"` to serve requests via interactive `claude` (no `-p` / `--output-format` → `cc_entrypoint=cli`, subscription pool). **Single-user only** — see [Subscription-pool (TUI) mode](#subscription-pool-tui-mode) for the security constraint. |
 | `CLAUDE_CODE_OAUTH_TOKEN` | *(unset)* | OAuth bearer token (highest-precedence credential source for the `-p` path). **Recommended for TUI-mode hosts:** when set (and `OCP_TUI_HOME` unset), OCP runs the interactive `claude` in a **credential-isolated home** (`$HOME/.ocp-tui/home`, no `credentials.json`) so this long-lived token is the only credential and is authoritative — interactive `claude` otherwise *prefers* `~/.claude/.credentials.json` over the env var, so a stale one shadows the token and its single-use refresh token gets corrupted by the spawn/teardown cycle (the permanent `Please run /login` 401 — see [Subscription-pool (TUI) mode](#subscription-pool-tui-mode) and ADR 0007 PR-D). The token appears in the pane command (ps-visible) — acceptable for the single-user A-path; the multi-user B-path is refused at boot. |
+| `OCP_SPAWN_REAL_HOME` | *(unset)* | Kill-switch for the default `-p`/stream-json **spawn-home isolation** (latency fix). When unset and an OAuth token is resolvable, OCP runs the per-request `claude` spawn in a **credential-free minimal scratch home** (`$HOME/.ocp/spawn-home`, no `.credentials.json`/`settings.json`/plugins) with a neutral cwd and the env token — so it loads none of the operator's heavy global `~/.claude` (plugins/skills/hooks) or the project `CLAUDE.md`, cutting per-request latency (measured ~10–28s → ~3–7s). Set to `"1"` to force the legacy real-`HOME` spawn (no cwd override) even when a token exists. With **no** resolvable token, OCP falls back to the real `HOME` automatically (zero regression). Active mode is shown at startup and on `/health.spawn`. |
 | `CLAUDE_TUI_WALLCLOCK_MS` | `120000` | (TUI-mode) Maximum time in ms to wait for the native transcript to signal turn completion. Increase for long Opus thinking turns. |
 | `OCP_TUI_CWD` | `$HOME/.ocp-tui/work` | (TUI-mode) Scratch working directory where interactive claude sessions run. Transcripts land under `<HOME>/.claude/projects/<encoded-cwd>/`. Created automatically. |
 | `OCP_TUI_HOME` | *(auto)* | (TUI-mode) `HOME` claude runs under. **When unset, OCP picks it for you:** if `CLAUDE_CODE_OAUTH_TOKEN` is set → a **credential-isolated** scratch home `$HOME/.ocp-tui/home` (no `credentials.json`, env-token auth — **recommended**); if no env token → the operator's real home (legacy shared `credentials.json`). Setting this to an **explicit** path overrides the auto-default. The credential handling at that path still follows the env token: **with** the env token it is credential-free (env-token auth, no `credentials.json` written); **without** the env token (and the path ≠ real home) it uses the legacy symlinked-credentials scratch mode, which carries the credential-fork caveat — see ADR 0007. |
