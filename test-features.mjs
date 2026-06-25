@@ -1340,23 +1340,12 @@ test("streamStringAsSSE empty content: role + stop + [DONE] only", () => {
 });
 
 // ── Suite: TUI transcript reader ────────────────────────────────────────
-import { encodeCwd, transcriptPath, findTranscriptPath, parseTranscriptLines, isTerminalLine, extractLatestAssistantText, verifyEntrypoint, detectTuiUpstreamError } from "./lib/tui/transcript.mjs";
+import { findTranscriptPath, parseTranscriptLines, isTerminalLine, extractLatestAssistantText, verifyEntrypoint, detectTuiUpstreamError } from "./lib/tui/transcript.mjs";
 import { readFileSync as tuiReadFileSync, mkdtempSync as tuiMkdtemp0, mkdirSync as tuiMkdir0, writeFileSync as tuiWrite0 } from "node:fs";
 import { tmpdir as tuiTmp0 } from "node:os";
 
 console.log("\nTUI transcript — path formula:");
 
-test("encodeCwd replaces every slash AND every dot with dash", () => {
-  // Verified live (claude v2.1.158): /home/u/.ocp-tui/work -> -home-u--ocp-tui-work
-  assert.equal(encodeCwd("/home/u/.ocp-tui/work"), "-home-u--ocp-tui-work");
-  assert.equal(encodeCwd("/tmp/tui-test"), "-tmp-tui-test"); // dot-free path still correct
-});
-test("transcriptPath composes HOME/.claude/projects/<enc>/<sid>.jsonl", () => {
-  assert.equal(
-    transcriptPath("/home/u", "/home/u/.ocp-tui/work", "abc-123"),
-    "/home/u/.claude/projects/-home-u--ocp-tui-work/abc-123.jsonl"
-  );
-});
 test("findTranscriptPath locates <sid>.jsonl across projects subdirs by UUID", () => {
   const home = tuiMkdtemp0(`${tuiTmp0()}/tui-home-`);
   const sid = "11111111-2222-3333-4444-555555555555";
@@ -1740,7 +1729,7 @@ test("buildTuiCmd shq-escapes a token containing shell metacharacters (no inject
 test("buildTuiCmd OCP_TUI_FULL_TOOLS=1 grants -p-equivalent tool surface (single-user opt-in)", () => {
   const save = { ...process.env };
   const restore = () => {
-    for (const k of ["OCP_TUI_FULL_TOOLS", "CLAUDE_SKIP_PERMISSIONS", "CLAUDE_MCP_CONFIG", "CLAUDE_ALLOWED_TOOLS"]) {
+    for (const k of ["OCP_TUI_FULL_TOOLS", "CLAUDE_MCP_CONFIG", "CLAUDE_ALLOWED_TOOLS"]) {
       if (k in save) process.env[k] = save[k]; else delete process.env[k];
     }
   };
@@ -1752,20 +1741,14 @@ test("buildTuiCmd OCP_TUI_FULL_TOOLS=1 grants -p-equivalent tool surface (single
 
     // gate on: --allowedTools (default set incl Bash), MCP wall dropped
     process.env.OCP_TUI_FULL_TOOLS = "1";
-    delete process.env.CLAUDE_SKIP_PERMISSIONS;
     delete process.env.CLAUDE_MCP_CONFIG;
     delete process.env.CLAUDE_ALLOWED_TOOLS;
     const full = buildTuiCmd("/usr/bin/claude", "m", "s", "/home/u", "cli");
     assert.ok(full.includes("--allowedTools") && full.includes("Bash"), "full-tools grants --allowedTools incl Bash");
     assert.ok(!full.includes("--strict-mcp-config") && !/--disallowedTools/.test(full), "full-tools drops the MCP wall");
-
-    // skip-permissions supersedes --allowedTools
-    process.env.CLAUDE_SKIP_PERMISSIONS = "true";
-    const skip = buildTuiCmd("/usr/bin/claude", "m", "s", "/home/u", "cli");
-    assert.ok(skip.includes("--dangerously-skip-permissions") && !skip.includes("--allowedTools"), "skip-permissions honored");
+    assert.ok(!full.includes("--dangerously-skip-permissions"), "skip-permissions branch is removed (bricks headless TUI)");
 
     // mcp-config threaded through
-    delete process.env.CLAUDE_SKIP_PERMISSIONS;
     process.env.CLAUDE_MCP_CONFIG = "/tmp/mcp.json";
     const mcp = buildTuiCmd("/usr/bin/claude", "m", "s", "/home/u", "cli");
     assert.ok(/--mcp-config '\/tmp\/mcp.json'/.test(mcp), "mcp-config passed through (shq'd)");
@@ -1927,56 +1910,6 @@ test("resolveTuiHome: env token UNSET → real home (legacy credentials.json pat
 test("resolveTuiHome: explicit OCP_TUI_HOME wins regardless of env token (back-compat)", () => {
   assert.equal(resolveTuiHome({ realHome: "/home/u", configuredHome: "/custom/home", envTokenSet: true }), "/custom/home");
   assert.equal(resolveTuiHome({ realHome: "/home/u", configuredHome: "/custom/home", envTokenSet: false }), "/custom/home");
-});
-
-// ── resolveTuiEntrypointEnv ───────────────────────────────────────────────
-import { resolveTuiEntrypointEnv } from "./lib/tui/session.mjs";
-
-console.log("\nresolveTuiEntrypointEnv:");
-
-test("mode 'cli' sets CLAUDE_CODE_ENTRYPOINT=cli", () => {
-  const env = {};
-  resolveTuiEntrypointEnv(env, "cli");
-  assert.equal(env.CLAUDE_CODE_ENTRYPOINT, "cli");
-});
-
-test("mode 'cli' overwrites an inherited CLAUDE_CODE_ENTRYPOINT value", () => {
-  const env = { CLAUDE_CODE_ENTRYPOINT: "sdk-cli" };
-  resolveTuiEntrypointEnv(env, "cli");
-  assert.equal(env.CLAUDE_CODE_ENTRYPOINT, "cli");
-});
-
-test("mode 'auto' deletes CLAUDE_CODE_ENTRYPOINT (leaves unset)", () => {
-  const env = {};
-  resolveTuiEntrypointEnv(env, "auto");
-  assert.equal(env.CLAUDE_CODE_ENTRYPOINT, undefined);
-  assert.ok(!Object.prototype.hasOwnProperty.call(env, "CLAUDE_CODE_ENTRYPOINT"));
-});
-
-test("mode 'auto' deletes an inherited CLAUDE_CODE_ENTRYPOINT value", () => {
-  const env = { CLAUDE_CODE_ENTRYPOINT: "sdk-cli" };
-  resolveTuiEntrypointEnv(env, "auto");
-  assert.equal(env.CLAUDE_CODE_ENTRYPOINT, undefined);
-  assert.ok(!Object.prototype.hasOwnProperty.call(env, "CLAUDE_CODE_ENTRYPOINT"));
-});
-
-test("mode 'off' leaves an inherited CLAUDE_CODE_ENTRYPOINT value untouched", () => {
-  const env = { CLAUDE_CODE_ENTRYPOINT: "sdk-cli" };
-  resolveTuiEntrypointEnv(env, "off");
-  assert.equal(env.CLAUDE_CODE_ENTRYPOINT, "sdk-cli");
-});
-
-test("mode 'off' with no inherited value leaves env unchanged", () => {
-  const env = { OTHER: "x" };
-  resolveTuiEntrypointEnv(env, "off");
-  assert.equal(env.CLAUDE_CODE_ENTRYPOINT, undefined);
-  assert.equal(env.OTHER, "x");
-});
-
-test("default mode (no second arg) behaves like 'cli'", () => {
-  const env = { CLAUDE_CODE_ENTRYPOINT: "sdk-cli" };
-  resolveTuiEntrypointEnv(env);
-  assert.equal(env.CLAUDE_CODE_ENTRYPOINT, "cli");
 });
 
 // ── TUI concurrency limiter + drift observability (PR-B: audit C-4 / C-5) ──
