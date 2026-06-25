@@ -1,5 +1,29 @@
 # Changelog
 
+## v3.21.0 — 2026-06-25
+
+Cleanup + docs release: TUI dead-code removal, docs honesty, and release prep. No new `cli.js` wire behavior; the default path (`CLAUDE_TUI_MODE` unset) is byte-for-byte unchanged.
+
+### TUI dead-code / footgun cleanup
+
+- **A1 — removed inert entrypoint-env path** (`lib/tui/session.mjs`): deleted `resolveTuiEntrypointEnv()` and the redundant env-strip block in `runTuiTurn`. The `{env}` object passed to `spawnSync` (tmux itself) was the wrong target — tmux does NOT forward the spawning process's environment to the pane; the pane's `claude` gets its env exclusively from the `env` prefix string built inside `buildTuiCmd` (verified live 2026-06-01). The spawnSync env is now intentionally minimal (`HOME` only). Behavior is unchanged: `buildTuiCmd` already handled all claude-specific env vars via its prefix string.
+- **A2 — removed test-only transcript helpers** (`lib/tui/transcript.mjs`): deleted `encodeCwd()` and `transcriptPath()` exports and the tests that pinned them. Production resolves transcripts exclusively via `findTranscriptPath()` (glob by session-id), which is immune to the exact path-encoding rule. No non-test importers existed (grep confirms). A `// TODO` comment near `findTranscriptPath()` notes that a CI fixture-contract test would make claude-schema drift fail loudly.
+- **A3 — removed headless-unusable `--dangerously-skip-permissions` branch** (`lib/tui/session.mjs` + `README.md`): `OCP_TUI_FULL_TOOLS=1` now always takes the `--allowedTools` path. The removed branch pushed `--dangerously-skip-permissions` when `CLAUDE_SKIP_PERMISSIONS=true`; on claude v2.1.x this triggers an interactive bypass-acceptance screen that a headless tmux pane cannot answer → the turn hangs to the wallclock cap and bricks the pane. The working path is `--allowedTools` + scratch-home `settings.json` `additionalDirectories`. `CLAUDE_SKIP_PERMISSIONS` for the `-p` path is unchanged (still used in `server.mjs`).
+
+### Docs
+
+- **Client-tools boundary** (README `§ How It Works`): OCP is a text-prompt bridge only — it does not pass OpenAI `tools`/`functions` or Anthropic `tool_use` blocks to the client. Clients receive assistant TEXT only; client-local tool execution is not supported by design (bypassing `cli.js` = out of scope per `ALIGNMENT.md`).
+- **ToS honesty** (README `§ Deployment model & security`): pooling one Claude subscription across multiple distinct people may violate Anthropic's Consumer ToS and risk account suspension by the abuse classifier. The defensible framing is "one person, your own devices" — friends/team sharing is not. The prior language ("account terms are your call") was accurate but understated the risk.
+- **"Why OCP" posture** (README `§ Why OCP?`): new bullet making explicit that OCP drives the official `claude` CLI as-is — no OAuth token extraction, no binary patching, no protocol invention — so traffic looks like genuine Claude Code (`cc_entrypoint=cli`).
+- **Promotion plan** (`docs/PROMOTION.md`): "stable & visible" strategy covering goal (polish + low-key OSS visibility, NOT growth-hacking given the live ToS/billing risk), pre-requisites (stability first), honest ToS disclosure requirement, items explicitly skipped (multi-backend routing → OLP; gateway model-discovery; raw API passthrough → ALIGNMENT.md scope), TUI toggle as billing-split insurance, and low-key visibility actions. Framed as a recommendation for the maintainer to review, not a committed plan.
+
+### Previously shipped (v3.20.x) — documented here for completeness
+
+- **Default `-p` spawn-home isolation** (v3.20.0 / PR-A): per-request `claude` spawns run in a credential-free minimal scratch HOME (`$HOME/.ocp/spawn-home`, no `.credentials.json`/`settings.json`/plugins) with a neutral cwd and the env token, cutting per-request latency (measured ~10–28s → ~3–7s). Kill-switch: `OCP_SPAWN_REAL_HOME=1`. Active mode shown at startup and on `/health.spawn`.
+- **Bounded concurrency wait-queue** (v3.20.0 / PR-B): excess `-p` requests queue (up to `CLAUDE_MAX_QUEUE`, default 16) instead of being rejected; a full queue returns `HTTP 429` + `Retry-After` (not an opaque 500). New env vars: `CLAUDE_MAX_QUEUE`, `CLAUDE_QUEUE_RETRY_AFTER`. Surfaced on `/health.concurrency` + `/health.stats.queueRejections`.
+- **`ocp restart`** macOS `bootout`+`bootstrap` (v3.20.0 / PR-B): safe restart command that forces launchd to re-read the plist (unlike `kickstart -k` which reuses the cached env).
+- **`/ocp` plugin OpenClaw-2026.5.27 compat** (v3.20.0 / PR-C): gateway plugin updated for the current OpenClaw API version.
+
 ## v3.20.1 — 2026-06-13
 
 TUI-mode auth hardening: fixes the recurring `Please run /login · API Error: 401` (the PI231 incident) and reaps leaked defunct `claude` sessions. ([#141](https://github.com/dtzp555-max/ocp/pull/141))
