@@ -392,24 +392,43 @@ function prepareSpawnHome(dir = SPAWN_HOME_DIR) {
 // once). Returns { isolated, home, token } where:
 //   - isolated:true  → spawn under SPAWN_HOME_DIR with cwd=SPAWN_HOME_DIR + the env token.
 //   - isolated:false → legacy real-HOME spawn, no cwd override (no token, or kill-switch on).
-// NEVER logs/returns the token verbatim to any caller that logs; spawnClaudeProcess uses it only
-// to populate the spawn env. token is null when isolation is off.
+// Caches only the isolation DECISION (isolated/home/reason), NOT the token — the token is
+// re-resolved FRESH per spawn via resolveSpawnToken(). A memoized token goes stale when its
+// source rotates: the macOS keychain access token rotates (~hourly, refreshed by the operator's
+// real claude), so a startup snapshot 401s once it expires (caused a ~31h Mac-mini 401 outage,
+// 2026-06-26). OCP deliberately does NOT refresh the token itself — a refresh-token grant would
+// consume the single-use refresh token and log out the operator's real claude (issue #112).
 let _spawnHomeMode = null;
 function getSpawnHomeMode() {
   if (_spawnHomeMode) return _spawnHomeMode;
   if (SPAWN_REAL_HOME) {
-    _spawnHomeMode = { isolated: false, home: null, token: null, reason: "kill-switch (OCP_SPAWN_REAL_HOME=1)" };
+    _spawnHomeMode = { isolated: false, home: null, reason: "kill-switch (OCP_SPAWN_REAL_HOME=1)" };
     return _spawnHomeMode;
   }
-  let token = null;
-  try { token = getOAuthCredentials()?.accessToken || null; } catch { token = null; }
-  if (token) {
+  let hasToken = false;
+  try { hasToken = !!(getOAuthCredentials()?.accessToken); } catch { hasToken = false; }
+  if (hasToken) {
     prepareSpawnHome(SPAWN_HOME_DIR);
-    _spawnHomeMode = { isolated: true, home: SPAWN_HOME_DIR, token, reason: "oauth token resolved" };
+    _spawnHomeMode = { isolated: true, home: SPAWN_HOME_DIR, reason: "oauth token resolved" };
   } else {
-    _spawnHomeMode = { isolated: false, home: null, token: null, reason: "no oauth token resolvable" };
+    _spawnHomeMode = { isolated: false, home: null, reason: "no oauth token resolvable" };
   }
   return _spawnHomeMode;
+}
+
+// Resolve a FRESH OAuth access token for an isolated spawn. Read-only (keychain / credentials.json
+// / env) — NEVER refreshes/rotates (see getSpawnHomeMode note). Returns null if none resolvable OR
+// if a known expiry has passed (5-min buffer): a null return makes the caller fall back to real
+// HOME, where the spawned claude refreshes the credential natively and self-heals (the keychain
+// token is then fresh again → next spawn is fast). The env-token path (Linux) carries no expiresAt
+// → never expiry-gated (those tokens are long-lived).
+function resolveSpawnToken() {
+  try {
+    const creds = getOAuthCredentials();
+    if (!creds?.accessToken) return null;
+    if (creds.expiresAt && Date.now() + 300000 >= creds.expiresAt) return null;
+    return creds.accessToken;
+  } catch { return null; }
 }
 
 // ── FIX ⑥ (concurrency): bounded wait-queue for the -p / stream-json path ──────────────
@@ -954,11 +973,17 @@ function spawnClaudeProcess(model, messages, conversationId, keyName, releaseSlo
   const spawnHome = getSpawnHomeMode();
   const spawnOpts = { env, stdio: ["pipe", "pipe", "pipe"] };
   if (spawnHome.isolated) {
-    env.HOME = spawnHome.home;
-    env.CLAUDE_CODE_OAUTH_TOKEN = spawnHome.token; // env token is authoritative for -p
-    env.CLAUDE_CODE_DISABLE_CLAUDE_MDS = "1";
-    env.CLAUDE_CODE_DISABLE_AUTO_MEMORY = "1";
-    spawnOpts.cwd = spawnHome.home; // neutral cwd: no project CLAUDE.md/skills
+    // Re-resolve the token FRESH per spawn (never a startup snapshot — keychain tokens rotate;
+    // a stale snapshot 401s). If unresolvable right now, fall through to real HOME so the spawned
+    // claude resolves + refreshes credentials natively instead of 401ing on a stale/null token.
+    const freshToken = resolveSpawnToken();
+    if (freshToken) {
+      env.HOME = spawnHome.home;
+      env.CLAUDE_CODE_OAUTH_TOKEN = freshToken; // env token is authoritative for -p
+      env.CLAUDE_CODE_DISABLE_CLAUDE_MDS = "1";
+      env.CLAUDE_CODE_DISABLE_AUTO_MEMORY = "1";
+      spawnOpts.cwd = spawnHome.home; // neutral cwd: no project CLAUDE.md/skills
+    }
   }
 
   const proc = spawn(CLAUDE, cliArgs, spawnOpts);
