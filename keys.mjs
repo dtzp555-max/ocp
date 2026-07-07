@@ -382,11 +382,25 @@ export function getCacheStats() {
 // Per ADR 0005 / spec D4: in-process scope only (single Node process per host).
 const inflightMap = new Map();
 
-export function singleflight(hash, fn) {
+// `retryIf` (optional, audit finding M1): a predicate applied on the FOLLOWER path only.
+// When a follower joins an existing flight and the shared promise rejects with an error for
+// which retryIf(err) is true (in practice: the LEADER's client disconnected while queued —
+// an error that is personal to the leader, not a verdict about the upstream), the follower
+// does NOT inherit that rejection. Instead it re-enters singleflight with its OWN fn: it
+// either becomes the new leader (the map entry is already deleted — see the finally below,
+// which runs before any follower's catch because it is attached upstream of the promise the
+// followers await) or joins a flight another retrying follower just created. The leader's
+// own rejection is never retried here — its error belongs to it (leader path returns the
+// bare promise). Callers that pass no retryIf get the exact pre-M1 share-everything behavior.
+export function singleflight(hash, fn, retryIf) {
   const existing = inflightMap.get(hash);
   if (existing) {
     existing.requesters++;
-    return existing.promise;
+    if (!retryIf) return existing.promise;
+    return existing.promise.catch((err) => {
+      if (!retryIf(err)) throw err;
+      return singleflight(hash, fn, retryIf);
+    });
   }
   // Wrap fn() in Promise.resolve().then() so synchronous throws don't escape.
   const promise = Promise.resolve().then(fn).finally(() => {

@@ -1297,9 +1297,15 @@ async function callClaudeTui(model, messages, _conversationId, _keyName, res) {
     await tuiSemaphore.acquire(signal);
   } catch (err) {
     detach();
-    throw err instanceof SemaphoreAbortError
-      ? new RequestDisconnectedError("client disconnected while waiting for a TUI concurrency slot")
-      : err;
+    if (err instanceof SemaphoreAbortError) {
+      // L1: client-driven cancellation, not an upstream failure — info, not error (mirrors
+      // acquireClaudeSlot's concurrency_wait_cancelled on the -p path).
+      logEvent("info", "concurrency_wait_cancelled", {
+        reason: "client_disconnected", path: "tui", inflight: tuiSemaphore.inflight, queued: tuiSemaphore.queued,
+      });
+      throw new RequestDisconnectedError("client disconnected while waiting for a TUI concurrency slot");
+    }
+    throw err;
   }
   detach();
   // release() runs in a finally so any throw from runTuiTurn (tmux spawn failure,
@@ -2302,12 +2308,24 @@ async function handleChatCompletions(req, res) {
         const c = await upstreamCall(model, messages, conversationId, req._authKeyName, res);
         try { setCachedResponse(req._cacheHash, model, c); } catch (e) { logEvent("error", "cache_write_failed", { error: e.message }); }
         return c;
-      });
+      },
+      // M1: if the LEADER disconnected while queued (F2), its RequestDisconnectedError is
+      // personal to the leader — a live follower must not inherit it as a spurious 500.
+      // retryIf makes this follower re-enter singleflight with its OWN fn (own res, own
+      // disconnect signal), becoming the new leader or joining a retrying sibling's flight —
+      // but only while OUR client is still connected. If our client is also gone, the
+      // rejection propagates and the RDE early-return in the catch below ends it quietly.
+      (err) => err instanceof RequestDisconnectedError && !res.destroyed);
       const id = `chatcmpl-${randomUUID()}`;
       completionResponse(res, id, model, content);
       try { recordUsage({ keyId: req._authKeyId, keyName: req._authKeyName, model, promptChars, responseChars: content.length, elapsedMs: Date.now() - t0Usage, success: true }); } catch (e) { logEvent("error", "usage_record_failed", { error: e.message }); }
       return;
     } catch (err) {
+      // L1: a client disconnect while queued is NOT an upstream failure — mirror the
+      // streaming path (which returns without recording anything): no usage-failure row,
+      // no [proxy] error log, no error response (the socket is gone). The disconnect is
+      // already logged at info level (concurrency_wait_cancelled) by acquireClaudeSlot.
+      if (err instanceof RequestDisconnectedError) { try { res.end(); } catch {} return; }
       try { recordUsage({ keyId: req._authKeyId, keyName: req._authKeyName, model, promptChars, responseChars: 0, elapsedMs: Date.now() - t0Usage, success: false }); } catch (e) { logEvent("error", "usage_record_failed", { error: e.message }); }
       console.error(`[proxy] error: ${err.message}`);
       if (res.headersSent || res.writableEnded || res.destroyed) {
@@ -2325,6 +2343,9 @@ async function handleChatCompletions(req, res) {
     completionResponse(res, id, model, content);
     try { recordUsage({ keyId: req._authKeyId, keyName: req._authKeyName, model, promptChars, responseChars: content.length, elapsedMs: Date.now() - t0Usage, success: true }); } catch (e) { logEvent("error", "usage_record_failed", { error: e.message }); }
   } catch (err) {
+    // L1: disconnect-while-queued — same quiet non-error outcome as the singleflight
+    // path above and the streaming path (see acquireClaudeSlot's info-level log).
+    if (err instanceof RequestDisconnectedError) { try { res.end(); } catch {} return; }
     try { recordUsage({ keyId: req._authKeyId, keyName: req._authKeyName, model, promptChars, responseChars: 0, elapsedMs: Date.now() - t0Usage, success: false }); } catch (e) { logEvent("error", "usage_record_failed", { error: e.message }); }
     console.error(`[proxy] error: ${err.message}`);
     if (res.headersSent || res.writableEnded || res.destroyed) {

@@ -463,6 +463,52 @@ async function runSingleflightTests() {
     assert.equal(r1, 1);
     assert.equal(r2, 2);
   });
+
+  // 7. M1: leader disconnect while queued must not poison live followers. server.mjs passes
+  // retryIf = (err) => err instanceof RequestDisconnectedError && !res.destroyed — here we
+  // model that with a tagged error class. The leader (no retryIf on its own promise — the
+  // rejection is ITS OWN disconnect) sees the error; the live follower re-executes its OWN
+  // fn and gets a real result instead of a spurious inherited failure.
+  await asyncTest("M1: leader disconnects while queued → live follower re-executes and gets a real result", async () => {
+    class FakeDisconnectError extends Error {}
+    const leaderGate = Promise.withResolvers();
+    let leaderRuns = 0;
+    let followerRuns = 0;
+    const leaderFn = async () => { leaderRuns++; await leaderGate.promise; throw new FakeDisconnectError("leader client gone"); };
+    const followerFn = async () => { followerRuns++; return "real-execution"; };
+    const retryIf = (err) => err instanceof FakeDisconnectError;
+
+    const leaderP = singleflight("sf-m1-leader-dc", leaderFn);             // becomes leader
+    const followerP = singleflight("sf-m1-leader-dc", followerFn, retryIf); // joins as follower
+    leaderGate.resolve(); // leader "disconnects" while holding the flight
+
+    await assert.rejects(leaderP, FakeDisconnectError, "the leader itself still sees its own disconnect");
+    assert.equal(await followerP, "real-execution", "follower got a REAL execution, not the leader's disconnect");
+    assert.equal(leaderRuns, 1, "leader fn ran once");
+    assert.equal(followerRuns, 1, "follower re-executed exactly once (as the new leader)");
+    assert.equal(getInflightStats().inflight, 0, "map fully cleaned up after the retry flight settles");
+  });
+
+  // 8. M1 guard: a follower whose retryIf returns false (server.mjs: its OWN client is also
+  // gone) inherits the rejection unchanged — no retry, no masked error. And a follower with
+  // NO retryIf keeps the exact pre-M1 share-everything behavior (test 2 pins the fan-out;
+  // this pins the predicate=false path specifically for the disconnect error).
+  await asyncTest("M1: follower with retryIf=false (own client also gone) inherits the leader's rejection, no retry", async () => {
+    class FakeDisconnectError extends Error {}
+    const gate = Promise.withResolvers();
+    let followerRuns = 0;
+    const leaderFn = async () => { await gate.promise; throw new FakeDisconnectError("leader client gone"); };
+    const followerFn = async () => { followerRuns++; return "should-never-run"; };
+
+    const leaderP = singleflight("sf-m1-both-dc", leaderFn);
+    const followerP = singleflight("sf-m1-both-dc", followerFn, () => false); // own client dead → no retry
+    gate.resolve();
+
+    await assert.rejects(leaderP, FakeDisconnectError);
+    await assert.rejects(followerP, FakeDisconnectError, "rejection propagates unchanged when retryIf says no");
+    assert.equal(followerRuns, 0, "follower fn never executed — no wasted spawn for a dead client");
+    assert.equal(getInflightStats().inflight, 0);
+  });
 }
 
 await runSingleflightTests();
@@ -2291,6 +2337,42 @@ await asyncTest("F2: cancelling one queued waiter preserves FIFO order for the o
   assert.deepEqual(started, ["A", "C"], "C granted next");
   g3.resolve();
   await t3;
+  assert.equal(sem.inflight, 0);
+});
+
+await asyncTest("F2/L2: abort AFTER grant is a no-op — waiter keeps its slot, no rejection, slot released exactly once", async () => {
+  const sem = new TuiSemaphore(1, { maxQueue: 16 });
+  const g1 = deferred();
+  const t1 = sem.run(async () => { await g1.p; }); // holds the only slot
+  await new Promise((r) => setImmediate(r));
+
+  const controller = new AbortController();
+  let granted = false;
+  const acq = sem.acquire(controller.signal).then(() => { granted = true; });
+  await new Promise((r) => setImmediate(r));
+  assert.equal(sem.queued, 1, "waiter queued behind t1");
+
+  // t1 finishes → release() shifts the waiter out and grants it the slot (waiter() detaches
+  // the abort listener before resolving).
+  g1.resolve();
+  await t1;
+  await acq;
+  assert.equal(granted, true, "waiter was granted the slot");
+  assert.equal(sem.inflight, 1, "granted waiter holds the slot");
+  assert.equal(sem.queued, 0);
+
+  // The client disconnects AFTER the grant — the abort-after-grant race. onAbort must be a
+  // no-op (the waiter is no longer in _waiters; idx===-1 guard): no rejection materializes,
+  // the queue is untouched, and the slot is still owned by the (already-resolved) acquirer.
+  controller.abort();
+  await new Promise((r) => setImmediate(r));
+  assert.equal(sem.inflight, 1, "abort after grant did NOT revoke or double-free the slot");
+  assert.equal(sem.queued, 0, "abort after grant did not corrupt queue accounting");
+
+  // The slot is released exactly once via the normal path and is immediately reusable.
+  sem.release();
+  assert.equal(sem.inflight, 0, "slot released exactly once via the normal path");
+  await sem.run(async () => {}); // prove the semaphore is fully healthy afterward
   assert.equal(sem.inflight, 0);
 });
 
