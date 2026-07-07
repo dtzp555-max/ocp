@@ -894,6 +894,10 @@ node ~/ocp/scripts/sync-openclaw.mjs
 
 This is read-only at startup; the warning never blocks the gateway from running.
 
+### A TUI session vanished right after upgrading OCP
+
+If you ran a pre-3.21.1 OCP instance and a post-3.21.1 instance on the same host at the same time during an upgrade, the new instance's one-time boot reap can, once, kill an old-format (`ocp-tui-<8hex>`) live TUI session belonging to the still-running old instance — restart the affected session (`ocp restart` or re-run your TUI turn) and it will come back under the new instance's port-scoped naming.
+
 ### OpenClaw shows old models after `ocp update` (v3.10→v3.11 only)
 
 One-time bootstrap quirk for the v3.10.0 → v3.11.0 jump only — the running shell had the old `cmd_update` cached. Run once manually:
