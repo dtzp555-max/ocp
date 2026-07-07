@@ -5,6 +5,7 @@
  */
 import { getDb, createKey, listKeys, validateKey, recordUsage, checkQuota, updateKeyQuota, getKeyQuota, findKey, cacheHash, getCachedResponse, setCachedResponse, clearCache, getCacheStats, closeDb, hasCacheControl, singleflight, getInflightStats } from "./keys.mjs";
 import { isLoopbackBind } from "./lib/net.mjs";
+import { createSerialMutex, createTtlCache, isTokenExpiring, orderLabelsLastGoodFirst } from "./lib/spawn-auth.mjs";
 import { createHash } from "node:crypto";
 import { strict as assert } from "node:assert";
 import { unlinkSync } from "node:fs";
@@ -25,6 +26,17 @@ let failed = 0;
 function test(name, fn) {
   try {
     fn();
+    passed++;
+    console.log(`  ✓ ${name}`);
+  } catch (e) {
+    failed++;
+    console.log(`  ✗ ${name}: ${e.message}`);
+  }
+}
+
+async function testAsync(name, fn) {
+  try {
+    await fn();
     passed++;
     console.log(`  ✓ ${name}`);
   } catch (e) {
@@ -2478,8 +2490,131 @@ test("isLoopbackBind: '100.64.0.1' → false (Tailscale IP)", () => {
   assert.equal(isLoopbackBind("100.64.0.1"), false);
 });
 
-// ── Cleanup ──
-closeDb();
+// ── Spawn-auth primitives (F3 / F5 / F6, lib/spawn-auth.mjs) ──
+// Pure, dependency-injected primitives extracted from server.mjs so the spawn-token concurrency /
+// caching / expiry logic is testable without booting the server or mocking execFileSync/spawn.
+console.log("\nSpawn-auth (F3 mutex / F5 TTL cache + label memo / F6 expiry gate):");
 
-console.log(`\n=== Results: ${passed} passed, ${failed} failed ===\n`);
-process.exit(failed > 0 ? 1 : 0);
+// F5: expiry gate — the load-bearing invariant that lets a short-TTL keychain cache stay safe.
+test("isTokenExpiring: creds within 5-min buffer → true", () => {
+  assert.equal(isTokenExpiring({ expiresAt: 1000 }, 1000 - 300000, 300000), true); // exactly at buffer edge
+  assert.equal(isTokenExpiring({ expiresAt: 1000 }, 900, 300000), true);           // past the edge
+});
+test("isTokenExpiring: creds well beyond buffer → false", () => {
+  assert.equal(isTokenExpiring({ expiresAt: 10_000_000 }, 0, 300000), false);
+});
+test("isTokenExpiring: no expiresAt (long-lived env token) → never expiring", () => {
+  assert.equal(isTokenExpiring({ accessToken: "x" }, Date.now(), 300000), false);
+  assert.equal(isTokenExpiring(null, Date.now(), 300000), false);
+});
+
+// F5: last-good label ordering — one exec instead of two on the steady-state keychain path.
+test("orderLabelsLastGoodFirst: last-good label is tried first", () => {
+  const labels = ["A", "B"];
+  assert.deepEqual(orderLabelsLastGoodFirst(labels, "B"), ["B", "A"]);
+});
+test("orderLabelsLastGoodFirst: null/unknown last-good → original order, fresh array", () => {
+  const labels = ["A", "B"];
+  assert.deepEqual(orderLabelsLastGoodFirst(labels, null), ["A", "B"]);
+  assert.deepEqual(orderLabelsLastGoodFirst(labels, "Z"), ["A", "B"]);
+  assert.notEqual(orderLabelsLastGoodFirst(labels, null), labels); // does not mutate/alias input
+});
+
+// F5: TTL cache — bounds how often we RE-READ the keychain (not how often we re-decide expiry).
+test("createTtlCache: serves cached value within TTL, re-produces after TTL", () => {
+  const cache = createTtlCache({ ttlMs: 30000 });
+  let calls = 0;
+  const produce = () => { calls++; return `v${calls}`; };
+  assert.equal(cache.get(produce, 0), "v1");
+  assert.equal(cache.get(produce, 10000), "v1"); // within TTL → cached, producer NOT called
+  assert.equal(calls, 1);
+  assert.equal(cache.get(produce, 40000), "v2"); // past TTL → re-produced
+  assert.equal(calls, 2);
+});
+test("createTtlCache: caches a null miss (absent source not re-probed within TTL)", () => {
+  const cache = createTtlCache({ ttlMs: 30000 });
+  let calls = 0;
+  const produce = () => { calls++; return null; };
+  assert.equal(cache.get(produce, 0), null);
+  assert.equal(cache.get(produce, 5000), null);
+  assert.equal(calls, 1); // the null was cached, not re-probed
+});
+
+// F5 core safety property: a short-TTL cache CANNOT reintroduce the #146 forever-stale bug because
+// the expiry gate is applied to the CACHED creds on every use. The cache keeps returning the same
+// creds object, but isTokenExpiring flips to true the moment the clock crosses the expiry buffer.
+test("TTL cache respects expiry gate: cached creds still rejected once clock passes expiry", () => {
+  const cache = createTtlCache({ ttlMs: 30000 });
+  const creds = { accessToken: "tok", expiresAt: 1_000_000 };
+  // t=980_000: cached AND not yet within the 5-min (300_000) buffer → usable.
+  const c1 = cache.get(() => creds, 980_000 - 300_000 - 1);
+  assert.equal(isTokenExpiring(c1, 980_000 - 300_000 - 1, 300000), false);
+  // t=800_000 later: SAME cached object returned (within TTL of the second read window), but now
+  // within the expiry buffer → gate rejects it → caller falls back to real HOME. No forever-stale.
+  const c2 = cache.get(() => creds, 990_000);
+  assert.equal(c2, c1, "cache returns the same creds object");
+  assert.equal(isTokenExpiring(c2, 990_000, 300000), true, "expiry gate still fires on cached creds");
+});
+
+// ── Async: F3 real-HOME fallback serialization mutex ──
+async function runAsyncTests() {
+  await testAsync("createSerialMutex: second waiter blocks until first holder releases", async () => {
+    const mutex = createSerialMutex();
+    const order = [];
+    const rel1 = await mutex.acquire();
+    order.push("h1-enter");
+    let secondEntered = false;
+    const p2 = mutex.acquire().then((rel2) => { secondEntered = true; order.push("h2-enter"); return rel2; });
+    await new Promise((r) => setTimeout(r, 15));
+    assert.equal(secondEntered, false, "second waiter must NOT enter while first holds the mutex");
+    order.push("h1-release");
+    rel1();
+    const rel2 = await p2;
+    assert.equal(secondEntered, true, "second waiter enters only after release");
+    rel2();
+    assert.deepEqual(order, ["h1-enter", "h1-release", "h2-enter"]);
+  });
+
+  await testAsync("createSerialMutex: N acquires run strictly in FIFO order, never overlapping", async () => {
+    const mutex = createSerialMutex();
+    const events = [];
+    let active = 0;
+    async function critical(id) {
+      const rel = await mutex.acquire();
+      active++;
+      assert.equal(active, 1, `only one holder at a time (id=${id})`);
+      events.push(`start${id}`);
+      await new Promise((r) => setTimeout(r, 5));
+      events.push(`end${id}`);
+      active--;
+      rel();
+    }
+    await Promise.all([critical(1), critical(2), critical(3)]);
+    assert.deepEqual(events, ["start1", "end1", "start2", "end2", "start3", "end3"]);
+  });
+
+  await testAsync("createSerialMutex: release() is idempotent (double-release does not double-admit)", async () => {
+    const mutex = createSerialMutex();
+    const rel1 = await mutex.acquire();
+    rel1();
+    rel1(); // second call must be a no-op
+    const rel2 = await mutex.acquire(); // should acquire cleanly, exactly once
+    let thirdEntered = false;
+    const p3 = mutex.acquire().then((r) => { thirdEntered = true; return r; });
+    await new Promise((r) => setTimeout(r, 15));
+    assert.equal(thirdEntered, false, "double-release must not have leaked an extra admit slot");
+    rel2();
+    (await p3)();
+  });
+}
+
+// ── Cleanup ──
+runAsyncTests().then(() => {
+  closeDb();
+  console.log(`\n=== Results: ${passed} passed, ${failed} failed ===\n`);
+  process.exit(failed > 0 ? 1 : 0);
+}).catch((e) => {
+  console.error("async test runner crashed:", e);
+  closeDb();
+  process.exit(1);
+});
