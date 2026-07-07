@@ -1652,12 +1652,23 @@ await asyncTest("readTuiTranscript throws when no text and cap elapses", async (
 });
 
 // ── TUI session reaper ───────────────────────────────────────────────────
-import { reapStaleTuiSessions, SESSION_PREFIX, buildTuiCmd } from "./lib/tui/session.mjs";
+import { reapStaleTuiSessions, sessionPrefixForPort, LEGACY_SESSION_PREFIX, LEGACY_SESSION_NAME_RE, buildTuiCmd } from "./lib/tui/session.mjs";
 
 console.log("\nTUI session reaper:");
 
-test("SESSION_PREFIX is ocp-tui-", () => {
-  assert.equal(SESSION_PREFIX, "ocp-tui-");
+// F7 fix: the session prefix is instance-scoped by listen port so a second OCP
+// instance on the same host (different port) is never mistaken for "ours".
+test("sessionPrefixForPort embeds the port (F7 instance scoping)", () => {
+  assert.equal(sessionPrefixForPort(3456), "ocp-tui-3456-");
+  assert.equal(sessionPrefixForPort(4000), "ocp-tui-4000-");
+  assert.notEqual(sessionPrefixForPort(3456), sessionPrefixForPort(4000));
+});
+
+test("LEGACY_SESSION_NAME_RE matches only the exact old bare-prefix shape, never the new shape", () => {
+  assert.ok(LEGACY_SESSION_NAME_RE.test(`${LEGACY_SESSION_PREFIX}a1b2c3d4`), "legacy 8-hex shape matches");
+  assert.ok(!LEGACY_SESSION_NAME_RE.test("ocp-tui-3456-a1b2c3d4"), "new port-scoped shape must NOT match legacy regex");
+  assert.ok(!LEGACY_SESSION_NAME_RE.test("ocp-tui-a1b2c3"), "too-short suffix must not match");
+  assert.ok(!LEGACY_SESSION_NAME_RE.test("ocp-tui-a1b2c3d4extra"), "trailing extra chars must not match");
 });
 
 console.log("\nTUI command construction (proxy-purity / #4):");
@@ -1764,22 +1775,40 @@ test("buildTuiCmd OCP_TUI_FULL_TOOLS=1 grants -p-equivalent tool surface (single
   }
 });
 
-test("reaper kills ONLY ocp-tui- sessions, never olp-tui-", () => {
+test("reaper kills ONLY this instance's own port-scoped sessions, never olp-tui-", () => {
   const killed = [];
   const fakeTmux = (args) => {
-    if (args[0] === "list-sessions") return { status: 0, stdout: "ocp-tui-aaaa\nolp-tui-bbbb\nmisc\nocp-tui-cccc\n" };
+    if (args[0] === "list-sessions") return { status: 0, stdout: "ocp-tui-3456-aaaa\nolp-tui-bbbb\nmisc\nocp-tui-3456-cccc\n" };
     if (args[0] === "kill-session") { killed.push(args[args.indexOf("-t") + 1]); return { status: 0 }; }
     return { status: 0, stdout: "" };
   };
-  const n = reapStaleTuiSessions({ tmux: fakeTmux });
+  const n = reapStaleTuiSessions({ tmux: fakeTmux, port: 3456 });
   assert.equal(n, 2);
-  assert.equal(killed.join(","), "ocp-tui-aaaa,ocp-tui-cccc");
+  assert.equal(killed.join(","), "ocp-tui-3456-aaaa,ocp-tui-3456-cccc");
   assert.ok(!killed.includes("olp-tui-bbbb"), "olp-tui-bbbb must never be killed");
+});
+
+// F7 fix: a second OCP instance on the same host (different port) must be treated exactly
+// like a foreign product prefix — never reaped, never allowed to trigger kill-server.
+test("reaper treats a sibling OCP instance on a DIFFERENT port as foreign (F7)", () => {
+  const killed = [];
+  const calls = [];
+  const fakeTmux = (args) => {
+    calls.push(args.join(" "));
+    if (args[0] === "list-sessions") return { status: 0, stdout: "ocp-tui-3456-aaaa\nocp-tui-9999-bbbb\n" };
+    if (args[0] === "kill-session") { killed.push(args[args.indexOf("-t") + 1]); return { status: 0 }; }
+    return { status: 0, stdout: "" };
+  };
+  const n = reapStaleTuiSessions({ tmux: fakeTmux, port: 3456 });
+  assert.equal(n, 1, "killed only the own-port session");
+  assert.equal(killed.join(","), "ocp-tui-3456-aaaa");
+  assert.ok(!killed.includes("ocp-tui-9999-bbbb"), "sibling instance's session (port 9999) must NEVER be killed");
+  assert.ok(!calls.includes("kill-server"), "kill-server MUST NOT fire — sibling instance's session still live");
 });
 
 test("reaper returns 0 when tmux status !== 0 (no server)", () => {
   const fakeTmux = (_args) => ({ status: 1, stdout: "" });
-  const n = reapStaleTuiSessions({ tmux: fakeTmux });
+  const n = reapStaleTuiSessions({ tmux: fakeTmux, port: 3456 });
   assert.equal(n, 0);
 });
 
@@ -1790,7 +1819,7 @@ test("reaper returns 0 for empty session list", () => {
     if (args[0] === "kill-session") { killed.push(args[args.indexOf("-t") + 1]); return { status: 0 }; }
     return { status: 0, stdout: "" };
   };
-  const n = reapStaleTuiSessions({ tmux: fakeTmux });
+  const n = reapStaleTuiSessions({ tmux: fakeTmux, port: 3456 });
   assert.equal(n, 0);
   assert.equal(killed.length, 0);
 });
@@ -1803,10 +1832,10 @@ test("reaper kill-servers when the server is ours-only (flush defunct claude zom
   const calls = [];
   const fakeTmux = (args) => {
     calls.push(args.join(" "));
-    if (args[0] === "list-sessions") return { status: 0, stdout: "ocp-tui-aaaa\nocp-tui-bbbb\n" };
+    if (args[0] === "list-sessions") return { status: 0, stdout: "ocp-tui-3456-aaaa\nocp-tui-3456-bbbb\n" };
     return { status: 0, stdout: "" };
   };
-  const n = reapStaleTuiSessions({ tmux: fakeTmux });
+  const n = reapStaleTuiSessions({ tmux: fakeTmux, port: 3456 });
   assert.equal(n, 2, "killed both of our sessions");
   assert.ok(calls.includes("kill-server"), "kill-server fired — reaps the defunct backlog");
 });
@@ -1815,10 +1844,10 @@ test("reaper does NOT kill-server when a foreign (non-ocp) session remains (coex
   const calls = [];
   const fakeTmux = (args) => {
     calls.push(args.join(" "));
-    if (args[0] === "list-sessions") return { status: 0, stdout: "ocp-tui-aaaa\nolp-tui-bbbb\n" };
+    if (args[0] === "list-sessions") return { status: 0, stdout: "ocp-tui-3456-aaaa\nolp-tui-bbbb\n" };
     return { status: 0, stdout: "" };
   };
-  const n = reapStaleTuiSessions({ tmux: fakeTmux });
+  const n = reapStaleTuiSessions({ tmux: fakeTmux, port: 3456 });
   assert.equal(n, 1, "killed only our own session");
   assert.ok(!calls.includes("kill-server"), "kill-server MUST NOT fire — would disrupt olp-tui-*");
 });
@@ -1826,8 +1855,59 @@ test("reaper does NOT kill-server when a foreign (non-ocp) session remains (coex
 test("reaper does NOT kill-server when there is no server (status !== 0)", () => {
   const calls = [];
   const fakeTmux = (args) => { calls.push(args.join(" ")); return { status: 1, stdout: "" }; };
-  reapStaleTuiSessions({ tmux: fakeTmux });
+  reapStaleTuiSessions({ tmux: fakeTmux, port: 3456 });
   assert.ok(!calls.includes("kill-server"), "no server → no kill-server (early return)");
+});
+
+// Legacy migration (F7): pre-fix versions created bare-prefix `ocp-tui-<uuid8>` sessions with
+// no port segment. includeLegacy is the boot-only opt-in that claims these as our own leftover
+// zombies; the periodic sweep never sets it, so a lingering legacy session cannot trigger
+// kill-server on a routine 15-minute tick.
+console.log("\nTUI legacy-prefix migration (boot-only reap, F7):");
+
+test("reaper leaves legacy bare-prefix sessions untouched by default (includeLegacy unset)", () => {
+  const killed = [];
+  const calls = [];
+  const fakeTmux = (args) => {
+    calls.push(args.join(" "));
+    if (args[0] === "list-sessions") return { status: 0, stdout: "ocp-tui-3456-aaaa\nocp-tui-deadbeef\n" };
+    if (args[0] === "kill-session") { killed.push(args[args.indexOf("-t") + 1]); return { status: 0 }; }
+    return { status: 0, stdout: "" };
+  };
+  const n = reapStaleTuiSessions({ tmux: fakeTmux, port: 3456 });
+  assert.equal(n, 1, "killed only the own-port session");
+  assert.ok(!killed.includes("ocp-tui-deadbeef"), "legacy session must NOT be reaped without includeLegacy");
+  assert.ok(!calls.includes("kill-server"), "legacy session blocks kill-server when not claimed");
+});
+
+test("reaper claims legacy bare-prefix sessions when includeLegacy=true (boot-time migration)", () => {
+  const killed = [];
+  const calls = [];
+  const fakeTmux = (args) => {
+    calls.push(args.join(" "));
+    if (args[0] === "list-sessions") return { status: 0, stdout: "ocp-tui-3456-aaaa\nocp-tui-deadbeef\n" };
+    if (args[0] === "kill-session") { killed.push(args[args.indexOf("-t") + 1]); return { status: 0 }; }
+    return { status: 0, stdout: "" };
+  };
+  const n = reapStaleTuiSessions({ tmux: fakeTmux, port: 3456, includeLegacy: true });
+  assert.equal(n, 2, "both own-port and legacy sessions reaped");
+  assert.ok(killed.includes("ocp-tui-deadbeef"), "legacy session claimed as our own leftover");
+  assert.ok(calls.includes("kill-server"), "kill-server fires once no foreign/unclaimed session remains");
+});
+
+test("reaper with includeLegacy=true still spares a sibling instance's port-scoped session", () => {
+  const killed = [];
+  const calls = [];
+  const fakeTmux = (args) => {
+    calls.push(args.join(" "));
+    if (args[0] === "list-sessions") return { status: 0, stdout: "ocp-tui-3456-aaaa\nocp-tui-deadbeef\nocp-tui-9999-zzzz\n" };
+    if (args[0] === "kill-session") { killed.push(args[args.indexOf("-t") + 1]); return { status: 0 }; }
+    return { status: 0, stdout: "" };
+  };
+  const n = reapStaleTuiSessions({ tmux: fakeTmux, port: 3456, includeLegacy: true });
+  assert.equal(n, 2, "own-port + legacy reaped, sibling instance untouched");
+  assert.ok(!killed.includes("ocp-tui-9999-zzzz"), "sibling instance session must never be claimed as legacy");
+  assert.ok(!calls.includes("kill-server"), "sibling instance's live session still blocks kill-server");
 });
 
 // ── TUI home preparation (scratch vs real) ───────────────────────────────
