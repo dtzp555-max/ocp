@@ -471,6 +471,10 @@ async function resolveSpawnDecision() {
   // piling every request into the real HOME.
   const release = await realHomeFallbackMutex.acquire();
   try {
+    // Drop the 30s keychain TTL cache so the re-check reads FRESH keychain state — otherwise a
+    // waiter admitted right after the prior holder's claude refreshed the token could still see the
+    // stale (expiring) cached creds and needlessly fall back to real HOME again for up to ~30s.
+    invalidateKeychainReadCache();
     const retry = resolveSpawnToken();
     if (retry) {
       release();
@@ -1639,6 +1643,14 @@ function readKeychainCreds() {
     }
     return null;
   });
+}
+
+// F3 drain helper: drop the F5 keychain TTL cache so the NEXT getOAuthCredentials() re-reads the
+// keychain from scratch. Called under the real-HOME fallback mutex just before the re-check, so a
+// waiter admitted after the prior holder's claude refreshed the keychain sees the FRESH token
+// immediately (and proceeds ISOLATED) instead of waiting out the ≤30s TTL on the stale creds.
+function invalidateKeychainReadCache() {
+  _keychainCache.clear();
 }
 
 function getOAuthCredentials() {
