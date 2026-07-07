@@ -44,6 +44,7 @@ import { isLoopbackBind } from "./lib/net.mjs";
 import { runTuiTurn, reapStaleTuiSessions, resolveTuiHome } from "./lib/tui/session.mjs";
 import { detectTuiUpstreamError } from "./lib/tui/transcript.mjs";
 import { TuiSemaphore, recordTuiEntrypoint, buildTuiHealthBlock } from "./lib/tui/semaphore.mjs";
+import { createSerialMutex, createTtlCache, isTokenExpiring, orderLabelsLastGoodFirst } from "./lib/spawn-auth.mjs";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const _pkg = JSON.parse(readFileSync(join(__dirname, "package.json"), "utf8"));
@@ -387,48 +388,100 @@ function prepareSpawnHome(dir = SPAWN_HOME_DIR) {
   } catch { /* best effort — spawn will surface a hard error if the dir is truly unusable */ }
 }
 
-// Resolve the default-spawn HOME-isolation decision ONCE, lazily + memoized (so it runs after
-// getOAuthCredentials is defined regardless of source order, and the token probe happens at most
-// once). Returns { isolated, home, token } where:
+// Resolve the default-spawn HOME-isolation decision. Returns { isolated, home, reason }:
 //   - isolated:true  → spawn under SPAWN_HOME_DIR with cwd=SPAWN_HOME_DIR + the env token.
 //   - isolated:false → legacy real-HOME spawn, no cwd override (no token, or kill-switch on).
-// Caches only the isolation DECISION (isolated/home/reason), NOT the token — the token is
-// re-resolved FRESH per spawn via resolveSpawnToken(). A memoized token goes stale when its
-// source rotates: the macOS keychain access token rotates (~hourly, refreshed by the operator's
-// real claude), so a startup snapshot 401s once it expires (caused a ~31h Mac-mini 401 outage,
-// 2026-06-26). OCP deliberately does NOT refresh the token itself — a refresh-token grant would
-// consume the single-use refresh token and log out the operator's real claude (issue #112).
-let _spawnHomeMode = null;
+//
+// FIX F6 (2026-07-07): this decision is NO LONGER memoized permanently. The previous version
+// cached it forever at first call, which meant: (a) credentials appearing after startup never
+// enabled isolation; (b) `rm -rf ~/.ocp/spawn-home` at runtime made every isolated spawn ENOENT
+// until restart; (c) during a token-expiry stint /health reported isolated:true while spawns
+// actually ran real-HOME. Re-evaluating per spawn is cheap because F5's 30s keychain TTL cache
+// backs getOAuthCredentials(). This function is the CONFIG-level decision (isolated iff a token
+// resolves AND the kill-switch is off) and has NO fs side effects — the per-spawn EFFECTIVE
+// decision additionally applies the expiry gate (resolveSpawnDecision), and scratch-HOME dir prep
+// moved to ensureSpawnHome() at the isolated spawn site.
+//
+// The token itself is re-resolved FRESH per spawn via resolveSpawnToken(); a memoized token goes
+// stale when its source rotates (the macOS keychain access token rotates ~hourly, refreshed by the
+// operator's real claude), which 401'd every isolated spawn for ~31h on 2026-06-26 (#146). OCP
+// deliberately does NOT refresh the token itself — a refresh-token grant would consume the
+// single-use refresh token and log out the operator's real claude (issue #112).
 function getSpawnHomeMode() {
-  if (_spawnHomeMode) return _spawnHomeMode;
   if (SPAWN_REAL_HOME) {
-    _spawnHomeMode = { isolated: false, home: null, reason: "kill-switch (OCP_SPAWN_REAL_HOME=1)" };
-    return _spawnHomeMode;
+    return { isolated: false, home: null, reason: "kill-switch (OCP_SPAWN_REAL_HOME=1)" };
   }
   let hasToken = false;
   try { hasToken = !!(getOAuthCredentials()?.accessToken); } catch { hasToken = false; }
-  if (hasToken) {
-    prepareSpawnHome(SPAWN_HOME_DIR);
-    _spawnHomeMode = { isolated: true, home: SPAWN_HOME_DIR, reason: "oauth token resolved" };
-  } else {
-    _spawnHomeMode = { isolated: false, home: null, reason: "no oauth token resolvable" };
-  }
-  return _spawnHomeMode;
+  if (hasToken) return { isolated: true, home: SPAWN_HOME_DIR, reason: "oauth token resolved" };
+  return { isolated: false, home: null, reason: "no oauth token resolvable" };
+}
+
+// FIX F6: re-verify the scratch HOME exists before each isolated spawn and re-create it if it was
+// deleted at runtime (it used to be prepared once at startup, so a runtime deletion made every
+// isolated spawn fail ENOENT until restart). mkdirSync is recursive+idempotent → cheap to re-run.
+function ensureSpawnHome(dir = SPAWN_HOME_DIR) {
+  if (!existsSync(`${dir}/.claude`)) prepareSpawnHome(dir);
 }
 
 // Resolve a FRESH OAuth access token for an isolated spawn. Read-only (keychain / credentials.json
 // / env) — NEVER refreshes/rotates (see getSpawnHomeMode note). Returns null if none resolvable OR
-// if a known expiry has passed (5-min buffer): a null return makes the caller fall back to real
-// HOME, where the spawned claude refreshes the credential natively and self-heals (the keychain
-// token is then fresh again → next spawn is fast). The env-token path (Linux) carries no expiresAt
-// → never expiry-gated (those tokens are long-lived).
+// if a known expiry is within the 5-min buffer (isTokenExpiring): a null return makes the caller
+// fall back to real HOME, where the spawned claude refreshes the credential natively and self-heals
+// (the keychain token is then fresh again → next spawn is fast). The env-token path (Linux) carries
+// no expiresAt → never expiry-gated (those tokens are long-lived).
 function resolveSpawnToken() {
   try {
     const creds = getOAuthCredentials();
     if (!creds?.accessToken) return null;
-    if (creds.expiresAt && Date.now() + 300000 >= creds.expiresAt) return null;
+    if (isTokenExpiring(creds)) return null; // 5-min buffer; applied to the CACHED creds every use
     return creds.accessToken;
   } catch { return null; }
+}
+
+// FIX F3 (2026-07-07): serializes ONLY the real-HOME fallback spawns. Isolated spawns (the common
+// fast path) never touch this mutex.
+const realHomeFallbackMutex = createSerialMutex();
+
+// Resolve the EFFECTIVE per-spawn HOME/token decision. Returns
+//   { isolated, home, token, releaseFallback }
+// `releaseFallback` is non-null ONLY for a real-HOME fallback holder — the caller MUST call it on
+// spawn teardown (wired into cleanup()); it releases the serialization mutex. It is null (no-op)
+// for isolated and stable real-HOME (kill-switch / no-token) spawns.
+//
+// This is async so the real-HOME fallback can `await` the mutex; the keychain reads inside stay
+// synchronous (F5 keeps the call sites off async conversion).
+async function resolveSpawnDecision() {
+  const shm = getSpawnHomeMode();
+  if (!shm.isolated) return { isolated: false, home: null, token: null, releaseFallback: null };
+  const token = resolveSpawnToken();
+  if (token) {
+    ensureSpawnHome(shm.home);
+    return { isolated: true, home: shm.home, token, releaseFallback: null };
+  }
+  // Token is present but within the 5-min expiry window → we would fall back to real HOME, where
+  // the spawned claude refreshes the credential natively. HAZARD PREVENTED: without serialization,
+  // every concurrent -p spawn inside this window runs claude under the real HOME simultaneously,
+  // and each spawned claude races a `refresh_token` grant against the SAME single-use refresh
+  // token — rotating it out from under the others AND the operator's own real claude (the
+  // credential-fork hazard; #112 / #146 class). Serialize: admit ONE real-HOME spawn at a time.
+  // When the next waiter is admitted (the prior holder torn down → its claude has had its lifetime
+  // to refresh the keychain), re-run resolveSpawnToken(): a now-fresh token means we proceed
+  // ISOLATED and release the mutex immediately, so the queue drains to the fast path instead of
+  // piling every request into the real HOME.
+  const release = await realHomeFallbackMutex.acquire();
+  try {
+    const retry = resolveSpawnToken();
+    if (retry) {
+      release();
+      ensureSpawnHome(shm.home);
+      return { isolated: true, home: shm.home, token: retry, releaseFallback: null };
+    }
+  } catch (e) {
+    release();
+    throw e;
+  }
+  return { isolated: false, home: null, token: null, releaseFallback: release };
 }
 
 // ── FIX ⑥ (concurrency): bounded wait-queue for the -p / stream-json path ──────────────
@@ -925,7 +978,7 @@ function getModelTier(cliModel) {
 // budget. releaseSlot is wired into the idempotent cleanup() so the slot is freed on EVERY exit
 // path (close/error/timeout/abort). Back-compat: releaseSlot defaults to a no-op so any future
 // internal caller that does its own gating still works.
-function spawnClaudeProcess(model, messages, conversationId, keyName, releaseSlot = () => {}) {
+function spawnClaudeProcess(model, messages, conversationId, keyName, releaseSlot = () => {}, spawnDecision = null) {
   const cliModel = MODEL_MAP[model] || model;
 
   // Circuit breaker: disabled (see comment at top of breaker section)
@@ -962,28 +1015,24 @@ function spawnClaudeProcess(model, messages, conversationId, keyName, releaseSlo
     env.CLAUDE_CODE_DISABLE_AUTO_MEMORY = "1";
   }
 
-  // FIX ③ (latency): default-path spawn-home isolation. When a token is resolvable (and the
-  // OCP_SPAWN_REAL_HOME kill-switch is off), run claude under a credential-free minimal HOME
-  // with cwd = that same neutral dir, so it loads NONE of the operator's global ~/.claude
-  // (plugins/skills/hooks) or the ~/ocp project CLAUDE.md/skills — the measured 10–28s → 3–7s
-  // latency win. The env token is authoritative for `-p` (unlike interactive claude). When no
-  // token is resolvable, falls back to real HOME + inherited cwd (zero regression). See
-  // getSpawnHomeMode() / prepareSpawnHome() above. The DISABLE_CLAUDE_MDS / AUTO_MEMORY flags
-  // are set unconditionally in isolated mode (belt-and-braces; mirrors the TUI path).
-  const spawnHome = getSpawnHomeMode();
+  // FIX ③ (latency) + F3 (concurrency): apply the pre-resolved per-spawn HOME/token decision.
+  // The decision is resolved ASYNC in the caller (resolveSpawnDecision) so the real-HOME fallback
+  // serialization can await its mutex; here we only apply the result. When isolated, run claude
+  // under a credential-free minimal HOME with cwd = that same neutral dir, so it loads NONE of the
+  // operator's global ~/.claude (plugins/skills/hooks) or the ~/ocp project CLAUDE.md/skills — the
+  // measured 10–28s → 3–7s latency win. The env token is authoritative for `-p` (unlike
+  // interactive claude). When no fresh token is resolvable, decision.isolated is false → real HOME
+  // + inherited cwd (zero regression), and the spawned claude resolves+refreshes credentials
+  // natively. The DISABLE_CLAUDE_MDS / AUTO_MEMORY flags are set unconditionally in isolated mode
+  // (belt-and-braces; mirrors the TUI path).
+  const decision = spawnDecision || { isolated: false, releaseFallback: null };
   const spawnOpts = { env, stdio: ["pipe", "pipe", "pipe"] };
-  if (spawnHome.isolated) {
-    // Re-resolve the token FRESH per spawn (never a startup snapshot — keychain tokens rotate;
-    // a stale snapshot 401s). If unresolvable right now, fall through to real HOME so the spawned
-    // claude resolves + refreshes credentials natively instead of 401ing on a stale/null token.
-    const freshToken = resolveSpawnToken();
-    if (freshToken) {
-      env.HOME = spawnHome.home;
-      env.CLAUDE_CODE_OAUTH_TOKEN = freshToken; // env token is authoritative for -p
-      env.CLAUDE_CODE_DISABLE_CLAUDE_MDS = "1";
-      env.CLAUDE_CODE_DISABLE_AUTO_MEMORY = "1";
-      spawnOpts.cwd = spawnHome.home; // neutral cwd: no project CLAUDE.md/skills
-    }
+  if (decision.isolated && decision.token) {
+    env.HOME = decision.home;
+    env.CLAUDE_CODE_OAUTH_TOKEN = decision.token; // env token is authoritative for -p
+    env.CLAUDE_CODE_DISABLE_CLAUDE_MDS = "1";
+    env.CLAUDE_CODE_DISABLE_AUTO_MEMORY = "1";
+    spawnOpts.cwd = decision.home; // neutral cwd: no project CLAUDE.md/skills
   }
 
   const proc = spawn(CLAUDE, cliArgs, spawnOpts);
@@ -1002,6 +1051,11 @@ function spawnClaudeProcess(model, messages, conversationId, keyName, releaseSlo
     // and cleanup() is guarded by `cleaned`, so the slot is released exactly once on the first
     // exit path reached (proc 'exit' fires before 'close'; 'error' covers spawn failure).
     try { releaseSlot(); } catch { /* never let release throw out of cleanup */ }
+    // F3: release the real-HOME fallback serialization mutex (no-op for isolated/normal spawns).
+    // By now this spawn's claude has had its lifetime to refresh the keychain token, so the next
+    // queued fallback waiter re-checks resolveSpawnToken() and proceeds ISOLATED with the now-fresh
+    // token instead of piling into the real HOME. Idempotent; cleanup() is guarded by `cleaned`.
+    try { if (decision.releaseFallback) decision.releaseFallback(); } catch { /* never throw out of cleanup */ }
   }
 
   // Guarantee slot release on ANY exit path (normal close, error, timeout kill,
@@ -1077,12 +1131,16 @@ async function callClaude(model, messages, conversationId, keyName) {
   // spawn so the idempotent cleanup() frees it on every exit path. If the spawn itself throws
   // synchronously (before cleanup is wired), release here so the slot never leaks.
   const releaseSlot = await acquireClaudeSlot();
+  // F3: resolve the per-spawn HOME/token decision (may serialize on the real-HOME fallback mutex).
+  const spawnDecision = await resolveSpawnDecision();
   return new Promise((resolve, reject) => {
     let ctx;
     try {
-      ctx = spawnClaudeProcess(model, messages, conversationId, keyName, releaseSlot);
+      ctx = spawnClaudeProcess(model, messages, conversationId, keyName, releaseSlot, spawnDecision);
     } catch (err) {
       releaseSlot();
+      // Spawn threw before cleanup() was wired → release the fallback mutex here so it never leaks.
+      try { spawnDecision.releaseFallback?.(); } catch { /* best effort */ }
       return reject(err);
     }
 
@@ -1266,11 +1324,15 @@ async function callClaudeStreaming(model, messages, conversationId, res, authInf
     return jsonResponse(res, 500, { error: { message: sanitizeError(err.message), type: "proxy_error" } });
   }
 
+  // F3: resolve the per-spawn HOME/token decision (may serialize on the real-HOME fallback mutex).
+  const spawnDecision = await resolveSpawnDecision();
   let ctx;
   try {
-    ctx = spawnClaudeProcess(model, messages, conversationId, authInfo.keyName, releaseSlot);
+    ctx = spawnClaudeProcess(model, messages, conversationId, authInfo.keyName, releaseSlot, spawnDecision);
   } catch (err) {
     releaseSlot();
+    // Spawn threw before cleanup() was wired → release the fallback mutex here so it never leaks.
+    try { spawnDecision.releaseFallback?.(); } catch { /* best effort */ }
     return jsonResponse(res, 500, { error: { message: sanitizeError(err.message), type: "proxy_error" } });
   }
 
@@ -1542,6 +1604,43 @@ const OAUTH_REFRESH_MIN_BACKOFF = 60 * 1000;
 const OAUTH_REFRESH_MAX_BACKOFF = 3600 * 1000;
 let oauthRefreshBackoff = { nextAttemptAt: 0, currentDelay: OAUTH_REFRESH_MIN_BACKOFF };
 
+// FIX F5 (2026-07-07): the macOS keychain read (`security find-generic-password`, up to 5s × 2
+// labels when the first label misses) ran on EVERY -p spawn's hot path, blocking the event loop
+// (worst case 10s) and stalling all in-flight SSE streams. Two minimal, sync-preserving mitigations:
+//   (a) memoize the last-good keychain label and try it FIRST → one exec instead of two on the
+//       steady-state path (orderLabelsLastGoodFirst);
+//   (b) a short (30s) TTL cache of the keychain read result (createTtlCache).
+// SAFETY vs the #146 regression: #146 was a token memoized FOREVER at startup that went stale and
+// 401'd. This is a 30s TTL (not forever), AND resolveSpawnToken() re-applies the 5-min expiry gate
+// (isTokenExpiring) to the CACHED creds on EVERY use — the creds object carries `expiresAt`, so a
+// token expiring within the cache window is still rejected → real-HOME fallback. A short TTL bounds
+// how often we re-READ the keychain; it does NOT bound how often we re-DECIDE expiry. This is why a
+// short-TTL keychain cache + a per-use expiry check does not reintroduce the forever-stale bug.
+const KEYCHAIN_LABELS = ["claude-code-credentials", "Claude Code-credentials"];
+const KEYCHAIN_CACHE_TTL_MS = 30 * 1000;
+const _keychainCache = createTtlCache({ ttlMs: KEYCHAIN_CACHE_TTL_MS });
+let _lastGoodKeychainLabel = null;
+
+// Read the macOS keychain credentials, label-memoized + short-TTL cached (F5). Sync (execFileSync);
+// returns the `claudeAiOauth` creds object or null.
+function readKeychainCreds() {
+  return _keychainCache.get(() => {
+    for (const label of orderLabelsLastGoodFirst(KEYCHAIN_LABELS, _lastGoodKeychainLabel)) {
+      try {
+        const raw = execFileSync("security", [
+          "find-generic-password", "-s", label, "-w"
+        ], { encoding: "utf8", timeout: 5000 }).trim();
+        const creds = JSON.parse(raw);
+        if (creds?.claudeAiOauth?.accessToken) {
+          _lastGoodKeychainLabel = label; // remember the winner → try it first next time
+          return creds.claudeAiOauth;
+        }
+      } catch { /* try next label */ }
+    }
+    return null;
+  });
+}
+
 function getOAuthCredentials() {
   // 1. Env var fallback — highest precedence for explicit overrides.
   if (process.env.CLAUDE_CODE_OAUTH_TOKEN) {
@@ -1555,17 +1654,8 @@ function getOAuthCredentials() {
     if (creds?.claudeAiOauth?.accessToken) return creds.claudeAiOauth;
   } catch { /* fall through to macOS keychain */ }
 
-  // 3. macOS keychain (both label formats)
-  for (const label of ["claude-code-credentials", "Claude Code-credentials"]) {
-    try {
-      const raw = execFileSync("security", [
-        "find-generic-password", "-s", label, "-w"
-      ], { encoding: "utf8", timeout: 5000 }).trim();
-      const creds = JSON.parse(raw);
-      if (creds?.claudeAiOauth?.accessToken) return creds.claudeAiOauth;
-    } catch { /* try next */ }
-  }
-  return null;
+  // 3. macOS keychain (both label formats) — F5: label-memoized + 30s TTL cached (see above).
+  return readKeychainCreds();
 }
 
 async function refreshOAuthToken(refreshToken) {
@@ -2298,11 +2388,22 @@ const server = createServer(async (req, res) => {
       spawn: (() => {
         if (TUI_MODE) return { mode: "tui (default -p path unused)", isolated: false, home: null };
         const shm = getSpawnHomeMode();
+        // FIX F6: report the EFFECTIVE current decision, not just token PRESENCE. During the
+        // 5-min pre-expiry window the token exists (shm.isolated=true) but resolveSpawnToken()
+        // returns null and spawns actually run real-HOME — so `isolated` MUST also reflect the
+        // expiry gate, or /health lies. The field SET is unchanged (grandfathered B.2 contract,
+        // ADR 0006 — HARD CONSTRAINT: no field add/remove/rename); only the VALUES are made
+        // truthful. resolveSpawnToken() is read-only + backed by F5's 30s keychain cache → cheap.
+        const effIsolated = shm.isolated && resolveSpawnToken() !== null;
         return {
-          mode: shm.isolated ? "isolated-scratch-home" : "real-home",
-          isolated: shm.isolated,
-          home: shm.isolated ? shm.home : null,
-          reason: shm.reason,
+          mode: effIsolated ? "isolated-scratch-home" : "real-home",
+          isolated: effIsolated,
+          home: effIsolated ? shm.home : null,
+          reason: effIsolated
+            ? shm.reason
+            : (shm.isolated
+                ? "oauth token within 5-min expiry window → real-HOME fallback (self-heals on next refresh)"
+                : shm.reason),
         };
       })(),
       // ── FIX ⑥ -p concurrency wait-queue surface — ADDITIVE ──
