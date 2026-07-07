@@ -100,6 +100,37 @@ function resolveClaude() {
     }
   }
 
+  // Windows: the POSIX well-known paths below never match, so resolution would
+  // fall through to `which`. Under Git Bash that returns an MSYS-style path
+  // (`/c/Users/.../claude`, often extension-less) that Node's spawn cannot
+  // execute (ENOENT on both the auth check and every completion). Resolve a real
+  // `claude.exe` via Windows-native lookups instead. A real claude.exe (incl. the
+  // WinGet App Execution Alias) is directly spawnable by Node — no shell needed.
+  if (process.platform === "win32") {
+    const winCandidates = [];
+    const { LOCALAPPDATA, ProgramFiles } = process.env;
+    if (LOCALAPPDATA) winCandidates.push(join(LOCALAPPDATA, "Microsoft", "WinGet", "Links", "claude.exe"));
+    if (ProgramFiles) winCandidates.push(join(ProgramFiles, "Claude", "claude.exe"));
+    for (const p of winCandidates) {
+      if (existsSync(p)) { console.warn(`[init] CLAUDE_BIN not set, resolved to ${p}`); return p; }
+    }
+    // PATH lookup via Windows-native `where` (returns proper C:\... paths, one per
+    // line). Prefer an .exe: .cmd/.bat cannot be spawned without a shell.
+    try {
+      const lines = execFileSync("where", ["claude"], { encoding: "utf8", timeout: 5000 })
+        .split(/\r?\n/).map(s => s.trim()).filter(Boolean);
+      const exe = lines.find(p => /\.exe$/i.test(p)) || lines.find(p => /\.(cmd|bat)$/i.test(p));
+      if (exe) { console.warn(`[init] CLAUDE_BIN not set, resolved via where: ${exe}`); return exe; }
+    } catch { /* fall through to FATAL */ }
+    console.error(
+      "FATAL: claude.exe not found.\n" +
+      "  Set CLAUDE_BIN to the full path of claude.exe, e.g.\n" +
+      "  set CLAUDE_BIN=%LOCALAPPDATA%\\Microsoft\\WinGet\\Links\\claude.exe\n" +
+      "  (a claude.cmd/.bat shim will not work — OCP spawns the binary without a shell.)"
+    );
+    process.exit(1);
+  }
+
   const home = process.env.HOME || "";
   const candidates = [
     "/opt/homebrew/bin/claude",
