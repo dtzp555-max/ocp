@@ -43,7 +43,7 @@ import { DEFAULT_PORT } from "./lib/constants.mjs";
 import { isLoopbackBind } from "./lib/net.mjs";
 import { runTuiTurn, reapStaleTuiSessions, resolveTuiHome } from "./lib/tui/session.mjs";
 import { detectTuiUpstreamError } from "./lib/tui/transcript.mjs";
-import { TuiSemaphore, recordTuiEntrypoint, buildTuiHealthBlock } from "./lib/tui/semaphore.mjs";
+import { TuiSemaphore, SemaphoreAbortError, recordTuiEntrypoint, buildTuiHealthBlock } from "./lib/tui/semaphore.mjs";
 import { createSerialMutex, createTtlCache, isTokenExpiring, orderLabelsLastGoodFirst } from "./lib/spawn-auth.mjs";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -507,16 +507,61 @@ class ConcurrencyOverflowError extends Error {
   constructor(message) { super(message); this.name = "ConcurrencyOverflowError"; this.httpStatus = 429; this.retryAfter = CLAUDE_QUEUE_RETRY_AFTER; }
 }
 
+// Tagged error for audit finding F2: the client disconnected while queued (or was already gone
+// before we even tried to queue it). Distinct from ConcurrencyOverflowError so callers never send
+// a response on this path — there is no socket left to write to.
+class RequestDisconnectedError extends Error {
+  constructor(message) { super(message); this.name = "RequestDisconnectedError"; }
+}
+
+// Build an AbortSignal that fires when `res` (an http.ServerResponse) closes — i.e. the client
+// disconnected. Used to cancel a QUEUED concurrency-slot wait (F2) so a client that gives up
+// before a slot is granted is spliced out of the wait queue instead of eventually spawning a
+// claude process for a dead socket. If `res` has already closed by the time we get here (its
+// underlying stream already torn down), the signal is returned pre-aborted so acquire() rejects
+// immediately without ever touching the queue — the "close already fired before we attach" case.
+// `detach()` MUST be called once the wait settles (granted or rejected) to avoid a listener leak.
+function closeSignalFor(res) {
+  const controller = new AbortController();
+  if (!res || typeof res.on !== "function") return { signal: controller.signal, detach() {} };
+  if (res.destroyed) {
+    controller.abort();
+    return { signal: controller.signal, detach() {} };
+  }
+  const onClose = () => controller.abort();
+  res.on("close", onClose);
+  return { signal: controller.signal, detach() { res.removeListener("close", onClose); } };
+}
+
 // Acquire a -p concurrency slot, queuing if all are busy (up to CLAUDE_MAX_QUEUE). Resolves to a
 // release() fn that MUST be called exactly once on every exit path (wired into ctx.cleanup()).
-// Rejects with ConcurrencyOverflowError when the wait-queue is full. Increments stats.queued while
-// waiting (decremented on acquire) and stats.queueRejections on overflow.
-async function acquireClaudeSlot() {
-  stats.queued = claudeSemaphore.queued + 1; // reflect this waiter before we (maybe) block
+// Rejects with ConcurrencyOverflowError when the wait-queue is full, or with
+// RequestDisconnectedError when `res` closes before a slot is granted (F2) — the caller must not
+// spawn claude in that case. `res` is optional (back-compat for any caller without a live response
+// object); omitting it just means a queued wait can't be cancelled early.
+//
+// F8 fix: stats.queued is set from claudeSemaphore.queued AFTER calling acquire() (not before) —
+// acquire() synchronously updates _inflight/_waiters before its Promise ever resolves, so reading
+// .queued right after the call already reflects reality. The old code set `queued + 1` BEFORE
+// calling acquire() to account for "this waiter", which over-reported by 1 whenever the slot was
+// granted immediately (the common case, not a queue at all).
+async function acquireClaudeSlot(res) {
+  const { signal, detach } = closeSignalFor(res);
+  const slot = claudeSemaphore.acquire(signal);
+  stats.queued = claudeSemaphore.queued; // accurate: acquire() already updated the queue synchronously
   try {
-    await claudeSemaphore.acquire();
+    await slot;
   } catch (e) {
+    detach();
     stats.queued = claudeSemaphore.queued;
+    if (e instanceof SemaphoreAbortError) {
+      // Client-driven cancellation, not backpressure — do NOT count it as a queueRejection or
+      // log it as concurrency_queue_full (that log/counter means "the queue itself is full").
+      logEvent("info", "concurrency_wait_cancelled", {
+        reason: "client_disconnected", inflight: claudeSemaphore.inflight, queued: claudeSemaphore.queued,
+      });
+      throw new RequestDisconnectedError("client disconnected while waiting for a concurrency slot");
+    }
     stats.queueRejections++;
     logEvent("warn", "concurrency_queue_full", {
       limit: claudeSemaphore.limit, maxQueue: claudeSemaphore.maxQueue,
@@ -526,6 +571,7 @@ async function acquireClaudeSlot() {
       `backpressure: concurrency limit (${claudeSemaphore.limit}) reached and wait queue ` +
       `(${claudeSemaphore.maxQueue}) is full — retry shortly`);
   }
+  detach();
   stats.queued = claudeSemaphore.queued;
   let released = false;
   return function releaseClaudeSlot() {
@@ -1135,14 +1181,29 @@ function spawnClaudeProcess(model, messages, conversationId, keyName, releaseSlo
 // We accumulate full text across all content_block_delta events plus the
 // assistant-aggregate fallback, then resolve with the assembled string.
 // Reference: OLP ADR 0009 Amendment 1 + commit 97e7d16.
-async function callClaude(model, messages, conversationId, keyName) {
+// `res` (optional, F2) is the client's http.ServerResponse — passed through so a queued wait
+// can be cancelled the moment the client disconnects, instead of spawning claude for a dead
+// socket once a slot finally frees up.
+async function callClaude(model, messages, conversationId, keyName, res) {
   // FIX ⑥: acquire a concurrency slot first (queues up to CLAUDE_MAX_QUEUE; rejects with a
-  // ConcurrencyOverflowError → 429 when the queue is full). The release fn is passed into the
-  // spawn so the idempotent cleanup() frees it on every exit path. If the spawn itself throws
-  // synchronously (before cleanup is wired), release here so the slot never leaks.
-  const releaseSlot = await acquireClaudeSlot();
-  // F3: resolve the per-spawn HOME/token decision (may serialize on the real-HOME fallback mutex).
-  const spawnDecision = await resolveSpawnDecision();
+  // ConcurrencyOverflowError → 429 when the queue is full, or a RequestDisconnectedError (F2)
+  // if the client goes away first). The release fn is passed into the spawn so the idempotent
+  // cleanup() frees it on every exit path. If the spawn itself throws synchronously (before
+  // cleanup is wired), release here so the slot never leaks.
+  // F2×F3 composition: the slot acquire comes FIRST and is the cancellable step — a client
+  // that disconnects while queued rejects here, BEFORE resolveSpawnDecision() runs, so a
+  // cancelled request can never acquire (or briefly hold) the real-HOME fallback mutex.
+  const releaseSlot = await acquireClaudeSlot(res);
+  // F3: resolve the per-spawn HOME/token decision (may serialize on the real-HOME fallback
+  // mutex). If it throws, release the just-acquired slot before propagating — cleanup() is
+  // not wired yet at this point.
+  let spawnDecision;
+  try {
+    spawnDecision = await resolveSpawnDecision();
+  } catch (err) {
+    releaseSlot();
+    throw err;
+  }
   return new Promise((resolve, reject) => {
     let ctx;
     try {
@@ -1221,28 +1282,44 @@ async function callClaude(model, messages, conversationId, keyName) {
 // flag that could perturb cc_entrypoint classification.
 // Authority: claude CLI v2.1.158 interactive mode (cc_entrypoint=cli).
 // SECURITY: A-path single-user ONLY — home is NOT isolation (see ADR 0007).
-function callClaudeTui(model, messages, _conversationId, _keyName) {
+// `res` (optional, F2) is the client's http.ServerResponse — see closeSignalFor.
+async function callClaudeTui(model, messages, _conversationId, _keyName, res) {
   const cliModel = MODEL_MAP[model] || model;
   const prompt = messagesToPrompt(messages); // includes system as [System] inline
   recordModelRequest(cliModel, prompt.length);
-  // C-4: gate the heavy interactive boot behind the TUI semaphore. run() acquires a slot
-  // (queuing if all are busy, up to maxQueue), then releases in a finally so any throw from
-  // runTuiTurn (tmux spawn failure, paste-not-landed) OR from the honesty gates below
-  // (truncation / error banner) can NEVER leak a slot. tuiSemaphore.inflight feeds /health.
-  return tuiSemaphore.run(() => runTuiTurn({
-    prompt,
-    model: cliModel,
-    claudeBin: CLAUDE,
-    home: TUI_HOME,
-    realHome: process.env.HOME,
-    cwd: TUI_CWD,
-    port: PORT, // F7 fix: port-scopes the tmux session name so a sibling OCP instance on a
-                // different port never collides with this instance's reap/kill-server logic.
-    wallclockMs: TUI_WALLCLOCK_MS,
-    entrypointMode: TUI_ENTRYPOINT,
-  }).then(({ text, entrypoint, truncated }) => {
+  // C-4: gate the heavy interactive boot behind the TUI semaphore (queuing if all slots are
+  // busy, up to maxQueue). F2: `signal` (tied to `res` "close") cancels a QUEUED wait the
+  // instant the client disconnects, so a dead socket never triggers a cold-boot tmux+claude
+  // spawn; detach() drops the "close" listener as soon as the wait settles rather than
+  // holding it for the whole (up to 120s) turn.
+  const { signal, detach } = closeSignalFor(res);
+  try {
+    await tuiSemaphore.acquire(signal);
+  } catch (err) {
+    detach();
+    throw err instanceof SemaphoreAbortError
+      ? new RequestDisconnectedError("client disconnected while waiting for a TUI concurrency slot")
+      : err;
+  }
+  detach();
+  // release() runs in a finally so any throw from runTuiTurn (tmux spawn failure,
+  // paste-not-landed) OR from the honesty gates below (truncation / error banner) can NEVER
+  // leak a slot. tuiSemaphore.inflight feeds /health.
+  try {
+    const { text, entrypoint, truncated } = await runTuiTurn({
+      prompt,
+      model: cliModel,
+      claudeBin: CLAUDE,
+      home: TUI_HOME,
+      realHome: process.env.HOME,
+      cwd: TUI_CWD,
+      port: PORT, // F7 fix: port-scopes the tmux session name so a sibling OCP instance on a
+                  // different port never collides with this instance's reap/kill-server logic.
+      wallclockMs: TUI_WALLCLOCK_MS,
+      entrypointMode: TUI_ENTRYPOINT,
+    });
     // ── Honesty gates (issue #133) ─ run BEFORE recordModelSuccess / cache write-back.
-    // A throw here propagates to the .catch below (recordModelError + reject), so the
+    // A throw here propagates to the catch below (recordModelError + reject), so the
     // result never reaches the downstream setCachedResponse / singleflight / SUCCESS path.
 
     // C-2: the wall-clock cap hit with partial text and NO terminal marker — the turn
@@ -1277,10 +1354,12 @@ function callClaudeTui(model, messages, _conversationId, _keyName) {
       logEvent("warn", "tui_entrypoint_mismatch", { expected: "cli", got: entrypoint, model: cliModel });
     }
     return text;
-  }).catch((err) => {
+  } catch (err) {
     recordModelError(cliModel, false);
     throw err;
-  }));
+  } finally {
+    tuiSemaphore.release();
+  }
 }
 
 // ── SSE heartbeat (opt-in idle watchdog) ────────────────────────────────
@@ -1326,18 +1405,30 @@ async function callClaudeStreaming(model, messages, conversationId, res, authInf
   // FIX ⑥: acquire a concurrency slot first (queues up to CLAUDE_MAX_QUEUE). On overflow, surface
   // HTTP 429 + Retry-After (NOT 500). Release is wired into cleanup() for every exit path; if the
   // spawn throws synchronously before cleanup is wired, release here.
+  // F2: pass `res` so a queued wait is cancelled the instant this client disconnects — the client
+  // is already gone in that case, so there is no response to send back.
   let releaseSlot;
   try {
-    releaseSlot = await acquireClaudeSlot();
+    releaseSlot = await acquireClaudeSlot(res);
   } catch (err) {
+    if (err instanceof RequestDisconnectedError) return; // client gone — nothing to write to
     if (err instanceof ConcurrencyOverflowError) {
       return jsonResponse(res, 429, { error: { message: sanitizeError(err.message), type: "rate_limit_error" } }, { "Retry-After": String(err.retryAfter) });
     }
     return jsonResponse(res, 500, { error: { message: sanitizeError(err.message), type: "proxy_error" } });
   }
 
-  // F3: resolve the per-spawn HOME/token decision (may serialize on the real-HOME fallback mutex).
-  const spawnDecision = await resolveSpawnDecision();
+  // F3: resolve the per-spawn HOME/token decision (may serialize on the real-HOME fallback
+  // mutex). F2×F3 composition: this runs strictly AFTER the (cancellable) slot acquire, so a
+  // request cancelled while queued never touches the fallback mutex. If it throws, release
+  // the just-acquired slot before responding — cleanup() is not wired yet at this point.
+  let spawnDecision;
+  try {
+    spawnDecision = await resolveSpawnDecision();
+  } catch (err) {
+    releaseSlot();
+    return jsonResponse(res, 500, { error: { message: sanitizeError(err.message), type: "proxy_error" } });
+  }
   let ctx;
   try {
     ctx = spawnClaudeProcess(model, messages, conversationId, authInfo.keyName, releaseSlot, spawnDecision);
@@ -2009,9 +2100,12 @@ function applySettingUpdate(key, value) {
 
   switch (key) {
     case "timeout":          TIMEOUT = value; break;
-    // FIX ⑥: keep the -p wait-queue semaphore's limit in sync with the runtime MAX_CONCURRENT
-    // so a /settings change to maxConcurrent actually changes how many claude procs run at once.
-    case "maxConcurrent":    MAX_CONCURRENT = value; claudeSemaphore.limit = Math.max(1, value); break;
+    // FIX ⑥ + F1: keep the -p wait-queue semaphore's limit in sync with the runtime MAX_CONCURRENT
+    // so a /settings change to maxConcurrent actually changes how many claude procs run at once —
+    // in BOTH directions. setLimit() (not a bare `.limit =` assignment) is required: lowering
+    // needs release() to stop over-granting until inflight drains under the new cap, and raising
+    // needs queued waiters woken immediately to use the new headroom. See lib/tui/semaphore.mjs.
+    case "maxConcurrent":    MAX_CONCURRENT = value; claudeSemaphore.setLimit(value); break;
     case "sessionTTL":       SESSION_TTL = value; break;
     case "maxPromptChars":   MAX_PROMPT_CHARS = value; break;
     case "cacheTTL":         CACHE_TTL = value; break;
@@ -2168,7 +2262,7 @@ async function handleChatCompletions(req, res) {
       const t0TuiStream = Date.now();
       const promptCharsTuiStream = messages.reduce((a, m) => a + contentToText(m.content).length, 0);
       try {
-        const content = await callClaudeTui(model, messages, conversationId, req._authKeyName);
+        const content = await callClaudeTui(model, messages, conversationId, req._authKeyName, res);
         if (CACHE_TTL > 0 && req._cacheHash) {
           try { setCachedResponse(req._cacheHash, model, content); } catch (e) { logEvent("error", "cache_write_failed", { error: e.message }); }
         }
@@ -2205,7 +2299,7 @@ async function handleChatCompletions(req, res) {
         // will re-read the freshly-populated cache entry here rather than spawning.
         const recheck = getCachedResponse(req._cacheHash, CACHE_TTL);
         if (recheck) return recheck.response;
-        const c = await upstreamCall(model, messages, conversationId, req._authKeyName);
+        const c = await upstreamCall(model, messages, conversationId, req._authKeyName, res);
         try { setCachedResponse(req._cacheHash, model, c); } catch (e) { logEvent("error", "cache_write_failed", { error: e.message }); }
         return c;
       });
@@ -2226,7 +2320,7 @@ async function handleChatCompletions(req, res) {
 
   // Fallback: cache disabled (CACHE_TTL=0) or no _cacheHash — original path untouched.
   try {
-    const content = await upstreamCall(model, messages, conversationId, req._authKeyName);
+    const content = await upstreamCall(model, messages, conversationId, req._authKeyName, res);
     const id = `chatcmpl-${randomUUID()}`;
     completionResponse(res, id, model, content);
     try { recordUsage({ keyId: req._authKeyId, keyName: req._authKeyName, model, promptChars, responseChars: content.length, elapsedMs: Date.now() - t0Usage, success: true }); } catch (e) { logEvent("error", "usage_record_failed", { error: e.message }); }
