@@ -463,6 +463,52 @@ async function runSingleflightTests() {
     assert.equal(r1, 1);
     assert.equal(r2, 2);
   });
+
+  // 7. M1: leader disconnect while queued must not poison live followers. server.mjs passes
+  // retryIf = (err) => err instanceof RequestDisconnectedError && !res.destroyed — here we
+  // model that with a tagged error class. The leader (no retryIf on its own promise — the
+  // rejection is ITS OWN disconnect) sees the error; the live follower re-executes its OWN
+  // fn and gets a real result instead of a spurious inherited failure.
+  await asyncTest("M1: leader disconnects while queued → live follower re-executes and gets a real result", async () => {
+    class FakeDisconnectError extends Error {}
+    const leaderGate = Promise.withResolvers();
+    let leaderRuns = 0;
+    let followerRuns = 0;
+    const leaderFn = async () => { leaderRuns++; await leaderGate.promise; throw new FakeDisconnectError("leader client gone"); };
+    const followerFn = async () => { followerRuns++; return "real-execution"; };
+    const retryIf = (err) => err instanceof FakeDisconnectError;
+
+    const leaderP = singleflight("sf-m1-leader-dc", leaderFn);             // becomes leader
+    const followerP = singleflight("sf-m1-leader-dc", followerFn, retryIf); // joins as follower
+    leaderGate.resolve(); // leader "disconnects" while holding the flight
+
+    await assert.rejects(leaderP, FakeDisconnectError, "the leader itself still sees its own disconnect");
+    assert.equal(await followerP, "real-execution", "follower got a REAL execution, not the leader's disconnect");
+    assert.equal(leaderRuns, 1, "leader fn ran once");
+    assert.equal(followerRuns, 1, "follower re-executed exactly once (as the new leader)");
+    assert.equal(getInflightStats().inflight, 0, "map fully cleaned up after the retry flight settles");
+  });
+
+  // 8. M1 guard: a follower whose retryIf returns false (server.mjs: its OWN client is also
+  // gone) inherits the rejection unchanged — no retry, no masked error. And a follower with
+  // NO retryIf keeps the exact pre-M1 share-everything behavior (test 2 pins the fan-out;
+  // this pins the predicate=false path specifically for the disconnect error).
+  await asyncTest("M1: follower with retryIf=false (own client also gone) inherits the leader's rejection, no retry", async () => {
+    class FakeDisconnectError extends Error {}
+    const gate = Promise.withResolvers();
+    let followerRuns = 0;
+    const leaderFn = async () => { await gate.promise; throw new FakeDisconnectError("leader client gone"); };
+    const followerFn = async () => { followerRuns++; return "should-never-run"; };
+
+    const leaderP = singleflight("sf-m1-both-dc", leaderFn);
+    const followerP = singleflight("sf-m1-both-dc", followerFn, () => false); // own client dead → no retry
+    gate.resolve();
+
+    await assert.rejects(leaderP, FakeDisconnectError);
+    await assert.rejects(followerP, FakeDisconnectError, "rejection propagates unchanged when retryIf says no");
+    assert.equal(followerRuns, 0, "follower fn never executed — no wasted spawn for a dead client");
+    assert.equal(getInflightStats().inflight, 0);
+  });
 }
 
 await runSingleflightTests();
@@ -2005,7 +2051,7 @@ test("resolveTuiHome: explicit OCP_TUI_HOME wins regardless of env token (back-c
 });
 
 // ── TUI concurrency limiter + drift observability (PR-B: audit C-4 / C-5) ──
-import { TuiSemaphore, recordTuiEntrypoint, buildTuiHealthBlock } from "./lib/tui/semaphore.mjs";
+import { TuiSemaphore, SemaphoreAbortError, recordTuiEntrypoint, buildTuiHealthBlock } from "./lib/tui/semaphore.mjs";
 
 console.log("\nTUI concurrency limiter (C-4):");
 
@@ -2107,6 +2153,226 @@ await asyncTest("FIX ⑥: slot released on normal completion is immediately reus
   await new Promise((r) => setImmediate(r));
   assert.equal(sem.inflight, 1, "limit still enforced after reuse cycles");
   g.resolve(); await held;
+  assert.equal(sem.inflight, 0);
+});
+
+// ── Audit F1 — runtime-lowered/raised limit must actually bite ──────────────
+// server.mjs reuses this same TuiSemaphore as `claudeSemaphore`; a PATCH /settings
+// maxConcurrent update now calls `claudeSemaphore.setLimit(value)` (see applySettingUpdate's
+// "maxConcurrent" case). These tests pin the semaphore-level contract that fix depends on.
+console.log("\nF1 — runtime concurrency-limit changes (setLimit / release honoring the current limit):");
+
+await asyncTest("F1: lowering the limit mid-load — release() stops re-granting until inflight drains under the new limit", async () => {
+  const sem = new TuiSemaphore(3, { maxQueue: 16 });
+  const g = [deferred(), deferred(), deferred()];
+  const held = g.map((d) => sem.run(async () => { await d.p; }));
+  await new Promise((r) => setImmediate(r));
+  assert.equal(sem.inflight, 3, "3 tasks hold the 3 slots");
+  // A 4th arrives while at capacity — it queues.
+  const g4 = deferred();
+  const queued4 = sem.run(async () => { await g4.p; });
+  await new Promise((r) => setImmediate(r));
+  assert.equal(sem.queued, 1, "4th request queued");
+
+  // Operator lowers maxConcurrent from 3 to 1 while all 3 original slots are still inflight
+  // (mirrors a PATCH /settings maxConcurrent=1 hitting server.mjs mid-burst).
+  sem.setLimit(1);
+  assert.equal(sem.limit, 1);
+
+  // Releasing one of the 3 original holders must NOT hand the freed slot to the queued 4th
+  // request — before the F1 fix, release() handed slots off unconditionally, so inflight
+  // would have stayed pinned at the OLD higher occupancy forever.
+  g[0].resolve();
+  await held[0];
+  await new Promise((r) => setImmediate(r));
+  assert.equal(sem.inflight, 2, "inflight drains toward the new limit, not re-granted");
+  assert.equal(sem.queued, 1, "4th request is STILL queued — not over-admitted");
+
+  g[1].resolve();
+  await held[1];
+  await new Promise((r) => setImmediate(r));
+  assert.equal(sem.inflight, 1, "inflight now exactly at the new limit (1)");
+  assert.equal(sem.queued, 1, "still queued — inflight(1) is not < limit(1), so no grant yet");
+
+  // Releasing the LAST original holder finally drops inflight under the new limit — only
+  // now does the queued 4th request get granted.
+  g[2].resolve();
+  await held[2];
+  await new Promise((r) => setImmediate(r));
+  assert.equal(sem.inflight, 1, "queued 4th request now holds the single slot");
+  assert.equal(sem.queued, 0, "queue drained");
+  g4.resolve();
+  await queued4;
+  assert.equal(sem.inflight, 0);
+});
+
+await asyncTest("F1: raising the limit wakes queued waiters immediately, up to the new headroom", async () => {
+  const sem = new TuiSemaphore(1, { maxQueue: 16 });
+  const g1 = deferred();
+  const t1 = sem.run(async () => { await g1.p; }); // holds the only slot
+  await new Promise((r) => setImmediate(r));
+  const started = [];
+  const g2 = deferred(), g3 = deferred();
+  const t2 = sem.run(async () => { started.push(2); await g2.p; });
+  const t3 = sem.run(async () => { started.push(3); await g3.p; });
+  await new Promise((r) => setImmediate(r));
+  assert.equal(sem.queued, 2, "both queue behind the single holder");
+  assert.deepEqual(started, [], "neither queued task has started");
+
+  // Operator raises maxConcurrent from 1 to 3 (2 units of new headroom) — BOTH queued
+  // waiters must be woken immediately, without waiting for t1 to release.
+  sem.setLimit(3);
+  await new Promise((r) => setImmediate(r));
+  assert.equal(sem.inflight, 3, "t1 + both newly-woken waiters now hold slots");
+  assert.equal(sem.queued, 0, "queue drained by the limit raise");
+  assert.deepEqual(started.sort(), [2, 3], "both queued tasks started without waiting for t1's release");
+
+  g1.resolve(); g2.resolve(); g3.resolve();
+  await Promise.all([t1, t2, t3]);
+  assert.equal(sem.inflight, 0);
+});
+
+await asyncTest("F1: raising the limit wakes only as many waiters as the new headroom allows (FIFO)", async () => {
+  const sem = new TuiSemaphore(1, { maxQueue: 16 });
+  const g1 = deferred();
+  const t1 = sem.run(async () => { await g1.p; });
+  await new Promise((r) => setImmediate(r));
+  const started = [];
+  const g2 = deferred(), g3 = deferred();
+  const t2 = sem.run(async () => { started.push(2); await g2.p; });
+  const t3 = sem.run(async () => { started.push(3); await g3.p; });
+  await new Promise((r) => setImmediate(r));
+  assert.equal(sem.queued, 2);
+
+  sem.setLimit(2); // only 1 unit of new headroom (1 -> 2) — exactly one queued waiter wakes
+  await new Promise((r) => setImmediate(r));
+  assert.equal(sem.inflight, 2);
+  assert.equal(sem.queued, 1, "one waiter still queued — only one slot of headroom existed");
+  assert.deepEqual(started, [2], "FIFO: the earlier-queued waiter (t2) wakes, not t3");
+
+  // Freeing t1's slot afterward still honors the (now current) limit of 2 via release()'s
+  // normal path — the still-queued t3 gets in once a slot actually frees.
+  g1.resolve();
+  await t1;
+  await new Promise((r) => setImmediate(r));
+  assert.deepEqual(started, [2, 3], "t3 granted once a slot frees, honoring the raised limit");
+  assert.equal(sem.queued, 0);
+
+  g2.resolve(); g3.resolve();
+  await t2; await t3;
+  assert.equal(sem.inflight, 0);
+});
+
+// ── Audit F2 — queued waiters must be cancellable on client disconnect ──────
+// server.mjs wires an AbortSignal derived from the client's res "close" event into
+// claudeSemaphore.acquire()/tuiSemaphore.acquire() (see closeSignalFor + acquireClaudeSlot /
+// callClaudeTui). These tests pin the semaphore-level cancellation contract that depends on.
+console.log("\nF2 — queued-wait cancellation via AbortSignal (client disconnect while queued):");
+
+await asyncTest("F2: aborting a QUEUED waiter rejects with SemaphoreAbortError and SPLICES it out (queued drops immediately, not just flagged)", async () => {
+  const sem = new TuiSemaphore(1, { maxQueue: 16 });
+  const g1 = deferred();
+  const t1 = sem.run(async () => { await g1.p; }); // holds the only slot
+  await new Promise((r) => setImmediate(r));
+  const controller = new AbortController();
+  const acquire2 = sem.acquire(controller.signal); // queues behind t1
+  await new Promise((r) => setImmediate(r));
+  assert.equal(sem.queued, 1, "second acquire queued");
+
+  controller.abort(); // simulates the client disconnecting while still queued
+  await assert.rejects(acquire2, SemaphoreAbortError, "cancelled waiter rejects with SemaphoreAbortError");
+  assert.equal(sem.queued, 0, "cancelled waiter is REMOVED — queue length drops immediately");
+  assert.equal(sem.inflight, 1, "t1's slot is untouched by the cancellation");
+
+  // Prove the cancelled waiter never later acquires a slot: free t1's slot and confirm
+  // nobody is waiting to receive it (the queue is genuinely empty, not just decremented).
+  g1.resolve();
+  await t1;
+  assert.equal(sem.inflight, 0, "slot freed with nobody queued — the cancelled waiter never got it");
+});
+
+await asyncTest("F2: an already-aborted signal rejects acquire() immediately, never touching the wait queue", async () => {
+  const sem = new TuiSemaphore(1, { maxQueue: 16 });
+  const g1 = deferred();
+  const t1 = sem.run(async () => { await g1.p; }); // holds the only slot
+  await new Promise((r) => setImmediate(r));
+
+  const controller = new AbortController();
+  controller.abort(); // client already gone before this request ever tries to acquire
+  await assert.rejects(sem.acquire(controller.signal), SemaphoreAbortError);
+  assert.equal(sem.queued, 0, "never entered the wait queue at all");
+
+  g1.resolve(); await t1;
+});
+
+await asyncTest("F2: cancelling one queued waiter preserves FIFO order for the others", async () => {
+  const sem = new TuiSemaphore(1, { maxQueue: 16 });
+  const g1 = deferred();
+  const t1 = sem.run(async () => { await g1.p; });
+  await new Promise((r) => setImmediate(r));
+
+  const started = [];
+  const cA = new AbortController();
+  const cB = new AbortController();
+  const accA = sem.acquire(cA.signal).then(() => started.push("A"));
+  const accB = sem.acquire(cB.signal).then(() => started.push("B"));
+  const g3 = deferred();
+  const t3 = sem.run(async () => { started.push("C"); await g3.p; });
+  await new Promise((r) => setImmediate(r));
+  assert.equal(sem.queued, 3, "A, B, C all queued behind t1");
+
+  cB.abort(); // B (the middle waiter) disconnects
+  await assert.rejects(accB, SemaphoreAbortError);
+  assert.equal(sem.queued, 2, "B removed; A and C remain, in original relative order");
+
+  g1.resolve();
+  await t1;
+  await new Promise((r) => setImmediate(r));
+  assert.deepEqual(started, ["A"], "A (queued first, still present) is granted next — FIFO preserved after B's removal");
+  assert.equal(sem.inflight, 1);
+  assert.equal(sem.queued, 1, "C still waiting");
+
+  sem.release(); // A was acquired directly (not via run()) — free its slot manually
+  await new Promise((r) => setImmediate(r));
+  assert.deepEqual(started, ["A", "C"], "C granted next");
+  g3.resolve();
+  await t3;
+  assert.equal(sem.inflight, 0);
+});
+
+await asyncTest("F2/L2: abort AFTER grant is a no-op — waiter keeps its slot, no rejection, slot released exactly once", async () => {
+  const sem = new TuiSemaphore(1, { maxQueue: 16 });
+  const g1 = deferred();
+  const t1 = sem.run(async () => { await g1.p; }); // holds the only slot
+  await new Promise((r) => setImmediate(r));
+
+  const controller = new AbortController();
+  let granted = false;
+  const acq = sem.acquire(controller.signal).then(() => { granted = true; });
+  await new Promise((r) => setImmediate(r));
+  assert.equal(sem.queued, 1, "waiter queued behind t1");
+
+  // t1 finishes → release() shifts the waiter out and grants it the slot (waiter() detaches
+  // the abort listener before resolving).
+  g1.resolve();
+  await t1;
+  await acq;
+  assert.equal(granted, true, "waiter was granted the slot");
+  assert.equal(sem.inflight, 1, "granted waiter holds the slot");
+  assert.equal(sem.queued, 0);
+
+  // The client disconnects AFTER the grant — the abort-after-grant race. onAbort must be a
+  // no-op (the waiter is no longer in _waiters; idx===-1 guard): no rejection materializes,
+  // the queue is untouched, and the slot is still owned by the (already-resolved) acquirer.
+  controller.abort();
+  await new Promise((r) => setImmediate(r));
+  assert.equal(sem.inflight, 1, "abort after grant did NOT revoke or double-free the slot");
+  assert.equal(sem.queued, 0, "abort after grant did not corrupt queue accounting");
+
+  // The slot is released exactly once via the normal path and is immediately reusable.
+  sem.release();
+  assert.equal(sem.inflight, 0, "slot released exactly once via the normal path");
+  await sem.run(async () => {}); // prove the semaphore is fully healthy afterward
   assert.equal(sem.inflight, 0);
 });
 
