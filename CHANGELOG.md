@@ -1,5 +1,15 @@
 # Changelog
 
+## v3.21.1 — 2026-07-07
+
+Patch release: three bug fixes from an independent concurrency/session-lifecycle audit, each its own PR with a fresh-context reviewer (Iron Rule 10). No new `cli.js` wire behavior, no new endpoint, header, or env var; the `/health` field set is unchanged (only value truthfulness improved).
+
+### Fixed
+
+- **TUI session-scope / boot-reap (#148)** — `lib/tui/session.mjs`'s tmux session prefix is now scoped per-instance by listen port (`ocp-tui-<port>-`) instead of a bare host-wide `ocp-tui-` constant, so a second OCP instance on the same host (e.g. a temporary verification instance) can no longer have its live TUI sessions reaped or `kill-server`'d by another instance's boot/periodic sweep. The one-time boot reap also claims exact-shape legacy `ocp-tui-<8hex>` sessions (pre-fix naming) once, to clean up zombies left behind across an in-place upgrade.
+- **`-p` spawn-token mutex + keychain caching (#150)** — the real-HOME token fallback used when the keychain token is within its 5-minute expiry window is now serialized behind a mutex, so concurrent `-p` spawns no longer race the same single-use refresh token against each other (the credential-fork hazard). Added a 30s TTL cache + last-good-label memoization for the keychain read, cutting per-spawn event-loop blocking. The isolation decision (`/health` isolated/real-home reporting) is now re-evaluated per spawn instead of memoized forever, so `/health` no longer misreports a stale decision. New module `lib/spawn-auth.mjs` extracts the pure, unit-testable primitives (mutex, TTL cache, expiry gate, label ordering).
+- **Concurrency queue / disconnect handling (#149)** — the shared semaphore now honors a runtime-lowered `maxConcurrent` immediately (previously a decrease was silently ignored until in-flight tasks finished on their own) and wakes queued waiters right away when the limit is raised. Queued `-p`/TUI requests are now linked to the client's HTTP connection via `AbortSignal`; a client that disconnects while queued is spliced out of the queue instead of still spawning `claude` once a slot frees. A singleflight follower whose leader disconnected now retries instead of inheriting a spurious 500, and a queued-then-disconnected request is no longer recorded as a usage failure or logged as an error (quiet disconnect handling).
+
 ## v3.21.0 — 2026-06-25
 
 Cleanup + docs release: TUI dead-code removal, docs honesty, and release prep. No new `cli.js` wire behavior; the default path (`CLAUDE_TUI_MODE` unset) is byte-for-byte unchanged.
