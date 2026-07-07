@@ -671,7 +671,13 @@ const TUI_REAP_INTERVAL_MS = 15 * 60 * 1000;
 const tuiReapInterval = TUI_MODE ? setInterval(() => {
   if (tuiSemaphore.inflight > 0 || tuiSemaphore.queued > 0) return; // a turn is live — defer
   try {
-    const n = reapStaleTuiSessions();
+    // F7 fix: scope to THIS instance's own port; a sibling ocp-tui-<otherPort>-* session
+    // (a second OCP instance on the same host) is treated as foreign, same as olp-tui-*.
+    // includeLegacy is NOT set here — see reapStaleTuiSessions' comment: the periodic sweep
+    // conservatively treats any lingering bare-prefix legacy session as foreign so it can
+    // never trigger kill-server on a steady-state tick; only the one-time boot reap below
+    // claims legacy-shaped zombies.
+    const n = reapStaleTuiSessions({ port: PORT });
     if (n) logEvent("info", "tui_reaped_stale_sessions", { count: n, trigger: "periodic" });
   } catch (e) { logEvent("error", "tui_periodic_reap_failed", { error: e.message }); }
 }, TUI_REAP_INTERVAL_MS) : null;
@@ -1168,6 +1174,8 @@ function callClaudeTui(model, messages, _conversationId, _keyName) {
     home: TUI_HOME,
     realHome: process.env.HOME,
     cwd: TUI_CWD,
+    port: PORT, // F7 fix: port-scopes the tmux session name so a sibling OCP instance on a
+                // different port never collides with this instance's reap/kill-server logic.
     wallclockMs: TUI_WALLCLOCK_MS,
     entrypointMode: TUI_ENTRYPOINT,
   }).then(({ text, entrypoint, truncated }) => {
@@ -2631,7 +2639,11 @@ server.listen(PORT, BIND_ADDRESS, () => {
       : "credentials.json (no CLAUDE_CODE_OAUTH_TOKEN — see Troubleshooting #401)";
     console.log(`  TUI-mode: ON home=${TUI_HOME} cwd=${TUI_CWD} auth=${tuiAuth} wallclock=${TUI_WALLCLOCK_MS}ms maxConcurrent=${TUI_MAX_CONCURRENT}`);
     try {
-      const n = reapStaleTuiSessions();
+      // F7 fix: scope to THIS instance's own port (see reapStaleTuiSessions). includeLegacy:
+      // true ONLY here — the one-time boot reap is the designated point to claim orphaned
+      // bare-prefix ("ocp-tui-<uuid8>") zombie sessions left by a PRE-fix process generation
+      // of this same instance (no live post-fix instance ever creates that shape again).
+      const n = reapStaleTuiSessions({ port: PORT, includeLegacy: true });
       if (n) logEvent("info", "tui_reaped_stale_sessions", { count: n });
     } catch {}
   }
