@@ -935,6 +935,7 @@ Supported shapes:
 
 - `response_format: { "type": "json_schema", "json_schema": { "name", "strict", "schema" } }`
 - `response_format: { "type": "json_object" }`
+- `json_mode: true` — non-standard top-level alias honored by several OpenAI-compatible clients; treated as `json_object`.
 
 When a structured request is detected, OCP:
 
@@ -945,6 +946,8 @@ When a structured request is detected, OCP:
 5. If no valid JSON can be produced, returns `HTTP 422` (`invalid_response_error`) rather than passing prose through.
 
 `message.content` for a structured request is the raw JSON string only — no fences, no reasoning, no wrapper. Non-structured requests are completely unaffected (normal conversational behaviour, streaming included). This is a Class B.1 endpoint extension authorized by ADR 0006; the pure logic lives in [`lib/structured-output.mjs`](./lib/structured-output.mjs) and is unit-tested in `test-features.mjs`.
+
+**Caching.** When `CLAUDE_CACHE_TTL > 0`, structured responses are cached like any other, but on a **structured-keyed** hash (the detected `response_format`/schema is folded into the cache key) so a JSON reply never collides with the conversational answer to the same prompt, and different schemas never share a slot. Only a **validated** result is written back — a `422` (no valid JSON) is never cached.
 
 ## Environment Variables
 

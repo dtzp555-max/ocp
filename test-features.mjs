@@ -3827,9 +3827,22 @@ test("detectStructuredOutput: json_schema shape", () => {
 test("detectStructuredOutput: json_object shape", () => {
   assert.deepEqual(detectStructuredOutput({ response_format: { type: "json_object" } }), { mode: "json_object" });
 });
+test("detectStructuredOutput: json_mode:true alias → json_object", () => {
+  assert.deepEqual(detectStructuredOutput({ json_mode: true }), { mode: "json_object" });
+});
 test("detectStructuredOutput: absent → null (non-structured untouched)", () => {
   assert.equal(detectStructuredOutput({ messages: [] }), null);
   assert.equal(detectStructuredOutput({ response_format: "nonsense" }), null);
+  assert.equal(detectStructuredOutput({ json_mode: false }), null);
+});
+test("cacheHash: structured marker isolates JSON requests from the conversational slot", () => {
+  const msgs = [{ role: "user", content: "list 3 fruits" }];
+  const plain = cacheHash("m", msgs, { keyId: "k" });
+  const asJson = cacheHash("m", msgs, { keyId: "k", structured: { mode: "json_object" } });
+  const asSchema = cacheHash("m", msgs, { keyId: "k", structured: { mode: "schema", schema: { type: "array" } } });
+  assert.notEqual(plain, asJson);      // JSON vs prose never collide
+  assert.notEqual(asJson, asSchema);   // different schema → different slot
+  assert.equal(plain, cacheHash("m", msgs, { keyId: "k" })); // unchanged for normal requests
 });
 
 test("validateJsonSchema: valid object passes", () => {

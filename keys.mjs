@@ -355,6 +355,11 @@ export function cacheHash(model, messages, opts = {}) {
   if (opts.temperature != null) h.update(`t:${opts.temperature}`);
   if (opts.max_tokens != null) h.update(`mt:${opts.max_tokens}`);
   if (opts.top_p != null) h.update(`tp:${opts.top_p}`);
+  // Structured-output (OpenAI response_format / json_mode) requests must never share a cache slot
+  // with the conversational answer to the same prompt, nor with a different schema — the steering
+  // instruction and validated JSON payload differ. Keying on the detected descriptor isolates them.
+  // Absent for normal requests → hashes are byte-identical to pre-change.
+  if (opts.structured != null) h.update(`s:${JSON.stringify(opts.structured)}`);
   for (const m of messages) {
     h.update(m.role || "");
     h.update(typeof m.content === "string" ? m.content : JSON.stringify(m.content));

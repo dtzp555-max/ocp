@@ -2653,15 +2653,32 @@ async function handleChatCompletions(req, res) {
     }
   }
 
-  // Structured output (OpenAI response_format): handled on its own path so it bypasses the OCP
-  // cache/singleflight (the cache hash does not key on response_format) and always validates.
+  // Structured output (OpenAI response_format / json_mode): its own path — the response must be
+  // schema-valid JSON, so it never shares the conversational cache slot. When caching is enabled it
+  // uses a structured-keyed hash (isolated via cacheHash's `structured` marker) and writes back ONLY
+  // a validated result (never a 422). Always validates on a miss.
   const structured = detectStructuredOutput(parsed);
   if (structured) {
     const t0s = Date.now();
     const promptCharsS = messages.reduce((a, m) => a + contentToText(m.content).length, 0);
+    let structuredHash = null;
+    if (CACHE_TTL > 0 && !conversationId && !hasCacheControl(messages)) {
+      structuredHash = cacheHash(model, messages, { keyId: req._authKeyId, temperature: parsed.temperature, max_tokens: parsed.max_tokens, top_p: parsed.top_p, structured });
+      try {
+        const cached = getCachedResponse(structuredHash, CACHE_TTL);
+        if (cached) {
+          logEvent("info", "cache_hit", { model, hash: structuredHash.slice(0, 12), hits: cached.hits, structured: true });
+          const id = `chatcmpl-${randomUUID()}`;
+          if (stream) streamStringAsSSE(res, id, model, cached.response);
+          else completionResponse(res, id, model, cached.response);
+          return;
+        }
+      } catch (e) { logEvent("error", "cache_check_failed", { error: e.message }); }
+    }
     const upstreamCall = TUI_MODE ? callClaudeTui : callClaude;
     try {
       const content = await runStructuredCompletion(upstreamCall, model, messages, conversationId, req._authKeyName, res, structured);
+      if (structuredHash) { try { setCachedResponse(structuredHash, model, content); } catch (e) { logEvent("error", "cache_write_failed", { error: e.message }); } }
       const id = `chatcmpl-${randomUUID()}`;
       if (stream) streamStringAsSSE(res, id, model, content);
       else completionResponse(res, id, model, content);
