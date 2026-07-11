@@ -2608,6 +2608,211 @@ test("contentToText: null returns empty string", () => {
   assert.equal(contentToText(null), "");
 });
 
+// ── multimodal image transform (issue #110) ──────────────────────────────────
+// OpenAI image_url parts → Anthropic image blocks for `claude -p --input-format
+// stream-json`. lib/multimodal.mjs is a PURE module (no server.listen()), so it is
+// imported directly here. Class B.1: shape per OpenAI vision spec, authorized by
+// ADR 0006. Mechanism verified live: a base64 PNG fed as an Anthropic image block
+// via --input-format stream-json is correctly described by the model.
+import {
+  hasImageContent as mmHasImageContent,
+  buildImageBlocks as mmBuildImageBlocks,
+  buildStreamJsonInput as mmBuildStreamJsonInput,
+  MultimodalError as MmError,
+  SUPPORTED_IMAGE_TYPES as MM_SUPPORTED,
+} from "./lib/multimodal.mjs";
+
+console.log("\nmultimodal image transform (issue #110):");
+
+// A short, valid base64 string (charset-valid; not decoded by the transform).
+const MM_B64 = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAAAAAA6fptVAAAACklEQVR4nGP4DwABAQEAG7buVgAAAABJRU5ErkJggg==";
+const dataUri = (mt = "image/png") => `data:${mt};base64,${MM_B64}`;
+const imgPart = (mt) => ({ type: "image_url", image_url: { url: dataUri(mt) } });
+const txtPart = (t) => ({ type: "text", text: t });
+
+test("hasImageContent: plain string message → false (text path preserved)", () => {
+  assert.equal(mmHasImageContent([{ role: "user", content: "hello" }]), false);
+});
+
+test("hasImageContent: array of text-only parts → false", () => {
+  assert.equal(mmHasImageContent([{ role: "user", content: [txtPart("a"), txtPart("b")] }]), false);
+});
+
+test("hasImageContent: message with an image_url part → true", () => {
+  assert.equal(mmHasImageContent([{ role: "user", content: [txtPart("q"), imgPart()] }]), true);
+});
+
+test("hasImageContent: image anywhere in history (not just last) → true", () => {
+  const msgs = [
+    { role: "user", content: [txtPart("look"), imgPart()] },
+    { role: "assistant", content: "ok" },
+    { role: "user", content: "and now?" },
+  ];
+  assert.equal(mmHasImageContent(msgs), true);
+});
+
+test("buildImageBlocks: data-URI parsed into an Anthropic base64 image block", () => {
+  const { blocks, stats } = mmBuildImageBlocks([{ role: "user", content: [txtPart("what is this?"), imgPart("image/png")] }]);
+  assert.equal(blocks.length, 2);
+  assert.equal(blocks[0].type, "text");
+  assert.equal(blocks[0].text, "what is this?");
+  assert.deepEqual(blocks[1], { type: "image", source: { type: "base64", media_type: "image/png", data: MM_B64 } });
+  assert.equal(stats.imageCount, 1);
+  assert.ok(stats.totalImageBytes > 0);
+});
+
+test("buildImageBlocks: media_type carried through (jpeg/gif/webp)", () => {
+  for (const mt of ["image/jpeg", "image/gif", "image/webp"]) {
+    const { blocks } = mmBuildImageBlocks([{ role: "user", content: [imgPart(mt)] }]);
+    assert.equal(blocks.find(b => b.type === "image").source.media_type, mt);
+  }
+});
+
+test("buildImageBlocks: multiple images in one message both emitted", () => {
+  const { blocks, stats } = mmBuildImageBlocks([{ role: "user", content: [txtPart("compare"), imgPart(), imgPart()] }]);
+  const imgs = blocks.filter(b => b.type === "image");
+  assert.equal(imgs.length, 2);
+  assert.equal(stats.imageCount, 2);
+});
+
+test("buildImageBlocks: text/image/text ordering preserved", () => {
+  const { blocks } = mmBuildImageBlocks([{ role: "user", content: [txtPart("A"), imgPart(), txtPart("B")] }]);
+  assert.deepEqual(blocks.map(b => (b.type === "text" ? b.text : "IMG")), ["A", "IMG", "B"]);
+});
+
+test("buildImageBlocks: image-first message keeps ordering (image before text)", () => {
+  const { blocks } = mmBuildImageBlocks([{ role: "user", content: [imgPart(), txtPart("caption")] }]);
+  assert.deepEqual(blocks.map(b => (b.type === "text" ? b.text : "IMG")), ["IMG", "caption"]);
+});
+
+test("buildImageBlocks: multi-turn history — role prefixes + separators preserved", () => {
+  const msgs = [
+    { role: "user", content: "first q" },
+    { role: "assistant", content: "prior answer" },
+    { role: "user", content: [txtPart("now this"), imgPart()] },
+  ];
+  const { blocks } = mmBuildImageBlocks(msgs);
+  assert.equal(blocks[0].text, "first q");
+  assert.equal(blocks[1].text, "\n\n[Assistant] prior answer");
+  assert.equal(blocks[2].text, "\n\nnow this");
+  assert.equal(blocks[3].type, "image");
+});
+
+test("buildImageBlocks: image in an EARLIER turn is carried (history image)", () => {
+  const msgs = [
+    { role: "user", content: [txtPart("here"), imgPart()] },
+    { role: "assistant", content: "got it" },
+    { role: "user", content: "thanks" },
+  ];
+  const { blocks, stats } = mmBuildImageBlocks(msgs);
+  assert.equal(stats.imageCount, 1);
+  assert.equal(blocks.filter(b => b.type === "image").length, 1);
+});
+
+test("buildImageBlocks: image_url as bare string is accepted (client leniency)", () => {
+  const { blocks } = mmBuildImageBlocks([{ role: "user", content: [{ type: "image_url", image_url: dataUri() }] }]);
+  assert.equal(blocks.find(b => b.type === "image").source.data, MM_B64);
+});
+
+test("buildStreamJsonInput: emits one newline-terminated user envelope", () => {
+  const { payload } = mmBuildStreamJsonInput([{ role: "user", content: [txtPart("hi"), imgPart()] }]);
+  assert.ok(payload.endsWith("\n"));
+  const env = JSON.parse(payload.trim());
+  assert.equal(env.type, "user");
+  assert.equal(env.message.role, "user");
+  assert.equal(env.message.content[1].type, "image");
+});
+
+// ── malformed / policy / oversized handling (clean 4xx, never a silent drop) ──
+test("buildImageBlocks: unsupported media type → 400 unsupported_image_type", () => {
+  assert.throws(
+    () => mmBuildImageBlocks([{ role: "user", content: [imgPart("image/tiff")] }]),
+    (e) => e instanceof MmError && e.code === "unsupported_image_type" && e.status === 400
+  );
+});
+
+test("buildImageBlocks: non-base64 data URI → 400 invalid_data_uri", () => {
+  assert.throws(
+    () => mmBuildImageBlocks([{ role: "user", content: [{ type: "image_url", image_url: { url: "data:image/png,notbase64" } }] }]),
+    (e) => e instanceof MmError && e.code === "invalid_data_uri" && e.status === 400
+  );
+});
+
+test("buildImageBlocks: malformed data URI (no comma) → 400 invalid_data_uri", () => {
+  assert.throws(
+    () => mmBuildImageBlocks([{ role: "user", content: [{ type: "image_url", image_url: { url: "data:image/png;base64" } }] }]),
+    (e) => e instanceof MmError && e.code === "invalid_data_uri"
+  );
+});
+
+test("buildImageBlocks: image_url part missing a URL → 400 invalid_image_url", () => {
+  assert.throws(
+    () => mmBuildImageBlocks([{ role: "user", content: [{ type: "image_url", image_url: {} }] }]),
+    (e) => e instanceof MmError && e.code === "invalid_image_url"
+  );
+});
+
+test("buildImageBlocks: oversized single image → 413 image_too_large", () => {
+  assert.throws(
+    () => mmBuildImageBlocks([{ role: "user", content: [imgPart()] }], { maxImageBytes: 4 }),
+    (e) => e instanceof MmError && e.code === "image_too_large" && e.status === 413
+  );
+});
+
+test("buildImageBlocks: too many images → 413 too_many_images", () => {
+  const many = Array.from({ length: 3 }, () => imgPart());
+  assert.throws(
+    () => mmBuildImageBlocks([{ role: "user", content: many }], { maxImages: 2 }),
+    (e) => e instanceof MmError && e.code === "too_many_images" && e.status === 413
+  );
+});
+
+test("buildImageBlocks: aggregate image bytes over cap → 413 images_too_large", () => {
+  assert.throws(
+    () => mmBuildImageBlocks([{ role: "user", content: [imgPart(), imgPart()] }], { maxTotalImageBytes: 100, maxImageBytes: 1000 }),
+    (e) => e instanceof MmError && e.code === "images_too_large" && e.status === 413
+  );
+});
+
+test("buildImageBlocks: remote http(s) URL disabled by default → 400 remote_url_disabled", () => {
+  assert.throws(
+    () => mmBuildImageBlocks([{ role: "user", content: [{ type: "image_url", image_url: { url: "https://example.com/a.png" } }] }]),
+    (e) => e instanceof MmError && e.code === "remote_url_disabled" && e.status === 400
+  );
+});
+
+test("buildImageBlocks: remote URL passthrough when allowRemoteUrl=true (url source, OCP does not fetch)", () => {
+  const { blocks } = mmBuildImageBlocks(
+    [{ role: "user", content: [{ type: "image_url", image_url: { url: "https://example.com/a.png" } }] }],
+    { allowRemoteUrl: true }
+  );
+  assert.deepEqual(blocks.find(b => b.type === "image").source, { type: "url", url: "https://example.com/a.png" });
+});
+
+test("buildImageBlocks: unsupported URL scheme → 400 unsupported_url_scheme", () => {
+  assert.throws(
+    () => mmBuildImageBlocks([{ role: "user", content: [{ type: "image_url", image_url: { url: "ftp://x/y.png" } }] }], { allowRemoteUrl: true }),
+    (e) => e instanceof MmError && e.code === "unsupported_url_scheme"
+  );
+});
+
+test("buildImageBlocks: non-image parts (audio/file) fall back to placeholder text", () => {
+  const { blocks } = mmBuildImageBlocks([{ role: "user", content: [txtPart("hear this"), { type: "input_audio", input_audio: {} }] }]);
+  assert.deepEqual(blocks.map(b => b.text), ["hear this", "[non-text content omitted]"]);
+});
+
+test("SUPPORTED_IMAGE_TYPES: exactly the four Anthropic vision types", () => {
+  assert.deepEqual([...MM_SUPPORTED].sort(), ["image/gif", "image/jpeg", "image/png", "image/webp"]);
+});
+
+test("buildImageBlocks: pure-text conversation still yields text blocks (untouched-path parity)", () => {
+  // hasImageContent would be false for this input in server.mjs (text path taken),
+  // but the transform must still be well-defined for a text-only turn.
+  const { blocks, stats } = mmBuildImageBlocks([{ role: "user", content: "just text" }]);
+  assert.deepEqual(blocks, [{ type: "text", text: "just text" }]);
+  assert.equal(stats.imageCount, 0);
+});
+
 // ── messages guard predicate truth-table (issue #110) ────────────────────────
 // Mirrors the guard at server.mjs line ~1650: Array.isArray(x) && x.length > 0
 console.log("\nmessages guard predicate (issue #110):");

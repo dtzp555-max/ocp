@@ -45,6 +45,7 @@ import { runTuiTurn, reapStaleTuiSessions, resolveTuiHome } from "./lib/tui/sess
 import { detectTuiUpstreamError } from "./lib/tui/transcript.mjs";
 import { TuiSemaphore, SemaphoreAbortError, recordTuiEntrypoint, buildTuiHealthBlock } from "./lib/tui/semaphore.mjs";
 import { createSerialMutex, createTtlCache, isTokenExpiring, orderLabelsLastGoodFirst } from "./lib/spawn-auth.mjs";
+import { hasImageContent, buildImageBlocks, buildStreamJsonInput, MultimodalError } from "./lib/multimodal.mjs";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const _pkg = JSON.parse(readFileSync(join(__dirname, "package.json"), "utf8"));
@@ -899,7 +900,7 @@ const authCheckInterval = setInterval(checkAuth, 600000);
 // CLAUDE_SYSTEM_PROMPT env var is absorbed into the system prompt via
 // extractSystemPrompt() at the caller level; APPEND_SYSTEM_PROMPT no longer used.
 // Note: ALLOWED_TOOLS / SKIP_PERMISSIONS / MCP_CONFIG are preserved as before.
-function buildCliArgs(cliModel, systemPrompt) {
+function buildCliArgs(cliModel, systemPrompt, opts = {}) {
   const args = [
     "--model", cliModel,
     "--output-format", "stream-json",
@@ -907,6 +908,14 @@ function buildCliArgs(cliModel, systemPrompt) {
     "--no-session-persistence",
     "--system-prompt", systemPrompt,
   ];
+
+  // Multimodal path (issue #110): images are fed as Anthropic content blocks over
+  // a stream-json stdin stream. `--input-format stream-json` (§ --input-format,
+  // choices text|stream-json; realtime streaming input) is added ONLY when the
+  // request carries an image part; the default (text) input path is untouched.
+  if (opts.streamJsonInput) {
+    args.push("--input-format", "stream-json");
+  }
 
   // Permissions
   // ADR 0007 B-path: in multi-tenant mode, suppress operator-FS tools so a guest
@@ -948,6 +957,24 @@ function buildCliArgs(cliModel, systemPrompt) {
 // message(s) + first user message + last N messages, dropping the middle.
 // This prevents runaway context from gateway-side conversation accumulation.
 let MAX_PROMPT_CHARS = parseInt(process.env.CLAUDE_MAX_PROMPT_CHARS || "150000", 10);
+
+// ── Multimodal image caps (issue #110) ──────────────────────────────────
+// OpenAI `image_url` parts are forwarded to claude as Anthropic image blocks via
+// `--input-format stream-json`. Images deliberately BYPASS the text char budget
+// (MAX_PROMPT_CHARS) — they are bounded by these byte/count caps instead, and by
+// MAX_BODY_SIZE at the HTTP layer. Data URIs are supported by default; remote
+// http(s) image URLs are OFF unless CLAUDE_IMAGE_ALLOW_URL is set (v1: data URIs
+// only). See docs/adr/0006-openai-shim-scope.md (Class B.1) and README § "Images".
+const IMAGE_ALLOW_URL = /^(1|true|yes|on)$/i.test(process.env.CLAUDE_IMAGE_ALLOW_URL || "");
+const MAX_IMAGE_BYTES = parseInt(process.env.CLAUDE_MAX_IMAGE_BYTES || String(5 * 1024 * 1024), 10);
+const MAX_IMAGES = parseInt(process.env.CLAUDE_MAX_IMAGES || "20", 10);
+const MAX_IMAGE_TOTAL_BYTES = parseInt(process.env.CLAUDE_MAX_IMAGE_TOTAL_BYTES || String(20 * 1024 * 1024), 10);
+const MULTIMODAL_OPTS = {
+  allowRemoteUrl: IMAGE_ALLOW_URL,
+  maxImageBytes: MAX_IMAGE_BYTES,
+  maxImages: MAX_IMAGES,
+  maxTotalImageBytes: MAX_IMAGE_TOTAL_BYTES,
+};
 
 // Flatten OpenAI content (string | array of parts) to plain text for the prompt.
 // Array content: concatenate text parts; replace non-text parts (e.g. image_url)
@@ -1039,25 +1066,41 @@ function spawnClaudeProcess(model, messages, conversationId, keyName, releaseSlo
 
   // Circuit breaker: disabled (see comment at top of breaker section)
 
-  stats.activeRequests++;
-  stats.totalRequests++;
-
   // Phase 6c: always serialize full conversation via stdin (no session resume).
   // System messages are extracted and passed via --system-prompt; the remaining
-  // messages (user/assistant/tool) are serialized by messagesToPrompt.
+  // messages (user/assistant/tool) are serialized for stdin.
   const systemPrompt = extractSystemPrompt(messages);
 
-  // messagesToPrompt skips system messages now that they go via --system-prompt.
-  // Filter them out before calling to avoid double-injection.
+  // messagesToPrompt / buildStreamJsonInput skip system messages (they go via
+  // --system-prompt). Filter them out first to avoid double-injection.
   const nonSystemMessages = messages.filter(m => m.role !== "system");
-  const prompt = messagesToPrompt(nonSystemMessages);
 
-  stats.oneOffRequests++;
-  if (conversationId) {
-    console.log(`[session] stateless conv=${conversationId.slice(0, 12)}... key=${keyName || "anon"} msgs=${messages.length} prompt_chars=${prompt.length}`);
+  // Multimodal (issue #110): when any message carries an OpenAI image_url part,
+  // feed the conversation as Anthropic content blocks over --input-format
+  // stream-json (images preserved and kept OUT of the text char budget).
+  // Otherwise the text path is byte-for-byte unchanged. buildStreamJsonInput may
+  // throw MultimodalError on an invalid/oversized image; it runs BEFORE any stats
+  // mutation so a validation failure never leaks counters or the concurrency slot
+  // (handleChatCompletions validates first, so in practice it will not throw here).
+  const useStreamJson = hasImageContent(nonSystemMessages);
+  let stdinPayload, promptChars;
+  if (useStreamJson) {
+    const built = buildStreamJsonInput(nonSystemMessages, MULTIMODAL_OPTS);
+    stdinPayload = built.payload;
+    promptChars = built.stats.textChars;
+  } else {
+    stdinPayload = messagesToPrompt(nonSystemMessages);
+    promptChars = stdinPayload.length;
   }
 
-  const cliArgs = buildCliArgs(cliModel, systemPrompt);
+  stats.activeRequests++;
+  stats.totalRequests++;
+  stats.oneOffRequests++;
+  if (conversationId) {
+    console.log(`[session] stateless conv=${conversationId.slice(0, 12)}... key=${keyName || "anon"} msgs=${messages.length} prompt_chars=${promptChars}`);
+  }
+
+  const cliArgs = buildCliArgs(cliModel, systemPrompt, { streamJsonInput: useStreamJson });
 
   const env = { ...process.env };
   delete env.CLAUDECODE;
@@ -1143,12 +1186,13 @@ function spawnClaudeProcess(model, messages, conversationId, keyName, releaseSlo
   // the spawned process, NOT on the stdin Writable — it does not catch this.
   proc.stdin.on("error", (e) => logEvent("warn", "stdin_write_error", { error: e.message }));
 
-  // Write prompt to stdin immediately
-  proc.stdin.write(prompt);
+  // Write the serialized turn to stdin immediately. Text path: the flat prompt.
+  // Multimodal path: a single newline-terminated stream-json user envelope.
+  proc.stdin.write(stdinPayload);
   proc.stdin.end();
 
-  recordModelRequest(cliModel, prompt.length);
-  logEvent("info", "claude_spawned", { model: cliModel, promptChars: prompt.length, timeout: TIMEOUT, tier: getModelTier(cliModel), session: conversationId ? conversationId.slice(0, 12) + "..." : "none" });
+  recordModelRequest(cliModel, promptChars);
+  logEvent("info", "claude_spawned", { model: cliModel, promptChars, inputFormat: useStreamJson ? "stream-json" : "text", timeout: TIMEOUT, tier: getModelTier(cliModel), session: conversationId ? conversationId.slice(0, 12) + "..." : "none" });
 
   // Single request timeout — no separate first-byte timer.
   // Claude tool-use causes long pauses in the token stream (30s-5min),
@@ -2167,7 +2211,11 @@ async function handleSettings(req, res) {
 }
 
 // ── Handle chat completions ─────────────────────────────────────────────
-const MAX_BODY_SIZE = 5 * 1024 * 1024; // 5 MB
+// Default 5 MB, byte-for-byte unchanged unless CLAUDE_MAX_BODY_SIZE is set. Base64
+// image payloads inflate ~33%; operators enabling large images (issue #110) can
+// raise this to admit bigger requests. The human-readable label tracks the value.
+const MAX_BODY_SIZE = parseInt(process.env.CLAUDE_MAX_BODY_SIZE || String(5 * 1024 * 1024), 10);
+const MAX_BODY_SIZE_LABEL = `${Math.round(MAX_BODY_SIZE / (1024 * 1024))}MB`;
 
 // Set of all valid model identifiers (canonical IDs + aliases)
 const VALID_MODELS = new Set(Object.keys(MODEL_MAP));
@@ -2178,7 +2226,7 @@ async function handleChatCompletions(req, res) {
     for await (const chunk of req) {
       body += chunk;
       if (body.length > MAX_BODY_SIZE) {
-        return jsonResponse(res, 413, { error: { message: "Request body too large (max 5MB)", type: "invalid_request_error" } });
+        return jsonResponse(res, 413, { error: { message: `Request body too large (max ${MAX_BODY_SIZE_LABEL})`, type: "invalid_request_error" } });
       }
     }
   } catch (e) {
@@ -2205,6 +2253,24 @@ async function handleChatCompletions(req, res) {
 
   if (!Array.isArray(messages) || messages.length === 0) {
     return jsonResponse(res, 400, { error: { message: "'messages' must be a non-empty array", type: "invalid_request_error" } });
+  }
+
+  // Multimodal validation (issue #110): when a request carries OpenAI `image_url`
+  // content parts, validate/parse them now so an invalid, unsupported, or oversized
+  // image returns a clean 4xx BEFORE the cache/spawn path (rather than a silent drop
+  // or an opaque 500). The stream-json transform itself runs at spawn time
+  // (spawnClaudeProcess → buildStreamJsonInput). Class B.1: authorized by ADR 0006;
+  // request shape per OpenAI vision spec (image_url content parts). buildImageBlocks
+  // validates without stringifying, so this early pass is cheap.
+  if (hasImageContent(messages)) {
+    try {
+      buildImageBlocks(messages.filter(m => m.role !== "system"), MULTIMODAL_OPTS);
+    } catch (e) {
+      if (e instanceof MultimodalError) {
+        return jsonResponse(res, e.status, { error: { message: e.message, type: e.type, code: e.code } });
+      }
+      throw e;
+    }
   }
 
   // NOTE: quota is best-effort / eventually-consistent. The gate reads the recorded count

@@ -735,7 +735,7 @@ The canonical list lives in [`models.json`](./models.json) — the single source
 | Endpoint | Method | Description |
 |----------|--------|-------------|
 | `/v1/models` | GET | List available models |
-| `/v1/chat/completions` | POST | Chat completion (streaming + non-streaming) |
+| `/v1/chat/completions` | POST | Chat completion (streaming + non-streaming). Supports multimodal `image_url` content parts — see [Images / Multimodal](#images--multimodal-vision). |
 | `/health` | GET | Comprehensive health check (includes a `tui` block for TUI-mode drift/concurrency monitoring) |
 | `/usage` | GET | Plan usage limits + per-model stats |
 | `/status` | GET | Combined overview (usage + health) |
@@ -749,6 +749,71 @@ The canonical list lives in [`models.json`](./models.json) — the single source
 | `/api/usage` | GET | Per-key usage stats (`?since=&until=&hours=&limit=`); returns self only by default — pass `?all=true` (admin only) for all-keys data |
 | `/cache/stats` | GET | Cache statistics (admin only) |
 | `/cache` | DELETE | Clear response cache (admin only) |
+
+## Images / Multimodal (Vision)
+
+`POST /v1/chat/completions` accepts OpenAI-style multimodal `content` parts, so a
+message can carry images alongside text and Claude will actually see them. This
+follows OpenAI's [vision](https://platform.openai.com/docs/guides/vision) /
+[chat-completions `image_url`](https://platform.openai.com/docs/api-reference/chat/create#chat-create-messages)
+request shape — no OCP-invented fields. (Class B.1 endpoint; see ADR 0006.)
+
+Under the hood, when a request carries an image OCP feeds the conversation to the
+Claude CLI as Anthropic image blocks over `--input-format stream-json`. Text-only
+requests are completely unaffected (unchanged code path).
+
+### Supported input
+
+- **Base64 data URIs** (default, recommended):
+  `data:image/png;base64,<...>`. Media types: `image/jpeg`, `image/png`,
+  `image/gif`, `image/webp`.
+- **Remote `http(s)` URLs** — **off by default**. Set `CLAUDE_IMAGE_ALLOW_URL=1`
+  to enable; the URL is passed through to Anthropic (OCP never fetches it itself,
+  so there is no OCP-side SSRF surface).
+- Images may appear in **any** message in the history (multi-turn), not just the
+  last one.
+- Non-image, non-text parts (audio, files) are **not** yet supported and are
+  replaced with a `[non-text content omitted]` placeholder (deferred to a future
+  version).
+
+### Example (base64 data URI)
+
+```bash
+curl -X POST http://127.0.0.1:3456/v1/chat/completions \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "model": "claude-sonnet-4-6",
+    "messages": [{
+      "role": "user",
+      "content": [
+        { "type": "text", "text": "What is in this image?" },
+        { "type": "image_url",
+          "image_url": { "url": "data:image/png;base64,iVBORw0KGgoAAA..." } }
+      ]
+    }]
+  }'
+```
+
+### Limits
+
+Images bypass the text `CLAUDE_MAX_PROMPT_CHARS` budget and are instead bounded by
+their own byte/count caps. Requests that violate a cap get a clear `4xx` (never a
+silent drop):
+
+| Cap | Env var | Default | Error |
+|-----|---------|---------|-------|
+| Request body | `CLAUDE_MAX_BODY_SIZE` | 5 MB | `413` request body too large |
+| Per-image bytes | `CLAUDE_MAX_IMAGE_BYTES` | 5 MB | `413` `image_too_large` |
+| Total image bytes | `CLAUDE_MAX_IMAGE_TOTAL_BYTES` | 20 MB | `413` `images_too_large` |
+| Image count | `CLAUDE_MAX_IMAGES` | 20 | `413` `too_many_images` |
+| Unsupported media type | — | — | `400` `unsupported_image_type` |
+| Malformed data URI | — | — | `400` `invalid_data_uri` |
+| Remote URL while disabled | `CLAUDE_IMAGE_ALLOW_URL` | off | `400` `remote_url_disabled` |
+
+Base64 payloads are large: a 5 MB image is ~6.7 MB as a data URI, so raise
+`CLAUDE_MAX_BODY_SIZE` (and, if needed, `CLAUDE_MAX_IMAGE_BYTES`) to admit big
+images. Vision support depends on the target model — request a current
+vision-capable Claude model.
 
 ## OpenClaw Integration
 
@@ -942,7 +1007,12 @@ See [Subscription-pool (TUI) mode](#subscription-pool-tui-mode) and ADR 0007 PR-
 | `CLAUDE_MAX_CONCURRENT` | `8` | Max concurrent claude processes (`-p`/stream-json path) |
 | `CLAUDE_MAX_QUEUE` | `16` | Max requests **waiting** for a `-p` concurrency slot. Beyond `CLAUDE_MAX_CONCURRENT`, requests queue (up to this cap) instead of being rejected; when the queue is **also** full, the request gets `HTTP 429` + `Retry-After` (not an opaque 500). Surfaced on `/health.concurrency` + `/health.stats.queueRejections`. |
 | `CLAUDE_QUEUE_RETRY_AFTER` | `5` | Seconds advertised in the `Retry-After` header on a `-p` concurrency-overflow `429`. |
-| `CLAUDE_MAX_PROMPT_CHARS` | `150000` | Prompt truncation limit (chars) |
+| `CLAUDE_MAX_PROMPT_CHARS` | `150000` | Prompt truncation limit (chars). Applies to **text only** — image bytes bypass this budget (see [Images / Multimodal](#images--multimodal-vision)). |
+| `CLAUDE_MAX_BODY_SIZE` | `5242880` | Max request body size (bytes, default 5 MB). Base64 image payloads inflate ~33%; raise this to admit larger multimodal requests. |
+| `CLAUDE_IMAGE_ALLOW_URL` | `false` | Allow remote `http(s)` image URLs in `image_url` parts. **Off by default** (v1 supports base64 `data:` URIs only). When on, the URL is passed through to Anthropic as a `url` image source — **OCP does not fetch it** (no OCP-side SSRF surface); unreachable/blocked URLs surface as an API error. |
+| `CLAUDE_MAX_IMAGE_BYTES` | `5242880` | Per-image decoded-byte cap (default 5 MB). Over-cap images get `HTTP 413`. |
+| `CLAUDE_MAX_IMAGES` | `20` | Max image parts per request. Over-cap gets `HTTP 413`. |
+| `CLAUDE_MAX_IMAGE_TOTAL_BYTES` | `20971520` | Aggregate decoded-byte cap across all images in a request (default 20 MB). Over-cap gets `HTTP 413`. |
 | `CLAUDE_SESSION_TTL` | `3600000` | Session expiry (ms, default: 1 hour) |
 | `CLAUDE_CACHE_TTL` | `0` | Response cache TTL (ms, 0 = disabled). Set to e.g. `300000` for 5-min cache |
 | `CLAUDE_ALLOWED_TOOLS` | `Bash,Read,...,Agent` | Comma-separated tools to pre-approve |
