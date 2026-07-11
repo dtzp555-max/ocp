@@ -927,6 +927,25 @@ tr '\0' '\n' < /proc/$(pgrep -f server.mjs | head -1)/environ | grep CLAUDE_CODE
 
 See [Subscription-pool (TUI) mode](#subscription-pool-tui-mode) and ADR 0007 PR-C / PR-D amendments.
 
+## Structured Outputs (OpenAI `response_format`)
+
+`/v1/chat/completions` honors OpenAI's [`response_format`](https://platform.openai.com/docs/api-reference/chat/create#chat-create-response_format) parameter so OpenAI-SDK clients that require machine-parseable JSON (Home Assistant AI Tasks, Honcho, BYO scripts) get JSON in `choices[].message.content` — not prose.
+
+Supported shapes:
+
+- `response_format: { "type": "json_schema", "json_schema": { "name", "strict", "schema" } }`
+- `response_format: { "type": "json_object" }`
+
+When a structured request is detected, OCP:
+
+1. Appends a strict JSON-only steering instruction to the request (no Markdown, no fences, no prose, must begin with `{` or `[`).
+2. Extracts the JSON from the model reply (unwraps a stray code fence / prose via a string-aware balanced slice).
+3. For `json_schema`, validates the result against the supplied schema (types, `required`, `enum`, `const`, `additionalProperties`, nullability, `items`, `min/maxItems`).
+4. On a parse/validation miss, retries with a stronger instruction that names the failure, up to `OCP_STRUCTURED_MAX_ATTEMPTS` (default 3).
+5. If no valid JSON can be produced, returns `HTTP 422` (`invalid_response_error`) rather than passing prose through.
+
+`message.content` for a structured request is the raw JSON string only — no fences, no reasoning, no wrapper. Non-structured requests are completely unaffected (normal conversational behaviour, streaming included). This is a Class B.1 endpoint extension authorized by ADR 0006; the pure logic lives in [`lib/structured-output.mjs`](./lib/structured-output.mjs) and is unit-tested in `test-features.mjs`.
+
 ## Environment Variables
 
 | Variable | Default | Description |
@@ -966,6 +985,7 @@ See [Subscription-pool (TUI) mode](#subscription-pool-tui-mode) and ADR 0007 PR-
 | `OCP_TUI_MAX_CONCURRENT` | `2` | (TUI-mode) Max concurrent interactive TUI turns. **Independent** of `CLAUDE_MAX_CONCURRENT` (which bounds the `-p`/stream-json path; TUI never uses it). A TUI turn is heavy (per-request cold-boot of tmux+claude + up to `CLAUDE_TUI_WALLCLOCK_MS` wallclock), so the default is low to keep small hosts (e.g. a Pi 4) alive under a burst. Excess turns **queue** (bounded); a full queue yields a 503. See ADR 0007 PR-B amendment. |
 | `OCP_TUI_POOL_SIZE` | `0` (off) | (TUI-mode) Number of **pre-booted warm `claude` panes** kept ready, so a request does not pay the cold boot. `0` disables the pool entirely — the request path is then exactly the cold-boot path. Max `4`; an unparseable value disables it rather than guessing. **Measured on a Mac mini (Sonnet 4.6, `--effort low`): end-to-end p50 `10.17s` (n=6, pool off) → `6.00s` (n=12 warm hits) — −4.2 s / −41%** — the pool recovers both the ~1.2 s boot *and* ~2.9 s of post-input-bar init that a pane which has been idle a moment has already finished. **Cost:** each warm pane is a *live idle `claude` process* held whether or not a request ever arrives (peak processes ≈ pool size + `OCP_TUI_MAX_CONCURRENT` + 1 booting replacement) — which is why it is opt-in. Panes are **single-use**: one turn, then killed and replaced in the background. The **first request after start (and after any model switch) is always a cold miss** — the pool warms the most recently requested model, since OCP cannot know which model the next caller wants. See `docs/plans/2026-07-13-tui-latency/`. |
 | `OCP_SKIP_AUTH_TEST` | *(unset)* | When `=1`, skip the `claude -p` auth probe during `setup.mjs`. After 2026-06-15 this probe draws from the Agent SDK credit pool; set this to avoid burning a metered credit on re-installs or `ocp update` runs. Auth is validated at the first real request. |
+| `OCP_STRUCTURED_MAX_ATTEMPTS` | `3` | Max attempts (initial + retries) to coerce a schema-valid JSON reply when a request uses OpenAI `response_format`. See [Structured Outputs](#structured-outputs-openai-response_format). |
 | `OCP_TUI_FULL_TOOLS` | *(unset)* | (TUI-mode, **single-user only**) When `=1`, grant the interactive session the **same tool surface as the `-p` path** — `--allowedTools` (+ optional `--mcp-config`, read from `CLAUDE_ALLOWED_TOOLS` / `CLAUDE_MCP_CONFIG`) — instead of the default MCP-walled, built-in-tools-only set. Lets a trusted single-operator TUI deployment run a **tool-using / MCP agent** (e.g. an OpenClaw assistant) on the subscription pool. Safe because TUI **refuses to boot under `AUTH_MODE=multi`** (hard exit) — no guest key can ever reach the TUI path, so this gate cannot expose tools to an untrusted caller. (Under `AUTH_MODE=shared` + `OCP_TUI_ALLOW_LAN=1`, anyone holding the single shared key reaches it — that is the existing TUI trust model, unchanged.) Note: `--dangerously-skip-permissions` / `CLAUDE_SKIP_PERMISSIONS` is **not** supported for TUI — claude v2.1.x shows an interactive bypass-acceptance screen in headless tmux that cannot be answered, bricking the pane. Use scratch-home `settings.json` `additionalDirectories` instead. See [Subscription-pool (TUI) mode](#subscription-pool-tui-mode) and ADR 0007. |
 
 ### Streaming heartbeat

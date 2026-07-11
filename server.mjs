@@ -42,6 +42,7 @@ import { dirname, join } from "node:path";
 import { homedir } from "node:os";
 import { validateKey, recordUsage, getUsageByKey, getUsageTimeline, getRecentUsage, createKey, listKeys, revokeKey, closeDb, checkQuota, updateKeyQuota, getKeyQuota, findKey, cacheHash, getCachedResponse, setCachedResponse, clearCache, getCacheStats, hasCacheControl, singleflight, getInflightStats } from "./keys.mjs";
 import { DEFAULT_PORT } from "./lib/constants.mjs";
+import { StructuredOutputError, detectStructuredOutput, validateJsonSchema, extractJsonPayload, structuredSystemInstruction } from "./lib/structured-output.mjs";
 import { isLoopbackBind } from "./lib/net.mjs";
 import { runTuiTurn, reapStaleTuiSessions, resolveTuiHome, bootTuiPane, tuiPaneHealthy, poolPaneName, POOL_BOOT_MS } from "./lib/tui/session.mjs";
 import { detectTuiUpstreamError } from "./lib/tui/transcript.mjs";
@@ -324,6 +325,9 @@ const ALLOWED_TOOLS = (process.env.CLAUDE_ALLOWED_TOOLS ||
   "Bash,Read,Write,Edit,Glob,Grep,WebSearch,WebFetch,Agent"
 ).split(",").map(s => s.trim()).filter(Boolean);
 const SYSTEM_PROMPT = process.env.CLAUDE_SYSTEM_PROMPT || "";
+// Max attempts (initial + retries) to coerce a valid structured-output (OpenAI response_format)
+// JSON response out of the model before rejecting. See runStructuredCompletion.
+const STRUCTURED_MAX_ATTEMPTS = Math.max(1, parseInt(process.env.OCP_STRUCTURED_MAX_ATTEMPTS || "3", 10));
 const MCP_CONFIG = process.env.CLAUDE_MCP_CONFIG || "";
 let SESSION_TTL = parseInt(process.env.CLAUDE_SESSION_TTL || "3600000", 10);
 let MAX_CONCURRENT = parseInt(process.env.CLAUDE_MAX_CONCURRENT || "8", 10);
@@ -2562,6 +2566,37 @@ const MAX_BODY_SIZE = 5 * 1024 * 1024; // 5 MB
 // Set of all valid model identifiers (canonical IDs + aliases)
 const VALID_MODELS = new Set(Object.keys(MODEL_MAP));
 
+// Drive the model to a valid structured-output (OpenAI response_format) JSON string, retrying up to
+// STRUCTURED_MAX_ATTEMPTS. Appends a strict JSON-only steering instruction, extracts + validates the
+// reply (pure helpers in lib/structured-output.mjs), and escalates the instruction on failure.
+// Returns the canonical JSON string (message.content) or throws StructuredOutputError.
+async function runStructuredCompletion(upstreamCall, model, messages, conversationId, keyName, res, structured) {
+  let lastErr = "no valid JSON produced";
+  let lastRaw = "";
+  for (let attempt = 0; attempt < STRUCTURED_MAX_ATTEMPTS; attempt++) {
+    const augmented = [...messages, { role: "system", content: structuredSystemInstruction(structured, attempt, lastErr) }];
+    const raw = await upstreamCall(model, augmented, conversationId, keyName, res);
+    lastRaw = raw;
+    const extracted = extractJsonPayload(raw);
+    if (!extracted.ok) {
+      lastErr = "response was not parseable as JSON";
+      logEvent("warn", "structured_retry", { attempt, reason: "unparseable" });
+      continue;
+    }
+    if (structured.mode === "schema" && structured.schema) {
+      const errs = validateJsonSchema(extracted.value, structured.schema, "$", structured.strict);
+      if (errs.length) {
+        lastErr = "schema validation failed: " + errs.slice(0, 5).join("; ");
+        logEvent("warn", "structured_retry", { attempt, reason: "schema", errors: errs.slice(0, 5) });
+        continue;
+      }
+    }
+    if (attempt > 0) logEvent("info", "structured_recovered", { attempt });
+    return JSON.stringify(extracted.value); // canonical, fence-free, prose-free
+  }
+  throw new StructuredOutputError(lastErr, lastRaw);
+}
+
 async function handleChatCompletions(req, res) {
   let body = "";
   try {
@@ -2615,6 +2650,32 @@ async function handleChatCompletions(req, res) {
           quota: exceeded,
         },
       });
+    }
+  }
+
+  // Structured output (OpenAI response_format): handled on its own path so it bypasses the OCP
+  // cache/singleflight (the cache hash does not key on response_format) and always validates.
+  const structured = detectStructuredOutput(parsed);
+  if (structured) {
+    const t0s = Date.now();
+    const promptCharsS = messages.reduce((a, m) => a + contentToText(m.content).length, 0);
+    const upstreamCall = TUI_MODE ? callClaudeTui : callClaude;
+    try {
+      const content = await runStructuredCompletion(upstreamCall, model, messages, conversationId, req._authKeyName, res, structured);
+      const id = `chatcmpl-${randomUUID()}`;
+      if (stream) streamStringAsSSE(res, id, model, content);
+      else completionResponse(res, id, model, content);
+      try { recordUsage({ keyId: req._authKeyId, keyName: req._authKeyName, model, promptChars: promptCharsS, responseChars: content.length, elapsedMs: Date.now() - t0s, success: true }); } catch (e) { logEvent("error", "usage_record_failed", { error: e.message }); }
+      return;
+    } catch (err) {
+      if (err instanceof RequestDisconnectedError) { try { res.end(); } catch {} return; }
+      try { recordUsage({ keyId: req._authKeyId, keyName: req._authKeyName, model, promptChars: promptCharsS, responseChars: 0, elapsedMs: Date.now() - t0s, success: false }); } catch {}
+      if (res.headersSent || res.writableEnded || res.destroyed) { try { res.end(); } catch {} return; }
+      if (err instanceof StructuredOutputError) {
+        logEvent("warn", "structured_failed", { reason: err.reason });
+        return jsonResponse(res, 422, { error: { message: sanitizeError(err.message), type: "invalid_response_error" } });
+      }
+      return respondUpstreamError(res, err);
     }
   }
 
