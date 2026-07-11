@@ -3322,8 +3322,8 @@ test("models.json aliases.haiku === 'claude-haiku-4-5-20251001' (usage-probe SPO
   assert.equal(_spotModels.aliases.haiku, "claude-haiku-4-5-20251001");
 });
 
-test("models.json aliases.sonnet === 'claude-sonnet-4-6' (default-request-model SPOT)", () => {
-  assert.equal(_spotModels.aliases.sonnet, "claude-sonnet-4-6");
+test("models.json aliases.sonnet === 'claude-sonnet-5' (default-request-model SPOT)", () => {
+  assert.equal(_spotModels.aliases.sonnet, "claude-sonnet-5");
 });
 
 // ── escapeHtml + key-name validator (issue #114) ────────────────────────────
