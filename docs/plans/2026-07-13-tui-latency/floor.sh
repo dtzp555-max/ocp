@@ -1,7 +1,5 @@
 #!/usr/bin/env bash
 # OCP TUI-mode latency floor harness — see README.md in this directory.
-# Measures TRUE first-token time of the subscription path by polling tmux capture-pane,
-# bypassing OCP entirely (no :3456, no ocp-tui-* sessions).
 #
 # 目的：回答一个问题——如果把 OCP 现有的两个已知开销砍掉
 #   (a) 每请求 spawn + boot（可用预热进程池消除）
