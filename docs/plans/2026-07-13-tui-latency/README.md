@@ -78,7 +78,7 @@ the transcript or the exit status reveals this.
 
 ### 1. Pass `--effort` explicitly on spawn — **do this first**
 
-`buildTuiCmd` (`lib/tui/session.mjs`) does not pass `--effort` — `grep -rn -- "--effort\|effortLevel" lib/ server.mjs bin/`
+`buildTuiCmd` (`lib/tui/session.mjs`) does not pass `--effort` — `grep -rn -- "--effort\|effortLevel" lib/ server.mjs`
 returns zero hits. What the pane's `claude` ends up using therefore depends on **which HOME mode
 `resolveTuiHome()` picked**:
 
@@ -87,7 +87,11 @@ returns zero hits. What the pane's `claude` ends up using therefore depends on *
 | **real-home** (legacy default — *current* service config: no `CLAUDE_CODE_OAUTH_TOKEN`, no `OCP_TUI_HOME`) | `~` | **inherits the operator's `~/.claude/settings.json` → `effortLevel: xhigh` on this host** |
 | env-token scratch (`CLAUDE_CODE_OAUTH_TOKEN` set — the direction #146/#150 pushed) | `~/.ocp-tui/home` | that settings.json contains only `permissions.additionalDirectories`; `prepareTuiHome()` never writes `effortLevel` → **claude's built-in default** |
 
-So today, on the production config, **every OCP request runs extended thinking** — pure waste
+**Scope note**: TUI mode is currently *off* on this host (`CLAUDE_TUI_MODE=false`; `/health` →
+`"tui": {"enabled": false}`), so live traffic takes the `-p` path today. The statement below is
+about what happens **when TUI mode is enabled**.
+
+On the current HOME config, **every TUI request would run extended thinking** — pure waste
 for the typical "generate this JSON" request, and it makes latency depend on an unrelated global
 setting the operator may have changed for their own interactive use. And the mode split means
 the effort level silently changes if the operator ever switches to env-token mode.
@@ -164,7 +168,8 @@ tmux kill-session -t probe
 - **Kill direction is safe both ways**: `reapStaleTuiSessions()` only `kill-session`s names
   matching `ocp-tui-<port>-`, which `zhiyin-floor-*` never matches; and the harness only
   `kill-session`s its own single session — it contains **no `kill-server`**.
-- **One benign interaction**: OCP's periodic `kill-server` (zombie reaping) is gated on
+- **One benign interaction** (only when TUI mode is enabled — the reap tick is itself gated on
+  `TUI_MODE`): OCP's periodic `kill-server` (zombie reaping) is gated on
   `othersRemain` — *any* foreign-prefixed tmux session suppresses it. So while the harness is
   running, that sweep is skipped. This is the coexistence guard working as designed; it resumes
   on the next tick.
