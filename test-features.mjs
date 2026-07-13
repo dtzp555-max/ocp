@@ -3598,6 +3598,26 @@ test("F1: an auth banner rendered as a LATER message is never forwarded to the c
   assert.equal(a.finalize(BANNER).ok, false, "and the turn is refused, not served");
 });
 
+test("F1: a first payload with message_id:null cannot disarm the guard", () => {
+  // The residual bypass the reviewer found by probing. `this.messageId` used to be initialized
+  // to null, so a first payload carrying message_id:null compared EQUAL to it → no boundary
+  // registered → `messages` stayed 0 → when the REAL boundary arrived, `messages > 1` evaluated
+  // 1 > 1 === false → restartedAfterEmit never armed → the released branch forwarded the banner.
+  // The whole F1 guard was disarmed by a single null field. parseDeltaChunk does not validate
+  // message_id, so such a payload does reach push().
+  const a = new TuiDeltaAssembler({ holdbackChars: 100 });
+  const narration = "I'll check that file for you and then report back with what I find inside it.";
+  a.push({ hook_event_name: "MessageDisplay", message_id: null, delta: narration + narration });
+  assert.notEqual(a.emitted, "", "precondition: the narration released to the client");
+  assert.equal(a.messages, 1, "a null message_id is still a MESSAGE — it must register as one");
+
+  const BANNER = "Please run /login · API Error: 401 Invalid authentication credentials";
+  const out = a.push({ hook_event_name: "MessageDisplay", message_id: "m2", delta: BANNER });
+  assert.equal(out, null, "the banner must not be forwarded — the guard must arm regardless");
+  assert.equal(a.restartedAfterEmit, true);
+  assert.ok(!a.emitted.includes("401"));
+});
+
 test("F1: whitespace cannot buy a release — the holdback screens TRIMMED length", () => {
   // detectTuiUpstreamError() TRIMS before applying its <=100-char rule, so gating release on
   // the UNTRIMMED pending.length let 101 spaces trim to "" → the detector has nothing to
