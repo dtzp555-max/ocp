@@ -1,0 +1,3 @@
+[]                     | ▝▜█████▛▘  Sonnet 5 with xhigh effort · Claude Max
+[--effort low]         | ▝▜█████▛▘  Sonnet 5 with low effort · Claude Max
+[--bare]               | ▝▜█████▛▘  Sonnet 5 with xhigh effort · API Usage Billing

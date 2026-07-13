@@ -1,0 +1,15 @@
+{"i": 1, "tag": "effort-low", "model": "claude-sonnet-5", "extra_args": "--effort low", "prompt_chars": 7451, "boot_ms": 1077, "ttft_ms": 6172, "complete_ms": 9929}
+{"i": 2, "tag": "effort-low", "model": "claude-sonnet-5", "extra_args": "--effort low", "prompt_chars": 7451, "boot_ms": 1026, "ttft_ms": 6160, "complete_ms": 9996}
+{"i": 3, "tag": "effort-low", "model": "claude-sonnet-5", "extra_args": "--effort low", "prompt_chars": 7451, "boot_ms": 1010, "ttft_ms": 6437, "complete_ms": 9977}
+{"i": 4, "tag": "effort-low", "model": "claude-sonnet-5", "extra_args": "--effort low", "prompt_chars": 7451, "boot_ms": 1033, "ttft_ms": 5872, "complete_ms": 9944}
+{"i": 5, "tag": "effort-low", "model": "claude-sonnet-5", "extra_args": "--effort low", "prompt_chars": 7451, "boot_ms": 1154, "ttft_ms": 6387, "complete_ms": 9993}
+{"i":1,"tag":"baseline","model":"claude-sonnet-5","extra_args":"","prompt_chars":7451,"boot_ms":1300,"ttft_ms":8321,"complete_ms":9939}
+{"i":2,"tag":"baseline","model":"claude-sonnet-5","extra_args":"","prompt_chars":7451,"boot_ms":1070,"ttft_ms":10347,"complete_ms":11320}
+{"i":3,"tag":"baseline","model":"claude-sonnet-5","extra_args":"","prompt_chars":7451,"boot_ms":911,"ttft_ms":13061,"complete_ms":15163}
+{"i":4,"tag":"baseline","model":"claude-sonnet-5","extra_args":"","prompt_chars":7451,"boot_ms":1441,"ttft_ms":9981,"complete_ms":11066}
+{"i":5,"tag":"baseline","model":"claude-sonnet-5","extra_args":"","prompt_chars":7451,"boot_ms":1036,"ttft_ms":17189,"complete_ms":17985}
+{"i":1,"tag":"bare","model":"claude-sonnet-5","extra_args":"--bare","prompt_chars":7451,"boot_ms":429,"ttft_ms":-1,"complete_ms":-1}
+{"i":2,"tag":"bare","model":"claude-sonnet-5","extra_args":"--bare","prompt_chars":7451,"boot_ms":437,"ttft_ms":-1,"complete_ms":-1}
+{"i":3,"tag":"bare","model":"claude-sonnet-5","extra_args":"--bare","prompt_chars":7451,"boot_ms":444,"ttft_ms":-1,"complete_ms":-1}
+{"i":4,"tag":"bare","model":"claude-sonnet-5","extra_args":"--bare","prompt_chars":7451,"boot_ms":446,"ttft_ms":-1,"complete_ms":-1}
+{"i":5,"tag":"bare","model":"claude-sonnet-5","extra_args":"--bare","prompt_chars":7451,"boot_ms":441,"ttft_ms":-1,"complete_ms":-1}
