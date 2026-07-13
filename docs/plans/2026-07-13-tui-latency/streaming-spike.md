@@ -71,13 +71,32 @@ This is exactly the contract a streaming design needs: deltas forward straight i
 
 ### Caveats for the implementer
 
-- **Block-level granularity, not token-level** — 5–7 chunks for a ~600-byte answer, not one per token.
-  Plenty for SSE (`delta.content` has no minimum size), but do not promise token-by-token output.
+- **Block-level granularity, not token-level** — the hook fires **once per rendered block** (roughly one
+  per paragraph / list item / code block), so the chunk count **scales with answer length**: 7 fires for a
+  ~600-byte answer, **18 for a ~2 KB one**. Plenty for SSE (`delta.content` has no minimum size), but do
+  not promise token-by-token output, and do not hard-code any assumption about chunk count.
+- **🔴 The sink MUST be keyed by `session_id` — this is live TODAY, not a future concern.**
+  `OCP_TUI_MAX_CONCURRENT` defaults to **2**, so **two `claude` processes already run concurrently**. One
+  hook command writing to one shared sink would **interleave deltas from two different turns into one
+  stream** — request A's client receiving request B's text, the worst failure a proxy can have, and one a
+  single-request test will never surface. The payload carries `session_id` (and `turn_id` / `message_id`),
+  so demux is easy: derive the sink path from `session_id` (`<dir>/<session_id>.jsonl`) and read only your
+  own turn's file. This *also* keeps the design **warm-pool compatible**, because a pre-booted pane's
+  session-id is fixed at boot — one static hook script serves every pane. **Test it with ≥2 concurrent
+  streaming requests carrying distinguishable prompts and assert zero cross-contamination.**
 - **⚠️ `forceSyncExecution: true` in the hook's source — `claude` BLOCKS on the hook.** A slow hook
   adds latency to *every* delta. The hook must write and exit immediately (e.g. write to a FIFO / unix
   socket that OCP reads; never work inline). **Measure the added per-delta latency.**
-- Only `text` blocks fire it (`content.map(c => c.type === "text" ? c.text : "")`) — **thinking blocks
-  are excluded**, which is what OCP wants.
+- **Thinking blocks appear to be excluded — but this is NOT yet stress-tested. Verify before shipping.**
+  The exclusion is inferred from `content.map(c => c.type === "text" ? c.text : "")` — but that snippet is
+  from the **`final:true`** call site, not the incremental one. Four live turns (incl. two at `--effort
+  high`) showed no thinking text in any delta and `concat === T` held — **but each transcript's thinking
+  block was empty (`thinking:""`, 0 chars)**, so the exclusion was never actually stressed. **The failure
+  mode is severe**: if thinking deltas *do* fire on some config (Opus, `xhigh`), `concat(deltas) !== T`
+  **and OCP streams the model's private reasoning to the caller**. The end-of-turn `concat === T` assertion
+  would *detect* that but **cannot prevent** it — SSE deltas cannot be un-sent. **Before shipping, run a
+  turn on a model+effort that produces substantive thinking** (a hard reasoning prompt on Opus / `xhigh`)
+  and confirm both (a) no thinking text in any delta and (b) `concat === T` still holds.
 - OCP already owns the spawn (isolated HOME, its own flags), so injecting `--settings` with a
   `MessageDisplay` hook sits inside the existing architecture.
 - **`ALIGNMENT.md`**: this consumes `claude`'s **own** hook surface as emitted — forwarding, not
