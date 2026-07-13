@@ -2978,12 +2978,18 @@ test("buildTuiHealthBlock: shape + live counters (the additive /health tui block
   const ts = { lastEntrypoint: "cli", entrypointMismatches: 3 };
   const block = buildTuiHealthBlock(
     { enabled: true, entrypointMode: "cli", maxConcurrent: 2 }, ts, sem);
-  // `pool` joined this key set with the warm pane pool. The tui block is ADR-0007-owned (it
-  // did not exist at v3.16.4, so it is outside ADR 0006's grandfather freeze), and the
-  // addition is purely additive: every pre-existing key below still carries a byte-identical
-  // value, and `pool` is null unless the operator opts in via OCP_TUI_POOL_SIZE.
-  assert.deepEqual(Object.keys(block).sort(),
-    ["enabled", "entrypointMismatches", "entrypointMode", "inflight", "lastEntrypoint", "maxConcurrent", "pool", "queued"]);
+  // Shape is ADDITIVE-only: the seven original keys must all still be present (existing
+  // /health consumers are grandfathered, ADR 0006), plus `pool` (warm pane pool) and the
+  // stream* fields (backlog #2). Asserting CONTAINMENT plus an exact added-set — rather than
+  // one flat deepEqual — is what makes "additive" itself the thing under test: a future field
+  // that silently REPLACED an original key would pass a flat equality check that was updated
+  // alongside it, but cannot pass this one.
+  const ORIGINAL_KEYS = ["enabled", "entrypointMismatches", "entrypointMode", "inflight", "lastEntrypoint", "maxConcurrent", "queued"];
+  const keys = Object.keys(block);
+  for (const k of ORIGINAL_KEYS) assert.ok(keys.includes(k), `original /health key must survive: ${k}`);
+  assert.deepEqual(keys.filter((k) => !ORIGINAL_KEYS.includes(k)).sort(),
+    ["pool", "streamDeltas", "streamDivergences", "streamEnabled", "streamTopUps", "streamTurns", "streamZeroDeltaTurns"],
+    "only the documented pool + streaming fields may be added");
   assert.equal(block.pool, null, "no pool passed → null (the default, pool disabled)");
   assert.equal(block.enabled, true);
   assert.equal(block.entrypointMode, "cli");
@@ -3442,9 +3448,349 @@ async function runAsyncTests() {
   });
 }
 
+// ── TUI real streaming: MessageDisplay hook sink (backlog #2) ───────────────
+// Pure-logic coverage for lib/tui/stream.mjs: sink parsing, the concat===T assertion,
+// prefix-stability, the auth-banner holdback, message scoping, and the error paths.
+import { TuiDeltaAssembler, parseDeltaChunk, buildStreamSettings, streamFilePath, HOOK_SCRIPT, prepareStreamHook } from "./lib/tui/stream.mjs";
+
+test("stream: parseDeltaChunk consumes only COMPLETE lines (a torn write stays unread)", () => {
+  const p = (i, d, final = false) => JSON.stringify({ hook_event_name: "MessageDisplay", session_id: "s", message_id: "m", index: i, final, delta: d });
+  // second payload is mid-write — no trailing newline yet
+  const partial = `${p(0, "## A\n\n")}\n${p(1, "body").slice(0, 20)}`;
+  const r1 = parseDeltaChunk(partial, 0);
+  assert.equal(r1.deltas.length, 1, "only the terminated line is consumed");
+  assert.equal(r1.consumed, 1);
+  // now it lands complete
+  const whole = `${p(0, "## A\n\n")}\n${p(1, "body")}\n`;
+  const r2 = parseDeltaChunk(whole, r1.consumed);
+  assert.equal(r2.deltas.length, 1, "the once-partial line is picked up exactly once");
+  assert.equal(r2.deltas[0].delta, "body");
+  assert.equal(r2.consumed, 2);
+  // idempotent: nothing new
+  assert.equal(parseDeltaChunk(whole, r2.consumed).deltas.length, 0);
+});
+
+test("stream: parseDeltaChunk skips blank/garbage lines and foreign hook events", () => {
+  const md = JSON.stringify({ hook_event_name: "MessageDisplay", message_id: "m", index: 0, final: true, delta: "ok" });
+  const other = JSON.stringify({ hook_event_name: "Stop", message_id: "m", delta: "nope" });
+  const text = `\n{not json\n${other}\n${md}\n`;
+  const { deltas } = parseDeltaChunk(text, 0);
+  assert.equal(deltas.length, 1);
+  assert.equal(deltas[0].delta, "ok");
+});
+
+// The live-verified contract (claude 2.1.207): deltas are the raw markdown source and
+// concat(deltas) === extractLatestAssistantText(transcript), byte-exactly.
+const mdFire = (i, delta, { final = false, mid = "m1" } = {}) =>
+  ({ hook_event_name: "MessageDisplay", session_id: "s1", message_id: mid, index: i, final, delta });
+
+test("stream: concat(deltas) === T → exact, no top-up, prefix-stable at every n", () => {
+  const chunks = ["## Mutex\n\n", "A **mutual exclusion lock** prevents concurrent access.\n\n", "```javascript\nconst m = new Mutex();\n```"];
+  const T = chunks.join("");
+  const a = new TuiDeltaAssembler({ holdbackChars: 10 });
+  let acc = "";
+  chunks.forEach((c, i) => {
+    const out = a.push(mdFire(i, c, { final: i === chunks.length - 1 }));
+    if (out) acc += out;
+    assert.ok(T.startsWith(a.full), `prefix-stable at n=${i}`);
+  });
+  const rec = a.finalize(T);
+  assert.equal(rec.ok, true);
+  assert.equal(rec.exact, true, "concat(deltas) === T");
+  assert.equal(acc + rec.tail, T, "client's assembled stream === T");
+  assert.equal(a.deltas, 3);
+});
+
+test("stream: holdback withholds the first chars so the auth-banner gate can still fire", () => {
+  const banner = "Please run /login · API Error: 401 Invalid authentication credentials"; // 69 chars, a real one
+  const a = new TuiDeltaAssembler(); // default holdback 100
+  const out = a.push(mdFire(0, banner, { final: true }));
+  assert.equal(out, null, "a banner-length message must NEVER reach the client");
+  assert.equal(a.emitted, "", "nothing emitted");
+  // and the whole-message detector still classifies it — the gate runs on T, before any flush
+  assert.ok(detectTuiUpstreamError(a.full) !== null, "banner still detected at terminal");
+});
+
+test("stream: holdback releases once past the detector's reach, and only then", () => {
+  const a = new TuiDeltaAssembler({ holdbackChars: 100 });
+  assert.equal(a.push(mdFire(0, "x".repeat(80))), null, "80 chars: still held");
+  const out = a.push(mdFire(1, "y".repeat(40)));
+  assert.equal(out, "x".repeat(80) + "y".repeat(40), "released as one chunk once >100");
+  assert.equal(a.push(mdFire(2, "tail")), "tail", "subsequent deltas stream straight through");
+});
+
+test("stream: a short answer never passes the holdback and is delivered whole at terminal", () => {
+  const T = "The capital of France is Paris.";
+  const a = new TuiDeltaAssembler();
+  assert.equal(a.push(mdFire(0, T, { final: true })), null);
+  const rec = a.finalize(T);
+  assert.equal(rec.ok, true);
+  assert.equal(rec.exact, true);
+  assert.equal(rec.tail, T, "the whole short answer is flushed at terminal (buffered semantics)");
+});
+
+test("stream: a DROPPED delta is a safe prefix → top-up from the transcript, exact=false", () => {
+  const a = new TuiDeltaAssembler({ holdbackChars: 5 });
+  a.push(mdFire(0, "Hello world, this is the first block. "));
+  const T = "Hello world, this is the first block. And the tail the hook never delivered.";
+  const rec = a.finalize(T);
+  assert.equal(rec.ok, true, "prefix → recoverable");
+  assert.equal(rec.exact, false, "flagged: concat(deltas) !== T");
+  assert.equal(rec.tail, "And the tail the hook never delivered.");
+  assert.equal(a.emitted + rec.tail, T, "client still receives exactly T");
+});
+
+test("stream: emitted bytes NOT a prefix of T → divergence, refuse the turn", () => {
+  const a = new TuiDeltaAssembler({ holdbackChars: 5 });
+  a.push(mdFire(0, "Let me go and read that file for you first."));
+  const rec = a.finalize("A completely different final answer.");
+  assert.equal(rec.ok, false, "must NOT serve text the transcript disagrees with");
+  assert.equal(rec.tail, null);
+});
+
+// Message scoping: the transcript keeps only the LAST assistant message, so the assembler
+// must too. Discarding is safe while nothing has been emitted; after that it is a divergence.
+test("stream: new message_id BEFORE any emit → held text discarded, stays exact vs T", () => {
+  const a = new TuiDeltaAssembler({ holdbackChars: 100 });
+  a.push(mdFire(0, "I'll check the file.", { mid: "m1" })); // short pre-tool prose, held back
+  assert.equal(a.emitted, "");
+  const answer = "The file defines a Mutex class with acquire and release, and " + "z".repeat(90);
+  const out = a.push(mdFire(0, answer, { mid: "m2", final: true }));
+  assert.equal(out, answer, "only the FINAL message's text is emitted");
+  const rec = a.finalize(answer); // T = extractLatestAssistantText = the last message only
+  assert.equal(rec.ok, true);
+  assert.equal(rec.exact, true, "scoping to the last message_id keeps concat === T true");
+  assert.equal(a.messages, 2);
+});
+
+test("stream: new message_id AFTER an emit → unretractable, flagged and refused", () => {
+  const a = new TuiDeltaAssembler({ holdbackChars: 10 });
+  a.push(mdFire(0, "Long pre-tool prose that already went out to the client.", { mid: "m1" }));
+  assert.notEqual(a.emitted, "");
+  // Assert what push() RETURNS, not merely that finalize() refuses. This test used to check
+  // only restartedAfterEmit + finalize().ok, which left it passing while F1 was live: the
+  // second message's bytes were still being handed to the client. "The turn is refused" and
+  // "the client got the bytes anyway" were both true at once.
+  const out = a.push(mdFire(0, "The real answer.", { mid: "m2", final: true }));
+  assert.equal(out, null, "after a message boundary follows an emit, NOTHING more may be emitted");
+  assert.equal(a.restartedAfterEmit, true);
+  assert.equal(a.finalize("The real answer.").ok, false, "must refuse: prose already emitted is not in T");
+});
+
+test("F1: an auth banner rendered as a LATER message is never forwarded to the client", () => {
+  // The leak this class exists to prevent, in the shape production actually runs
+  // (OCP_TUI_FULL_TOOLS=1 → multi-message tool-using turns are the norm):
+  //   1. the model narrates past the holdback before a tool call  → released, emitted != ""
+  //   2. credentials expire mid-turn → claude renders the 401 as ordinary assistant TEXT,
+  //      as a NEW message
+  //   3. pre-fix: push() took the `if (this.released)` branch — `released` was never reset at
+  //      a message boundary — and returned the BANNER verbatim, straight to the client.
+  // The holdback protected only the FIRST message of a turn. This asserts it protects the rest.
+  const a = new TuiDeltaAssembler({ holdbackChars: 100 });
+  const narration = "I'll check that file for you and then report back with what I find inside it.";
+  a.push(mdFire(0, narration + narration, { mid: "m1" }));   // > holdback → released
+  assert.notEqual(a.emitted, "", "precondition: the narration really did reach the client");
+
+  const BANNER = "Please run /login · API Error: 401 Invalid authentication credentials";
+  const out = a.push(mdFire(1, BANNER, { mid: "m2", final: true }));
+  assert.equal(out, null, "the auth banner must NOT be forwarded once a later message begins");
+  assert.ok(!a.emitted.includes("401"), "no byte of the banner may have reached the client");
+  assert.equal(a.finalize(BANNER).ok, false, "and the turn is refused, not served");
+});
+
+test("F1: whitespace cannot buy a release — the holdback screens TRIMMED length", () => {
+  // detectTuiUpstreamError() TRIMS before applying its <=100-char rule, so gating release on
+  // the UNTRIMMED pending.length let 101 spaces trim to "" → the detector has nothing to
+  // classify → returns null → release fires having screened nothing, and every subsequent
+  // delta of that message (a banner included) streams unfiltered.
+  const a = new TuiDeltaAssembler({ holdbackChars: 100 });
+  assert.equal(a.push(mdFire(0, " ".repeat(101), { mid: "m1" })), null,
+    "101 chars of whitespace must not clear a 100-char holdback");
+  assert.equal(a.released, false, "…and must not flip the assembler into released state");
+  const BANNER = "Please run /login · API Error: 401 Invalid authentication credentials";
+  assert.equal(a.push(mdFire(1, BANNER, { mid: "m1" })), null, "so the banner stays held back");
+  assert.ok(!a.emitted.includes("401"));
+});
+
+test("F3: a STALE or truncated hook script is overwritten, not trusted because it exists", () => {
+  // ~/.ocp-tui/stream/{md-hook.sh,settings.json} persist across OCP restarts. The old
+  // write-if-missing guard meant a host that booted once under an older version was stuck on
+  // that version's HOOK_SCRIPT forever — no upgrade could reach it. Worse, a non-atomic write
+  // interrupted mid-flight leaves a TRUNCATED md-hook.sh that existsSync() calls fine, and
+  // claude BLOCKS on that hook synchronously on every fire.
+  const dir = mkdtemp2(`${tmpdir2()}/ocp-hook-`);
+  mkdir2(dir, { recursive: true });
+  writeFile2(`${dir}/md-hook.sh`, "#!/bin/sh\n# stale, truncated leftov", { mode: 0o700 });
+  writeFile2(`${dir}/settings.json`, "{ TRUNCATED", { mode: 0o600 });
+
+  const settings = prepareStreamHook(dir);
+
+  assert.equal(readFile2(`${dir}/md-hook.sh`, "utf8"), HOOK_SCRIPT,
+    "the stale script must be replaced with the current one, not left because it existed");
+  assert.deepEqual(JSON.parse(readFile2(settings, "utf8")), buildStreamSettings(`${dir}/md-hook.sh`),
+    "…and so must the stale settings file");
+});
+
+test("stream: hook script is a write-and-exit sh script and tolerates a missing sink var", () => {
+  // forceSyncExecution: claude BLOCKS on this hook, so it must do no work inline.
+  assert.ok(HOOK_SCRIPT.startsWith("#!/bin/sh"));
+  assert.ok(HOOK_SCRIPT.includes('[ -n "$OCP_TUI_STREAM_FILE" ] || exec cat >/dev/null'),
+    "no sink configured => swallow stdin and exit 0; never fail, never block claude");
+  assert.ok(!/curl|node |python/.test(HOOK_SCRIPT), "no interpreter/network work in a blocking hook");
+});
+
+test("stream: settings registers exactly one MessageDisplay command hook (static, no per-request data)", () => {
+  const s = buildStreamSettings("/x/md-hook.sh");
+  assert.deepEqual(Object.keys(s.hooks), ["MessageDisplay"]);
+  assert.equal(s.hooks.MessageDisplay[0].hooks[0].type, "command");
+  assert.equal(s.hooks.MessageDisplay[0].hooks[0].command, "/x/md-hook.sh");
+  // Warm-pool compatibility: the settings file must NOT carry a session/request-specific path.
+  assert.ok(!JSON.stringify(s).includes(".jsonl"), "sink path comes from the pane env, not the settings file");
+});
+
+test("stream: sink path is keyed by session_id (concurrent panes cannot interleave)", () => {
+  // OCP_TUI_MAX_CONCURRENT defaults to 2 — two claude panes DO run at once. A shared sink
+  // would splice request A's deltas into request B's stream.
+  const A = streamFilePath("/d", "aaaa-1111");
+  const B = streamFilePath("/d", "bbbb-2222");
+  assert.notEqual(A, B, "one sink per session-id");
+  assert.ok(A.endsWith("/aaaa-1111.jsonl"));
+});
+
+test("stream: buildTuiCmd — OFF is byte-for-byte the pre-streaming argv; ON adds only env + --settings", () => {
+  const off = buildTuiCmd("/bin/claude", "m", "SID", "/h", "cli");
+  assert.ok(!off.includes("--settings"), "no --settings when streaming is off");
+  assert.ok(!off.includes("OCP_TUI_STREAM_FILE"), "no sink env when streaming is off");
+  const on = buildTuiCmd("/bin/claude", "m", "SID", "/h", "cli", { file: "/d/SID.jsonl", settings: "/d/s.json" });
+  assert.ok(on.includes("OCP_TUI_STREAM_FILE='/d/SID.jsonl'"), "sink delivered via the pane env");
+  assert.ok(on.includes("--settings '/d/s.json'"));
+  // must not regress the MCP wall or the pinned effort (#156)
+  assert.ok(on.includes("--strict-mcp-config") && on.includes("--disallowedTools 'mcp__*'"), "MCP wall intact");
+  assert.ok(on.includes("--effort low"), "OCP_TUI_EFFORT default intact");
+  assert.ok(!on.includes(" -p ") && !on.includes("--bare"), "still a plain interactive TUI spawn");
+});
+
+test("stream: /health block is additive and exposes the divergence counter", () => {
+  const stats = { lastEntrypoint: "cli", entrypointMismatches: 0, streamTurns: 3, streamDeltas: 21, streamTopUps: 1, streamDivergences: 0 };
+  const sem = { inflight: 0, queued: 0 };
+  const b = buildTuiHealthBlock({ enabled: true, entrypointMode: "cli", maxConcurrent: 2, streamEnabled: true }, stats, sem);
+  assert.equal(b.streamEnabled, true);
+  assert.equal(b.streamTurns, 3);
+  assert.equal(b.streamDivergences, 0);
+  // existing fields unchanged (grandfathered /health consumers)
+  assert.equal(b.enabled, true);
+  assert.equal(b.entrypointMode, "cli");
+  assert.equal(b.maxConcurrent, 2);
+  // a pre-streaming tuiStats (no stream* keys) must not produce undefined/NaN
+  const legacy = buildTuiHealthBlock({ enabled: false, entrypointMode: "cli", maxConcurrent: 2 }, { lastEntrypoint: null, entrypointMismatches: 0 }, sem);
+  assert.equal(legacy.streamEnabled, false);
+  assert.equal(legacy.streamDivergences, 0);
+});
+
 // ── Cleanup ──
 // Settle the async-bodied tests registered through the sync `test()` helper BEFORE summarizing —
 // otherwise their pass/fail is not reflected in the counts (see the `pendingAsync` comment above).
+// ─── TUI streaming × warm pool: the INTEGRATION seam (backlog #2 rebased onto #158) ───
+//
+// The hook is installed by bootTuiPane at BOOT, and runTuiTurn reads the sink off the PANE
+// (pane.streamFile). That indirection is the entire reason a POOLED pane streams: the pool
+// pre-boots panes long before a request exists, so anything derived at turn time would leave
+// every pool HIT silently buffered while every MISS streamed — a perf regression with no
+// failing test and no error, visible only as "streaming mysteriously does nothing in prod".
+// These three guard that seam.
+console.log("\nTUI streaming × warm pane pool integration:");
+
+import { bootTuiPane as bootPaneUnderTest, runTuiTurn as runTurnUnderTest } from "./lib/tui/session.mjs";
+import { mkdtempSync as mkdtemp2, writeFileSync as writeFile2, mkdirSync as mkdir2, readFileSync as readFile2 } from "node:fs";
+import { tmpdir as tmpdir2 } from "node:os";
+
+// Fake tmux that records the spawned pane command and always looks ready + pasted.
+function makeTmuxRecorder() {
+  const cmds = [];
+  const tmux = (args) => {
+    cmds.push(args);
+    if (args[0] === "capture-pane") {
+      // input bar present AND the prompt visibly landed → both polls pass immediately
+      return { status: 0, stdout: "[Pasted text #1 +2 lines]\n ? for shortcuts" };
+    }
+    return { status: 0, stdout: "" };
+  };
+  return { tmux, cmds, paneCmd: () => (cmds.find((a) => a[0] === "new-session") || []).slice(-1)[0] || "" };
+}
+
+// A HOME with one already-terminal transcript for `sid`, so readTuiTranscript returns at once.
+function seedTranscript(home, sid, text) {
+  const dir = `${home}/.claude/projects/x`;
+  mkdir2(dir, { recursive: true });
+  writeFile2(`${dir}/${sid}.jsonl`, JSON.stringify({
+    type: "assistant",
+    message: { role: "assistant", content: [{ type: "text", text }], stop_reason: "end_turn" },
+    turn_duration: 1234, cc_entrypoint: "cli",
+  }) + "\n");
+}
+
+test("bootTuiPane with a streamDir installs the hook AT BOOT and hands the sink back on the pane", async () => {
+  const home = mkdtemp2(`${tmpdir2()}/ocp-t-`);
+  const streamDir = mkdtemp2(`${tmpdir2()}/ocp-s-`);
+  const rec = makeTmuxRecorder();
+  const pane = await bootPaneUnderTest({
+    model: "sonnet", claudeBin: "claude", home, realHome: home,
+    cwd: `${home}/wk`, port: 3456, tmux: rec.tmux, streamDir,
+  });
+  // The pane carries its OWN sink, named from its OWN session-id — which is what a pre-booted
+  // pool pane needs, since it is minted with no knowledge of the request it will eventually serve.
+  assert.ok(pane.streamFile, "a streamDir must yield a per-pane sink on the returned pane");
+  assert.ok(pane.streamFile.includes(pane.sessionId), "the sink is keyed by the pane's own session-id");
+  const cmd = rec.paneCmd();
+  assert.ok(cmd.includes("OCP_TUI_STREAM_FILE="), "the pane's env must carry its sink path");
+  assert.ok(cmd.includes(pane.streamFile), "…and it must be THIS pane's sink, not a shared one");
+  assert.ok(cmd.includes("--settings"), "the MessageDisplay hook must be registered at spawn");
+});
+
+test("bootTuiPane WITHOUT a streamDir spawns exactly today's pane — no hook, no --settings", async () => {
+  const home = mkdtemp2(`${tmpdir2()}/ocp-t-`);
+  const rec = makeTmuxRecorder();
+  const pane = await bootPaneUnderTest({
+    model: "sonnet", claudeBin: "claude", home, realHome: home,
+    cwd: `${home}/wk`, port: 3456, tmux: rec.tmux,
+  });
+  assert.equal(pane.streamFile, null, "no streamDir → no sink (streaming is opt-in, default OFF)");
+  const cmd = rec.paneCmd();
+  assert.ok(!cmd.includes("--settings"), "the default spawn must not gain --settings");
+  assert.ok(!cmd.includes("OCP_TUI_STREAM_FILE"), "the default spawn must not gain the hook env");
+});
+
+test("REGRESSION: a WARM (pooled) pane streams — the sink comes off the pane, not the turn", async () => {
+  const home = mkdtemp2(`${tmpdir2()}/ocp-t-`);
+  const streamDir = mkdtemp2(`${tmpdir2()}/ocp-s-`);
+  const rec = makeTmuxRecorder();
+
+  // Pre-boot a pane the way the POOL does (its own session-id + sink, fixed at boot).
+  const warm = await bootPaneUnderTest({
+    model: "sonnet", claudeBin: "claude", home, realHome: home,
+    cwd: `${home}/wk`, port: 3456, tmux: rec.tmux, streamDir,
+  });
+  // Its hook has already fired twice by the time the turn's transcript goes terminal.
+  writeFile2(warm.streamFile,
+    JSON.stringify({ hook_event_name: "MessageDisplay", delta: "Hello " }) + "\n" +
+    JSON.stringify({ hook_event_name: "MessageDisplay", delta: "world" }) + "\n");
+  seedTranscript(home, warm.sessionId, "Hello world");
+
+  const seen = [];
+  const pool = { acquire: () => warm, refill: () => {}, warm: 0 };
+  const out = await runTurnUnderTest({
+    prompt: "say hello", model: "sonnet", claudeBin: "claude", home, realHome: home,
+    cwd: `${home}/wk`, port: 3456, tmux: rec.tmux, pool,
+    onDelta: (d) => seen.push(d.delta),
+    // streamDir is deliberately NOT passed: on a pool HIT runTuiTurn never cold-boots, so if it
+    // recomputed the sink from a turn-time streamDir (the pre-rebase shape) this turn would emit
+    // ZERO deltas and silently serve buffered. Reading pane.streamFile is what makes it stream.
+    streamDir: null,
+  });
+  assert.deepEqual(seen, ["Hello ", "world"], "the pooled pane's deltas must reach the client");
+  assert.equal(out.text, "Hello world", "and the transcript stays authoritative for the final text");
+});
+
 runAsyncTests().then(() => Promise.all(pendingAsync)).then(() => {
   closeDb();
   console.log(`\n=== Results: ${passed} passed, ${failed} failed ===\n`);
