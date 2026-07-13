@@ -56,7 +56,7 @@ Add `CLAUDE_TUI_MODE=true` as an opt-in flag in `server.mjs`.
 3. The serialized prompt (from `messagesToPrompt`) is pasted via `tmux send-keys … "$(cat file)"` + a separate `Enter` key event.
 4. The answer is read from claude's native JSONL transcript at `<HOME>/.claude/projects/<encoded-cwd>/<session-id>.jsonl`, polling until a `turn_duration` system event or the wall-clock cap (`CLAUDE_TUI_WALLCLOCK_MS`, default 120 s).
 5. The string answer is returned to OCP's existing downstream (singleflight → cache write-back → `completionResponse` / `streamStringAsSSE`) — **same contract as `callClaude`**.
-6. Streaming requests are buffered then replayed as chunked SSE (no real token streaming — deliberate; "don't build fragile features").
+6. Streaming requests are buffered then replayed as chunked SSE (no real token streaming — deliberate; "don't build fragile features"). **Superseded for `stream:true` when `OCP_TUI_STREAM=1` — see the 2026-07-13 amendment below. The buffered path remains the default and is unchanged.**
 
 ### Billing-classifier labeling (`OCP_TUI_ENTRYPOINT`, PR-4)
 
@@ -332,6 +332,61 @@ The original "Home strategy" section and PR-C's `prepareTuiHome` comment warned 
 - tmux prefix `ocp-tui-` is registered. Any co-hosted OLP test instance must use `olp-tui-`. Never run two TUI proxies on the same OAuth concurrently — stop one instance during integration testing.
 
 ---
+
+## Amendment (2026-07-13) — real SSE streaming via the `MessageDisplay` hook (`OCP_TUI_STREAM`)
+
+**Supersedes**: Request-flow step 6 above ("no real token streaming — deliberate"), for `stream:true`
+requests when `OCP_TUI_STREAM=1`. The buffered path stays the default and is byte-for-byte unchanged.
+
+**Context.** Step 6 was written when the interactive CLI appeared to expose no byte-faithful
+incremental source. A prereq spike (`docs/plans/2026-07-13-tui-latency/streaming-spike.md`) confirmed
+three obvious sources are dead ends — the transcript JSONL grows one *whole event* at a time (the
+answer lands as a single line ~0.3 s before the terminal marker); `tmux capture-pane` yields a
+*rendered* view whose markdown source is unrecoverable (an H2 and a bold span produce identical ANSI);
+`--debug-file` logs stream *timing*, never stream *content*. Every interface that does emit
+`text_delta` (`--output-format stream-json`) requires `-p`, which moves the request to the **metered**
+`sdk-cli` pool — precisely what TUI-mode exists to avoid.
+
+**Decision.** Consume `claude`'s own **`MessageDisplay`** hook, registered via `--settings` on the
+ordinary interactive spawn (no `-p`, no `--bare`). Each fire delivers the **raw markdown source** of an
+incremental `delta` on the hook's stdin. Verified live (claude 2.1.207, sonnet-4-6): banner stays
+`· Claude Max` and the transcript `entrypoint` stays `cli` (subscription pool); `concat(deltas) === T`
+byte-exactly; `T.startsWith(concat(deltas[0..n]))` at every *n*. This is **forwarding, not inventing**
+— ALIGNMENT.md **Class B**. No `cli.js` citation applies: the TUI spawn is OCP-owned surface (this
+ADR), the hook payload is claude's own published contract, and the SSE wire shapes are the OpenAI
+chat/completions streaming spec adopted by **ADR 0006** (the emitters are literally the `-p` path's).
+
+**The transcript remains authoritative.** It is still the terminal-turn signal, still the source of the
+returned/cached text `T`, and still the input to the honesty gates (auth-banner detection C-1,
+`truncated` C-2). The delta stream is a low-latency **mirror**, never a replacement. At end of turn OCP
+asserts the streamed bytes against `T`: equal → serve; a strict *prefix* of `T` → top up from the
+transcript (client still receives exactly `T`); **not** a prefix → **refuse the turn** (SSE error frame,
+no cache, `tui.streamDivergences++`). Serving text the transcript disagrees with is the failure class
+ALIGNMENT.md exists to prevent, so streaming fails loud rather than degrading quietly.
+
+**Consequences / constraints recorded for future authors:**
+
+- **Opt-in, default OFF.** The buffered path is stable production; streaming does not change it.
+- **Per-`session_id` sink is mandatory, not an optimization.** `OCP_TUI_MAX_CONCURRENT` defaults to
+  **2** — two `claude` panes already run concurrently. A single shared sink would interleave one
+  client's deltas into another's stream. The hook writes to `<dir>/<session_id>.jsonl`, the path
+  delivered through the *pane's own env* (`OCP_TUI_STREAM_FILE`); OCP reads only its own turn's file.
+  Verified with two concurrent streamed turns (ALPHA/BRAVO): zero cross-contamination.
+- **Warm-pool compatible (a separate in-flight PR depends on this).** The hook script and the settings
+  file are **static** — nothing request-specific is baked in at spawn time. The sink path derives from
+  the session-id, which for a pre-booted pane is fixed at boot.
+- **The hook is synchronous** (`forceSyncExecution: true` — `claude` *blocks* on it). The hook script
+  must write and exit; it does one `cat` append and nothing else. Measured: p50 **7.2 ms** per fire,
+  ~50 ms across a whole turn — noise against a 6–10 s turn. Do not add work to it.
+- **Thinking blocks do not fire the hook** — verified on a substantive Opus/`xhigh` reasoning turn (see
+  the PR evidence), not merely inferred from the `final:true` call site. This must be **re-verified** if
+  the hook is ever pointed at a new model/effort tier: a thinking delta reaching a client would be
+  unretractable, and the `concat === T` assertion can only *detect* that after the fact, never prevent
+  it. The first-bytes **holdback** (`OCP_TUI_STREAM_HOLDBACK`, default 100 chars) is the same
+  prevention-not-detection reasoning applied to the auth-banner gate.
+- **Block-level granularity**, scaling with answer length — not token-level. Do not promise otherwise.
+- **It moves the first byte, not the last.** Only a progressively-rendering consumer benefits; it does
+  not move TUI-mode's ~6 s TTFT floor.
 
 ## Provenance
 
