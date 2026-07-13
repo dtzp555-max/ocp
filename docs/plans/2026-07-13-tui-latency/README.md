@@ -119,23 +119,28 @@ the effort level silently changes if the operator ever switches to env-token mod
 - **Risk**: none — banner confirms it stays on `Claude Max` (see `billing-banner.txt`).
 - ⚠️ Do **not** reach for `--bare` to shave boot: see above.
 
-### 2. Real streaming instead of blocking on turn-terminal — ~~the big one (~20 s)~~ → **DEAD**
+### 2. Real streaming instead of blocking on turn-terminal — **ACHIEVABLE → [`streaming-spike.md`](streaming-spike.md)**
 
-> **2026-07-13 update — the prereq spike below was run, and it kills this item.** The transcript
-> grows at *event* granularity (the whole answer lands in one line, ~0.3 s before terminal), and the
-> pane is a **rendered** view whose `capture-pane` text no longer contains the answer's source bytes
-> (`## `, `**`, code fences are gone) — so no pane-derived stream can be reconciled with the
-> authoritative text. A third source (`--debug-file`) does emit mid-turn stream events at
-> `CLAUDE_CODE_DEBUG_LOG_LEVEL=verbose` — but they carry **timing only, no text payload** (0
-> `text_delta` at any verbosity); its only byte-exact text is the end-of-turn `Stop` hook payload.
-> `--output-format stream-json`, the only interface that emits token deltas, requires `-p` — the
-> metered-billing path that TUI mode exists to avoid. **True token streaming is not achievable on the
-> TUI path**; OCP's TUI SSE is replay-only. Note also that streaming would never have shortened a
-> turn — only its first byte — so a consumer that needs the *complete* answer (the JSON-card case
-> that motivated this investigation) gains nothing from it.
+> **2026-07-13 update — the prereq spike was run. The answer is YES, but not from either source this
+> item guessed at.** (a) The transcript grows at *event* granularity (the whole answer lands in one
+> line, ~0.3 s before terminal) — dead. (b) The pane is a **rendered** view whose `capture-pane` text
+> no longer contains the answer's source bytes (`## `, `**`, code fences are gone) — dead, and worse
+> than "lossy": it is *not the model's text*. **But there is a third source neither this backlog nor
+> the first spike considered: `claude` fires a `MessageDisplay` hook carrying incremental,
+> byte-faithful `delta`s of the raw reply.** Verified live on a plain interactive TUI spawn (no `-p`),
+> banner `· Claude Max`: 7 fires spread across generation, `concat(deltas) === T` **byte-exactly**
+> (579 == 579), `T.startsWith(S)` true at every step, `## ` / `**` / ```` ```javascript ```` all
+> present in the deltas. Granularity is block-level (~5–7 chunks/answer), not token-level — plenty for
+> SSE. **Build it.**
 >
-> Full evidence, the value re-assessment, and the maintainer's options: **[`streaming-spike.md`](streaming-spike.md)**.
-> The original framing is preserved below for the record.
+> ⚠️ Two corrections to this item as written: the **"~20 s" is wrong** (inferred from an external
+> report, never measured through OCP — the same-turn decomposition puts OCP's own overhead at **~4 s**,
+> n=1), and **streaming moves the first byte, not the last** — so a consumer needing the *complete*
+> answer (the JSON-card case that motivated this) gains **nothing** from it. Build it for
+> progressively-rendering consumers, not as a throughput win.
+>
+> Full evidence + implementer caveats (the hook is `forceSyncExecution` — claude BLOCKS on it):
+> **[`streaming-spike.md`](streaming-spike.md)**. Original framing preserved below.
 
 Today `runTuiTurn` blocks on the transcript until the turn is *finished*. The pane is already
 rendering tokens incrementally the whole time — this harness proves you can observe first token

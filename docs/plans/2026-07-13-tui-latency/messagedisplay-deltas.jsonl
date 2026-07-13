@@ -1,0 +1,7 @@
+{"hook_event_name": "MessageDisplay", "index": 0, "final": false, "delta": "## Mutex\n\n"}
+{"hook_event_name": "MessageDisplay", "index": 1, "final": false, "delta": "A **mutual exclusion lock** prevents concurrent access to a shared resource, ensuring only one thread runs the critical section at a time.\n\n"}
+{"hook_event_name": "MessageDisplay", "index": 2, "final": false, "delta": "- Acquiring a locked mutex blocks the caller until the current holder releases it.\n"}
+{"hook_event_name": "MessageDisplay", "index": 3, "final": false, "delta": "- Failing to release a mutex causes a deadlock, freezing all waiting threads.\n\n```javascript\nconst { Mutex } = require('async-mutex');\n\nconst mutex = new Mutex();\n"}
+{"hook_event_name": "MessageDisplay", "index": 4, "final": false, "delta": "let counter = 0;\n\nasync function increment() {\n  const release = await mutex.acquire();\n  try {\n"}
+{"hook_event_name": "MessageDisplay", "index": 5, "final": false, "delta": "    counter++; // only one caller here at a time\n  } finally {\n    release();\n  }\n}\n"}
+{"hook_event_name": "MessageDisplay", "index": 6, "final": true, "delta": "```"}
