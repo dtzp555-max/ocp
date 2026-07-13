@@ -2988,7 +2988,7 @@ test("buildTuiHealthBlock: shape + live counters (the additive /health tui block
   const keys = Object.keys(block);
   for (const k of ORIGINAL_KEYS) assert.ok(keys.includes(k), `original /health key must survive: ${k}`);
   assert.deepEqual(keys.filter((k) => !ORIGINAL_KEYS.includes(k)).sort(),
-    ["pool", "streamDeltas", "streamDivergences", "streamEnabled", "streamTopUps", "streamTurns"],
+    ["pool", "streamDeltas", "streamDivergences", "streamEnabled", "streamTopUps", "streamTurns", "streamZeroDeltaTurns"],
     "only the documented pool + streaming fields may be added");
   assert.equal(block.pool, null, "no pool passed → null (the default, pool disabled)");
   assert.equal(block.enabled, true);
@@ -3451,7 +3451,7 @@ async function runAsyncTests() {
 // ── TUI real streaming: MessageDisplay hook sink (backlog #2) ───────────────
 // Pure-logic coverage for lib/tui/stream.mjs: sink parsing, the concat===T assertion,
 // prefix-stability, the auth-banner holdback, message scoping, and the error paths.
-import { TuiDeltaAssembler, parseDeltaChunk, buildStreamSettings, streamFilePath, HOOK_SCRIPT } from "./lib/tui/stream.mjs";
+import { TuiDeltaAssembler, parseDeltaChunk, buildStreamSettings, streamFilePath, HOOK_SCRIPT, prepareStreamHook } from "./lib/tui/stream.mjs";
 
 test("stream: parseDeltaChunk consumes only COMPLETE lines (a torn write stays unread)", () => {
   const p = (i, d, final = false) => JSON.stringify({ hook_event_name: "MessageDisplay", session_id: "s", message_id: "m", index: i, final, delta: d });
@@ -3567,9 +3567,68 @@ test("stream: new message_id AFTER an emit → unretractable, flagged and refuse
   const a = new TuiDeltaAssembler({ holdbackChars: 10 });
   a.push(mdFire(0, "Long pre-tool prose that already went out to the client.", { mid: "m1" }));
   assert.notEqual(a.emitted, "");
-  a.push(mdFire(0, "The real answer.", { mid: "m2", final: true }));
+  // Assert what push() RETURNS, not merely that finalize() refuses. This test used to check
+  // only restartedAfterEmit + finalize().ok, which left it passing while F1 was live: the
+  // second message's bytes were still being handed to the client. "The turn is refused" and
+  // "the client got the bytes anyway" were both true at once.
+  const out = a.push(mdFire(0, "The real answer.", { mid: "m2", final: true }));
+  assert.equal(out, null, "after a message boundary follows an emit, NOTHING more may be emitted");
   assert.equal(a.restartedAfterEmit, true);
   assert.equal(a.finalize("The real answer.").ok, false, "must refuse: prose already emitted is not in T");
+});
+
+test("F1: an auth banner rendered as a LATER message is never forwarded to the client", () => {
+  // The leak this class exists to prevent, in the shape production actually runs
+  // (OCP_TUI_FULL_TOOLS=1 → multi-message tool-using turns are the norm):
+  //   1. the model narrates past the holdback before a tool call  → released, emitted != ""
+  //   2. credentials expire mid-turn → claude renders the 401 as ordinary assistant TEXT,
+  //      as a NEW message
+  //   3. pre-fix: push() took the `if (this.released)` branch — `released` was never reset at
+  //      a message boundary — and returned the BANNER verbatim, straight to the client.
+  // The holdback protected only the FIRST message of a turn. This asserts it protects the rest.
+  const a = new TuiDeltaAssembler({ holdbackChars: 100 });
+  const narration = "I'll check that file for you and then report back with what I find inside it.";
+  a.push(mdFire(0, narration + narration, { mid: "m1" }));   // > holdback → released
+  assert.notEqual(a.emitted, "", "precondition: the narration really did reach the client");
+
+  const BANNER = "Please run /login · API Error: 401 Invalid authentication credentials";
+  const out = a.push(mdFire(1, BANNER, { mid: "m2", final: true }));
+  assert.equal(out, null, "the auth banner must NOT be forwarded once a later message begins");
+  assert.ok(!a.emitted.includes("401"), "no byte of the banner may have reached the client");
+  assert.equal(a.finalize(BANNER).ok, false, "and the turn is refused, not served");
+});
+
+test("F1: whitespace cannot buy a release — the holdback screens TRIMMED length", () => {
+  // detectTuiUpstreamError() TRIMS before applying its <=100-char rule, so gating release on
+  // the UNTRIMMED pending.length let 101 spaces trim to "" → the detector has nothing to
+  // classify → returns null → release fires having screened nothing, and every subsequent
+  // delta of that message (a banner included) streams unfiltered.
+  const a = new TuiDeltaAssembler({ holdbackChars: 100 });
+  assert.equal(a.push(mdFire(0, " ".repeat(101), { mid: "m1" })), null,
+    "101 chars of whitespace must not clear a 100-char holdback");
+  assert.equal(a.released, false, "…and must not flip the assembler into released state");
+  const BANNER = "Please run /login · API Error: 401 Invalid authentication credentials";
+  assert.equal(a.push(mdFire(1, BANNER, { mid: "m1" })), null, "so the banner stays held back");
+  assert.ok(!a.emitted.includes("401"));
+});
+
+test("F3: a STALE or truncated hook script is overwritten, not trusted because it exists", () => {
+  // ~/.ocp-tui/stream/{md-hook.sh,settings.json} persist across OCP restarts. The old
+  // write-if-missing guard meant a host that booted once under an older version was stuck on
+  // that version's HOOK_SCRIPT forever — no upgrade could reach it. Worse, a non-atomic write
+  // interrupted mid-flight leaves a TRUNCATED md-hook.sh that existsSync() calls fine, and
+  // claude BLOCKS on that hook synchronously on every fire.
+  const dir = mkdtemp2(`${tmpdir2()}/ocp-hook-`);
+  mkdir2(dir, { recursive: true });
+  writeFile2(`${dir}/md-hook.sh`, "#!/bin/sh\n# stale, truncated leftov", { mode: 0o700 });
+  writeFile2(`${dir}/settings.json`, "{ TRUNCATED", { mode: 0o600 });
+
+  const settings = prepareStreamHook(dir);
+
+  assert.equal(readFile2(`${dir}/md-hook.sh`, "utf8"), HOOK_SCRIPT,
+    "the stale script must be replaced with the current one, not left because it existed");
+  assert.deepEqual(JSON.parse(readFile2(settings, "utf8")), buildStreamSettings(`${dir}/md-hook.sh`),
+    "…and so must the stale settings file");
 });
 
 test("stream: hook script is a write-and-exit sh script and tolerates a missing sink var", () => {

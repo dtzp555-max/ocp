@@ -353,10 +353,12 @@ const tuiSemaphore = new TuiSemaphore(TUI_MAX_CONCURRENT);
 const tuiStats = {
   lastEntrypoint: null,      // last observed cc_entrypoint from the transcript ("cli" | "sdk-cli" | null)
   entrypointMismatches: 0,   // count of cli-expected-but-got-other turns
-  streamTurns: 0,            // streamed TUI turns attempted
-  streamDeltas: 0,           // MessageDisplay hook fires forwarded
+  streamTurns: 0,            // streamed TUI turns ATTEMPTED (counted before the honesty gates — F6)
+  streamDeltas: 0,           // MessageDisplay hook fires OBSERVED (forwarded + held-back — F6)
   streamTopUps: 0,           // turns where the delta stream != T but was a safe PREFIX of it
   streamDivergences: 0,      // turns REFUSED: emitted bytes were not a prefix of T
+  streamZeroDeltaTurns: 0,   // streamed turns where the hook fired ZERO times (F7 — the hook is
+                             // dead, not just one fire dropped; distinct from streamTopUps)
 };
 
 // ── TUI real streaming (backlog #2) — opt-in; default OFF ────────────────
@@ -373,18 +375,23 @@ const tuiStats = {
 const TUI_STREAM = process.env.OCP_TUI_STREAM === "1";
 const TUI_STREAM_DIR = process.env.OCP_TUI_STREAM_DIR || `${process.env.HOME}/.ocp-tui/stream`;
 // First-bytes holdback — the auth-banner gate's (C-1) survival mechanism under streaming.
-// See TuiDeltaAssembler: nothing is emitted until the accumulation EXCEEDS this, which puts
-// it provably out of the default banner detector's <=100-char reach. Only raise it.
+// See TuiDeltaAssembler: nothing is emitted for a message until its TRIMMED accumulation
+// exceeds this, which puts it out of the default banner detector's <=100-char reach — the
+// FIRST of the two halves of the guarantee (see the assembler's class comment for the second:
+// no further emission at all once a message boundary follows an emit). Only raise it.
 const TUI_STREAM_HOLDBACK = parseInt(process.env.OCP_TUI_STREAM_HOLDBACK || String(DEFAULT_HOLDBACK_CHARS), 10);
 if (TUI_MODE && TUI_STREAM && process.env.CLAUDE_TUI_ERROR_PATTERNS != null && TUI_STREAM_HOLDBACK <= DEFAULT_HOLDBACK_CHARS) {
-  // The holdback is sound for the DEFAULT auth-banner detector (which cannot match a message
-  // longer than 100 chars). An operator-supplied pattern set has no such bound, so a banner
-  // longer than the holdback could reach the client before the terminal gate rejects the turn.
+  // The holdback's FIRST-MESSAGE half (see TuiDeltaAssembler) is sound for the DEFAULT
+  // auth-banner detector (which cannot match a message longer than 100 chars). An
+  // operator-supplied pattern set has no such bound, so a banner longer than the holdback
+  // could reach the client before the terminal gate rejects the turn. (The second half — no
+  // further emission once a message boundary follows an emit — holds regardless of the
+  // detector; this warning is only about the first-message case.)
   console.error(
     `[tui] WARNING: OCP_TUI_STREAM=1 with a custom CLAUDE_TUI_ERROR_PATTERNS and holdback=${TUI_STREAM_HOLDBACK}.\n` +
-    "  The streaming holdback is only provably safe against the DEFAULT banner detector (<=100 chars).\n" +
-    "  Raise OCP_TUI_STREAM_HOLDBACK above your longest custom banner, or the first chars of one\n" +
-    "  could be streamed before the end-of-turn gate refuses the turn."
+    "  The streaming holdback's first-message coverage is sound only against the DEFAULT banner\n" +
+    "  detector (<=100 chars). Raise OCP_TUI_STREAM_HOLDBACK above your longest custom banner, or\n" +
+    "  the first chars of one could be streamed before the end-of-turn gate refuses the turn."
   );
 }
 
@@ -425,8 +432,11 @@ const tuiPool = TUI_POOL_SIZE > 0
         bootMs: POOL_BOOT_MS,   // background pre-boot — no client is blocked, so be patient
         // Warm panes must carry the MessageDisplay hook too, or every pool HIT would
         // silently fall back to buffered while every MISS streamed — the two paths have to
-        // spawn identically. bootTuiPane derives the sink from the pane's own session-id,
-        // which is minted above, so nothing request-specific is baked in at pre-boot time.
+        // spawn identically (F4). Gated on TUI_STREAM, the deployment-wide switch — NOT on any
+        // particular request's stream:true/false, which does not exist yet at pre-boot time.
+        // The runTuiTurn cold-boot call site (callClaudeTui, below) mirrors this exact gate for
+        // the same reason. bootTuiPane derives the sink from the pane's own session-id, which is
+        // minted above, so nothing request-specific is baked in at pre-boot time.
         streamDir: TUI_STREAM ? TUI_STREAM_DIR : null,
       }),
       killPane: (name) => { try { spawnSync(process.env.OCP_TUI_TMUX_BIN || "tmux", ["kill-session", "-t", name]); } catch { /* already gone */ } },
@@ -1432,10 +1442,16 @@ async function callClaudeTui(model, messages, _conversationId, _keyName, res, st
   // spawns no hook, and behaves byte-for-byte as before). It owns the auth-banner holdback
   // and the message scoping; see lib/tui/stream.mjs.
   const assembler = streamCtx ? new TuiDeltaAssembler({ holdbackChars: TUI_STREAM_HOLDBACK }) : null;
+  // F6: counted here — the moment a streamed turn is ATTEMPTED — not after the honesty gates
+  // below. A turn refused by the truncation or auth-banner gate is exactly the turn an operator
+  // most wants visible in streamTurns; counting only turns that reached the gates made
+  // streamDivergences/streamTurns silently exclude its own worst cases from the denominator.
+  if (assembler) tuiStats.streamTurns++;
   const onDelta = assembler
     ? (payload) => {
         const out = assembler.push(payload);
-        tuiStats.streamDeltas++;
+        tuiStats.streamDeltas++; // every hook fire OBSERVED, not just forwarded ones — see the
+                                  // /health field doc in lib/tui/semaphore.mjs (F6)
         if (out) streamCtx.emit(out); // released past the holdback — safe to show the client
       }
     : null;
@@ -1461,7 +1477,16 @@ async function callClaudeTui(model, messages, _conversationId, _keyName, res, st
             { model: cliModel, warmRemaining: tuiPool.warm })
         : null,
       onDelta,
-      streamDir: assembler ? TUI_STREAM_DIR : null,
+      // Gated on TUI_STREAM (the deployment-wide switch), NOT on `assembler` (this REQUEST's
+      // stream:true/false) — F4 fix. The pool's bootPane closure above installs the hook on
+      // every warm pane whenever TUI_STREAM is on, regardless of what any given future request
+      // asks for (a pre-booted pane cannot know that yet); the cold path must match, or a
+      // stream:false request gets --settings on a pool HIT and not on a pool MISS — two
+      // different spawn argvs for the identical request, which this project's alignment/billing
+      // posture cannot tolerate. Whether the hook's OUTPUT is actually consumed for THIS turn is
+      // decided downstream by `onDelta` (null when assembler is null), so a non-streaming
+      // request still never polls or emits — it just spawns identically either way.
+      streamDir: TUI_STREAM ? TUI_STREAM_DIR : null,
       abortSignal: streamCtx ? streamCtx.signal : null,
     });
     // ── Honesty gates (issue #133) ─ run BEFORE recordModelSuccess / cache write-back.
@@ -1504,7 +1529,16 @@ async function callClaudeTui(model, messages, _conversationId, _keyName, res, st
     //               holdback — the transcript keeps only the LAST assistant message, so the
     //               prose we streamed is text T does not contain.)
     if (assembler) {
-      tuiStats.streamTurns++;
+      // F7: a total hook failure (a claude version bump stops honoring --settings, or a
+      // truncated md-hook.sh per F3) produces zero fires for every turn, finalize() still
+      // reports ok:true/exact:false (the transcript alone carries the whole answer), and the
+      // turn succeeds NORMALLY — degrading to buffered with no error, no divergence, nothing
+      // but streamTopUps climbing (which the comment above calls "benign"). That is
+      // indistinguishable from one late fire dropped unless it is counted separately.
+      if (assembler.deltas === 0) {
+        tuiStats.streamZeroDeltaTurns++;
+        logEvent("warn", "tui_stream_zero_deltas", { model: cliModel });
+      }
       const rec = assembler.finalize(text);
       if (!rec.ok) {
         tuiStats.streamDivergences++;
