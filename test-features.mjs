@@ -1795,6 +1795,65 @@ test("buildTuiCmd shq-escapes a token containing shell metacharacters (no inject
   }
 });
 
+// OCP_TUI_EFFORT (TUI latency, docs/plans/2026-07-13-tui-latency): the pane's claude
+// must get an EXPLICIT --effort so its effort never depends on which HOME mode
+// resolveTuiHome() picked (real-home inherits the operator's settings.json effortLevel;
+// env-token scratch inherits claude's built-in default).
+test("buildTuiCmd passes --effort low by default (OCP_TUI_EFFORT unset)", () => {
+  const save = process.env.OCP_TUI_EFFORT;
+  try {
+    delete process.env.OCP_TUI_EFFORT;
+    const cmd = buildTuiCmd("/usr/bin/claude", "m", "sid-eff1", "/home/u", "cli");
+    assert.ok(cmd.includes("--effort low"), "default must pin --effort low");
+  } finally {
+    if (save === undefined) delete process.env.OCP_TUI_EFFORT;
+    else process.env.OCP_TUI_EFFORT = save;
+  }
+});
+
+test("buildTuiCmd honors an explicit OCP_TUI_EFFORT level (case/space-normalized)", () => {
+  const save = process.env.OCP_TUI_EFFORT;
+  try {
+    process.env.OCP_TUI_EFFORT = " XHigh ";
+    const cmd = buildTuiCmd("/usr/bin/claude", "m", "sid-eff2", "/home/u", "cli");
+    assert.ok(cmd.includes("--effort xhigh"), "explicit level must be passed, normalized");
+    assert.ok(!cmd.includes("--effort low"), "default must not also appear");
+  } finally {
+    if (save === undefined) delete process.env.OCP_TUI_EFFORT;
+    else process.env.OCP_TUI_EFFORT = save;
+  }
+});
+
+test("buildTuiCmd OCP_TUI_EFFORT=inherit omits --effort entirely (pre-flag argv)", () => {
+  const save = process.env.OCP_TUI_EFFORT;
+  try {
+    process.env.OCP_TUI_EFFORT = "inherit";
+    const cmd = buildTuiCmd("/usr/bin/claude", "m", "sid-eff3", "/home/u", "cli");
+    assert.ok(!/--effort/.test(cmd), "inherit must not add --effort");
+  } finally {
+    if (save === undefined) delete process.env.OCP_TUI_EFFORT;
+    else process.env.OCP_TUI_EFFORT = save;
+  }
+});
+
+test("buildTuiCmd falls back to --effort low on an invalid OCP_TUI_EFFORT (never reaches argv)", () => {
+  const save = process.env.OCP_TUI_EFFORT;
+  const savedErr = console.error;
+  try {
+    process.env.OCP_TUI_EFFORT = "ludicrous'; rm -rf /;'";
+    let warned = "";
+    console.error = (...a) => { warned = a.join(" "); };
+    const cmd = buildTuiCmd("/usr/bin/claude", "m", "sid-eff4", "/home/u", "cli");
+    assert.ok(cmd.includes("--effort low"), "invalid value must fall back to low");
+    assert.ok(!cmd.includes("ludicrous"), "invalid raw value must NOT reach the shell string");
+    assert.ok(/invalid OCP_TUI_EFFORT/.test(warned), "must log a warning");
+  } finally {
+    console.error = savedErr;
+    if (save === undefined) delete process.env.OCP_TUI_EFFORT;
+    else process.env.OCP_TUI_EFFORT = save;
+  }
+});
+
 test("buildTuiCmd OCP_TUI_FULL_TOOLS=1 grants -p-equivalent tool surface (single-user opt-in)", () => {
   const save = { ...process.env };
   const restore = () => {
