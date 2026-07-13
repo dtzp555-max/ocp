@@ -23,9 +23,30 @@ process.env.HOME = homedir(); // ensure consistent
 let passed = 0;
 let failed = 0;
 
+// Pending promises from tests declared `async` but registered through the SYNC `test()` helper.
+// 44 tests in this file are written that way. Before this, `test()` called fn(), got a promise back,
+// and immediately printed ✓ and incremented `passed` — WITHOUT AWAITING IT. So for every async test:
+//   - ✓ meant "did not throw synchronously", NOT "passed";
+//   - a failed assertion escaped as an unhandled rejection, which crashes the process (CI still goes
+//     red on the non-zero exit) but is NOT counted, so the summary could print "N passed, 0 failed"
+//     and be wrong.
+// The suite's own headline number was therefore not evidence for any async test — including the
+// regression guards in this PR. Collected here and awaited before the summary prints.
+const pendingAsync = [];
+
 function test(name, fn) {
   try {
-    fn();
+    const r = fn();
+    if (r && typeof r.then === "function") {
+      // Async body: settle it before counting. Do NOT print ✓ yet.
+      pendingAsync.push(
+        r.then(
+          () => { passed++; console.log(`  ✓ ${name}`); },
+          (e) => { failed++; console.log(`  ✗ ${name}: ${e.message}`); },
+        ),
+      );
+      return;
+    }
     passed++;
     console.log(`  ✓ ${name}`);
   } catch (e) {
@@ -2208,13 +2229,19 @@ test("a model switch drops the wrong-model panes and retargets the pool (--model
 });
 
 test("a boot that resolves AFTER a drain kills its own pane instead of enlisting it", async () => {
-  const { pool, killed } = makeFakePool({ size: 1 });
+  const { pool, live } = makeFakePool({ size: 1 });
   pool.acquire("sonnet");
   pool.refill();          // boot is in flight...
   pool.drain();           // ...pool drained before it resolves (shutdown / reap sweep)
   await settle();
   assert.equal(pool.warm, 0, "the late pane must NOT be enlisted into a drained pool");
-  assert.equal(killed.length, 1, "it kills itself — no orphan process left behind");
+  // Assert LIVENESS, not the kill-call COUNT. This assertion used to read
+  // `assert.equal(killed.length, 1)` — and it PASSED while the orphan it is named after was
+  // actually present: _cancelBooting kills BY NAME, and at drain time the tmux session does not
+  // exist yet (bootPane runs on a microtask), so that kill is a NO-OP which still increments the
+  // counter. "kill was called once" and "a live session is orphaned" were both true at the same
+  // time. The only honest question is whether the session is dead.
+  assert.equal(live.size, 0, "it kills itself — no orphan process left behind");
 });
 
 test("bootPane failure is counted, never thrown into the request path, and does not wedge refill", async () => {
@@ -2384,6 +2411,32 @@ test("M1b: shutdown drain kills the booting pane SYNCHRONOUSLY — no orphaned c
   assert.equal(live.size, 0,
     "REGRESSION GUARD: the pane must be dead BEFORE any await. A .then()-based cleanup would " +
     "never run before process.exit and would orphan a live authenticated `claude`.");
+});
+
+// M1b, second costume: drain() in the SAME synchronous block as refill(). The tmux session does
+// not exist yet at drain time (bootPane runs on a microtask), so _cancelBooting's kill-by-name is
+// a no-op — and a `.then` that merely `return`s on a stale generation would then let the boot
+// CREATE the session and walk away from it. Not reachable from any current call site, but ADR 0008
+// and the reap-tick comment both contemplate a boot-time pre-warm, which is exactly this shape.
+// NOTE: deliberately NOT `hold: true`. A held boot never settles, so its `.then` never runs and
+// the guard would vacuously pass — the test must let the boot actually SUCCEED, because the bug is
+// precisely that a SUCCESSFUL boot on a cancelled generation walks away from its live session.
+test("M1b': a boot cancelled BEFORE its session existed is still killed when it settles", async () => {
+  const { pool, live } = makeFakePool({ size: 1 });
+  pool.acquire("sonnet");                 // miss → learns the model
+
+  pool.refill();   // mints the identity; bootPane is queued on a microtask — no session YET
+  pool.drain();    // SAME sync block: kill-by-name finds nothing to kill (no-op), bumps the gen
+  assert.equal(live.size, 0, "precondition: the session genuinely did not exist at cancel time");
+
+  await tick();    // NOW the boot microtask runs, CREATES the session, and settles on a stale gen
+  await tick();
+
+  assert.equal(live.size, 0,
+    "REGRESSION GUARD: a stale-generation boot must KILL its pane, not assume _cancelBooting " +
+    "already did. _cancelBooting kills BY NAME, and the tmux session does not exist until the " +
+    "boot microtask runs — so a cancellation landing first is a no-op, and a bare `return` here " +
+    "orphans a live authenticated `claude` that nothing owns.");
 });
 
 test("a stale boot settling after drain+resume must not clear the NEW boot's slot", async () => {
@@ -3390,7 +3443,9 @@ async function runAsyncTests() {
 }
 
 // ── Cleanup ──
-runAsyncTests().then(() => {
+// Settle the async-bodied tests registered through the sync `test()` helper BEFORE summarizing —
+// otherwise their pass/fail is not reflected in the counts (see the `pendingAsync` comment above).
+runAsyncTests().then(() => Promise.all(pendingAsync)).then(() => {
   closeDb();
   console.log(`\n=== Results: ${passed} passed, ${failed} failed ===\n`);
   process.exit(failed > 0 ? 1 : 0);
