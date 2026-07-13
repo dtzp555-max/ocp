@@ -2027,6 +2027,457 @@ test("reaper with includeLegacy=true still spares a sibling instance's port-scop
   assert.ok(!calls.includes("kill-server"), "sibling instance's live session still blocks kill-server");
 });
 
+// ── TUI warm pane pool (docs/plans/2026-07-13-tui-latency #3) ────────────
+import { TuiPanePool, resolvePoolSize, POOL_MAX_SIZE, POOL_MAX_AGE_MS } from "./lib/tui/pool.mjs";
+import { poolPaneName as poolName } from "./lib/tui/session.mjs";
+
+// A pool wired to fakes: no tmux, no claude. bootPane resolves on the microtask queue; use
+// `await settle()` after a refill() to let the SERIALIZED boot chain run to target.
+// `live` models the real tmux server: bootTuiPane creates the session SYNCHRONOUSLY and only
+// THEN waits (up to POOL_BOOT_MS) for the input bar, so the fake boot registers the session
+// immediately and only afterwards resolves. `opts.hold` keeps a boot in that mid-flight window
+// so tests can act on a pane that is live-but-not-yet-warm — the state that hid two bugs.
+function makeFakePool(opts = {}) {
+  const killed = [];
+  const booted = [];
+  const live = new Set();   // "tmux sessions" that currently exist
+  let seq = 0;
+  let clock = 1_000_000;
+  const healthy = new Set();
+  // FIFO gate queue — one entry per in-flight held boot. A single `release` slot would be
+  // OVERWRITTEN by a later boot, so releasing "the first boot" would silently release the
+  // second instead (and mask the stale-settle bug this harness exists to test).
+  const gates = [];
+  const pool = new TuiPanePool({
+    size: opts.size ?? 2,
+    maxAgeMs: opts.maxAgeMs ?? POOL_MAX_AGE_MS,
+    now: () => clock,
+    mintPane: () => {
+      const n = ++seq;
+      return { sessionId: `sid-${n}`, name: `ocp-tui-3456-p${String(n).padStart(8, "0")}` };
+    },
+    bootPane: async (model, { sessionId, name }) => {
+      live.add(name);                                     // session exists NOW
+      booted.push({ name, model });
+      if (opts.hold) {
+        await new Promise((r) => gates.push(r));          // ...stuck waiting for readiness
+      }
+      if (opts.bootThrows) { live.delete(name); throw new Error("boom"); }
+      // A pane whose session was killed while booting can never become ready — exactly what
+      // the real bootTuiPane does (it throws tui_pane_not_ready).
+      if (!live.has(name)) throw new Error("tui_pane_not_ready");
+      healthy.add(name);
+      return { name, sessionId, model, bootedAt: clock };
+    },
+    killPane: (name) => { killed.push(name); healthy.delete(name); live.delete(name); },
+    paneHealthy: (name) => healthy.has(name),
+  });
+  return {
+    pool, killed, booted, healthy, live,
+    releaseBoot: () => { const r = gates.shift(); if (r) r(); },  // release the OLDEST held boot
+    advance: (ms) => { clock += ms; }, at: () => clock,
+  };
+}
+const tick = () => new Promise((r) => setImmediate(r));
+// Refills are SERIALIZED (one boot at a time, re-kicked on success), so settling the pool
+// takes a chain of microtask turns, not one. 40 is far more than POOL_MAX_SIZE needs.
+const settle = async () => { for (let i = 0; i < 40; i++) await tick(); };
+
+console.log("\nTUI warm pane pool (acquire / miss / refill / TTL / reaper exemption):");
+
+test("resolvePoolSize: default/garbage/negative disable the pool; size is clamped to POOL_MAX_SIZE", () => {
+  assert.equal(resolvePoolSize(undefined), 0, "unset => off (byte-for-byte today's cold path)");
+  assert.equal(resolvePoolSize("0"), 0);
+  assert.equal(resolvePoolSize("-3"), 0);
+  assert.equal(resolvePoolSize("banana"), 0, "garbage disables rather than guessing a size");
+  assert.equal(resolvePoolSize("2"), 2);
+  assert.equal(resolvePoolSize("99"), POOL_MAX_SIZE, "clamped — never boot an unbounded number of idle claudes");
+});
+
+test("pool size 0 is inert: acquire always misses and refill never boots", async () => {
+  const { pool, booted } = makeFakePool({ size: 0 });
+  assert.equal(pool.enabled, false);
+  assert.equal(pool.acquire("m1"), null, "disabled pool always MISSES → caller cold-boots");
+  pool.refill();
+  await settle();
+  assert.equal(booted.length, 0, "a disabled pool must never spawn a process");
+});
+
+test("acquire MISSES on an empty pool, and the miss refills for the requested model", async () => {
+  const { pool, booted } = makeFakePool({ size: 2 });
+  assert.equal(pool.acquire("sonnet"), null, "first request is always a MISS (no boot-time pre-warm)");
+  assert.equal(pool.misses, 1);
+  pool.refill();
+  await settle();
+  assert.equal(pool.warm, 2, "refilled to target");
+  assert.deepEqual(booted.map((b) => b.model), ["sonnet", "sonnet"], "warmed for the model that missed");
+});
+
+test("acquire HITS a warm pane, hands it out ONCE, and never returns it (single-use)", async () => {
+  const { pool } = makeFakePool({ size: 2 });
+  pool.acquire("sonnet"); pool.refill(); await settle();
+  assert.equal(pool.warm, 2);
+
+  const a = pool.acquire("sonnet");
+  assert.ok(a && a.name && a.sessionId, "warm pane handed out");
+  assert.equal(pool.hits, 1);
+  assert.equal(pool.warm, 1, "the pane LEAVES the registry when acquired");
+
+  const b = pool.acquire("sonnet");
+  assert.notEqual(b.name, a.name, "a pane is NEVER handed out twice — single-use");
+  assert.notEqual(b.sessionId, a.sessionId, "each pane carries its OWN fresh session-id (transcript.mjs scoping)");
+  assert.equal(pool.warm, 0);
+  assert.equal(pool.acquire("sonnet"), null, "exhausted pool MISSES rather than reusing a pane");
+});
+
+test("refill is bounded: never more than `size` panes, and concurrent refills do not overshoot", async () => {
+  const { pool, booted } = makeFakePool({ size: 2 });
+  pool.acquire("sonnet");
+  pool.refill(); pool.refill(); pool.refill(); // hammer it
+  await settle();
+  assert.equal(pool.warm, 2, "still exactly `size` warm panes");
+  assert.equal(booted.length, 2, "the _booting guard prevented duplicate boots");
+});
+
+// Live finding at size=2: two cold `claude` boots racing an in-flight turn made a refill
+// overrun even the generous pool readiness cap. Boots are therefore SERIALIZED.
+test("refill boots panes ONE AT A TIME (never two claude cold-boots racing each other)", async () => {
+  let concurrent = 0, peak = 0;
+  let seq = 0;
+  const pool = new TuiPanePool({
+    size: 3,
+    mintPane: () => { const n = ++seq; return { sessionId: `s${n}`, name: `p${n}` }; },
+    bootPane: async (model, { sessionId, name }) => {
+      concurrent++; peak = Math.max(peak, concurrent);
+      await new Promise((r) => setImmediate(r)); // simulate boot latency
+      concurrent--;
+      return { name, sessionId, model, bootedAt: Date.now() };
+    },
+    killPane: () => {},
+    paneHealthy: () => true,
+  });
+  pool.acquire("sonnet");
+  pool.refill();
+  await settle();
+  assert.equal(pool.warm, 3, "chain still reaches the target size");
+  assert.equal(peak, 1, "at most ONE boot in flight at any moment");
+});
+
+test("a FAILED boot does not re-kick the chain (backoff — a broken claude must not spin)", async () => {
+  const { pool, booted } = makeFakePool({ size: 3, bootThrows: true });
+  pool.acquire("sonnet");
+  pool.refill();
+  await settle();
+  assert.equal(pool.bootFailures, 1, "counted as a genuine failure (nobody cancelled it)");
+  assert.equal(booted.length, 1, "exactly ONE attempt — a failure stops the chain, it does not respawn forever");
+  assert.equal(pool.warm, 0);
+  assert.equal(pool.booting, 0, "and the booting slot is released, so the next trigger can retry");
+});
+
+test("acquire drops an UNHEALTHY warm pane (kills it) and falls through to a MISS", async () => {
+  const { pool, killed, healthy, booted } = makeFakePool({ size: 1 });
+  pool.acquire("sonnet"); pool.refill(); await settle();
+  const dead = booted[0].name;
+  healthy.delete(dead); // pane died / stopped being input-ready while idle
+
+  assert.equal(pool.acquire("sonnet"), null, "a dead pane must MISS, never hang a turn");
+  assert.ok(killed.includes(dead), "the dead pane is killed, not leaked");
+  assert.equal(pool.misses, 2);
+});
+
+test("acquire drops an EXPIRED warm pane (older than maxAgeMs)", async () => {
+  const { pool, killed, booted, advance } = makeFakePool({ size: 1, maxAgeMs: 60_000 });
+  pool.acquire("sonnet"); pool.refill(); await settle();
+  advance(60_001);
+  assert.equal(pool.acquire("sonnet"), null, "a pane past its TTL is not handed out");
+  assert.ok(killed.includes(booted[0].name), "expired pane is killed");
+});
+
+test("a model switch drops the wrong-model panes and retargets the pool (--model is fixed at spawn)", async () => {
+  const { pool, killed, booted } = makeFakePool({ size: 2 });
+  pool.acquire("sonnet"); pool.refill(); await settle();
+  const sonnetPanes = booted.map((b) => b.name);
+
+  assert.equal(pool.acquire("opus"), null, "different model => MISS (a sonnet pane cannot serve opus)");
+  assert.equal(pool.warm, 0, "sonnet panes dropped");
+  for (const p of sonnetPanes) assert.ok(killed.includes(p), "wrong-model pane killed, not leaked");
+  assert.equal(pool.warmModel, "opus", "pool retargeted to the model actually being asked for");
+
+  pool.refill(); await settle();
+  assert.deepEqual(booted.slice(2).map((b) => b.model), ["opus", "opus"], "refilled for the NEW model");
+});
+
+test("a boot that resolves AFTER a drain kills its own pane instead of enlisting it", async () => {
+  const { pool, killed } = makeFakePool({ size: 1 });
+  pool.acquire("sonnet");
+  pool.refill();          // boot is in flight...
+  pool.drain();           // ...pool drained before it resolves (shutdown / reap sweep)
+  await settle();
+  assert.equal(pool.warm, 0, "the late pane must NOT be enlisted into a drained pool");
+  assert.equal(killed.length, 1, "it kills itself — no orphan process left behind");
+});
+
+test("bootPane failure is counted, never thrown into the request path, and does not wedge refill", async () => {
+  const { pool } = makeFakePool({ size: 1, bootThrows: true });
+  pool.acquire("sonnet");
+  pool.refill();
+  await settle();
+  assert.equal(pool.warm, 0);
+  assert.equal(pool.bootFailures, 1);
+  assert.equal(pool.booting, 0, "the _booting counter is released on failure (else refill wedges forever)");
+  assert.equal(pool.acquire("sonnet"), null, "and the caller just MISSES → cold path");
+});
+
+test("drain kills every warm pane and pauses refills; resume restarts them", async () => {
+  const { pool, killed } = makeFakePool({ size: 2 });
+  pool.acquire("sonnet"); pool.refill(); await settle();
+  assert.equal(pool.warm, 2);
+
+  assert.equal(pool.drain(), 2, "drain reports how many it killed");
+  assert.equal(pool.warm, 0);
+  assert.equal(killed.length, 2, "both panes killed — none outlive the drain");
+
+  pool.refill(); await settle();
+  assert.equal(pool.warm, 0, "refill is a NO-OP while drained (paused)");
+
+  pool.resume(); await settle();
+  assert.equal(pool.warm, 2, "resume refills");
+});
+
+// ── The crux: pool ↔ reaper coexistence (POOL/REAPER INVARIANT, lib/tui/session.mjs) ──
+console.log("\nTUI warm pool ↔ session reaper coexistence:");
+
+test("INVARIANT 1: a LIVE pooled pane is NEVER reaped (it is in the spare set)", () => {
+  const killed = [];
+  const live = "ocp-tui-3456-pdeadbeef";
+  const fakeTmux = (args) => {
+    if (args[0] === "list-sessions") return { status: 0, stdout: `${live}\nocp-tui-3456-aaaa\n` };
+    if (args[0] === "kill-session") { killed.push(args[args.indexOf("-t") + 1]); return { status: 0 }; }
+    return { status: 0, stdout: "" };
+  };
+  const n = reapStaleTuiSessions({ tmux: fakeTmux, port: 3456, spare: new Set([live]) });
+  assert.equal(n, 1, "only the stale turn session was reaped");
+  assert.ok(!killed.includes(live), "the live warm pane must survive the sweep");
+  assert.ok(killed.includes("ocp-tui-3456-aaaa"), "a genuinely stale own session is still reaped");
+});
+
+test("INVARIANT 2: an ORPHANED pooled pane (pool-shaped but NOT in the spare set) IS reaped", () => {
+  const killed = [];
+  // ocp-tui-3456-porphan01 LOOKS pooled but the live registry does not claim it — e.g. left
+  // behind by a previous process generation, whose in-memory registry died with it.
+  const fakeTmux = (args) => {
+    if (args[0] === "list-sessions") return { status: 0, stdout: "ocp-tui-3456-porphan01\nocp-tui-3456-plive0001\n" };
+    if (args[0] === "kill-session") { killed.push(args[args.indexOf("-t") + 1]); return { status: 0 }; }
+    return { status: 0, stdout: "" };
+  };
+  const n = reapStaleTuiSessions({ tmux: fakeTmux, port: 3456, spare: new Set(["ocp-tui-3456-plive0001"]) });
+  assert.equal(n, 1);
+  assert.deepEqual(killed, ["ocp-tui-3456-porphan01"], "exemption is by EXACT NAME, never by name shape");
+});
+
+test("INVARIANT 2b: with NO spare set (the pre-pool call shape) pool-shaped panes are reaped — fail-safe", () => {
+  const killed = [];
+  const fakeTmux = (args) => {
+    if (args[0] === "list-sessions") return { status: 0, stdout: "ocp-tui-3456-pdeadbeef\n" };
+    if (args[0] === "kill-session") { killed.push(args[args.indexOf("-t") + 1]); return { status: 0 }; }
+    return { status: 0, stdout: "" };
+  };
+  const n = reapStaleTuiSessions({ tmux: fakeTmux, port: 3456 });
+  assert.equal(n, 1, "omitting `spare` reaps MORE, never less — forgetting it can't leak panes");
+  assert.deepEqual(killed, ["ocp-tui-3456-pdeadbeef"]);
+});
+
+test("INVARIANT 3: kill-server is SUPPRESSED while a live pooled pane is spared", () => {
+  const calls = [];
+  const live = "ocp-tui-3456-plive0001";
+  const fakeTmux = (args) => {
+    calls.push(args.join(" "));
+    if (args[0] === "list-sessions") return { status: 0, stdout: `${live}\nocp-tui-3456-aaaa\n` };
+    return { status: 0, stdout: "" };
+  };
+  reapStaleTuiSessions({ tmux: fakeTmux, port: 3456, spare: new Set([live]) });
+  assert.ok(!calls.includes("kill-server"), "kill-server would kill the live pane (a child of the tmux server)");
+});
+
+test("INVARIANT 3b: after a DRAIN the spare set is empty, so kill-server fires again (zombie reaping preserved)", async () => {
+  // This is the whole reason server.mjs drains BEFORE the periodic sweep: a permanently-full
+  // pool would otherwise permanently suppress the only mechanism that reaps defunct claudes.
+  const { pool } = makeFakePool({ size: 2 });
+  pool.acquire("sonnet"); pool.refill(); await settle();
+  assert.equal(pool.liveNames().size, 2, "pool is full → the sweep would be suppressed");
+
+  pool.drain();
+  assert.equal(pool.liveNames().size, 0, "drain empties the live registry");
+
+  const calls = [];
+  const fakeTmux = (args) => {
+    calls.push(args.join(" "));
+    if (args[0] === "list-sessions") return { status: 0, stdout: "ocp-tui-3456-aaaa\n" };
+    return { status: 0, stdout: "" };
+  };
+  reapStaleTuiSessions({ tmux: fakeTmux, port: 3456, spare: pool.liveNames() });
+  assert.ok(calls.includes("kill-server"), "kill-server fires post-drain — defunct zombies still get reaped");
+});
+
+// ── MID-BOOT: the state that hid M1a + M1b ────────────────────────────────────────────
+// bootTuiPane creates the tmux session SYNCHRONOUSLY, then waits up to POOL_BOOT_MS (20s)
+// for the input bar. So a pooled session can be LIVE for ~20s before its boot resolves.
+// Every reaper test above uses a pool that is either full or drained — never mid-boot.
+// That gap is exactly why both bugs shipped past the first round of tests.
+
+test("M1a: a reap tick during an IN-FLIGHT BOOT must not orphan-kill the booting pane", async () => {
+  const { pool, live } = makeFakePool({ size: 1, hold: true });
+  pool.acquire("sonnet");
+  pool.refill();
+  await tick();                                    // boot started; session live; NOT yet warm
+  assert.equal(pool.warm, 0, "not warm yet");
+  assert.equal(pool.booting, 1, "a boot is in flight");
+  assert.equal(live.size, 1, "...and its tmux session ALREADY EXISTS");
+
+  const bootingName = [...live][0];
+  assert.ok(pool.liveNames().has(bootingName),
+    "REGRESSION GUARD: the booting pane MUST be nameable, or the sweep cannot spare it " +
+    "(the pool used to track in-flight boots as a COUNT and this was empty)");
+});
+
+test("M1a: the reap tick's drain kills the booting pane, and resume() starts a FRESH boot", async () => {
+  const warns = [];
+  const { pool, live, releaseBoot } = makeFakePool({ size: 1, hold: true });
+  pool._log = (lvl, ev) => { if (lvl === "warn") warns.push(ev); };
+  pool.acquire("sonnet");
+  pool.refill();
+  await tick();
+  const first = [...live][0];
+
+  // The reap tick, as server.mjs runs it: drain -> reap -> resume.
+  const drained = pool.drain();
+  assert.equal(drained, 1, "drain accounts for the booting pane");
+  assert.equal(live.size, 0, "its tmux session is killed — kill-server can now flush zombies");
+  assert.equal(pool.liveNames().size, 0, "nothing left to spare, so kill-server is not suppressed");
+
+  pool.resume();
+  await tick();
+  assert.equal(pool.booting, 1, "resume() started a FRESH boot — the pool is not left empty with nothing scheduled");
+  assert.notEqual([...live][0], first, "and it is a NEW pane, not the killed one");
+
+  // Now let the ORIGINAL (cancelled) boot settle. It rejects with tui_pane_not_ready because
+  // we killed its session — but that is OUR doing, not a fault.
+  releaseBoot();
+  await settle();
+  assert.equal(pool.bootFailures, 0,
+    "a cancelled boot must NOT be counted as a bootFailure — that is the WARN operators alert on");
+  assert.deepEqual(warns, [], "and it must not log tui_pool_boot_failed for a healthy drain");
+  assert.equal(pool.cancelled, 1, "it is counted as a cancellation instead (counted exactly once)");
+});
+
+test("M1b: shutdown drain kills the booting pane SYNCHRONOUSLY — no orphaned claude", async () => {
+  const { pool, live } = makeFakePool({ size: 1, hold: true });
+  pool.acquire("sonnet");
+  pool.refill();
+  await tick();
+  assert.equal(live.size, 1, "a live pooled session exists");
+
+  // gracefulShutdown: drain() then process.exit(0) IN THE SAME TICK (TUI panes are tmux
+  // children, not node children, so activeProcesses is empty and the exit is immediate).
+  // Nothing scheduled on the microtask queue can run. So we assert WITHOUT awaiting.
+  pool.drain();
+  assert.equal(live.size, 0,
+    "REGRESSION GUARD: the pane must be dead BEFORE any await. A .then()-based cleanup would " +
+    "never run before process.exit and would orphan a live authenticated `claude`.");
+});
+
+test("a stale boot settling after drain+resume must not clear the NEW boot's slot", async () => {
+  const { pool, releaseBoot } = makeFakePool({ size: 1, hold: true });
+  pool.acquire("sonnet");
+  pool.refill();
+  await tick();
+  pool.drain();                 // cancels boot #1 (generation bumped)
+  pool.resume();
+  await tick();
+  assert.equal(pool.booting, 1, "boot #2 owns the slot");
+  releaseBoot();                // boot #1 finally settles (rejects)
+  await settle();
+  assert.equal(pool.booting, 1, "boot #2 STILL owns the slot — a stale settle must not free it");
+});
+
+test("a model switch cancels an in-flight boot for the OLD model (kills it, frees the slot)", async () => {
+  const { pool, live, killed } = makeFakePool({ size: 1, hold: true });
+  pool.acquire("sonnet");
+  pool.refill();
+  await tick();
+  const sonnetPane = [...live][0];
+
+  pool.acquire("opus");         // retarget mid-boot
+  assert.ok(killed.includes(sonnetPane), "the old model's booting pane is killed, not left to linger");
+  assert.equal(pool.booting, 0, "and its slot is freed immediately, so the new model can boot now");
+  assert.equal(pool.warmModel, "opus");
+
+  pool.refill();
+  await tick();
+  assert.equal(pool.booting, 1, "a boot for the NEW model starts without waiting out the old one");
+});
+
+test("a pane handed out for a turn leaves the spare set immediately (so its teardown is authoritative)", async () => {
+  const { pool } = makeFakePool({ size: 2 });
+  pool.acquire("sonnet"); pool.refill(); await settle();
+  const taken = pool.acquire("sonnet");
+  assert.ok(!pool.liveNames().has(taken.name),
+    "an acquired pane is the CALLER's — the pool must not also claim it live, or a crashed turn's pane would be spared forever");
+});
+
+test("N1: the pool mints ONE identity — the tmux name's hex is the transcript session-id's hex", async () => {
+  // Without this, `tmux ls` shows a pane whose name has no relation to any transcript file,
+  // so a live pane cannot be correlated to <HOME>/.claude/projects/*/<sessionId>.jsonl.
+  const seen = [];
+  const pool = new TuiPanePool({
+    size: 1,
+    mintPane: () => {
+      const sessionId = "deadbeef-1111-2222-3333-444444444444";
+      return { sessionId, name: poolName(3456, sessionId) };
+    },
+    bootPane: async (model, ident) => {
+      seen.push(ident);
+      return { ...ident, model, bootedAt: Date.now() };
+    },
+    killPane: () => {},
+    paneHealthy: () => true,
+  });
+  pool.acquire("sonnet");
+  pool.refill();
+  await settle();
+  assert.equal(seen.length, 1, "bootPane received the pool-minted identity");
+  assert.equal(seen[0].name, "ocp-tui-3456-pdeadbeef");
+  assert.ok(seen[0].name.endsWith(seen[0].sessionId.slice(0, 8)),
+    "the tmux session name carries the session-id's own hex — `tmux ls` correlates to the transcript");
+  const pane = pool.acquire("sonnet");
+  assert.equal(pane.sessionId, seen[0].sessionId,
+    "and the turn reads the transcript under THAT session-id — one identity end to end");
+});
+
+test("pool pane names are port-scoped (reapable as ours) and never match the legacy shape", () => {
+  const name = poolName(3456, "deadbeef-1111-2222-3333-444444444444");
+  assert.ok(name.startsWith(sessionPrefixForPort(3456)), "pool panes are OURS → reapable when orphaned");
+  assert.equal(name, "ocp-tui-3456-pdeadbeef");
+  assert.ok(!LEGACY_SESSION_NAME_RE.test(name), "must never be mistaken for a legacy bare-prefix session");
+  assert.ok(!poolName(9999, "aaaaaaaa-0000-0000-0000-000000000000").startsWith(sessionPrefixForPort(3456)),
+    "a sibling instance's pool pane is foreign to us");
+});
+
+test("buildTuiHealthBlock reports pool:null when off, and the pool's stats when on", async () => {
+  const st = { lastEntrypoint: "cli", entrypointMismatches: 0 };
+  const sem = { inflight: 0, queued: 0 };
+  const off = buildTuiHealthBlock({ enabled: true, entrypointMode: "cli", maxConcurrent: 2 }, st, sem, null);
+  assert.equal(off.pool, null, "pool disabled → explicit null (stable /health shape)");
+
+  const { pool } = makeFakePool({ size: 2 });
+  pool.acquire("sonnet"); pool.refill(); await settle();
+  const on = buildTuiHealthBlock({ enabled: true, entrypointMode: "cli", maxConcurrent: 2 }, st, sem, pool);
+  assert.equal(on.pool.size, 2);
+  assert.equal(on.pool.warm, 2);
+  assert.equal(on.pool.misses, 1);
+  assert.equal(on.pool.model, "sonnet");
+});
+
 // ── TUI home preparation (scratch vs real) ───────────────────────────────
 import { prepareTuiHome, ensureTuiCwdTrusted } from "./lib/tui/session.mjs";
 import { mkdtempSync as hMkdtemp, mkdirSync as hMkdir, writeFileSync as hWrite, readFileSync as hRead, existsSync as hExists, readlinkSync as hReadlink } from "node:fs";
@@ -2474,8 +2925,13 @@ test("buildTuiHealthBlock: shape + live counters (the additive /health tui block
   const ts = { lastEntrypoint: "cli", entrypointMismatches: 3 };
   const block = buildTuiHealthBlock(
     { enabled: true, entrypointMode: "cli", maxConcurrent: 2 }, ts, sem);
+  // `pool` joined this key set with the warm pane pool. The tui block is ADR-0007-owned (it
+  // did not exist at v3.16.4, so it is outside ADR 0006's grandfather freeze), and the
+  // addition is purely additive: every pre-existing key below still carries a byte-identical
+  // value, and `pool` is null unless the operator opts in via OCP_TUI_POOL_SIZE.
   assert.deepEqual(Object.keys(block).sort(),
-    ["enabled", "entrypointMismatches", "entrypointMode", "inflight", "lastEntrypoint", "maxConcurrent", "queued"]);
+    ["enabled", "entrypointMismatches", "entrypointMode", "inflight", "lastEntrypoint", "maxConcurrent", "pool", "queued"]);
+  assert.equal(block.pool, null, "no pool passed → null (the default, pool disabled)");
   assert.equal(block.enabled, true);
   assert.equal(block.entrypointMode, "cli");
   assert.equal(block.lastEntrypoint, "cli");

@@ -960,6 +960,7 @@ See [Subscription-pool (TUI) mode](#subscription-pool-tui-mode) and ADR 0007 PR-
 | `OCP_TUI_ENTRYPOINT` | `cli` | (TUI-mode) Billing-classifier labeling: `cli` (default) pins `cc_entrypoint=cli` deterministically; `auto` lets claude self-classify via TTY detection; `off` leaves the inherited env untouched. Honest only when the spawn is a genuine interactive PTY — see ADR 0007. |
 | `OCP_TUI_EFFORT` | `low` | (TUI-mode) Effort level passed to the interactive `claude` as an explicit `--effort` flag: `low` (default), `medium`, `high`, `xhigh`, `max`, or `inherit` to omit the flag (the pre-flag behaviour: the pane inherits a HOME-dependent effort — the operator's `~/.claude/settings.json` `effortLevel` in real-home mode, claude's built-in default in env-token scratch mode). Explicit `low` cuts measured TTFT p50 by ~40% and collapses run-to-run variance ~15× versus an inherited `xhigh` (see `docs/plans/2026-07-13-tui-latency/`); proxied requests rarely benefit from extended thinking. Banner-verified to stay on the subscription pool (`· Claude Max`). An invalid value logs a warning and falls back to `low`. |
 | `OCP_TUI_MAX_CONCURRENT` | `2` | (TUI-mode) Max concurrent interactive TUI turns. **Independent** of `CLAUDE_MAX_CONCURRENT` (which bounds the `-p`/stream-json path; TUI never uses it). A TUI turn is heavy (per-request cold-boot of tmux+claude + up to `CLAUDE_TUI_WALLCLOCK_MS` wallclock), so the default is low to keep small hosts (e.g. a Pi 4) alive under a burst. Excess turns **queue** (bounded); a full queue yields a 503. See ADR 0007 PR-B amendment. |
+| `OCP_TUI_POOL_SIZE` | `0` (off) | (TUI-mode) Number of **pre-booted warm `claude` panes** kept ready, so a request does not pay the cold boot. `0` disables the pool entirely — the request path is then exactly the cold-boot path. Max `4`; an unparseable value disables it rather than guessing. **Measured on a Mac mini (Sonnet 4.6, `--effort low`): end-to-end p50 `10.17s` (n=6, pool off) → `6.00s` (n=12 warm hits) — −4.2 s / −41%** — the pool recovers both the ~1.2 s boot *and* ~2.9 s of post-input-bar init that a pane which has been idle a moment has already finished. **Cost:** each warm pane is a *live idle `claude` process* held whether or not a request ever arrives (peak processes ≈ pool size + `OCP_TUI_MAX_CONCURRENT` + 1 booting replacement) — which is why it is opt-in. Panes are **single-use**: one turn, then killed and replaced in the background. The **first request after start (and after any model switch) is always a cold miss** — the pool warms the most recently requested model, since OCP cannot know which model the next caller wants. See `docs/plans/2026-07-13-tui-latency/`. |
 | `OCP_SKIP_AUTH_TEST` | *(unset)* | When `=1`, skip the `claude -p` auth probe during `setup.mjs`. After 2026-06-15 this probe draws from the Agent SDK credit pool; set this to avoid burning a metered credit on re-installs or `ocp update` runs. Auth is validated at the first real request. |
 | `OCP_TUI_FULL_TOOLS` | *(unset)* | (TUI-mode, **single-user only**) When `=1`, grant the interactive session the **same tool surface as the `-p` path** — `--allowedTools` (+ optional `--mcp-config`, read from `CLAUDE_ALLOWED_TOOLS` / `CLAUDE_MCP_CONFIG`) — instead of the default MCP-walled, built-in-tools-only set. Lets a trusted single-operator TUI deployment run a **tool-using / MCP agent** (e.g. an OpenClaw assistant) on the subscription pool. Safe because TUI **refuses to boot under `AUTH_MODE=multi`** (hard exit) — no guest key can ever reach the TUI path, so this gate cannot expose tools to an untrusted caller. (Under `AUTH_MODE=shared` + `OCP_TUI_ALLOW_LAN=1`, anyone holding the single shared key reaches it — that is the existing TUI trust model, unchanged.) Note: `--dangerously-skip-permissions` / `CLAUDE_SKIP_PERMISSIONS` is **not** supported for TUI — claude v2.1.x shows an interactive bypass-acceptance screen in headless tmux that cannot be answered, bricking the pane. Use scratch-home `settings.json` `additionalDirectories` instead. See [Subscription-pool (TUI) mode](#subscription-pool-tui-mode) and ADR 0007. |
 
@@ -1040,6 +1041,7 @@ Then restart OCP. At boot you will see (with the env token set, isolated home au
 - **Stale tmux sessions are reaped.** The pane's `claude` is a child of the tmux server (not OCP), so OCP cannot reap it directly; `claude` zombies can otherwise accumulate as `<defunct>` over a long-running host. OCP reaps them at boot and on a 15-min idle sweep by issuing `tmux kill-server` — but **only when no foreign tmux session remains** (it never disrupts a co-hosted `olp-tui-*` instance). See ADR 0007 PR-C amendment.
 - **Default path unchanged.** Unset `CLAUDE_TUI_MODE` and restart → `callClaude` / `callClaudeStreaming` are used again, byte-for-byte identical to today.
 - **Concurrency is bounded separately.** TUI turns are heavy (per-request cold-boot + long wallclock), so the TUI path has its own limiter — `OCP_TUI_MAX_CONCURRENT` (default `2`), independent of `CLAUDE_MAX_CONCURRENT`. Excess turns queue; a full queue returns a 503. Tune it up only on a host that can run more interactive `claude` sessions at once.
+- **Optional warm pane pool (`OCP_TUI_POOL_SIZE`, default off).** Pre-boots panes so a request skips the cold boot — measured p50 `10.17s` → `6.00s` (−41%). Pooled panes are **single-use** (one turn, then killed and replaced in the background), each carrying its own fresh `--session-id`, so one session still means one exchange and no earlier-turn text can leak into a later answer. They are named `ocp-tui-<port>-p<hex>` and coexist with the reaper by design: the sweep **drains the pool first**, then reaps (so `kill-server` still flushes `<defunct>` zombies), then the pool refills in the background. Drain→reap→resume is synchronous, so no request can land mid-sweep; a request arriving while the pool is still re-booting simply misses it and cold-boots. A live pooled pane is never reaped — **including one that is still booting**, whose tmux session already exists — while an *orphaned* one (left by a previous process generation) still is.
 
 ### ⚠️ Latency: TUI mode has a ~6-second floor, and it is immovable
 
@@ -1082,11 +1084,25 @@ a sub-5-second budget. Full measurements and methodology:
   "entrypointMismatches": 0,   // count of cli-expected-but-got-other turns — ALERT if this climbs
   "inflight": 1,               // TUI turns running right now
   "queued": 0,                 // TUI turns waiting for a concurrency slot
-  "maxConcurrent": 2           // OCP_TUI_MAX_CONCURRENT
+  "maxConcurrent": 2,          // OCP_TUI_MAX_CONCURRENT
+  "pool": {                    // warm pane pool — null when OCP_TUI_POOL_SIZE=0 (the default)
+    "size": 2,                 // target warm panes (OCP_TUI_POOL_SIZE)
+    "warm": 2,                 // panes ready right now — each is a LIVE idle claude process
+    "booting": 0,              // replacement panes currently pre-booting
+    "model": "claude-sonnet-4-6", // the model being warmed (the most recently requested one)
+    "hits": 12,                // requests served by a warm pane
+    "misses": 1,               // requests that fell back to the cold boot (the 1st is always one)
+    "boots": 14,               // panes successfully pre-booted
+    "bootFailures": 0,         // pre-boots that genuinely never reached the input bar — WATCH this
+    "cancelled": 4,            // in-flight boots OCP killed on purpose (drain / model switch) — not faults
+    "dropped": 8               // panes discarded unused (drain sweep / expired / unhealthy)
+  }
 }
 ```
 
 Alert on `entrypointMismatches > 0` (or `lastEntrypoint !== "cli"`): it means a turn drew from the metered Agent SDK pool instead of the subscription. `inflight` / `queued` show how close the TUI path is to its concurrency cap.
+
+With the pool on, `hits` / `misses` is the hit rate (a steady single-model consumer should sit near 100% after the first request), and `warm` is your standing idle-process cost. A climbing `bootFailures` means panes are not reaching their input bar — the pool then degrades safely to the cold path, but latency reverts to the un-pooled numbers. `cancelled` counts boots OCP killed *on purpose* (a drain, a model switch) and is **not** a fault signal — do not alert on it. A steadily climbing `dropped` is likewise normal: the 15-min reap sweep drains and re-boots the pool on every tick so `kill-server` can still flush `<defunct>` zombies.
 
 ### Kill-switch
 

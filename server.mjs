@@ -22,6 +22,8 @@
  *   CLAUDE_MAX_CONCURRENT        — max concurrent claude processes, -p/stream-json path (default: 8)
  *   CLAUDE_MAX_QUEUE             — max requests waiting for a -p slot before HTTP 429 (default: 16)
  *   OCP_TUI_MAX_CONCURRENT       — max concurrent interactive TUI turns, TUI-mode path (default: 2)
+ *   OCP_TUI_POOL_SIZE            — pre-booted warm `claude` panes held for TUI-mode (default: 0 = off;
+ *                                  max 4). Each is a live idle process; cuts ~3-4s per request.
  *   OCP_SPAWN_REAL_HOME          — "1" forces the -p spawn to use the real HOME (disables the
  *                                  latency spawn-home isolation; default: isolated when a token exists)
  *   CLAUDE_BREAKER_THRESHOLD     — failures in window before circuit opens (default: 6)
@@ -32,7 +34,7 @@
  *   CLAUDE_HEARTBEAT_INTERVAL    — SSE heartbeat interval in ms on streaming path (default: 0 = disabled)
  */
 import { createServer } from "node:http";
-import { spawn, execFileSync } from "node:child_process";
+import { spawn, execFileSync, spawnSync } from "node:child_process";
 import { randomUUID, timingSafeEqual } from "node:crypto";
 import { readFileSync, readdirSync, accessSync, existsSync, constants, chmodSync, statSync, mkdirSync, writeFileSync, rmSync } from "node:fs";
 import { fileURLToPath } from "node:url";
@@ -41,9 +43,10 @@ import { homedir } from "node:os";
 import { validateKey, recordUsage, getUsageByKey, getUsageTimeline, getRecentUsage, createKey, listKeys, revokeKey, closeDb, checkQuota, updateKeyQuota, getKeyQuota, findKey, cacheHash, getCachedResponse, setCachedResponse, clearCache, getCacheStats, hasCacheControl, singleflight, getInflightStats } from "./keys.mjs";
 import { DEFAULT_PORT } from "./lib/constants.mjs";
 import { isLoopbackBind } from "./lib/net.mjs";
-import { runTuiTurn, reapStaleTuiSessions, resolveTuiHome } from "./lib/tui/session.mjs";
+import { runTuiTurn, reapStaleTuiSessions, resolveTuiHome, bootTuiPane, tuiPaneHealthy, poolPaneName, POOL_BOOT_MS } from "./lib/tui/session.mjs";
 import { detectTuiUpstreamError } from "./lib/tui/transcript.mjs";
 import { TuiSemaphore, SemaphoreAbortError, recordTuiEntrypoint, buildTuiHealthBlock } from "./lib/tui/semaphore.mjs";
+import { TuiPanePool, resolvePoolSize, POOL_MAX_SIZE } from "./lib/tui/pool.mjs";
 import { createSerialMutex, createTtlCache, isTokenExpiring, orderLabelsLastGoodFirst } from "./lib/spawn-auth.mjs";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -350,6 +353,48 @@ const tuiStats = {
   lastEntrypoint: null,      // last observed cc_entrypoint from the transcript ("cli" | "sdk-cli" | null)
   entrypointMismatches: 0,   // count of cli-expected-but-got-other turns
 };
+
+// ── Warm pane pool (docs/plans/2026-07-13-tui-latency #3) — opt-in; default OFF ─────────
+// OCP_TUI_POOL_SIZE=0 (default) => tuiPool is null => runTuiTurn's cold-boot path is
+// byte-for-byte unchanged. Set it to N (clamped to POOL_MAX_SIZE) to keep N pre-booted
+// `claude` panes warm, each SINGLE-USE (see lib/tui/pool.mjs for why single-use is the
+// load-bearing rule, and lib/tui/session.mjs for the POOL/REAPER INVARIANT).
+//
+// Default-off is deliberate on a stable production path: a warm pane is a LIVE idle
+// `claude` process held whether or not a request ever arrives, so the operator must opt
+// in to that standing cost. Measured saving when on (this host, Sonnet 4.6, --effort low):
+// end-to-end p50 10.17 s (n=6, pool off) -> 6.00 s (n=12 warm hits), i.e. -41%.
+// cli.js does NOT perform this operation (Class B, OCP-owned TUI spawn) — see ADR 0007.
+const TUI_POOL_SIZE = TUI_MODE ? resolvePoolSize(process.env.OCP_TUI_POOL_SIZE) : 0;
+const tuiPool = TUI_POOL_SIZE > 0
+  ? new TuiPanePool({
+      size: TUI_POOL_SIZE,
+      // The POOL mints the pane's identity, not bootTuiPane: the tmux session exists the
+      // instant the boot starts, so the pool must be able to name (hence spare, hence kill)
+      // it before then. Name is derived from the session-id, so `tmux ls` correlates to the
+      // transcript file <HOME>/.claude/projects/*/<sessionId>.jsonl.
+      mintPane: () => {
+        const sessionId = randomUUID();
+        return { sessionId, name: poolPaneName(PORT, sessionId) };
+      },
+      bootPane: (model, ident) => bootTuiPane({
+        model,
+        claudeBin: CLAUDE,
+        home: TUI_HOME,
+        realHome: process.env.HOME,
+        cwd: TUI_CWD,
+        port: PORT,
+        entrypointMode: TUI_ENTRYPOINT,
+        sessionId: ident.sessionId,
+        name: ident.name,
+        requireReady: true,     // a pane that never reached its input bar must not be enlisted
+        bootMs: POOL_BOOT_MS,   // background pre-boot — no client is blocked, so be patient
+      }),
+      killPane: (name) => { try { spawnSync(process.env.OCP_TUI_TMUX_BIN || "tmux", ["kill-session", "-t", name]); } catch { /* already gone */ } },
+      paneHealthy: (name) => tuiPaneHealthy((args) => spawnSync(process.env.OCP_TUI_TMUX_BIN || "tmux", args, { encoding: "utf8" }), name),
+      log: (level, event, data) => logEvent(level, event, data),
+    })
+  : null;
 
 // ── FIX ③ (latency): default-path (-p / stream-json) spawn-home isolation ──────────────
 // PROBLEM (measured, not theoretical): OCP's default spawn inherits the operator's real HOME
@@ -770,19 +815,45 @@ const cacheCleanupInterval = setInterval(() => {
 // mechanism and the 15-min cadence makes the window negligible).
 // Gated on TUI_MODE — zero effect (no kill-server, no list-sessions) when TUI is off.
 // cli.js does NOT perform this operation (Class B, OCP-owned TUI spawn) — see ADR 0007.
+//
+// WARM POOL INTERACTION (the crux — see the POOL/REAPER INVARIANT in lib/tui/session.mjs).
+// A warm pooled pane is one of OUR OWN ocp-tui-<port>-* sessions that is alive and idle BY
+// DESIGN, and this sweep fires precisely when the instance is idle — i.e. exactly when the
+// pool is full. Two things are therefore required, and both are done here:
+//   (a) DRAIN the pool BEFORE the sweep. Zombie reaping is possible ONLY via kill-server,
+//       and a live pooled pane suppresses kill-server (it is a live child of the tmux
+//       server). A permanently-full pool would otherwise permanently disable the very
+//       thing this tick exists to do. Draining costs one pane re-boot per tick (~1.2 s of
+//       background work every 15 min) and is invisible to callers: a request landing in the
+//       drain→refill gap simply MISSES the pool and takes today's cold path.
+//   (b) Pass the pool's live registry as `spare` anyway. After (a) it is empty, so this is
+//       belt-and-braces — it makes it impossible for THIS call site (or a future one) to
+//       kill a live pooled pane even if the drain were ever removed or reordered.
+// RESIDUAL (unchanged in kind from the pre-pool code, and explicitly accepted there): a
+// request arriving in the narrow window between the idle-check and kill-server has its pane
+// torn down and fails cleanly via runTuiTurn's honesty gates. The drain widens that window
+// by the cost of N kill-session calls (single-digit ms), not materially.
 const TUI_REAP_INTERVAL_MS = 15 * 60 * 1000;
 const tuiReapInterval = TUI_MODE ? setInterval(() => {
   if (tuiSemaphore.inflight > 0 || tuiSemaphore.queued > 0) return; // a turn is live — defer
   try {
+    const drained = tuiPool ? tuiPool.drain() : 0;
     // F7 fix: scope to THIS instance's own port; a sibling ocp-tui-<otherPort>-* session
     // (a second OCP instance on the same host) is treated as foreign, same as olp-tui-*.
     // includeLegacy is NOT set here — see reapStaleTuiSessions' comment: the periodic sweep
     // conservatively treats any lingering bare-prefix legacy session as foreign so it can
     // never trigger kill-server on a steady-state tick; only the one-time boot reap below
     // claims legacy-shaped zombies.
-    const n = reapStaleTuiSessions({ port: PORT });
-    if (n) logEvent("info", "tui_reaped_stale_sessions", { count: n, trigger: "periodic" });
+    const n = reapStaleTuiSessions({ port: PORT, spare: tuiPool ? tuiPool.liveNames() : null });
+    if (n || drained) {
+      logEvent("info", "tui_reaped_stale_sessions", { count: n, poolDrained: drained, trigger: "periodic" });
+    }
   } catch (e) { logEvent("error", "tui_periodic_reap_failed", { error: e.message }); }
+  finally {
+    // Refill in the background regardless of how the sweep went — a throw mid-sweep must not
+    // leave the pool permanently paused (it would silently degrade to the cold path forever).
+    if (tuiPool) { try { tuiPool.resume(); } catch { /* best effort */ } }
+  }
 }, TUI_REAP_INTERVAL_MS) : null;
 if (tuiReapInterval && typeof tuiReapInterval.unref === "function") tuiReapInterval.unref();
 
@@ -1323,6 +1394,15 @@ async function callClaudeTui(model, messages, _conversationId, _keyName, res) {
                   // different port never collides with this instance's reap/kill-server logic.
       wallclockMs: TUI_WALLCLOCK_MS,
       entrypointMode: TUI_ENTRYPOINT,
+      // Warm pane pool (null unless OCP_TUI_POOL_SIZE > 0 → today's cold path exactly).
+      // A pooled pane is single-use: runTuiTurn kills it in its finally like any other.
+      pool: tuiPool,
+      // Only observe when the pool is ON — with it off (the default) no new log line is
+      // emitted, so the disabled path stays byte-for-byte today's, logs included.
+      onPane: tuiPool
+        ? ({ warm }) => logEvent("info", warm ? "tui_pool_hit" : "tui_pool_miss",
+            { model: cliModel, warmRemaining: tuiPool.warm })
+        : null,
     });
     // ── Honesty gates (issue #133) ─ run BEFORE recordModelSuccess / cache write-back.
     // A throw here propagates to the catch below (recordModelError + reject), so the
@@ -2558,9 +2638,12 @@ const server = createServer(async (req, res) => {
       // still appears with enabled:false (cheap, harmless) so the shape is stable.
       // entrypointMismatches/lastEntrypoint exist so an operator can poll /health to catch a
       // silent metered-pool drift (the audit's top risk after the 6/15 billing flip).
+      // `pool` is a NEW nested field inside the (already additive) tui block: null when the
+      // warm pool is off (the default), so the disabled shape is unchanged apart from one
+      // explicit null. Lets the operator confirm hit rate + standing process cost.
       tui: buildTuiHealthBlock(
         { enabled: TUI_MODE, entrypointMode: TUI_ENTRYPOINT, maxConcurrent: TUI_MAX_CONCURRENT },
-        tuiStats, tuiSemaphore,
+        tuiStats, tuiSemaphore, tuiPool,
       ),
     });
   }
@@ -2797,6 +2880,27 @@ function gracefulShutdown(signal) {
   if (tuiReapInterval) clearInterval(tuiReapInterval);
   closeDb();
 
+  // 2b. Drain the warm pane pool. A pooled `claude` is a child of the tmux SERVER, not of
+  // this node process, so it is NOT in activeProcesses and step 3 below cannot reach it —
+  // without this explicit drain every warm pane would outlive OCP as an orphan (and the
+  // pool's in-memory registry dies with the process, so nothing would remember it owned them).
+  //
+  // drain() kills the pane that is currently BOOTING too, and it does so SYNCHRONOUSLY. That
+  // is required, not incidental: step 4 below calls process.exit(0) in THIS SAME TICK whenever
+  // activeProcesses is empty — which on a TUI host it always is — so any cleanup a boot
+  // deferred to a .then()/.catch() would simply never run. (That was a real bug: the pool used
+  // to track in-flight boots as a count, could not name the booting session, and orphaned a
+  // live authenticated `claude` on every shutdown that landed mid-boot.)
+  //
+  // Orphans that survive anyway (SIGKILL, power loss) are still caught by the next instance's
+  // boot reap — this makes the graceful path clean, it is not the only safety net.
+  if (tuiPool) {
+    try {
+      const drained = tuiPool.drain();
+      if (drained) logEvent("info", "tui_pool_drained", { count: drained, trigger: "shutdown" });
+    } catch (e) { logEvent("error", "tui_pool_drain_failed", { error: e.message }); }
+  }
+
   // 3. Kill all active child processes
   for (const proc of activeProcesses) {
     try { proc.kill("SIGTERM"); } catch {}
@@ -2866,11 +2970,19 @@ server.listen(PORT, BIND_ADDRESS, () => {
       ? (TUI_HOME === process.env.HOME ? "env-token (real home — unset OCP_TUI_HOME for credential isolation)" : "env-token (credential-isolated home — no credentials.json)")
       : "credentials.json (no CLAUDE_CODE_OAUTH_TOKEN — see Troubleshooting #401)";
     console.log(`  TUI-mode: ON home=${TUI_HOME} cwd=${TUI_CWD} auth=${tuiAuth} wallclock=${TUI_WALLCLOCK_MS}ms maxConcurrent=${TUI_MAX_CONCURRENT}`);
+    console.log(TUI_POOL_SIZE > 0
+      ? `  TUI warm pool: ON size=${TUI_POOL_SIZE} — ${TUI_POOL_SIZE} idle \`claude\` process(es) held warm; first request per model is still a cold MISS`
+      : `  TUI warm pool: OFF (set OCP_TUI_POOL_SIZE=1..${POOL_MAX_SIZE} to pre-boot panes and cut ~3-4s per request)`);
     try {
       // F7 fix: scope to THIS instance's own port (see reapStaleTuiSessions). includeLegacy:
       // true ONLY here — the one-time boot reap is the designated point to claim orphaned
       // bare-prefix ("ocp-tui-<uuid8>") zombie sessions left by a PRE-fix process generation
       // of this same instance (no live post-fix instance ever creates that shape again).
+      // No `spare`: the warm pool is EMPTY at boot (there is no boot-time pre-warm — the pool
+      // learns its model from the first request), so this reap has no live pane to protect and
+      // it is exactly what SHOULD claim any ocp-tui-<port>-p* pool orphans left by a previous
+      // process generation of this instance (POOL/REAPER INVARIANT property 2). If a future
+      // change ever pre-warms at boot, this call MUST start passing tuiPool.liveNames().
       const n = reapStaleTuiSessions({ port: PORT, includeLegacy: true });
       if (n) logEvent("info", "tui_reaped_stale_sessions", { count: n });
     } catch {}
