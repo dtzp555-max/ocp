@@ -3631,6 +3631,107 @@ test("stream: /health block is additive and exposes the divergence counter", () 
 // ── Cleanup ──
 // Settle the async-bodied tests registered through the sync `test()` helper BEFORE summarizing —
 // otherwise their pass/fail is not reflected in the counts (see the `pendingAsync` comment above).
+// ─── TUI streaming × warm pool: the INTEGRATION seam (backlog #2 rebased onto #158) ───
+//
+// The hook is installed by bootTuiPane at BOOT, and runTuiTurn reads the sink off the PANE
+// (pane.streamFile). That indirection is the entire reason a POOLED pane streams: the pool
+// pre-boots panes long before a request exists, so anything derived at turn time would leave
+// every pool HIT silently buffered while every MISS streamed — a perf regression with no
+// failing test and no error, visible only as "streaming mysteriously does nothing in prod".
+// These three guard that seam.
+console.log("\nTUI streaming × warm pane pool integration:");
+
+import { bootTuiPane as bootPaneUnderTest, runTuiTurn as runTurnUnderTest } from "./lib/tui/session.mjs";
+import { mkdtempSync as mkdtemp2, writeFileSync as writeFile2, mkdirSync as mkdir2, readFileSync as readFile2 } from "node:fs";
+import { tmpdir as tmpdir2 } from "node:os";
+
+// Fake tmux that records the spawned pane command and always looks ready + pasted.
+function makeTmuxRecorder() {
+  const cmds = [];
+  const tmux = (args) => {
+    cmds.push(args);
+    if (args[0] === "capture-pane") {
+      // input bar present AND the prompt visibly landed → both polls pass immediately
+      return { status: 0, stdout: "[Pasted text #1 +2 lines]\n ? for shortcuts" };
+    }
+    return { status: 0, stdout: "" };
+  };
+  return { tmux, cmds, paneCmd: () => (cmds.find((a) => a[0] === "new-session") || []).slice(-1)[0] || "" };
+}
+
+// A HOME with one already-terminal transcript for `sid`, so readTuiTranscript returns at once.
+function seedTranscript(home, sid, text) {
+  const dir = `${home}/.claude/projects/x`;
+  mkdir2(dir, { recursive: true });
+  writeFile2(`${dir}/${sid}.jsonl`, JSON.stringify({
+    type: "assistant",
+    message: { role: "assistant", content: [{ type: "text", text }], stop_reason: "end_turn" },
+    turn_duration: 1234, cc_entrypoint: "cli",
+  }) + "\n");
+}
+
+test("bootTuiPane with a streamDir installs the hook AT BOOT and hands the sink back on the pane", async () => {
+  const home = mkdtemp2(`${tmpdir2()}/ocp-t-`);
+  const streamDir = mkdtemp2(`${tmpdir2()}/ocp-s-`);
+  const rec = makeTmuxRecorder();
+  const pane = await bootPaneUnderTest({
+    model: "sonnet", claudeBin: "claude", home, realHome: home,
+    cwd: `${home}/wk`, port: 3456, tmux: rec.tmux, streamDir,
+  });
+  // The pane carries its OWN sink, named from its OWN session-id — which is what a pre-booted
+  // pool pane needs, since it is minted with no knowledge of the request it will eventually serve.
+  assert.ok(pane.streamFile, "a streamDir must yield a per-pane sink on the returned pane");
+  assert.ok(pane.streamFile.includes(pane.sessionId), "the sink is keyed by the pane's own session-id");
+  const cmd = rec.paneCmd();
+  assert.ok(cmd.includes("OCP_TUI_STREAM_FILE="), "the pane's env must carry its sink path");
+  assert.ok(cmd.includes(pane.streamFile), "…and it must be THIS pane's sink, not a shared one");
+  assert.ok(cmd.includes("--settings"), "the MessageDisplay hook must be registered at spawn");
+});
+
+test("bootTuiPane WITHOUT a streamDir spawns exactly today's pane — no hook, no --settings", async () => {
+  const home = mkdtemp2(`${tmpdir2()}/ocp-t-`);
+  const rec = makeTmuxRecorder();
+  const pane = await bootPaneUnderTest({
+    model: "sonnet", claudeBin: "claude", home, realHome: home,
+    cwd: `${home}/wk`, port: 3456, tmux: rec.tmux,
+  });
+  assert.equal(pane.streamFile, null, "no streamDir → no sink (streaming is opt-in, default OFF)");
+  const cmd = rec.paneCmd();
+  assert.ok(!cmd.includes("--settings"), "the default spawn must not gain --settings");
+  assert.ok(!cmd.includes("OCP_TUI_STREAM_FILE"), "the default spawn must not gain the hook env");
+});
+
+test("REGRESSION: a WARM (pooled) pane streams — the sink comes off the pane, not the turn", async () => {
+  const home = mkdtemp2(`${tmpdir2()}/ocp-t-`);
+  const streamDir = mkdtemp2(`${tmpdir2()}/ocp-s-`);
+  const rec = makeTmuxRecorder();
+
+  // Pre-boot a pane the way the POOL does (its own session-id + sink, fixed at boot).
+  const warm = await bootPaneUnderTest({
+    model: "sonnet", claudeBin: "claude", home, realHome: home,
+    cwd: `${home}/wk`, port: 3456, tmux: rec.tmux, streamDir,
+  });
+  // Its hook has already fired twice by the time the turn's transcript goes terminal.
+  writeFile2(warm.streamFile,
+    JSON.stringify({ hook_event_name: "MessageDisplay", delta: "Hello " }) + "\n" +
+    JSON.stringify({ hook_event_name: "MessageDisplay", delta: "world" }) + "\n");
+  seedTranscript(home, warm.sessionId, "Hello world");
+
+  const seen = [];
+  const pool = { acquire: () => warm, refill: () => {}, warm: 0 };
+  const out = await runTurnUnderTest({
+    prompt: "say hello", model: "sonnet", claudeBin: "claude", home, realHome: home,
+    cwd: `${home}/wk`, port: 3456, tmux: rec.tmux, pool,
+    onDelta: (d) => seen.push(d.delta),
+    // streamDir is deliberately NOT passed: on a pool HIT runTuiTurn never cold-boots, so if it
+    // recomputed the sink from a turn-time streamDir (the pre-rebase shape) this turn would emit
+    // ZERO deltas and silently serve buffered. Reading pane.streamFile is what makes it stream.
+    streamDir: null,
+  });
+  assert.deepEqual(seen, ["Hello ", "world"], "the pooled pane's deltas must reach the client");
+  assert.equal(out.text, "Hello world", "and the transcript stays authoritative for the final text");
+});
+
 runAsyncTests().then(() => Promise.all(pendingAsync)).then(() => {
   closeDb();
   console.log(`\n=== Results: ${passed} passed, ${failed} failed ===\n`);
