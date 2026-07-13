@@ -1,0 +1,10 @@
+{"i":1,"model":"claude-sonnet-5","prompt_chars":7451,"boot_ms":918,"ttft_ms":9701,"complete_ms":10386}
+{"i":2,"model":"claude-sonnet-5","prompt_chars":7451,"boot_ms":1031,"ttft_ms":12856,"complete_ms":13499}
+{"i":3,"model":"claude-sonnet-5","prompt_chars":7451,"boot_ms":1019,"ttft_ms":9619,"complete_ms":10796}
+{"i":4,"model":"claude-sonnet-5","prompt_chars":7451,"boot_ms":1301,"ttft_ms":13067,"complete_ms":14610}
+{"i":5,"model":"claude-sonnet-5","prompt_chars":7451,"boot_ms":1018,"ttft_ms":7851,"complete_ms":10003}
+{"i":1,"tag":"effort-low","model":"claude-sonnet-5","extra_args":"--effort low","prompt_chars":7451,"boot_ms":1077,"ttft_ms":6172,"complete_ms":9929}
+{"i":2,"tag":"effort-low","model":"claude-sonnet-5","extra_args":"--effort low","prompt_chars":7451,"boot_ms":1026,"ttft_ms":6160,"complete_ms":9996}
+{"i":3,"tag":"effort-low","model":"claude-sonnet-5","extra_args":"--effort low","prompt_chars":7451,"boot_ms":1010,"ttft_ms":6437,"complete_ms":9977}
+{"i":4,"tag":"effort-low","model":"claude-sonnet-5","extra_args":"--effort low","prompt_chars":7451,"boot_ms":1033,"ttft_ms":5872,"complete_ms":9944}
+{"i":5,"tag":"effort-low","model":"claude-sonnet-5","extra_args":"--effort low","prompt_chars":7451,"boot_ms":1154,"ttft_ms":6387,"complete_ms":9993}
