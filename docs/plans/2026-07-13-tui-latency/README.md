@@ -52,9 +52,10 @@ real TTFT and OCP's reported 30–32 s is exactly that.
 > **⚠️ 2026-07-13 correction — this decomposition attributes the ~20 s to the wrong thing.** It was
 > inferred from the external 30–32 s report, never measured *through* OCP. It has since been measured
 > through a real OCP instance (TUI mode, `claude-sonnet-4-6`, the same ~1850-token prompt, n=5):
-> **median 11.30 s** before [#156](https://github.com/dtzp555-max/ocp/pull/156), **9.55 s** after —
-> against a native `turn_duration` of ~7.3 s for a comparable turn. So **OCP's own overhead above the
-> CLI is ~2–4 s, not ~20 s.** The rest of any larger number is the model *generating a long answer*,
+> **median 11.30 s** before [#156](https://github.com/dtzp555-max/ocp/pull/156), **9.55 s** after.
+> Same-turn decomposition (baseline row `i=5`): **11.563 s** wall through OCP vs `turn_duration:
+> 7.319 s` of CLI-internal time on that same turn → **OCP's own overhead ≈ 4.2 s** (n=1), **not
+> ~20 s**. The rest of any larger number is the model *generating a long answer*,
 > which the blocking wait does not cause and streaming would not shorten — it would only move the
 > first byte earlier. The 30–32 s figure therefore reflects a much longer output (and/or the
 > then-inherited `xhigh` effort), not 20 s of OCP dead time. See
@@ -124,7 +125,9 @@ the effort level silently changes if the operator ever switches to env-token mod
 > grows at *event* granularity (the whole answer lands in one line, ~0.3 s before terminal), and the
 > pane is a **rendered** view whose `capture-pane` text no longer contains the answer's source bytes
 > (`## `, `**`, code fences are gone) — so no pane-derived stream can be reconciled with the
-> authoritative text. A third source (`--debug-file`) is byte-exact but also end-of-turn.
+> authoritative text. A third source (`--debug-file`) does emit mid-turn stream events at
+> `CLAUDE_CODE_DEBUG_LOG_LEVEL=verbose` — but they carry **timing only, no text payload** (0
+> `text_delta` at any verbosity); its only byte-exact text is the end-of-turn `Stop` hook payload.
 > `--output-format stream-json`, the only interface that emits token deltas, requires `-p` — the
 > metered-billing path that TUI mode exists to avoid. **True token streaming is not achievable on the
 > TUI path**; OCP's TUI SSE is replay-only. Note also that streaming would never have shortened a
@@ -159,13 +162,17 @@ the background) amortizes it to zero for any workload below the pool refill rate
   #148 — pooled panes must not look like zombies to the sweep.
 - Lower priority than #1 and #2: it is the smallest slice.
 
-### 4. Trim the prefill — ~~probably not worth it~~ **MEASURED: no effect. Do not adopt.**
+### 4. Trim the prefill — ~~probably not worth it~~ **MEASURED: no detectable benefit. Do not adopt.**
 
 > **2026-07-13 update.** `--exclude-dynamic-system-prompt-sections` was measured with the same
 > harness (`floor.sh`, n=5, Sonnet 5, on top of `--effort low`): **TTFT median 6.39 s**
-> (5.87–10.54 s) vs **6.17 s** (5.87–6.44 s) for `--effort low` alone — i.e. **zero marginal
-> benefit**, within noise and with one worse outlier. The banner stayed on `· Claude Max`
-> (no billing-pool drop), but there is no win to bank. The ~6 s floor stands as stated below.
+> (5.87–10.54 s) vs **6.17 s** (5.87–6.44 s) for `--effort low` alone — i.e. **0.22 s worse, inside
+> the noise band**, with one worse outlier; dropping that outlier does not change the verdict. n=5
+> cannot prove "zero", only "no benefit detectable above noise" — but there is also a **mechanistic**
+> reason not to expect one: `--help` says the flag *"Improves cross-user prompt-cache **reuse**"*, and
+> **OCP is single-user** — there is no cross-user cache to share, so the flag has nothing to buy here.
+> The banner stayed on `· Claude Max` (no billing-pool drop), but there is no win to bank. The ~6 s
+> floor stands as stated below. Raw rows: [`prefill-spike-measurements.jsonl`](prefill-spike-measurements.jsonl).
 
 
 After #1–#3, the floor is **~6 s**, and it does not go lower. `claude` always injects the full

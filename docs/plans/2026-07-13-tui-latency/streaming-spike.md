@@ -66,14 +66,28 @@ PANE (the same turn):
   '  - Tracks available "permits" and decrements the count when a thread acquires access, …'
 ```
 
-Token-presence check over the whole final frame:
+Token-presence check **over the pane's answer region** (the prompt echo above it is excluded — it
+does contain a literal `**`, because the prompt itself asked for bold):
 
-| token in the answer | in transcript `T` | in pane |
+| token in the answer | in transcript `T` | in pane's answer region |
 |---|---|---|
 | `## ` (ATX heading) | yes | **no** — rendered as `⏺` |
 | `**` (bold markers) | yes | **no** — rendered as ANSI bold, then stripped by `-p` |
 | ` ```javascript ` (fence + language) | yes | **no** — fence gone, language tag gone |
 | `- ` (list item) | yes | yes |
+
+**`capture-pane -e` (keep the ANSI) does not rescue it — the inverse is provably non-unique.**
+Minimal case, transcript `T` = ``"## Alpha\n\n**bravo**\n\n```javascript\nlet x=1;\n```"``:
+
+```
+⏺\e[39m \e[1mAlpha\n\n\e[0m  \e[1mbravo\n\n\e[0m  \e[34mlet\e[39m x=\e[32m1\e[39m;
+```
+
+`## Alpha` → **SGR 1 (bold)**. `**bravo**` → **SGR 1 (bold)**. *Identical ANSI* — an H2 and a bold
+span are indistinguishable, never mind `**` vs `__`. The fence and its `javascript` tag are consumed
+by the syntax highlighter into colours (`\e[34mlet`); recovering the tag would mean inverting a
+highlighter, and `let x=1;` is valid in several languages. Marker check on the `-e` capture: `## `,
+`**`, ```` ``` ````, ```` ```javascript ```` — **all absent**.
 
 Consequence for any design built on pane diffing: with `S` = text streamed from the pane and `T` =
 the transcript's authoritative text, the prefix invariant **`T.startsWith(S)` is false** — both raw
@@ -91,31 +105,66 @@ A proxy that streams pane text is streaming **something the model did not say**.
 a quality trade-off, it is a correctness violation (`ALIGNMENT.md` Core Principle: forward what
 `cli.js` emits; do not invent).
 
-### (c) `--debug-file` — **dead: byte-exact, but only at end-of-turn**
+### (c) `--debug-file` — **dead: it logs stream *timing*, never stream *content***
 
-Not considered in the original backlog; checked for completeness because it is the only other
-observable claude writes.
+Not considered in the original backlog; checked because it is the only other observable claude writes.
 
-`claude --debug-file <path>` does contain the **byte-exact raw markdown** — but only inside
-**end-of-turn hook payloads**:
+**There ARE mid-turn stream events in the debug log** — this is the one place a casual check
+misleads, so it is worth stating precisely. The default log level is `debug`, which **suppresses
+every `verbose` site**. Raise it and per-chunk lines appear, spread across the generation:
 
+```bash
+CLAUDE_CODE_DEBUG_LOG_LEVEL=verbose claude --debug-file /tmp/d.log …
 ```
-[DEBUG] Hooks: Parsed initial response: {… "hook_event_name":"Stop", …
-        "last_assistant_message":"## Title\n\n**alpha bravo charlie**" …}
+```
+05:51:11.088 [VERBOSE] [shoji-engine] yield stream_event/-     ← 16 of these, mid-turn,
+05:51:11.537 [VERBOSE] [shoji-engine] yield stream_event/-        spread over ~3.9 s of generation
+…
+05:51:14.910 [VERBOSE] [shoji-engine] yield assistant/-
+05:51:15.192 [DEBUG]   [shoji-engine] turn 1 end (usage in=575 out=255 api=6736ms stop=end_turn resultLen=857)
 ```
 
-Note `## ` and `**` survive here — this is the real text. But it arrives with the `Stop` hook, i.e.
-the same end-of-turn granularity as the transcript. Grepping the log for streaming events
-(`content_block_delta` / `text_delta`) finds **zero**. The log is also ~2.7 MB per turn, which rules
-it out as a production mechanism regardless.
+**But they carry no payload.** The format is `yield <type>/<subtype>` — a bare presence marker. At
+verbose level, with every category filter, the log contains:
+
+| event | count |
+|---|---|
+| `content_block_delta` | **0** |
+| `text_delta` | **0** |
+| `content_block_start` / `message_start` | **0** |
+
+The only byte-exact text in the log is the **end-of-turn `Stop` hook payload**
+(`"last_assistant_message":"## Title\n\n**alpha bravo charlie**"` — note `## ` and `**` survive, so
+this *is* the real text), which is the same granularity as the transcript. So the debug log gives you
+**when** tokens arrive, never **what** they are. It is also ~2.7 MB per turn.
+
+*(An incremental "a token arrived" signal with no token in it cannot feed an SSE `delta.content`.)*
+
+### Everything else that could plausibly carry tokens — also checked, also dead
+
+An adversarial second pass (independent reviewer, tasked with *refuting* this document) enumerated
+the rest of the search space rather than sampling it. Nothing survived:
+
+| candidate | how it dies |
+|---|---|
+| **Hooks** — is there a per-message/per-chunk hook? | The hook registry was enumerated from the shipped binary: `PreToolUse, PostToolUse, PostToolUseFailure, PostToolBatch, Notification, UserPromptSubmit, UserPromptExpansion, SessionStart, SessionEnd, Stop, StopFailure, SubagentStart, SubagentStop, PreCompact, PostCompact, PermissionRequest, PermissionDenied, Setup, TeammateIdle, TaskCreated, TaskCompleted`. **No streaming/per-chunk hook exists.** |
+| `CLAUDE_CODE_INCLUDE_PARTIAL_MESSAGES=1` (undocumented env twin of the flag; bypasses flag validation) | Ran live in a TUI turn: transcript still had **1** assistant event, **0** partials. Interactive mode has no stream-json *sink* for it to write to. Banner stayed `· Claude Max`. |
+| `sessionMirror` (undocumented) | Gated on `outputFormat === "stream-json"` → the `-p` family. |
+| `--sdk-url` (hidden) | Forces stream-json + non-interactive → `sdk-cli` (metered pool). |
+| `--input-format stream-json` | Live: `Error: --input-format=stream-json requires output-format=stream-json` → which requires `--print`. And it is an *input* format regardless. |
+| `~/.claude/sessions/<pid>.json` (modified mid-turn) | Registry metadata only: `{pid, sessionId, cwd, status, version, entrypoint:"cli", kind:"interactive"}`. **No assistant text.** (Its `entrypoint:"cli"` is incidental independent confirmation that the TUI path stays on the subscription pool.) |
+| `~/.claude/history.jsonl` (modified mid-turn) | Keys: `[display, pastedContents, timestamp, project, sessionId]` — **user prompts only**; the answer text is absent. |
+| `~/.claude/settings.json` | No key for partial/streaming output. |
+| **Ask the model to emit plain text** (so the pane render is faithful) | Would require OCP to **mutate the caller's prompt** — a correctness violation for a proxy (`ALIGNMENT.md`: forward what `cli.js` emits; do not invent), it would corrupt callers who legitimately want markdown or JSON, and it *still* would not be byte-faithful (the TUI keeps wrapping and 2-space indenting). Rejected. |
 
 ---
 
 ## What this means
 
 **True token streaming is not achievable on the TUI path**, at any effort, with any flag combination
-available in claude 2.1.207. The three observables are: a rendered terminal (lossy beyond repair), a
-transcript written at event granularity (end-of-turn), and a debug log written at end-of-turn.
+available in claude 2.1.207. The three observables are: a rendered terminal (lossy beyond
+repair), a transcript written at event granularity (the answer lands whole, end-of-turn), and a debug
+log that reports *when* tokens arrive but never *what* they are.
 `--output-format stream-json` — the one interface that *does* emit `text_delta` events — works
 **only with `--print`/`-p`**, and the `-p` path is precisely what TUI mode exists to avoid (it is
 classified `cc_entrypoint=sdk-cli` → the metered credit pool, not the subscription pool). The
@@ -135,15 +184,28 @@ Worth stating plainly, because it changes the value calculus:
   gains **nothing at all** from streaming. Only a progressively-rendering consumer (a chat UI) gains.
 - The backlog's "~20 s" for item #2 was inferred from an external report of 30–32 s, not measured
   through OCP. Measured through a real OCP instance (TUI mode, `claude-sonnet-4-6`, ~1850-token
-  prompt, n=5): **median 11.30 s** before PR #156, **9.55 s** after — against a native
-  `turn_duration` of ~7.3 s for a comparable turn. So OCP's own overhead over the CLI is roughly
-  **2–4 s**, not 20 s; the rest of any large number is the model generating a long answer, which
-  streaming hides but does not shorten. (A 30 s turn is a 30 s turn either way — the last token
-  lands at the same wall-clock moment.)
+  prompt, n=5): **median 11.30 s** before PR #156, **9.55 s** after.
+
+  **Same-turn decomposition** (the honest form — one turn, both numbers): baseline row `i=5` took
+  **11.563 s** end-to-end through OCP, and that same turn's transcript records
+  `turn_duration: 7.319 s` of CLI-internal time. → **OCP's own overhead ≈ 4.2 s** (n=1, baseline
+  `effort=high` config). Not 20 s.
+
+  Two caveats, stated so the number is not over-trusted: this is **n=1**, and `turn_duration` is the
+  *CLI's* internal duration on an **OCP-driven** turn (it is not a "native, non-OCP" baseline — the
+  same interactive `claude` is doing the work either way). Do **not** subtract this 7.3 s
+  (`effort=high`) from the 9.55 s `effort=low` median: a low-effort turn generates faster, so its own
+  `turn_duration` would be lower, and mixing the two would *understate* the overhead. There is no
+  `turn_duration` sample for the `effort=low` config.
+
+  Either way the direction is settled: OCP's overhead is **single-digit seconds**, not the ~20 s the
+  plan assumed. The rest of any large number is the model generating a long answer — which streaming
+  hides but does not shorten. (A 30 s turn is a 30 s turn either way; the last token lands at the same
+  wall-clock moment.)
 
 The honest remaining levers on the TUI path are therefore: the **~6 s TTFT floor** (immovable — see
 [`README.md`](README.md)), the **generation time** (a function of output length — not OCP's to
-optimize), and OCP's **own 2–4 s of overhead** (per-request cold boot ≈1 s → backlog #3 warm pool;
+optimize), and OCP's **own ~4 s of overhead** (n=1 same-turn decomposition; per-request cold boot ≈1 s → backlog #3 warm pool;
 plus readiness/paste/transcript poll granularity).
 
 ---
@@ -174,10 +236,13 @@ plus readiness/paste/transcript poll granularity).
 #     answer region against extractLatestAssistantText() over the session's transcript JSONL.
 #     Expect: T.startsWith(paneText) === false, '## ' and '**' and '```' absent from the pane.
 
-# (c) debug log
-claude --model claude-sonnet-5 --session-id "$(uuidgen)" --effort low --debug-file /tmp/d.log
-grep -cE 'content_block_delta|text_delta' /tmp/d.log     # → 0
-grep -o 'last_assistant_message":"[^"]*' /tmp/d.log      # → byte-exact text, at Stop-hook time
+# (c) debug log — NOTE: default level is `debug`, which SUPPRESSES the verbose stream sites.
+#     Raise it, or you will wrongly conclude there are no mid-turn events at all.
+CLAUDE_CODE_DEBUG_LOG_LEVEL=verbose \
+  claude --model claude-sonnet-5 --session-id "$(uuidgen)" --effort low --debug-file /tmp/d.log
+grep -c 'yield stream_event'          /tmp/d.log   # → 16 (mid-turn — timing exists!)
+grep -cE 'content_block_delta|text_delta' /tmp/d.log   # → 0  (…but no text payload, ever)
+grep -o 'last_assistant_message":"[^"]*' /tmp/d.log    # → byte-exact text, only at Stop-hook time
 ```
 
 Banner check (mandatory for every spawn-flag change, per [`billing-banner.txt`](billing-banner.txt)):
