@@ -1,7 +1,9 @@
 # TUI-mode latency: measured floor, and the four things worth fixing
 
 **Date**: 2026-07-13
-**Status**: findings + backlog (no code changed yet)
+**Status**: findings + backlog. **Superseded in part** — see the dated update boxes below.
+Item #1 shipped ([#156](https://github.com/dtzp555-max/ocp/pull/156)); item #2 is **dead**
+([`streaming-spike.md`](streaming-spike.md)); item #4 measured, **no effect**; item #3 stands.
 **Measured on**: Mac mini / macOS 26.5.2 / Claude Code **v2.1.207** / Sonnet 5 / Claude Max subscription / **real-home mode** (no `CLAUDE_CODE_OAUTH_TOKEN`, no `OCP_TUI_HOME` in the service env)
 **Evidence**: [`measurements.jsonl`](measurements.jsonl) — **n=15** (3 configs × 5) · banner captures [`billing-banner.txt`](billing-banner.txt) · harness [`floor.sh`](floor.sh)
 
@@ -46,6 +48,18 @@ All rows in [`measurements.jsonl`](measurements.jsonl); every number below is re
 `lib/tui/transcript.mjs`; ADR 0007 step 4) — i.e. it waits for the **entire turn** to complete
 before returning anything. There is no streaming path. The ~20 s delta between this harness's
 real TTFT and OCP's reported 30–32 s is exactly that.
+
+> **⚠️ 2026-07-13 correction — this decomposition attributes the ~20 s to the wrong thing.** It was
+> inferred from the external 30–32 s report, never measured *through* OCP. It has since been measured
+> through a real OCP instance (TUI mode, `claude-sonnet-4-6`, the same ~1850-token prompt, n=5):
+> **median 11.30 s** before [#156](https://github.com/dtzp555-max/ocp/pull/156), **9.55 s** after.
+> Same-turn decomposition (baseline row `i=5`): **11.563 s** wall through OCP vs `turn_duration:
+> 7.319 s` of CLI-internal time on that same turn → **OCP's own overhead ≈ 4.2 s** (n=1), **not
+> ~20 s**. The rest of any larger number is the model *generating a long answer*,
+> which the blocking wait does not cause and streaming would not shorten — it would only move the
+> first byte earlier. The 30–32 s figure therefore reflects a much longer output (and/or the
+> then-inherited `xhigh` effort), not 20 s of OCP dead time. See
+> [`streaming-spike.md`](streaming-spike.md) § "What streaming would have bought".
 
 ---
 
@@ -105,7 +119,28 @@ the effort level silently changes if the operator ever switches to env-token mod
 - **Risk**: none — banner confirms it stays on `Claude Max` (see `billing-banner.txt`).
 - ⚠️ Do **not** reach for `--bare` to shave boot: see above.
 
-### 2. Real streaming instead of blocking on turn-terminal — **the big one (~20 s)**
+### 2. Real streaming instead of blocking on turn-terminal — **ACHIEVABLE → [`streaming-spike.md`](streaming-spike.md)**
+
+> **2026-07-13 update — the prereq spike was run. The answer is YES, but not from either source this
+> item guessed at.** (a) The transcript grows at *event* granularity (the whole answer lands in one
+> line, ~0.3 s before terminal) — dead. (b) The pane is a **rendered** view whose `capture-pane` text
+> no longer contains the answer's source bytes (`## `, `**`, code fences are gone) — dead, and worse
+> than "lossy": it is *not the model's text*. **But there is a third source neither this backlog nor
+> the first spike considered: `claude` fires a `MessageDisplay` hook carrying incremental,
+> byte-faithful `delta`s of the raw reply.** Verified live on a plain interactive TUI spawn (no `-p`),
+> banner `· Claude Max`: 7 fires spread across generation, `concat(deltas) === T` **byte-exactly**
+> (579 == 579), `T.startsWith(S)` true at every step, `## ` / `**` / ```` ```javascript ```` all
+> present in the deltas. Granularity is block-level (~5–7 chunks/answer), not token-level — plenty for
+> SSE. **Build it.**
+>
+> ⚠️ Two corrections to this item as written: the **"~20 s" is wrong** (inferred from an external
+> report, never measured through OCP — the same-turn decomposition puts OCP's own overhead at **~4 s**,
+> n=1), and **streaming moves the first byte, not the last** — so a consumer needing the *complete*
+> answer (the JSON-card case that motivated this) gains **nothing** from it. Build it for
+> progressively-rendering consumers, not as a throughput win.
+>
+> Full evidence + implementer caveats (the hook is `forceSyncExecution` — claude BLOCKS on it):
+> **[`streaming-spike.md`](streaming-spike.md)**. Original framing preserved below.
 
 Today `runTuiTurn` blocks on the transcript until the turn is *finished*. The pane is already
 rendering tokens incrementally the whole time — this harness proves you can observe first token
@@ -132,7 +167,18 @@ the background) amortizes it to zero for any workload below the pool refill rate
   #148 — pooled panes must not look like zombies to the sweep.
 - Lower priority than #1 and #2: it is the smallest slice.
 
-### 4. Trim the prefill — **probably not worth it; know the floor**
+### 4. Trim the prefill — ~~probably not worth it~~ **MEASURED: no detectable benefit. Do not adopt.**
+
+> **2026-07-13 update.** `--exclude-dynamic-system-prompt-sections` was measured with the same
+> harness (`floor.sh`, n=5, Sonnet 5, on top of `--effort low`): **TTFT median 6.39 s**
+> (5.87–10.54 s) vs **6.17 s** (5.87–6.44 s) for `--effort low` alone — i.e. **0.22 s worse, inside
+> the noise band**, with one worse outlier; dropping that outlier does not change the verdict. n=5
+> cannot prove "zero", only "no benefit detectable above noise" — but there is also a **mechanistic**
+> reason not to expect one: `--help` says the flag *"Improves cross-user prompt-cache **reuse**"*, and
+> **OCP is single-user** — there is no cross-user cache to share, so the flag has nothing to buy here.
+> The banner stayed on `· Claude Max` (no billing-pool drop), but there is no win to bank. The ~6 s
+> floor stands as stated below. Raw rows: [`prefill-spike-measurements.jsonl`](prefill-spike-measurements.jsonl).
+
 
 After #1–#3, the floor is **~6 s**, and it does not go lower. `claude` always injects the full
 Claude Code system prompt + tool definitions (thousands to tens of thousands of prefill tokens)
