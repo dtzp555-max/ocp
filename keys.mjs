@@ -6,25 +6,63 @@ import { join } from "node:path";
 import { mkdirSync, chmodSync } from "node:fs";
 import { homedir } from "node:os";
 
-const OCP_DIR = join(homedir(), ".ocp");
-mkdirSync(OCP_DIR, { recursive: true, mode: 0o700 });
-// Tighten the directory mode in case it already existed with broader permissions.
-try { chmodSync(OCP_DIR, 0o700); } catch { /* ignore EPERM on pre-existing dirs */ }
-const DB_PATH = join(OCP_DIR, "ocp.db");
+// Resolved LAZILY, on first getDb() — not at module top-level. Two reasons, and the second is
+// the bug this fixes:
+//
+//  1. Merely IMPORTING keys.mjs should not, as a side effect, create directories in the
+//     operator's home.
+//  2. OCP_DIR_OVERRIDE exists so the test suite can point the key store at a scratch dir — and
+//     because ESM hoists imports, a top-level `const OCP_DIR = ...` here would be evaluated
+//     BEFORE an importing module's body could set the env var. Eager resolution made the
+//     override unsettable in the one place that needs it. (test-features.mjs carried a comment
+//     claiming it could "set env before the first getDb() call" — it could not, because nothing
+//     here ever read an env var. So `npm test` wrote real, UNREVOKED api_keys rows into the
+//     operator's live ~/.ocp/ocp.db: two per run, unbounded — 737 junk keys against 12 real ones
+//     on the maintainer's host — and two concurrent runs raced one file, which is the ~1-in-6
+//     flake in `listKeys includes quota fields`.)
+//
+// The override is gated on NODE_ENV === "test", and that gate is the ACTUAL guard. An earlier
+// cut of this fix relied on the variable merely having an awkward name — i.e. a naming convention
+// plus a comment — which is precisely the failure mode this whole change exists to indict (a
+// comment describing an intention that nothing enforces). A production server runs without
+// NODE_ENV, so it CANNOT honor the override, however the variable got into its environment
+// (`ocp start`'s nohup fallback inherits the invoking shell's env — a maintainer who exported
+// this while debugging and then started the server would otherwise get a server silently
+// authenticating against an empty key store: in AUTH_MODE=multi, a total auth outage, with
+// nothing logged and nothing on /health to show it).
+function resolveOcpDir() {
+  const override = process.env.NODE_ENV === "test" ? process.env.OCP_DIR_OVERRIDE : null;
+  const dir = override || join(homedir(), ".ocp");
+  mkdirSync(dir, { recursive: true, mode: 0o700 });
+  // Tighten the directory mode in case it already existed with broader permissions.
+  try { chmodSync(dir, 0o700); } catch { /* ignore EPERM on pre-existing dirs */ }
+  return dir;
+}
 
 let db;
+let dbPath;   // resolved on first open, alongside the db handle
 
 export function getDb() {
   if (!db) {
-    db = new DatabaseSync(DB_PATH);
+    dbPath = join(resolveOcpDir(), "ocp.db");
+    // Say which store we opened. Silence was the other half of the bug: a server on the wrong
+    // key store looks exactly like a server on the right one until every request 401s.
+    if (dbPath !== join(homedir(), ".ocp", "ocp.db")) {
+      console.error(`[keys] key store: ${dbPath} (NOT the default ~/.ocp/ocp.db)`);
+    }
+    db = new DatabaseSync(dbPath);
     db.exec("PRAGMA journal_mode = WAL");
     db.exec("PRAGMA foreign_keys = ON");
     initSchema();
     // Tighten mode on the DB file (0600) after creation / first open.
-    try { chmodSync(DB_PATH, 0o600); } catch { /* ignore — same-user access still works */ }
+    try { chmodSync(dbPath, 0o600); } catch { /* ignore — same-user access still works */ }
   }
   return db;
 }
+
+// Which file the key store actually opened. Exported so a test can ASSERT it is not the
+// operator's real db — the bug this replaced was invisible precisely because nothing checked.
+export function getDbPath() { return dbPath; }
 
 function initSchema() {
   db.exec(`
@@ -426,5 +464,5 @@ export function findKey(idOrName) {
 }
 
 export function closeDb() {
-  if (db) { db.close(); db = null; }
+  if (db) { db.close(); db = null; dbPath = undefined; }  // clear both — a path to a closed db is a footgun
 }
