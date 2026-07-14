@@ -215,7 +215,7 @@ After install the `ocp` CLI lives at `~/ocp/ocp`. To put it on your PATH, either
 export OPENAI_BASE_URL=http://127.0.0.1:3456/v1
 ```
 
-**LAN mode** — share with other devices on your network:
+**LAN mode** — reach OCP from your own devices on the network (Claude Pro/Max are per-user accounts — see [Sharing with family / a team — honest limits](#deployment-model--security-read-this) before extending access to other people):
 ```bash
 # Enable LAN access with per-user auth (recommended)
 node setup.mjs --bind 0.0.0.0 --auth-mode multi
