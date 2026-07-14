@@ -474,7 +474,12 @@ const SPAWN_HOME_DIR = `${process.env.HOME}/.ocp/spawn-home`;
 // erroring loudly — never a silent auth/credential corruption (there are no credentials here).
 function prepareSpawnHome(dir = SPAWN_HOME_DIR) {
   try {
-    mkdirSync(`${dir}/.claude`, { recursive: true });
+    // mode 0700, and it matters for the PARENT: with `recursive`, this call can create ~/.ocp
+    // itself on a fresh install (spawn homes live under it), and without an explicit mode that
+    // parent lands at the umask default — world-listable 0755. keys.mjs used to pre-create it
+    // 0700 as an import side effect; it no longer does (it resolves its dir lazily), so the
+    // 0700 guarantee has to be stated here rather than inherited by luck.
+    mkdirSync(`${dir}/.claude`, { recursive: true, mode: 0o700 });
     // Belt-and-braces: ensure no settings.json/plugins leak in (this home is fully ours).
     for (const f of [`${dir}/.claude/settings.json`, `${dir}/.claude/settings.local.json`]) {
       try { if (existsSync(f)) rmSync(f, { force: true }); } catch { /* best effort */ }

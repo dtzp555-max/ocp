@@ -6,9 +6,20 @@
 // live ~/.ocp/ocp.db (the same database the running server reads) — two per run, unbounded.
 // It also made the suite racy: two concurrent runs (e.g. review worktrees) shared one file, so
 // `listKeys()` could miss "test-user-1" and the `in` check would throw on undefined.
-import { mkdtempSync } from "node:fs";
+import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 export const TEST_OCP_DIR = mkdtempSync(join(tmpdir(), "ocp-test-"));
+
+// BOTH are required. keys.mjs honors OCP_DIR_OVERRIDE only when NODE_ENV === "test", so that a
+// production server — which runs without NODE_ENV — cannot be redirected onto a different key
+// store no matter how the variable reached its environment.
+process.env.NODE_ENV = "test";
 process.env.OCP_DIR_OVERRIDE = TEST_OCP_DIR;
+
+// Remove the scratch store on exit. Without this the fix would trade unbounded growth in
+// ~/.ocp/ocp.db for unbounded growth in $TMPDIR — better, but still litter.
+process.on("exit", () => {
+  try { rmSync(TEST_OCP_DIR, { recursive: true, force: true }); } catch { /* best effort */ }
+});

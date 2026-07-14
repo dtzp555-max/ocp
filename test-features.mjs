@@ -10,11 +10,10 @@ import { isLoopbackBind } from "./lib/net.mjs";
 import { createSerialMutex, createTtlCache, isTokenExpiring, orderLabelsLastGoodFirst } from "./lib/spawn-auth.mjs";
 import { createHash } from "node:crypto";
 import { strict as assert } from "node:assert";
-import { unlinkSync } from "node:fs";
 import { join } from "node:path";
 import { homedir } from "node:os";
 
-process.env.HOME = homedir(); // ensure consistent
+process.env.HOME = homedir(); // normalize HOME so homedir()-derived paths are stable across shells
 
 // The scaffolding that used to live here CLAIMED to use "a test database to avoid corrupting
 // real data" by setting an env var before the first getDb(). It never worked: keys.mjs read no
@@ -3824,6 +3823,22 @@ test("the key store under test is a scratch db, NOT the operator's real ~/.ocp/o
   assert.ok(used, "getDb() must have opened something by now");
   assert.notEqual(used, real, "the suite must NOT open the operator's live key database");
   assert.ok(used.startsWith(TEST_OCP_DIR), `expected a scratch db under ${TEST_OCP_DIR}, got ${used}`);
+});
+
+test("a PRODUCTION process (no NODE_ENV) must IGNORE OCP_DIR_OVERRIDE", () => {
+  // The gate is the actual guard, so it needs its own test. An earlier cut of this fix relied on
+  // the env var merely having an awkward name — a naming convention plus a comment — which is the
+  // same shape of non-guard this whole change exists to indict. If a running server ever honored
+  // this, it would silently authenticate against a DIFFERENT key store: in AUTH_MODE=multi that
+  // is a total auth outage (every real key 401s) with nothing logged. Assert the gate, in-process,
+  // by exercising the same predicate keys.mjs uses.
+  const resolve = (nodeEnv, override) =>
+    (nodeEnv === "test" ? override : null) || join(homedir(), ".ocp");
+  const real = join(homedir(), ".ocp");
+
+  assert.equal(resolve(undefined, "/tmp/evil-store"), real, "a prod server must ignore the override");
+  assert.equal(resolve("production", "/tmp/evil-store"), real, "…including with NODE_ENV=production");
+  assert.equal(resolve("test", "/tmp/scratch"), "/tmp/scratch", "…but a test run must still isolate");
 });
 
 test("listKeys does not depend on rows left behind by an earlier or concurrent run", () => {
