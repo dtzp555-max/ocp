@@ -3839,14 +3839,20 @@ test("a PRODUCTION process (no NODE_ENV) must IGNORE OCP_DIR_OVERRIDE", () => {
   const evil = mkdtempSync(join(tmpdir(), "ocp-evil-"));
   try {
     const keysUrl = pathToFileURL(join(import.meta.dirname, "keys.mjs")).href;
+    // The child prints the override it SAW, then the store it actually opened. Printing both is
+    // the negative control: without it, a future refactor that renamed the env var and missed
+    // this test's `env` object would leave the child with no override at all — and "prod opened
+    // the right store" would pass for the wrong reason. Asserting the child saw it and ignored
+    // it anyway is the claim we actually want to make.
     const probe = `import { getDb, getDbPath, closeDb } from ${JSON.stringify(keysUrl)};
-getDb(); process.stdout.write(getDbPath()); closeDb();`;
+getDb(); process.stdout.write(process.env.OCP_DIR_OVERRIDE + "\\n" + getDbPath()); closeDb();`;
     const env = { ...process.env, HOME: home, OCP_DIR_OVERRIDE: evil };
     delete env.NODE_ENV;                       // a production server has no NODE_ENV
-    const out = execFileSync(process.execPath, ["--input-type=module", "-e", probe],
-      { env, encoding: "utf8" }).trim();
-    assert.equal(out, join(home, ".ocp", "ocp.db"), "a prod process must open HOME/.ocp/ocp.db");
-    assert.ok(!out.startsWith(evil), "a prod process must NEVER honor OCP_DIR_OVERRIDE");
+    const [seen, opened] = execFileSync(process.execPath, ["--input-type=module", "-e", probe],
+      { env, encoding: "utf8" }).trim().split("\n");
+    assert.equal(seen, evil, "precondition: the child must actually SEE the override");
+    assert.equal(opened, join(home, ".ocp", "ocp.db"), "a prod process must open HOME/.ocp/ocp.db");
+    assert.ok(!opened.startsWith(evil), "…having seen the override, a prod process must IGNORE it");
   } finally {
     rmSync(home, { recursive: true, force: true });
     rmSync(evil, { recursive: true, force: true });
