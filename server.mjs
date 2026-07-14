@@ -97,8 +97,40 @@ function _collectNodeManagerCandidates(home) {
 
   return out;
 }
+function _joinIfBase(base, ...parts) {
+  return base ? join(base, ...parts) : null;
+}
+function _collectWindowsClaudeCandidates() {
+  const userProfile = process.env.USERPROFILE || process.env.HOME || "";
+  const localAppData = process.env.LOCALAPPDATA || "";
+  return [
+    _joinIfBase(userProfile, ".local", "bin", "claude.exe"),
+    _joinIfBase(localAppData, "Microsoft", "WinGet", "Links", "claude.exe"),
+    _joinIfBase(localAppData, "Microsoft", "WindowsApps", "claude.exe"),
+  ].filter(Boolean);
+}
+function _isWindowsSpawnableBinary(path) {
+  return /\.exe$/i.test(path);
+}
+function _lookupLines(out) {
+  return out.split(/\r?\n/).map(line => line.trim()).filter(Boolean);
+}
+function _warnUnspawnableWindowsMatches(lines) {
+  const unspawnable = lines.filter(p => !/\.exe$/i.test(p));
+  if (unspawnable.length > 0) {
+    console.warn(`[init] Ignoring non-exe Windows claude command(s): ${unspawnable.join(", ")}`);
+  }
+}
 function resolveClaude() {
+  const isWin = process.platform === "win32";
   if (process.env.CLAUDE_BIN) {
+    if (isWin && !_isWindowsSpawnableBinary(process.env.CLAUDE_BIN)) {
+      console.error(
+        `FATAL: CLAUDE_BIN="${process.env.CLAUDE_BIN}" is not a native Windows executable.\n` +
+        "  Set CLAUDE_BIN to claude.exe; shell shims cannot be spawned without a shell."
+      );
+      process.exit(1);
+    }
     try {
       accessSync(process.env.CLAUDE_BIN, constants.X_OK);
       return process.env.CLAUDE_BIN;
@@ -108,28 +140,48 @@ function resolveClaude() {
     }
   }
 
-  const home = process.env.HOME || "";
-  const candidates = [
-    "/opt/homebrew/bin/claude",
-    "/usr/local/bin/claude",
-    "/usr/bin/claude",
-    join(home, ".local/bin/claude"),
-    ..._collectNodeManagerCandidates(home),
-  ];
+  const home = process.env.HOME || process.env.USERPROFILE || "";
+  const candidates = isWin
+    ? _collectWindowsClaudeCandidates()
+    : [
+        "/opt/homebrew/bin/claude",
+        "/usr/local/bin/claude",
+        "/usr/bin/claude",
+        join(home, ".local/bin/claude"),
+        ..._collectNodeManagerCandidates(home),
+      ];
   for (const p of candidates) {
     try { accessSync(p, constants.X_OK); console.warn(`[init] CLAUDE_BIN not set, resolved to ${p}`); return p; } catch {}
   }
 
-  try {
-    const resolved = execFileSync("which", ["claude"], { encoding: "utf8", timeout: 5000 }).trim();
-    if (resolved) { console.warn(`[init] CLAUDE_BIN not set, resolved via which: ${resolved}`); return resolved; }
-  } catch {}
+  if (isWin) {
+    try {
+      const lines = _lookupLines(execFileSync("where.exe", ["claude.exe"], { encoding: "utf8", timeout: 5000 }));
+      const resolved = lines.find(_isWindowsSpawnableBinary);
+      if (resolved) { console.warn(`[init] CLAUDE_BIN not set, resolved via where.exe: ${resolved}`); return resolved; }
+    } catch {}
+
+    try {
+      const lines = _lookupLines(execFileSync("where.exe", ["claude"], { encoding: "utf8", timeout: 5000 }));
+      const resolved = lines.find(_isWindowsSpawnableBinary);
+      if (resolved) { console.warn(`[init] CLAUDE_BIN not set, resolved via where.exe: ${resolved}`); return resolved; }
+      _warnUnspawnableWindowsMatches(lines);
+    } catch {}
+  } else {
+    try {
+      const resolved = execFileSync("which", ["claude"], { encoding: "utf8", timeout: 5000 }).trim();
+      if (resolved) { console.warn(`[init] CLAUDE_BIN not set, resolved via which: ${resolved}`); return resolved; }
+    } catch {}
+  }
 
   console.error(
     "FATAL: claude binary not found.\n" +
-    "  Set CLAUDE_BIN=/path/to/claude or ensure claude is in PATH.\n" +
-    "  Hint: if you use nvm/fnm/asdf, set CLAUDE_BIN to the absolute path\n" +
-    "  shown by `which claude` in your interactive shell.\n" +
+    (isWin
+      ? "  Set CLAUDE_BIN to the absolute path of claude.exe or ensure claude.exe is in PATH.\n" +
+        "  Hint: npm .cmd/.bat/.ps1 shims cannot be spawned without a shell.\n"
+      : "  Set CLAUDE_BIN=/path/to/claude or ensure claude is in PATH.\n" +
+        "  Hint: if you use nvm/fnm/asdf, set CLAUDE_BIN to the absolute path\n" +
+        "  shown by `which claude` in your interactive shell.\n") +
     "  Checked: " + candidates.join(", ")
   );
   process.exit(1);
