@@ -3,7 +3,9 @@
  * Integration test for Quota + Cache features.
  * Tests database layer functions directly — no server needed.
  */
-import { getDb, createKey, listKeys, validateKey, recordUsage, checkQuota, updateKeyQuota, getKeyQuota, findKey, cacheHash, getCachedResponse, setCachedResponse, clearCache, getCacheStats, closeDb, hasCacheControl, singleflight, getInflightStats } from "./keys.mjs";
+// MUST come before keys.mjs: redirects the key store to a scratch dir (see test-env.mjs).
+import { TEST_OCP_DIR } from "./test-env.mjs";
+import { getDb, getDbPath, createKey, listKeys, validateKey, recordUsage, checkQuota, updateKeyQuota, getKeyQuota, findKey, cacheHash, getCachedResponse, setCachedResponse, clearCache, getCacheStats, closeDb, hasCacheControl, singleflight, getInflightStats } from "./keys.mjs";
 import { isLoopbackBind } from "./lib/net.mjs";
 import { createSerialMutex, createTtlCache, isTokenExpiring, orderLabelsLastGoodFirst } from "./lib/spawn-auth.mjs";
 import { createHash } from "node:crypto";
@@ -12,13 +14,12 @@ import { unlinkSync } from "node:fs";
 import { join } from "node:path";
 import { homedir } from "node:os";
 
-// Use a test database to avoid corrupting real data
-const TEST_DB = join(homedir(), ".ocp", "ocp-test.db");
-try { unlinkSync(TEST_DB); } catch {}
-
-// Monkey-patch DB_PATH for testing (override the module-level variable)
-// Since keys.mjs uses lazy init, we can set env before first getDb() call
 process.env.HOME = homedir(); // ensure consistent
+
+// The scaffolding that used to live here CLAIMED to use "a test database to avoid corrupting
+// real data" by setting an env var before the first getDb(). It never worked: keys.mjs read no
+// env var, and ESM hoisting meant the assignment ran after the import anyway. The redirect is
+// now real, and lives in test-env.mjs (imported above, before keys.mjs). This test proves it.
 
 let passed = 0;
 let failed = 0;
@@ -3809,6 +3810,28 @@ test("REGRESSION: a WARM (pooled) pane streams — the sink comes off the pane, 
   });
   assert.deepEqual(seen, ["Hello ", "world"], "the pooled pane's deltas must reach the client");
   assert.equal(out.text, "Hello world", "and the transcript stays authoritative for the final text");
+});
+
+console.log("\nTest isolation (the suite must never touch the operator's live key store):");
+
+test("the key store under test is a scratch db, NOT the operator's real ~/.ocp/ocp.db", () => {
+  // The guard that was missing. `npm test` wrote live, UNREVOKED api_keys rows straight into the
+  // operator's real ~/.ocp/ocp.db — the same database the running server reads — two per run,
+  // unbounded (737 junk keys vs 12 real ones on the maintainer's host before this landed). It
+  // went unnoticed for so long precisely because NOTHING asserted where the store actually was.
+  const real = join(homedir(), ".ocp", "ocp.db");
+  const used = getDbPath();
+  assert.ok(used, "getDb() must have opened something by now");
+  assert.notEqual(used, real, "the suite must NOT open the operator's live key database");
+  assert.ok(used.startsWith(TEST_OCP_DIR), `expected a scratch db under ${TEST_OCP_DIR}, got ${used}`);
+});
+
+test("listKeys does not depend on rows left behind by an earlier or concurrent run", () => {
+  // The ~1-in-6 flake: two runs sharing one db file. keys.find() returned undefined and the
+  // caller's `in` check threw a TypeError instead of failing cleanly. With a per-run scratch db
+  // the store starts empty, so the count is exactly what THIS run created.
+  const mine = listKeys().filter((k) => k.name === "test-user-1");
+  assert.equal(mine.length, 1, "exactly one test-user-1 — a shared store would accumulate duplicates");
 });
 
 runAsyncTests().then(() => Promise.all(pendingAsync)).then(() => {
