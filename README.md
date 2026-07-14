@@ -24,7 +24,7 @@ One proxy. Multiple IDEs. All models. **$0 API cost.**
 
 There are several Claude proxy projects. OCP picks a specific lane: **align tightly with what `cli.js` actually does, observe + multiplex what's already there, don't extend the protocol.** What you get:
 
-- **LAN multi-user keys** (v3.7.0) — share one Claude Pro/Max subscription with family, friends, or your own devices. Each user gets a per-key API token (no OAuth session leak), with independent usage tracking and one-line revocation.
+- **LAN multi-user keys** (v3.7.0) — reach one Claude Pro/Max subscription from your own devices across the LAN. Each device gets a per-key API token (no OAuth session leak), with independent usage tracking and one-line revocation. Pro/Max are **per-user** accounts — see [Sharing with family / a team — honest limits](#auth-modes) before extending access to other **people**.
 - **`ocp-connect` one-shot IDE setup** — one command on the client machine detects and configures Claude Code, Cursor, Cline, Continue.dev, OpenCode, and OpenClaw. No pasting `OPENAI_BASE_URL` six times.
 - **Response cache with per-key isolation + singleflight** (v3.13.0). Optional SHA-256 prompt cache, isolated per API key (cross-user pollution is impossible by hash construction, not by application logic), with stampede protection on concurrent identical prompts. Off by default. ([PR #65](https://github.com/dtzp555-max/ocp/pull/65), [PR #66](https://github.com/dtzp555-max/ocp/pull/66))
 - **Per-key request quotas** (v3.8.0). Daily / weekly / monthly limits per key — set a kid's iPad to 20/day, a partner's laptop to 100/week. ([PR #18](https://github.com/dtzp555-max/ocp/pull/18))
