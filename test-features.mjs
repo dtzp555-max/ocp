@@ -11,6 +11,8 @@ import { createSerialMutex, createTtlCache, isTokenExpiring, orderLabelsLastGood
 import { createHash } from "node:crypto";
 import { strict as assert } from "node:assert";
 import { join } from "node:path";
+import { pathToFileURL } from "node:url";
+import { execFileSync } from "node:child_process";
 import { homedir } from "node:os";
 
 process.env.HOME = homedir(); // normalize HOME so homedir()-derived paths are stable across shells
@@ -3826,19 +3828,29 @@ test("the key store under test is a scratch db, NOT the operator's real ~/.ocp/o
 });
 
 test("a PRODUCTION process (no NODE_ENV) must IGNORE OCP_DIR_OVERRIDE", () => {
-  // The gate is the actual guard, so it needs its own test. An earlier cut of this fix relied on
-  // the env var merely having an awkward name — a naming convention plus a comment — which is the
-  // same shape of non-guard this whole change exists to indict. If a running server ever honored
-  // this, it would silently authenticate against a DIFFERENT key store: in AUTH_MODE=multi that
-  // is a total auth outage (every real key 401s) with nothing logged. Assert the gate, in-process,
-  // by exercising the same predicate keys.mjs uses.
-  const resolve = (nodeEnv, override) =>
-    (nodeEnv === "test" ? override : null) || join(homedir(), ".ocp");
-  const real = join(homedir(), ".ocp");
-
-  assert.equal(resolve(undefined, "/tmp/evil-store"), real, "a prod server must ignore the override");
-  assert.equal(resolve("production", "/tmp/evil-store"), real, "…including with NODE_ENV=production");
-  assert.equal(resolve("test", "/tmp/scratch"), "/tmp/scratch", "…but a test run must still isolate");
+  // Must run OUT OF PROCESS. The parent is irreversibly NODE_ENV=test by the time any test runs
+  // (test-env.mjs set it before keys.mjs was imported), so the production path is unreachable
+  // from in here — and an in-process test can only ever RE-IMPLEMENT the predicate, which is
+  // worthless: the first cut of this test did exactly that, and deleting the whole NODE_ENV gate
+  // from keys.mjs still left the suite at 320 passed / 0 failed. A copy of the predicate is not
+  // the predicate. So: spawn a child with no NODE_ENV, the override set, and HOME redirected to
+  // a temp dir (so the real key store is never opened), and assert what the REAL keys.mjs did.
+  const home = mkdtempSync(join(tmpdir(), "ocp-prodsim-"));
+  const evil = mkdtempSync(join(tmpdir(), "ocp-evil-"));
+  try {
+    const keysUrl = pathToFileURL(join(import.meta.dirname, "keys.mjs")).href;
+    const probe = `import { getDb, getDbPath, closeDb } from ${JSON.stringify(keysUrl)};
+getDb(); process.stdout.write(getDbPath()); closeDb();`;
+    const env = { ...process.env, HOME: home, OCP_DIR_OVERRIDE: evil };
+    delete env.NODE_ENV;                       // a production server has no NODE_ENV
+    const out = execFileSync(process.execPath, ["--input-type=module", "-e", probe],
+      { env, encoding: "utf8" }).trim();
+    assert.equal(out, join(home, ".ocp", "ocp.db"), "a prod process must open HOME/.ocp/ocp.db");
+    assert.ok(!out.startsWith(evil), "a prod process must NEVER honor OCP_DIR_OVERRIDE");
+  } finally {
+    rmSync(home, { recursive: true, force: true });
+    rmSync(evil, { recursive: true, force: true });
+  }
 });
 
 test("listKeys does not depend on rows left behind by an earlier or concurrent run", () => {

@@ -390,7 +390,7 @@ if (!DRY_RUN) {
   // and "ocp-proxy" keeps the proxy invisible to that heuristic.
   const OCP_HOME = join(HOME, ".ocp");
   const ocpLogsDir = join(OCP_HOME, "logs");
-  if (!existsSync(ocpLogsDir)) mkdirSync(ocpLogsDir, { recursive: true });
+  if (!existsSync(ocpLogsDir)) mkdirSync(ocpLogsDir, { recursive: true, mode: 0o700 })  // 0700: this call can create ~/.ocp itself on a fresh install;
 
   // Uninstall legacy service names if present (upgrade path)
   if (platform === "darwin") {
