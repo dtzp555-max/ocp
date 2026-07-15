@@ -537,7 +537,7 @@ async function runSingleflightTests() {
 await runSingleflightTests();
 
 // ── Plist Env Merge Tests ──
-import { mergePlistEnv, mergeSystemdEnv } from "./scripts/lib/plist-merge.mjs";
+import { mergePlistEnv, mergeSystemdEnv, NEVER_PRESERVE } from "./scripts/lib/plist-merge.mjs";
 
 console.log("\nPlist env merge:");
 
@@ -649,6 +649,78 @@ test("mergeSystemdEnv first-install returns template unchanged", () => {
 test("mergePlistEnv is idempotent", () => {
   const r1 = mergePlistEnv(SAMPLE_EXISTING_PLIST, SAMPLE_TEMPLATE_PLIST);
   assert.equal(mergePlistEnv(r1, SAMPLE_TEMPLATE_PLIST), r1);
+});
+
+// ── A4: security denylist — test-only key-store redirection vars must NEVER survive a setup
+// re-run, even when a prior unit already carried them. Mutation-proof: drop the
+// `!NEVER_PRESERVE.has(k)` guard in either merge fn and these fail (the vars get preserved).
+test("NEVER_PRESERVE denylists exactly the two key-store redirection vars", () => {
+  assert.ok(NEVER_PRESERVE.has("NODE_ENV") && NEVER_PRESERVE.has("OCP_DIR_OVERRIDE"));
+  assert.equal(NEVER_PRESERVE.size, 2, "exactly two — a new entry needs its own rationale + test");
+});
+
+const PLIST_EXISTING_WITH_TEST_VARS = `<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>dev.ocp.proxy</string>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>CLAUDE_PROXY_PORT</key>
+    <string>3456</string>
+    <key>CLAUDE_CACHE_TTL</key>
+    <string>600</string>
+    <key>NODE_ENV</key>
+    <string>test</string>
+    <key>OCP_DIR_OVERRIDE</key>
+    <string>/tmp/scratch-store</string>
+  </dict>
+</dict>
+</plist>`;
+
+test("mergePlistEnv strips test-only redirection vars (A4) but keeps legit user keys", () => {
+  const merged = mergePlistEnv(PLIST_EXISTING_WITH_TEST_VARS, SAMPLE_TEMPLATE_PLIST);
+  assert.match(merged, /<key>CLAUDE_CACHE_TTL<\/key>\s*<string>600<\/string>/, "a legit user key is still preserved");
+  assert.doesNotMatch(merged, /<key>NODE_ENV<\/key>/, "NODE_ENV must never reach a service unit");
+  assert.doesNotMatch(merged, /OCP_DIR_OVERRIDE/, "OCP_DIR_OVERRIDE must never reach a service unit (key or value)");
+});
+
+test("mergePlistEnv: an existing unit whose ONLY extras are denylisted → template unchanged", () => {
+  const existing = `<?xml version="1.0" encoding="UTF-8"?>
+<plist version="1.0">
+<dict>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>CLAUDE_PROXY_PORT</key>
+    <string>3456</string>
+    <key>NODE_ENV</key>
+    <string>test</string>
+    <key>OCP_DIR_OVERRIDE</key>
+    <string>/tmp/scratch-store</string>
+  </dict>
+</dict>
+</plist>`;
+  assert.equal(mergePlistEnv(existing, SAMPLE_TEMPLATE_PLIST), SAMPLE_TEMPLATE_PLIST, "nothing left to preserve → clean template");
+});
+
+const SYSTEMD_EXISTING_WITH_TEST_VARS = `[Unit]
+Description=OCP — Open Claude Proxy
+
+[Service]
+ExecStart=/usr/bin/node /home/u/ocp/server.mjs
+Environment=CLAUDE_PROXY_PORT=3456
+Environment=CLAUDE_CACHE_TTL=600
+Environment=NODE_ENV=test
+Environment=OCP_DIR_OVERRIDE=/tmp/scratch-store
+Restart=always
+`;
+
+test("mergeSystemdEnv strips test-only redirection vars (A4) but keeps legit user keys", () => {
+  const merged = mergeSystemdEnv(SYSTEMD_EXISTING_WITH_TEST_VARS, SAMPLE_TEMPLATE_SYSTEMD);
+  assert.match(merged, /Environment=CLAUDE_CACHE_TTL=600/, "a legit user key is still preserved");
+  assert.doesNotMatch(merged, /Environment=NODE_ENV=/, "NODE_ENV must never reach a service unit");
+  assert.doesNotMatch(merged, /OCP_DIR_OVERRIDE/, "OCP_DIR_OVERRIDE must never reach a service unit");
 });
 
 test("mergeSystemdEnv is idempotent", () => {

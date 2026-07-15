@@ -24,12 +24,22 @@ import { homedir } from "node:os";
 // The override is gated on NODE_ENV === "test", and that gate is the ACTUAL guard. An earlier
 // cut of this fix relied on the variable merely having an awkward name — i.e. a naming convention
 // plus a comment — which is precisely the failure mode this whole change exists to indict (a
-// comment describing an intention that nothing enforces). A production server runs without
-// NODE_ENV, so it CANNOT honor the override, however the variable got into its environment
-// (`ocp start`'s nohup fallback inherits the invoking shell's env — a maintainer who exported
-// this while debugging and then started the server would otherwise get a server silently
-// authenticating against an empty key store: in AUTH_MODE=multi, a total auth outage, with
-// nothing logged and nothing on /health to show it).
+// comment describing an intention that nothing enforces). The two-key gate means NEITHER var
+// alone does anything: a stray OCP_DIR_OVERRIDE with no NODE_ENV is inert, and NODE_ENV=test with
+// no override just resolves the default dir.
+//
+// This gate does NOT, by itself, prove a production daemon can't be redirected — an earlier
+// version of this comment overclaimed that ("a production server runs without NODE_ENV, so it
+// CANNOT honor the override no matter how the variable got in"). That is only true while the
+// daemon's env actually lacks NODE_ENV=test, which is an assumption, not something this file can
+// enforce. What makes it hold in the shipped configuration is defense-in-depth in OCP's launchers:
+// the plist/systemd units strip both vars on every (re)install (scripts/lib/plist-merge.mjs
+// NEVER_PRESERVE), and `ocp` restart's manual nohup fallback strips them (`env -u`). So a server
+// OCP itself started cannot carry the test-only redirection. The one residual path is an operator
+// who hand-launches `node server.mjs` with BOTH vars explicitly exported, bypassing every
+// launcher — a case no library-level gate can catch. The loud getDb() log below ("NOT the default
+// ~/.ocp/ocp.db") is the backstop there: a wrong key store is at least never silent (in
+// AUTH_MODE=multi that would otherwise be a total auth outage with nothing on /health to show it).
 function resolveOcpDir() {
   const override = process.env.NODE_ENV === "test" ? process.env.OCP_DIR_OVERRIDE : null;
   const dir = override || join(homedir(), ".ocp");
