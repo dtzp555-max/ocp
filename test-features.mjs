@@ -656,6 +656,7 @@ test("mergePlistEnv is idempotent", () => {
 // `!NEVER_PRESERVE.has(k)` guard in either merge fn and these fail (the vars get preserved).
 test("NEVER_PRESERVE denylists exactly the two key-store redirection vars", () => {
   assert.ok(NEVER_PRESERVE.has("NODE_ENV") && NEVER_PRESERVE.has("OCP_DIR_OVERRIDE"));
+  assert.equal(NEVER_PRESERVE.size, 2, "exactly two — a new entry needs its own rationale + test");
 });
 
 const PLIST_EXISTING_WITH_TEST_VARS = `<?xml version="1.0" encoding="UTF-8"?>
