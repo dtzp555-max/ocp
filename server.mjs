@@ -47,7 +47,7 @@ import { runTuiTurn, reapStaleTuiSessions, resolveTuiHome, bootTuiPane, tuiPaneH
 import { detectTuiUpstreamError } from "./lib/tui/transcript.mjs";
 import { TuiSemaphore, SemaphoreAbortError, recordTuiEntrypoint, buildTuiHealthBlock } from "./lib/tui/semaphore.mjs";
 import { TuiPanePool, resolvePoolSize, POOL_MAX_SIZE } from "./lib/tui/pool.mjs";
-import { TuiDeltaAssembler, DEFAULT_HOLDBACK_CHARS } from "./lib/tui/stream.mjs";
+import { TuiDeltaAssembler, DEFAULT_HOLDBACK_CHARS, resolveStreamHoldback } from "./lib/tui/stream.mjs";
 import { createSerialMutex, createTtlCache, isTokenExpiring, orderLabelsLastGoodFirst } from "./lib/spawn-auth.mjs";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -379,7 +379,20 @@ const TUI_STREAM_DIR = process.env.OCP_TUI_STREAM_DIR || `${process.env.HOME}/.o
 // exceeds this, which puts it out of the default banner detector's <=100-char reach — the
 // FIRST of the two halves of the guarantee (see the assembler's class comment for the second:
 // no further emission at all once a message boundary follows an emit). Only raise it.
-const TUI_STREAM_HOLDBACK = parseInt(process.env.OCP_TUI_STREAM_HOLDBACK || String(DEFAULT_HOLDBACK_CHARS), 10);
+// resolveStreamHoldback enforces the DEFAULT_HOLDBACK_CHARS floor: the "Only raise it" comment
+// above is now load-bearing, not advisory. A sub-floor value (or garbage) is clamped UP to the
+// floor and reported via `_holdback.clamped`, because a holdback below the default banner
+// detector's 100-char reach would let the first chars of a real auth banner stream before the
+// end-of-turn gate rejects the turn (the A1 leak). We can only ever raise the guarantee, never
+// weaken it below the detector's bound.
+const _holdback = resolveStreamHoldback(process.env.OCP_TUI_STREAM_HOLDBACK);
+const TUI_STREAM_HOLDBACK = _holdback.value;
+if (TUI_MODE && TUI_STREAM && _holdback.clamped) {
+  console.error(
+    `[tui] WARNING: OCP_TUI_STREAM_HOLDBACK=${JSON.stringify(process.env.OCP_TUI_STREAM_HOLDBACK)} is below the\n` +
+    `  safe floor (${DEFAULT_HOLDBACK_CHARS}) or not a number; clamped up to ${DEFAULT_HOLDBACK_CHARS}. The holdback can only be raised.`
+  );
+}
 if (TUI_MODE && TUI_STREAM && process.env.CLAUDE_TUI_ERROR_PATTERNS != null && TUI_STREAM_HOLDBACK <= DEFAULT_HOLDBACK_CHARS) {
   // The holdback's FIRST-MESSAGE half (see TuiDeltaAssembler) is sound for the DEFAULT
   // auth-banner detector (which cannot match a message longer than 100 chars). An
@@ -1494,6 +1507,17 @@ async function callClaudeTui(model, messages, _conversationId, _keyName, res, st
       streamDir: TUI_STREAM ? TUI_STREAM_DIR : null,
       abortSignal: streamCtx ? streamCtx.signal : null,
     });
+    // ── Billing-pool observation (issue #115, #133) — A3 fix: record the entrypoint the moment
+    // runTuiTurn returns, BEFORE the honesty gates below that can throw. The entrypoint (cli vs
+    // sdk-cli) is which BILLING POOL the turn consumed; a turn that then fails a gate (wall-clock
+    // truncation, auth banner, stream divergence) STILL spent that pool — and those failed turns
+    // are exactly the ones most likely to signal a silent degrade to the metered Agent SDK pool.
+    // Recording only on the success path (the old placement) blinded /health's entrypointMismatches
+    // and lastEntrypoint to every failed turn. recordModelSuccess still runs later, only on success.
+    if (recordTuiEntrypoint(tuiStats, entrypoint, TUI_ENTRYPOINT)) {
+      logEvent("warn", "tui_entrypoint_mismatch", { expected: "cli", got: entrypoint, model: cliModel });
+    }
+
     // ── Honesty gates (issue #133) ─ run BEFORE recordModelSuccess / cache write-back.
     // A throw here propagates to the catch below (recordModelError + reject), so the
     // result never reaches the downstream setCachedResponse / singleflight / SUCCESS path.
@@ -1571,17 +1595,9 @@ async function callClaudeTui(model, messages, _conversationId, _keyName, res, st
     }
 
     recordModelSuccess(cliModel, 0); // elapsed not measurable here; wallclock at reader level
-    // Assert the subscription-pool classification. TUI exists to keep cc_entrypoint=cli
-    // (subscription pool); a silent degrade to sdk-cli (metered Agent SDK pool) would still
-    // return text but cost money — warn loudly so it's visible. (issue #115)
-    // C-5: also surface the observation on /health. recordTuiEntrypoint sets lastEntrypoint
-    // unconditionally (operators can poll it to confirm cli) and increments
-    // entrypointMismatches when expected=cli but observed≠cli — the same condition the
-    // journald warning already covers — so a silent metered-pool drift is visible on /health
-    // without tailing logs.
-    if (recordTuiEntrypoint(tuiStats, entrypoint, TUI_ENTRYPOINT)) {
-      logEvent("warn", "tui_entrypoint_mismatch", { expected: "cli", got: entrypoint, model: cliModel });
-    }
+    // Entrypoint/billing-pool observation was already recorded above, right after runTuiTurn
+    // returned — see the A3-fix comment there (it must cover failed turns too, so it cannot live
+    // on this success-only path).
     return text;
   } catch (err) {
     // A mid-turn client disconnect (streaming path only — abortSignal) is NOT an upstream

@@ -3453,7 +3453,7 @@ async function runAsyncTests() {
 // ── TUI real streaming: MessageDisplay hook sink (backlog #2) ───────────────
 // Pure-logic coverage for lib/tui/stream.mjs: sink parsing, the concat===T assertion,
 // prefix-stability, the auth-banner holdback, message scoping, and the error paths.
-import { TuiDeltaAssembler, parseDeltaChunk, buildStreamSettings, streamFilePath, HOOK_SCRIPT, prepareStreamHook } from "./lib/tui/stream.mjs";
+import { TuiDeltaAssembler, parseDeltaChunk, buildStreamSettings, streamFilePath, HOOK_SCRIPT, prepareStreamHook, resolveStreamHoldback, DEFAULT_HOLDBACK_CHARS } from "./lib/tui/stream.mjs";
 
 test("stream: parseDeltaChunk consumes only COMPLETE lines (a torn write stays unread)", () => {
   const p = (i, d, final = false) => JSON.stringify({ hook_event_name: "MessageDisplay", session_id: "s", message_id: "m", index: i, final, delta: d });
@@ -3519,6 +3519,42 @@ test("stream: holdback releases once past the detector's reach, and only then", 
   const out = a.push(mdFire(1, "y".repeat(40)));
   assert.equal(out, "x".repeat(80) + "y".repeat(40), "released as one chunk once >100");
   assert.equal(a.push(mdFire(2, "tail")), "tail", "subsequent deltas stream straight through");
+});
+
+// ── resolveStreamHoldback: the FLOOR under OCP_TUI_STREAM_HOLDBACK (A1 fix) ────────────
+// The C-1 auth-banner guarantee holds only while the holdback >= the default detector's
+// 100-char reach. These tests pin that the resolver CLAMPS UP to the floor. They are
+// mutation-proof: delete the `parsed < floor` branch and the sub-floor cases below fail
+// (a 50 would pass straight through, reopening the leak). The clamped flag drives the boot
+// warning in server.mjs, so its truthiness is asserted alongside every value.
+test("holdback: a sub-floor value is clamped UP to the floor and flagged", () => {
+  assert.deepEqual(resolveStreamHoldback("50"), { value: DEFAULT_HOLDBACK_CHARS, clamped: true });
+  assert.deepEqual(resolveStreamHoldback("0"), { value: DEFAULT_HOLDBACK_CHARS, clamped: true });
+  assert.deepEqual(resolveStreamHoldback("-5"), { value: DEFAULT_HOLDBACK_CHARS, clamped: true });
+  assert.deepEqual(resolveStreamHoldback("99"), { value: DEFAULT_HOLDBACK_CHARS, clamped: true });
+});
+
+test("holdback: garbage / NaN falls back to the floor and is flagged (not silently 0)", () => {
+  assert.deepEqual(resolveStreamHoldback("unlimited"), { value: DEFAULT_HOLDBACK_CHARS, clamped: true });
+  assert.deepEqual(resolveStreamHoldback("5MB"), { value: DEFAULT_HOLDBACK_CHARS, clamped: true });
+});
+
+test("holdback: an above-floor value passes through unchanged and is NOT flagged", () => {
+  assert.deepEqual(resolveStreamHoldback("200"), { value: 200, clamped: false });
+  assert.deepEqual(resolveStreamHoldback("101"), { value: 101, clamped: false });
+  assert.deepEqual(resolveStreamHoldback(String(DEFAULT_HOLDBACK_CHARS)), { value: DEFAULT_HOLDBACK_CHARS, clamped: false });
+});
+
+test("holdback: an unset env var takes the floor WITHOUT flagging (no spurious boot warning)", () => {
+  assert.deepEqual(resolveStreamHoldback(undefined), { value: DEFAULT_HOLDBACK_CHARS, clamped: false });
+  assert.deepEqual(resolveStreamHoldback(null), { value: DEFAULT_HOLDBACK_CHARS, clamped: false });
+  assert.deepEqual(resolveStreamHoldback(""), { value: DEFAULT_HOLDBACK_CHARS, clamped: false });
+  assert.deepEqual(resolveStreamHoldback("   "), { value: DEFAULT_HOLDBACK_CHARS, clamped: false });
+});
+
+test("holdback: the floor is a parameter, so a deployment can raise (never lower) it", () => {
+  assert.deepEqual(resolveStreamHoldback("150", 200), { value: 200, clamped: true }, "custom floor still clamps up");
+  assert.deepEqual(resolveStreamHoldback("300", 200), { value: 300, clamped: false });
 });
 
 test("stream: a short answer never passes the holdback and is delivered whole at terminal", () => {
