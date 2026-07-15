@@ -1,5 +1,27 @@
 # Changelog
 
+## v3.22.0 — 2026-07-16
+
+Minor release: TUI-mode latency and streaming features — **all opt-in and off by default**, so the default request path (`-p` / `--output-format stream-json`) is byte-for-byte unchanged — plus hardening from an independent (Codex) re-review of the streaming work. No new `cli.js` wire behavior and no new endpoint; the new surface is entirely OCP-owned TUI-mode configuration (env vars) and `/health` observation. Every code PR carried a fresh-context reviewer (Iron Rule 10).
+
+### Added — TUI mode (all opt-in, default off)
+
+- **Spawn effort control — `OCP_TUI_EFFORT` (default `low`) (#156)** — the interactive `claude` is now spawned with an explicit `--effort` flag. `low` cuts measured TTFT p50 by ~40% and collapses run-to-run variance ~15× versus an inherited `xhigh`; proxied requests rarely benefit from extended thinking. Set `inherit` to omit the flag and restore the pre-flag HOME-dependent behaviour. Banner-verified to stay on the subscription pool (`· Claude Max`); an invalid value warns and falls back to `low`. README § "Environment Variables".
+- **Warm pane pool — `OCP_TUI_POOL_SIZE` (default `0` / off) (#158)** — pre-boots up to 4 single-use `claude` panes so a request skips the cold boot: measured end-to-end p50 `10.17s` → `6.00s` (−41%) on a Mac mini (Sonnet 4.6, `--effort low`). Opt-in because each warm pane is a live idle process held whether or not a request ever arrives. Panes are single-use (one turn, then killed and replaced in the background), port-scoped (`ocp-tui-<port>-p<hex>`), and coexist with the zombie reaper by a synchronous drain→reap→resume sweep. README §§ "Environment Variables" + "How It Works".
+- **Real SSE streaming — `OCP_TUI_STREAM` (default `0` / off) (#159, #160)** — `stream:true` turns emit real `delta.content` chunks as `claude` generates them, sourced from `claude`'s own `MessageDisplay` hook (registered via `--settings` on the ordinary interactive spawn — banner-verified on the subscription pool). Granularity is block-level, and it moves the *first* byte, not the last. The transcript stays authoritative: streamed text is asserted equal to it at end-of-turn, the auth-banner and truncation gates still run before anything is committed, and a turn whose stream cannot be reconciled is **refused** (SSE error frame, not cached) and counted on `/health` (`tui.streamDivergences`; a silent total-hook-failure is counted separately as `tui.streamZeroDeltaTurns`). Tunables: `OCP_TUI_STREAM_HOLDBACK` (default `100`), `OCP_TUI_STREAM_DIR`, `OCP_TUI_STREAM_POLL_MS`. See ADR 0007 (2026-07-13 amendment). README §§ "Environment Variables" + "How It Works".
+
+### Fixed
+
+- **Streaming auth-banner guard: a null `message_id` on the first hook fire (#160)** — a first `MessageDisplay` fire with a null `message_id` could disarm the auth-banner guard; re-landed after a #159 squash dropped it (`lib/tui/stream.mjs`).
+- **Test suite wrote live, unrevoked API keys into the operator's real key store (#163)** — `npm test` had been opening `~/.ocp/ocp.db` (the running server's DB) and writing two junk `api_keys` rows per run (737 accumulated on the maintainer's host), because the isolation the comments claimed was never wired (ESM import hoisting). `keys.mjs` now honors `OCP_DIR_OVERRIDE` under `NODE_ENV=test` and the suite points at a scratch dir; a child-process probe verifies a production process (no `NODE_ENV`) cannot be redirected.
+- **Streaming holdback floor + billing-pool observation on failed turns (#164)** — (A1) `OCP_TUI_STREAM_HOLDBACK` now clamps up to the safe floor (`100`) with a boot warning, closing a latent auth-banner leak when an operator set a sub-floor value. (A3) the `cc_entrypoint` (billing-pool) observation is now recorded before the honesty gates that throw, so `/health` no longer goes blind to exactly the failed turns most likely to signal a silent degrade to the metered Agent SDK pool.
+- **Test-only key-store redirection vars can no longer reach a server OCP launches (#165)** — (A4) `NODE_ENV`/`OCP_DIR_OVERRIDE` are stripped from every service unit `setup.mjs` writes (`plist-merge`'s `NEVER_PRESERVE`) and from the `ocp restart` manual nohup fallback (`env -u`); #163's overstated "a prod server can NEVER be redirected" comments were softened to name the one residual hand-launch path and the loud `getDb()` "NOT the default" backstop.
+
+### Docs
+
+- **README billing honesty (#162, closes #136)** — removed a feature bullet that promised what the § "honest limits" section forbids.
+- **TUI latency plans + streaming-achievability spike (#155, #157)** — measured latency decomposition, backlog, and the `MessageDisplay`-hook streaming prereq spike under `docs/plans/2026-07-13-tui-latency/`.
+
 ## v3.21.1 — 2026-07-07
 
 Patch release: three bug fixes from an independent concurrency/session-lifecycle audit, each its own PR with a fresh-context reviewer (Iron Rule 10). No new `cli.js` wire behavior, no new endpoint, header, or env var; the `/health` field set is unchanged (only value truthfulness improved).
