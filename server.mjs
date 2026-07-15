@@ -156,12 +156,6 @@ function resolveClaude() {
 
   if (isWin) {
     try {
-      const lines = _lookupLines(execFileSync("where.exe", ["claude.exe"], { encoding: "utf8", timeout: 5000 }));
-      const resolved = lines.find(_isWindowsSpawnableBinary);
-      if (resolved) { console.warn(`[init] CLAUDE_BIN not set, resolved via where.exe: ${resolved}`); return resolved; }
-    } catch {}
-
-    try {
       const lines = _lookupLines(execFileSync("where.exe", ["claude"], { encoding: "utf8", timeout: 5000 }));
       const resolved = lines.find(_isWindowsSpawnableBinary);
       if (resolved) { console.warn(`[init] CLAUDE_BIN not set, resolved via where.exe: ${resolved}`); return resolved; }
@@ -178,7 +172,8 @@ function resolveClaude() {
     "FATAL: claude binary not found.\n" +
     (isWin
       ? "  Set CLAUDE_BIN to the absolute path of claude.exe or ensure claude.exe is in PATH.\n" +
-        "  Hint: npm .cmd/.bat/.ps1 shims cannot be spawned without a shell.\n"
+        "  Hint: npm .cmd/.bat/.ps1 shims cannot be spawned without a shell.\n" +
+        "  The .exe requirement is an intentional allow-list for shell-less spawning.\n"
       : "  Set CLAUDE_BIN=/path/to/claude or ensure claude is in PATH.\n" +
         "  Hint: if you use nvm/fnm/asdf, set CLAUDE_BIN to the absolute path\n" +
         "  shown by `which claude` in your interactive shell.\n") +
