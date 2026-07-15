@@ -12,9 +12,10 @@ import { join } from "node:path";
 
 export const TEST_OCP_DIR = mkdtempSync(join(tmpdir(), "ocp-test-"));
 
-// BOTH are required. keys.mjs honors OCP_DIR_OVERRIDE only when NODE_ENV === "test", so that a
-// production server — which runs without NODE_ENV — cannot be redirected onto a different key
-// store no matter how the variable reached its environment.
+// BOTH are required. keys.mjs honors OCP_DIR_OVERRIDE only when NODE_ENV === "test", so neither
+// var alone redirects anything — a stray OCP_DIR_OVERRIDE in a production env is inert without
+// NODE_ENV=test alongside it. (A daemon OCP launches never carries either: the service units and
+// the `ocp` restart fallback strip both — see plist-merge NEVER_PRESERVE / keys.mjs's comment.)
 process.env.NODE_ENV = "test";
 process.env.OCP_DIR_OVERRIDE = TEST_OCP_DIR;
 
