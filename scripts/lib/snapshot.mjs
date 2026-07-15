@@ -2,7 +2,7 @@ import { mkdirSync, writeFileSync, readFileSync, copyFileSync, existsSync, readd
 import { join } from "node:path";
 
 export function writeSnapshot({ homeDir, fromCommit, fromVersion, toVersion, extraFiles = [] }) {
-  const ts = new Date().toISOString().replace(/\.\d+Z$/, "Z");
+  const ts = formatSnapshotTimestamp(new Date());
   const root = join(homeDir, ".ocp", `upgrade-snapshot-${ts}`);
   mkdirSync(root, { recursive: true });
 
@@ -107,9 +107,21 @@ export function gcSnapshots(homeDir, opts = {}) {
 }
 
 function parseSnapshotTimestamp(name) {
+  // Both legacy ISO names and Windows-safe names are supported.
   // upgrade-snapshot-2026-05-11T08:30:00Z → epoch ms
+  // upgrade-snapshot-2026-05-11T08-30-00Z → epoch ms
   const m = name.match(/upgrade-snapshot-(.+)$/);
   if (!m) return 0;
-  const t = Date.parse(m[1]);
-  return Number.isFinite(t) ? t : 0;
+  const raw = m[1];
+  const t = Date.parse(raw);
+  if (Number.isFinite(t)) return t;
+  const iso = raw.replace(/(T\d{2})-(\d{2})-(\d{2})Z$/, "$1:$2:$3Z");
+  const portable = Date.parse(iso);
+  return Number.isFinite(portable) ? portable : 0;
+}
+
+function formatSnapshotTimestamp(date) {
+  // Windows forbids ':' in directory names. Replacing only the time separators
+  // preserves chronological lexical order and keeps the timestamp readable.
+  return date.toISOString().replace(/\.\d+Z$/, "Z").replace(/:/g, "-");
 }
