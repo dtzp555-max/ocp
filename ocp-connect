@@ -202,8 +202,13 @@ for mid in model_ids:
 
 # Handle primary/backup
 if priority == "1":
-    # OCP as primary — pick the best model (prefer sonnet for daily use)
-    primary_model = provider_name + "/claude-sonnet-4-6" if "claude-sonnet-4-6" in model_ids else provider_name + "/" + model_ids[0]
+    # OCP as primary — pick the best model (prefer the latest Sonnet for daily use,
+    # tracking the `sonnet` alias default in models.json; fall back across versions).
+    _sonnet_pref = ["claude-sonnet-5", "claude-sonnet-4-6"]
+    primary_model = next(
+        (provider_name + "/" + m for m in _sonnet_pref if m in model_ids),
+        provider_name + "/" + model_ids[0],
+    )
     config["agents"]["defaults"].setdefault("model", {})
     config["agents"]["defaults"]["model"]["primary"] = primary_model
     # Keep existing fallbacks
