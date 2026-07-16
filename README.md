@@ -25,7 +25,7 @@ One proxy. Multiple IDEs. All models. **$0 API cost.**
 There are several Claude proxy projects. OCP picks a specific lane: **align tightly with what `cli.js` actually does, observe + multiplex what's already there, don't extend the protocol.** What you get:
 
 - **LAN multi-user keys** (v3.7.0) — reach one Claude Pro/Max subscription from your own devices across the LAN. Each device gets a per-key API token (no OAuth session leak), with independent usage tracking and one-line revocation. Pro/Max are **per-user** accounts — see [Sharing with family / a team — honest limits](#deployment-model--security-read-this) before extending access to other **people**.
-- **`ocp-connect` one-shot IDE setup** — one command on the client machine detects and configures Claude Code, Cursor, Cline, Continue.dev, OpenCode, and OpenClaw. No pasting `OPENAI_BASE_URL` six times.
+- **`ocp-connect` one-shot client setup** — one command on the client machine auto-configures OpenClaw, and detects Cursor, Cline, Continue.dev, and opencode to print ready-to-paste setup hints for each. No hunting for where each tool keeps its `OPENAI_BASE_URL`.
 - **Response cache with per-key isolation + singleflight** (v3.13.0). Optional SHA-256 prompt cache, isolated per API key (cross-user pollution is impossible by hash construction, not by application logic), with stampede protection on concurrent identical prompts. Off by default. ([PR #65](https://github.com/dtzp555-max/ocp/pull/65), [PR #66](https://github.com/dtzp555-max/ocp/pull/66))
 - **Per-key request quotas** (v3.8.0). Daily / weekly / monthly limits per key — set a kid's iPad to 20/day, a partner's laptop to 100/week. ([PR #18](https://github.com/dtzp555-max/ocp/pull/18))
 - **SSE heartbeat for long reasoning** ([v3.12.0](https://github.com/dtzp555-max/ocp/releases/tag/v3.12.0), opt-in). If you've ever watched your IDE die at the 60s idle mark during a long Claude tool-use pause — that's nginx/Cloudflare default behavior. OCP emits an SSE comment frame to keep the connection alive without polluting the response. ([PR #49](https://github.com/dtzp555-max/ocp/pull/49))
@@ -121,7 +121,7 @@ Please follow https://github.com/dtzp555-max/ocp/blob/main/README.md
    installed and logged in (`claude auth status`). Install missing pieces
    using my system's package manager.
 2. git clone the repo, cd in, and run `node setup.mjs`.
-3. Verify with `curl http://127.0.0.1:3456/v1/models` (should list 5 models).
+3. Verify with `curl http://127.0.0.1:3456/v1/models` (should list 6 models).
 4. Add `export OPENAI_BASE_URL=http://127.0.0.1:3456/v1` to my shell rc.
 5. Tell me to reload my shell and try a tool like Cline / Continue / Cursor.
 
@@ -148,7 +148,7 @@ Please follow https://github.com/dtzp555-max/ocp/blob/main/README.md
 5. Add OCP_ADMIN_KEY to my shell rc (~/.zshrc or ~/.bashrc).
 6. Run `ocp lan` to show me the LAN IP and connect command.
 7. Optionally create example keys: `ocp keys add laptop`, `ocp keys add tablet`.
-8. Verify: `curl http://127.0.0.1:3456/v1/models` returns 5 models.
+8. Verify: `curl http://127.0.0.1:3456/v1/models` returns 6 models.
 
 Tell me each step before running it. On error, diagnose before retrying.
 ```
@@ -157,8 +157,7 @@ Tell me each step before running it. On error, diagnose before retrying.
 
 ```text
 There's an OCP server at <SERVER_IP> on my LAN. Configure this machine to
-use it for any local IDEs (Cursor, Cline, Continue.dev, OpenCode, Claude
-Code, OpenClaw).
+use it for any local IDEs (Cursor, Cline, Continue.dev, OpenCode, OpenClaw).
 
 Server IP: <SERVER_IP>
 API key (leave blank if the server has anonymous mode enabled): <OPTIONAL_KEY>
@@ -171,7 +170,7 @@ Please follow https://github.com/dtzp555-max/ocp/blob/main/README.md
      chmod +x ocp-connect
 2. Run `./ocp-connect <SERVER_IP>` (add `--key <KEY>` if you have one).
 3. Follow any IDE-specific manual hints it prints.
-4. Verify: `curl http://<SERVER_IP>:3456/v1/models` returns 5 models.
+4. Verify: `curl http://<SERVER_IP>:3456/v1/models` returns 6 models.
 5. Tell me to reload my shell + restart any IDE that was already running.
 
 Don't auto-retry on error. Tell me the failure mode first.
@@ -241,7 +240,7 @@ Run `ocp lan` to see your IP and ready-to-share instructions.
 **Verify:**
 ```bash
 curl http://127.0.0.1:3456/v1/models
-# Returns: claude-opus-4-8, claude-opus-4-7, claude-opus-4-6, claude-sonnet-4-6, claude-haiku-4-5-20251001
+# Returns: claude-opus-4-8, claude-opus-4-7, claude-opus-4-6, claude-sonnet-5, claude-sonnet-4-6, claude-haiku-4-5-20251001
 ```
 
 #### Headless install notes
@@ -320,7 +319,7 @@ OCP Connect v1.3.0
     (set by admin via PROXY_ANONYMOUS_KEY; see issue #12 §14 Path A)
 
   Testing API access...
-  ✓ API accessible (5 models available)
+  ✓ API accessible (6 models available)
 
   Shell config:
     ✓ .bashrc
@@ -353,6 +352,7 @@ OCP Connect v1.3.0
       • ocp/claude-opus-4-8
       • ocp/claude-opus-4-7
       • ocp/claude-opus-4-6
+      • ocp/claude-sonnet-5
       • ocp/claude-sonnet-4-6
       • ocp/claude-haiku-4-5-20251001
     Priority: PRIMARY (default model)
@@ -577,9 +577,9 @@ The simplest path: ask your AI.
 
 What `ocp update` does:
 
-- **Patch bump** (e.g. `v3.14.0 → v3.14.1`):
+- **Patch bump** (e.g. `v3.21.0 → v3.21.1`):
   light path (git pull + npm install + restart).
-- **Cross-minor** (e.g. `v3.10 → v3.14`):
+- **Cross-minor** (e.g. `v3.18 → v3.22`):
   full path: pre-flight check, snapshot, `setup.mjs` (with plist env-merge),
   service restart, post-flight `/health` and `/v1/models` verification.
 - **Old version** (< v3.4.0):
@@ -827,10 +827,11 @@ lsof -nP -iTCP:3456 -sTCP:LISTEN
 If it's an old OCP process, stop it before re-running setup:
 
 ```bash
-ocp stop                                                # if the CLI is on PATH
-launchctl bootout gui/$(id -u)/dev.ocp.proxy            # macOS launchd fallback
-sudo systemctl stop ocp-proxy                           # Linux systemd fallback
+launchctl bootout gui/$(id -u)/dev.ocp.proxy            # macOS launchd
+sudo systemctl stop ocp-proxy                           # Linux systemd
 ```
+
+(There is no `ocp stop` subcommand — the proxy runs as a service, so stopping it goes through the service manager above. `ocp restart` exists for the bounce case.)
 
 ### Setup fails with "node: command not found" or version error
 
@@ -948,6 +949,8 @@ See [Subscription-pool (TUI) mode](#subscription-pool-tui-mode) and ADR 0007 PR-
 | `CLAUDE_CACHE_TTL` | `0` | Response cache TTL (ms, 0 = disabled). Set to e.g. `300000` for 5-min cache |
 | `CLAUDE_ALLOWED_TOOLS` | `Bash,Read,...,Agent` | Comma-separated tools to pre-approve |
 | `CLAUDE_SKIP_PERMISSIONS` | `false` | Bypass all permission checks |
+| `CLAUDE_SYSTEM_PROMPT` | *(unset)* | Extra system-prompt text appended to every request's system prompt (server-wide) |
+| `CLAUDE_MCP_CONFIG` | *(unset)* | Path to an MCP server config JSON, passed to the spawned `claude` as `--mcp-config` (both the `-p` path and TUI `OCP_TUI_FULL_TOOLS` panes) |
 | `CLAUDE_NO_CONTEXT` | `false` | Suppress CLAUDE.md and auto-memory injection (pure API mode) |
 | `PROXY_API_KEY` | *(unset)* | Bearer token for shared-mode authentication |
 | `PROXY_ANONYMOUS_KEY` | *(unset)* | Well-known anonymous key allowlist (multi mode). When set, this exact string bypasses `validateKey()` and grants public access. Exposed via `/health.anonymousKey` only to localhost, or to all callers when `PROXY_ADVERTISE_ANON_KEY=1`. See [Anonymous Access](#anonymous-access-optional). |
