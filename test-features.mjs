@@ -2621,6 +2621,7 @@ import {
   MultimodalError as MmError,
   SUPPORTED_IMAGE_TYPES as MM_SUPPORTED,
 } from "./lib/multimodal.mjs";
+import { parsePositiveInt } from "./lib/env.mjs";
 
 console.log("\nmultimodal image transform (issue #110):");
 
@@ -2811,6 +2812,97 @@ test("buildImageBlocks: pure-text conversation still yields text blocks (untouch
   const { blocks, stats } = mmBuildImageBlocks([{ role: "user", content: "just text" }]);
   assert.deepEqual(blocks, [{ type: "text", text: "just text" }]);
   assert.equal(stats.imageCount, 0);
+  assert.equal(stats.truncated, false);
+});
+
+// ── F2 (PR #154 review): text char budget is enforced on the multimodal path ──
+// Regression guard: without maxTextChars, attaching one tiny image let unbounded
+// text bypass MAX_PROMPT_CHARS entirely (the text path truncates; the image path
+// did not). server.mjs passes maxTextChars: MAX_PROMPT_CHARS into this transform.
+console.log("\nmultimodal text-budget enforcement (PR #154 F2):");
+
+test("buildImageBlocks: text under budget → not truncated, blocks unchanged", () => {
+  const { blocks, stats } = mmBuildImageBlocks(
+    [{ role: "user", content: [txtPart("short"), imgPart()] }],
+    { maxTextChars: 1000 }
+  );
+  assert.equal(stats.truncated, false);
+  assert.equal(stats.textChars, "short".length);
+  assert.equal(blocks.filter(b => b.type === "image").length, 1);
+});
+
+test("buildImageBlocks: text over budget → truncated, keeps most-recent tail + note", () => {
+  const big = "A".repeat(300) + "TAIL_MARKER";
+  const { blocks, stats } = mmBuildImageBlocks(
+    [{ role: "user", content: [txtPart(big)] }],
+    { maxTextChars: 50 }
+  );
+  assert.equal(stats.truncated, true);
+  assert.equal(stats.originalTextChars, big.length);
+  // The most recent characters (the tail) survive; the oldest 'A's are dropped.
+  const joined = blocks.filter(b => b.type === "text").map(b => b.text).join("");
+  assert.ok(joined.includes("TAIL_MARKER"), "tail text must be kept");
+  assert.ok(joined.includes("truncated to fit"), "a truncation note must be present");
+  assert.ok(stats.originalTextChars > stats.textChars, "post-truncation text is smaller");
+});
+
+test("buildImageBlocks: F2 exact scenario — 500k chars + one image → text bounded, image preserved", () => {
+  const { blocks, stats } = mmBuildImageBlocks(
+    [{ role: "user", content: [txtPart("Z".repeat(500000)), imgPart()] }],
+    { maxTextChars: 150000 }
+  );
+  assert.equal(stats.truncated, true);
+  assert.ok(stats.textChars <= 150000 + 200, "text char count is bounded by the budget (+note)");
+  // The image bypasses the text budget and is NOT dropped by truncation.
+  assert.equal(blocks.filter(b => b.type === "image").length, 1);
+});
+
+test("buildImageBlocks: default (no maxTextChars) never truncates — pure module standalone", () => {
+  const { stats } = mmBuildImageBlocks([{ role: "user", content: [txtPart("x".repeat(10000))] }]);
+  assert.equal(stats.truncated, false);
+  assert.equal(stats.textChars, 10000);
+});
+
+// ── F3 (PR #154 review): fail-closed positive-int env parsing ────────────────
+// A misconfigured numeric cap must NEVER silently disable a guard (`x > NaN` is
+// always false) or brick the proxy with a nonsense value. parsePositiveInt keeps
+// the default and reports ok:false so the caller can warn.
+console.log("\nfail-closed env-cap parsing (PR #154 F3):");
+
+test("parsePositiveInt: missing/empty → default, ok", () => {
+  assert.deepEqual(parsePositiveInt(undefined, 42), { value: 42, ok: true });
+  assert.deepEqual(parsePositiveInt("", 42), { value: 42, ok: true });
+});
+
+test("parsePositiveInt: valid positive integer → parsed value", () => {
+  assert.equal(parsePositiveInt("5000000", 42).value, 5000000);
+  assert.equal(parsePositiveInt("5000000", 42).ok, true);
+});
+
+test("parsePositiveInt: 'unlimited' → NaN rejected, default kept (would drop the cap)", () => {
+  const r = parsePositiveInt("unlimited", 5 * 1024 * 1024);
+  assert.equal(r.value, 5 * 1024 * 1024);
+  assert.equal(r.ok, false);
+});
+
+test("parsePositiveInt: '5MB' → unit suffix rejected (naive parseInt would give 5 bytes)", () => {
+  const r = parsePositiveInt("5MB", 5 * 1024 * 1024);
+  assert.equal(r.value, 5 * 1024 * 1024);
+  assert.equal(r.ok, false);
+});
+
+test("parsePositiveInt: '0' and '-1' → non-positive rejected", () => {
+  assert.equal(parsePositiveInt("0", 20).ok, false);
+  assert.equal(parsePositiveInt("0", 20).value, 20);
+  assert.equal(parsePositiveInt("-1", 20).ok, false);
+});
+
+test("parsePositiveInt: '20.5' → fractional/ambiguous rejected", () => {
+  assert.equal(parsePositiveInt("20.5", 20).ok, false);
+});
+
+test("parsePositiveInt: surrounding whitespace tolerated", () => {
+  assert.deepEqual(parsePositiveInt("  20  ", 5), { value: 20, ok: true });
 });
 
 // ── messages guard predicate truth-table (issue #110) ────────────────────────

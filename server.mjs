@@ -46,6 +46,7 @@ import { detectTuiUpstreamError } from "./lib/tui/transcript.mjs";
 import { TuiSemaphore, SemaphoreAbortError, recordTuiEntrypoint, buildTuiHealthBlock } from "./lib/tui/semaphore.mjs";
 import { createSerialMutex, createTtlCache, isTokenExpiring, orderLabelsLastGoodFirst } from "./lib/spawn-auth.mjs";
 import { hasImageContent, buildImageBlocks, buildStreamJsonInput, MultimodalError } from "./lib/multimodal.mjs";
+import { parsePositiveInt } from "./lib/env.mjs";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const _pkg = JSON.parse(readFileSync(join(__dirname, "package.json"), "utf8"));
@@ -958,6 +959,15 @@ function buildCliArgs(cliModel, systemPrompt, opts = {}) {
 // This prevents runaway context from gateway-side conversation accumulation.
 let MAX_PROMPT_CHARS = parseInt(process.env.CLAUDE_MAX_PROMPT_CHARS || "150000", 10);
 
+// Thin env wrapper over parsePositiveInt (lib/env.mjs): resolve `name` from the
+// environment fail-closed, warning on a present-but-invalid value. Keeps the pure
+// parse in a unit-testable module. (PR #154 review F3)
+function parseIntEnv(name, def) {
+  const { value, ok } = parsePositiveInt(process.env[name], def);
+  if (!ok) console.warn(`⚠ ${name}="${process.env[name]}" is not a valid positive integer (bytes/count, no unit suffix); ignoring and using default ${def}.`);
+  return value;
+}
+
 // ── Multimodal image caps (issue #110) ──────────────────────────────────
 // OpenAI `image_url` parts are forwarded to claude as Anthropic image blocks via
 // `--input-format stream-json`. Images deliberately BYPASS the text char budget
@@ -966,9 +976,9 @@ let MAX_PROMPT_CHARS = parseInt(process.env.CLAUDE_MAX_PROMPT_CHARS || "150000",
 // http(s) image URLs are OFF unless CLAUDE_IMAGE_ALLOW_URL is set (v1: data URIs
 // only). See docs/adr/0006-openai-shim-scope.md (Class B.1) and README § "Images".
 const IMAGE_ALLOW_URL = /^(1|true|yes|on)$/i.test(process.env.CLAUDE_IMAGE_ALLOW_URL || "");
-const MAX_IMAGE_BYTES = parseInt(process.env.CLAUDE_MAX_IMAGE_BYTES || String(5 * 1024 * 1024), 10);
-const MAX_IMAGES = parseInt(process.env.CLAUDE_MAX_IMAGES || "20", 10);
-const MAX_IMAGE_TOTAL_BYTES = parseInt(process.env.CLAUDE_MAX_IMAGE_TOTAL_BYTES || String(20 * 1024 * 1024), 10);
+const MAX_IMAGE_BYTES = parseIntEnv("CLAUDE_MAX_IMAGE_BYTES", 5 * 1024 * 1024);
+const MAX_IMAGES = parseIntEnv("CLAUDE_MAX_IMAGES", 20);
+const MAX_IMAGE_TOTAL_BYTES = parseIntEnv("CLAUDE_MAX_IMAGE_TOTAL_BYTES", 20 * 1024 * 1024);
 const MULTIMODAL_OPTS = {
   allowRemoteUrl: IMAGE_ALLOW_URL,
   maxImageBytes: MAX_IMAGE_BYTES,
@@ -1085,9 +1095,19 @@ function spawnClaudeProcess(model, messages, conversationId, keyName, releaseSlo
   const useStreamJson = hasImageContent(nonSystemMessages);
   let stdinPayload, promptChars;
   if (useStreamJson) {
-    const built = buildStreamJsonInput(nonSystemMessages, MULTIMODAL_OPTS);
+    // Pass MAX_PROMPT_CHARS so the multimodal text is bounded by the same
+    // runaway-context guard as the text path (PR #154 review F2). Images bypass it.
+    const built = buildStreamJsonInput(nonSystemMessages, { ...MULTIMODAL_OPTS, maxTextChars: MAX_PROMPT_CHARS });
     stdinPayload = built.payload;
     promptChars = built.stats.textChars;
+    if (built.stats.truncated) {
+      logEvent("warn", "prompt_truncated", {
+        originalChars: built.stats.originalTextChars,
+        maxChars: MAX_PROMPT_CHARS,
+        keptChars: built.stats.textChars,
+        path: "multimodal",
+      });
+    }
   } else {
     stdinPayload = messagesToPrompt(nonSystemMessages);
     promptChars = stdinPayload.length;
@@ -2213,8 +2233,10 @@ async function handleSettings(req, res) {
 // ── Handle chat completions ─────────────────────────────────────────────
 // Default 5 MB, byte-for-byte unchanged unless CLAUDE_MAX_BODY_SIZE is set. Base64
 // image payloads inflate ~33%; operators enabling large images (issue #110) can
-// raise this to admit bigger requests. The human-readable label tracks the value.
-const MAX_BODY_SIZE = parseInt(process.env.CLAUDE_MAX_BODY_SIZE || String(5 * 1024 * 1024), 10);
+// raise this to admit bigger requests. Parsed fail-closed (PR #154 review F3): a
+// bad value (`unlimited` → NaN, `5MB` → 5) must not disable the body cap or brick
+// the proxy — parseIntEnv keeps the 5 MB default and warns instead.
+const MAX_BODY_SIZE = parseIntEnv("CLAUDE_MAX_BODY_SIZE", 5 * 1024 * 1024);
 const MAX_BODY_SIZE_LABEL = `${Math.round(MAX_BODY_SIZE / (1024 * 1024))}MB`;
 
 // Set of all valid model identifiers (canonical IDs + aliases)
@@ -2263,8 +2285,24 @@ async function handleChatCompletions(req, res) {
   // request shape per OpenAI vision spec (image_url content parts). buildImageBlocks
   // validates without stringifying, so this early pass is cheap.
   if (hasImageContent(messages)) {
+    // F1 (PR #154 review): the TUI path (callClaudeTui → messagesToPrompt) cannot
+    // carry image blocks — it renders every non-text part as "[non-text content
+    // omitted]". Forwarding here would let the model answer about an image it never
+    // saw and return 200, which is strictly worse than an honest error (the one
+    // outcome ALIGNMENT.md forbids: silently serving text the model did not mean).
+    // Stream-json image input requires the `claude -p` path, so in TUI_MODE we fail
+    // loudly instead of dropping. Documented in README § "Images".
+    if (TUI_MODE) {
+      return jsonResponse(res, 400, {
+        error: {
+          message: "Image inputs are not supported in TUI mode (CLAUDE_TUI_MODE=true). Images require the default -p spawn path; remove images or run OCP without TUI mode.",
+          type: "invalid_request_error",
+          code: "images_unsupported_in_tui_mode",
+        },
+      });
+    }
     try {
-      buildImageBlocks(messages.filter(m => m.role !== "system"), MULTIMODAL_OPTS);
+      buildImageBlocks(messages.filter(m => m.role !== "system"), { ...MULTIMODAL_OPTS, maxTextChars: MAX_PROMPT_CHARS });
     } catch (e) {
       if (e instanceof MultimodalError) {
         return jsonResponse(res, e.status, { error: { message: e.message, type: e.type, code: e.code } });

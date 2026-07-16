@@ -794,10 +794,24 @@ curl -X POST http://127.0.0.1:3456/v1/chat/completions \
   }'
 ```
 
+### Not supported in TUI mode
+
+Multimodal images require the default `-p` spawn path. In **TUI / subscription-pool
+mode** (`CLAUDE_TUI_MODE=true`) the CLI is driven interactively and cannot carry
+image blocks, so a request with an `image_url` part returns **`400
+images_unsupported_in_tui_mode`** rather than silently dropping the image and
+answering about something the model never saw. Remove the images, or run OCP
+without TUI mode, to use vision.
+
 ### Limits
 
 Images bypass the text `CLAUDE_MAX_PROMPT_CHARS` budget and are instead bounded by
-their own byte/count caps. Requests that violate a cap get a clear `4xx` (never a
+their own byte/count caps. The **text** in a multimodal request is still subject to
+`CLAUDE_MAX_PROMPT_CHARS` (older text is truncated exactly as on the text-only
+path — only the image bytes are exempt). All numeric caps are parsed **fail-closed**:
+a malformed value (e.g. `CLAUDE_MAX_BODY_SIZE=unlimited` or `=5MB`) is rejected with
+a startup warning and the safe default is kept — a misconfigured cap can never
+silently disable the guard. Requests that violate a cap get a clear `4xx` (never a
 silent drop):
 
 | Cap | Env var | Default | Error |
