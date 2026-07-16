@@ -2674,8 +2674,33 @@ test("models.json aliases.haiku === 'claude-haiku-4-5-20251001' (usage-probe SPO
   assert.equal(_spotModels.aliases.haiku, "claude-haiku-4-5-20251001");
 });
 
-test("models.json aliases.sonnet === 'claude-sonnet-5' (default-request-model SPOT)", () => {
-  assert.equal(_spotModels.aliases.sonnet, "claude-sonnet-5");
+test("models.json aliases.sonnet === 'claude-sonnet-4-6' (default-request-model SPOT)", () => {
+  assert.equal(_spotModels.aliases.sonnet, "claude-sonnet-4-6");
+});
+
+// ── Referential integrity (PR #152 review) ──────────────────────────────────
+// The value-mirror assertions above only prove the alias equals a string literal —
+// they pass even if that literal points at a model that does not exist in
+// models[]. A one-line slip (edit an alias, forget the models[] entry) would leave
+// /v1/models missing the model while every `model: "<alias>"` request passes
+// validation and then fails at CLI spawn. VALID_MODELS keys on alias *names*, so
+// nothing else checks alias *targets*. This is the guard with teeth.
+const _spotModelIds = new Set(_spotModels.models.map(m => m.id));
+
+test("models.json: claude-sonnet-5 is present in models[] (the entry this PR adds)", () => {
+  assert.ok(_spotModelIds.has("claude-sonnet-5"), "claude-sonnet-5 must exist as a models[].id");
+});
+
+test("models.json: every aliases value resolves to a real models[].id (referential integrity)", () => {
+  for (const [name, target] of Object.entries(_spotModels.aliases)) {
+    assert.ok(_spotModelIds.has(target), `aliases.${name} -> '${target}' is a dangling alias (no matching models[].id)`);
+  }
+});
+
+test("models.json: every legacyAliases value resolves to a real models[].id (referential integrity)", () => {
+  for (const [name, target] of Object.entries(_spotModels.legacyAliases || {})) {
+    assert.ok(_spotModelIds.has(target), `legacyAliases.${name} -> '${target}' is a dangling alias (no matching models[].id)`);
+  }
 });
 
 // ── escapeHtml + key-name validator (issue #114) ────────────────────────────

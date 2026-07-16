@@ -122,11 +122,17 @@ provider = {
     "models": []
 }
 
-# Model metadata mapping (prefix match for versioned IDs like claude-haiku-4-5-20251001)
+# Model metadata mapping. Prefix match on the model FAMILY (claude-opus / -sonnet /
+# -haiku), not a pinned version. A version-pinned prefix like "claude-sonnet-4"
+# silently misses "claude-sonnet-5" and falls through to the non-reasoning /
+# 8k-output default (PR #152 review) — every future Sonnet/Opus/Haiku bump would
+# re-trip it. Family prefixes classify any versioned ID correctly with no per-model
+# edit. (ADR 0003: models.json is the SPOT for model existence; /v1/models does not
+# expose reasoning/maxTokens, so family classification stays here.)
 model_meta = {
-    "claude-opus-4": {"name": "Claude Opus (OCP)", "reasoning": True, "maxTokens": 16384},
-    "claude-sonnet-4": {"name": "Claude Sonnet (OCP)", "reasoning": True, "maxTokens": 16384},
-    "claude-haiku-4": {"name": "Claude Haiku (OCP)", "reasoning": False, "maxTokens": 8192},
+    "claude-opus": {"name": "Claude Opus (OCP)", "reasoning": True, "maxTokens": 16384},
+    "claude-sonnet": {"name": "Claude Sonnet (OCP)", "reasoning": True, "maxTokens": 16384},
+    "claude-haiku": {"name": "Claude Haiku (OCP)", "reasoning": False, "maxTokens": 8192},
 }
 
 def get_model_meta(mid):
@@ -178,11 +184,11 @@ config.setdefault("agents", {})
 config["agents"].setdefault("defaults", {})
 config["agents"]["defaults"].setdefault("models", {})
 
-# Build alias map (prefix match)
+# Build alias map (family prefix match — version-agnostic, see model_meta note)
 alias_prefixes = {
-    "claude-opus-4": "Claude Opus",
-    "claude-sonnet-4": "Claude Sonnet",
-    "claude-haiku-4": "Claude Haiku",
+    "claude-opus": "Claude Opus",
+    "claude-sonnet": "Claude Sonnet",
+    "claude-haiku": "Claude Haiku",
 }
 
 for mid in model_ids:
