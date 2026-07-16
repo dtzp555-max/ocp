@@ -6,9 +6,14 @@
 
 - **Default `sonnet` alias → `claude-sonnet-5`.** The `sonnet` alias (the model used for every `/v1/chat/completions` request that omits `model`, and OpenClaw's OCP primary via `ocp-connect`) now resolves to `claude-sonnet-5` instead of `claude-sonnet-4-6`. `claude-sonnet-4-6` remains available by full ID for pinning. This is a behavior change for clients relying on the default — pin `claude-sonnet-4-6` explicitly to retain the previous model. Split out from the additive `claude-sonnet-5` model entry (#152) per Iron Rule 11.
 
-## v3.22.0 — 2026-07-16
+## v3.22.1 — 2026-07-17
 
-Minor release: TUI-mode latency and streaming features — **all opt-in and off by default**, so the default request path (`-p` / `--output-format stream-json`) is byte-for-byte unchanged — plus hardening from an independent (Codex) re-review of the streaming work. No new `cli.js` wire behavior and no new endpoint; the new surface is entirely OCP-owned TUI-mode configuration (env vars) and `/health` observation. Every code PR carried a fresh-context reviewer (Iron Rule 10).
+Minor release: TUI-mode latency and streaming features — **all opt-in and off by default**, so the default request path (`-p` / `--output-format stream-json`) is byte-for-byte unchanged — plus hardening from an independent (Codex) re-review of the streaming work, Windows `claude.exe` startup resolution, and the Claude Sonnet 5 model entry. No new `cli.js` wire behavior and no new endpoint; the new surface is entirely OCP-owned TUI-mode configuration (env vars), startup binary discovery, model metadata, and `/health` observation. Every code PR carried a fresh-context reviewer (Iron Rule 10). (Version note: v3.22.0 was prepared but never tagged; its contents ship here as v3.22.1 together with the additions below.)
+
+### Added
+
+- **Claude Sonnet 5 in the model SPOT (#152, contributed by @vvlasy-openclaw)** — `claude-sonnet-5` added to `models.json` (`contextWindow` 200000 / `maxTokens` 16384 / `reasoning` true, consistent with existing entries), exposed via `/v1/models` and the OpenClaw sync. Purely additive: the `sonnet` alias still resolves to `claude-sonnet-4-6` (the repoint is tracked separately in #168). `ocp-connect`'s model classifier now matches on the model *family* prefix (`claude-sonnet`/`claude-opus`/`claude-haiku`) instead of version-pinned prefixes, so current and future versioned IDs register with correct `reasoning`/`maxTokens` metadata. New referential-integrity tests guard that every alias target exists in `models[]`.
+- **Windows `claude.exe` startup resolution (#161, contributed by @nyxst4ck, diagnosis credit #147 @Justinsato)** — on Windows, `resolveClaude()` now discovers a native `claude.exe` (`%USERPROFILE%\.local\bin`, WinGet Links, WindowsApps, then `where.exe`) and rejects npm `.cmd`/`.bat`/`.ps1` shims, which cannot be spawned without a shell — previously startup resolved a shim and failed. A non-`.exe` `CLAUDE_BIN` on Windows is a fatal error with an actionable hint. The macOS/Linux path is byte-for-byte unchanged. Note: this is startup binary resolution only — full Windows support is not yet claimed (snapshot-path portability is tracked in #167).
 
 ### Added — TUI mode (all opt-in, default off)
 
