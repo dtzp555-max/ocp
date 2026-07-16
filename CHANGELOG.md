@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+### Changed
+
+- **Default `sonnet` alias → `claude-sonnet-5`.** The `sonnet` alias (the model used for every `/v1/chat/completions` request that omits `model`, and OpenClaw's OCP primary via `ocp-connect`) now resolves to `claude-sonnet-5` instead of `claude-sonnet-4-6`. `claude-sonnet-4-6` remains available by full ID for pinning. This is a behavior change for clients relying on the default — pin `claude-sonnet-4-6` explicitly to retain the previous model. Split out from the additive `claude-sonnet-5` model entry (#152) per Iron Rule 11.
+
 ## v3.22.1 — 2026-07-17
 
 Minor release: TUI-mode latency and streaming features — **all opt-in and off by default**, so the default request path (`-p` / `--output-format stream-json`) is byte-for-byte unchanged — plus hardening from an independent (Codex) re-review of the streaming work, Windows `claude.exe` startup resolution, and the Claude Sonnet 5 model entry. No new `cli.js` wire behavior and no new endpoint; the new surface is entirely OCP-owned TUI-mode configuration (env vars), startup binary discovery, model metadata, and `/health` observation. Every code PR carried a fresh-context reviewer (Iron Rule 10). (Version note: v3.22.0 was prepared but never tagged; its contents ship here as v3.22.1 together with the additions below.)
