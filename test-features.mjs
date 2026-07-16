@@ -881,6 +881,39 @@ import { join as testJoin } from "node:path";
 console.log("\nSnapshot:");
 
 const portableSnapshotName = (isoTimestamp) => `upgrade-snapshot-${isoTimestamp.replace(/:/g, "-")}`;
+const legacyMixedSnapshot = "upgrade-snapshot-2026-05-11T09:05:00Z";
+const portableMixedSnapshot = "upgrade-snapshot-2026-05-11T09-47-00Z";
+
+function runMixedSnapshotScenario() {
+  // NTFS rejects the legacy ':' name, so exercise the real exported functions
+  // in an isolated process whose built-in fs bindings expose both formats.
+  const moduleUrl = new URL("./scripts/lib/snapshot.mjs", import.meta.url).href;
+  const script = `
+    import fs from "node:fs";
+    import { syncBuiltinESMExports } from "node:module";
+    const names = ${JSON.stringify([legacyMixedSnapshot, portableMixedSnapshot])};
+    const deleted = [];
+    fs.existsSync = () => true;
+    fs.readdirSync = () => [...names];
+    fs.statSync = () => ({ mtimeMs: 0 });
+    fs.rmSync = (path) => { deleted.push(path); };
+    syncBuiltinESMExports();
+    const { listSnapshots, gcSnapshots } = await import(${JSON.stringify(moduleUrl)});
+    const listed = listSnapshots("/virtual-home").map(snapshot => snapshot.name);
+    const gc = gcSnapshots("/virtual-home", {
+      keepCount: 1,
+      keepDays: 0,
+      now: new Date("2026-05-12T00:00:00Z")
+    });
+    process.stdout.write(JSON.stringify({
+      listed,
+      kept: gc.kept.map(snapshot => snapshot.name),
+      removed: gc.removed.map(snapshot => snapshot.name),
+      deleted
+    }));
+  `;
+  return JSON.parse(execFileSync(process.execPath, ["--input-type=module", "--eval", script], { encoding: "utf8" }));
+}
 
 test("writeSnapshot creates dir + manifest files", () => {
   const root = mkdtempSync(testJoin(tmpdir(), "ocp-snap-test-"));
@@ -913,6 +946,19 @@ test("listSnapshots returns sorted by ISO timestamp", () => {
   assert.ok(list[0].path.includes("2026-05-01"));
   assert.ok(list[2].path.includes("2026-05-03"));
   rmSync(root, { recursive: true, force: true });
+});
+
+test("listSnapshots sorts mixed legacy and Windows-safe names chronologically", () => {
+  const result = runMixedSnapshotScenario();
+  assert.deepEqual(result.listed, [legacyMixedSnapshot, portableMixedSnapshot]);
+});
+
+test("gcSnapshots keeps the newer Windows-safe snapshot across the format boundary", () => {
+  const result = runMixedSnapshotScenario();
+  assert.deepEqual(result.kept, [portableMixedSnapshot]);
+  assert.deepEqual(result.removed, [legacyMixedSnapshot]);
+  assert.equal(result.deleted.length, 1);
+  assert.ok(result.deleted[0].endsWith(legacyMixedSnapshot));
 });
 
 test("upgrade error after snapshot carries snapshotPath + hint", async () => {

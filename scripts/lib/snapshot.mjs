@@ -48,7 +48,10 @@ export function listSnapshots(homeDir) {
   return readdirSync(root)
     .filter(name => name.startsWith("upgrade-snapshot-"))
     .map(name => ({ name, path: join(root, name), mtime: statSync(join(root, name)).mtimeMs }))
-    .sort((a, b) => a.name.localeCompare(b.name));
+    .sort((a, b) => {
+      const chronological = parseSnapshotTimestamp(a.name) - parseSnapshotTimestamp(b.name);
+      return chronological || a.name.localeCompare(b.name);
+    });
 }
 
 /**
