@@ -716,6 +716,7 @@ Any tool use happens server-side, under the `--allowedTools` set configured on t
 | `claude-opus-4-8` | Most capable (default for `opus` alias) |
 | `claude-opus-4-7` | Previous Opus, retained for pinning |
 | `claude-opus-4-6` | Older Opus, retained for pinning |
+| `claude-sonnet-5` | Latest Sonnet (available by full ID; `sonnet` alias repoint tracked separately) |
 | `claude-sonnet-4-6` | Good balance of speed/quality (default for `sonnet` alias) |
 | `claude-haiku-4-5-20251001` | Fastest, lightweight (default for `haiku` alias) |
 
