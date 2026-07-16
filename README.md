@@ -716,8 +716,8 @@ Any tool use happens server-side, under the `--allowedTools` set configured on t
 | `claude-opus-4-8` | Most capable (default for `opus` alias) |
 | `claude-opus-4-7` | Previous Opus, retained for pinning |
 | `claude-opus-4-6` | Older Opus, retained for pinning |
-| `claude-sonnet-5` | Latest Sonnet (default for `sonnet` alias) |
-| `claude-sonnet-4-6` | Previous Sonnet, retained for pinning |
+| `claude-sonnet-5` | Latest Sonnet (available by full ID; `sonnet` alias repoint tracked separately) |
+| `claude-sonnet-4-6` | Good balance of speed/quality (default for `sonnet` alias) |
 | `claude-haiku-4-5-20251001` | Fastest, lightweight (default for `haiku` alias) |
 
 The canonical list lives in [`models.json`](./models.json) — the single source of truth as of v3.11.0. Both `server.mjs` (the `/v1/models` endpoint) and `setup.mjs` (the OpenClaw registration) derive from it. Adding a new model is now a one-file edit:
