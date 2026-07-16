@@ -3900,6 +3900,91 @@ test("StructuredOutputError carries reason", () => {
   assert.equal(e.reason, "schema validation failed"); assert.ok(e instanceof Error);
 });
 
+// ── PR #153 review finding 1: $ref/$defs + strict:true must accept conforming objects ──
+// The flagship shape the OpenAI SDK emits (zodResponseFormat / client.beta.chat.completions.parse)
+// and OpenAI's own structured-outputs docs example: nested {$ref:"#/$defs/step"} + strict:true.
+// Before the fix, strict inferred additionalProperties:false on the unresolved $ref (empty props) and
+// rejected every real key. This is the exact regression the PR must not ship.
+const OPENAI_DOC_SCHEMA = {
+  type: "object",
+  properties: {
+    steps: { type: "array", items: { $ref: "#/$defs/step" } },
+    final_answer: { type: "string" },
+  },
+  $defs: {
+    step: {
+      type: "object",
+      properties: { explanation: { type: "string" }, output: { type: "string" } },
+      required: ["explanation", "output"],
+      additionalProperties: false,
+    },
+  },
+  required: ["steps", "final_answer"],
+  additionalProperties: false,
+};
+
+test("validateJsonSchema: OpenAI doc schema ($ref/$defs) + strict:true accepts a conforming reply", () => {
+  const conforming = { steps: [{ explanation: "add", output: "4" }, { explanation: "done", output: "4" }], final_answer: "4" };
+  assert.deepEqual(validateJsonSchema(conforming, OPENAI_DOC_SCHEMA, "$", true), []);
+});
+
+test("validateJsonSchema: $ref + strict:true still REJECTS a genuinely-extra key (fix didn't disable validation)", () => {
+  const extra = { steps: [{ explanation: "add", output: "4", bogus: 1 }], final_answer: "4" };
+  const errs = validateJsonSchema(extra, OPENAI_DOC_SCHEMA, "$", true);
+  assert.ok(errs.some(e => /bogus.*additional property not allowed/.test(e)), `expected the extra key rejected, got: ${JSON.stringify(errs)}`);
+});
+
+test("validateJsonSchema: $ref + strict:true still catches a missing required property", () => {
+  const missing = { steps: [{ explanation: "add" }], final_answer: "4" };
+  assert.ok(validateJsonSchema(missing, OPENAI_DOC_SCHEMA, "$", true).some(e => /output.*required/.test(e)));
+});
+
+test("validateJsonSchema: anyOf accepts a value matching one branch, rejects a value matching none", () => {
+  const schema = { anyOf: [{ type: "string" }, { type: "integer" }] };
+  assert.deepEqual(validateJsonSchema("hi", schema), []);
+  assert.deepEqual(validateJsonSchema(3, schema), []);
+  assert.ok(validateJsonSchema(true, schema).length > 0);
+});
+
+test("validateJsonSchema: allOf requires every branch to pass", () => {
+  const schema = { allOf: [{ type: "object", properties: { a: { type: "integer" } }, required: ["a"] }, { type: "object", properties: { b: { type: "string" } }, required: ["b"] }] };
+  assert.deepEqual(validateJsonSchema({ a: 1, b: "x" }, schema), []);
+  assert.ok(validateJsonSchema({ a: 1 }, schema).some(e => /b.*required/.test(e)));
+});
+
+test("validateJsonSchema: unresolvable $ref is skipped, not failed", () => {
+  assert.deepEqual(validateJsonSchema({ anything: 1 }, { $ref: "#/$defs/missing" }), []);
+});
+
+// ── PR #153 review finding 2: never serve an unvalidated / ambiguous extraction ──
+test("extractJsonPayload: json_object mode rejects a refusal that merely CONTAINS json", () => {
+  const reply = 'I can\'t do that. For reference the schema looks like {"type":"object"} — sorry.';
+  const r = extractJsonPayload(reply, { whole: true });
+  assert.equal(r.ok, false);
+});
+
+test("extractJsonPayload: json_object mode accepts a whole-reply JSON value", () => {
+  const r = extractJsonPayload('  {"temp":21}  ', { whole: true });
+  assert.ok(r.ok); assert.deepEqual(r.value, { temp: 21 });
+});
+
+test("extractJsonPayload: schema mode rejects >1 top-level JSON value (Schema:{} Answer:{})", () => {
+  const reply = 'Schema: {"type":"object"}\n\nAnswer: {"temp":21}';
+  const r = extractJsonPayload(reply);
+  assert.equal(r.ok, false);
+  assert.ok(/more than one/.test(r.reason || ""));
+});
+
+test("extractJsonPayload: schema mode rejects two competing options rather than silently picking one", () => {
+  const r = extractJsonPayload('Option A:\n{"a":1}\nOption B:\n{"b":2}');
+  assert.equal(r.ok, false);
+});
+
+test("extractJsonPayload: single prose-wrapped value still accepted in schema mode", () => {
+  const r = extractJsonPayload('Sure, here you go: {"a":1} — done.');
+  assert.ok(r.ok); assert.deepEqual(r.value, { a: 1 });
+});
+
 // ── Cleanup ──
 // Settle the async-bodied tests registered through the sync `test()` helper BEFORE summarizing —
 // otherwise their pass/fail is not reflected in the counts (see the `pendingAsync` comment above).

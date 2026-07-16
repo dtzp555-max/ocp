@@ -941,13 +941,15 @@ When a structured request is detected, OCP:
 
 1. Appends a strict JSON-only steering instruction to the request (no Markdown, no fences, no prose, must begin with `{` or `[`).
 2. Extracts the JSON from the model reply (unwraps a stray code fence / prose via a string-aware balanced slice).
-3. For `json_schema`, validates the result against the supplied schema (types, `required`, `enum`, `const`, `additionalProperties`, nullability, `items`, `min/maxItems`).
+3. For `json_schema`, validates the result against the supplied schema (types, `required`, `enum`, `const`, `additionalProperties`, nullability, `items`, `min/maxItems`, and `$ref`/`$defs` + `allOf`/`anyOf`/`oneOf` composition — the shapes the official OpenAI SDK emits via `zodResponseFormat` / `client.beta.chat.completions.parse`). For `json_object`, the whole reply must parse as a single JSON value (a stray brace inside prose is not served as the answer).
 4. On a parse/validation miss, retries with a stronger instruction that names the failure, up to `OCP_STRUCTURED_MAX_ATTEMPTS` (default 3).
-5. If no valid JSON can be produced, returns `HTTP 422` (`invalid_response_error`) rather than passing prose through.
+5. If no valid JSON can be produced, returns OpenAI's assistant **`refusal`** field (`HTTP 200`, `message.content: null`, `message.refusal: "<reason>"`, `finish_reason: "stop"`) — the spec's own mechanism for "the model would not produce the required output" — rather than an invented error type or passing prose through. SDK clients take their written `refusal` branch.
+
+A reply that carries **more than one** top-level JSON value (e.g. `Schema: {…}` then `Answer: {…}`) is rejected as ambiguous rather than silently serving the first — OCP never serves an unvalidated or arbitrarily-chosen extraction.
 
 `message.content` for a structured request is the raw JSON string only — no fences, no reasoning, no wrapper. Non-structured requests are completely unaffected (normal conversational behaviour, streaming included). This is a Class B.1 endpoint extension authorized by ADR 0006; the pure logic lives in [`lib/structured-output.mjs`](./lib/structured-output.mjs) and is unit-tested in `test-features.mjs`.
 
-**Caching.** When `CLAUDE_CACHE_TTL > 0`, structured responses are cached like any other, but on a **structured-keyed** hash (the detected `response_format`/schema is folded into the cache key) so a JSON reply never collides with the conversational answer to the same prompt, and different schemas never share a slot. Only a **validated** result is written back — a `422` (no valid JSON) is never cached.
+**Caching & cost.** A structured request can cost up to `OCP_STRUCTURED_MAX_ATTEMPTS` metered `claude` spawns (each retry is a fresh spawn under the post-2026-06-15 billing model), so this feature adds cost-attack surface. Two guards bound it: (a) identical **concurrent** structured requests share one flight (single-flight dedup, so N callers ≠ N× spawns), and (b) when `CLAUDE_CACHE_TTL > 0`, a **validated** result is cached on a **structured-keyed** hash (the `response_format`/schema is folded into the key, so a JSON reply never collides with the conversational answer and different schemas never share a slot). A refusal is never cached. Operators concerned about cost can lower `OCP_STRUCTURED_MAX_ATTEMPTS` to `1` (no retries) or gate the surface behind per-key quotas (`/api/keys/:id/quota`).
 
 ## Environment Variables
 

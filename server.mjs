@@ -2060,6 +2060,31 @@ function completionResponse(res, id, model, content) {
   });
 }
 
+// OpenAI's designated mechanism for "the model would not produce the required output" is the
+// assistant `refusal` field (content:null, refusal:<text>, finish_reason:"stop") — NOT an invented
+// error type. Structured-output exhaustion emits this so SDK clients take their written `refusal`
+// branch instead of throwing an opaque UnprocessableEntityError. (PR #153 review, finding 3.)
+function refusalResponse(res, id, model, refusal) {
+  jsonResponse(res, 200, {
+    id, object: "chat.completion",
+    created: Math.floor(Date.now() / 1000),
+    model,
+    choices: [{ index: 0, message: { role: "assistant", content: null, refusal }, finish_reason: "stop" }],
+    usage: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 },
+  });
+}
+
+// Streaming form of refusalResponse: a role chunk, a `refusal` delta, then the stop chunk.
+function streamRefusalAsSSE(res, id, model, refusal) {
+  const created = Math.floor(Date.now() / 1000);
+  res.writeHead(200, { "Content-Type": "text/event-stream", "Cache-Control": "no-cache", "Connection": "keep-alive", "X-Accel-Buffering": "no" });
+  sendSSE(res, { id, object: "chat.completion.chunk", created, model, choices: [{ index: 0, delta: { role: "assistant" }, finish_reason: null }] });
+  sendSSE(res, { id, object: "chat.completion.chunk", created, model, choices: [{ index: 0, delta: { refusal }, finish_reason: null }] });
+  sendSSE(res, { id, object: "chat.completion.chunk", created, model, choices: [{ index: 0, delta: {}, finish_reason: "stop" }] });
+  res.write("data: [DONE]\n\n");
+  res.end();
+}
+
 // Replay a complete string as a chunked SSE stream (80 codepoints/chunk).
 // Used by: (a) cache-hit replay on the streaming path; (b) TUI-mode streaming
 // (buffered response replayed as SSE so clients get the same wire format).
@@ -2577,10 +2602,10 @@ async function runStructuredCompletion(upstreamCall, model, messages, conversati
     const augmented = [...messages, { role: "system", content: structuredSystemInstruction(structured, attempt, lastErr) }];
     const raw = await upstreamCall(model, augmented, conversationId, keyName, res);
     lastRaw = raw;
-    const extracted = extractJsonPayload(raw);
+    const extracted = extractJsonPayload(raw, { whole: structured.mode === "json_object" });
     if (!extracted.ok) {
-      lastErr = "response was not parseable as JSON";
-      logEvent("warn", "structured_retry", { attempt, reason: "unparseable" });
+      lastErr = extracted.reason || "response was not parseable as JSON";
+      logEvent("warn", "structured_retry", { attempt, reason: extracted.reason || "unparseable" });
       continue;
     }
     if (structured.mode === "schema" && structured.schema) {
@@ -2676,9 +2701,27 @@ async function handleChatCompletions(req, res) {
       } catch (e) { logEvent("error", "cache_check_failed", { error: e.message }); }
     }
     const upstreamCall = TUI_MODE ? callClaudeTui : callClaude;
+    // Stampede protection (PR #153 review, finding 5): a structured request can cost up to
+    // STRUCTURED_MAX_ATTEMPTS metered spawns, so N identical concurrent requests (Home Assistant
+    // firing several AI Tasks at once) must NOT each pay N× — they share one flight. We dedup every
+    // one-off structured request (not stateful sessions / client-side prompt caching), independent of
+    // whether OCP response caching is enabled; when caching IS on, the same key gates cache read/write.
+    const dedupKey = (!conversationId && !hasCacheControl(messages))
+      ? cacheHash(model, messages, { keyId: req._authKeyId, temperature: parsed.temperature, max_tokens: parsed.max_tokens, top_p: parsed.top_p, structured })
+      : null;
+    const runStructured = async () => {
+      const c = await runStructuredCompletion(upstreamCall, model, messages, conversationId, req._authKeyName, res, structured);
+      if (structuredHash) { try { setCachedResponse(structuredHash, model, c); } catch (e) { logEvent("error", "cache_write_failed", { error: e.message }); } }
+      return c;
+    };
     try {
-      const content = await runStructuredCompletion(upstreamCall, model, messages, conversationId, req._authKeyName, res, structured);
-      if (structuredHash) { try { setCachedResponse(structuredHash, model, content); } catch (e) { logEvent("error", "cache_write_failed", { error: e.message }); } }
+      const content = dedupKey
+        ? await singleflight(dedupKey, async () => {
+            // A follower that raced in after the leader populated the cache re-reads it here.
+            if (structuredHash) { const rc = getCachedResponse(structuredHash, CACHE_TTL); if (rc) return rc.response; }
+            return runStructured();
+          }, (err) => err instanceof RequestDisconnectedError && !res.destroyed)
+        : await runStructured();
       const id = `chatcmpl-${randomUUID()}`;
       if (stream) streamStringAsSSE(res, id, model, content);
       else completionResponse(res, id, model, content);
@@ -2689,8 +2732,15 @@ async function handleChatCompletions(req, res) {
       try { recordUsage({ keyId: req._authKeyId, keyName: req._authKeyName, model, promptChars: promptCharsS, responseChars: 0, elapsedMs: Date.now() - t0s, success: false }); } catch {}
       if (res.headersSent || res.writableEnded || res.destroyed) { try { res.end(); } catch {} return; }
       if (err instanceof StructuredOutputError) {
+        // OpenAI's spec mechanism for "model would not produce the required output" is the assistant
+        // `refusal` field (200, content:null, finish_reason:"stop"), NOT an invented 422 error type —
+        // so SDK clients take their written refusal branch. (PR #153 review, finding 3.)
         logEvent("warn", "structured_failed", { reason: err.reason });
-        return jsonResponse(res, 422, { error: { message: sanitizeError(err.message), type: "invalid_response_error" } });
+        const id = `chatcmpl-${randomUUID()}`;
+        const refusal = `Could not produce a response matching the requested response_format after ${STRUCTURED_MAX_ATTEMPTS} attempts (${sanitizeError(err.reason)}).`;
+        if (stream) streamRefusalAsSSE(res, id, model, refusal);
+        else refusalResponse(res, id, model, refusal);
+        return;
       }
       return respondUpstreamError(res, err);
     }
