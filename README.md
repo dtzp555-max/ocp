@@ -828,7 +828,7 @@ If it's an old OCP process, stop it before re-running setup:
 
 ```bash
 launchctl bootout gui/$(id -u)/dev.ocp.proxy            # macOS launchd
-sudo systemctl stop ocp-proxy                           # Linux systemd
+systemctl --user stop ocp-proxy                         # Linux systemd (installed as a --user unit)
 ```
 
 (There is no `ocp stop` subcommand — the proxy runs as a service, so stopping it goes through the service manager above. `ocp restart` exists for the bounce case.)
@@ -949,7 +949,6 @@ See [Subscription-pool (TUI) mode](#subscription-pool-tui-mode) and ADR 0007 PR-
 | `CLAUDE_CACHE_TTL` | `0` | Response cache TTL (ms, 0 = disabled). Set to e.g. `300000` for 5-min cache |
 | `CLAUDE_ALLOWED_TOOLS` | `Bash,Read,...,Agent` | Comma-separated tools to pre-approve |
 | `CLAUDE_SKIP_PERMISSIONS` | `false` | Bypass all permission checks |
-| `CLAUDE_SYSTEM_PROMPT` | *(unset)* | Extra system-prompt text appended to every request's system prompt (server-wide) |
 | `CLAUDE_MCP_CONFIG` | *(unset)* | Path to an MCP server config JSON, passed to the spawned `claude` as `--mcp-config` (both the `-p` path and TUI `OCP_TUI_FULL_TOOLS` panes) |
 | `CLAUDE_NO_CONTEXT` | `false` | Suppress CLAUDE.md and auto-memory injection (pure API mode) |
 | `PROXY_API_KEY` | *(unset)* | Bearer token for shared-mode authentication |
