@@ -204,6 +204,23 @@ test("cacheHash includes temperature in hash", () => {
   assert.notEqual(h2, h3);
 });
 
+// ── configEpoch (#176): a boot-config change must invalidate the persistent cache ──
+// Mutation-proof: drop the `ce:` fold in keys.mjs and the first test goes green-to-red.
+test("cacheHash: different configEpoch → different key (config change invalidates)", () => {
+  const h1 = cacheHash("sonnet", msgs1, { configEpoch: "aaaa000011112222" });
+  const h2 = cacheHash("sonnet", msgs1, { configEpoch: "bbbb000011112222" });
+  assert.notEqual(h1, h2);
+});
+
+test("cacheHash: same configEpoch is stable; absent epoch hashes byte-identically to pre-#176", () => {
+  const e1 = cacheHash("sonnet", msgs1, { configEpoch: "aaaa000011112222" });
+  const e2 = cacheHash("sonnet", msgs1, { configEpoch: "aaaa000011112222" });
+  assert.equal(e1, e2);
+  // absent-epoch calls (older callers, all pre-existing tests) must not change behavior
+  assert.equal(cacheHash("sonnet", msgs1, {}), cacheHash("sonnet", msgs1));
+  assert.notEqual(e1, cacheHash("sonnet", msgs1), "epoch-carrying key differs from legacy key");
+});
+
 test("cacheHash includes max_tokens in hash", () => {
   const h1 = cacheHash("sonnet", msgs1, {});
   const h2 = cacheHash("sonnet", msgs1, { max_tokens: 100 });
