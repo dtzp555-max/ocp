@@ -822,9 +822,33 @@ test("doctor falls back to currentVersion when origin/main unreachable (no stale
 });
 
 // ── Upgrade Tests ──
-import { runUpgrade } from "./scripts/upgrade.mjs";
+import { runUpgrade, postFlightOk } from "./scripts/upgrade.mjs";
 
 console.log("\nUpgrade:");
+
+// ── postFlightOk (issue #173) — the acceptance predicate for phase 6 ─────────
+// Mutation-proof: revert the version comparison to auth-only and the "stale process
+// still holds the port" test below goes green-to-red (that case is the 2026-07-17
+// Oracle incident: orphan answered auth.ok=true while serving the OLD version).
+test("postFlightOk: rejects a healthy-looking probe that serves the WRONG version (orphan case)", () => {
+  assert.equal(postFlightOk({ auth: { ok: true }, version: "3.21.1" }, "v3.22.1"), false);
+});
+
+test("postFlightOk: accepts auth.ok + exact target version, tolerating the leading v", () => {
+  assert.equal(postFlightOk({ auth: { ok: true }, version: "3.22.1" }, "v3.22.1"), true);
+  assert.equal(postFlightOk({ auth: { ok: true }, version: "3.22.1" }, "3.22.1"), true);
+});
+
+test("postFlightOk: auth failure rejects regardless of version", () => {
+  assert.equal(postFlightOk({ auth: { ok: false }, version: "3.22.1" }, "v3.22.1"), false);
+  assert.equal(postFlightOk({ version: "3.22.1" }, "v3.22.1"), false);
+  assert.equal(postFlightOk(null, "v3.22.1"), false);
+});
+
+test("postFlightOk: unknown/empty target degrades to the auth-only check (never blocks)", () => {
+  assert.equal(postFlightOk({ auth: { ok: true }, version: "3.22.1" }, ""), true);
+  assert.equal(postFlightOk({ auth: { ok: true }, version: "3.22.1" }, undefined), true);
+});
 
 test("upgrade --dry-run prints plan, no side effects", async () => {
   const result = await runUpgrade({
