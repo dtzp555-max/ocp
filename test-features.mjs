@@ -880,6 +880,41 @@ import { join as testJoin } from "node:path";
 
 console.log("\nSnapshot:");
 
+const portableSnapshotName = (isoTimestamp) => `upgrade-snapshot-${isoTimestamp.replace(/:/g, "-")}`;
+const legacyMixedSnapshot = "upgrade-snapshot-2026-05-11T09:05:00Z";
+const portableMixedSnapshot = "upgrade-snapshot-2026-05-11T09-47-00Z";
+
+function runMixedSnapshotScenario() {
+  // NTFS rejects the legacy ':' name, so exercise the real exported functions
+  // in an isolated process whose built-in fs bindings expose both formats.
+  const moduleUrl = new URL("./scripts/lib/snapshot.mjs", import.meta.url).href;
+  const script = `
+    import fs from "node:fs";
+    import { syncBuiltinESMExports } from "node:module";
+    const names = ${JSON.stringify([legacyMixedSnapshot, portableMixedSnapshot])};
+    const deleted = [];
+    fs.existsSync = () => true;
+    fs.readdirSync = () => [...names];
+    fs.statSync = () => ({ mtimeMs: 0 });
+    fs.rmSync = (path) => { deleted.push(path); };
+    syncBuiltinESMExports();
+    const { listSnapshots, gcSnapshots } = await import(${JSON.stringify(moduleUrl)});
+    const listed = listSnapshots("/virtual-home").map(snapshot => snapshot.name);
+    const gc = gcSnapshots("/virtual-home", {
+      keepCount: 1,
+      keepDays: 0,
+      now: new Date("2026-05-12T00:00:00Z")
+    });
+    process.stdout.write(JSON.stringify({
+      listed,
+      kept: gc.kept.map(snapshot => snapshot.name),
+      removed: gc.removed.map(snapshot => snapshot.name),
+      deleted
+    }));
+  `;
+  return JSON.parse(execFileSync(process.execPath, ["--input-type=module", "--eval", script], { encoding: "utf8" }));
+}
+
 test("writeSnapshot creates dir + manifest files", () => {
   const root = mkdtempSync(testJoin(tmpdir(), "ocp-snap-test-"));
   const dotOcp = testJoin(root, ".ocp");
@@ -904,13 +939,26 @@ test("listSnapshots returns sorted by ISO timestamp", () => {
   const dotOcp = testJoin(root, ".ocp");
   tMkdirSync(dotOcp, { recursive: true });
   for (const ts of ["2026-05-01T10:00:00Z", "2026-05-02T10:00:00Z", "2026-05-03T10:00:00Z"]) {
-    tMkdirSync(testJoin(dotOcp, `upgrade-snapshot-${ts}`));
+    tMkdirSync(testJoin(dotOcp, portableSnapshotName(ts)));
   }
   const list = listSnapshots(root);
   assert.equal(list.length, 3);
   assert.ok(list[0].path.includes("2026-05-01"));
   assert.ok(list[2].path.includes("2026-05-03"));
   rmSync(root, { recursive: true, force: true });
+});
+
+test("listSnapshots sorts mixed legacy and Windows-safe names chronologically", () => {
+  const result = runMixedSnapshotScenario();
+  assert.deepEqual(result.listed, [legacyMixedSnapshot, portableMixedSnapshot]);
+});
+
+test("gcSnapshots keeps the newer Windows-safe snapshot across the format boundary", () => {
+  const result = runMixedSnapshotScenario();
+  assert.deepEqual(result.kept, [portableMixedSnapshot]);
+  assert.deepEqual(result.removed, [legacyMixedSnapshot]);
+  assert.equal(result.deleted.length, 1);
+  assert.ok(result.deleted[0].endsWith(legacyMixedSnapshot));
 });
 
 test("upgrade error after snapshot carries snapshotPath + hint", async () => {
@@ -1002,7 +1050,7 @@ test("gcSnapshots keeps last N regardless of age", () => {
   const dotOcp = testJoin(root, ".ocp");
   tMkdirSync(dotOcp, { recursive: true });
   for (const ts of ["2026-04-01T10:00:00Z", "2026-04-15T10:00:00Z", "2026-04-30T10:00:00Z", "2026-05-01T10:00:00Z", "2026-05-10T10:00:00Z"]) {
-    tMkdirSync(testJoin(dotOcp, `upgrade-snapshot-${ts}`));
+    tMkdirSync(testJoin(dotOcp, portableSnapshotName(ts)));
   }
   const result = gcSnapshots(root, { keepCount: 3, keepDays: 0, now: new Date("2026-05-11T00:00:00Z") });
   assert.equal(result.kept.length, 3);
@@ -1085,7 +1133,7 @@ test("gcSnapshots keeps snapshots newer than keepDays regardless of count", () =
   const dotOcp = testJoin(root, ".ocp");
   tMkdirSync(dotOcp, { recursive: true });
   for (const ts of ["2026-04-01T10:00:00Z", "2026-04-15T10:00:00Z", "2026-04-30T10:00:00Z", "2026-05-01T10:00:00Z", "2026-05-10T10:00:00Z"]) {
-    tMkdirSync(testJoin(dotOcp, `upgrade-snapshot-${ts}`));
+    tMkdirSync(testJoin(dotOcp, portableSnapshotName(ts)));
   }
   // keepCount=1 but keepDays=15 means anything from after 2026-04-26 is kept too
   const result = gcSnapshots(root, { keepCount: 1, keepDays: 15, now: new Date("2026-05-11T00:00:00Z") });
@@ -1099,7 +1147,7 @@ test("gcSnapshots never deletes the most recent snapshot", () => {
   const root = mkdtempSync(testJoin(tmpdir(), "ocp-gc-recent-"));
   const dotOcp = testJoin(root, ".ocp");
   tMkdirSync(dotOcp, { recursive: true });
-  tMkdirSync(testJoin(dotOcp, "upgrade-snapshot-2026-01-01T10:00:00Z"));
+  tMkdirSync(testJoin(dotOcp, portableSnapshotName("2026-01-01T10:00:00Z")));
   // Even with keepCount=0 and keepDays=0, the most recent must survive
   const result = gcSnapshots(root, { keepCount: 0, keepDays: 0, now: new Date("2026-05-11T00:00:00Z") });
   assert.equal(result.kept.length, 1);
@@ -1112,13 +1160,13 @@ test("gcSnapshots --dry-run reports plan without deleting", () => {
   const dotOcp = testJoin(root, ".ocp");
   tMkdirSync(dotOcp, { recursive: true });
   for (const ts of ["2026-04-01T10:00:00Z", "2026-04-15T10:00:00Z", "2026-05-10T10:00:00Z"]) {
-    tMkdirSync(testJoin(dotOcp, `upgrade-snapshot-${ts}`));
+    tMkdirSync(testJoin(dotOcp, portableSnapshotName(ts)));
   }
   const result = gcSnapshots(root, { keepCount: 1, keepDays: 0, dryRun: true, now: new Date("2026-05-11T00:00:00Z") });
   assert.equal(result.dryRun, true);
   assert.equal(result.removed.length, 2);
   // Files still exist
-  assert.ok(testExistsSync(testJoin(dotOcp, "upgrade-snapshot-2026-04-01T10:00:00Z")));
+  assert.ok(testExistsSync(testJoin(dotOcp, portableSnapshotName("2026-04-01T10:00:00Z"))));
   rmSync(root, { recursive: true, force: true });
 });
 
@@ -2613,21 +2661,21 @@ import { tmpdir as hTmp } from "node:os";
 console.log("\nTUI home preparation:");
 
 test("prepareTuiHome scratch mode: symlinks creds, seeds onboarded config, trusts cwd, strips history", () => {
-  const realHome = hMkdtemp(`${hTmp()}/real-`);
-  hMkdir(`${realHome}/.claude`, { recursive: true });
-  hWrite(`${realHome}/.claude/.credentials.json`, '{"token":"x"}');
-  hWrite(`${realHome}/.claude.json`, JSON.stringify({ theme: "dark", projects: { "/old/secret/project": { hasTrustDialogAccepted: true } } }));
-  const tuiHome = hMkdtemp(`${hTmp()}/tui-`);
-  const cwd = `${tuiHome}/work`;
+  const realHome = hMkdtemp(testJoin(hTmp(), "real-"));
+  hMkdir(testJoin(realHome, ".claude"), { recursive: true });
+  hWrite(testJoin(realHome, ".claude", ".credentials.json"), '{"token":"x"}');
+  hWrite(testJoin(realHome, ".claude.json"), JSON.stringify({ theme: "dark", projects: { "/old/secret/project": { hasTrustDialogAccepted: true } } }));
+  const tuiHome = hMkdtemp(testJoin(hTmp(), "tui-"));
+  const cwd = testJoin(tuiHome, "work");
   prepareTuiHome(realHome, tuiHome, cwd);
   // credentials symlinked (token never copied)
-  assert.equal(hReadlink(`${tuiHome}/.claude/.credentials.json`), `${realHome}/.claude/.credentials.json`);
-  const seed = JSON.parse(hRead(`${tuiHome}/.claude.json`, "utf8"));
+  assert.equal(hReadlink(testJoin(tuiHome, ".claude", ".credentials.json")), testJoin(realHome, ".claude", ".credentials.json"));
+  const seed = JSON.parse(hRead(testJoin(tuiHome, ".claude.json"), "utf8"));
   assert.equal(seed.hasCompletedOnboarding, true);
   assert.equal(seed.theme, "dark");                                   // onboarded config carried over
   assert.equal(seed.projects[cwd].hasTrustDialogAccepted, true);      // scratch cwd trusted
   assert.equal(seed.projects["/old/secret/project"], undefined);      // user project history stripped
-  assert.ok(hExists(`${tuiHome}/.claude/projects`));                  // own projects dir
+  assert.ok(hExists(testJoin(tuiHome, ".claude", "projects")));    // own projects dir
 });
 
 test("prepareTuiHome real mode (tuiHome===realHome): no symlink, just trusts cwd in real config", () => {
