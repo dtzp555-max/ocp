@@ -8,7 +8,7 @@ The billing classifier reading `cli` is **necessary but NOT sufficient** proof. 
 
 ## Prerequisites
 
-- `CLAUDE_TUI_MODE=true` already set and OCP restarted (see [TUI-mode setup in README](../../README.md#enabling-tui-mode-opt-in))
+- `CLAUDE_TUI_MODE=true` already set and OCP restarted (see [TUI-mode setup](../tui-mode.md#enabling-tui-mode-opt-in))
 - `tmux` installed on the host
 - No other OCP traffic during the canary (quiesce — see below)
 - Access to your Anthropic account billing page (manual step — see below)
@@ -148,4 +148,4 @@ Run this after any major `claude` CLI upgrade. The `auto` mode lets the CLI's ow
 
 - [Flip/rollback runbook](./tui-flip-rollback.md) — how to set and unset `CLAUDE_TUI_MODE` on systemd and launchd hosts
 - [ADR 0007](../adr/0007-tui-interactive-mode.md) — TUI-mode architecture and governing rules
-- README § [Subscription-pool (TUI) mode](../../README.md#subscription-pool-tui-mode)
+- [Subscription-pool (TUI) mode](../tui-mode.md#subscription-pool-tui-mode)
