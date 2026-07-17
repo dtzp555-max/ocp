@@ -35,7 +35,7 @@
  */
 import { createServer } from "node:http";
 import { spawn, execFileSync, spawnSync } from "node:child_process";
-import { randomUUID, timingSafeEqual } from "node:crypto";
+import { randomUUID, timingSafeEqual, createHash as cryptoCreateHash } from "node:crypto";
 import { readFileSync, readdirSync, accessSync, existsSync, constants, chmodSync, statSync, mkdirSync, writeFileSync, rmSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
@@ -346,6 +346,19 @@ const BREAKER_HALF_OPEN_MAX = parseInt(process.env.CLAUDE_BREAKER_HALF_OPEN_MAX 
 const HEARTBEAT_INTERVAL = parseInt(process.env.CLAUDE_HEARTBEAT_INTERVAL || "0", 10);
 const BIND_ADDRESS = process.env.CLAUDE_BIND || "127.0.0.1";
 const NO_CONTEXT = process.env.CLAUDE_NO_CONTEXT === "true";
+// Config epoch for the response cache (issue #176). The cache key hashes model + messages +
+// sampling params, but the ANSWER also depends on boot-time server config that shapes the
+// composed prompt / tool surface: the operator system prompt (#175), the OCP wrapper text,
+// the allowed-tools set, and NO_CONTEXT. The cache store is SQLite-backed and survives
+// restarts, so without this an operator who changes any of these and restarts keeps serving
+// answers composed under the OLD config until TTL expiry. Folding a digest of the four into
+// every cache key makes any change an instant, whole-cache invalidation — the honest behavior.
+// Deliberately boot-time-only: runtime-mutable settings (e.g. maxPromptChars via the settings
+// API) are excluded because a const epoch cannot track them; truncation also only drops
+// context rather than changing the instruction set.
+const CONFIG_EPOCH = cryptoCreateHash("sha256")
+  .update(JSON.stringify([SYSTEM_PROMPT, OCP_SYSTEM_PROMPT_WRAPPER, ALLOWED_TOOLS, NO_CONTEXT]))
+  .digest("hex").slice(0, 16);
 // Kill-switch for the FIX-③ default-path spawn-home isolation (see resolveSpawnHome /
 // spawnHomeMode below). When "1", the -p/stream-json spawn always runs in the operator's
 // real HOME with no cwd override — byte-for-byte the pre-isolation behaviour — even if an
@@ -2629,8 +2642,9 @@ async function handleChatCompletions(req, res) {
       req._cacheHash = null;
       logEvent("info", "cache_skipped", { reason: "cache_control_present" });
     } else {
-      // D1: include keyId in hash to isolate per-key cache pools (v2 format)
-      const hash = cacheHash(model, messages, { keyId: req._authKeyId, temperature: parsed.temperature, max_tokens: parsed.max_tokens, top_p: parsed.top_p });
+      // D1: include keyId in hash to isolate per-key cache pools (v2 format).
+      // configEpoch (#176): any boot-config change that shapes answers invalidates the cache.
+      const hash = cacheHash(model, messages, { keyId: req._authKeyId, temperature: parsed.temperature, max_tokens: parsed.max_tokens, top_p: parsed.top_p, configEpoch: CONFIG_EPOCH });
       req._cacheHash = hash; // store for later write-back
       try {
         const cached = getCachedResponse(hash, CACHE_TTL);
