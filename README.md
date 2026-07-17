@@ -701,6 +701,8 @@ Your IDE → OCP (localhost:3456) → claude --output-format stream-json CLI →
 
 OCP translates OpenAI-compatible `/v1/chat/completions` requests into `claude --output-format stream-json` CLI calls. Anthropic sees normal Claude Code usage — no API billing, no separate key needed.
 
+> **Billing-policy status (as of 2026-07).** Anthropic announced (2026-05-14) that from 2026-06-15 the `claude -p` / Agent SDK path would move to a separate metered credit pool — then **paused the change on its effective date**: *"For now, nothing has changed: Claude Agent SDK, `claude -p`, and third-party app usage still draw from your subscription's usage limits"* ([official help article](https://support.claude.com/en/articles/15036540-use-the-claude-agent-sdk-with-your-claude-plan)). So the default path above currently bills your subscription. Anthropic has said it will give notice before any future change; if the split re-lands, OCP's opt-in [subscription-pool (TUI) mode](#subscription-pool-tui-mode) is the ready-made hedge — see the billing table there.
+
 ### Client-tools boundary
 
 OCP is a **text-prompt bridge** to the official `claude` CLI. It does **not** pass through OpenAI `tools`/`functions` payloads or Anthropic `tool_use` blocks to the client. Clients (Cline, Cursor, OpenClaw, etc.) pointed at OCP receive **assistant TEXT only** — they never get `tool_calls` to execute locally.
@@ -708,6 +710,8 @@ OCP is a **text-prompt bridge** to the official `claude` CLI. It does **not** pa
 Any tool use happens server-side, under the `--allowedTools` set configured on the OCP host. In default mode (no `CLAUDE_NO_CONTEXT`), the `claude` CLI's own built-in tools are available to the model; in TUI mode, the operator controls the tool surface via `OCP_TUI_FULL_TOOLS`. Either way, the tools run under the operator's credentials on the server, and the client sees only the final text output.
 
 **Client-local tool execution is not supported by design.** Supporting it would require bypassing the `claude` CLI to call the raw Anthropic API directly — that is a different product, and is out of scope per `ALIGNMENT.md` (every OCP endpoint must correspond to something `cli.js` actually does).
+
+**What this means for choosing OCP (workload fit).** LAN/multi-device OCP is built for **chat-class** workloads — Q&A, translation, scripting against the API, chat frontends, home-automation backends — where text in/text out is the whole job. It is **not** the right tool for a coding agent running on a *client* machine that needs the AI to read and edit *that machine's* files: tools execute on the OCP host, so the model can never touch the client's filesystem. For that workload, run `claude` (or a local OCP) directly on the machine where the code lives.
 
 ## Available Models
 
@@ -968,7 +972,7 @@ See [Subscription-pool (TUI) mode](#subscription-pool-tui-mode) and ADR 0007 PR-
 | `OCP_TUI_STREAM_POLL_MS` | `100` | (TUI-mode, streaming) Interval at which OCP drains the delta sink. The hook fires at block granularity (seconds apart), so a finer poll buys nothing. |
 | `OCP_TUI_MAX_CONCURRENT` | `2` | (TUI-mode) Max concurrent interactive TUI turns. **Independent** of `CLAUDE_MAX_CONCURRENT` (which bounds the `-p`/stream-json path; TUI never uses it). A TUI turn is heavy (per-request cold-boot of tmux+claude + up to `CLAUDE_TUI_WALLCLOCK_MS` wallclock), so the default is low to keep small hosts (e.g. a Pi 4) alive under a burst. Excess turns **queue** (bounded); a full queue yields a 503. See ADR 0007 PR-B amendment. |
 | `OCP_TUI_POOL_SIZE` | `0` (off) | (TUI-mode) Number of **pre-booted warm `claude` panes** kept ready, so a request does not pay the cold boot. `0` disables the pool entirely — the request path is then exactly the cold-boot path. Max `4`; an unparseable value disables it rather than guessing. **Measured on a Mac mini (Sonnet 4.6, `--effort low`): end-to-end p50 `10.17s` (n=6, pool off) → `6.00s` (n=12 warm hits) — −4.2 s / −41%** — the pool recovers both the ~1.2 s boot *and* ~2.9 s of post-input-bar init that a pane which has been idle a moment has already finished. **Cost:** each warm pane is a *live idle `claude` process* held whether or not a request ever arrives (peak processes ≈ pool size + `OCP_TUI_MAX_CONCURRENT` + 1 booting replacement) — which is why it is opt-in. Panes are **single-use**: one turn, then killed and replaced in the background. The **first request after start (and after any model switch) is always a cold miss** — the pool warms the most recently requested model, since OCP cannot know which model the next caller wants. See `docs/plans/2026-07-13-tui-latency/`. |
-| `OCP_SKIP_AUTH_TEST` | *(unset)* | When `=1`, skip the `claude -p` auth probe during `setup.mjs`. After 2026-06-15 this probe draws from the Agent SDK credit pool; set this to avoid burning a metered credit on re-installs or `ocp update` runs. Auth is validated at the first real request. |
+| `OCP_SKIP_AUTH_TEST` | *(unset)* | When `=1`, skip the `claude -p` auth probe during `setup.mjs`. Under the announced (currently **paused**) 2026-06-15 billing split this probe would draw from the metered Agent SDK credit pool; set this to avoid burning a probe on re-installs or `ocp update` runs. Auth is validated at the first real request. |
 | `OCP_TUI_FULL_TOOLS` | *(unset)* | (TUI-mode, **single-user only**) When `=1`, grant the interactive session the **same tool surface as the `-p` path** — `--allowedTools` (+ optional `--mcp-config`, read from `CLAUDE_ALLOWED_TOOLS` / `CLAUDE_MCP_CONFIG`) — instead of the default MCP-walled, built-in-tools-only set. Lets a trusted single-operator TUI deployment run a **tool-using / MCP agent** (e.g. an OpenClaw assistant) on the subscription pool. Safe because TUI **refuses to boot under `AUTH_MODE=multi`** (hard exit) — no guest key can ever reach the TUI path, so this gate cannot expose tools to an untrusted caller. (Under `AUTH_MODE=shared` + `OCP_TUI_ALLOW_LAN=1`, anyone holding the single shared key reaches it — that is the existing TUI trust model, unchanged.) Note: `--dangerously-skip-permissions` / `CLAUDE_SKIP_PERMISSIONS` is **not** supported for TUI — claude v2.1.x shows an interactive bypass-acceptance screen in headless tmux that cannot be answered, bricking the pane. Use scratch-home `settings.json` `additionalDirectories` instead. See [Subscription-pool (TUI) mode](#subscription-pool-tui-mode) and ADR 0007. |
 
 ### Streaming heartbeat
@@ -988,14 +992,16 @@ OCP also sends `X-Accel-Buffering: no` on SSE responses so nginx-default proxy b
 
 ### What it is and why
 
-From 2026-06-15 Anthropic routes `claude` invocations by `cc_entrypoint`:
+> **⚠️ Status (as of 2026-07): the billing split below is PAUSED.** Anthropic announced it for 2026-06-15, then paused it on the effective date — *"For now, nothing has changed: Claude Agent SDK, `claude -p`, and third-party app usage still draw from your subscription's usage limits"* ([official help article](https://support.claude.com/en/articles/15036540-use-the-claude-agent-sdk-with-your-claude-plan)). While the pause holds, OCP's default `-p` path bills the subscription and **TUI-mode is a hedge, not a necessity**. The table describes the *announced* regime, kept here because Anthropic says a reworked change will return (with advance notice) — everything in this section is ready to flip on that day.
 
-| Launch method | `cc_entrypoint` | Billing pool |
+The announced routing keys `claude` invocations by `cc_entrypoint`:
+
+| Launch method | `cc_entrypoint` | Billing pool (announced regime, currently paused) |
 |---------------|-----------------|-------------|
 | `claude -p` / `--output-format` (OCP default) | `sdk-cli` | Agent SDK credit pool (~$20/mo on Pro) |
 | Interactive `claude` (no flags) | `cli` | Pro/Max subscription pool |
 
-TUI-mode lets OCP serve requests via the interactive path so they bill against the subscription pool. The response is read from claude's native JSONL session transcript once the turn is complete, then replayed to the caller as a normal OpenAI completion or chunked SSE response.
+TUI-mode lets OCP serve requests via the interactive path so they bill against the subscription pool under that regime. The response is read from claude's native JSONL session transcript once the turn is complete, then replayed to the caller as a normal OpenAI completion or chunked SSE response.
 
 ### Billing-classifier labeling (`OCP_TUI_ENTRYPOINT`)
 
@@ -1081,7 +1087,7 @@ a sub-5-second budget. Full measurements and methodology:
 
 ### Monitoring drift via `/health`
 
-`GET /health` includes a `tui` block so you can poll for a silent billing-pool drift (the top risk after the 6/15 flip — a lost TTY flipping `cc_entrypoint` from `cli` to the metered `sdk-cli` pool would still return answers but burn metered credits). The block is **always present** (with `enabled:false` when TUI-mode is off):
+`GET /health` includes a `tui` block so you can poll for a silent billing-pool drift (the top risk under the announced split, if it re-lands — a lost TTY flipping `cc_entrypoint` from `cli` to `sdk-cli` would still return answers but land in the metered pool). The block is **always present** (with `enabled:false` when TUI-mode is off):
 
 ```jsonc
 "tui": {
@@ -1120,9 +1126,11 @@ unset CLAUDE_TUI_MODE
 
 The stream-json path is restored immediately. No other change is needed.
 
-### 2026-06-15 operator checklist
+### Operator checklist for the (paused) billing split
 
-Every host serving traffic must be flipped to TUI-mode **and** canary-verified before 2026-06-15, or it will bill the metered Agent SDK credit pool instead of the subscription.
+> **Status:** the 2026-06-15 split never took effect — Anthropic paused it on the effective date (see the status note at the top of this section). **Nothing needs flipping while the pause holds.** The checklist is retained verbatim as the runbook for if/when a reworked change lands (Anthropic has promised advance notice).
+
+Under the announced regime, every host serving traffic must be flipped to TUI-mode **and** canary-verified before the effective date, or it will bill the metered Agent SDK credit pool instead of the subscription.
 
 - **[Flip/rollback runbook](docs/runbooks/tui-flip-rollback.md)** — how to set `CLAUDE_TUI_MODE=true` on systemd (Linux) and launchd (macOS) hosts. Covers the `daemon-reload` requirement (systemd) and the `bootout`+`bootstrap` cycle requirement (launchd — `launchctl kickstart -k` does not reload plist env).
 - **[615-canary runbook](docs/runbooks/615-canary.md)** — after each flip, run one quiesced request and compare the Agent SDK credit balance before and after. `entrypoint:cli` in the transcript (the `cc_entrypoint` billing classifier) is necessary but not sufficient — only a stable credit balance confirms the subscription pool is being used. Balance check is a manual step (no known programmatic API for the Agent SDK credit pool balance).
