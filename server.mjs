@@ -49,6 +49,7 @@ import { TuiSemaphore, SemaphoreAbortError, recordTuiEntrypoint, buildTuiHealthB
 import { TuiPanePool, resolvePoolSize, POOL_MAX_SIZE } from "./lib/tui/pool.mjs";
 import { TuiDeltaAssembler, DEFAULT_HOLDBACK_CHARS, resolveStreamHoldback } from "./lib/tui/stream.mjs";
 import { createSerialMutex, createTtlCache, isTokenExpiring, orderLabelsLastGoodFirst } from "./lib/spawn-auth.mjs";
+import { appendOperatorPrompt } from "./lib/prompt.mjs";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const _pkg = JSON.parse(readFileSync(join(__dirname, "package.json"), "utf8"));
@@ -195,17 +196,19 @@ function resolveClaude() {
 const OCP_SYSTEM_PROMPT_WRAPPER = `You are accessed via the OCP HTTP proxy. You do NOT have access to any local filesystem, working directory, shell, git status, or machine environment. Do not infer or invent such information from any context you observe. Respond only based on the conversation provided.`;
 
 // Build the full system-prompt string: OCP_SYSTEM_PROMPT_WRAPPER prepended,
-// then any system-role messages from the request appended (separated by blank line).
-// ADR 0009 Amendment 1 analogue § "OLP system prompt wrapper".
+// then any system-role messages from the request appended (separated by blank line),
+// then the operator-wide CLAUDE_SYSTEM_PROMPT appended LAST (lib/prompt.mjs — a
+// no-op returning the same string when the var is unset, so the default path is
+// byte-for-byte unchanged). ADR 0009 Amendment 1 analogue § "OLP system prompt wrapper".
 function extractSystemPrompt(messages) {
   const systemMessages = (messages ?? []).filter(m => m.role === "system");
   if (systemMessages.length === 0) {
-    return OCP_SYSTEM_PROMPT_WRAPPER;
+    return appendOperatorPrompt(OCP_SYSTEM_PROMPT_WRAPPER, SYSTEM_PROMPT);
   }
   const clientContent = systemMessages.map(m =>
     contentToText(m.content)
   ).join("\n\n");
-  return `${OCP_SYSTEM_PROMPT_WRAPPER}\n\n${clientContent}`;
+  return appendOperatorPrompt(`${OCP_SYSTEM_PROMPT_WRAPPER}\n\n${clientContent}`, SYSTEM_PROMPT);
 }
 
 // ── NDJSON line buffer parser (Phase 6c port) ─────────────────────────────

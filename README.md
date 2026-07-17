@@ -228,6 +228,7 @@ The canonical list lives in [`models.json`](./models.json) — the single source
 | `CLAUDE_ALLOWED_TOOLS` | `Bash,Read,...,Agent` | Comma-separated tools to pre-approve |
 | `CLAUDE_SKIP_PERMISSIONS` | `false` | Bypass all permission checks |
 | `CLAUDE_MCP_CONFIG` | *(unset)* | Path to an MCP server config JSON, passed to the spawned `claude` as `--mcp-config` (both the `-p` path and TUI `OCP_TUI_FULL_TOOLS` panes) |
+| `CLAUDE_SYSTEM_PROMPT` | *(unset)* | Operator-wide system-prompt text appended (last) to every request's composed system prompt on the default `-p` path. TUI-mode panes are unaffected (they keep the interactive CLI's own system prompt). Echoed truncated on `/health.systemPrompt`. Note: the response cache key does not include server config — after changing this value, flush the cache (`ocp clear`) or let TTL expire. |
 | `CLAUDE_NO_CONTEXT` | `false` | Suppress CLAUDE.md and auto-memory injection (pure API mode) |
 | `PROXY_API_KEY` | *(unset)* | Bearer token for shared-mode authentication |
 | `PROXY_ANONYMOUS_KEY` | *(unset)* | Well-known anonymous key (multi mode) — this exact string bypasses `validateKey()` and grants public access. Exposed via `/health.anonymousKey` only to localhost, or to all callers when `PROXY_ADVERTISE_ANON_KEY=1`. Full setup + security notes: [docs/lan-mode.md § Anonymous Access](docs/lan-mode.md#anonymous-access-optional). |
