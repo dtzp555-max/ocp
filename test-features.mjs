@@ -821,6 +821,32 @@ test("doctor falls back to currentVersion when origin/main unreachable (no stale
   assert.equal(result.next_action.kind, "noop");
 });
 
+// ── System-prompt operator append (CLAUDE_SYSTEM_PROMPT wiring) ─────────────
+// The var was documented + echoed on /health but never reached a request (dead
+// since APPEND_SYSTEM_PROMPT was retired — caught in PR #170 review). The wiring
+// contract lives in lib/prompt.mjs. Mutation-proof: make appendOperatorPrompt
+// return `base` unconditionally and the first test fails; make it stop trimming
+// and the whitespace test fails.
+import { appendOperatorPrompt } from "./lib/prompt.mjs";
+
+console.log("\nSystem-prompt operator append:");
+
+test("appendOperatorPrompt: appends the operator prompt LAST, blank-line separated", () => {
+  assert.equal(appendOperatorPrompt("WRAPPER\n\nclient", "Answer in Chinese."), "WRAPPER\n\nclient\n\nAnswer in Chinese.");
+});
+
+test("appendOperatorPrompt: unset/empty/whitespace-only → base returned BYTE-IDENTICAL", () => {
+  const base = "WRAPPER\n\nclient sys";
+  assert.equal(appendOperatorPrompt(base, undefined), base);
+  assert.equal(appendOperatorPrompt(base, ""), base);
+  assert.equal(appendOperatorPrompt(base, "   \n "), base, "a stray space in a service unit must not inject anything");
+  assert.equal(appendOperatorPrompt(base, null), base);
+});
+
+test("appendOperatorPrompt: operator value is trimmed before appending", () => {
+  assert.equal(appendOperatorPrompt("W", "  hi  "), "W\n\nhi");
+});
+
 // ── Upgrade Tests ──
 import { runUpgrade, postFlightOk } from "./scripts/upgrade.mjs";
 
