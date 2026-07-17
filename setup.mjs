@@ -334,7 +334,7 @@ if (OPENCLAW_PRESENT) {
     `║  Aider / OpenClaw) at:                                       ║`,
     `║    http://${BIND_ADDRESS}:${String(PORT)}/v1${" ".repeat(Math.max(0, 47 - BIND_ADDRESS.length - String(PORT).length))}║`,
     `║                                                              ║`,
-    `║  See README § "Client Setup" for per-IDE instructions.       ║`,
+    `║  See docs/lan-mode.md for per-IDE client setup.              ║`,
     `║                                                              ║`,
   );
 }
