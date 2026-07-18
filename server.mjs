@@ -1004,6 +1004,27 @@ const stats = {
 };
 const recentErrors = []; // last 20 errors
 
+function reconcileActiveRequestCounter(reason = "unspecified") {
+  const live = activeProcesses.size;
+  if (stats.activeRequests !== live) {
+    logEvent("warn", "active_request_counter_reconciled", {
+      reason,
+      before: stats.activeRequests,
+      liveProcesses: live,
+    });
+    stats.activeRequests = live;
+  }
+}
+
+function releaseActiveRequestCounter(reason = "unspecified") {
+  if (stats.activeRequests > 0) {
+    stats.activeRequests--;
+  } else {
+    logEvent("warn", "active_request_counter_underflow_prevented", { reason });
+    stats.activeRequests = 0;
+  }
+}
+
 // Per-model request stats
 const modelStats = new Map(); // cliModel → { requests, errors, timeouts, totalElapsed, maxElapsed, totalPromptChars, maxPromptChars }
 
@@ -1298,8 +1319,14 @@ function spawnClaudeProcess(model, messages, conversationId, keyName, releaseSlo
     spawnOpts.cwd = decision.home; // neutral cwd: no project CLAUDE.md/skills
   }
 
-  const proc = spawn(CLAUDE, cliArgs, spawnOpts);
-  activeProcesses.add(proc);
+  let proc;
+  try {
+    proc = spawn(CLAUDE, cliArgs, spawnOpts);
+    activeProcesses.add(proc);
+  } catch (err) {
+    releaseActiveRequestCounter("spawn_throw");
+    throw err;
+  }
 
   const t0 = Date.now();
   let gotFirstByte = false;
@@ -1309,7 +1336,9 @@ function spawnClaudeProcess(model, messages, conversationId, keyName, releaseSlo
     if (cleaned) return;
     cleaned = true;
     clearTimeout(overallTimer);
-    stats.activeRequests--;
+    activeProcesses.delete(proc);
+    releaseActiveRequestCounter("process_cleanup");
+    reconcileActiveRequestCounter("process_cleanup");
     // FIX ⑥: free the concurrency slot for a queued waiter. releaseSlot is itself idempotent,
     // and cleanup() is guarded by `cleaned`, so the slot is released exactly once on the first
     // exit path reached (proc 'exit' fires before 'close'; 'error' covers spawn failure).
@@ -1451,7 +1480,6 @@ async function callClaude(model, messages, conversationId, keyName, res) {
     proc.stderr.on("data", (d) => (stderr += d));
 
     proc.on("close", (code, signal) => {
-      activeProcesses.delete(proc);
       const elapsed = Date.now() - t0;
       cleanup();
       // Tolerate null exit code when result event was seen (sandbox-wrap noise, same
@@ -2893,6 +2921,7 @@ const server = createServer(async (req, res) => {
 
   // GET /health — comprehensive diagnostics
   if (req.url === "/health") {
+    reconcileActiveRequestCounter("health_snapshot");
     let binaryOk = false;
     try { accessSync(CLAUDE, constants.X_OK); binaryOk = true; } catch {}
 
@@ -3026,6 +3055,7 @@ const server = createServer(async (req, res) => {
   // GET /status — combined usage + health summary; uses operator token; admin only
   if (req.url === "/status" && req.method === "GET") {
     if (!isAdmin) return jsonResponse(res, 403, { error: { message: "admin only", type: "auth_error" } });
+    reconcileActiveRequestCounter("status_snapshot");
     return handleStatus(req, res);
   }
 
