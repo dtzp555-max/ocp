@@ -844,7 +844,34 @@ test("doctor falls back to currentVersion when origin/main unreachable (no stale
 // contract lives in lib/prompt.mjs. Mutation-proof: make appendOperatorPrompt
 // return `base` unconditionally and the first test fails; make it stop trimming
 // and the whitespace test fails.
-import { appendOperatorPrompt } from "./lib/prompt.mjs";
+import { appendOperatorPrompt, derivePromptCharBudget } from "./lib/prompt.mjs";
+
+console.log("\nPrompt-char budget (ADR 0009 — SPOT-derived):");
+
+// Mutation-proof: drop the ×charsPerToken and the first test fails; drop the
+// Math.max floor guard and the floor tests fail; use min() instead of max() over
+// windows and the largest-window test fails.
+test("derivePromptCharBudget: LARGEST contextWindow × 3 chars/token", () => {
+  const models = [{ contextWindow: 200000 }, { contextWindow: 100000 }];
+  assert.equal(derivePromptCharBudget(models), 600000);
+});
+
+test("derivePromptCharBudget: matches the live models.json SPOT (200k → 600k today)", () => {
+  const spot = JSON.parse(tuiReadFileSync(new URL("./models.json", import.meta.url), "utf8"));
+  assert.equal(derivePromptCharBudget(spot.models), 600000);
+});
+
+test("derivePromptCharBudget: floor wins over a tiny/absent window; empty input → floor", () => {
+  assert.equal(derivePromptCharBudget([{ contextWindow: 1000 }]), 150000, "3k chars would truncate everything — floor guards it");
+  assert.equal(derivePromptCharBudget([]), 150000);
+  assert.equal(derivePromptCharBudget(undefined), 150000);
+  assert.equal(derivePromptCharBudget([{ id: "x" }, { contextWindow: "junk" }, { contextWindow: -5 }]), 150000);
+});
+
+test("derivePromptCharBudget: charsPerToken and floor are tunable parameters", () => {
+  assert.equal(derivePromptCharBudget([{ contextWindow: 1000000 }], { charsPerToken: 3 }), 3000000);
+  assert.equal(derivePromptCharBudget([], { floor: 42 }), 42);
+});
 
 console.log("\nSystem-prompt operator append:");
 
