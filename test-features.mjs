@@ -844,7 +844,49 @@ test("doctor falls back to currentVersion when origin/main unreachable (no stale
 // contract lives in lib/prompt.mjs. Mutation-proof: make appendOperatorPrompt
 // return `base` unconditionally and the first test fails; make it stop trimming
 // and the whitespace test fails.
-import { appendOperatorPrompt } from "./lib/prompt.mjs";
+import { appendOperatorPrompt, derivePromptCharBudget, resolvePromptCharBudget } from "./lib/prompt.mjs";
+
+console.log("\nPrompt-char budget (ADR 0009 — SPOT-derived):");
+
+// Mutation-proof: drop the ×charsPerToken and the first test fails; drop the
+// Math.max floor guard and the floor tests fail; use min() instead of max() over
+// windows and the largest-window test fails.
+test("derivePromptCharBudget: LARGEST contextWindow × 3 chars/token", () => {
+  const models = [{ contextWindow: 200000 }, { contextWindow: 100000 }];
+  assert.equal(derivePromptCharBudget(models), 600000);
+});
+
+test("derivePromptCharBudget: matches the live models.json SPOT (200k → 600k today)", () => {
+  const spot = JSON.parse(tuiReadFileSync(new URL("./models.json", import.meta.url), "utf8"));
+  assert.equal(derivePromptCharBudget(spot.models), 600000);
+});
+
+test("derivePromptCharBudget: floor wins over a tiny/absent window; empty input → floor", () => {
+  assert.equal(derivePromptCharBudget([{ contextWindow: 1000 }]), 150000, "3k chars would truncate everything — floor guards it");
+  assert.equal(derivePromptCharBudget([]), 150000);
+  assert.equal(derivePromptCharBudget(undefined), 150000);
+  assert.equal(derivePromptCharBudget([{ id: "x" }, { contextWindow: "junk" }, { contextWindow: -5 }]), 150000);
+});
+
+test("derivePromptCharBudget: charsPerToken and floor are tunable parameters", () => {
+  assert.equal(derivePromptCharBudget([{ contextWindow: 1000000 }], { charsPerToken: 3 }), 3000000);
+  assert.equal(derivePromptCharBudget([], { floor: 42 }), 42);
+});
+
+// PR #179 review regression: EMPTY env value must mean "use the default" (the old
+// `parseInt(env || "150000")` contract). Mutation-proof: switch the resolver's
+// truthiness check to `!= null` and the empty-string test fails (NaN ≠ 600000).
+test("resolvePromptCharBudget: empty/unset env → SPOT-derived default, never NaN", () => {
+  const models = [{ contextWindow: 200000 }];
+  assert.equal(resolvePromptCharBudget("", models), 600000, "CLAUDE_MAX_PROMPT_CHARS= (empty) must fall back to derived");
+  assert.equal(resolvePromptCharBudget(undefined, models), 600000);
+});
+
+test("resolvePromptCharBudget: a set env value overrides the derivation absolutely", () => {
+  const models = [{ contextWindow: 200000 }];
+  assert.equal(resolvePromptCharBudget("300000", models), 300000);
+  assert.equal(resolvePromptCharBudget("150000", models), 150000, "explicit legacy value wins over the bigger derived default");
+});
 
 console.log("\nSystem-prompt operator append:");
 
