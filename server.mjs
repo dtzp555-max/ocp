@@ -49,7 +49,7 @@ import { TuiSemaphore, SemaphoreAbortError, recordTuiEntrypoint, buildTuiHealthB
 import { TuiPanePool, resolvePoolSize, POOL_MAX_SIZE } from "./lib/tui/pool.mjs";
 import { TuiDeltaAssembler, DEFAULT_HOLDBACK_CHARS, resolveStreamHoldback } from "./lib/tui/stream.mjs";
 import { createSerialMutex, createTtlCache, isTokenExpiring, orderLabelsLastGoodFirst } from "./lib/spawn-auth.mjs";
-import { appendOperatorPrompt, derivePromptCharBudget } from "./lib/prompt.mjs";
+import { appendOperatorPrompt, resolvePromptCharBudget } from "./lib/prompt.mjs";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const _pkg = JSON.parse(readFileSync(join(__dirname, "package.json"), "utf8"));
@@ -1154,9 +1154,7 @@ function buildCliArgs(cliModel, systemPrompt) {
 // English tokens), which silently under-delivered the advertised window by ~5×. The env
 // var (and the runtime settings API below) remain absolute operator overrides. If
 // models.json ever advertises a bigger window, this budget follows automatically.
-let MAX_PROMPT_CHARS = process.env.CLAUDE_MAX_PROMPT_CHARS != null
-  ? parseInt(process.env.CLAUDE_MAX_PROMPT_CHARS, 10)
-  : derivePromptCharBudget(modelsConfig.models);
+let MAX_PROMPT_CHARS = resolvePromptCharBudget(process.env.CLAUDE_MAX_PROMPT_CHARS, modelsConfig.models);
 
 // Flatten OpenAI content (string | array of parts) to plain text for the prompt.
 // Array content: concatenate text parts; replace non-text parts (e.g. image_url)
