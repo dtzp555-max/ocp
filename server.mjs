@@ -22,6 +22,8 @@
  *   CLAUDE_MAX_CONCURRENT        — max concurrent claude processes, -p/stream-json path (default: 8)
  *   CLAUDE_MAX_QUEUE             — max requests waiting for a -p slot before HTTP 429 (default: 16)
  *   OCP_TUI_MAX_CONCURRENT       — max concurrent interactive TUI turns, TUI-mode path (default: 2)
+ *   OCP_TUI_POOL_SIZE            — pre-booted warm `claude` panes held for TUI-mode (default: 0 = off;
+ *                                  max 4). Each is a live idle process; cuts ~3-4s per request.
  *   OCP_SPAWN_REAL_HOME          — "1" forces the -p spawn to use the real HOME (disables the
  *                                  latency spawn-home isolation; default: isolated when a token exists)
  *   CLAUDE_BREAKER_THRESHOLD     — failures in window before circuit opens (default: 6)
@@ -32,8 +34,8 @@
  *   CLAUDE_HEARTBEAT_INTERVAL    — SSE heartbeat interval in ms on streaming path (default: 0 = disabled)
  */
 import { createServer } from "node:http";
-import { spawn, execFileSync } from "node:child_process";
-import { randomUUID, timingSafeEqual } from "node:crypto";
+import { spawn, execFileSync, spawnSync } from "node:child_process";
+import { randomUUID, timingSafeEqual, createHash as cryptoCreateHash } from "node:crypto";
 import { readFileSync, readdirSync, accessSync, existsSync, constants, chmodSync, statSync, mkdirSync, writeFileSync, rmSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
@@ -41,12 +43,15 @@ import { homedir } from "node:os";
 import { validateKey, recordUsage, getUsageByKey, getUsageTimeline, getRecentUsage, createKey, listKeys, revokeKey, closeDb, checkQuota, updateKeyQuota, getKeyQuota, findKey, cacheHash, getCachedResponse, setCachedResponse, clearCache, getCacheStats, hasCacheControl, singleflight, getInflightStats } from "./keys.mjs";
 import { DEFAULT_PORT } from "./lib/constants.mjs";
 import { isLoopbackBind } from "./lib/net.mjs";
-import { runTuiTurn, reapStaleTuiSessions, resolveTuiHome } from "./lib/tui/session.mjs";
+import { runTuiTurn, reapStaleTuiSessions, resolveTuiHome, bootTuiPane, tuiPaneHealthy, poolPaneName, POOL_BOOT_MS } from "./lib/tui/session.mjs";
 import { detectTuiUpstreamError } from "./lib/tui/transcript.mjs";
 import { TuiSemaphore, SemaphoreAbortError, recordTuiEntrypoint, buildTuiHealthBlock } from "./lib/tui/semaphore.mjs";
+import { TuiPanePool, resolvePoolSize, POOL_MAX_SIZE } from "./lib/tui/pool.mjs";
+import { TuiDeltaAssembler, DEFAULT_HOLDBACK_CHARS, resolveStreamHoldback } from "./lib/tui/stream.mjs";
 import { createSerialMutex, createTtlCache, isTokenExpiring, orderLabelsLastGoodFirst } from "./lib/spawn-auth.mjs";
 import { hasImageContent, buildImageBlocks, buildStreamJsonInput, MultimodalError } from "./lib/multimodal.mjs";
 import { parsePositiveInt } from "./lib/env.mjs";
+import { appendOperatorPrompt, derivePromptCharBudget } from "./lib/prompt.mjs";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const _pkg = JSON.parse(readFileSync(join(__dirname, "package.json"), "utf8"));
@@ -95,8 +100,40 @@ function _collectNodeManagerCandidates(home) {
 
   return out;
 }
+function _joinIfBase(base, ...parts) {
+  return base ? join(base, ...parts) : null;
+}
+function _collectWindowsClaudeCandidates() {
+  const userProfile = process.env.USERPROFILE || process.env.HOME || "";
+  const localAppData = process.env.LOCALAPPDATA || "";
+  return [
+    _joinIfBase(userProfile, ".local", "bin", "claude.exe"),
+    _joinIfBase(localAppData, "Microsoft", "WinGet", "Links", "claude.exe"),
+    _joinIfBase(localAppData, "Microsoft", "WindowsApps", "claude.exe"),
+  ].filter(Boolean);
+}
+function _isWindowsSpawnableBinary(path) {
+  return /\.exe$/i.test(path);
+}
+function _lookupLines(out) {
+  return out.split(/\r?\n/).map(line => line.trim()).filter(Boolean);
+}
+function _warnUnspawnableWindowsMatches(lines) {
+  const unspawnable = lines.filter(p => !/\.exe$/i.test(p));
+  if (unspawnable.length > 0) {
+    console.warn(`[init] Ignoring non-exe Windows claude command(s): ${unspawnable.join(", ")}`);
+  }
+}
 function resolveClaude() {
+  const isWin = process.platform === "win32";
   if (process.env.CLAUDE_BIN) {
+    if (isWin && !_isWindowsSpawnableBinary(process.env.CLAUDE_BIN)) {
+      console.error(
+        `FATAL: CLAUDE_BIN="${process.env.CLAUDE_BIN}" is not a native Windows executable.\n` +
+        "  Set CLAUDE_BIN to claude.exe; shell shims cannot be spawned without a shell."
+      );
+      process.exit(1);
+    }
     try {
       accessSync(process.env.CLAUDE_BIN, constants.X_OK);
       return process.env.CLAUDE_BIN;
@@ -106,28 +143,43 @@ function resolveClaude() {
     }
   }
 
-  const home = process.env.HOME || "";
-  const candidates = [
-    "/opt/homebrew/bin/claude",
-    "/usr/local/bin/claude",
-    "/usr/bin/claude",
-    join(home, ".local/bin/claude"),
-    ..._collectNodeManagerCandidates(home),
-  ];
+  const home = process.env.HOME || process.env.USERPROFILE || "";
+  const candidates = isWin
+    ? _collectWindowsClaudeCandidates()
+    : [
+        "/opt/homebrew/bin/claude",
+        "/usr/local/bin/claude",
+        "/usr/bin/claude",
+        join(home, ".local/bin/claude"),
+        ..._collectNodeManagerCandidates(home),
+      ];
   for (const p of candidates) {
     try { accessSync(p, constants.X_OK); console.warn(`[init] CLAUDE_BIN not set, resolved to ${p}`); return p; } catch {}
   }
 
-  try {
-    const resolved = execFileSync("which", ["claude"], { encoding: "utf8", timeout: 5000 }).trim();
-    if (resolved) { console.warn(`[init] CLAUDE_BIN not set, resolved via which: ${resolved}`); return resolved; }
-  } catch {}
+  if (isWin) {
+    try {
+      const lines = _lookupLines(execFileSync("where.exe", ["claude"], { encoding: "utf8", timeout: 5000 }));
+      const resolved = lines.find(_isWindowsSpawnableBinary);
+      if (resolved) { console.warn(`[init] CLAUDE_BIN not set, resolved via where.exe: ${resolved}`); return resolved; }
+      _warnUnspawnableWindowsMatches(lines);
+    } catch {}
+  } else {
+    try {
+      const resolved = execFileSync("which", ["claude"], { encoding: "utf8", timeout: 5000 }).trim();
+      if (resolved) { console.warn(`[init] CLAUDE_BIN not set, resolved via which: ${resolved}`); return resolved; }
+    } catch {}
+  }
 
   console.error(
     "FATAL: claude binary not found.\n" +
-    "  Set CLAUDE_BIN=/path/to/claude or ensure claude is in PATH.\n" +
-    "  Hint: if you use nvm/fnm/asdf, set CLAUDE_BIN to the absolute path\n" +
-    "  shown by `which claude` in your interactive shell.\n" +
+    (isWin
+      ? "  Set CLAUDE_BIN to the absolute path of claude.exe or ensure claude.exe is in PATH.\n" +
+        "  Hint: npm .cmd/.bat/.ps1 shims cannot be spawned without a shell.\n" +
+        "  The .exe requirement is an intentional allow-list for shell-less spawning.\n"
+      : "  Set CLAUDE_BIN=/path/to/claude or ensure claude is in PATH.\n" +
+        "  Hint: if you use nvm/fnm/asdf, set CLAUDE_BIN to the absolute path\n" +
+        "  shown by `which claude` in your interactive shell.\n") +
     "  Checked: " + candidates.join(", ")
   );
   process.exit(1);
@@ -146,17 +198,19 @@ function resolveClaude() {
 const OCP_SYSTEM_PROMPT_WRAPPER = `You are accessed via the OCP HTTP proxy. You do NOT have access to any local filesystem, working directory, shell, git status, or machine environment. Do not infer or invent such information from any context you observe. Respond only based on the conversation provided.`;
 
 // Build the full system-prompt string: OCP_SYSTEM_PROMPT_WRAPPER prepended,
-// then any system-role messages from the request appended (separated by blank line).
-// ADR 0009 Amendment 1 analogue § "OLP system prompt wrapper".
+// then any system-role messages from the request appended (separated by blank line),
+// then the operator-wide CLAUDE_SYSTEM_PROMPT appended LAST (lib/prompt.mjs — a
+// no-op returning the same string when the var is unset, so the default path is
+// byte-for-byte unchanged). ADR 0009 Amendment 1 analogue § "OLP system prompt wrapper".
 function extractSystemPrompt(messages) {
   const systemMessages = (messages ?? []).filter(m => m.role === "system");
   if (systemMessages.length === 0) {
-    return OCP_SYSTEM_PROMPT_WRAPPER;
+    return appendOperatorPrompt(OCP_SYSTEM_PROMPT_WRAPPER, SYSTEM_PROMPT);
   }
   const clientContent = systemMessages.map(m =>
     contentToText(m.content)
   ).join("\n\n");
-  return `${OCP_SYSTEM_PROMPT_WRAPPER}\n\n${clientContent}`;
+  return appendOperatorPrompt(`${OCP_SYSTEM_PROMPT_WRAPPER}\n\n${clientContent}`, SYSTEM_PROMPT);
 }
 
 // ── NDJSON line buffer parser (Phase 6c port) ─────────────────────────────
@@ -294,6 +348,19 @@ const BREAKER_HALF_OPEN_MAX = parseInt(process.env.CLAUDE_BREAKER_HALF_OPEN_MAX 
 const HEARTBEAT_INTERVAL = parseInt(process.env.CLAUDE_HEARTBEAT_INTERVAL || "0", 10);
 const BIND_ADDRESS = process.env.CLAUDE_BIND || "127.0.0.1";
 const NO_CONTEXT = process.env.CLAUDE_NO_CONTEXT === "true";
+// Config epoch for the response cache (issue #176). The cache key hashes model + messages +
+// sampling params, but the ANSWER also depends on boot-time server config that shapes the
+// composed prompt / tool surface: the operator system prompt (#175), the OCP wrapper text,
+// the allowed-tools set, and NO_CONTEXT. The cache store is SQLite-backed and survives
+// restarts, so without this an operator who changes any of these and restarts keeps serving
+// answers composed under the OLD config until TTL expiry. Folding a digest of the four into
+// every cache key makes any change an instant, whole-cache invalidation — the honest behavior.
+// Deliberately boot-time-only: runtime-mutable settings (e.g. maxPromptChars via the settings
+// API) are excluded because a const epoch cannot track them; truncation also only drops
+// context rather than changing the instruction set.
+const CONFIG_EPOCH = cryptoCreateHash("sha256")
+  .update(JSON.stringify([SYSTEM_PROMPT, OCP_SYSTEM_PROMPT_WRAPPER, ALLOWED_TOOLS, NO_CONTEXT]))
+  .digest("hex").slice(0, 16);
 // Kill-switch for the FIX-③ default-path spawn-home isolation (see resolveSpawnHome /
 // spawnHomeMode below). When "1", the -p/stream-json spawn always runs in the operator's
 // real HOME with no cwd override — byte-for-byte the pre-isolation behaviour — even if an
@@ -351,7 +418,110 @@ const tuiSemaphore = new TuiSemaphore(TUI_MAX_CONCURRENT);
 const tuiStats = {
   lastEntrypoint: null,      // last observed cc_entrypoint from the transcript ("cli" | "sdk-cli" | null)
   entrypointMismatches: 0,   // count of cli-expected-but-got-other turns
+  streamTurns: 0,            // streamed TUI turns ATTEMPTED (counted before the honesty gates — F6)
+  streamDeltas: 0,           // MessageDisplay hook fires OBSERVED (forwarded + held-back — F6)
+  streamTopUps: 0,           // turns where the delta stream != T but was a safe PREFIX of it
+  streamDivergences: 0,      // turns REFUSED: emitted bytes were not a prefix of T
+  streamZeroDeltaTurns: 0,   // streamed turns where the hook fired ZERO times (F7 — the hook is
+                             // dead, not just one fire dropped; distinct from streamTopUps)
 };
+
+// ── TUI real streaming (backlog #2) — opt-in; default OFF ────────────────
+// When ON *and* TUI_MODE is on *and* the client asked for stream:true, the turn is emitted
+// as real SSE delta.content chunks as claude renders them, sourced from claude's own
+// MessageDisplay hook (lib/tui/stream.mjs). When OFF, the buffered
+// callClaudeTui → streamStringAsSSE path below is byte-for-byte unchanged — the spawn does
+// not even get --settings. Opt-in is deliberate: the buffered path is stable production.
+//
+// Honest expectation (docs/plans/2026-07-13-tui-latency/streaming-spike.md): this moves the
+// FIRST byte, not the last. A consumer that must parse a complete reply gains nothing; a
+// progressively-rendering chat UI gains the ~4s between first delta and last. It does not
+// move the ~6s TTFT floor of TUI mode.
+const TUI_STREAM = process.env.OCP_TUI_STREAM === "1";
+const TUI_STREAM_DIR = process.env.OCP_TUI_STREAM_DIR || `${process.env.HOME}/.ocp-tui/stream`;
+// First-bytes holdback — the auth-banner gate's (C-1) survival mechanism under streaming.
+// See TuiDeltaAssembler: nothing is emitted for a message until its TRIMMED accumulation
+// exceeds this, which puts it out of the default banner detector's <=100-char reach — the
+// FIRST of the two halves of the guarantee (see the assembler's class comment for the second:
+// no further emission at all once a message boundary follows an emit). Only raise it.
+// resolveStreamHoldback enforces the DEFAULT_HOLDBACK_CHARS floor: the "Only raise it" comment
+// above is now load-bearing, not advisory. A sub-floor value (or garbage) is clamped UP to the
+// floor and reported via `_holdback.clamped`, because a holdback below the default banner
+// detector's 100-char reach would let the first chars of a real auth banner stream before the
+// end-of-turn gate rejects the turn (the A1 leak). We can only ever raise the guarantee, never
+// weaken it below the detector's bound.
+const _holdback = resolveStreamHoldback(process.env.OCP_TUI_STREAM_HOLDBACK);
+const TUI_STREAM_HOLDBACK = _holdback.value;
+if (TUI_MODE && TUI_STREAM && _holdback.clamped) {
+  console.error(
+    `[tui] WARNING: OCP_TUI_STREAM_HOLDBACK=${JSON.stringify(process.env.OCP_TUI_STREAM_HOLDBACK)} is below the\n` +
+    `  safe floor (${DEFAULT_HOLDBACK_CHARS}) or not a number; clamped up to ${DEFAULT_HOLDBACK_CHARS}. The holdback can only be raised.`
+  );
+}
+if (TUI_MODE && TUI_STREAM && process.env.CLAUDE_TUI_ERROR_PATTERNS != null && TUI_STREAM_HOLDBACK <= DEFAULT_HOLDBACK_CHARS) {
+  // The holdback's FIRST-MESSAGE half (see TuiDeltaAssembler) is sound for the DEFAULT
+  // auth-banner detector (which cannot match a message longer than 100 chars). An
+  // operator-supplied pattern set has no such bound, so a banner longer than the holdback
+  // could reach the client before the terminal gate rejects the turn. (The second half — no
+  // further emission once a message boundary follows an emit — holds regardless of the
+  // detector; this warning is only about the first-message case.)
+  console.error(
+    `[tui] WARNING: OCP_TUI_STREAM=1 with a custom CLAUDE_TUI_ERROR_PATTERNS and holdback=${TUI_STREAM_HOLDBACK}.\n` +
+    "  The streaming holdback's first-message coverage is sound only against the DEFAULT banner\n" +
+    "  detector (<=100 chars). Raise OCP_TUI_STREAM_HOLDBACK above your longest custom banner, or\n" +
+    "  the first chars of one could be streamed before the end-of-turn gate refuses the turn."
+  );
+}
+
+// ── Warm pane pool (docs/plans/2026-07-13-tui-latency #3) — opt-in; default OFF ─────────
+// OCP_TUI_POOL_SIZE=0 (default) => tuiPool is null => runTuiTurn's cold-boot path is
+// byte-for-byte unchanged. Set it to N (clamped to POOL_MAX_SIZE) to keep N pre-booted
+// `claude` panes warm, each SINGLE-USE (see lib/tui/pool.mjs for why single-use is the
+// load-bearing rule, and lib/tui/session.mjs for the POOL/REAPER INVARIANT).
+//
+// Default-off is deliberate on a stable production path: a warm pane is a LIVE idle
+// `claude` process held whether or not a request ever arrives, so the operator must opt
+// in to that standing cost. Measured saving when on (this host, Sonnet 4.6, --effort low):
+// end-to-end p50 10.17 s (n=6, pool off) -> 6.00 s (n=12 warm hits), i.e. -41%.
+// cli.js does NOT perform this operation (Class B, OCP-owned TUI spawn) — see ADR 0007.
+const TUI_POOL_SIZE = TUI_MODE ? resolvePoolSize(process.env.OCP_TUI_POOL_SIZE) : 0;
+const tuiPool = TUI_POOL_SIZE > 0
+  ? new TuiPanePool({
+      size: TUI_POOL_SIZE,
+      // The POOL mints the pane's identity, not bootTuiPane: the tmux session exists the
+      // instant the boot starts, so the pool must be able to name (hence spare, hence kill)
+      // it before then. Name is derived from the session-id, so `tmux ls` correlates to the
+      // transcript file <HOME>/.claude/projects/*/<sessionId>.jsonl.
+      mintPane: () => {
+        const sessionId = randomUUID();
+        return { sessionId, name: poolPaneName(PORT, sessionId) };
+      },
+      bootPane: (model, ident) => bootTuiPane({
+        model,
+        claudeBin: CLAUDE,
+        home: TUI_HOME,
+        realHome: process.env.HOME,
+        cwd: TUI_CWD,
+        port: PORT,
+        entrypointMode: TUI_ENTRYPOINT,
+        sessionId: ident.sessionId,
+        name: ident.name,
+        requireReady: true,     // a pane that never reached its input bar must not be enlisted
+        bootMs: POOL_BOOT_MS,   // background pre-boot — no client is blocked, so be patient
+        // Warm panes must carry the MessageDisplay hook too, or every pool HIT would
+        // silently fall back to buffered while every MISS streamed — the two paths have to
+        // spawn identically (F4). Gated on TUI_STREAM, the deployment-wide switch — NOT on any
+        // particular request's stream:true/false, which does not exist yet at pre-boot time.
+        // The runTuiTurn cold-boot call site (callClaudeTui, below) mirrors this exact gate for
+        // the same reason. bootTuiPane derives the sink from the pane's own session-id, which is
+        // minted above, so nothing request-specific is baked in at pre-boot time.
+        streamDir: TUI_STREAM ? TUI_STREAM_DIR : null,
+      }),
+      killPane: (name) => { try { spawnSync(process.env.OCP_TUI_TMUX_BIN || "tmux", ["kill-session", "-t", name]); } catch { /* already gone */ } },
+      paneHealthy: (name) => tuiPaneHealthy((args) => spawnSync(process.env.OCP_TUI_TMUX_BIN || "tmux", args, { encoding: "utf8" }), name),
+      log: (level, event, data) => logEvent(level, event, data),
+    })
+  : null;
 
 // ── FIX ③ (latency): default-path (-p / stream-json) spawn-home isolation ──────────────
 // PROBLEM (measured, not theoretical): OCP's default spawn inherits the operator's real HOME
@@ -382,7 +552,12 @@ const SPAWN_HOME_DIR = `${process.env.HOME}/.ocp/spawn-home`;
 // erroring loudly — never a silent auth/credential corruption (there are no credentials here).
 function prepareSpawnHome(dir = SPAWN_HOME_DIR) {
   try {
-    mkdirSync(`${dir}/.claude`, { recursive: true });
+    // mode 0700, and it matters for the PARENT: with `recursive`, this call can create ~/.ocp
+    // itself on a fresh install (spawn homes live under it), and without an explicit mode that
+    // parent lands at the umask default — world-listable 0755. keys.mjs used to pre-create it
+    // 0700 as an import side effect; it no longer does (it resolves its dir lazily), so the
+    // 0700 guarantee has to be stated here rather than inherited by luck.
+    mkdirSync(`${dir}/.claude`, { recursive: true, mode: 0o700 });
     // Belt-and-braces: ensure no settings.json/plugins leak in (this home is fully ours).
     for (const f of [`${dir}/.claude/settings.json`, `${dir}/.claude/settings.local.json`]) {
       try { if (existsSync(f)) rmSync(f, { force: true }); } catch { /* best effort */ }
@@ -772,19 +947,45 @@ const cacheCleanupInterval = setInterval(() => {
 // mechanism and the 15-min cadence makes the window negligible).
 // Gated on TUI_MODE — zero effect (no kill-server, no list-sessions) when TUI is off.
 // cli.js does NOT perform this operation (Class B, OCP-owned TUI spawn) — see ADR 0007.
+//
+// WARM POOL INTERACTION (the crux — see the POOL/REAPER INVARIANT in lib/tui/session.mjs).
+// A warm pooled pane is one of OUR OWN ocp-tui-<port>-* sessions that is alive and idle BY
+// DESIGN, and this sweep fires precisely when the instance is idle — i.e. exactly when the
+// pool is full. Two things are therefore required, and both are done here:
+//   (a) DRAIN the pool BEFORE the sweep. Zombie reaping is possible ONLY via kill-server,
+//       and a live pooled pane suppresses kill-server (it is a live child of the tmux
+//       server). A permanently-full pool would otherwise permanently disable the very
+//       thing this tick exists to do. Draining costs one pane re-boot per tick (~1.2 s of
+//       background work every 15 min) and is invisible to callers: a request landing in the
+//       drain→refill gap simply MISSES the pool and takes today's cold path.
+//   (b) Pass the pool's live registry as `spare` anyway. After (a) it is empty, so this is
+//       belt-and-braces — it makes it impossible for THIS call site (or a future one) to
+//       kill a live pooled pane even if the drain were ever removed or reordered.
+// RESIDUAL (unchanged in kind from the pre-pool code, and explicitly accepted there): a
+// request arriving in the narrow window between the idle-check and kill-server has its pane
+// torn down and fails cleanly via runTuiTurn's honesty gates. The drain widens that window
+// by the cost of N kill-session calls (single-digit ms), not materially.
 const TUI_REAP_INTERVAL_MS = 15 * 60 * 1000;
 const tuiReapInterval = TUI_MODE ? setInterval(() => {
   if (tuiSemaphore.inflight > 0 || tuiSemaphore.queued > 0) return; // a turn is live — defer
   try {
+    const drained = tuiPool ? tuiPool.drain() : 0;
     // F7 fix: scope to THIS instance's own port; a sibling ocp-tui-<otherPort>-* session
     // (a second OCP instance on the same host) is treated as foreign, same as olp-tui-*.
     // includeLegacy is NOT set here — see reapStaleTuiSessions' comment: the periodic sweep
     // conservatively treats any lingering bare-prefix legacy session as foreign so it can
     // never trigger kill-server on a steady-state tick; only the one-time boot reap below
     // claims legacy-shaped zombies.
-    const n = reapStaleTuiSessions({ port: PORT });
-    if (n) logEvent("info", "tui_reaped_stale_sessions", { count: n, trigger: "periodic" });
+    const n = reapStaleTuiSessions({ port: PORT, spare: tuiPool ? tuiPool.liveNames() : null });
+    if (n || drained) {
+      logEvent("info", "tui_reaped_stale_sessions", { count: n, poolDrained: drained, trigger: "periodic" });
+    }
   } catch (e) { logEvent("error", "tui_periodic_reap_failed", { error: e.message }); }
+  finally {
+    // Refill in the background regardless of how the sweep went — a throw mid-sweep must not
+    // leave the pool permanently paused (it would silently degrade to the cold path forever).
+    if (tuiPool) { try { tuiPool.resume(); } catch { /* best effort */ } }
+  }
 }, TUI_REAP_INTERVAL_MS) : null;
 if (tuiReapInterval && typeof tuiReapInterval.unref === "function") tuiReapInterval.unref();
 
@@ -966,12 +1167,14 @@ function parseIntEnv(name, def) {
 // Truncation guard: if total chars exceed MAX_PROMPT_CHARS, keep the system
 // message(s) + first user message + last N messages, dropping the middle.
 // This prevents runaway context from gateway-side conversation accumulation.
-// Routed through parseIntEnv (hoisted above) so a misconfigured cap fails CLOSED
-// to the default rather than NaN — CLAUDE_MAX_PROMPT_CHARS=unlimited previously →
-// NaN → enforceTextBudget's `!(NaN > 0)` early-return → 500k chars passed unbounded,
-// silently defeating F2's text-budget guarantee for multimodal requests. `let` is
-// kept for the settings API. (PR #154 review round 2, gap (a).)
-let MAX_PROMPT_CHARS = parseIntEnv("CLAUDE_MAX_PROMPT_CHARS", 150000);
+// Routed through parseIntEnv so a misconfigured cap fails CLOSED to the default rather than
+// NaN — CLAUDE_MAX_PROMPT_CHARS=unlimited previously → NaN → enforceTextBudget's `!(NaN > 0)`
+// early-return → 500k chars passed unbounded, silently defeating F2's text-budget guarantee
+// (PR #154 round 2, gap (a)). The default itself is SPOT-DERIVED (ADR 0009, PR #179):
+// max(models.json contextWindow) × 3 chars/token — currently 600,000 — so the two fixes
+// compose: parseIntEnv guards a SET-but-garbage value, the derivation supplies the honest
+// default when unset/empty. `let` is kept for the settings API.
+let MAX_PROMPT_CHARS = parseIntEnv("CLAUDE_MAX_PROMPT_CHARS", derivePromptCharBudget(modelsConfig.models));
 
 // ── Multimodal image caps (issue #110) ──────────────────────────────────
 // OpenAI `image_url` parts are forwarded to claude as Anthropic image blocks via
@@ -1352,7 +1555,14 @@ async function callClaude(model, messages, conversationId, keyName, res) {
 // Authority: claude CLI v2.1.158 interactive mode (cc_entrypoint=cli).
 // SECURITY: A-path single-user ONLY — home is NOT isolation (see ADR 0007).
 // `res` (optional, F2) is the client's http.ServerResponse — see closeSignalFor.
-async function callClaudeTui(model, messages, _conversationId, _keyName, res) {
+//
+// `streamCtx` (optional, OCP_TUI_STREAM): { emit(text), signal } — when present the turn is
+// ALSO streamed live via claude's MessageDisplay hook. The contract is unchanged: this still
+// returns the TRANSCRIPT's text (T), the honesty gates still run on T before anything is
+// committed, and the cache still stores T — never the concatenated deltas. streamCtx.emit is
+// the SSE sink; streamCtx.signal is the client's disconnect signal, which tears the pane down
+// mid-turn instead of holding the semaphore slot for a dead socket.
+async function callClaudeTui(model, messages, _conversationId, _keyName, res, streamCtx = null) {
   const cliModel = MODEL_MAP[model] || model;
   const prompt = messagesToPrompt(messages); // includes system as [System] inline
   recordModelRequest(cliModel, prompt.length);
@@ -1380,6 +1590,23 @@ async function callClaudeTui(model, messages, _conversationId, _keyName, res) {
   // release() runs in a finally so any throw from runTuiTurn (tmux spawn failure,
   // paste-not-landed) OR from the honesty gates below (truncation / error banner) can NEVER
   // leak a slot. tuiSemaphore.inflight feeds /health.
+  // Streaming assembler (null when OCP_TUI_STREAM is off — then runTuiTurn gets no onDelta,
+  // spawns no hook, and behaves byte-for-byte as before). It owns the auth-banner holdback
+  // and the message scoping; see lib/tui/stream.mjs.
+  const assembler = streamCtx ? new TuiDeltaAssembler({ holdbackChars: TUI_STREAM_HOLDBACK }) : null;
+  // F6: counted here — the moment a streamed turn is ATTEMPTED — not after the honesty gates
+  // below. A turn refused by the truncation or auth-banner gate is exactly the turn an operator
+  // most wants visible in streamTurns; counting only turns that reached the gates made
+  // streamDivergences/streamTurns silently exclude its own worst cases from the denominator.
+  if (assembler) tuiStats.streamTurns++;
+  const onDelta = assembler
+    ? (payload) => {
+        const out = assembler.push(payload);
+        tuiStats.streamDeltas++; // every hook fire OBSERVED, not just forwarded ones — see the
+                                  // /health field doc in lib/tui/semaphore.mjs (F6)
+        if (out) streamCtx.emit(out); // released past the holdback — safe to show the client
+      }
+    : null;
   try {
     const { text, entrypoint, truncated } = await runTuiTurn({
       prompt,
@@ -1392,7 +1619,39 @@ async function callClaudeTui(model, messages, _conversationId, _keyName, res) {
                   // different port never collides with this instance's reap/kill-server logic.
       wallclockMs: TUI_WALLCLOCK_MS,
       entrypointMode: TUI_ENTRYPOINT,
+      // Warm pane pool (null unless OCP_TUI_POOL_SIZE > 0 → today's cold path exactly).
+      // A pooled pane is single-use: runTuiTurn kills it in its finally like any other.
+      pool: tuiPool,
+      // Only observe when the pool is ON — with it off (the default) no new log line is
+      // emitted, so the disabled path stays byte-for-byte today's, logs included.
+      onPane: tuiPool
+        ? ({ warm }) => logEvent("info", warm ? "tui_pool_hit" : "tui_pool_miss",
+            { model: cliModel, warmRemaining: tuiPool.warm })
+        : null,
+      onDelta,
+      // Gated on TUI_STREAM (the deployment-wide switch), NOT on `assembler` (this REQUEST's
+      // stream:true/false) — F4 fix. The pool's bootPane closure above installs the hook on
+      // every warm pane whenever TUI_STREAM is on, regardless of what any given future request
+      // asks for (a pre-booted pane cannot know that yet); the cold path must match, or a
+      // stream:false request gets --settings on a pool HIT and not on a pool MISS — two
+      // different spawn argvs for the identical request, which this project's alignment/billing
+      // posture cannot tolerate. Whether the hook's OUTPUT is actually consumed for THIS turn is
+      // decided downstream by `onDelta` (null when assembler is null), so a non-streaming
+      // request still never polls or emits — it just spawns identically either way.
+      streamDir: TUI_STREAM ? TUI_STREAM_DIR : null,
+      abortSignal: streamCtx ? streamCtx.signal : null,
     });
+    // ── Billing-pool observation (issue #115, #133) — A3 fix: record the entrypoint the moment
+    // runTuiTurn returns, BEFORE the honesty gates below that can throw. The entrypoint (cli vs
+    // sdk-cli) is which BILLING POOL the turn consumed; a turn that then fails a gate (wall-clock
+    // truncation, auth banner, stream divergence) STILL spent that pool — and those failed turns
+    // are exactly the ones most likely to signal a silent degrade to the metered Agent SDK pool.
+    // Recording only on the success path (the old placement) blinded /health's entrypointMismatches
+    // and lastEntrypoint to every failed turn. recordModelSuccess still runs later, only on success.
+    if (recordTuiEntrypoint(tuiStats, entrypoint, TUI_ENTRYPOINT)) {
+      logEvent("warn", "tui_entrypoint_mismatch", { expected: "cli", got: entrypoint, model: cliModel });
+    }
+
     // ── Honesty gates (issue #133) ─ run BEFORE recordModelSuccess / cache write-back.
     // A throw here propagates to the catch below (recordModelError + reject), so the
     // result never reaches the downstream setCachedResponse / singleflight / SUCCESS path.
@@ -1416,24 +1675,173 @@ async function callClaudeTui(model, messages, _conversationId, _keyName, res) {
       throw new Error("tui_upstream_error: claude CLI returned an in-session error banner instead of an answer");
     }
 
-    recordModelSuccess(cliModel, 0); // elapsed not measurable here; wallclock at reader level
-    // Assert the subscription-pool classification. TUI exists to keep cc_entrypoint=cli
-    // (subscription pool); a silent degrade to sdk-cli (metered Agent SDK pool) would still
-    // return text but cost money — warn loudly so it's visible. (issue #115)
-    // C-5: also surface the observation on /health. recordTuiEntrypoint sets lastEntrypoint
-    // unconditionally (operators can poll it to confirm cli) and increments
-    // entrypointMismatches when expected=cli but observed≠cli — the same condition the
-    // journald warning already covers — so a silent metered-pool drift is visible on /health
-    // without tailing logs.
-    if (recordTuiEntrypoint(tuiStats, entrypoint, TUI_ENTRYPOINT)) {
-      logEvent("warn", "tui_entrypoint_mismatch", { expected: "cli", got: entrypoint, model: cliModel });
+    // ── Streaming safety net — the transcript is the authority, the deltas are the mirror.
+    // Runs AFTER the two gates above (so a truncated turn or an auth banner is never
+    // reconciled, let alone flushed) and BEFORE recordModelSuccess / the caller's cache
+    // write. Three outcomes:
+    //   exact     — concat(deltas) === T. The invariant held; emit whatever is still held
+    //               back (a short answer never passes the holdback, so this is its whole text).
+    //   top-up    — what we emitted is a strict PREFIX of T but the deltas did not add up to
+    //               it (a dropped/late fire). We serve exactly T by emitting the missing tail;
+    //               the client still gets the right answer. Counted, and visible on /health.
+    //   divergence— we already emitted bytes that are NOT a prefix of T. The client is holding
+    //               text the transcript disagrees with and it cannot be retracted. REFUSE the
+    //               turn: throw → SSE error frame, no cache, no success. Serving on would be
+    //               exactly the "silently serve wrong text" failure this gate exists to stop.
+    //               (Known trigger: a tool-using turn whose pre-tool prose exceeded the
+    //               holdback — the transcript keeps only the LAST assistant message, so the
+    //               prose we streamed is text T does not contain.)
+    if (assembler) {
+      // F7: a total hook failure (a claude version bump stops honoring --settings, or a
+      // truncated md-hook.sh per F3) produces zero fires for every turn, finalize() still
+      // reports ok:true/exact:false (the transcript alone carries the whole answer), and the
+      // turn succeeds NORMALLY — degrading to buffered with no error, no divergence, nothing
+      // but streamTopUps climbing (which the comment above calls "benign"). That is
+      // indistinguishable from one late fire dropped unless it is counted separately.
+      if (assembler.deltas === 0) {
+        tuiStats.streamZeroDeltaTurns++;
+        logEvent("warn", "tui_stream_zero_deltas", { model: cliModel });
+      }
+      const rec = assembler.finalize(text);
+      if (!rec.ok) {
+        tuiStats.streamDivergences++;
+        logEvent("error", "tui_stream_divergence", {
+          model: cliModel,
+          // The dominant cause in practice: a TOOL-USING turn whose pre-tool prose exceeded the
+          // holdback and was already streamed. The transcript keeps only the LAST assistant
+          // message, so that prose is text T does not contain. Remedy for such a deployment:
+          // raise OCP_TUI_STREAM_HOLDBACK above the model's typical narration length (later first
+          // chunk, but the prose stays held back and is then correctly discarded), or leave
+          // OCP_TUI_STREAM off. See README + ADR 0007 (2026-07-13 amendment).
+          reason: assembler.restartedAfterEmit ? "multi_message_after_emit (tool-use turn?)" : "delta_transcript_mismatch",
+          emittedChars: rec.emitted, transcriptChars: rec.transcript,
+          deltas: assembler.deltas, messages: assembler.messages,
+        });
+        throw new Error("tui_stream_divergence: streamed text is not a prefix of the transcript; refusing to serve it");
+      }
+      if (!rec.exact) {
+        tuiStats.streamTopUps++;
+        logEvent("warn", "tui_stream_topup", {
+          model: cliModel, emittedChars: rec.emitted, transcriptChars: rec.transcript, deltas: assembler.deltas,
+        });
+      }
+      if (rec.tail) streamCtx.emit(rec.tail);
     }
+
+    recordModelSuccess(cliModel, 0); // elapsed not measurable here; wallclock at reader level
+    // Entrypoint/billing-pool observation was already recorded above, right after runTuiTurn
+    // returned — see the A3-fix comment there (it must cover failed turns too, so it cannot live
+    // on this success-only path).
     return text;
   } catch (err) {
+    // A mid-turn client disconnect (streaming path only — abortSignal) is NOT an upstream
+    // failure: runTuiTurn's finally already tore the pane down, and this finally releases the
+    // slot. Mirror the queued-disconnect handling above (info, no recordModelError, no
+    // response) rather than booking a phantom model error against the socket going away.
+    if (err && err.name === "TuiAbortError") {
+      logEvent("info", "tui_turn_aborted", { reason: "client_disconnected", model: cliModel });
+      throw new RequestDisconnectedError("client disconnected mid-turn; TUI pane torn down");
+    }
     recordModelError(cliModel, false);
     throw err;
   } finally {
     tuiSemaphore.release();
+  }
+}
+
+// ── TUI-mode REAL streaming (OCP_TUI_STREAM=1) ──────────────────────────
+// The stream:true + TUI_MODE + OCP_TUI_STREAM=1 path. Emits the turn as it is generated,
+// from claude's own MessageDisplay hook, instead of buffering it and replaying it with
+// streamStringAsSSE.
+//
+// WIRE SHAPES: every frame below is COPIED from callClaudeStreaming (the -p path) — the role
+// chunk, the content-delta chunk, the stop chunk, `[DONE]`, and the post-header
+// {error:{message,type}} frame. No new fields, no new shapes. (ALIGNMENT.md Rule 2 / Class B:
+// the authority for the wire format is the OpenAI chat/completions streaming spec, adopted by
+// ADR 0006; the authority for the TUI spawn is ADR 0007. No cli.js citation applies — see the
+// commit body.)
+//
+// HEADERS ARE SENT EAGERLY, exactly as the -p path does, so the existing heartbeat
+// (CLAUDE_HEARTBEAT_INTERVAL) covers the ~6s of silence before the first delta. The cost is
+// the same one the -p path already pays: after the headers are out, an upstream failure can
+// no longer be a JSON 500, so it is surfaced as the SSE error frame instead (issue #110).
+async function callClaudeTuiStreaming(model, messages, conversationId, res, authInfo = {}) {
+  const id = `chatcmpl-${randomUUID()}`;
+  const created = Math.floor(Date.now() / 1000);
+  const t0 = Date.now();
+  const promptChars = messages.reduce((a, m) => a + contentToText(m.content).length, 0);
+  let headersSent = false;
+
+  function ensureHeaders() {
+    if (res.writableEnded || res.destroyed) return false;
+    if (headersSent) return true;
+    headersSent = true;
+    res.writeHead(200, {
+      "Content-Type": "text/event-stream",
+      "Cache-Control": "no-cache",
+      "Connection": "keep-alive",
+      "X-Accel-Buffering": "no",
+    });
+    sendSSE(res, {
+      id, object: "chat.completion.chunk", created, model,
+      choices: [{ index: 0, delta: { role: "assistant" }, finish_reason: null }],
+    });
+    return true;
+  }
+
+  ensureHeaders();
+  const hb = startHeartbeat(res, HEARTBEAT_INTERVAL, conversationId);
+  // Held for the WHOLE turn (not just the queue wait): a disconnect must abort the transcript
+  // wait so runTuiTurn tears the pane down and callClaudeTui's finally frees the slot.
+  const { signal, detach } = closeSignalFor(res);
+
+  const streamCtx = {
+    signal,
+    emit(text) {
+      if (!text) return;
+      if (!ensureHeaders()) return; // client vanished — drop the write, the turn still unwinds
+      sendSSE(res, {
+        id, object: "chat.completion.chunk", created, model,
+        choices: [{ index: 0, delta: { content: text }, finish_reason: null }],
+      }, hb);
+    },
+  };
+
+  try {
+    // callClaudeTui returns the TRANSCRIPT text T after its honesty gates + the streaming
+    // reconciliation. Everything the client should see has been emitted by then.
+    const content = await callClaudeTui(model, messages, conversationId, authInfo.keyName, res, streamCtx);
+    // Cache T — never the concatenated deltas (mirrors the buffered TUI path).
+    if (CACHE_TTL > 0 && authInfo.cacheHash) {
+      try { setCachedResponse(authInfo.cacheHash, model, content); } catch (e) { logEvent("error", "cache_write_failed", { error: e.message }); }
+    }
+    if (!res.writableEnded && !res.destroyed) {
+      sendSSE(res, {
+        id, object: "chat.completion.chunk", created, model,
+        choices: [{ index: 0, delta: {}, finish_reason: "stop" }],
+      }, hb);
+      res.write("data: [DONE]\n\n");
+      res.end();
+    }
+    try { recordUsage({ keyId: authInfo.keyId, keyName: authInfo.keyName, model, promptChars, responseChars: content.length, elapsedMs: Date.now() - t0, success: true }); } catch (e) { logEvent("error", "usage_record_failed", { error: e.message }); }
+  } catch (err) {
+    // Client walked away (queued OR mid-turn): nothing to write to, nothing to record —
+    // same quiet outcome as every other disconnect path (L1 / F2).
+    if (err instanceof RequestDisconnectedError) { try { res.end(); } catch {} return; }
+    try { recordUsage({ keyId: authInfo.keyId, keyName: authInfo.keyName, model, promptChars, responseChars: 0, elapsedMs: Date.now() - t0, success: false }); } catch (e) { logEvent("error", "usage_record_failed", { error: e.message }); }
+    console.error(`[proxy] error: ${err.message}`);
+    // Headers are already out (eager, above), so — exactly like the -p path — the failure is
+    // surfaced as an SSE error frame, NOT a success-looking finish_reason:"stop". This is what
+    // keeps a truncated turn, an auth banner, or a stream divergence from being served as an
+    // answer: the client sees an error, and nothing was cached.
+    if (!res.writableEnded && !res.destroyed) {
+      sendSSE(res, { error: { message: sanitizeError(err.message), type: "provider_error" } }, hb);
+      res.write("data: [DONE]\n\n");
+      res.end();
+    }
+  } finally {
+    hb.stop();
+    detach();
   }
 }
 
@@ -2362,8 +2770,9 @@ async function handleChatCompletions(req, res) {
       req._cacheHash = null;
       logEvent("info", "cache_skipped", { reason: "cache_control_present" });
     } else {
-      // D1: include keyId in hash to isolate per-key cache pools (v2 format)
-      const hash = cacheHash(model, messages, { keyId: req._authKeyId, temperature: parsed.temperature, max_tokens: parsed.max_tokens, top_p: parsed.top_p });
+      // D1: include keyId in hash to isolate per-key cache pools (v2 format).
+      // configEpoch (#176): any boot-config change that shapes answers invalidates the cache.
+      const hash = cacheHash(model, messages, { keyId: req._authKeyId, temperature: parsed.temperature, max_tokens: parsed.max_tokens, top_p: parsed.top_p, configEpoch: CONFIG_EPOCH });
       req._cacheHash = hash; // store for later write-back
       try {
         const cached = getCachedResponse(hash, CACHE_TTL);
@@ -2386,6 +2795,11 @@ async function handleChatCompletions(req, res) {
   }
 
   if (stream) {
+    if (TUI_MODE && TUI_STREAM) {
+      // TUI-mode REAL streaming (opt-in): emit delta.content chunks as claude renders them,
+      // via its MessageDisplay hook. The transcript remains authoritative (gates + cache).
+      return callClaudeTuiStreaming(model, messages, conversationId, res, { keyId: req._authKeyId, keyName: req._authKeyName, cacheHash: req._cacheHash });
+    }
     if (TUI_MODE) {
       // TUI-mode: no real token stream — buffer the full turn via callClaudeTui,
       // optionally write-back to cache, then replay as chunked SSE.
@@ -2684,9 +3098,17 @@ const server = createServer(async (req, res) => {
       // still appears with enabled:false (cheap, harmless) so the shape is stable.
       // entrypointMismatches/lastEntrypoint exist so an operator can poll /health to catch a
       // silent metered-pool drift (the audit's top risk after the 6/15 billing flip).
+      // `pool` is a NEW nested field inside the (already additive) tui block: null when the
+      // warm pool is off (the default), so the disabled shape is unchanged apart from one
+      // explicit null. Lets the operator confirm hit rate + standing process cost.
+      //
+      // streamEnabled + the stream* counters are likewise ADDITIVE (new fields only, same
+      // grandfathered B.2 rationale — ADR 0006). streamDivergences is the one an operator
+      // must watch: a non-zero value means a streamed turn was REFUSED because the deltas
+      // disagreed with the transcript, which is the streaming path's only correctness risk.
       tui: buildTuiHealthBlock(
-        { enabled: TUI_MODE, entrypointMode: TUI_ENTRYPOINT, maxConcurrent: TUI_MAX_CONCURRENT },
-        tuiStats, tuiSemaphore,
+        { enabled: TUI_MODE, entrypointMode: TUI_ENTRYPOINT, maxConcurrent: TUI_MAX_CONCURRENT, streamEnabled: TUI_MODE && TUI_STREAM },
+        tuiStats, tuiSemaphore, tuiPool,
       ),
     });
   }
@@ -2923,6 +3345,27 @@ function gracefulShutdown(signal) {
   if (tuiReapInterval) clearInterval(tuiReapInterval);
   closeDb();
 
+  // 2b. Drain the warm pane pool. A pooled `claude` is a child of the tmux SERVER, not of
+  // this node process, so it is NOT in activeProcesses and step 3 below cannot reach it —
+  // without this explicit drain every warm pane would outlive OCP as an orphan (and the
+  // pool's in-memory registry dies with the process, so nothing would remember it owned them).
+  //
+  // drain() kills the pane that is currently BOOTING too, and it does so SYNCHRONOUSLY. That
+  // is required, not incidental: step 4 below calls process.exit(0) in THIS SAME TICK whenever
+  // activeProcesses is empty — which on a TUI host it always is — so any cleanup a boot
+  // deferred to a .then()/.catch() would simply never run. (That was a real bug: the pool used
+  // to track in-flight boots as a count, could not name the booting session, and orphaned a
+  // live authenticated `claude` on every shutdown that landed mid-boot.)
+  //
+  // Orphans that survive anyway (SIGKILL, power loss) are still caught by the next instance's
+  // boot reap — this makes the graceful path clean, it is not the only safety net.
+  if (tuiPool) {
+    try {
+      const drained = tuiPool.drain();
+      if (drained) logEvent("info", "tui_pool_drained", { count: drained, trigger: "shutdown" });
+    } catch (e) { logEvent("error", "tui_pool_drain_failed", { error: e.message }); }
+  }
+
   // 3. Kill all active child processes
   for (const proc of activeProcesses) {
     try { proc.kill("SIGTERM"); } catch {}
@@ -2992,11 +3435,19 @@ server.listen(PORT, BIND_ADDRESS, () => {
       ? (TUI_HOME === process.env.HOME ? "env-token (real home — unset OCP_TUI_HOME for credential isolation)" : "env-token (credential-isolated home — no credentials.json)")
       : "credentials.json (no CLAUDE_CODE_OAUTH_TOKEN — see Troubleshooting #401)";
     console.log(`  TUI-mode: ON home=${TUI_HOME} cwd=${TUI_CWD} auth=${tuiAuth} wallclock=${TUI_WALLCLOCK_MS}ms maxConcurrent=${TUI_MAX_CONCURRENT}`);
+    console.log(TUI_POOL_SIZE > 0
+      ? `  TUI warm pool: ON size=${TUI_POOL_SIZE} — ${TUI_POOL_SIZE} idle \`claude\` process(es) held warm; first request per model is still a cold MISS`
+      : `  TUI warm pool: OFF (set OCP_TUI_POOL_SIZE=1..${POOL_MAX_SIZE} to pre-boot panes and cut ~3-4s per request)`);
     try {
       // F7 fix: scope to THIS instance's own port (see reapStaleTuiSessions). includeLegacy:
       // true ONLY here — the one-time boot reap is the designated point to claim orphaned
       // bare-prefix ("ocp-tui-<uuid8>") zombie sessions left by a PRE-fix process generation
       // of this same instance (no live post-fix instance ever creates that shape again).
+      // No `spare`: the warm pool is EMPTY at boot (there is no boot-time pre-warm — the pool
+      // learns its model from the first request), so this reap has no live pane to protect and
+      // it is exactly what SHOULD claim any ocp-tui-<port>-p* pool orphans left by a previous
+      // process generation of this instance (POOL/REAPER INVARIANT property 2). If a future
+      // change ever pre-warms at boot, this call MUST start passing tuiPool.liveNames().
       const n = reapStaleTuiSessions({ port: PORT, includeLegacy: true });
       if (n) logEvent("info", "tui_reaped_stale_sessions", { count: n });
     } catch {}

@@ -176,5 +176,5 @@ If you want to continue using OCP without TUI-mode after 2026-06-15, budget for 
 
 - [615-canary runbook](./615-canary.md) — how to verify billing pool routing after a flip
 - [ADR 0007](../adr/0007-tui-interactive-mode.md) — TUI-mode architecture; Kill-switch section
-- README § [Subscription-pool (TUI) mode](../../README.md#subscription-pool-tui-mode)
+- [Subscription-pool (TUI) mode](../tui-mode.md#subscription-pool-tui-mode)
 - README § [Environment Variables](../../README.md#environment-variables) — `CLAUDE_TUI_MODE`, `OCP_TUI_ALLOW_LAN=1`

@@ -6,25 +6,73 @@ import { join } from "node:path";
 import { mkdirSync, chmodSync } from "node:fs";
 import { homedir } from "node:os";
 
-const OCP_DIR = join(homedir(), ".ocp");
-mkdirSync(OCP_DIR, { recursive: true, mode: 0o700 });
-// Tighten the directory mode in case it already existed with broader permissions.
-try { chmodSync(OCP_DIR, 0o700); } catch { /* ignore EPERM on pre-existing dirs */ }
-const DB_PATH = join(OCP_DIR, "ocp.db");
+// Resolved LAZILY, on first getDb() — not at module top-level. Two reasons, and the second is
+// the bug this fixes:
+//
+//  1. Merely IMPORTING keys.mjs should not, as a side effect, create directories in the
+//     operator's home.
+//  2. OCP_DIR_OVERRIDE exists so the test suite can point the key store at a scratch dir — and
+//     because ESM hoists imports, a top-level `const OCP_DIR = ...` here would be evaluated
+//     BEFORE an importing module's body could set the env var. Eager resolution made the
+//     override unsettable in the one place that needs it. (test-features.mjs carried a comment
+//     claiming it could "set env before the first getDb() call" — it could not, because nothing
+//     here ever read an env var. So `npm test` wrote real, UNREVOKED api_keys rows into the
+//     operator's live ~/.ocp/ocp.db: two per run, unbounded — 737 junk keys against 12 real ones
+//     on the maintainer's host — and two concurrent runs raced one file, which is the ~1-in-6
+//     flake in `listKeys includes quota fields`.)
+//
+// The override is gated on NODE_ENV === "test", and that gate is the ACTUAL guard. An earlier
+// cut of this fix relied on the variable merely having an awkward name — i.e. a naming convention
+// plus a comment — which is precisely the failure mode this whole change exists to indict (a
+// comment describing an intention that nothing enforces). The two-key gate means NEITHER var
+// alone does anything: a stray OCP_DIR_OVERRIDE with no NODE_ENV is inert, and NODE_ENV=test with
+// no override just resolves the default dir.
+//
+// This gate does NOT, by itself, prove a production daemon can't be redirected — an earlier
+// version of this comment overclaimed that ("a production server runs without NODE_ENV, so it
+// CANNOT honor the override no matter how the variable got in"). That is only true while the
+// daemon's env actually lacks NODE_ENV=test, which is an assumption, not something this file can
+// enforce. What makes it hold in the shipped configuration is defense-in-depth in OCP's launchers:
+// the plist/systemd units strip both vars on every (re)install (scripts/lib/plist-merge.mjs
+// NEVER_PRESERVE), and `ocp` restart's manual nohup fallback strips them (`env -u`). So a server
+// OCP itself started cannot carry the test-only redirection. The one residual path is an operator
+// who hand-launches `node server.mjs` with BOTH vars explicitly exported, bypassing every
+// launcher — a case no library-level gate can catch. The loud getDb() log below ("NOT the default
+// ~/.ocp/ocp.db") is the backstop there: a wrong key store is at least never silent (in
+// AUTH_MODE=multi that would otherwise be a total auth outage with nothing on /health to show it).
+function resolveOcpDir() {
+  const override = process.env.NODE_ENV === "test" ? process.env.OCP_DIR_OVERRIDE : null;
+  const dir = override || join(homedir(), ".ocp");
+  mkdirSync(dir, { recursive: true, mode: 0o700 });
+  // Tighten the directory mode in case it already existed with broader permissions.
+  try { chmodSync(dir, 0o700); } catch { /* ignore EPERM on pre-existing dirs */ }
+  return dir;
+}
 
 let db;
+let dbPath;   // resolved on first open, alongside the db handle
 
 export function getDb() {
   if (!db) {
-    db = new DatabaseSync(DB_PATH);
+    dbPath = join(resolveOcpDir(), "ocp.db");
+    // Say which store we opened. Silence was the other half of the bug: a server on the wrong
+    // key store looks exactly like a server on the right one until every request 401s.
+    if (dbPath !== join(homedir(), ".ocp", "ocp.db")) {
+      console.error(`[keys] key store: ${dbPath} (NOT the default ~/.ocp/ocp.db)`);
+    }
+    db = new DatabaseSync(dbPath);
     db.exec("PRAGMA journal_mode = WAL");
     db.exec("PRAGMA foreign_keys = ON");
     initSchema();
     // Tighten mode on the DB file (0600) after creation / first open.
-    try { chmodSync(DB_PATH, 0o600); } catch { /* ignore — same-user access still works */ }
+    try { chmodSync(dbPath, 0o600); } catch { /* ignore — same-user access still works */ }
   }
   return db;
 }
+
+// Which file the key store actually opened. Exported so a test can ASSERT it is not the
+// operator's real db — the bug this replaced was invisible precisely because nothing checked.
+export function getDbPath() { return dbPath; }
 
 function initSchema() {
   db.exec(`
@@ -307,6 +355,11 @@ export function cacheHash(model, messages, opts = {}) {
   if (opts.temperature != null) h.update(`t:${opts.temperature}`);
   if (opts.max_tokens != null) h.update(`mt:${opts.max_tokens}`);
   if (opts.top_p != null) h.update(`tp:${opts.top_p}`);
+  // #176: fold the server's boot-config epoch into the key, so a config change that shapes
+  // answers (operator system prompt, wrapper text, allowed tools, NO_CONTEXT) invalidates
+  // the persistent cache instead of serving answers composed under the old config. Callers
+  // that omit it (older paths, tests) hash byte-identically to before.
+  if (opts.configEpoch != null) h.update(`ce:${opts.configEpoch}|`);
   for (const m of messages) {
     h.update(m.role || "");
     h.update(typeof m.content === "string" ? m.content : JSON.stringify(m.content));
@@ -426,5 +479,5 @@ export function findKey(idOrName) {
 }
 
 export function closeDb() {
-  if (db) { db.close(); db = null; }
+  if (db) { db.close(); db = null; dbPath = undefined; }  // clear both — a path to a closed db is a footgun
 }

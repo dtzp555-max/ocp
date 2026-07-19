@@ -20,12 +20,23 @@ OpenClaw       ───┘
 
 One proxy. Multiple IDEs. All models. **$0 API cost.**
 
+## Contents
+
+- [Why OCP?](#why-ocp) · [Supported Tools](#supported-tools)
+- [Quickstart](#quickstart)
+- [How It Works](#how-it-works)
+- Reference: [Available Models](#available-models) · [API Endpoints](#api-endpoints) · [Environment Variables](#environment-variables)
+- Modes & operations: [LAN & multi-user](#lan--multi-user) → [`docs/lan-mode.md`](docs/lan-mode.md) · [Subscription-pool (TUI) mode](#subscription-pool-tui-mode) → [`docs/tui-mode.md`](docs/tui-mode.md) · [Upgrading](#upgrading) → [`docs/upgrading.md`](docs/upgrading.md)
+- [Built-in Usage Monitoring](#built-in-usage-monitoring) · [Response Cache](#response-cache) · [Images / Multimodal](#images--multimodal-vision) · [OpenClaw Integration](#openclaw-integration)
+- [Troubleshooting](#troubleshooting) → [`docs/troubleshooting.md`](docs/troubleshooting.md)
+- [Repository Layout](#repository-layout) · [Security](#security) · [Governance](#governance) · [Support OCP](#support-ocp) · [License](#license)
+
 ## Why OCP?
 
 There are several Claude proxy projects. OCP picks a specific lane: **align tightly with what `cli.js` actually does, observe + multiplex what's already there, don't extend the protocol.** What you get:
 
-- **LAN multi-user keys** (v3.7.0) — share one Claude Pro/Max subscription with family, friends, or your own devices. Each user gets a per-key API token (no OAuth session leak), with independent usage tracking and one-line revocation.
-- **`ocp-connect` one-shot IDE setup** — one command on the client machine detects and configures Claude Code, Cursor, Cline, Continue.dev, OpenCode, and OpenClaw. No pasting `OPENAI_BASE_URL` six times.
+- **LAN multi-user keys** (v3.7.0) — reach one Claude Pro/Max subscription from your own devices across the LAN. Each device gets a per-key API token (no OAuth session leak), with independent usage tracking and one-line revocation. Pro/Max are **per-user** accounts — see [Sharing with family / a team — honest limits](docs/lan-mode.md#deployment-model--security-read-this) before extending access to other **people**.
+- **`ocp-connect` one-shot client setup** — one command on the client machine auto-configures OpenClaw, and detects Cursor, Cline, Continue.dev, and opencode to print ready-to-paste setup hints for each. No hunting for where each tool keeps its `OPENAI_BASE_URL`.
 - **Response cache with per-key isolation + singleflight** (v3.13.0). Optional SHA-256 prompt cache, isolated per API key (cross-user pollution is impossible by hash construction, not by application logic), with stampede protection on concurrent identical prompts. Off by default. ([PR #65](https://github.com/dtzp555-max/ocp/pull/65), [PR #66](https://github.com/dtzp555-max/ocp/pull/66))
 - **Per-key request quotas** (v3.8.0). Daily / weekly / monthly limits per key — set a kid's iPad to 20/day, a partner's laptop to 100/week. ([PR #18](https://github.com/dtzp555-max/ocp/pull/18))
 - **SSE heartbeat for long reasoning** ([v3.12.0](https://github.com/dtzp555-max/ocp/releases/tag/v3.12.0), opt-in). If you've ever watched your IDE die at the 60s idle mark during a long Claude tool-use pause — that's nginx/Cloudflare default behavior. OCP emits an SSE comment frame to keep the connection alive without polluting the response. ([PR #49](https://github.com/dtzp555-max/ocp/pull/49))
@@ -49,7 +60,7 @@ OCP and the alternatives serve adjacent but distinct needs. Pick the one that fi
 | GitHub stars / ecosystem size | small | large | mid |
 | Governance discipline (CI-enforced alignment with cli.js) | yes | n/a | n/a |
 
-**Plain English**: `claude-code-router` is the routing-and-switching power tool — pick it if you want to mix Anthropic, OpenAI, Gemini, and local models behind one endpoint. `anthropic-proxy` is the minimal forwarder. **OCP focuses on disciplined `cli.js`-aligned forwarding plus subscription multiplexing** — pick it if you want to share one Claude Pro/Max subscription across IDEs, devices, and people, with LAN auth, quotas, and a governance contract that prevents endpoint drift.
+**Plain English**: `claude-code-router` is the routing-and-switching power tool — pick it if you want to mix Anthropic, OpenAI, Gemini, and local models behind one endpoint. `anthropic-proxy` is the minimal forwarder. **OCP focuses on disciplined `cli.js`-aligned forwarding plus subscription multiplexing** — pick it if you want to reach one Claude Pro/Max subscription from your own IDEs and devices, with LAN auth, quotas, and a governance contract that prevents endpoint drift.
 
 ### Related: OLP — Open LLM Proxy
 
@@ -72,195 +83,58 @@ Any tool that accepts `OPENAI_BASE_URL` works with OCP:
 
 [^openclaw]: **OpenClaw** is an IDE-agnostic AI coding agent (sibling project to OCP). When OCP runs on the same machine, OpenClaw can use it as a local provider — see `scripts/sync-openclaw.mjs` and ADR 0004.
 
-## Installation
+## Quickstart
 
 The simplest path: ask your AI.
 
   Paste this prompt to Claude Code / Cursor / Copilot:
 
   ```
-  Install OCP for me. Read README §Manual Installation and follow it.
+  Install OCP for me. Read README §Quickstart and follow it.
   Tell me when I need to run `claude auth login`.
   ```
 
-The AI will run `git clone`, `npm install`, `node setup.mjs`, and tell you
-when to OAuth.
+The AI will run `git clone`, `npm install`, `node setup.mjs`, and tell you when to OAuth.
 
-### Manual Installation
-
-OCP has two roles: **Server** (runs the proxy, needs Claude CLI) and **Client** (connects to a server, zero dependencies).
-
-```
-┌─ Server (always-on device) ─────────────────────────────┐
-│  Mac mini / NAS / Raspberry Pi / Desktop                │
-│  Claude CLI + OCP server → bound to 0.0.0.0:3456       │
-└───────────────────────┬─────────────────────────────────┘
-                        │ LAN
-    ┌───────────────────┼───────────────────┐
-    ▼                   ▼                   ▼
- Laptop             Phone/Tablet        Pi / Server
- (client)           (browser)           (client)
-```
-
----
-
-### Quick install with AI assistance
-
-If you've got Claude Code, Cursor, or any other AI coding assistant on this machine, you can copy-paste one of these prompts and let the AI walk through the install for you. Each prompt pins the AI to the right README section, names the verification step, and forbids silent retries — so you stay in the loop.
-
-**Single-machine use** — install OCP for IDEs on this same machine only:
-
-```text
-I want to install OCP on this machine to use my Claude Pro/Max subscription
-as an OpenAI-compatible API for local IDEs.
-
-Please follow https://github.com/dtzp555-max/ocp/blob/main/README.md
-"Server Setup" → "Single-machine use" path:
-
-1. Verify prerequisites: macOS or Linux, Node.js 22.5+, git, Claude CLI
-   installed and logged in (`claude auth status`). Install missing pieces
-   using my system's package manager.
-2. git clone the repo, cd in, and run `node setup.mjs`.
-3. Verify with `curl http://127.0.0.1:3456/v1/models` (should list 5 models).
-4. Add `export OPENAI_BASE_URL=http://127.0.0.1:3456/v1` to my shell rc.
-5. Tell me to reload my shell and try a tool like Cline / Continue / Cursor.
-
-Before each step, tell me what you'll run and wait for confirmation.
-On any error, diagnose first — don't auto-retry.
-```
-
-**LAN mode (server)** — install OCP as a server so your own devices on the LAN can reach it (Claude Pro/Max are per-user accounts — review Anthropic's Usage Policy before extending access to other people):
-
-```text
-I want to install OCP on this device as a LAN server so my own devices on the
-network can reach my Claude Pro/Max subscription through a local
-OpenAI-compatible endpoint.
-
-Please follow https://github.com/dtzp555-max/ocp/blob/main/README.md
-"Server Setup" → "LAN mode" path:
-
-1. Verify prerequisites: macOS or Linux (Windows not supported), Node.js
-   22.5+, git, Claude CLI installed and authenticated.
-2. Generate a strong admin key with `openssl rand -base64 32`. Save it —
-   I'll need it to manage per-user keys later.
-3. git clone https://github.com/dtzp555-max/ocp.git && cd ocp
-4. Run `node setup.mjs --bind 0.0.0.0 --auth-mode multi`.
-5. Add OCP_ADMIN_KEY to my shell rc (~/.zshrc or ~/.bashrc).
-6. Run `ocp lan` to show me the LAN IP and connect command.
-7. Optionally create example keys: `ocp keys add laptop`, `ocp keys add tablet`.
-8. Verify: `curl http://127.0.0.1:3456/v1/models` returns 5 models.
-
-Tell me each step before running it. On error, diagnose before retrying.
-```
-
-**Client connect** — configure this device to use an existing OCP server on your LAN:
-
-```text
-There's an OCP server at <SERVER_IP> on my LAN. Configure this machine to
-use it for any local IDEs (Cursor, Cline, Continue.dev, OpenCode, Claude
-Code, OpenClaw).
-
-Server IP: <SERVER_IP>
-API key (leave blank if the server has anonymous mode enabled): <OPTIONAL_KEY>
-
-Please follow https://github.com/dtzp555-max/ocp/blob/main/README.md
-"Client Setup" path:
-
-1. Download ocp-connect:
-     curl -fsSL https://raw.githubusercontent.com/dtzp555-max/ocp/main/ocp-connect -o ocp-connect
-     chmod +x ocp-connect
-2. Run `./ocp-connect <SERVER_IP>` (add `--key <KEY>` if you have one).
-3. Follow any IDE-specific manual hints it prints.
-4. Verify: `curl http://<SERVER_IP>:3456/v1/models` returns 5 models.
-5. Tell me to reload my shell + restart any IDE that was already running.
-
-Don't auto-retry on error. Tell me the failure mode first.
-```
-
-> If you'd rather do everything manually, the **Server Setup** and **Client Setup** sections below have the same steps in handbook form.
-
----
-
-### Server Setup
-
-> **Recommended:** Install OCP on a device that stays powered on — Mac mini, NAS, Raspberry Pi, or a desktop that doesn't sleep. This ensures all clients always have access.
-
-**Prerequisites:**
-- macOS or Linux (Windows is not supported — `setup.mjs` installs launchd / systemd auto-start)
-- Node.js 22.5+ (Node 23+ recommended — `node:sqlite` is fully stable without flags from 23.0; on 22.5–22.x it works behind `--experimental-sqlite`)
-- `git`
-- [Claude CLI](https://docs.anthropic.com/en/docs/claude-cli) — install and authenticate:
-  ```bash
-  npm install -g @anthropic-ai/claude-code
-  claude auth login   # prints a URL + code — open URL on any browser, sign in, paste code back
-  ```
-  Headless servers (Pi / NAS / VPS without a desktop browser): see [Headless install notes](#headless-install-notes) below.
+**Prerequisites:** macOS or Linux (Windows is not supported), Node.js 22.5+ (Node 23+ recommended), `git`, and the [Claude CLI](https://docs.anthropic.com/en/docs/claude-cli), authenticated:
 
 ```bash
-# 1. Clone and run setup
+npm install -g @anthropic-ai/claude-code
+claude auth login   # prints a URL + code — open on any browser, sign in, paste code back
+```
+
+**Install** (Server role — runs the proxy):
+
+```bash
 git clone https://github.com/dtzp555-max/ocp.git
 cd ocp
 node setup.mjs
 ```
 
-The setup script will:
-1. Verify Claude CLI is installed and authenticated
-2. Start the proxy on port 3456
-3. Install auto-start (launchd on macOS, systemd on Linux)
+`setup.mjs` verifies the Claude CLI, starts the proxy on port 3456, and installs auto-start (launchd on macOS, systemd on Linux). The `ocp` CLI lands at `~/ocp/ocp` — symlink it onto your PATH (`sudo ln -sf ~/ocp/ocp /usr/local/bin/ocp`, or `ln -sf ~/ocp/ocp ~/.local/bin/ocp`) or alias it (`alias ocp=~/ocp/ocp`); the rest of the docs assume `ocp` is on your PATH.
 
-After install the `ocp` CLI lives at `~/ocp/ocp`. To put it on your PATH, either symlink it manually (`ln -sf ~/ocp/ocp ~/.local/bin/ocp` if `~/.local/bin` is on your PATH, or `sudo ln -sf ~/ocp/ocp /usr/local/bin/ocp` for a system-wide symlink) or add an alias (`alias ocp=~/ocp/ocp`). Otherwise invoke it as `~/ocp/ocp <subcommand>`. The rest of this README assumes `ocp` is on your PATH.
+**Verify** — should list 6 models:
 
-**Single-machine use** — just set your IDE to use the proxy:
+```bash
+curl http://127.0.0.1:3456/v1/models
+# claude-opus-4-8, claude-opus-4-7, claude-opus-4-6, claude-sonnet-5, claude-sonnet-4-6, claude-haiku-4-5-20251001
+```
+
+**Connect one IDE** — point any OpenAI-compatible tool at the proxy, then reload your shell and start a tool (Cline / Continue / Cursor / OpenCode):
+
 ```bash
 export OPENAI_BASE_URL=http://127.0.0.1:3456/v1
 ```
 
-**LAN mode** — share with other devices on your network:
+See [Supported Tools](#supported-tools) for per-tool config.
+
+**LAN / multi-user** — reach OCP from your own devices, with per-key auth, quotas, and anonymous access:
+
 ```bash
-# Enable LAN access with per-user auth (recommended)
 node setup.mjs --bind 0.0.0.0 --auth-mode multi
 ```
 
-Then create API keys for each person/device:
-```bash
-# Generate a strong admin key (one-time — save it for later key management):
-export OCP_ADMIN_KEY=$(openssl rand -base64 32)
-# Add the same export line to ~/.zshrc or ~/.bashrc so it persists.
-
-ocp keys add wife-laptop
-#  ✓ Key created for "wife-laptop"
-#    API Key: ocp_example12345abcde...
-#    Copy this key now — you won't see it again.
-
-ocp keys add son-ipad
-ocp keys add pi-server
-```
-
-Run `ocp lan` to see your IP and ready-to-share instructions.
-
-**Verify:**
-```bash
-curl http://127.0.0.1:3456/v1/models
-# Returns: claude-opus-4-8, claude-opus-4-7, claude-opus-4-6, claude-sonnet-4-6, claude-haiku-4-5-20251001
-```
-
-#### Headless install notes
-
-OCP is designed for always-on devices that often don't have a desktop browser — Mac mini, NAS, Raspberry Pi, cloud VPS. The Claude CLI auth flow still works headless:
-
-**Option 1 — interactive OAuth over SSH (one-shot).** `claude auth login` prints a URL + 8-digit code. Open the URL on **any** device with a browser (your laptop, phone), sign in to your Anthropic account, and paste the code back into the SSH session. No browser needed on the server itself.
-
-**Option 2 — long-lived token (auth once, no re-prompts).**
-
-```bash
-claude setup-token   # subscription-backed long-lived token
-```
-
-Same Claude subscription as Option 1; the token is stored in Claude CLI's normal config location. Useful when you'd rather not redo the OAuth flow when sessions expire.
-
-If `claude auth login` errors out with something like `cannot open browser`, you've hit the same case — fall back to either option above.
-
----
+The full LAN server + client handbook, headless (Pi / NAS / VPS) OAuth, key/quota/anonymous-access management, AI-assisted install prompts, and the deployment/security model live in **[docs/lan-mode.md](docs/lan-mode.md)**. Claude Pro/Max are per-user accounts — read the [honest limits of sharing](docs/lan-mode.md#deployment-model--security-read-this) before extending access to other people.
 
 ### Uninstall
 
@@ -271,234 +145,164 @@ node uninstall.mjs
 
 Removes the launchd (macOS) or systemd (Linux) auto-start entry. Handles both legacy (`ai.openclaw.proxy` / `openclaw-proxy`) and current (`dev.ocp.proxy` / `ocp-proxy`) service names. Does not delete `~/.openclaw/`, `~/.ocp/`, or the cloned repo — remove those manually if desired.
 
----
+## How It Works
 
-### Client Setup
+```
+Your IDE → OCP (localhost:3456) → claude --output-format stream-json CLI → Anthropic (via subscription)
+```
 
-> Clients do **not** need to install Node.js, Claude CLI, or the OCP repo. Only `curl` and `python3` are required (pre-installed on most Linux/Mac systems).
->
-> **Find the server's LAN IP** by running `ocp lan` on the server machine — it prints both the IP and a ready-to-share connect command.
+OCP translates OpenAI-compatible `/v1/chat/completions` requests into `claude --output-format stream-json` CLI calls. Anthropic sees normal Claude Code usage — no API billing, no separate key needed.
 
-**One-command setup** — download the lightweight `ocp-connect` script:
+> **Billing-policy status (as of 2026-07).** Anthropic announced (2026-05-14) that from 2026-06-15 the `claude -p` / Agent SDK path would move to a separate metered credit pool — then **paused the change on its effective date**: *"For now, nothing has changed: Claude Agent SDK, `claude -p`, and third-party app usage still draw from your subscription's usage limits"* ([official help article](https://support.claude.com/en/articles/15036540-use-the-claude-agent-sdk-with-your-claude-plan)). So the default path above currently bills your subscription. Anthropic has said it will give notice before any future change; if the split re-lands, OCP's opt-in [subscription-pool (TUI) mode](docs/tui-mode.md#subscription-pool-tui-mode) is the ready-made hedge — see the billing table there.
+
+### Client-tools boundary
+
+OCP is a **text-prompt bridge** to the official `claude` CLI. It does **not** pass through OpenAI `tools`/`functions` payloads or Anthropic `tool_use` blocks to the client. Clients (Cline, Cursor, OpenClaw, etc.) pointed at OCP receive **assistant TEXT only** — they never get `tool_calls` to execute locally.
+
+Any tool use happens server-side, under the `--allowedTools` set configured on the OCP host. In default mode (no `CLAUDE_NO_CONTEXT`), the `claude` CLI's own built-in tools are available to the model; in TUI mode, the operator controls the tool surface via `OCP_TUI_FULL_TOOLS`. Either way, the tools run under the operator's credentials on the server, and the client sees only the final text output.
+
+**Client-local tool execution is not supported by design.** Supporting it would require bypassing the `claude` CLI to call the raw Anthropic API directly — that is a different product, and is out of scope per `ALIGNMENT.md` (every OCP endpoint must correspond to something `cli.js` actually does).
+
+**What this means for choosing OCP (workload fit).** LAN/multi-device OCP is built for **chat-class** workloads — Q&A, translation, scripting against the API, chat frontends, home-automation backends — where text in/text out is the whole job. It is **not** the right tool for a coding agent running on a *client* machine that needs the AI to read and edit *that machine's* files: tools execute on the OCP host, so the model can never touch the client's filesystem. For that workload, run `claude` (or a local OCP) directly on the machine where the code lives.
+
+## Available Models
+
+| Model ID | Notes |
+|----------|-------|
+| `claude-opus-4-8` | Most capable (default for `opus` alias) |
+| `claude-opus-4-7` | Previous Opus, retained for pinning |
+| `claude-opus-4-6` | Older Opus, retained for pinning |
+| `claude-sonnet-5` | Latest Sonnet (default for `sonnet` alias) |
+| `claude-sonnet-4-6` | Previous Sonnet, retained for pinning |
+| `claude-haiku-4-5-20251001` | Fastest, lightweight (default for `haiku` alias) |
+
+The canonical list lives in [`models.json`](./models.json) — the single source of truth as of v3.11.0. Both `server.mjs` (the `/v1/models` endpoint) and `setup.mjs` (the OpenClaw registration) derive from it. Adding a new model is now a one-file edit:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/dtzp555-max/ocp/main/ocp-connect -o ocp-connect
-chmod +x ocp-connect
-./ocp-connect <server-ip>
+# 1. Edit models.json — add an entry
+# 2. Bump version, commit, tag, push
+# 3. Users get it on next `ocp update`:
+#    - OpenClaw: auto-synced via scripts/sync-openclaw.mjs
+#    - Cline / Aider / Cursor / opencode: live /v1/models, picks up immediately
+#    - Continue.dev: user edits their own config.json
 ```
 
-**Zero-config** — when the server admin has set `PROXY_ANONYMOUS_KEY` *and* opted in with `PROXY_ADVERTISE_ANON_KEY=1` (see [Anonymous Access](#anonymous-access-optional) below), just pass the server IP and nothing else. `ocp-connect` reads the anonymous key from `/health` and uses it automatically. Without the opt-in, `/health` does not expose the key (issue #109); pass `--key` or rely on anonymous access instead:
+## API Endpoints
+
+| Endpoint | Method | Description |
+|----------|--------|-------------|
+| `/v1/models` | GET | List available models |
+| `/v1/chat/completions` | POST | Chat completion (streaming + non-streaming) |
+| `/health` | GET | Comprehensive health check (includes a `tui` block for TUI-mode drift/concurrency monitoring) |
+| `/usage` | GET | Plan usage limits + per-model stats |
+| `/status` | GET | Combined overview (usage + health) |
+| `/settings` | GET/PATCH | View or update settings at runtime |
+| `/logs` | GET | Recent log entries (`?n=20&level=error`) |
+| `/sessions` | GET/DELETE | List or clear active sessions |
+| `/dashboard` | GET | Web dashboard (always public) |
+| `/api/keys` | GET/POST | List or create API keys (admin only) |
+| `/api/keys/:id` | DELETE | Revoke an API key (admin only) |
+| `/api/keys/:id/quota` | GET/PATCH | View or set per-key quota (admin only) |
+| `/api/usage` | GET | Per-key usage stats (`?since=&until=&hours=&limit=`); returns self only by default — pass `?all=true` (admin only) for all-keys data |
+| `/cache/stats` | GET | Cache statistics (admin only) |
+| `/cache` | DELETE | Clear response cache (admin only) |
+
+## Environment Variables
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `CLAUDE_PROXY_PORT` | `3456` | Listen port (server-side). Also consumed by the OpenClaw `ocp-plugin` to dial the local proxy. |
+| `OCP_PROXY_URL` | *(unset)* | Plugin-side full URL override (e.g. `http://10.0.0.5:3456`). Wins over `CLAUDE_PROXY_PORT` when both are set. Read by `ocp-plugin/index.js` only — server ignores it. |
+| `CLAUDE_BIND` | `127.0.0.1` | Bind address (`0.0.0.0` for LAN access) |
+| `CLAUDE_AUTH_MODE` | `none` | Auth mode: `none`, `shared`, or `multi` |
+| `OCP_ADMIN_KEY` | *(unset)* | Admin key for key management (multi mode) |
+| `CLAUDE_BIN` | *(auto-detect)* | Path to claude binary |
+| `CLAUDE_TIMEOUT` | `600000` | Request timeout (ms, default: 10 min) |
+| `CLAUDE_HEARTBEAT_INTERVAL` | `0` | Streaming SSE keepalive interval (ms). `0` = disabled. See ["Streaming heartbeat"](#streaming-heartbeat) below. |
+| `CLAUDE_MAX_CONCURRENT` | `8` | Max concurrent claude processes (`-p`/stream-json path) |
+| `CLAUDE_MAX_QUEUE` | `16` | Max requests **waiting** for a `-p` concurrency slot. Beyond `CLAUDE_MAX_CONCURRENT`, requests queue (up to this cap) instead of being rejected; when the queue is **also** full, the request gets `HTTP 429` + `Retry-After` (not an opaque 500). Surfaced on `/health.concurrency` + `/health.stats.queueRejections`. |
+| `CLAUDE_QUEUE_RETRY_AFTER` | `5` | Seconds advertised in the `Retry-After` header on a `-p` concurrency-overflow `429`. |
+| `CLAUDE_MAX_PROMPT_CHARS` | *(derived)* | Prompt truncation limit in chars. Default derives from the models.json SPOT: `max(contextWindow) × 3` — currently **600,000** (≈150–200k tokens). Setting this env var (or the runtime settings API) overrides the derivation absolutely. See [ADR 0009](docs/adr/0009-spot-derived-prompt-budget.md). Note: very large prompts burn subscription-window quota quickly and slow TTFT; the TUI-mode paste path is untested beyond ~hundreds of KB. Applies to **text only** — image bytes bypass this budget (see [Images / Multimodal](#images--multimodal-vision)). |
+| `CLAUDE_SESSION_TTL` | `3600000` | Session expiry (ms, default: 1 hour) |
+| `CLAUDE_CACHE_TTL` | `0` | Response cache TTL (ms, 0 = disabled). Set to e.g. `300000` for 5-min cache. See [Response Cache](#response-cache). |
+| `CLAUDE_ALLOWED_TOOLS` | `Bash,Read,...,Agent` | Comma-separated tools to pre-approve |
+| `CLAUDE_SKIP_PERMISSIONS` | `false` | Bypass all permission checks |
+| `CLAUDE_MCP_CONFIG` | *(unset)* | Path to an MCP server config JSON, passed to the spawned `claude` as `--mcp-config` (both the `-p` path and TUI `OCP_TUI_FULL_TOOLS` panes) |
+| `CLAUDE_MAX_BODY_SIZE` | `5242880` | Max request body size (bytes, default 5 MB). Base64 image payloads inflate ~33%; raise this to admit larger multimodal requests. Fail-closed parsing: a garbage value keeps the default. |
+| `CLAUDE_IMAGE_ALLOW_URL` | `false` | Allow remote `http(s)` image URLs in `image_url` parts. **Off by default** (v1 supports base64 `data:` URIs only). When on, the URL is passed through to Anthropic as a `url` image source — **OCP does not fetch it** (no OCP-side SSRF surface); unreachable/blocked URLs surface as an API error. |
+| `CLAUDE_MAX_IMAGE_BYTES` | `5242880` | Per-image decoded-byte cap (default 5 MB). Over-cap images get `HTTP 413`. |
+| `CLAUDE_MAX_IMAGES` | `20` | Max image parts per request. Over-cap gets `HTTP 413`. |
+| `CLAUDE_MAX_IMAGE_TOTAL_BYTES` | `20971520` | Aggregate decoded-byte cap across all images in a request (default 20 MB). Over-cap gets `HTTP 413`. |
+| `CLAUDE_SYSTEM_PROMPT` | *(unset)* | Operator-wide system-prompt text appended (last) to every request's composed system prompt on the default `-p` path. TUI-mode panes are unaffected (they keep the interactive CLI's own system prompt). Echoed truncated on `/health.systemPrompt`. Note: changing this value and restarting auto-invalidates the response cache (the key carries a boot-config epoch, #177). |
+| `CLAUDE_NO_CONTEXT` | `false` | Suppress CLAUDE.md and auto-memory injection (pure API mode) |
+| `PROXY_API_KEY` | *(unset)* | Bearer token for shared-mode authentication |
+| `PROXY_ANONYMOUS_KEY` | *(unset)* | Well-known anonymous key (multi mode) — this exact string bypasses `validateKey()` and grants public access. Exposed via `/health.anonymousKey` only to localhost, or to all callers when `PROXY_ADVERTISE_ANON_KEY=1`. Full setup + security notes: [docs/lan-mode.md § Anonymous Access](docs/lan-mode.md#anonymous-access-optional). |
+| `PROXY_ADVERTISE_ANON_KEY` | *(unset)* | When `=1`, advertise `PROXY_ANONYMOUS_KEY` in the public `/health` body for remote zero-config discovery. Default off — `/health` is unauthenticated, so this exposes the shared key to any LAN-reachable device (issue #109). Localhost always sees it regardless. |
+| `CLAUDE_TUI_MODE` | `false` | **Opt-in, single-user only.** Set to `"true"` to serve requests via interactive `claude` (`cc_entrypoint=cli`, subscription pool). Refuses to boot under `AUTH_MODE=multi`. See [Subscription-pool (TUI) mode](docs/tui-mode.md#subscription-pool-tui-mode). |
+| `CLAUDE_CODE_OAUTH_TOKEN` | *(unset)* | OAuth bearer token — highest-precedence credential for the `-p` path, and the **recommended** credential for TUI-mode hosts (when set with `OCP_TUI_HOME` unset, OCP runs the TUI `claude` in a credential-isolated home). See [docs/tui-mode.md](docs/tui-mode.md#tui-other-vars) and the [permanent-401 fix](docs/troubleshooting.md#tui-401). |
+| `OCP_SPAWN_REAL_HOME` | *(unset)* | Kill-switch for the default `-p`/stream-json **spawn-home isolation** (latency fix). When unset and an OAuth token is resolvable, OCP runs the per-request `claude` spawn in a **credential-free minimal scratch home** (`$HOME/.ocp/spawn-home`, no `.credentials.json`/`settings.json`/plugins) with a neutral cwd and the env token — so it loads none of the operator's heavy global `~/.claude` (plugins/skills/hooks) or the project `CLAUDE.md`, cutting per-request latency (measured ~10–28s → ~3–7s). Set to `"1"` to force the legacy real-`HOME` spawn (no cwd override) even when a token exists. With **no** resolvable token, OCP falls back to the real `HOME` automatically (zero regression). Active mode is shown at startup and on `/health.spawn`. |
+| `CLAUDE_TUI_WALLCLOCK_MS` | `120000` | (TUI-mode) Maximum time in ms to wait for the native transcript to signal turn completion. Increase for long Opus thinking turns. |
+| `OCP_TUI_CWD` | `$HOME/.ocp-tui/work` | (TUI-mode) Scratch working directory where interactive claude sessions run. Transcripts land under `<HOME>/.claude/projects/<encoded-cwd>/`. Created automatically. |
+| `OCP_TUI_HOME` | *(auto)* | (TUI-mode) `HOME` claude runs under. When unset, OCP auto-picks a credential-isolated scratch home (env token set) or the real home (no token). Full home/credential strategy: [docs/tui-mode.md](docs/tui-mode.md#tui-other-vars). |
+| `OCP_TUI_ENTRYPOINT` | `cli` | (TUI-mode) Billing-classifier labeling: `cli` pins `cc_entrypoint=cli`; `auto` self-classifies via TTY; `off` leaves inherited env untouched. See [docs/tui-mode.md](docs/tui-mode.md#tui-entrypoint). |
+| `OCP_TUI_EFFORT` | `low` | (TUI-mode) `--effort` level for the interactive spawn (`low`/`medium`/`high`/`xhigh`/`max`/`inherit`). Explicit `low` cuts TTFT p50 ~40% vs an inherited `xhigh`; invalid values fall back to `low`. See [docs/tui-mode.md](docs/tui-mode.md#tui-other-vars). |
+| `OCP_TUI_STREAM` | `0` (off) | (TUI-mode) `=1` emits real SSE `delta.content` chunks (block-level) from claude's `MessageDisplay` hook instead of buffering; transcript stays authoritative and divergent turns are refused. Caveats (tool-using turns, zero-delta detection) in [docs/tui-mode.md § `OCP_TUI_STREAM`](docs/tui-mode.md#ocp-tui-stream). |
+| `OCP_TUI_STREAM_HOLDBACK` | `100` | (TUI-mode, streaming) Characters withheld before the first chunk — keeps the auth-banner gate alive and is the knob for tool-using turns. See [docs/tui-mode.md § `OCP_TUI_STREAM_HOLDBACK`](docs/tui-mode.md#ocp-tui-stream-holdback). |
+| `OCP_TUI_STREAM_DIR` | `$HOME/.ocp-tui/stream` | (TUI-mode, streaming) Directory for the hook script/settings + per-session delta sink (one sink per session-id, so concurrent turns never interleave). See [docs/tui-mode.md](docs/tui-mode.md#ocp-tui-stream). |
+| `OCP_TUI_STREAM_POLL_MS` | `100` | (TUI-mode, streaming) Interval at which OCP drains the delta sink; the hook fires at block granularity so a finer poll buys nothing. See [docs/tui-mode.md](docs/tui-mode.md#ocp-tui-stream). |
+| `OCP_TUI_MAX_CONCURRENT` | `2` | (TUI-mode) Max concurrent interactive TUI turns, independent of `CLAUDE_MAX_CONCURRENT`. Excess turns queue (bounded); a full queue yields 503. See [docs/tui-mode.md](docs/tui-mode.md#tui-other-vars). |
+| `OCP_TUI_POOL_SIZE` | `0` (off) | (TUI-mode) Number of pre-booted warm `claude` panes (max `4`) so a request skips the cold boot — measured p50 `10.17s` → `6.00s`. Each warm pane is a live idle process; panes are single-use. See [docs/tui-mode.md § `OCP_TUI_POOL_SIZE`](docs/tui-mode.md#ocp-tui-pool-size). |
+| `OCP_SKIP_AUTH_TEST` | *(unset)* | When `=1`, skip the `claude -p` auth probe during `setup.mjs`. Under the announced (currently **paused**) 2026-06-15 billing split this probe would draw from the metered Agent SDK credit pool; set this to avoid burning a probe on re-installs or `ocp update` runs. Auth is validated at the first real request. |
+| `OCP_TUI_FULL_TOOLS` | *(unset)* | (TUI-mode, **single-user only**) `=1` grants the interactive session the same tool surface as the `-p` path (`--allowedTools` + optional `--mcp-config`) so a trusted single operator can run a tool-using / MCP agent on the subscription pool. Safe because TUI refuses to boot under `AUTH_MODE=multi`. See [docs/tui-mode.md § `OCP_TUI_FULL_TOOLS`](docs/tui-mode.md#ocp-tui-full-tools). |
+
+### Streaming heartbeat
+
+When `CLAUDE_HEARTBEAT_INTERVAL` is set to a positive integer (milliseconds), OCP emits an SSE comment frame (`: keepalive\n\n`) on streaming responses whenever the stream has been idle for that duration. The timer resets on every real chunk, so heartbeats only fire during genuine silent windows (for example, Claude CLI tool-use pauses of 30s–5min, or a long "processing large contexts" delay before the first token).
+
+Use cases: downstream HTTP clients or load balancers with idle-connection timeouts that would otherwise abort a slow-but-alive request. `CLAUDE_HEARTBEAT_INTERVAL=30000` (30s) is a reasonable starting value if your downstream has a 60s idle timeout.
+
+Heartbeats are inert SSE comment lines — conforming SSE clients ignore them. If your downstream client's SSE parser crashes on comment frames, leave this disabled (the default) and file an issue so we can consider an alternate frame format.
+
+OCP also sends `X-Accel-Buffering: no` on SSE responses so nginx-default proxy buffering does not hold heartbeats in an upstream buffer.
+
+### Runtime settings (no restart needed)
+
+Many tunables can be changed live via `ocp settings <key> <value>` (or `PATCH /settings`) without restarting:
+
+```
+$ ocp settings maxPromptChars 200000
+✓ maxPromptChars = 200000
+
+$ ocp settings maxConcurrent 4
+✓ maxConcurrent = 4
+```
+
+## LAN & multi-user
+
+Run OCP as a server on an always-on device and reach your one Claude Pro/Max subscription from your own laptops, phones, and Pis across the LAN — with per-key API tokens, per-key usage tracking + quotas, response-cache isolation, and one-command client setup (`ocp connect` / `ocp-connect`). A shared **anonymous key** covers simple trusted-family sharing.
 
 ```bash
-./ocp-connect <server-ip>
-```
-
-If the server requires a key, pass it with `--key`:
-```bash
-./ocp-connect <server-ip> --key <your-api-key>
-```
-
-Or as a one-liner (no file saved):
-```bash
-curl -fsSL https://raw.githubusercontent.com/dtzp555-max/ocp/main/ocp-connect | bash -s -- <server-ip>
-```
-
-Example:
-```
-$ ./ocp-connect 192.168.1.100
-
-OCP Connect v1.3.0
-─────────────────────────────────────
-  Remote: http://192.168.1.100:3456
-
-  Checking connectivity...
-  ✓ Connected
-
-  Remote OCP v3.11.0  (auth: multi)
-
-  ⓘ Using server-advertised anonymous key: ocp_publ...n_v1
-    (set by admin via PROXY_ANONYMOUS_KEY; see issue #12 §14 Path A)
-
-  Testing API access...
-  ✓ API accessible (5 models available)
-
-  Shell config:
-    ✓ .bashrc
-    ✓ .zshrc
-    OPENAI_BASE_URL=http://192.168.1.100:3456/v1
-
-  System-level (launchctl):
-    ✓ OPENAI_BASE_URL set for GUI apps and daemons
-
-  IDE Configuration
-  ─────────────────────────────────────
-  Detected: OpenClaw (~/.openclaw/openclaw.json)
-
-  Configure OpenClaw to use this OCP? [Y/n] y
-  Provider name (models show as <name>/model-id) [ocp]: ocp
-
-  How should OCP models be configured?
-    1) Primary — use OCP by default, keep existing models as backup
-    2) Backup  — keep current primary, add OCP as additional option
-
-  Choice [1]: 1
-
-  Writing OpenClaw config...
-    ✓ Per-agent auth profile seeded (2):
-      • ~/.openclaw/agents/main/agent/auth-profiles.json
-      • ~/.openclaw/agents/macbook_bot/agent/auth-profiles.json
-  ✓ OpenClaw configured
-    Provider: ocp
-    Models:
-      • ocp/claude-opus-4-8
-      • ocp/claude-opus-4-7
-      • ocp/claude-opus-4-6
-      • ocp/claude-sonnet-4-6
-      • ocp/claude-haiku-4-5-20251001
-    Priority: PRIMARY (default model)
-
-    Restart OpenClaw to apply: openclaw gateway restart
-
-  Running smoke test...
-  ✓ Smoke test passed: OK
-    Note: smoke test only verifies OCP is reachable and the key is valid.
-    It does not verify your IDE/agent end-to-end. To verify OpenClaw works,
-    restart it (`openclaw gateway restart`) and send a test message to your bot.
-
-  Done. Reload your shell to apply:
-    source ~/.zshrc
-```
-
-The script automatically:
-- Writes env vars to all relevant shell rc files (`.bashrc`, `.zshrc`)
-- Sets system-level env vars (`launchctl setenv` on macOS, `environment.d` on Linux)
-- **Auto-discovers anonymous key** from `/health.anonymousKey` when no `--key` given (v1.3.0+, requires server v3.10.0+; server must also set `PROXY_ADVERTISE_ANON_KEY=1` — see [Anonymous Access](#anonymous-access-optional))
-- Configures OpenClaw automatically (including per-agent `auth-profiles.json` for multi-agent setups)
-- Detects Cline, Continue.dev, Cursor, and opencode, and prints setup hints (manual configuration required for these IDEs)
-
-On macOS, `launchctl setenv` vars reset on reboot — re-run `ocp-connect` after restart.
-
-**Manual setup** — if you prefer not to use the script:
-```bash
-export OPENAI_BASE_URL=http://<server-ip>:3456/v1
-export OPENAI_API_KEY=ocp_<your-key>
-```
-Add these lines to `~/.bashrc` or `~/.zshrc` to persist across sessions.
-
----
-
-### Monitoring (Server-side)
-
-```bash
-# Per-key usage stats
-ocp usage --by-key
-#  Key                  Reqs   OK  Err  Avg Time
-#  wife-laptop             5    5    0      8.0s
-#  son-ipad                3    3    0      6.2s
-
-# Manage keys
-ocp keys              # List all keys
-ocp keys revoke son-ipad   # Revoke a key
-```
-
-**Web Dashboard:** Open `http://<server-ip>:3456/dashboard` in any browser for real-time monitoring — per-key usage, request history, plan utilization, and system health.
-
-![OCP Dashboard](docs/images/dashboard.png)
-
-### Auth Modes
-
-| Mode | Env | Use Case |
-|------|-----|----------|
-| `none` | `CLAUDE_AUTH_MODE=none` | Trusted home network, no auth needed |
-| `shared` | `CLAUDE_AUTH_MODE=shared` + `PROXY_API_KEY=xxx` | Everyone shares one key |
-| `multi` | `CLAUDE_AUTH_MODE=multi` + `OCP_ADMIN_KEY=xxx` | Per-person keys for usage tracking + quotas (trusted users only — see Deployment model below) |
-
-> **Usage scope (v3.14.0+):** `/api/usage` returns the caller's own rows by default. Admin callers must pass `?all=true` to retrieve data for all keys; doing so emits an audit log line.
-
-### Deployment model & security (read this)
-
-**What OCP is built for today: single-user, multi-IDE.** Run OCP as a server on one machine and point all of *your own* IDEs/devices at it — one Claude Pro/Max subscription, used everywhere. This is the primary, solid use case.
-
-**Sharing with family / a team — honest limits.** You *can* share OCP on a LAN, but be clear about what the auth modes do and don't give you:
-
-- The per-key modes (`shared` / `multi`) give per-key **usage tracking, quotas, and cache separation** — useful for seeing who used what and capping budgets.
-- They do **not** give a **security isolation boundary**. The spawned `claude` runs with the **operator's filesystem access** and is *not* sandboxed per key. **Only share with people you fully trust, on a trusted network.**
-- For simple trusted family sharing, the easiest setup is a single shared **anonymous key** (see [Anonymous Access](#anonymous-access-optional)) — no per-person separation, same trust assumption.
-- **Account terms and ToS — read before sharing with others.** Claude Pro/Max are *per-user* accounts. Pooling a single subscription across **multiple distinct people** may violate Anthropic's Consumer Terms of Service and risk account suspension by the abuse classifier. The defensible framing is **"one person, your own devices"** — sharing with friends or a team is not. OCP does not change your account terms, and whether any particular sharing setup complies with the ToS is the account holder's responsibility. Review Anthropic's Usage Policy before extending access to other people.
-
-**Real per-user isolation (sandboxed, multi-tenant-safe) is planned for after 2026-06-15** — per-key ephemeral home + tool lockdown + an OS sandbox. Until then, treat a multi-user OCP as a *trusted-group convenience*, not a security boundary. (This is also why `CLAUDE_TUI_MODE` is single-user-only — see [Subscription-pool (TUI) mode](#subscription-pool-tui-mode).)
-
-### Anonymous Access (optional)
-
-In `multi` mode, the admin can designate a single well-known "anonymous" key that bypasses `validateKey()` and grants public read/write access. This is useful for letting LAN users (or clients like OpenClaw multi-agent setups) connect without individual per-user keys.
-
-**Enable**:
-
-The anonymous key is wired into the service unit (launchd plist on macOS, systemd unit on Linux) at install time. Export `PROXY_ANONYMOUS_KEY` in your shell before running `setup.mjs`, and `setup.mjs` will write it into the service unit env so the auto-started proxy picks it up:
-
-```bash
-export PROXY_ANONYMOUS_KEY=ocp_public_anon   # or any string of your choice
 node setup.mjs --bind 0.0.0.0 --auth-mode multi
+ocp keys add laptop     # then: ocp lan  → prints the LAN IP + connect command
 ```
 
-If OCP is already installed without it, re-export the env var and re-run `node setup.mjs` (the installer is idempotent — it refreshes the service unit). Then `ocp restart` so the running proxy picks up the new env. Setting `PROXY_ANONYMOUS_KEY` only in your interactive shell **does not** affect the auto-started proxy — the service unit is the source of truth for its environment.
+⚠️ The per-key modes give usage tracking, quotas, and cache separation — **not** a security isolation boundary. The spawned `claude` runs with the operator's filesystem access and is not sandboxed per key, so only share with people you fully trust, on a trusted network. Pro/Max are per-user accounts; pooling across distinct people may violate Anthropic's ToS.
 
-**Client side**: the anonymous key value is exposed via `GET /health` as the field `anonymousKey` (null when not set) **only to localhost callers** or when the admin has also set `PROXY_ADVERTISE_ANON_KEY=1` (default off — see issue #109). With that opt-in, clients like `ocp-connect` can auto-discover and use it, so the end user doesn't need to get a personal key from the admin.
+Full server + client handbook, headless OAuth, AI-assisted install prompts, key/quota/anonymous-access management, monitoring dashboard, and the [deployment/security model & honest limits](docs/lan-mode.md#deployment-model--security-read-this): **[docs/lan-mode.md](docs/lan-mode.md)**.
 
-**Security note**: setting this env var is an **opt-in** to public access — anyone who can reach your OCP endpoint can use it, up to any rate limits you configure. Don't enable this on internet-exposed OCP instances without additional protection.
+## Subscription-pool (TUI) mode
 
-**Not a secret**: because `/health` is an unauthenticated endpoint, the anonymous key is **publicly readable** by anyone who can reach the server. That is intentional — the key exists so clients can self-configure without out-of-band coordination. Treat it as a convenience handle, not as an access credential.
+**Opt-in, single-user only.** `CLAUDE_TUI_MODE=true` serves requests through interactive `claude` (no `-p`, `cc_entrypoint=cli`) so they bill the Pro/Max **subscription pool** instead of the metered Agent SDK path. Because `claude` runs with the operator's filesystem access, it is **single-operator only** — never enable it on a multi-user OCP (it refuses to boot under `AUTH_MODE=multi`).
 
-### Per-Key Quota (Budget Control)
+> **⚠️ Status (as of 2026-07): a hedge, not a necessity.** The 2026-06-15 billing split that made this matter was announced, then **paused on its effective date** — the default `-p` path currently bills your subscription. TUI-mode is kept ready for if/when a reworked change lands (Anthropic has promised advance notice).
 
-Prevent any single user from exhausting your subscription. Set daily, weekly, or monthly request limits per API key:
+Setup, the ~6-second latency floor, real-SSE streaming (`OCP_TUI_STREAM`), the warm-pane pool (`OCP_TUI_POOL_SIZE`), full-tool mode (`OCP_TUI_FULL_TOOLS`), `/health` drift monitoring, and the flip/canary runbooks: **[docs/tui-mode.md](docs/tui-mode.md)**.
 
-```bash
-# Set a daily limit of 50 requests for a key
-curl -X PATCH http://127.0.0.1:3456/api/keys/wife-laptop/quota \
-  -H "Authorization: Bearer $OCP_ADMIN_KEY" \
-  -d '{"daily": 50}'
+## Upgrading
 
-# Set multiple limits at once
-curl -X PATCH http://127.0.0.1:3456/api/keys/son-ipad/quota \
-  -H "Authorization: Bearer $OCP_ADMIN_KEY" \
-  -d '{"daily": 20, "weekly": 100}'
+Run **`ocp update`** — it smart-picks the path. A **patch bump** (e.g. `v3.21.0 → v3.21.1`) takes the light path (git pull + npm install + restart); a **cross-minor** jump (e.g. `v3.18 → v3.22`) takes the full path (pre-flight, snapshot, `setup.mjs` with plist env-merge, restart, post-flight `/health` + `/v1/models` verification). `ocp update --check` shows available updates without applying.
 
-# Check current quota + usage
-curl http://127.0.0.1:3456/api/keys/wife-laptop/quota
-# → { "daily": { "limit": 50, "used": 12 }, "weekly": { "limit": null, "used": 34 }, ... }
-
-# Remove a limit (set to null)
-curl -X PATCH http://127.0.0.1:3456/api/keys/wife-laptop/quota \
-  -d '{"daily": null}'
-```
-
-When a key exceeds its quota, OCP returns HTTP 429 with a structured error:
-```json
-{
-  "error": {
-    "message": "Quota exceeded: 50/50 requests (daily). Resets 6h 12m.",
-    "type": "quota_exceeded",
-    "quota": { "period": "daily", "limit": 50, "used": 50, "resetsIn": "6h 12m" }
-  }
-}
-```
-
-- `null` = unlimited (default for all keys)
-- Only successful requests count toward quota
-- Admin and anonymous users are never subject to quotas
-- PATCH is a partial update — omitted fields are left unchanged
-
-> **Note:** quotas are best-effort. Under concurrent bursts a key can exceed its cap by up to the server's max-concurrency (default 8), and cache hits are not counted toward quota. They cap budgets for cooperative family use, not adversarial abuse.
-
-### Important Notes
-
-- All users share your Claude Pro/Max **rate limits** (5h session + 7d weekly)
-- `ocp usage` shows how much quota remains
-- Keys are stored in `~/.ocp/ocp.db` (SQLite, zero external dependencies)
-- Admin key is required for key management API endpoints
-- The dashboard (`/dashboard`) and health check (`/health`) are always public
-- File modes for `~/.ocp` (0700), `admin-key` + `ocp.db` (0600) are auto-tightened at server startup as of v3.14.0
+Manual flags, rollback (`ocp update --rollback`), snapshots, and the OpenClaw model auto-sync (v3.11.0+): **[docs/upgrading.md](docs/upgrading.md)**.
 
 ## Built-in Usage Monitoring
 
@@ -526,6 +330,8 @@ Total           23
 Proxy: up 6h 32m | 23 reqs | 0 err | 0 timeout
 ```
 
+**Web Dashboard:** open `http://<host>:3456/dashboard` in any browser for real-time per-key usage, request history, plan utilization, and system health (screenshot + details in [docs/lan-mode.md § Monitoring](docs/lan-mode.md#monitoring-server-side)).
+
 ### All Commands
 
 ```
@@ -552,203 +358,34 @@ ocp update --check     Check for updates without applying
 ocp --help             Command reference
 ```
 
-### Install the CLI
-
-```bash
-# Symlink to PATH (recommended)
-sudo ln -sf $(pwd)/ocp /usr/local/bin/ocp
-
-# Verify
-ocp --help
-```
-
-> **Cloud/Linux servers:** If `ocp: command not found`, the binary isn't in PATH. Full path: `~/.openclaw/projects/ocp/ocp`
-
-## Upgrading
-
-The simplest path: ask your AI.
-
-  Paste this prompt:
-
-  ```
-  Upgrade my OCP. Run `ocp update` and follow whatever it says.
-  If it tells me to run `claude auth login`, I'll do that.
-  ```
-
-What `ocp update` does:
-
-- **Patch bump** (e.g. `v3.14.0 → v3.14.1`):
-  light path (git pull + npm install + restart).
-- **Cross-minor** (e.g. `v3.10 → v3.14`):
-  full path: pre-flight check, snapshot, `setup.mjs` (with plist env-merge),
-  service restart, post-flight `/health` and `/v1/models` verification.
-- **Old version** (< v3.4.0):
-  fresh-install. Pre-v3.4 lacked admin-key/usage-db, so there is nothing to
-  migrate. Your OAuth token (managed by the Claude Code CLI, not OCP) is
-  preserved; you do not need to re-OAuth unless your token expired
-  separately.
-
-Snapshots are saved to `~/.ocp/upgrade-snapshot-<ISO-ts>/` and never
-auto-deleted. Clean old ones with `rm -rf ~/.ocp/upgrade-snapshot-*` once
-you're confident the upgrade is stable.
-
-### Manual upgrade — same command, no AI
-
-```bash
-ocp update                  # smart-pick path
-ocp update --check          # show available updates, don't apply
-ocp update --dry-run        # preview plan
-ocp update --target v3.13.0 # pin a specific version
-ocp update --rollback --yes # restore most recent snapshot (--yes confirms)
-ocp update --rollback --list      # list snapshots, no mutation
-ocp update --rollback --dry-run   # preview rollback plan
-```
-
-### When upgrade fails
-
-`ocp update` prints a recovery line on failure. To restore from the snapshot:
-
-```bash
-ocp update --rollback --yes   # --yes confirms the destructive restore
-ocp doctor
-```
-
-If `ocp doctor` still reports problems after rollback, open a GitHub issue
-with the snapshot path and the doctor JSON output (`ocp doctor --json`).
-
-### OpenClaw Auto-Sync (v3.11.0+)
-
-Whenever the model list in [`models.json`](./models.json) changes, `ocp update` automatically reconciles your OpenClaw config so the model dropdown stays in sync — no more "I upgraded OCP but my Telegram bot still shows the old models" surprises.
-
-**What gets synced** (and only this — all other config keys are preserved):
-- `models.providers."claude-local".models` in `~/.openclaw/openclaw.json`
-- `agents.defaults.models["claude-local/*"]` aliases
-
-**Safety**:
-- Timestamped backup written before every change: `~/.openclaw/openclaw.json.bak.<ms>`
-- Idempotent — already-in-sync runs are a no-op (no backup, no rewrite)
-- Non-fatal — sync failure does NOT abort `ocp update`; `/v1/models` still works
-- Skips silently if OpenClaw is not installed (`~/.openclaw/openclaw.json` missing)
-
-**Manual trigger** (e.g. after fixing a hand-edited config, or for the one-time v3.10.0→v3.11.0 bootstrap quirk):
-```bash
-node ~/ocp/scripts/sync-openclaw.mjs
-node ~/ocp/scripts/sync-openclaw.mjs --quiet   # silent unless changes
-```
-
-**Opt-out**: `ocp update` only invokes the sync if `node` and `scripts/sync-openclaw.mjs` are both present. Removing the script disables auto-sync; the rest of `ocp update` still works.
-
-**One-time bootstrap caveat (v3.10.0 → v3.11.0 only)**: the first `ocp update` to v3.11.0 runs the *old* `cmd_update` already loaded into your shell, so the new sync hook does NOT fire on this single jump. Run `node ~/ocp/scripts/sync-openclaw.mjs` once manually. Every future update from v3.11.0+ syncs automatically.
-
-**Other IDEs** (Cline / Aider / Cursor / opencode) query `/v1/models` live, so they pick up new models on the next request — no sync needed. Continue.dev users edit their own `config.json` model id manually.
-
-### Runtime Settings (No Restart Needed)
-
-```
-$ ocp settings maxPromptChars 200000
-✓ maxPromptChars = 200000
-
-$ ocp settings maxConcurrent 4
-✓ maxConcurrent = 4
-```
+> **Note:** Terminal CLI uses `ocp <command>`; the OpenClaw gateway plugin exposes the same as `/ocp <command>` in Telegram/Discord (see [OpenClaw Integration](#openclaw-integration)).
 
 ## Response Cache
 
-OCP can cache responses to avoid redundant Claude CLI calls for identical prompts. This is useful during development when the same prompt is sent repeatedly.
+OCP can cache responses to avoid redundant Claude CLI calls for identical prompts — useful during development when the same prompt is sent repeatedly.
 
-**Enable** by setting `CLAUDE_CACHE_TTL` (in milliseconds):
+**Enable** by setting `CLAUDE_CACHE_TTL` (ms), or update at runtime with `ocp settings cacheTTL 300000`:
 
 ```bash
-# Cache responses for 5 minutes
-export CLAUDE_CACHE_TTL=300000
-
-# Or update at runtime (no restart)
-ocp settings cacheTTL 300000
+export CLAUDE_CACHE_TTL=300000   # cache responses for 5 minutes
 ```
 
 **How it works:**
 - Cache key = SHA-256 of `v2|<keyId or "anon">|model + messages + temperature + max_tokens + top_p`
 - **Per-key isolation** — different API keys never share cache entries; anonymous callers share one `anon` pool
-- Cache hits return instantly — no Claude CLI process spawned
-- **Streaming hits** are replayed as multiple SSE chunks (80 codepoints each), not one large delta — incremental render preserved
-- **`cache_control` bypass** — if a request carries an Anthropic `cache_control` annotation (top-level or nested in `content[]`), OCP skips its own cache entirely so it doesn't interfere with Anthropic-side prompt caching
-- **Singleflight stampede protection** — concurrent identical cache-miss requests share one upstream `cli.js` spawn; followers receive byte-identical responses to the leader's call. Non-streaming path only (streaming-path singleflight is a known TODO)
-- Multi-turn conversations (with `session_id`) are never cached
-- Expired entries are cleaned up automatically every 10 minutes
+- Cache hits return instantly — no Claude CLI process spawned. **Streaming hits** are replayed as multiple SSE chunks (80 codepoints each), not one large delta, so incremental render is preserved
+- **`cache_control` bypass** — a request carrying an Anthropic `cache_control` annotation (top-level or nested in `content[]`) skips OCP's cache entirely, so it doesn't interfere with Anthropic-side prompt caching
+- **Singleflight stampede protection** — concurrent identical cache-miss requests share one upstream `cli.js` spawn; followers receive byte-identical responses (non-streaming path only; streaming-path singleflight is a known TODO)
+- Multi-turn conversations (with `session_id`) are never cached; expired entries are reaped automatically every 10 minutes
 
 **Management:**
 ```bash
-# View cache stats (now includes singleflight in-flight counts)
-curl http://127.0.0.1:3456/cache/stats
-# → { "entries": 42, "totalHits": 156, "sizeBytes": 284000, "inflight": 0, "requesters": 0 }
-
-# Clear all cached responses
-curl -X DELETE http://127.0.0.1:3456/cache
-
-# Disable cache at runtime
-ocp settings cacheTTL 0
+curl http://127.0.0.1:3456/cache/stats   # { "entries": 42, "totalHits": 156, "sizeBytes": 284000, "inflight": 0, "requesters": 0 }
+curl -X DELETE http://127.0.0.1:3456/cache   # clear all cached responses
+ocp settings cacheTTL 0                       # disable at runtime
 ```
 
-Cache is **disabled by default** (`CLAUDE_CACHE_TTL=0`). All data is stored locally in `~/.ocp/ocp.db`.
-
-**Hash format upgrade in v3.13.0:** legacy `v1` cache rows from earlier versions don't match new `v2`-format lookups; they orphan and are reaped by the TTL cleanup interval within one window. No migration script required.
-
-## How It Works
-
-```
-Your IDE → OCP (localhost:3456) → claude --output-format stream-json CLI → Anthropic (via subscription)
-```
-
-OCP translates OpenAI-compatible `/v1/chat/completions` requests into `claude --output-format stream-json` CLI calls. Anthropic sees normal Claude Code usage — no API billing, no separate key needed.
-
-### Client-tools boundary
-
-OCP is a **text-prompt bridge** to the official `claude` CLI. It does **not** pass through OpenAI `tools`/`functions` payloads or Anthropic `tool_use` blocks to the client. Clients (Cline, Cursor, OpenClaw, etc.) pointed at OCP receive **assistant TEXT only** — they never get `tool_calls` to execute locally.
-
-Any tool use happens server-side, under the `--allowedTools` set configured on the OCP host. In default mode (no `CLAUDE_NO_CONTEXT`), the `claude` CLI's own built-in tools are available to the model; in TUI mode, the operator controls the tool surface via `OCP_TUI_FULL_TOOLS`. Either way, the tools run under the operator's credentials on the server, and the client sees only the final text output.
-
-**Client-local tool execution is not supported by design.** Supporting it would require bypassing the `claude` CLI to call the raw Anthropic API directly — that is a different product, and is out of scope per `ALIGNMENT.md` (every OCP endpoint must correspond to something `cli.js` actually does).
-
-## Available Models
-
-| Model ID | Notes |
-|----------|-------|
-| `claude-opus-4-8` | Most capable (default for `opus` alias) |
-| `claude-opus-4-7` | Previous Opus, retained for pinning |
-| `claude-opus-4-6` | Older Opus, retained for pinning |
-| `claude-sonnet-4-6` | Good balance of speed/quality (default for `sonnet` alias) |
-| `claude-haiku-4-5-20251001` | Fastest, lightweight (default for `haiku` alias) |
-
-The canonical list lives in [`models.json`](./models.json) — the single source of truth as of v3.11.0. Both `server.mjs` (the `/v1/models` endpoint) and `setup.mjs` (the OpenClaw registration) derive from it. Adding a new model is now a one-file edit:
-
-```bash
-# 1. Edit models.json — add an entry
-# 2. Bump version, commit, tag, push
-# 3. Users get it on next `ocp update`:
-#    - OpenClaw: auto-synced via scripts/sync-openclaw.mjs
-#    - Cline / Aider / Cursor / opencode: live /v1/models, picks up immediately
-#    - Continue.dev: user edits their own config.json
-```
-
-## API Endpoints
-
-| Endpoint | Method | Description |
-|----------|--------|-------------|
-| `/v1/models` | GET | List available models |
-| `/v1/chat/completions` | POST | Chat completion (streaming + non-streaming). Supports multimodal `image_url` content parts — see [Images / Multimodal](#images--multimodal-vision). |
-| `/health` | GET | Comprehensive health check (includes a `tui` block for TUI-mode drift/concurrency monitoring) |
-| `/usage` | GET | Plan usage limits + per-model stats |
-| `/status` | GET | Combined overview (usage + health) |
-| `/settings` | GET/PATCH | View or update settings at runtime |
-| `/logs` | GET | Recent log entries (`?n=20&level=error`) |
-| `/sessions` | GET/DELETE | List or clear active sessions |
-| `/dashboard` | GET | Web dashboard (always public) |
-| `/api/keys` | GET/POST | List or create API keys (admin only) |
-| `/api/keys/:id` | DELETE | Revoke an API key (admin only) |
-| `/api/keys/:id/quota` | GET/PATCH | View or set per-key quota (admin only) |
-| `/api/usage` | GET | Per-key usage stats (`?since=&until=&hours=&limit=`); returns self only by default — pass `?all=true` (admin only) for all-keys data |
-| `/cache/stats` | GET | Cache statistics (admin only) |
-| `/cache` | DELETE | Clear response cache (admin only) |
+Cache is **disabled by default** (`CLAUDE_CACHE_TTL=0`). All data is stored locally in `~/.ocp/ocp.db`. **Hash format upgrade in v3.13.0:** legacy `v1` cache rows don't match new `v2`-format lookups; they orphan and are reaped by the TTL cleanup interval within one window — no migration script required.
 
 ## Images / Multimodal (Vision)
 
@@ -845,13 +482,13 @@ OCP was originally built for [OpenClaw](https://github.com/openclaw/openclaw) an
 - **Multi-agent** — 8 concurrent requests sharing one subscription
 - **No conflicts** — uses neutral service names (`dev.ocp.proxy` / `ocp-proxy`) that don't trigger OpenClaw's gateway-like service detection
 
-### Install the Gateway Plugin
+**Install the gateway plugin:**
 
 ```bash
 cp -r ocp-plugin/ ~/.openclaw/extensions/ocp/
 ```
 
-Add to `~/.openclaw/openclaw.json`:
+Add to `~/.openclaw/openclaw.json`, then `openclaw gateway restart`:
 ```json
 {
   "plugins": {
@@ -861,312 +498,25 @@ Add to `~/.openclaw/openclaw.json`:
 }
 ```
 
-Restart: `openclaw gateway restart`
-
-### Telegram / Discord Usage
-
-After installing the gateway plugin, use `/ocp` slash commands in your chat:
-
-```
-/ocp status        — Quick overview
-/ocp usage         — Plan usage limits & model stats
-/ocp models        — Available models
-/ocp health        — Proxy diagnostics
-/ocp keys          — List all API keys (multi mode)
-/ocp keys add <name>   — Create a new key
-/ocp keys revoke <name> — Revoke a key
-```
-
-> **Note:** Terminal CLI uses `ocp <command>`, Telegram/Discord uses `/ocp <command>`.
+After installing, use `/ocp` slash commands in your chat: `/ocp status`, `/ocp usage`, `/ocp models`, `/ocp health`, `/ocp keys`, `/ocp keys add <name>`, `/ocp keys revoke <name>`.
 
 ## Troubleshooting
 
-The simplest path: ask your AI.
+The simplest path: ask your AI — paste `Run `ocp doctor` and follow its `next_action`. Tell me if you hit anything that needs human input.` The doctor emits a JSON `next_action` with `ai_executable[]` (commands to run verbatim) and `human_required[]` (usually just OAuth).
 
-  Paste this prompt:
+**Most common issues:**
 
-  ```
-  Run `ocp doctor` and follow its `next_action`. Tell me if you hit
-  anything that needs human input.
-  ```
+- **`EADDRINUSE: port 3456 already in use`** — an old OCP instance is bound. Find it (`lsof -nP -iTCP:3456 -sTCP:LISTEN`) and stop it (`launchctl bootout gui/$(id -u)/dev.ocp.proxy` on macOS, `systemctl --user stop ocp-proxy` on Linux). There is no `ocp stop` — the proxy is a service; `ocp restart` bounces it.
+- **`node: command not found` / version error** — OCP needs Node.js 22.5+ (`node --version`).
+- **`claude: command not found`** — install the Claude CLI, run `claude auth login`, then re-run `node setup.mjs`.
+- **Usage shows "unknown" / 401** — usually an expired Claude CLI session: `claude auth login && ocp restart`. For the *permanent* TUI-mode `Please run /login · API Error: 401` that re-login can't fix, see [docs/troubleshooting.md § permanent TUI-mode 401](docs/troubleshooting.md#tui-401).
 
-The doctor produces a JSON `next_action` with `ai_executable[]` (commands
-the agent runs verbatim) and `human_required[]` (steps that need you,
-typically just OAuth).
+**Bootstrap quirks (one-time migrations):**
 
-### Manual debugging
+- **A TUI session vanished right after upgrading OCP** — if a pre-3.21.1 and a post-3.21.1 instance ran on the same host at the same time during an upgrade, the new instance's one-time boot reap can, once, kill an old-format (`ocp-tui-<8hex>`) live TUI session belonging to the still-running old instance. Restart the affected session (`ocp restart` or re-run your TUI turn) and it returns under the new instance's port-scoped naming.
+- **OpenClaw shows old models after `ocp update` (v3.10→v3.11 only)** — the running shell had the old `cmd_update` cached, so the sync hook doesn't fire on that single jump. Run once: `node ~/ocp/scripts/sync-openclaw.mjs && openclaw gateway restart`. Every future update syncs automatically.
 
-### Setup fails with "claude: command not found"
-
-`setup.mjs` requires the Claude CLI to be on `PATH`. Install it via the [official guide](https://docs.anthropic.com/en/docs/claude-cli), confirm with `which claude`, then run `claude auth login` before re-running `node setup.mjs`.
-
-### Setup fails with "EADDRINUSE: port 3456 already in use"
-
-Something else is already bound to port 3456 — usually an old OCP instance. Check what:
-
-```bash
-lsof -nP -iTCP:3456 -sTCP:LISTEN
-```
-
-If it's an old OCP process, stop it before re-running setup:
-
-```bash
-ocp stop                                                # if the CLI is on PATH
-launchctl bootout gui/$(id -u)/dev.ocp.proxy            # macOS launchd fallback
-sudo systemctl stop ocp-proxy                           # Linux systemd fallback
-```
-
-### Setup fails with "node: command not found" or version error
-
-OCP requires Node.js 22.5+. Install:
-
-```bash
-brew install node          # macOS
-# Linux: see https://nodejs.org/en/download for current install commands
-```
-
-Confirm with `node --version` (should be ≥ v22.5).
-
-### Requests fail or agents stuck
-
-```bash
-# Clear sessions and restart
-ocp clear
-ocp restart
-
-# If using OpenClaw gateway
-openclaw gateway restart
-```
-
-### Env var change (e.g. `CLAUDE_BIND`, `CLAUDE_CODE_OAUTH_TOKEN`) doesn't take effect after restart
-
-On **macOS**, `ocp restart` does a full `launchctl bootout` + `bootstrap` of the agent, which **re-reads the plist `EnvironmentVariables`** — so an env change you made (in `~/Library/LaunchAgents/dev.ocp.proxy.plist`) actually takes effect:
-
-```bash
-ocp restart
-```
-
-This is deliberate: the older `launchctl kickstart -k` only re-execs the process and **reuses launchd's cached environment**, so plist env edits would be silently ignored. If you ever restart the agent by hand, use bootout+bootstrap, not `kickstart -k`:
-
-```bash
-launchctl bootout   gui/$(id -u)/dev.ocp.proxy 2>/dev/null
-launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/dev.ocp.proxy.plist
-```
-
-Verify the new value reached the running process:
-
-```bash
-ps -E -p "$(launchctl print gui/$(id -u)/dev.ocp.proxy 2>/dev/null | awk '/pid =/{print $3}')" | tr ' ' '\n' | grep CLAUDE_
-```
-
-On **Linux**, `systemctl --user restart` already re-reads the unit's `EnvironmentFile`, so no special handling is needed.
-
-### Usage shows "unknown"
-
-Usually caused by an expired Claude CLI session. Fix:
-```bash
-claude auth login
-ocp restart
-```
-
-### Startup log warns "OpenClaw registry out of sync"
-
-On boot, OCP compares OpenClaw's registered models against [`models.json`](./models.json) and warns if they drift. Cause: someone (or an OpenClaw upgrade) modified `~/.openclaw/openclaw.json` and removed entries OCP expects. Fix:
-
-```bash
-node ~/ocp/scripts/sync-openclaw.mjs
-```
-
-This is read-only at startup; the warning never blocks the gateway from running.
-
-### A TUI session vanished right after upgrading OCP
-
-If you ran a pre-3.21.1 OCP instance and a post-3.21.1 instance on the same host at the same time during an upgrade, the new instance's one-time boot reap can, once, kill an old-format (`ocp-tui-<8hex>`) live TUI session belonging to the still-running old instance — restart the affected session (`ocp restart` or re-run your TUI turn) and it will come back under the new instance's port-scoped naming.
-
-### OpenClaw shows old models after `ocp update` (v3.10→v3.11 only)
-
-One-time bootstrap quirk for the v3.10.0 → v3.11.0 jump only — the running shell had the old `cmd_update` cached. Run once manually:
-
-```bash
-node ~/ocp/scripts/sync-openclaw.mjs
-openclaw gateway restart   # so OpenClaw re-reads the config
-```
-
-Future `ocp update` invocations sync automatically.
-
-### TUI-mode returns `Please run /login · API Error: 401` (re-login doesn't stick)
-
-A long-running TUI-mode host can get stuck returning a permanent 401 that re-login cannot fix.
-
-**Root cause (two layers):** interactive `claude` **prefers `~/.claude/.credentials.json` over the `CLAUDE_CODE_OAUTH_TOKEN` env var** (this is *unlike* the `-p` path, where the env token wins). So (a) a stale/corrupt `credentials.json` **shadows** the env token — passing the token is not enough on its own; and (b) when claude does use `credentials.json`, its single-use OAuth refresh token can be corrupted (ending up an empty string) by the per-request spawn + `kill-session` teardown racing claude's token rotation. Re-login writes a fresh token, but the next spawn re-corrupts it. Proven live on PI231: *env token passed + broken `credentials.json` present → 401; env token passed + `credentials.json` moved aside → works.*
-
-**Fix:** set `CLAUDE_CODE_OAUTH_TOKEN` on the OCP host and leave `OCP_TUI_HOME` **unset**. OCP then runs the TUI `claude` in a **credential-isolated home** (`$HOME/.ocp-tui/home`) that has **no `credentials.json`** at all, so the env token is the only credential (authoritative — nothing shadows it) and claude never runs the refresh path (so the single-use token can't be corrupted). Then restart — on systemd `daemon-reload`, on launchd `bootout`+`bootstrap`; `kickstart -k` does **not** reload env. Verify the env reached the process and the boot log shows the isolated home:
-
-```bash
-# Linux (systemd): confirm the token is in the service env
-tr '\0' '\n' < /proc/$(pgrep -f server.mjs | head -1)/environ | grep CLAUDE_CODE_OAUTH_TOKEN
-# Boot log should read: TUI-mode: ON home=$HOME/.ocp-tui/home ... auth=env-token (credential-isolated home — no credentials.json)
-```
-
-> If you previously set `OCP_TUI_HOME` to the real home (or any home that contains a `credentials.json`), **unset it** so the credential-isolated default takes effect — otherwise the shadowing `credentials.json` remains in play.
-
-See [Subscription-pool (TUI) mode](#subscription-pool-tui-mode) and ADR 0007 PR-C / PR-D amendments.
-
-## Environment Variables
-
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `CLAUDE_PROXY_PORT` | `3456` | Listen port (server-side). Also consumed by the OpenClaw `ocp-plugin` to dial the local proxy. |
-| `OCP_PROXY_URL` | *(unset)* | Plugin-side full URL override (e.g. `http://10.0.0.5:3456`). Wins over `CLAUDE_PROXY_PORT` when both are set. Read by `ocp-plugin/index.js` only — server ignores it. |
-| `CLAUDE_BIND` | `127.0.0.1` | Bind address (`0.0.0.0` for LAN access) |
-| `CLAUDE_AUTH_MODE` | `none` | Auth mode: `none`, `shared`, or `multi` |
-| `OCP_ADMIN_KEY` | *(unset)* | Admin key for key management (multi mode) |
-| `CLAUDE_BIN` | *(auto-detect)* | Path to claude binary |
-| `CLAUDE_TIMEOUT` | `600000` | Request timeout (ms, default: 10 min) |
-| `CLAUDE_HEARTBEAT_INTERVAL` | `0` | Streaming SSE keepalive interval (ms). `0` = disabled. See "Streaming heartbeat" section. |
-| `CLAUDE_MAX_CONCURRENT` | `8` | Max concurrent claude processes (`-p`/stream-json path) |
-| `CLAUDE_MAX_QUEUE` | `16` | Max requests **waiting** for a `-p` concurrency slot. Beyond `CLAUDE_MAX_CONCURRENT`, requests queue (up to this cap) instead of being rejected; when the queue is **also** full, the request gets `HTTP 429` + `Retry-After` (not an opaque 500). Surfaced on `/health.concurrency` + `/health.stats.queueRejections`. |
-| `CLAUDE_QUEUE_RETRY_AFTER` | `5` | Seconds advertised in the `Retry-After` header on a `-p` concurrency-overflow `429`. |
-| `CLAUDE_MAX_PROMPT_CHARS` | `150000` | Prompt truncation limit (chars). Applies to **text only** — image bytes bypass this budget (see [Images / Multimodal](#images--multimodal-vision)). |
-| `CLAUDE_MAX_BODY_SIZE` | `5242880` | Max request body size (bytes, default 5 MB). Base64 image payloads inflate ~33%; raise this to admit larger multimodal requests. |
-| `CLAUDE_IMAGE_ALLOW_URL` | `false` | Allow remote `http(s)` image URLs in `image_url` parts. **Off by default** (v1 supports base64 `data:` URIs only). When on, the URL is passed through to Anthropic as a `url` image source — **OCP does not fetch it** (no OCP-side SSRF surface); unreachable/blocked URLs surface as an API error. |
-| `CLAUDE_MAX_IMAGE_BYTES` | `5242880` | Per-image decoded-byte cap (default 5 MB). Over-cap images get `HTTP 413`. |
-| `CLAUDE_MAX_IMAGES` | `20` | Max image parts per request. Over-cap gets `HTTP 413`. |
-| `CLAUDE_MAX_IMAGE_TOTAL_BYTES` | `20971520` | Aggregate decoded-byte cap across all images in a request (default 20 MB). Over-cap gets `HTTP 413`. |
-| `CLAUDE_SESSION_TTL` | `3600000` | Session expiry (ms, default: 1 hour) |
-| `CLAUDE_CACHE_TTL` | `0` | Response cache TTL (ms, 0 = disabled). Set to e.g. `300000` for 5-min cache |
-| `CLAUDE_ALLOWED_TOOLS` | `Bash,Read,...,Agent` | Comma-separated tools to pre-approve |
-| `CLAUDE_SKIP_PERMISSIONS` | `false` | Bypass all permission checks |
-| `CLAUDE_NO_CONTEXT` | `false` | Suppress CLAUDE.md and auto-memory injection (pure API mode) |
-| `PROXY_API_KEY` | *(unset)* | Bearer token for shared-mode authentication |
-| `PROXY_ANONYMOUS_KEY` | *(unset)* | Well-known anonymous key allowlist (multi mode). When set, this exact string bypasses `validateKey()` and grants public access. Exposed via `/health.anonymousKey` only to localhost, or to all callers when `PROXY_ADVERTISE_ANON_KEY=1`. See [Anonymous Access](#anonymous-access-optional). |
-| `PROXY_ADVERTISE_ANON_KEY` | *(unset)* | When `=1`, advertise `PROXY_ANONYMOUS_KEY` in the public `/health` body for remote zero-config discovery. Default off — `/health` is unauthenticated, so this exposes the shared key to any LAN-reachable device (issue #109). Localhost always sees it regardless. |
-| `CLAUDE_TUI_MODE` | `false` | **Opt-in.** Set to `"true"` to serve requests via interactive `claude` (no `-p` / `--output-format` → `cc_entrypoint=cli`, subscription pool). **Single-user only** — see [Subscription-pool (TUI) mode](#subscription-pool-tui-mode) for the security constraint. |
-| `CLAUDE_CODE_OAUTH_TOKEN` | *(unset)* | OAuth bearer token (highest-precedence credential source for the `-p` path). **Recommended for TUI-mode hosts:** when set (and `OCP_TUI_HOME` unset), OCP runs the interactive `claude` in a **credential-isolated home** (`$HOME/.ocp-tui/home`, no `credentials.json`) so this long-lived token is the only credential and is authoritative — interactive `claude` otherwise *prefers* `~/.claude/.credentials.json` over the env var, so a stale one shadows the token and its single-use refresh token gets corrupted by the spawn/teardown cycle (the permanent `Please run /login` 401 — see [Subscription-pool (TUI) mode](#subscription-pool-tui-mode) and ADR 0007 PR-D). The token appears in the pane command (ps-visible) — acceptable for the single-user A-path; the multi-user B-path is refused at boot. |
-| `OCP_SPAWN_REAL_HOME` | *(unset)* | Kill-switch for the default `-p`/stream-json **spawn-home isolation** (latency fix). When unset and an OAuth token is resolvable, OCP runs the per-request `claude` spawn in a **credential-free minimal scratch home** (`$HOME/.ocp/spawn-home`, no `.credentials.json`/`settings.json`/plugins) with a neutral cwd and the env token — so it loads none of the operator's heavy global `~/.claude` (plugins/skills/hooks) or the project `CLAUDE.md`, cutting per-request latency (measured ~10–28s → ~3–7s). Set to `"1"` to force the legacy real-`HOME` spawn (no cwd override) even when a token exists. With **no** resolvable token, OCP falls back to the real `HOME` automatically (zero regression). Active mode is shown at startup and on `/health.spawn`. |
-| `CLAUDE_TUI_WALLCLOCK_MS` | `120000` | (TUI-mode) Maximum time in ms to wait for the native transcript to signal turn completion. Increase for long Opus thinking turns. |
-| `OCP_TUI_CWD` | `$HOME/.ocp-tui/work` | (TUI-mode) Scratch working directory where interactive claude sessions run. Transcripts land under `<HOME>/.claude/projects/<encoded-cwd>/`. Created automatically. |
-| `OCP_TUI_HOME` | *(auto)* | (TUI-mode) `HOME` claude runs under. **When unset, OCP picks it for you:** if `CLAUDE_CODE_OAUTH_TOKEN` is set → a **credential-isolated** scratch home `$HOME/.ocp-tui/home` (no `credentials.json`, env-token auth — **recommended**); if no env token → the operator's real home (legacy shared `credentials.json`). Setting this to an **explicit** path overrides the auto-default. The credential handling at that path still follows the env token: **with** the env token it is credential-free (env-token auth, no `credentials.json` written); **without** the env token (and the path ≠ real home) it uses the legacy symlinked-credentials scratch mode, which carries the credential-fork caveat — see ADR 0007. |
-| `OCP_TUI_ENTRYPOINT` | `cli` | (TUI-mode) Billing-classifier labeling: `cli` (default) pins `cc_entrypoint=cli` deterministically; `auto` lets claude self-classify via TTY detection; `off` leaves the inherited env untouched. Honest only when the spawn is a genuine interactive PTY — see ADR 0007. |
-| `OCP_TUI_MAX_CONCURRENT` | `2` | (TUI-mode) Max concurrent interactive TUI turns. **Independent** of `CLAUDE_MAX_CONCURRENT` (which bounds the `-p`/stream-json path; TUI never uses it). A TUI turn is heavy (per-request cold-boot of tmux+claude + up to `CLAUDE_TUI_WALLCLOCK_MS` wallclock), so the default is low to keep small hosts (e.g. a Pi 4) alive under a burst. Excess turns **queue** (bounded); a full queue yields a 503. See ADR 0007 PR-B amendment. |
-| `OCP_SKIP_AUTH_TEST` | *(unset)* | When `=1`, skip the `claude -p` auth probe during `setup.mjs`. After 2026-06-15 this probe draws from the Agent SDK credit pool; set this to avoid burning a metered credit on re-installs or `ocp update` runs. Auth is validated at the first real request. |
-| `OCP_TUI_FULL_TOOLS` | *(unset)* | (TUI-mode, **single-user only**) When `=1`, grant the interactive session the **same tool surface as the `-p` path** — `--allowedTools` (+ optional `--mcp-config`, read from `CLAUDE_ALLOWED_TOOLS` / `CLAUDE_MCP_CONFIG`) — instead of the default MCP-walled, built-in-tools-only set. Lets a trusted single-operator TUI deployment run a **tool-using / MCP agent** (e.g. an OpenClaw assistant) on the subscription pool. Safe because TUI **refuses to boot under `AUTH_MODE=multi`** (hard exit) — no guest key can ever reach the TUI path, so this gate cannot expose tools to an untrusted caller. (Under `AUTH_MODE=shared` + `OCP_TUI_ALLOW_LAN=1`, anyone holding the single shared key reaches it — that is the existing TUI trust model, unchanged.) Note: `--dangerously-skip-permissions` / `CLAUDE_SKIP_PERMISSIONS` is **not** supported for TUI — claude v2.1.x shows an interactive bypass-acceptance screen in headless tmux that cannot be answered, bricking the pane. Use scratch-home `settings.json` `additionalDirectories` instead. See [Subscription-pool (TUI) mode](#subscription-pool-tui-mode) and ADR 0007. |
-
-### Streaming heartbeat
-
-When `CLAUDE_HEARTBEAT_INTERVAL` is set to a positive integer (milliseconds), OCP emits an SSE comment frame (`: keepalive\n\n`) on streaming responses whenever the stream has been idle for that duration. The timer resets on every real chunk, so heartbeats only fire during genuine silent windows (for example, Claude CLI tool-use pauses of 30s–5min, or a long "processing large contexts" delay before the first token).
-
-Use cases: downstream HTTP clients or load balancers with idle-connection timeouts that would otherwise abort a slow-but-alive request. `CLAUDE_HEARTBEAT_INTERVAL=30000` (30s) is a reasonable starting value if your downstream has a 60s idle timeout.
-
-Heartbeats are inert SSE comment lines — conforming SSE clients ignore them. If your downstream client's SSE parser crashes on comment frames, leave this disabled (the default) and file an issue so we can consider an alternate frame format.
-
-OCP also sends `X-Accel-Buffering: no` on SSE responses so nginx-default proxy buffering does not hold heartbeats in an upstream buffer.
-
-## Subscription-pool (TUI) mode
-
-> **SECURITY — read before enabling.**  
-> TUI-mode is **single-user / single-operator only**. `claude` runs with the OCP process owner's filesystem access regardless of `HOME` setting. If OCP serves multiple users or guest API keys, a guest prompt could exfiltrate files or exhaust the subscription. **Never enable `CLAUDE_TUI_MODE=true` on a multi-user OCP.**
-
-### What it is and why
-
-From 2026-06-15 Anthropic routes `claude` invocations by `cc_entrypoint`:
-
-| Launch method | `cc_entrypoint` | Billing pool |
-|---------------|-----------------|-------------|
-| `claude -p` / `--output-format` (OCP default) | `sdk-cli` | Agent SDK credit pool (~$20/mo on Pro) |
-| Interactive `claude` (no flags) | `cli` | Pro/Max subscription pool |
-
-TUI-mode lets OCP serve requests via the interactive path so they bill against the subscription pool. The response is read from claude's native JSONL session transcript once the turn is complete, then replayed to the caller as a normal OpenAI completion or chunked SSE response.
-
-### Billing-classifier labeling (`OCP_TUI_ENTRYPOINT`)
-
-`OCP_TUI_ENTRYPOINT` (default `cli`) controls how `CLAUDE_CODE_ENTRYPOINT` is set on the spawn
-environment. The default (`cli`) pins the value deterministically — immune to a stray inherited
-env var or a future stdout-redirect bug silently flipping it to `sdk-cli`. This label is honest
-**only** when the spawn is a genuine interactive PTY (tmux pane, no `-p`, stdout not redirected,
-and `tmux new-session` verified to succeed). If you need to observe the raw TTY-derived value, set
-`OCP_TUI_ENTRYPOINT=auto`. See ADR 0007 for the full rationale and governing rule.
-
-### Enabling TUI-mode (opt-in)
-
-```bash
-# Prerequisites
-mkdir -p ~/.ocp-tui/work    # one-time scratch cwd setup
-# tmux must be installed: brew install tmux  /  apt install tmux
-
-# Enable
-export CLAUDE_TUI_MODE=true
-# STRONGLY RECOMMENDED on a TUI host — authenticate via the long-lived OAuth token.
-# With this set (and OCP_TUI_HOME left UNSET), OCP runs the interactive claude in a
-# credential-isolated home ($HOME/.ocp-tui/home, no credentials.json), so the env token
-# is the only credential and is authoritative. This both stops a stale credentials.json
-# from shadowing the token AND ends the refresh-token corruption that caused a permanent
-# "Please run /login" 401 (no credentials file → claude never runs the refresh path).
-# See the auth note below + ADR 0007 PR-D.
-export CLAUDE_CODE_OAUTH_TOKEN=sk-ant-oat01-...
-# Optionally tune:
-export CLAUDE_TUI_WALLCLOCK_MS=180000   # 3 min cap for long Opus turns
-export OCP_TUI_CWD=$HOME/.ocp-tui/work  # default; override if needed
-export OCP_TUI_ENTRYPOINT=cli           # default; use 'auto' to observe TTY-derived value
-# Do NOT set OCP_TUI_HOME for the recommended setup — leaving it unset is what enables
-# the credential-isolated home. Set it only to opt into the legacy symlinked-creds mode.
-```
-
-Then restart OCP. At boot you will see (with the env token set, isolated home auto-selected):
-
-```
-⚠️  TUI-mode ON — single-user only; do NOT enable on a multi-user OCP ...
-  TUI-mode: ON home=/home/user/.ocp-tui/home cwd=/home/user/.ocp-tui/work auth=env-token (credential-isolated home — no credentials.json) wallclock=120000ms maxConcurrent=2
-```
-
-### What changes / what doesn't
-
-- **Callers see no API change.** The response is a normal OpenAI completion object or chunked SSE — identical wire format.
-- **No real token streaming.** TUI-mode buffers the full response then replays it as chunked SSE. You will see a delay then the complete response rather than real-time tokens.
-- **Cache and singleflight work normally.** TUI-mode writes the buffered response to the cache on success; cache-hits skip the interactive turn entirely.
-- **The host's `CLAUDE.md` / auto-memory is never injected.** OCP is a proxy — the proxied client (OpenClaw / your IDE) owns its own context and memory. TUI-mode always runs `claude` with `CLAUDE_CODE_DISABLE_CLAUDE_MDS` + `CLAUDE_CODE_DISABLE_AUTO_MEMORY`, so a `CLAUDE.md` on the OCP host can never leak into proxied turns (verified live; see #4). Built-in tool schemas + the interactive system prompt remain (the inherent ~20–35K context floor of interactive mode); MCP is hard-disabled.
-- **Authenticate via `CLAUDE_CODE_OAUTH_TOKEN` in a credential-isolated home (recommended).** tmux does not forward the parent process's env to the pane, so OCP sets the token explicitly on the spawned `claude` when `CLAUDE_CODE_OAUTH_TOKEN` is present. But passing the token is **not enough on its own**: interactive `claude` *prefers* `~/.claude/.credentials.json` over the env var (unlike the `-p` path), so a stale `credentials.json` would shadow the token. With the env token set and `OCP_TUI_HOME` unset, OCP therefore runs claude in a **credential-isolated home** (`$HOME/.ocp-tui/home`) that has **no `credentials.json`** — so the env token is the only credential and is authoritative, and claude never runs the token-refresh path (so the single-use refresh token can't be corrupted by the spawn/teardown cycle). On a long-running host the credentials.json path produced a permanent `Please run /login · API Error: 401` that re-login could not fix (the next spawn re-corrupted it); the isolated home ends that at the root. Transcripts land under the same isolated home, so the answer-reader is unaffected. Without the env token, claude falls back to the real home's `credentials.json` (byte-for-byte the previous behaviour). (The token is visible in `ps` on the pane command — acceptable for the single-user A-path; the multi-user B-path is refused at boot.) See ADR 0007 PR-C / PR-D amendments.
-- **Stale tmux sessions are reaped.** The pane's `claude` is a child of the tmux server (not OCP), so OCP cannot reap it directly; `claude` zombies can otherwise accumulate as `<defunct>` over a long-running host. OCP reaps them at boot and on a 15-min idle sweep by issuing `tmux kill-server` — but **only when no foreign tmux session remains** (it never disrupts a co-hosted `olp-tui-*` instance). See ADR 0007 PR-C amendment.
-- **Default path unchanged.** Unset `CLAUDE_TUI_MODE` and restart → `callClaude` / `callClaudeStreaming` are used again, byte-for-byte identical to today.
-- **Concurrency is bounded separately.** TUI turns are heavy (per-request cold-boot + long wallclock), so the TUI path has its own limiter — `OCP_TUI_MAX_CONCURRENT` (default `2`), independent of `CLAUDE_MAX_CONCURRENT`. Excess turns queue; a full queue returns a 503. Tune it up only on a host that can run more interactive `claude` sessions at once.
-
-### Monitoring drift via `/health`
-
-`GET /health` includes a `tui` block so you can poll for a silent billing-pool drift (the top risk after the 6/15 flip — a lost TTY flipping `cc_entrypoint` from `cli` to the metered `sdk-cli` pool would still return answers but burn metered credits). The block is **always present** (with `enabled:false` when TUI-mode is off):
-
-```jsonc
-"tui": {
-  "enabled": true,             // CLAUDE_TUI_MODE === "true"
-  "entrypointMode": "cli",     // OCP_TUI_ENTRYPOINT (cli | auto | off)
-  "lastEntrypoint": "cli",     // last cc_entrypoint observed in a transcript, or null
-  "entrypointMismatches": 0,   // count of cli-expected-but-got-other turns — ALERT if this climbs
-  "inflight": 1,               // TUI turns running right now
-  "queued": 0,                 // TUI turns waiting for a concurrency slot
-  "maxConcurrent": 2           // OCP_TUI_MAX_CONCURRENT
-}
-```
-
-Alert on `entrypointMismatches > 0` (or `lastEntrypoint !== "cli"`): it means a turn drew from the metered Agent SDK pool instead of the subscription. `inflight` / `queued` show how close the TUI path is to its concurrency cap.
-
-### Kill-switch
-
-```bash
-unset CLAUDE_TUI_MODE
-# restart OCP
-```
-
-The stream-json path is restored immediately. No other change is needed.
-
-### 2026-06-15 operator checklist
-
-Every host serving traffic must be flipped to TUI-mode **and** canary-verified before 2026-06-15, or it will bill the metered Agent SDK credit pool instead of the subscription.
-
-- **[Flip/rollback runbook](docs/runbooks/tui-flip-rollback.md)** — how to set `CLAUDE_TUI_MODE=true` on systemd (Linux) and launchd (macOS) hosts. Covers the `daemon-reload` requirement (systemd) and the `bootout`+`bootstrap` cycle requirement (launchd — `launchctl kickstart -k` does not reload plist env).
-- **[615-canary runbook](docs/runbooks/615-canary.md)** — after each flip, run one quiesced request and compare the Agent SDK credit balance before and after. `entrypoint:cli` in the transcript (the `cc_entrypoint` billing classifier) is necessary but not sufficient — only a stable credit balance confirms the subscription pool is being used. Balance check is a manual step (no known programmatic API for the Agent SDK credit pool balance).
-
-### Architecture and design decisions
-
-See [`docs/adr/0007-tui-interactive-mode.md`](docs/adr/0007-tui-interactive-mode.md) for the full rationale, home-strategy options, MCP-disable mechanism, coexistence rules, and the B-path (multi-tenant isolation) roadmap.
+Full manual — setup failures, env-var-not-taking-effect-after-restart (launchd bootout+bootstrap vs `kickstart -k`), stuck sessions, "OpenClaw registry out of sync", and the two-layer TUI-mode 401 root cause + fix: **[docs/troubleshooting.md](docs/troubleshooting.md)**.
 
 ## Repository Layout
 
@@ -1184,6 +534,10 @@ Top-level files a contributor or operator may need to know:
 | `scripts/sync-openclaw.mjs` | Idempotent OpenClaw registry sync invoked by `ocp update`. See ADR 0004. |
 | `.claude/skills/` | Project-specific Claude Code skills. |
 | `ocp-plugin/` | OpenClaw gateway plugin (optional installation). |
+| `docs/lan-mode.md` | LAN & multi-user operations manual (server/client setup, keys, quotas, anonymous access, security model). |
+| `docs/tui-mode.md` | Subscription-pool (TUI) mode: setup, latency, streaming, warm-pane pool, drift monitoring. |
+| `docs/troubleshooting.md` | Full troubleshooting manual, including the permanent TUI-mode 401 root cause + fix. |
+| `docs/upgrading.md` | Upgrade manual (`ocp update` paths, rollback, OpenClaw auto-sync). |
 | `docs/adr/` | Architecture Decision Records. Read these before proposing governance or SPOT changes — see [`docs/adr/README.md`](docs/adr/README.md). |
 | `ALIGNMENT.md` | The constitution. Binding for any `server.mjs` change. |
 | `AGENTS.md` / `CLAUDE.md` | Agent and Claude-Code-specific session instructions. |

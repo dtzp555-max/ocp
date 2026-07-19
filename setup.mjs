@@ -334,7 +334,7 @@ if (OPENCLAW_PRESENT) {
     `║  Aider / OpenClaw) at:                                       ║`,
     `║    http://${BIND_ADDRESS}:${String(PORT)}/v1${" ".repeat(Math.max(0, 47 - BIND_ADDRESS.length - String(PORT).length))}║`,
     `║                                                              ║`,
-    `║  See README § "Client Setup" for per-IDE instructions.       ║`,
+    `║  See docs/lan-mode.md for per-IDE client setup.              ║`,
     `║                                                              ║`,
   );
 }
@@ -390,7 +390,9 @@ if (!DRY_RUN) {
   // and "ocp-proxy" keeps the proxy invisible to that heuristic.
   const OCP_HOME = join(HOME, ".ocp");
   const ocpLogsDir = join(OCP_HOME, "logs");
-  if (!existsSync(ocpLogsDir)) mkdirSync(ocpLogsDir, { recursive: true });
+  // mode 0700: with `recursive`, this call can create ~/.ocp ITSELF on a fresh install, and
+  // without an explicit mode that parent lands at the umask default (world-listable 0755).
+  if (!existsSync(ocpLogsDir)) mkdirSync(ocpLogsDir, { recursive: true, mode: 0o700 });
 
   // Uninstall legacy service names if present (upgrade path)
   if (platform === "darwin") {

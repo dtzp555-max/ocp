@@ -622,7 +622,12 @@ cmd_restart() {
       self_r="${BASH_SOURCE[0]}"
       while [[ -L "$self_r" ]]; do self_r="$(readlink "$self_r")"; done
       script_dir="$(cd "$(dirname "$self_r")" && pwd)"
-      DISABLE_AUTOUPDATER=1 nohup node "$script_dir/server.mjs" >> "$HOME/.ocp/logs/proxy.log" 2>&1 &
+      # env -u strips test-only key-store redirection vars (A4): if the invoking shell had
+      # NODE_ENV=test + OCP_DIR_OVERRIDE exported (e.g. from a debugging session), this manual
+      # fallback would otherwise inherit them and start the daemon against a scratch/empty key
+      # store — a silent auth outage in AUTH_MODE=multi. The plist/systemd paths strip these via
+      # plist-merge's NEVER_PRESERVE; this covers the one direct-launch path OCP controls.
+      DISABLE_AUTOUPDATER=1 env -u NODE_ENV -u OCP_DIR_OVERRIDE nohup node "$script_dir/server.mjs" >> "$HOME/.ocp/logs/proxy.log" 2>&1 &
     fi
     sleep 3
     if curl -sf --max-time 5 "$PROXY/health" > /dev/null 2>&1; then

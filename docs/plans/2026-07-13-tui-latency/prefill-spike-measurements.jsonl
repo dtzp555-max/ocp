@@ -1,0 +1,5 @@
+{"i":1,"tag":"effort-low-exclude-dynamic","model":"claude-sonnet-5","extra_args":"--effort low --exclude-dynamic-system-prompt-sections","prompt_chars":7451,"boot_ms":934,"ttft_ms":5867,"complete_ms":9953}
+{"i":2,"tag":"effort-low-exclude-dynamic","model":"claude-sonnet-5","extra_args":"--effort low --exclude-dynamic-system-prompt-sections","prompt_chars":7451,"boot_ms":1275,"ttft_ms":6388,"complete_ms":9874}
+{"i":3,"tag":"effort-low-exclude-dynamic","model":"claude-sonnet-5","extra_args":"--effort low --exclude-dynamic-system-prompt-sections","prompt_chars":7451,"boot_ms":874,"ttft_ms":10537,"complete_ms":11782}
+{"i":4,"tag":"effort-low-exclude-dynamic","model":"claude-sonnet-5","extra_args":"--effort low --exclude-dynamic-system-prompt-sections","prompt_chars":7451,"boot_ms":1170,"ttft_ms":6379,"complete_ms":9947}
+{"i":5,"tag":"effort-low-exclude-dynamic","model":"claude-sonnet-5","extra_args":"--effort low --exclude-dynamic-system-prompt-sections","prompt_chars":7451,"boot_ms":1329,"ttft_ms":6443,"complete_ms":9884}

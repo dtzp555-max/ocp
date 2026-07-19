@@ -3,29 +3,52 @@
  * Integration test for Quota + Cache features.
  * Tests database layer functions directly — no server needed.
  */
-import { getDb, createKey, listKeys, validateKey, recordUsage, checkQuota, updateKeyQuota, getKeyQuota, findKey, cacheHash, getCachedResponse, setCachedResponse, clearCache, getCacheStats, closeDb, hasCacheControl, singleflight, getInflightStats } from "./keys.mjs";
+// MUST come before keys.mjs: redirects the key store to a scratch dir (see test-env.mjs).
+import { TEST_OCP_DIR } from "./test-env.mjs";
+import { getDb, getDbPath, createKey, listKeys, validateKey, recordUsage, checkQuota, updateKeyQuota, getKeyQuota, findKey, cacheHash, getCachedResponse, setCachedResponse, clearCache, getCacheStats, closeDb, hasCacheControl, singleflight, getInflightStats } from "./keys.mjs";
 import { isLoopbackBind } from "./lib/net.mjs";
 import { createSerialMutex, createTtlCache, isTokenExpiring, orderLabelsLastGoodFirst } from "./lib/spawn-auth.mjs";
 import { createHash } from "node:crypto";
 import { strict as assert } from "node:assert";
-import { unlinkSync } from "node:fs";
 import { join } from "node:path";
+import { pathToFileURL } from "node:url";
+import { execFileSync } from "node:child_process";
 import { homedir } from "node:os";
 
-// Use a test database to avoid corrupting real data
-const TEST_DB = join(homedir(), ".ocp", "ocp-test.db");
-try { unlinkSync(TEST_DB); } catch {}
+process.env.HOME = homedir(); // normalize HOME so homedir()-derived paths are stable across shells
 
-// Monkey-patch DB_PATH for testing (override the module-level variable)
-// Since keys.mjs uses lazy init, we can set env before first getDb() call
-process.env.HOME = homedir(); // ensure consistent
+// The scaffolding that used to live here CLAIMED to use "a test database to avoid corrupting
+// real data" by setting an env var before the first getDb(). It never worked: keys.mjs read no
+// env var, and ESM hoisting meant the assignment ran after the import anyway. The redirect is
+// now real, and lives in test-env.mjs (imported above, before keys.mjs). This test proves it.
 
 let passed = 0;
 let failed = 0;
 
+// Pending promises from tests declared `async` but registered through the SYNC `test()` helper.
+// 44 tests in this file are written that way. Before this, `test()` called fn(), got a promise back,
+// and immediately printed ✓ and incremented `passed` — WITHOUT AWAITING IT. So for every async test:
+//   - ✓ meant "did not throw synchronously", NOT "passed";
+//   - a failed assertion escaped as an unhandled rejection, which crashes the process (CI still goes
+//     red on the non-zero exit) but is NOT counted, so the summary could print "N passed, 0 failed"
+//     and be wrong.
+// The suite's own headline number was therefore not evidence for any async test — including the
+// regression guards in this PR. Collected here and awaited before the summary prints.
+const pendingAsync = [];
+
 function test(name, fn) {
   try {
-    fn();
+    const r = fn();
+    if (r && typeof r.then === "function") {
+      // Async body: settle it before counting. Do NOT print ✓ yet.
+      pendingAsync.push(
+        r.then(
+          () => { passed++; console.log(`  ✓ ${name}`); },
+          (e) => { failed++; console.log(`  ✗ ${name}: ${e.message}`); },
+        ),
+      );
+      return;
+    }
     passed++;
     console.log(`  ✓ ${name}`);
   } catch (e) {
@@ -179,6 +202,23 @@ test("cacheHash includes temperature in hash", () => {
   const h3 = cacheHash("sonnet", msgs1, { temperature: 1.0 });
   assert.notEqual(h1, h2);
   assert.notEqual(h2, h3);
+});
+
+// ── configEpoch (#176): a boot-config change must invalidate the persistent cache ──
+// Mutation-proof: drop the `ce:` fold in keys.mjs and the first test goes green-to-red.
+test("cacheHash: different configEpoch → different key (config change invalidates)", () => {
+  const h1 = cacheHash("sonnet", msgs1, { configEpoch: "aaaa000011112222" });
+  const h2 = cacheHash("sonnet", msgs1, { configEpoch: "bbbb000011112222" });
+  assert.notEqual(h1, h2);
+});
+
+test("cacheHash: same configEpoch is stable; absent epoch hashes byte-identically to pre-#176", () => {
+  const e1 = cacheHash("sonnet", msgs1, { configEpoch: "aaaa000011112222" });
+  const e2 = cacheHash("sonnet", msgs1, { configEpoch: "aaaa000011112222" });
+  assert.equal(e1, e2);
+  // absent-epoch calls (older callers, all pre-existing tests) must not change behavior
+  assert.equal(cacheHash("sonnet", msgs1, {}), cacheHash("sonnet", msgs1));
+  assert.notEqual(e1, cacheHash("sonnet", msgs1), "epoch-carrying key differs from legacy key");
 });
 
 test("cacheHash includes max_tokens in hash", () => {
@@ -514,7 +554,7 @@ async function runSingleflightTests() {
 await runSingleflightTests();
 
 // ── Plist Env Merge Tests ──
-import { mergePlistEnv, mergeSystemdEnv } from "./scripts/lib/plist-merge.mjs";
+import { mergePlistEnv, mergeSystemdEnv, NEVER_PRESERVE } from "./scripts/lib/plist-merge.mjs";
 
 console.log("\nPlist env merge:");
 
@@ -628,6 +668,78 @@ test("mergePlistEnv is idempotent", () => {
   assert.equal(mergePlistEnv(r1, SAMPLE_TEMPLATE_PLIST), r1);
 });
 
+// ── A4: security denylist — test-only key-store redirection vars must NEVER survive a setup
+// re-run, even when a prior unit already carried them. Mutation-proof: drop the
+// `!NEVER_PRESERVE.has(k)` guard in either merge fn and these fail (the vars get preserved).
+test("NEVER_PRESERVE denylists exactly the two key-store redirection vars", () => {
+  assert.ok(NEVER_PRESERVE.has("NODE_ENV") && NEVER_PRESERVE.has("OCP_DIR_OVERRIDE"));
+  assert.equal(NEVER_PRESERVE.size, 2, "exactly two — a new entry needs its own rationale + test");
+});
+
+const PLIST_EXISTING_WITH_TEST_VARS = `<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>dev.ocp.proxy</string>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>CLAUDE_PROXY_PORT</key>
+    <string>3456</string>
+    <key>CLAUDE_CACHE_TTL</key>
+    <string>600</string>
+    <key>NODE_ENV</key>
+    <string>test</string>
+    <key>OCP_DIR_OVERRIDE</key>
+    <string>/tmp/scratch-store</string>
+  </dict>
+</dict>
+</plist>`;
+
+test("mergePlistEnv strips test-only redirection vars (A4) but keeps legit user keys", () => {
+  const merged = mergePlistEnv(PLIST_EXISTING_WITH_TEST_VARS, SAMPLE_TEMPLATE_PLIST);
+  assert.match(merged, /<key>CLAUDE_CACHE_TTL<\/key>\s*<string>600<\/string>/, "a legit user key is still preserved");
+  assert.doesNotMatch(merged, /<key>NODE_ENV<\/key>/, "NODE_ENV must never reach a service unit");
+  assert.doesNotMatch(merged, /OCP_DIR_OVERRIDE/, "OCP_DIR_OVERRIDE must never reach a service unit (key or value)");
+});
+
+test("mergePlistEnv: an existing unit whose ONLY extras are denylisted → template unchanged", () => {
+  const existing = `<?xml version="1.0" encoding="UTF-8"?>
+<plist version="1.0">
+<dict>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>CLAUDE_PROXY_PORT</key>
+    <string>3456</string>
+    <key>NODE_ENV</key>
+    <string>test</string>
+    <key>OCP_DIR_OVERRIDE</key>
+    <string>/tmp/scratch-store</string>
+  </dict>
+</dict>
+</plist>`;
+  assert.equal(mergePlistEnv(existing, SAMPLE_TEMPLATE_PLIST), SAMPLE_TEMPLATE_PLIST, "nothing left to preserve → clean template");
+});
+
+const SYSTEMD_EXISTING_WITH_TEST_VARS = `[Unit]
+Description=OCP — Open Claude Proxy
+
+[Service]
+ExecStart=/usr/bin/node /home/u/ocp/server.mjs
+Environment=CLAUDE_PROXY_PORT=3456
+Environment=CLAUDE_CACHE_TTL=600
+Environment=NODE_ENV=test
+Environment=OCP_DIR_OVERRIDE=/tmp/scratch-store
+Restart=always
+`;
+
+test("mergeSystemdEnv strips test-only redirection vars (A4) but keeps legit user keys", () => {
+  const merged = mergeSystemdEnv(SYSTEMD_EXISTING_WITH_TEST_VARS, SAMPLE_TEMPLATE_SYSTEMD);
+  assert.match(merged, /Environment=CLAUDE_CACHE_TTL=600/, "a legit user key is still preserved");
+  assert.doesNotMatch(merged, /Environment=NODE_ENV=/, "NODE_ENV must never reach a service unit");
+  assert.doesNotMatch(merged, /OCP_DIR_OVERRIDE/, "OCP_DIR_OVERRIDE must never reach a service unit");
+});
+
 test("mergeSystemdEnv is idempotent", () => {
   const r1 = mergeSystemdEnv(SAMPLE_EXISTING_SYSTEMD, SAMPLE_TEMPLATE_SYSTEMD);
   assert.equal(mergeSystemdEnv(r1, SAMPLE_TEMPLATE_SYSTEMD), r1);
@@ -726,10 +838,102 @@ test("doctor falls back to currentVersion when origin/main unreachable (no stale
   assert.equal(result.next_action.kind, "noop");
 });
 
+// ── System-prompt operator append (CLAUDE_SYSTEM_PROMPT wiring) ─────────────
+// The var was documented + echoed on /health but never reached a request (dead
+// since APPEND_SYSTEM_PROMPT was retired — caught in PR #170 review). The wiring
+// contract lives in lib/prompt.mjs. Mutation-proof: make appendOperatorPrompt
+// return `base` unconditionally and the first test fails; make it stop trimming
+// and the whitespace test fails.
+import { appendOperatorPrompt, derivePromptCharBudget, resolvePromptCharBudget } from "./lib/prompt.mjs";
+
+console.log("\nPrompt-char budget (ADR 0009 — SPOT-derived):");
+
+// Mutation-proof: drop the ×charsPerToken and the first test fails; drop the
+// Math.max floor guard and the floor tests fail; use min() instead of max() over
+// windows and the largest-window test fails.
+test("derivePromptCharBudget: LARGEST contextWindow × 3 chars/token", () => {
+  const models = [{ contextWindow: 200000 }, { contextWindow: 100000 }];
+  assert.equal(derivePromptCharBudget(models), 600000);
+});
+
+test("derivePromptCharBudget: matches the live models.json SPOT (200k → 600k today)", () => {
+  const spot = JSON.parse(tuiReadFileSync(new URL("./models.json", import.meta.url), "utf8"));
+  assert.equal(derivePromptCharBudget(spot.models), 600000);
+});
+
+test("derivePromptCharBudget: floor wins over a tiny/absent window; empty input → floor", () => {
+  assert.equal(derivePromptCharBudget([{ contextWindow: 1000 }]), 150000, "3k chars would truncate everything — floor guards it");
+  assert.equal(derivePromptCharBudget([]), 150000);
+  assert.equal(derivePromptCharBudget(undefined), 150000);
+  assert.equal(derivePromptCharBudget([{ id: "x" }, { contextWindow: "junk" }, { contextWindow: -5 }]), 150000);
+});
+
+test("derivePromptCharBudget: charsPerToken and floor are tunable parameters", () => {
+  assert.equal(derivePromptCharBudget([{ contextWindow: 1000000 }], { charsPerToken: 3 }), 3000000);
+  assert.equal(derivePromptCharBudget([], { floor: 42 }), 42);
+});
+
+// PR #179 review regression: EMPTY env value must mean "use the default" (the old
+// `parseInt(env || "150000")` contract). Mutation-proof: switch the resolver's
+// truthiness check to `!= null` and the empty-string test fails (NaN ≠ 600000).
+test("resolvePromptCharBudget: empty/unset env → SPOT-derived default, never NaN", () => {
+  const models = [{ contextWindow: 200000 }];
+  assert.equal(resolvePromptCharBudget("", models), 600000, "CLAUDE_MAX_PROMPT_CHARS= (empty) must fall back to derived");
+  assert.equal(resolvePromptCharBudget(undefined, models), 600000);
+});
+
+test("resolvePromptCharBudget: a set env value overrides the derivation absolutely", () => {
+  const models = [{ contextWindow: 200000 }];
+  assert.equal(resolvePromptCharBudget("300000", models), 300000);
+  assert.equal(resolvePromptCharBudget("150000", models), 150000, "explicit legacy value wins over the bigger derived default");
+});
+
+console.log("\nSystem-prompt operator append:");
+
+test("appendOperatorPrompt: appends the operator prompt LAST, blank-line separated", () => {
+  assert.equal(appendOperatorPrompt("WRAPPER\n\nclient", "Answer in Chinese."), "WRAPPER\n\nclient\n\nAnswer in Chinese.");
+});
+
+test("appendOperatorPrompt: unset/empty/whitespace-only → base returned BYTE-IDENTICAL", () => {
+  const base = "WRAPPER\n\nclient sys";
+  assert.equal(appendOperatorPrompt(base, undefined), base);
+  assert.equal(appendOperatorPrompt(base, ""), base);
+  assert.equal(appendOperatorPrompt(base, "   \n "), base, "a stray space in a service unit must not inject anything");
+  assert.equal(appendOperatorPrompt(base, null), base);
+});
+
+test("appendOperatorPrompt: operator value is trimmed before appending", () => {
+  assert.equal(appendOperatorPrompt("W", "  hi  "), "W\n\nhi");
+});
+
 // ── Upgrade Tests ──
-import { runUpgrade } from "./scripts/upgrade.mjs";
+import { runUpgrade, postFlightOk } from "./scripts/upgrade.mjs";
 
 console.log("\nUpgrade:");
+
+// ── postFlightOk (issue #173) — the acceptance predicate for phase 6 ─────────
+// Mutation-proof: revert the version comparison to auth-only and the "stale process
+// still holds the port" test below goes green-to-red (that case is the 2026-07-17
+// Oracle incident: orphan answered auth.ok=true while serving the OLD version).
+test("postFlightOk: rejects a healthy-looking probe that serves the WRONG version (orphan case)", () => {
+  assert.equal(postFlightOk({ auth: { ok: true }, version: "3.21.1" }, "v3.22.1"), false);
+});
+
+test("postFlightOk: accepts auth.ok + exact target version, tolerating the leading v", () => {
+  assert.equal(postFlightOk({ auth: { ok: true }, version: "3.22.1" }, "v3.22.1"), true);
+  assert.equal(postFlightOk({ auth: { ok: true }, version: "3.22.1" }, "3.22.1"), true);
+});
+
+test("postFlightOk: auth failure rejects regardless of version", () => {
+  assert.equal(postFlightOk({ auth: { ok: false }, version: "3.22.1" }, "v3.22.1"), false);
+  assert.equal(postFlightOk({ version: "3.22.1" }, "v3.22.1"), false);
+  assert.equal(postFlightOk(null, "v3.22.1"), false);
+});
+
+test("postFlightOk: unknown/empty target degrades to the auth-only check (never blocks)", () => {
+  assert.equal(postFlightOk({ auth: { ok: true }, version: "3.22.1" }, ""), true);
+  assert.equal(postFlightOk({ auth: { ok: true }, version: "3.22.1" }, undefined), true);
+});
 
 test("upgrade --dry-run prints plan, no side effects", async () => {
   const result = await runUpgrade({
@@ -785,6 +989,41 @@ import { join as testJoin } from "node:path";
 
 console.log("\nSnapshot:");
 
+const portableSnapshotName = (isoTimestamp) => `upgrade-snapshot-${isoTimestamp.replace(/:/g, "-")}`;
+const legacyMixedSnapshot = "upgrade-snapshot-2026-05-11T09:05:00Z";
+const portableMixedSnapshot = "upgrade-snapshot-2026-05-11T09-47-00Z";
+
+function runMixedSnapshotScenario() {
+  // NTFS rejects the legacy ':' name, so exercise the real exported functions
+  // in an isolated process whose built-in fs bindings expose both formats.
+  const moduleUrl = new URL("./scripts/lib/snapshot.mjs", import.meta.url).href;
+  const script = `
+    import fs from "node:fs";
+    import { syncBuiltinESMExports } from "node:module";
+    const names = ${JSON.stringify([legacyMixedSnapshot, portableMixedSnapshot])};
+    const deleted = [];
+    fs.existsSync = () => true;
+    fs.readdirSync = () => [...names];
+    fs.statSync = () => ({ mtimeMs: 0 });
+    fs.rmSync = (path) => { deleted.push(path); };
+    syncBuiltinESMExports();
+    const { listSnapshots, gcSnapshots } = await import(${JSON.stringify(moduleUrl)});
+    const listed = listSnapshots("/virtual-home").map(snapshot => snapshot.name);
+    const gc = gcSnapshots("/virtual-home", {
+      keepCount: 1,
+      keepDays: 0,
+      now: new Date("2026-05-12T00:00:00Z")
+    });
+    process.stdout.write(JSON.stringify({
+      listed,
+      kept: gc.kept.map(snapshot => snapshot.name),
+      removed: gc.removed.map(snapshot => snapshot.name),
+      deleted
+    }));
+  `;
+  return JSON.parse(execFileSync(process.execPath, ["--input-type=module", "--eval", script], { encoding: "utf8" }));
+}
+
 test("writeSnapshot creates dir + manifest files", () => {
   const root = mkdtempSync(testJoin(tmpdir(), "ocp-snap-test-"));
   const dotOcp = testJoin(root, ".ocp");
@@ -809,13 +1048,26 @@ test("listSnapshots returns sorted by ISO timestamp", () => {
   const dotOcp = testJoin(root, ".ocp");
   tMkdirSync(dotOcp, { recursive: true });
   for (const ts of ["2026-05-01T10:00:00Z", "2026-05-02T10:00:00Z", "2026-05-03T10:00:00Z"]) {
-    tMkdirSync(testJoin(dotOcp, `upgrade-snapshot-${ts}`));
+    tMkdirSync(testJoin(dotOcp, portableSnapshotName(ts)));
   }
   const list = listSnapshots(root);
   assert.equal(list.length, 3);
   assert.ok(list[0].path.includes("2026-05-01"));
   assert.ok(list[2].path.includes("2026-05-03"));
   rmSync(root, { recursive: true, force: true });
+});
+
+test("listSnapshots sorts mixed legacy and Windows-safe names chronologically", () => {
+  const result = runMixedSnapshotScenario();
+  assert.deepEqual(result.listed, [legacyMixedSnapshot, portableMixedSnapshot]);
+});
+
+test("gcSnapshots keeps the newer Windows-safe snapshot across the format boundary", () => {
+  const result = runMixedSnapshotScenario();
+  assert.deepEqual(result.kept, [portableMixedSnapshot]);
+  assert.deepEqual(result.removed, [legacyMixedSnapshot]);
+  assert.equal(result.deleted.length, 1);
+  assert.ok(result.deleted[0].endsWith(legacyMixedSnapshot));
 });
 
 test("upgrade error after snapshot carries snapshotPath + hint", async () => {
@@ -907,7 +1159,7 @@ test("gcSnapshots keeps last N regardless of age", () => {
   const dotOcp = testJoin(root, ".ocp");
   tMkdirSync(dotOcp, { recursive: true });
   for (const ts of ["2026-04-01T10:00:00Z", "2026-04-15T10:00:00Z", "2026-04-30T10:00:00Z", "2026-05-01T10:00:00Z", "2026-05-10T10:00:00Z"]) {
-    tMkdirSync(testJoin(dotOcp, `upgrade-snapshot-${ts}`));
+    tMkdirSync(testJoin(dotOcp, portableSnapshotName(ts)));
   }
   const result = gcSnapshots(root, { keepCount: 3, keepDays: 0, now: new Date("2026-05-11T00:00:00Z") });
   assert.equal(result.kept.length, 3);
@@ -990,7 +1242,7 @@ test("gcSnapshots keeps snapshots newer than keepDays regardless of count", () =
   const dotOcp = testJoin(root, ".ocp");
   tMkdirSync(dotOcp, { recursive: true });
   for (const ts of ["2026-04-01T10:00:00Z", "2026-04-15T10:00:00Z", "2026-04-30T10:00:00Z", "2026-05-01T10:00:00Z", "2026-05-10T10:00:00Z"]) {
-    tMkdirSync(testJoin(dotOcp, `upgrade-snapshot-${ts}`));
+    tMkdirSync(testJoin(dotOcp, portableSnapshotName(ts)));
   }
   // keepCount=1 but keepDays=15 means anything from after 2026-04-26 is kept too
   const result = gcSnapshots(root, { keepCount: 1, keepDays: 15, now: new Date("2026-05-11T00:00:00Z") });
@@ -1004,7 +1256,7 @@ test("gcSnapshots never deletes the most recent snapshot", () => {
   const root = mkdtempSync(testJoin(tmpdir(), "ocp-gc-recent-"));
   const dotOcp = testJoin(root, ".ocp");
   tMkdirSync(dotOcp, { recursive: true });
-  tMkdirSync(testJoin(dotOcp, "upgrade-snapshot-2026-01-01T10:00:00Z"));
+  tMkdirSync(testJoin(dotOcp, portableSnapshotName("2026-01-01T10:00:00Z")));
   // Even with keepCount=0 and keepDays=0, the most recent must survive
   const result = gcSnapshots(root, { keepCount: 0, keepDays: 0, now: new Date("2026-05-11T00:00:00Z") });
   assert.equal(result.kept.length, 1);
@@ -1017,13 +1269,13 @@ test("gcSnapshots --dry-run reports plan without deleting", () => {
   const dotOcp = testJoin(root, ".ocp");
   tMkdirSync(dotOcp, { recursive: true });
   for (const ts of ["2026-04-01T10:00:00Z", "2026-04-15T10:00:00Z", "2026-05-10T10:00:00Z"]) {
-    tMkdirSync(testJoin(dotOcp, `upgrade-snapshot-${ts}`));
+    tMkdirSync(testJoin(dotOcp, portableSnapshotName(ts)));
   }
   const result = gcSnapshots(root, { keepCount: 1, keepDays: 0, dryRun: true, now: new Date("2026-05-11T00:00:00Z") });
   assert.equal(result.dryRun, true);
   assert.equal(result.removed.length, 2);
   // Files still exist
-  assert.ok(testExistsSync(testJoin(dotOcp, "upgrade-snapshot-2026-04-01T10:00:00Z")));
+  assert.ok(testExistsSync(testJoin(dotOcp, portableSnapshotName("2026-04-01T10:00:00Z"))));
   rmSync(root, { recursive: true, force: true });
 });
 
@@ -1795,6 +2047,65 @@ test("buildTuiCmd shq-escapes a token containing shell metacharacters (no inject
   }
 });
 
+// OCP_TUI_EFFORT (TUI latency, docs/plans/2026-07-13-tui-latency): the pane's claude
+// must get an EXPLICIT --effort so its effort never depends on which HOME mode
+// resolveTuiHome() picked (real-home inherits the operator's settings.json effortLevel;
+// env-token scratch inherits claude's built-in default).
+test("buildTuiCmd passes --effort low by default (OCP_TUI_EFFORT unset)", () => {
+  const save = process.env.OCP_TUI_EFFORT;
+  try {
+    delete process.env.OCP_TUI_EFFORT;
+    const cmd = buildTuiCmd("/usr/bin/claude", "m", "sid-eff1", "/home/u", "cli");
+    assert.ok(cmd.includes("--effort low"), "default must pin --effort low");
+  } finally {
+    if (save === undefined) delete process.env.OCP_TUI_EFFORT;
+    else process.env.OCP_TUI_EFFORT = save;
+  }
+});
+
+test("buildTuiCmd honors an explicit OCP_TUI_EFFORT level (case/space-normalized)", () => {
+  const save = process.env.OCP_TUI_EFFORT;
+  try {
+    process.env.OCP_TUI_EFFORT = " XHigh ";
+    const cmd = buildTuiCmd("/usr/bin/claude", "m", "sid-eff2", "/home/u", "cli");
+    assert.ok(cmd.includes("--effort xhigh"), "explicit level must be passed, normalized");
+    assert.ok(!cmd.includes("--effort low"), "default must not also appear");
+  } finally {
+    if (save === undefined) delete process.env.OCP_TUI_EFFORT;
+    else process.env.OCP_TUI_EFFORT = save;
+  }
+});
+
+test("buildTuiCmd OCP_TUI_EFFORT=inherit omits --effort entirely (pre-flag argv)", () => {
+  const save = process.env.OCP_TUI_EFFORT;
+  try {
+    process.env.OCP_TUI_EFFORT = "inherit";
+    const cmd = buildTuiCmd("/usr/bin/claude", "m", "sid-eff3", "/home/u", "cli");
+    assert.ok(!/--effort/.test(cmd), "inherit must not add --effort");
+  } finally {
+    if (save === undefined) delete process.env.OCP_TUI_EFFORT;
+    else process.env.OCP_TUI_EFFORT = save;
+  }
+});
+
+test("buildTuiCmd falls back to --effort low on an invalid OCP_TUI_EFFORT (never reaches argv)", () => {
+  const save = process.env.OCP_TUI_EFFORT;
+  const savedErr = console.error;
+  try {
+    process.env.OCP_TUI_EFFORT = "ludicrous'; rm -rf /;'";
+    let warned = "";
+    console.error = (...a) => { warned = a.join(" "); };
+    const cmd = buildTuiCmd("/usr/bin/claude", "m", "sid-eff4", "/home/u", "cli");
+    assert.ok(cmd.includes("--effort low"), "invalid value must fall back to low");
+    assert.ok(!cmd.includes("ludicrous"), "invalid raw value must NOT reach the shell string");
+    assert.ok(/invalid OCP_TUI_EFFORT/.test(warned), "must log a warning");
+  } finally {
+    console.error = savedErr;
+    if (save === undefined) delete process.env.OCP_TUI_EFFORT;
+    else process.env.OCP_TUI_EFFORT = save;
+  }
+});
+
 test("buildTuiCmd OCP_TUI_FULL_TOOLS=1 grants -p-equivalent tool surface (single-user opt-in)", () => {
   const save = { ...process.env };
   const restore = () => {
@@ -1968,6 +2279,489 @@ test("reaper with includeLegacy=true still spares a sibling instance's port-scop
   assert.ok(!calls.includes("kill-server"), "sibling instance's live session still blocks kill-server");
 });
 
+// ── TUI warm pane pool (docs/plans/2026-07-13-tui-latency #3) ────────────
+import { TuiPanePool, resolvePoolSize, POOL_MAX_SIZE, POOL_MAX_AGE_MS } from "./lib/tui/pool.mjs";
+import { poolPaneName as poolName } from "./lib/tui/session.mjs";
+
+// A pool wired to fakes: no tmux, no claude. bootPane resolves on the microtask queue; use
+// `await settle()` after a refill() to let the SERIALIZED boot chain run to target.
+// `live` models the real tmux server: bootTuiPane creates the session SYNCHRONOUSLY and only
+// THEN waits (up to POOL_BOOT_MS) for the input bar, so the fake boot registers the session
+// immediately and only afterwards resolves. `opts.hold` keeps a boot in that mid-flight window
+// so tests can act on a pane that is live-but-not-yet-warm — the state that hid two bugs.
+function makeFakePool(opts = {}) {
+  const killed = [];
+  const booted = [];
+  const live = new Set();   // "tmux sessions" that currently exist
+  let seq = 0;
+  let clock = 1_000_000;
+  const healthy = new Set();
+  // FIFO gate queue — one entry per in-flight held boot. A single `release` slot would be
+  // OVERWRITTEN by a later boot, so releasing "the first boot" would silently release the
+  // second instead (and mask the stale-settle bug this harness exists to test).
+  const gates = [];
+  const pool = new TuiPanePool({
+    size: opts.size ?? 2,
+    maxAgeMs: opts.maxAgeMs ?? POOL_MAX_AGE_MS,
+    now: () => clock,
+    mintPane: () => {
+      const n = ++seq;
+      return { sessionId: `sid-${n}`, name: `ocp-tui-3456-p${String(n).padStart(8, "0")}` };
+    },
+    bootPane: async (model, { sessionId, name }) => {
+      live.add(name);                                     // session exists NOW
+      booted.push({ name, model });
+      if (opts.hold) {
+        await new Promise((r) => gates.push(r));          // ...stuck waiting for readiness
+      }
+      if (opts.bootThrows) { live.delete(name); throw new Error("boom"); }
+      // A pane whose session was killed while booting can never become ready — exactly what
+      // the real bootTuiPane does (it throws tui_pane_not_ready).
+      if (!live.has(name)) throw new Error("tui_pane_not_ready");
+      healthy.add(name);
+      return { name, sessionId, model, bootedAt: clock };
+    },
+    killPane: (name) => { killed.push(name); healthy.delete(name); live.delete(name); },
+    paneHealthy: (name) => healthy.has(name),
+  });
+  return {
+    pool, killed, booted, healthy, live,
+    releaseBoot: () => { const r = gates.shift(); if (r) r(); },  // release the OLDEST held boot
+    advance: (ms) => { clock += ms; }, at: () => clock,
+  };
+}
+const tick = () => new Promise((r) => setImmediate(r));
+// Refills are SERIALIZED (one boot at a time, re-kicked on success), so settling the pool
+// takes a chain of microtask turns, not one. 40 is far more than POOL_MAX_SIZE needs.
+const settle = async () => { for (let i = 0; i < 40; i++) await tick(); };
+
+console.log("\nTUI warm pane pool (acquire / miss / refill / TTL / reaper exemption):");
+
+test("resolvePoolSize: default/garbage/negative disable the pool; size is clamped to POOL_MAX_SIZE", () => {
+  assert.equal(resolvePoolSize(undefined), 0, "unset => off (byte-for-byte today's cold path)");
+  assert.equal(resolvePoolSize("0"), 0);
+  assert.equal(resolvePoolSize("-3"), 0);
+  assert.equal(resolvePoolSize("banana"), 0, "garbage disables rather than guessing a size");
+  assert.equal(resolvePoolSize("2"), 2);
+  assert.equal(resolvePoolSize("99"), POOL_MAX_SIZE, "clamped — never boot an unbounded number of idle claudes");
+});
+
+test("pool size 0 is inert: acquire always misses and refill never boots", async () => {
+  const { pool, booted } = makeFakePool({ size: 0 });
+  assert.equal(pool.enabled, false);
+  assert.equal(pool.acquire("m1"), null, "disabled pool always MISSES → caller cold-boots");
+  pool.refill();
+  await settle();
+  assert.equal(booted.length, 0, "a disabled pool must never spawn a process");
+});
+
+test("acquire MISSES on an empty pool, and the miss refills for the requested model", async () => {
+  const { pool, booted } = makeFakePool({ size: 2 });
+  assert.equal(pool.acquire("sonnet"), null, "first request is always a MISS (no boot-time pre-warm)");
+  assert.equal(pool.misses, 1);
+  pool.refill();
+  await settle();
+  assert.equal(pool.warm, 2, "refilled to target");
+  assert.deepEqual(booted.map((b) => b.model), ["sonnet", "sonnet"], "warmed for the model that missed");
+});
+
+test("acquire HITS a warm pane, hands it out ONCE, and never returns it (single-use)", async () => {
+  const { pool } = makeFakePool({ size: 2 });
+  pool.acquire("sonnet"); pool.refill(); await settle();
+  assert.equal(pool.warm, 2);
+
+  const a = pool.acquire("sonnet");
+  assert.ok(a && a.name && a.sessionId, "warm pane handed out");
+  assert.equal(pool.hits, 1);
+  assert.equal(pool.warm, 1, "the pane LEAVES the registry when acquired");
+
+  const b = pool.acquire("sonnet");
+  assert.notEqual(b.name, a.name, "a pane is NEVER handed out twice — single-use");
+  assert.notEqual(b.sessionId, a.sessionId, "each pane carries its OWN fresh session-id (transcript.mjs scoping)");
+  assert.equal(pool.warm, 0);
+  assert.equal(pool.acquire("sonnet"), null, "exhausted pool MISSES rather than reusing a pane");
+});
+
+test("refill is bounded: never more than `size` panes, and concurrent refills do not overshoot", async () => {
+  const { pool, booted } = makeFakePool({ size: 2 });
+  pool.acquire("sonnet");
+  pool.refill(); pool.refill(); pool.refill(); // hammer it
+  await settle();
+  assert.equal(pool.warm, 2, "still exactly `size` warm panes");
+  assert.equal(booted.length, 2, "the _booting guard prevented duplicate boots");
+});
+
+// Live finding at size=2: two cold `claude` boots racing an in-flight turn made a refill
+// overrun even the generous pool readiness cap. Boots are therefore SERIALIZED.
+test("refill boots panes ONE AT A TIME (never two claude cold-boots racing each other)", async () => {
+  let concurrent = 0, peak = 0;
+  let seq = 0;
+  const pool = new TuiPanePool({
+    size: 3,
+    mintPane: () => { const n = ++seq; return { sessionId: `s${n}`, name: `p${n}` }; },
+    bootPane: async (model, { sessionId, name }) => {
+      concurrent++; peak = Math.max(peak, concurrent);
+      await new Promise((r) => setImmediate(r)); // simulate boot latency
+      concurrent--;
+      return { name, sessionId, model, bootedAt: Date.now() };
+    },
+    killPane: () => {},
+    paneHealthy: () => true,
+  });
+  pool.acquire("sonnet");
+  pool.refill();
+  await settle();
+  assert.equal(pool.warm, 3, "chain still reaches the target size");
+  assert.equal(peak, 1, "at most ONE boot in flight at any moment");
+});
+
+test("a FAILED boot does not re-kick the chain (backoff — a broken claude must not spin)", async () => {
+  const { pool, booted } = makeFakePool({ size: 3, bootThrows: true });
+  pool.acquire("sonnet");
+  pool.refill();
+  await settle();
+  assert.equal(pool.bootFailures, 1, "counted as a genuine failure (nobody cancelled it)");
+  assert.equal(booted.length, 1, "exactly ONE attempt — a failure stops the chain, it does not respawn forever");
+  assert.equal(pool.warm, 0);
+  assert.equal(pool.booting, 0, "and the booting slot is released, so the next trigger can retry");
+});
+
+test("acquire drops an UNHEALTHY warm pane (kills it) and falls through to a MISS", async () => {
+  const { pool, killed, healthy, booted } = makeFakePool({ size: 1 });
+  pool.acquire("sonnet"); pool.refill(); await settle();
+  const dead = booted[0].name;
+  healthy.delete(dead); // pane died / stopped being input-ready while idle
+
+  assert.equal(pool.acquire("sonnet"), null, "a dead pane must MISS, never hang a turn");
+  assert.ok(killed.includes(dead), "the dead pane is killed, not leaked");
+  assert.equal(pool.misses, 2);
+});
+
+test("acquire drops an EXPIRED warm pane (older than maxAgeMs)", async () => {
+  const { pool, killed, booted, advance } = makeFakePool({ size: 1, maxAgeMs: 60_000 });
+  pool.acquire("sonnet"); pool.refill(); await settle();
+  advance(60_001);
+  assert.equal(pool.acquire("sonnet"), null, "a pane past its TTL is not handed out");
+  assert.ok(killed.includes(booted[0].name), "expired pane is killed");
+});
+
+test("a model switch drops the wrong-model panes and retargets the pool (--model is fixed at spawn)", async () => {
+  const { pool, killed, booted } = makeFakePool({ size: 2 });
+  pool.acquire("sonnet"); pool.refill(); await settle();
+  const sonnetPanes = booted.map((b) => b.name);
+
+  assert.equal(pool.acquire("opus"), null, "different model => MISS (a sonnet pane cannot serve opus)");
+  assert.equal(pool.warm, 0, "sonnet panes dropped");
+  for (const p of sonnetPanes) assert.ok(killed.includes(p), "wrong-model pane killed, not leaked");
+  assert.equal(pool.warmModel, "opus", "pool retargeted to the model actually being asked for");
+
+  pool.refill(); await settle();
+  assert.deepEqual(booted.slice(2).map((b) => b.model), ["opus", "opus"], "refilled for the NEW model");
+});
+
+test("a boot that resolves AFTER a drain kills its own pane instead of enlisting it", async () => {
+  const { pool, live } = makeFakePool({ size: 1 });
+  pool.acquire("sonnet");
+  pool.refill();          // boot is in flight...
+  pool.drain();           // ...pool drained before it resolves (shutdown / reap sweep)
+  await settle();
+  assert.equal(pool.warm, 0, "the late pane must NOT be enlisted into a drained pool");
+  // Assert LIVENESS, not the kill-call COUNT. This assertion used to read
+  // `assert.equal(killed.length, 1)` — and it PASSED while the orphan it is named after was
+  // actually present: _cancelBooting kills BY NAME, and at drain time the tmux session does not
+  // exist yet (bootPane runs on a microtask), so that kill is a NO-OP which still increments the
+  // counter. "kill was called once" and "a live session is orphaned" were both true at the same
+  // time. The only honest question is whether the session is dead.
+  assert.equal(live.size, 0, "it kills itself — no orphan process left behind");
+});
+
+test("bootPane failure is counted, never thrown into the request path, and does not wedge refill", async () => {
+  const { pool } = makeFakePool({ size: 1, bootThrows: true });
+  pool.acquire("sonnet");
+  pool.refill();
+  await settle();
+  assert.equal(pool.warm, 0);
+  assert.equal(pool.bootFailures, 1);
+  assert.equal(pool.booting, 0, "the _booting counter is released on failure (else refill wedges forever)");
+  assert.equal(pool.acquire("sonnet"), null, "and the caller just MISSES → cold path");
+});
+
+test("drain kills every warm pane and pauses refills; resume restarts them", async () => {
+  const { pool, killed } = makeFakePool({ size: 2 });
+  pool.acquire("sonnet"); pool.refill(); await settle();
+  assert.equal(pool.warm, 2);
+
+  assert.equal(pool.drain(), 2, "drain reports how many it killed");
+  assert.equal(pool.warm, 0);
+  assert.equal(killed.length, 2, "both panes killed — none outlive the drain");
+
+  pool.refill(); await settle();
+  assert.equal(pool.warm, 0, "refill is a NO-OP while drained (paused)");
+
+  pool.resume(); await settle();
+  assert.equal(pool.warm, 2, "resume refills");
+});
+
+// ── The crux: pool ↔ reaper coexistence (POOL/REAPER INVARIANT, lib/tui/session.mjs) ──
+console.log("\nTUI warm pool ↔ session reaper coexistence:");
+
+test("INVARIANT 1: a LIVE pooled pane is NEVER reaped (it is in the spare set)", () => {
+  const killed = [];
+  const live = "ocp-tui-3456-pdeadbeef";
+  const fakeTmux = (args) => {
+    if (args[0] === "list-sessions") return { status: 0, stdout: `${live}\nocp-tui-3456-aaaa\n` };
+    if (args[0] === "kill-session") { killed.push(args[args.indexOf("-t") + 1]); return { status: 0 }; }
+    return { status: 0, stdout: "" };
+  };
+  const n = reapStaleTuiSessions({ tmux: fakeTmux, port: 3456, spare: new Set([live]) });
+  assert.equal(n, 1, "only the stale turn session was reaped");
+  assert.ok(!killed.includes(live), "the live warm pane must survive the sweep");
+  assert.ok(killed.includes("ocp-tui-3456-aaaa"), "a genuinely stale own session is still reaped");
+});
+
+test("INVARIANT 2: an ORPHANED pooled pane (pool-shaped but NOT in the spare set) IS reaped", () => {
+  const killed = [];
+  // ocp-tui-3456-porphan01 LOOKS pooled but the live registry does not claim it — e.g. left
+  // behind by a previous process generation, whose in-memory registry died with it.
+  const fakeTmux = (args) => {
+    if (args[0] === "list-sessions") return { status: 0, stdout: "ocp-tui-3456-porphan01\nocp-tui-3456-plive0001\n" };
+    if (args[0] === "kill-session") { killed.push(args[args.indexOf("-t") + 1]); return { status: 0 }; }
+    return { status: 0, stdout: "" };
+  };
+  const n = reapStaleTuiSessions({ tmux: fakeTmux, port: 3456, spare: new Set(["ocp-tui-3456-plive0001"]) });
+  assert.equal(n, 1);
+  assert.deepEqual(killed, ["ocp-tui-3456-porphan01"], "exemption is by EXACT NAME, never by name shape");
+});
+
+test("INVARIANT 2b: with NO spare set (the pre-pool call shape) pool-shaped panes are reaped — fail-safe", () => {
+  const killed = [];
+  const fakeTmux = (args) => {
+    if (args[0] === "list-sessions") return { status: 0, stdout: "ocp-tui-3456-pdeadbeef\n" };
+    if (args[0] === "kill-session") { killed.push(args[args.indexOf("-t") + 1]); return { status: 0 }; }
+    return { status: 0, stdout: "" };
+  };
+  const n = reapStaleTuiSessions({ tmux: fakeTmux, port: 3456 });
+  assert.equal(n, 1, "omitting `spare` reaps MORE, never less — forgetting it can't leak panes");
+  assert.deepEqual(killed, ["ocp-tui-3456-pdeadbeef"]);
+});
+
+test("INVARIANT 3: kill-server is SUPPRESSED while a live pooled pane is spared", () => {
+  const calls = [];
+  const live = "ocp-tui-3456-plive0001";
+  const fakeTmux = (args) => {
+    calls.push(args.join(" "));
+    if (args[0] === "list-sessions") return { status: 0, stdout: `${live}\nocp-tui-3456-aaaa\n` };
+    return { status: 0, stdout: "" };
+  };
+  reapStaleTuiSessions({ tmux: fakeTmux, port: 3456, spare: new Set([live]) });
+  assert.ok(!calls.includes("kill-server"), "kill-server would kill the live pane (a child of the tmux server)");
+});
+
+test("INVARIANT 3b: after a DRAIN the spare set is empty, so kill-server fires again (zombie reaping preserved)", async () => {
+  // This is the whole reason server.mjs drains BEFORE the periodic sweep: a permanently-full
+  // pool would otherwise permanently suppress the only mechanism that reaps defunct claudes.
+  const { pool } = makeFakePool({ size: 2 });
+  pool.acquire("sonnet"); pool.refill(); await settle();
+  assert.equal(pool.liveNames().size, 2, "pool is full → the sweep would be suppressed");
+
+  pool.drain();
+  assert.equal(pool.liveNames().size, 0, "drain empties the live registry");
+
+  const calls = [];
+  const fakeTmux = (args) => {
+    calls.push(args.join(" "));
+    if (args[0] === "list-sessions") return { status: 0, stdout: "ocp-tui-3456-aaaa\n" };
+    return { status: 0, stdout: "" };
+  };
+  reapStaleTuiSessions({ tmux: fakeTmux, port: 3456, spare: pool.liveNames() });
+  assert.ok(calls.includes("kill-server"), "kill-server fires post-drain — defunct zombies still get reaped");
+});
+
+// ── MID-BOOT: the state that hid M1a + M1b ────────────────────────────────────────────
+// bootTuiPane creates the tmux session SYNCHRONOUSLY, then waits up to POOL_BOOT_MS (20s)
+// for the input bar. So a pooled session can be LIVE for ~20s before its boot resolves.
+// Every reaper test above uses a pool that is either full or drained — never mid-boot.
+// That gap is exactly why both bugs shipped past the first round of tests.
+
+test("M1a: a reap tick during an IN-FLIGHT BOOT must not orphan-kill the booting pane", async () => {
+  const { pool, live } = makeFakePool({ size: 1, hold: true });
+  pool.acquire("sonnet");
+  pool.refill();
+  await tick();                                    // boot started; session live; NOT yet warm
+  assert.equal(pool.warm, 0, "not warm yet");
+  assert.equal(pool.booting, 1, "a boot is in flight");
+  assert.equal(live.size, 1, "...and its tmux session ALREADY EXISTS");
+
+  const bootingName = [...live][0];
+  assert.ok(pool.liveNames().has(bootingName),
+    "REGRESSION GUARD: the booting pane MUST be nameable, or the sweep cannot spare it " +
+    "(the pool used to track in-flight boots as a COUNT and this was empty)");
+});
+
+test("M1a: the reap tick's drain kills the booting pane, and resume() starts a FRESH boot", async () => {
+  const warns = [];
+  const { pool, live, releaseBoot } = makeFakePool({ size: 1, hold: true });
+  pool._log = (lvl, ev) => { if (lvl === "warn") warns.push(ev); };
+  pool.acquire("sonnet");
+  pool.refill();
+  await tick();
+  const first = [...live][0];
+
+  // The reap tick, as server.mjs runs it: drain -> reap -> resume.
+  const drained = pool.drain();
+  assert.equal(drained, 1, "drain accounts for the booting pane");
+  assert.equal(live.size, 0, "its tmux session is killed — kill-server can now flush zombies");
+  assert.equal(pool.liveNames().size, 0, "nothing left to spare, so kill-server is not suppressed");
+
+  pool.resume();
+  await tick();
+  assert.equal(pool.booting, 1, "resume() started a FRESH boot — the pool is not left empty with nothing scheduled");
+  assert.notEqual([...live][0], first, "and it is a NEW pane, not the killed one");
+
+  // Now let the ORIGINAL (cancelled) boot settle. It rejects with tui_pane_not_ready because
+  // we killed its session — but that is OUR doing, not a fault.
+  releaseBoot();
+  await settle();
+  assert.equal(pool.bootFailures, 0,
+    "a cancelled boot must NOT be counted as a bootFailure — that is the WARN operators alert on");
+  assert.deepEqual(warns, [], "and it must not log tui_pool_boot_failed for a healthy drain");
+  assert.equal(pool.cancelled, 1, "it is counted as a cancellation instead (counted exactly once)");
+});
+
+test("M1b: shutdown drain kills the booting pane SYNCHRONOUSLY — no orphaned claude", async () => {
+  const { pool, live } = makeFakePool({ size: 1, hold: true });
+  pool.acquire("sonnet");
+  pool.refill();
+  await tick();
+  assert.equal(live.size, 1, "a live pooled session exists");
+
+  // gracefulShutdown: drain() then process.exit(0) IN THE SAME TICK (TUI panes are tmux
+  // children, not node children, so activeProcesses is empty and the exit is immediate).
+  // Nothing scheduled on the microtask queue can run. So we assert WITHOUT awaiting.
+  pool.drain();
+  assert.equal(live.size, 0,
+    "REGRESSION GUARD: the pane must be dead BEFORE any await. A .then()-based cleanup would " +
+    "never run before process.exit and would orphan a live authenticated `claude`.");
+});
+
+// M1b, second costume: drain() in the SAME synchronous block as refill(). The tmux session does
+// not exist yet at drain time (bootPane runs on a microtask), so _cancelBooting's kill-by-name is
+// a no-op — and a `.then` that merely `return`s on a stale generation would then let the boot
+// CREATE the session and walk away from it. Not reachable from any current call site, but ADR 0008
+// and the reap-tick comment both contemplate a boot-time pre-warm, which is exactly this shape.
+// NOTE: deliberately NOT `hold: true`. A held boot never settles, so its `.then` never runs and
+// the guard would vacuously pass — the test must let the boot actually SUCCEED, because the bug is
+// precisely that a SUCCESSFUL boot on a cancelled generation walks away from its live session.
+test("M1b': a boot cancelled BEFORE its session existed is still killed when it settles", async () => {
+  const { pool, live } = makeFakePool({ size: 1 });
+  pool.acquire("sonnet");                 // miss → learns the model
+
+  pool.refill();   // mints the identity; bootPane is queued on a microtask — no session YET
+  pool.drain();    // SAME sync block: kill-by-name finds nothing to kill (no-op), bumps the gen
+  assert.equal(live.size, 0, "precondition: the session genuinely did not exist at cancel time");
+
+  await tick();    // NOW the boot microtask runs, CREATES the session, and settles on a stale gen
+  await tick();
+
+  assert.equal(live.size, 0,
+    "REGRESSION GUARD: a stale-generation boot must KILL its pane, not assume _cancelBooting " +
+    "already did. _cancelBooting kills BY NAME, and the tmux session does not exist until the " +
+    "boot microtask runs — so a cancellation landing first is a no-op, and a bare `return` here " +
+    "orphans a live authenticated `claude` that nothing owns.");
+});
+
+test("a stale boot settling after drain+resume must not clear the NEW boot's slot", async () => {
+  const { pool, releaseBoot } = makeFakePool({ size: 1, hold: true });
+  pool.acquire("sonnet");
+  pool.refill();
+  await tick();
+  pool.drain();                 // cancels boot #1 (generation bumped)
+  pool.resume();
+  await tick();
+  assert.equal(pool.booting, 1, "boot #2 owns the slot");
+  releaseBoot();                // boot #1 finally settles (rejects)
+  await settle();
+  assert.equal(pool.booting, 1, "boot #2 STILL owns the slot — a stale settle must not free it");
+});
+
+test("a model switch cancels an in-flight boot for the OLD model (kills it, frees the slot)", async () => {
+  const { pool, live, killed } = makeFakePool({ size: 1, hold: true });
+  pool.acquire("sonnet");
+  pool.refill();
+  await tick();
+  const sonnetPane = [...live][0];
+
+  pool.acquire("opus");         // retarget mid-boot
+  assert.ok(killed.includes(sonnetPane), "the old model's booting pane is killed, not left to linger");
+  assert.equal(pool.booting, 0, "and its slot is freed immediately, so the new model can boot now");
+  assert.equal(pool.warmModel, "opus");
+
+  pool.refill();
+  await tick();
+  assert.equal(pool.booting, 1, "a boot for the NEW model starts without waiting out the old one");
+});
+
+test("a pane handed out for a turn leaves the spare set immediately (so its teardown is authoritative)", async () => {
+  const { pool } = makeFakePool({ size: 2 });
+  pool.acquire("sonnet"); pool.refill(); await settle();
+  const taken = pool.acquire("sonnet");
+  assert.ok(!pool.liveNames().has(taken.name),
+    "an acquired pane is the CALLER's — the pool must not also claim it live, or a crashed turn's pane would be spared forever");
+});
+
+test("N1: the pool mints ONE identity — the tmux name's hex is the transcript session-id's hex", async () => {
+  // Without this, `tmux ls` shows a pane whose name has no relation to any transcript file,
+  // so a live pane cannot be correlated to <HOME>/.claude/projects/*/<sessionId>.jsonl.
+  const seen = [];
+  const pool = new TuiPanePool({
+    size: 1,
+    mintPane: () => {
+      const sessionId = "deadbeef-1111-2222-3333-444444444444";
+      return { sessionId, name: poolName(3456, sessionId) };
+    },
+    bootPane: async (model, ident) => {
+      seen.push(ident);
+      return { ...ident, model, bootedAt: Date.now() };
+    },
+    killPane: () => {},
+    paneHealthy: () => true,
+  });
+  pool.acquire("sonnet");
+  pool.refill();
+  await settle();
+  assert.equal(seen.length, 1, "bootPane received the pool-minted identity");
+  assert.equal(seen[0].name, "ocp-tui-3456-pdeadbeef");
+  assert.ok(seen[0].name.endsWith(seen[0].sessionId.slice(0, 8)),
+    "the tmux session name carries the session-id's own hex — `tmux ls` correlates to the transcript");
+  const pane = pool.acquire("sonnet");
+  assert.equal(pane.sessionId, seen[0].sessionId,
+    "and the turn reads the transcript under THAT session-id — one identity end to end");
+});
+
+test("pool pane names are port-scoped (reapable as ours) and never match the legacy shape", () => {
+  const name = poolName(3456, "deadbeef-1111-2222-3333-444444444444");
+  assert.ok(name.startsWith(sessionPrefixForPort(3456)), "pool panes are OURS → reapable when orphaned");
+  assert.equal(name, "ocp-tui-3456-pdeadbeef");
+  assert.ok(!LEGACY_SESSION_NAME_RE.test(name), "must never be mistaken for a legacy bare-prefix session");
+  assert.ok(!poolName(9999, "aaaaaaaa-0000-0000-0000-000000000000").startsWith(sessionPrefixForPort(3456)),
+    "a sibling instance's pool pane is foreign to us");
+});
+
+test("buildTuiHealthBlock reports pool:null when off, and the pool's stats when on", async () => {
+  const st = { lastEntrypoint: "cli", entrypointMismatches: 0 };
+  const sem = { inflight: 0, queued: 0 };
+  const off = buildTuiHealthBlock({ enabled: true, entrypointMode: "cli", maxConcurrent: 2 }, st, sem, null);
+  assert.equal(off.pool, null, "pool disabled → explicit null (stable /health shape)");
+
+  const { pool } = makeFakePool({ size: 2 });
+  pool.acquire("sonnet"); pool.refill(); await settle();
+  const on = buildTuiHealthBlock({ enabled: true, entrypointMode: "cli", maxConcurrent: 2 }, st, sem, pool);
+  assert.equal(on.pool.size, 2);
+  assert.equal(on.pool.warm, 2);
+  assert.equal(on.pool.misses, 1);
+  assert.equal(on.pool.model, "sonnet");
+});
+
 // ── TUI home preparation (scratch vs real) ───────────────────────────────
 import { prepareTuiHome, ensureTuiCwdTrusted } from "./lib/tui/session.mjs";
 import { mkdtempSync as hMkdtemp, mkdirSync as hMkdir, writeFileSync as hWrite, readFileSync as hRead, existsSync as hExists, readlinkSync as hReadlink } from "node:fs";
@@ -1976,21 +2770,21 @@ import { tmpdir as hTmp } from "node:os";
 console.log("\nTUI home preparation:");
 
 test("prepareTuiHome scratch mode: symlinks creds, seeds onboarded config, trusts cwd, strips history", () => {
-  const realHome = hMkdtemp(`${hTmp()}/real-`);
-  hMkdir(`${realHome}/.claude`, { recursive: true });
-  hWrite(`${realHome}/.claude/.credentials.json`, '{"token":"x"}');
-  hWrite(`${realHome}/.claude.json`, JSON.stringify({ theme: "dark", projects: { "/old/secret/project": { hasTrustDialogAccepted: true } } }));
-  const tuiHome = hMkdtemp(`${hTmp()}/tui-`);
-  const cwd = `${tuiHome}/work`;
+  const realHome = hMkdtemp(testJoin(hTmp(), "real-"));
+  hMkdir(testJoin(realHome, ".claude"), { recursive: true });
+  hWrite(testJoin(realHome, ".claude", ".credentials.json"), '{"token":"x"}');
+  hWrite(testJoin(realHome, ".claude.json"), JSON.stringify({ theme: "dark", projects: { "/old/secret/project": { hasTrustDialogAccepted: true } } }));
+  const tuiHome = hMkdtemp(testJoin(hTmp(), "tui-"));
+  const cwd = testJoin(tuiHome, "work");
   prepareTuiHome(realHome, tuiHome, cwd);
   // credentials symlinked (token never copied)
-  assert.equal(hReadlink(`${tuiHome}/.claude/.credentials.json`), `${realHome}/.claude/.credentials.json`);
-  const seed = JSON.parse(hRead(`${tuiHome}/.claude.json`, "utf8"));
+  assert.equal(hReadlink(testJoin(tuiHome, ".claude", ".credentials.json")), testJoin(realHome, ".claude", ".credentials.json"));
+  const seed = JSON.parse(hRead(testJoin(tuiHome, ".claude.json"), "utf8"));
   assert.equal(seed.hasCompletedOnboarding, true);
   assert.equal(seed.theme, "dark");                                   // onboarded config carried over
   assert.equal(seed.projects[cwd].hasTrustDialogAccepted, true);      // scratch cwd trusted
   assert.equal(seed.projects["/old/secret/project"], undefined);      // user project history stripped
-  assert.ok(hExists(`${tuiHome}/.claude/projects`));                  // own projects dir
+  assert.ok(hExists(testJoin(tuiHome, ".claude", "projects")));    // own projects dir
 });
 
 test("prepareTuiHome real mode (tuiHome===realHome): no symlink, just trusts cwd in real config", () => {
@@ -2415,8 +3209,19 @@ test("buildTuiHealthBlock: shape + live counters (the additive /health tui block
   const ts = { lastEntrypoint: "cli", entrypointMismatches: 3 };
   const block = buildTuiHealthBlock(
     { enabled: true, entrypointMode: "cli", maxConcurrent: 2 }, ts, sem);
-  assert.deepEqual(Object.keys(block).sort(),
-    ["enabled", "entrypointMismatches", "entrypointMode", "inflight", "lastEntrypoint", "maxConcurrent", "queued"]);
+  // Shape is ADDITIVE-only: the seven original keys must all still be present (existing
+  // /health consumers are grandfathered, ADR 0006), plus `pool` (warm pane pool) and the
+  // stream* fields (backlog #2). Asserting CONTAINMENT plus an exact added-set — rather than
+  // one flat deepEqual — is what makes "additive" itself the thing under test: a future field
+  // that silently REPLACED an original key would pass a flat equality check that was updated
+  // alongside it, but cannot pass this one.
+  const ORIGINAL_KEYS = ["enabled", "entrypointMismatches", "entrypointMode", "inflight", "lastEntrypoint", "maxConcurrent", "queued"];
+  const keys = Object.keys(block);
+  for (const k of ORIGINAL_KEYS) assert.ok(keys.includes(k), `original /health key must survive: ${k}`);
+  assert.deepEqual(keys.filter((k) => !ORIGINAL_KEYS.includes(k)).sort(),
+    ["pool", "streamDeltas", "streamDivergences", "streamEnabled", "streamTopUps", "streamTurns", "streamZeroDeltaTurns"],
+    "only the documented pool + streaming fields may be added");
+  assert.equal(block.pool, null, "no pool passed → null (the default, pool disabled)");
   assert.equal(block.enabled, true);
   assert.equal(block.entrypointMode, "cli");
   assert.equal(block.lastEntrypoint, "cli");
@@ -3005,8 +3810,33 @@ test("models.json aliases.haiku === 'claude-haiku-4-5-20251001' (usage-probe SPO
   assert.equal(_spotModels.aliases.haiku, "claude-haiku-4-5-20251001");
 });
 
-test("models.json aliases.sonnet === 'claude-sonnet-4-6' (default-request-model SPOT)", () => {
-  assert.equal(_spotModels.aliases.sonnet, "claude-sonnet-4-6");
+test("models.json aliases.sonnet === 'claude-sonnet-5' (default-request-model SPOT)", () => {
+  assert.equal(_spotModels.aliases.sonnet, "claude-sonnet-5");
+});
+
+// ── Referential integrity (PR #152 review) ──────────────────────────────────
+// The value-mirror assertions above only prove the alias equals a string literal —
+// they pass even if that literal points at a model that does not exist in
+// models[]. A one-line slip (edit an alias, forget the models[] entry) would leave
+// /v1/models missing the model while every `model: "<alias>"` request passes
+// validation and then fails at CLI spawn. VALID_MODELS keys on alias *names*, so
+// nothing else checks alias *targets*. This is the guard with teeth.
+const _spotModelIds = new Set(_spotModels.models.map(m => m.id));
+
+test("models.json: claude-sonnet-5 is present in models[] (the entry this PR adds)", () => {
+  assert.ok(_spotModelIds.has("claude-sonnet-5"), "claude-sonnet-5 must exist as a models[].id");
+});
+
+test("models.json: every aliases value resolves to a real models[].id (referential integrity)", () => {
+  for (const [name, target] of Object.entries(_spotModels.aliases)) {
+    assert.ok(_spotModelIds.has(target), `aliases.${name} -> '${target}' is a dangling alias (no matching models[].id)`);
+  }
+});
+
+test("models.json: every legacyAliases value resolves to a real models[].id (referential integrity)", () => {
+  for (const [name, target] of Object.entries(_spotModels.legacyAliases || {})) {
+    assert.ok(_spotModelIds.has(target), `legacyAliases.${name} -> '${target}' is a dangling alias (no matching models[].id)`);
+  }
 });
 
 // ── escapeHtml + key-name validator (issue #114) ────────────────────────────
@@ -3205,8 +4035,460 @@ async function runAsyncTests() {
   });
 }
 
+// ── TUI real streaming: MessageDisplay hook sink (backlog #2) ───────────────
+// Pure-logic coverage for lib/tui/stream.mjs: sink parsing, the concat===T assertion,
+// prefix-stability, the auth-banner holdback, message scoping, and the error paths.
+import { TuiDeltaAssembler, parseDeltaChunk, buildStreamSettings, streamFilePath, HOOK_SCRIPT, prepareStreamHook, resolveStreamHoldback, DEFAULT_HOLDBACK_CHARS } from "./lib/tui/stream.mjs";
+
+test("stream: parseDeltaChunk consumes only COMPLETE lines (a torn write stays unread)", () => {
+  const p = (i, d, final = false) => JSON.stringify({ hook_event_name: "MessageDisplay", session_id: "s", message_id: "m", index: i, final, delta: d });
+  // second payload is mid-write — no trailing newline yet
+  const partial = `${p(0, "## A\n\n")}\n${p(1, "body").slice(0, 20)}`;
+  const r1 = parseDeltaChunk(partial, 0);
+  assert.equal(r1.deltas.length, 1, "only the terminated line is consumed");
+  assert.equal(r1.consumed, 1);
+  // now it lands complete
+  const whole = `${p(0, "## A\n\n")}\n${p(1, "body")}\n`;
+  const r2 = parseDeltaChunk(whole, r1.consumed);
+  assert.equal(r2.deltas.length, 1, "the once-partial line is picked up exactly once");
+  assert.equal(r2.deltas[0].delta, "body");
+  assert.equal(r2.consumed, 2);
+  // idempotent: nothing new
+  assert.equal(parseDeltaChunk(whole, r2.consumed).deltas.length, 0);
+});
+
+test("stream: parseDeltaChunk skips blank/garbage lines and foreign hook events", () => {
+  const md = JSON.stringify({ hook_event_name: "MessageDisplay", message_id: "m", index: 0, final: true, delta: "ok" });
+  const other = JSON.stringify({ hook_event_name: "Stop", message_id: "m", delta: "nope" });
+  const text = `\n{not json\n${other}\n${md}\n`;
+  const { deltas } = parseDeltaChunk(text, 0);
+  assert.equal(deltas.length, 1);
+  assert.equal(deltas[0].delta, "ok");
+});
+
+// The live-verified contract (claude 2.1.207): deltas are the raw markdown source and
+// concat(deltas) === extractLatestAssistantText(transcript), byte-exactly.
+const mdFire = (i, delta, { final = false, mid = "m1" } = {}) =>
+  ({ hook_event_name: "MessageDisplay", session_id: "s1", message_id: mid, index: i, final, delta });
+
+test("stream: concat(deltas) === T → exact, no top-up, prefix-stable at every n", () => {
+  const chunks = ["## Mutex\n\n", "A **mutual exclusion lock** prevents concurrent access.\n\n", "```javascript\nconst m = new Mutex();\n```"];
+  const T = chunks.join("");
+  const a = new TuiDeltaAssembler({ holdbackChars: 10 });
+  let acc = "";
+  chunks.forEach((c, i) => {
+    const out = a.push(mdFire(i, c, { final: i === chunks.length - 1 }));
+    if (out) acc += out;
+    assert.ok(T.startsWith(a.full), `prefix-stable at n=${i}`);
+  });
+  const rec = a.finalize(T);
+  assert.equal(rec.ok, true);
+  assert.equal(rec.exact, true, "concat(deltas) === T");
+  assert.equal(acc + rec.tail, T, "client's assembled stream === T");
+  assert.equal(a.deltas, 3);
+});
+
+test("stream: holdback withholds the first chars so the auth-banner gate can still fire", () => {
+  const banner = "Please run /login · API Error: 401 Invalid authentication credentials"; // 69 chars, a real one
+  const a = new TuiDeltaAssembler(); // default holdback 100
+  const out = a.push(mdFire(0, banner, { final: true }));
+  assert.equal(out, null, "a banner-length message must NEVER reach the client");
+  assert.equal(a.emitted, "", "nothing emitted");
+  // and the whole-message detector still classifies it — the gate runs on T, before any flush
+  assert.ok(detectTuiUpstreamError(a.full) !== null, "banner still detected at terminal");
+});
+
+test("stream: holdback releases once past the detector's reach, and only then", () => {
+  const a = new TuiDeltaAssembler({ holdbackChars: 100 });
+  assert.equal(a.push(mdFire(0, "x".repeat(80))), null, "80 chars: still held");
+  const out = a.push(mdFire(1, "y".repeat(40)));
+  assert.equal(out, "x".repeat(80) + "y".repeat(40), "released as one chunk once >100");
+  assert.equal(a.push(mdFire(2, "tail")), "tail", "subsequent deltas stream straight through");
+});
+
+// ── resolveStreamHoldback: the FLOOR under OCP_TUI_STREAM_HOLDBACK (A1 fix) ────────────
+// The C-1 auth-banner guarantee holds only while the holdback >= the default detector's
+// 100-char reach. These tests pin that the resolver CLAMPS UP to the floor. They are
+// mutation-proof: delete the `parsed < floor` branch and the sub-floor cases below fail
+// (a 50 would pass straight through, reopening the leak). The clamped flag drives the boot
+// warning in server.mjs, so its truthiness is asserted alongside every value.
+test("holdback: a sub-floor value is clamped UP to the floor and flagged", () => {
+  assert.deepEqual(resolveStreamHoldback("50"), { value: DEFAULT_HOLDBACK_CHARS, clamped: true });
+  assert.deepEqual(resolveStreamHoldback("0"), { value: DEFAULT_HOLDBACK_CHARS, clamped: true });
+  assert.deepEqual(resolveStreamHoldback("-5"), { value: DEFAULT_HOLDBACK_CHARS, clamped: true });
+  assert.deepEqual(resolveStreamHoldback("99"), { value: DEFAULT_HOLDBACK_CHARS, clamped: true });
+});
+
+test("holdback: garbage / NaN falls back to the floor and is flagged (not silently 0)", () => {
+  assert.deepEqual(resolveStreamHoldback("unlimited"), { value: DEFAULT_HOLDBACK_CHARS, clamped: true });
+  assert.deepEqual(resolveStreamHoldback("5MB"), { value: DEFAULT_HOLDBACK_CHARS, clamped: true });
+});
+
+test("holdback: an above-floor value passes through unchanged and is NOT flagged", () => {
+  assert.deepEqual(resolveStreamHoldback("200"), { value: 200, clamped: false });
+  assert.deepEqual(resolveStreamHoldback("101"), { value: 101, clamped: false });
+  assert.deepEqual(resolveStreamHoldback(String(DEFAULT_HOLDBACK_CHARS)), { value: DEFAULT_HOLDBACK_CHARS, clamped: false });
+});
+
+test("holdback: an unset env var takes the floor WITHOUT flagging (no spurious boot warning)", () => {
+  assert.deepEqual(resolveStreamHoldback(undefined), { value: DEFAULT_HOLDBACK_CHARS, clamped: false });
+  assert.deepEqual(resolveStreamHoldback(null), { value: DEFAULT_HOLDBACK_CHARS, clamped: false });
+  assert.deepEqual(resolveStreamHoldback(""), { value: DEFAULT_HOLDBACK_CHARS, clamped: false });
+  assert.deepEqual(resolveStreamHoldback("   "), { value: DEFAULT_HOLDBACK_CHARS, clamped: false });
+});
+
+test("holdback: the floor is a parameter, so a deployment can raise (never lower) it", () => {
+  assert.deepEqual(resolveStreamHoldback("150", 200), { value: 200, clamped: true }, "custom floor still clamps up");
+  assert.deepEqual(resolveStreamHoldback("300", 200), { value: 300, clamped: false });
+});
+
+test("stream: a short answer never passes the holdback and is delivered whole at terminal", () => {
+  const T = "The capital of France is Paris.";
+  const a = new TuiDeltaAssembler();
+  assert.equal(a.push(mdFire(0, T, { final: true })), null);
+  const rec = a.finalize(T);
+  assert.equal(rec.ok, true);
+  assert.equal(rec.exact, true);
+  assert.equal(rec.tail, T, "the whole short answer is flushed at terminal (buffered semantics)");
+});
+
+test("stream: a DROPPED delta is a safe prefix → top-up from the transcript, exact=false", () => {
+  const a = new TuiDeltaAssembler({ holdbackChars: 5 });
+  a.push(mdFire(0, "Hello world, this is the first block. "));
+  const T = "Hello world, this is the first block. And the tail the hook never delivered.";
+  const rec = a.finalize(T);
+  assert.equal(rec.ok, true, "prefix → recoverable");
+  assert.equal(rec.exact, false, "flagged: concat(deltas) !== T");
+  assert.equal(rec.tail, "And the tail the hook never delivered.");
+  assert.equal(a.emitted + rec.tail, T, "client still receives exactly T");
+});
+
+test("stream: emitted bytes NOT a prefix of T → divergence, refuse the turn", () => {
+  const a = new TuiDeltaAssembler({ holdbackChars: 5 });
+  a.push(mdFire(0, "Let me go and read that file for you first."));
+  const rec = a.finalize("A completely different final answer.");
+  assert.equal(rec.ok, false, "must NOT serve text the transcript disagrees with");
+  assert.equal(rec.tail, null);
+});
+
+// Message scoping: the transcript keeps only the LAST assistant message, so the assembler
+// must too. Discarding is safe while nothing has been emitted; after that it is a divergence.
+test("stream: new message_id BEFORE any emit → held text discarded, stays exact vs T", () => {
+  const a = new TuiDeltaAssembler({ holdbackChars: 100 });
+  a.push(mdFire(0, "I'll check the file.", { mid: "m1" })); // short pre-tool prose, held back
+  assert.equal(a.emitted, "");
+  const answer = "The file defines a Mutex class with acquire and release, and " + "z".repeat(90);
+  const out = a.push(mdFire(0, answer, { mid: "m2", final: true }));
+  assert.equal(out, answer, "only the FINAL message's text is emitted");
+  const rec = a.finalize(answer); // T = extractLatestAssistantText = the last message only
+  assert.equal(rec.ok, true);
+  assert.equal(rec.exact, true, "scoping to the last message_id keeps concat === T true");
+  assert.equal(a.messages, 2);
+});
+
+test("stream: new message_id AFTER an emit → unretractable, flagged and refused", () => {
+  const a = new TuiDeltaAssembler({ holdbackChars: 10 });
+  a.push(mdFire(0, "Long pre-tool prose that already went out to the client.", { mid: "m1" }));
+  assert.notEqual(a.emitted, "");
+  // Assert what push() RETURNS, not merely that finalize() refuses. This test used to check
+  // only restartedAfterEmit + finalize().ok, which left it passing while F1 was live: the
+  // second message's bytes were still being handed to the client. "The turn is refused" and
+  // "the client got the bytes anyway" were both true at once.
+  const out = a.push(mdFire(0, "The real answer.", { mid: "m2", final: true }));
+  assert.equal(out, null, "after a message boundary follows an emit, NOTHING more may be emitted");
+  assert.equal(a.restartedAfterEmit, true);
+  assert.equal(a.finalize("The real answer.").ok, false, "must refuse: prose already emitted is not in T");
+});
+
+test("F1: an auth banner rendered as a LATER message is never forwarded to the client", () => {
+  // The leak this class exists to prevent, in the shape production actually runs
+  // (OCP_TUI_FULL_TOOLS=1 → multi-message tool-using turns are the norm):
+  //   1. the model narrates past the holdback before a tool call  → released, emitted != ""
+  //   2. credentials expire mid-turn → claude renders the 401 as ordinary assistant TEXT,
+  //      as a NEW message
+  //   3. pre-fix: push() took the `if (this.released)` branch — `released` was never reset at
+  //      a message boundary — and returned the BANNER verbatim, straight to the client.
+  // The holdback protected only the FIRST message of a turn. This asserts it protects the rest.
+  const a = new TuiDeltaAssembler({ holdbackChars: 100 });
+  const narration = "I'll check that file for you and then report back with what I find inside it.";
+  a.push(mdFire(0, narration + narration, { mid: "m1" }));   // > holdback → released
+  assert.notEqual(a.emitted, "", "precondition: the narration really did reach the client");
+
+  const BANNER = "Please run /login · API Error: 401 Invalid authentication credentials";
+  const out = a.push(mdFire(1, BANNER, { mid: "m2", final: true }));
+  assert.equal(out, null, "the auth banner must NOT be forwarded once a later message begins");
+  assert.ok(!a.emitted.includes("401"), "no byte of the banner may have reached the client");
+  assert.equal(a.finalize(BANNER).ok, false, "and the turn is refused, not served");
+});
+
+test("F1: a first payload with message_id:null cannot disarm the guard", () => {
+  // The residual bypass the reviewer found by probing. `this.messageId` used to be initialized
+  // to null, so a first payload carrying message_id:null compared EQUAL to it → no boundary
+  // registered → `messages` stayed 0 → when the REAL boundary arrived, `messages > 1` evaluated
+  // 1 > 1 === false → restartedAfterEmit never armed → the released branch forwarded the banner.
+  // The whole F1 guard was disarmed by a single null field. parseDeltaChunk does not validate
+  // message_id, so such a payload does reach push().
+  const a = new TuiDeltaAssembler({ holdbackChars: 100 });
+  const narration = "I'll check that file for you and then report back with what I find inside it.";
+  a.push({ hook_event_name: "MessageDisplay", message_id: null, delta: narration + narration });
+  assert.notEqual(a.emitted, "", "precondition: the narration released to the client");
+  assert.equal(a.messages, 1, "a null message_id is still a MESSAGE — it must register as one");
+
+  const BANNER = "Please run /login · API Error: 401 Invalid authentication credentials";
+  const out = a.push({ hook_event_name: "MessageDisplay", message_id: "m2", delta: BANNER });
+  assert.equal(out, null, "the banner must not be forwarded — the guard must arm regardless");
+  assert.equal(a.restartedAfterEmit, true);
+  assert.ok(!a.emitted.includes("401"));
+});
+
+test("F1: whitespace cannot buy a release — the holdback screens TRIMMED length", () => {
+  // detectTuiUpstreamError() TRIMS before applying its <=100-char rule, so gating release on
+  // the UNTRIMMED pending.length let 101 spaces trim to "" → the detector has nothing to
+  // classify → returns null → release fires having screened nothing, and every subsequent
+  // delta of that message (a banner included) streams unfiltered.
+  const a = new TuiDeltaAssembler({ holdbackChars: 100 });
+  assert.equal(a.push(mdFire(0, " ".repeat(101), { mid: "m1" })), null,
+    "101 chars of whitespace must not clear a 100-char holdback");
+  assert.equal(a.released, false, "…and must not flip the assembler into released state");
+  const BANNER = "Please run /login · API Error: 401 Invalid authentication credentials";
+  assert.equal(a.push(mdFire(1, BANNER, { mid: "m1" })), null, "so the banner stays held back");
+  assert.ok(!a.emitted.includes("401"));
+});
+
+test("F3: a STALE or truncated hook script is overwritten, not trusted because it exists", () => {
+  // ~/.ocp-tui/stream/{md-hook.sh,settings.json} persist across OCP restarts. The old
+  // write-if-missing guard meant a host that booted once under an older version was stuck on
+  // that version's HOOK_SCRIPT forever — no upgrade could reach it. Worse, a non-atomic write
+  // interrupted mid-flight leaves a TRUNCATED md-hook.sh that existsSync() calls fine, and
+  // claude BLOCKS on that hook synchronously on every fire.
+  const dir = mkdtemp2(`${tmpdir2()}/ocp-hook-`);
+  mkdir2(dir, { recursive: true });
+  writeFile2(`${dir}/md-hook.sh`, "#!/bin/sh\n# stale, truncated leftov", { mode: 0o700 });
+  writeFile2(`${dir}/settings.json`, "{ TRUNCATED", { mode: 0o600 });
+
+  const settings = prepareStreamHook(dir);
+
+  assert.equal(readFile2(`${dir}/md-hook.sh`, "utf8"), HOOK_SCRIPT,
+    "the stale script must be replaced with the current one, not left because it existed");
+  assert.deepEqual(JSON.parse(readFile2(settings, "utf8")), buildStreamSettings(`${dir}/md-hook.sh`),
+    "…and so must the stale settings file");
+});
+
+test("stream: hook script is a write-and-exit sh script and tolerates a missing sink var", () => {
+  // forceSyncExecution: claude BLOCKS on this hook, so it must do no work inline.
+  assert.ok(HOOK_SCRIPT.startsWith("#!/bin/sh"));
+  assert.ok(HOOK_SCRIPT.includes('[ -n "$OCP_TUI_STREAM_FILE" ] || exec cat >/dev/null'),
+    "no sink configured => swallow stdin and exit 0; never fail, never block claude");
+  assert.ok(!/curl|node |python/.test(HOOK_SCRIPT), "no interpreter/network work in a blocking hook");
+});
+
+test("stream: settings registers exactly one MessageDisplay command hook (static, no per-request data)", () => {
+  const s = buildStreamSettings("/x/md-hook.sh");
+  assert.deepEqual(Object.keys(s.hooks), ["MessageDisplay"]);
+  assert.equal(s.hooks.MessageDisplay[0].hooks[0].type, "command");
+  assert.equal(s.hooks.MessageDisplay[0].hooks[0].command, "/x/md-hook.sh");
+  // Warm-pool compatibility: the settings file must NOT carry a session/request-specific path.
+  assert.ok(!JSON.stringify(s).includes(".jsonl"), "sink path comes from the pane env, not the settings file");
+});
+
+test("stream: sink path is keyed by session_id (concurrent panes cannot interleave)", () => {
+  // OCP_TUI_MAX_CONCURRENT defaults to 2 — two claude panes DO run at once. A shared sink
+  // would splice request A's deltas into request B's stream.
+  const A = streamFilePath("/d", "aaaa-1111");
+  const B = streamFilePath("/d", "bbbb-2222");
+  assert.notEqual(A, B, "one sink per session-id");
+  assert.ok(A.endsWith("/aaaa-1111.jsonl"));
+});
+
+test("stream: buildTuiCmd — OFF is byte-for-byte the pre-streaming argv; ON adds only env + --settings", () => {
+  const off = buildTuiCmd("/bin/claude", "m", "SID", "/h", "cli");
+  assert.ok(!off.includes("--settings"), "no --settings when streaming is off");
+  assert.ok(!off.includes("OCP_TUI_STREAM_FILE"), "no sink env when streaming is off");
+  const on = buildTuiCmd("/bin/claude", "m", "SID", "/h", "cli", { file: "/d/SID.jsonl", settings: "/d/s.json" });
+  assert.ok(on.includes("OCP_TUI_STREAM_FILE='/d/SID.jsonl'"), "sink delivered via the pane env");
+  assert.ok(on.includes("--settings '/d/s.json'"));
+  // must not regress the MCP wall or the pinned effort (#156)
+  assert.ok(on.includes("--strict-mcp-config") && on.includes("--disallowedTools 'mcp__*'"), "MCP wall intact");
+  assert.ok(on.includes("--effort low"), "OCP_TUI_EFFORT default intact");
+  assert.ok(!on.includes(" -p ") && !on.includes("--bare"), "still a plain interactive TUI spawn");
+});
+
+test("stream: /health block is additive and exposes the divergence counter", () => {
+  const stats = { lastEntrypoint: "cli", entrypointMismatches: 0, streamTurns: 3, streamDeltas: 21, streamTopUps: 1, streamDivergences: 0 };
+  const sem = { inflight: 0, queued: 0 };
+  const b = buildTuiHealthBlock({ enabled: true, entrypointMode: "cli", maxConcurrent: 2, streamEnabled: true }, stats, sem);
+  assert.equal(b.streamEnabled, true);
+  assert.equal(b.streamTurns, 3);
+  assert.equal(b.streamDivergences, 0);
+  // existing fields unchanged (grandfathered /health consumers)
+  assert.equal(b.enabled, true);
+  assert.equal(b.entrypointMode, "cli");
+  assert.equal(b.maxConcurrent, 2);
+  // a pre-streaming tuiStats (no stream* keys) must not produce undefined/NaN
+  const legacy = buildTuiHealthBlock({ enabled: false, entrypointMode: "cli", maxConcurrent: 2 }, { lastEntrypoint: null, entrypointMismatches: 0 }, sem);
+  assert.equal(legacy.streamEnabled, false);
+  assert.equal(legacy.streamDivergences, 0);
+});
+
 // ── Cleanup ──
-runAsyncTests().then(() => {
+// Settle the async-bodied tests registered through the sync `test()` helper BEFORE summarizing —
+// otherwise their pass/fail is not reflected in the counts (see the `pendingAsync` comment above).
+// ─── TUI streaming × warm pool: the INTEGRATION seam (backlog #2 rebased onto #158) ───
+//
+// The hook is installed by bootTuiPane at BOOT, and runTuiTurn reads the sink off the PANE
+// (pane.streamFile). That indirection is the entire reason a POOLED pane streams: the pool
+// pre-boots panes long before a request exists, so anything derived at turn time would leave
+// every pool HIT silently buffered while every MISS streamed — a perf regression with no
+// failing test and no error, visible only as "streaming mysteriously does nothing in prod".
+// These three guard that seam.
+console.log("\nTUI streaming × warm pane pool integration:");
+
+import { bootTuiPane as bootPaneUnderTest, runTuiTurn as runTurnUnderTest } from "./lib/tui/session.mjs";
+import { mkdtempSync as mkdtemp2, writeFileSync as writeFile2, mkdirSync as mkdir2, readFileSync as readFile2 } from "node:fs";
+import { tmpdir as tmpdir2 } from "node:os";
+
+// Fake tmux that records the spawned pane command and always looks ready + pasted.
+function makeTmuxRecorder() {
+  const cmds = [];
+  const tmux = (args) => {
+    cmds.push(args);
+    if (args[0] === "capture-pane") {
+      // input bar present AND the prompt visibly landed → both polls pass immediately
+      return { status: 0, stdout: "[Pasted text #1 +2 lines]\n ? for shortcuts" };
+    }
+    return { status: 0, stdout: "" };
+  };
+  return { tmux, cmds, paneCmd: () => (cmds.find((a) => a[0] === "new-session") || []).slice(-1)[0] || "" };
+}
+
+// A HOME with one already-terminal transcript for `sid`, so readTuiTranscript returns at once.
+function seedTranscript(home, sid, text) {
+  const dir = `${home}/.claude/projects/x`;
+  mkdir2(dir, { recursive: true });
+  writeFile2(`${dir}/${sid}.jsonl`, JSON.stringify({
+    type: "assistant",
+    message: { role: "assistant", content: [{ type: "text", text }], stop_reason: "end_turn" },
+    turn_duration: 1234, cc_entrypoint: "cli",
+  }) + "\n");
+}
+
+test("bootTuiPane with a streamDir installs the hook AT BOOT and hands the sink back on the pane", async () => {
+  const home = mkdtemp2(`${tmpdir2()}/ocp-t-`);
+  const streamDir = mkdtemp2(`${tmpdir2()}/ocp-s-`);
+  const rec = makeTmuxRecorder();
+  const pane = await bootPaneUnderTest({
+    model: "sonnet", claudeBin: "claude", home, realHome: home,
+    cwd: `${home}/wk`, port: 3456, tmux: rec.tmux, streamDir,
+  });
+  // The pane carries its OWN sink, named from its OWN session-id — which is what a pre-booted
+  // pool pane needs, since it is minted with no knowledge of the request it will eventually serve.
+  assert.ok(pane.streamFile, "a streamDir must yield a per-pane sink on the returned pane");
+  assert.ok(pane.streamFile.includes(pane.sessionId), "the sink is keyed by the pane's own session-id");
+  const cmd = rec.paneCmd();
+  assert.ok(cmd.includes("OCP_TUI_STREAM_FILE="), "the pane's env must carry its sink path");
+  assert.ok(cmd.includes(pane.streamFile), "…and it must be THIS pane's sink, not a shared one");
+  assert.ok(cmd.includes("--settings"), "the MessageDisplay hook must be registered at spawn");
+});
+
+test("bootTuiPane WITHOUT a streamDir spawns exactly today's pane — no hook, no --settings", async () => {
+  const home = mkdtemp2(`${tmpdir2()}/ocp-t-`);
+  const rec = makeTmuxRecorder();
+  const pane = await bootPaneUnderTest({
+    model: "sonnet", claudeBin: "claude", home, realHome: home,
+    cwd: `${home}/wk`, port: 3456, tmux: rec.tmux,
+  });
+  assert.equal(pane.streamFile, null, "no streamDir → no sink (streaming is opt-in, default OFF)");
+  const cmd = rec.paneCmd();
+  assert.ok(!cmd.includes("--settings"), "the default spawn must not gain --settings");
+  assert.ok(!cmd.includes("OCP_TUI_STREAM_FILE"), "the default spawn must not gain the hook env");
+});
+
+test("REGRESSION: a WARM (pooled) pane streams — the sink comes off the pane, not the turn", async () => {
+  const home = mkdtemp2(`${tmpdir2()}/ocp-t-`);
+  const streamDir = mkdtemp2(`${tmpdir2()}/ocp-s-`);
+  const rec = makeTmuxRecorder();
+
+  // Pre-boot a pane the way the POOL does (its own session-id + sink, fixed at boot).
+  const warm = await bootPaneUnderTest({
+    model: "sonnet", claudeBin: "claude", home, realHome: home,
+    cwd: `${home}/wk`, port: 3456, tmux: rec.tmux, streamDir,
+  });
+  // Its hook has already fired twice by the time the turn's transcript goes terminal.
+  writeFile2(warm.streamFile,
+    JSON.stringify({ hook_event_name: "MessageDisplay", delta: "Hello " }) + "\n" +
+    JSON.stringify({ hook_event_name: "MessageDisplay", delta: "world" }) + "\n");
+  seedTranscript(home, warm.sessionId, "Hello world");
+
+  const seen = [];
+  const pool = { acquire: () => warm, refill: () => {}, warm: 0 };
+  const out = await runTurnUnderTest({
+    prompt: "say hello", model: "sonnet", claudeBin: "claude", home, realHome: home,
+    cwd: `${home}/wk`, port: 3456, tmux: rec.tmux, pool,
+    onDelta: (d) => seen.push(d.delta),
+    // streamDir is deliberately NOT passed: on a pool HIT runTuiTurn never cold-boots, so if it
+    // recomputed the sink from a turn-time streamDir (the pre-rebase shape) this turn would emit
+    // ZERO deltas and silently serve buffered. Reading pane.streamFile is what makes it stream.
+    streamDir: null,
+  });
+  assert.deepEqual(seen, ["Hello ", "world"], "the pooled pane's deltas must reach the client");
+  assert.equal(out.text, "Hello world", "and the transcript stays authoritative for the final text");
+});
+
+console.log("\nTest isolation (the suite must never touch the operator's live key store):");
+
+test("the key store under test is a scratch db, NOT the operator's real ~/.ocp/ocp.db", () => {
+  // The guard that was missing. `npm test` wrote live, UNREVOKED api_keys rows straight into the
+  // operator's real ~/.ocp/ocp.db — the same database the running server reads — two per run,
+  // unbounded (737 junk keys vs 12 real ones on the maintainer's host before this landed). It
+  // went unnoticed for so long precisely because NOTHING asserted where the store actually was.
+  const real = join(homedir(), ".ocp", "ocp.db");
+  const used = getDbPath();
+  assert.ok(used, "getDb() must have opened something by now");
+  assert.notEqual(used, real, "the suite must NOT open the operator's live key database");
+  assert.ok(used.startsWith(TEST_OCP_DIR), `expected a scratch db under ${TEST_OCP_DIR}, got ${used}`);
+});
+
+test("a PRODUCTION process (no NODE_ENV) must IGNORE OCP_DIR_OVERRIDE", () => {
+  // Must run OUT OF PROCESS. The parent is irreversibly NODE_ENV=test by the time any test runs
+  // (test-env.mjs set it before keys.mjs was imported), so the production path is unreachable
+  // from in here — and an in-process test can only ever RE-IMPLEMENT the predicate, which is
+  // worthless: the first cut of this test did exactly that, and deleting the whole NODE_ENV gate
+  // from keys.mjs still left the suite at 320 passed / 0 failed. A copy of the predicate is not
+  // the predicate. So: spawn a child with no NODE_ENV, the override set, and HOME redirected to
+  // a temp dir (so the real key store is never opened), and assert what the REAL keys.mjs did.
+  const home = mkdtempSync(join(tmpdir(), "ocp-prodsim-"));
+  const evil = mkdtempSync(join(tmpdir(), "ocp-evil-"));
+  try {
+    const keysUrl = pathToFileURL(join(import.meta.dirname, "keys.mjs")).href;
+    // The child prints the override it SAW, then the store it actually opened. Printing both is
+    // the negative control: without it, a future refactor that renamed the env var and missed
+    // this test's `env` object would leave the child with no override at all — and "prod opened
+    // the right store" would pass for the wrong reason. Asserting the child saw it and ignored
+    // it anyway is the claim we actually want to make.
+    const probe = `import { getDb, getDbPath, closeDb } from ${JSON.stringify(keysUrl)};
+getDb(); process.stdout.write(process.env.OCP_DIR_OVERRIDE + "\\n" + getDbPath()); closeDb();`;
+    const env = { ...process.env, HOME: home, OCP_DIR_OVERRIDE: evil };
+    delete env.NODE_ENV;                       // a production server has no NODE_ENV
+    const [seen, opened] = execFileSync(process.execPath, ["--input-type=module", "-e", probe],
+      { env, encoding: "utf8" }).trim().split("\n");
+    assert.equal(seen, evil, "precondition: the child must actually SEE the override");
+    assert.equal(opened, join(home, ".ocp", "ocp.db"), "a prod process must open HOME/.ocp/ocp.db");
+    assert.ok(!opened.startsWith(evil), "…having seen the override, a prod process must IGNORE it");
+  } finally {
+    rmSync(home, { recursive: true, force: true });
+    rmSync(evil, { recursive: true, force: true });
+  }
+});
+
+test("listKeys does not depend on rows left behind by an earlier or concurrent run", () => {
+  // The ~1-in-6 flake: two runs sharing one db file. keys.find() returned undefined and the
+  // caller's `in` check threw a TypeError instead of failing cleanly. With a per-run scratch db
+  // the store starts empty, so the count is exactly what THIS run created.
+  const mine = listKeys().filter((k) => k.name === "test-user-1");
+  assert.equal(mine.length, 1, "exactly one test-user-1 — a shared store would accumulate duplicates");
+});
+
+runAsyncTests().then(() => Promise.all(pendingAsync)).then(() => {
   closeDb();
   console.log(`\n=== Results: ${passed} passed, ${failed} failed ===\n`);
   process.exit(failed > 0 ? 1 : 0);

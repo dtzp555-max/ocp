@@ -59,6 +59,16 @@ export async function runDoctor(opts = {}) {
   // of recommending a downgrade against a stale hardcoded value.
   let latestVersion = opts.mockLatest;
   if (!latestVersion) {
+    // Issue #173: `git show origin/main:...` reads the LOCALLY CACHED remote ref. Without a
+    // fetch first, a machine that hasn't pulled since the last release sees latest == current
+    // and reports noop — new releases were invisible everywhere except the machine that cut
+    // the tag (live repro: Oracle VM, 2026-07-17). Fetch before comparing; on failure
+    // (offline, auth, timeout) fall through to the cached ref — the pre-existing behavior.
+    if (!opts.skipNetwork) {
+      try {
+        execSync(`git -C ${ocpDir} fetch --tags --quiet`, { stdio: ["pipe", "pipe", "pipe"], timeout: 15000 });
+      } catch { /* offline → compare against cached origin/main, as before */ }
+    }
     try {
       const out = execSync(`git -C ${ocpDir} show origin/main:package.json 2>/dev/null`, { stdio: ["pipe", "pipe", "pipe"] }).toString();
       const remotePkg = JSON.parse(out);

@@ -17,6 +17,20 @@ import { existsSync, copyFileSync } from "node:fs";
 import { writeSnapshot, listSnapshots, readSnapshot, gcSnapshots } from "./lib/snapshot.mjs";
 import { DEFAULT_PORT } from "../lib/constants.mjs";
 
+// Post-flight acceptance predicate (issue #173). A health probe passes ONLY when the server
+// is authed AND actually serving the TARGET version. auth.ok alone is not enough: a stale
+// process holding the port answers auth.ok=true while still running the OLD code — exactly
+// what a nohup-fallback orphan did on 2026-07-17 (upgrade "succeeded", /health kept serving
+// 3.21.1). Comparing /health.version to the checkout target catches orphan-holds-port,
+// restart-didn't-take, and wrong-unit-restarted alike. `target` tolerates a leading "v"
+// (doctor reports "v3.22.1"; /health reports "3.22.1"); an empty/unknown target degrades to
+// the old auth-only check rather than blocking an otherwise-good upgrade.
+export function postFlightOk(body, target) {
+  if (body?.auth?.ok !== true) return false;
+  const want = String(target || "").replace(/^v/, "");
+  return !want || body?.version === want;
+}
+
 export async function runUpgrade(opts = {}) {
   const dryRun = !!opts.dryRun;
   const yes = !!opts.yes;
@@ -137,16 +151,22 @@ async function runFullUpgrade({ doctor, opts }) {
     if (!opts.mockExec) {
       const port = process.env.CLAUDE_PROXY_PORT || String(DEFAULT_PORT);
       let ok = false;
+      let lastSeen = null;
       for (let i = 0; i < 10; i++) {
         try {
           const out = execSync(`curl -sf --max-time 2 http://127.0.0.1:${port}/health`).toString();
           const body = JSON.parse(out);
-          if (body.auth?.ok === true) { ok = true; break; }
+          lastSeen = body.version;
+          if (postFlightOk(body, doctor.latest_version)) { ok = true; break; }
         } catch { /* retry */ }
         await new Promise(r => setTimeout(r, 1000));
       }
       if (!ok) {
-        phases.push({ name: "post-flight", status: "fail", message: "health did not return auth.ok=true within 10s" });
+        phases.push({
+          name: "post-flight", status: "fail",
+          message: `health did not return auth.ok=true AND version=${doctor.latest_version} within 10s`
+            + (lastSeen ? ` (last saw version=${lastSeen} — a stale process may still hold the port; check \`ss -ltnp\` / \`lsof -i\`)` : ""),
+        });
         throw new Error("post-flight failed");
       }
       execSync(`curl -sf --max-time 3 http://127.0.0.1:${port}/v1/models > /dev/null`);
