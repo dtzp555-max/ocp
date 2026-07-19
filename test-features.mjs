@@ -3818,7 +3818,7 @@ test("stream: /health block is additive and exposes the divergence counter", () 
 });
 
 // ── OpenAI Structured Outputs (response_format) — lib/structured-output.mjs ──
-import { detectStructuredOutput, validateJsonSchema, extractJsonPayload, structuredSystemInstruction, StructuredOutputError } from "./lib/structured-output.mjs";
+import { detectStructuredOutput, validateJsonSchema, extractJsonPayload, structuredSystemInstruction, StructuredOutputError, resolveMaxAttempts } from "./lib/structured-output.mjs";
 
 test("detectStructuredOutput: json_schema shape", () => {
   const d = detectStructuredOutput({ response_format: { type: "json_schema", json_schema: { name: "x", strict: true, schema: { type: "object" } } } });
@@ -3900,6 +3900,35 @@ test("StructuredOutputError carries reason", () => {
   assert.equal(e.reason, "schema validation failed"); assert.ok(e instanceof Error);
 });
 
+// ── PR #153 review round 2, MUST-FIX: OCP_STRUCTURED_MAX_ATTEMPTS NaN guard must fail closed ──
+// The old `Math.max(1, parseInt(env||"3",10))` returned NaN for a non-integer value → the retry loop
+// `attempt < NaN` never ran → 0 spawns, every structured request refused. resolveMaxAttempts keeps
+// the default instead of silently bricking the feature.
+test("resolveMaxAttempts: valid integer honored", () => {
+  assert.equal(resolveMaxAttempts("5"), 5);
+  assert.equal(resolveMaxAttempts("1"), 1);
+});
+test("resolveMaxAttempts: unset/empty → default", () => {
+  assert.equal(resolveMaxAttempts(undefined), 3);
+  assert.equal(resolveMaxAttempts(""), 3);
+  assert.equal(resolveMaxAttempts(null), 3);
+});
+test("resolveMaxAttempts: non-integer / non-finite / <1 fails CLOSED to the default (not NaN, not 0)", () => {
+  let warned = 0; const warn = () => { warned++; };
+  for (const bad of ["abc", "0", "-1", "NaN", "Infinity", "  "]) {
+    const v = resolveMaxAttempts(bad, { fallback: 3, warn });
+    assert.equal(v, 3, `bad input ${JSON.stringify(bad)} must fall back to 3, got ${v}`);
+    assert.ok(Number.isFinite(v) && v >= 1, "result is always a usable positive integer");
+  }
+  assert.ok(warned > 0, "invalid values emit a startup warning");
+});
+test("resolveMaxAttempts: the retry loop is never bounded by NaN (regression: 0 spawns / silent refuse)", () => {
+  const attempts = resolveMaxAttempts("abc");
+  let ran = 0;
+  for (let attempt = 0; attempt < attempts; attempt++) ran++;
+  assert.ok(ran >= 1, "loop must execute at least once — pre-fix it ran 0 times");
+});
+
 // ── PR #153 review finding 1: $ref/$defs + strict:true must accept conforming objects ──
 // The flagship shape the OpenAI SDK emits (zodResponseFormat / client.beta.chat.completions.parse)
 // and OpenAI's own structured-outputs docs example: nested {$ref:"#/$defs/step"} + strict:true.
@@ -3954,6 +3983,37 @@ test("validateJsonSchema: allOf requires every branch to pass", () => {
 
 test("validateJsonSchema: unresolvable $ref is skipped, not failed", () => {
   assert.deepEqual(validateJsonSchema({ anything: 1 }, { $ref: "#/$defs/missing" }), []);
+});
+
+// ── PR #153 review round 2, BLOCKER: cyclic $ref must fail closed, not stack-overflow ──
+// A pure ref→ref cycle recurses independent of the data — before the fix ANY reply value (even `5`)
+// threw `RangeError: Maximum call stack size exceeded`, caught upstream as a 500 but only after
+// 1–3 metered spawns → a request-controlled cost-amplification / grief vector on an authed path.
+test("validateJsonSchema: a→b→a cyclic $ref fails closed (no stack overflow) for any value", () => {
+  const schema = { $defs: { a: { $ref: "#/$defs/b" }, b: { $ref: "#/$defs/a" } }, $ref: "#/$defs/a" };
+  let errs;
+  assert.doesNotThrow(() => { errs = validateJsonSchema(5, schema, "$", true); }, "cyclic $ref must not overflow the stack");
+  assert.ok(errs.some(e => /cyclic \$ref/.test(e)), `expected a cyclic-$ref error, got: ${JSON.stringify(errs)}`);
+});
+test("validateJsonSchema: self-referential $ref (a→a) fails closed", () => {
+  const schema = { $defs: { a: { $ref: "#/$defs/a" } }, $ref: "#/$defs/a" };
+  let errs;
+  assert.doesNotThrow(() => { errs = validateJsonSchema({ x: 1 }, schema, "$", true); });
+  assert.ok(errs.some(e => /cyclic \$ref/.test(e)));
+});
+test("validateJsonSchema: cycle routed through anyOf fails closed", () => {
+  const schema = { $defs: { a: { anyOf: [{ $ref: "#/$defs/a" }] } }, $ref: "#/$defs/a" };
+  assert.doesNotThrow(() => validateJsonSchema({ x: 1 }, schema, "$", true));
+});
+test("validateJsonSchema: a LEGITIMATE recursive schema (Node→child:Node) is NOT flagged as a cycle", () => {
+  // Data is a finite tree, so data-consuming recursion terminates — the cycle guard must not
+  // false-positive here (refChain resets across properties/items).
+  const schema = {
+    $defs: { node: { type: "object", properties: { v: { type: "integer" }, child: { $ref: "#/$defs/node" } }, required: ["v"], additionalProperties: false } },
+    $ref: "#/$defs/node",
+  };
+  const tree = { v: 1, child: { v: 2, child: { v: 3 } } };
+  assert.deepEqual(validateJsonSchema(tree, schema, "$", true), []);
 });
 
 // ── PR #153 review finding 2: never serve an unvalidated / ambiguous extraction ──

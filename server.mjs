@@ -42,7 +42,7 @@ import { dirname, join } from "node:path";
 import { homedir } from "node:os";
 import { validateKey, recordUsage, getUsageByKey, getUsageTimeline, getRecentUsage, createKey, listKeys, revokeKey, closeDb, checkQuota, updateKeyQuota, getKeyQuota, findKey, cacheHash, getCachedResponse, setCachedResponse, clearCache, getCacheStats, hasCacheControl, singleflight, getInflightStats } from "./keys.mjs";
 import { DEFAULT_PORT } from "./lib/constants.mjs";
-import { StructuredOutputError, detectStructuredOutput, validateJsonSchema, extractJsonPayload, structuredSystemInstruction } from "./lib/structured-output.mjs";
+import { StructuredOutputError, detectStructuredOutput, validateJsonSchema, extractJsonPayload, structuredSystemInstruction, resolveMaxAttempts } from "./lib/structured-output.mjs";
 import { isLoopbackBind } from "./lib/net.mjs";
 import { runTuiTurn, reapStaleTuiSessions, resolveTuiHome, bootTuiPane, tuiPaneHealthy, poolPaneName, POOL_BOOT_MS } from "./lib/tui/session.mjs";
 import { detectTuiUpstreamError } from "./lib/tui/transcript.mjs";
@@ -327,7 +327,14 @@ const ALLOWED_TOOLS = (process.env.CLAUDE_ALLOWED_TOOLS ||
 const SYSTEM_PROMPT = process.env.CLAUDE_SYSTEM_PROMPT || "";
 // Max attempts (initial + retries) to coerce a valid structured-output (OpenAI response_format)
 // JSON response out of the model before rejecting. See runStructuredCompletion.
-const STRUCTURED_MAX_ATTEMPTS = Math.max(1, parseInt(process.env.OCP_STRUCTURED_MAX_ATTEMPTS || "3", 10));
+// Fail closed on a non-numeric value via resolveMaxAttempts(): the old `Math.max(1, parseInt("abc",10))`
+// === `Math.max(1, NaN)` === NaN, which made the retry loop `attempt < NaN` never execute → 0 spawns,
+// every structured request silently refused. The helper rejects NaN/non-finite/<1 and keeps the
+// documented default of 3. (PR #153 review round 2, NaN-guard must-fix.)
+const STRUCTURED_MAX_ATTEMPTS = resolveMaxAttempts(
+  process.env.OCP_STRUCTURED_MAX_ATTEMPTS,
+  { fallback: 3, warn: (m) => console.warn(`[init] ${m}`) },
+);
 const MCP_CONFIG = process.env.CLAUDE_MCP_CONFIG || "";
 let SESSION_TTL = parseInt(process.env.CLAUDE_SESSION_TTL || "3600000", 10);
 let MAX_CONCURRENT = parseInt(process.env.CLAUDE_MAX_CONCURRENT || "8", 10);
