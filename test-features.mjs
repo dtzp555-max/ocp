@@ -2652,6 +2652,27 @@ test("hasImageContent: image anywhere in history (not just last) → true", () =
   assert.equal(mmHasImageContent(msgs), true);
 });
 
+// ── PR #154 review round 2, gap (b): image ONLY in a system message must not silently drop ──
+// The handler detects multimodal on the FULL list but extraction/spawn filter system messages out.
+// The guard fires exactly when the full list has an image but the non-system list does not — proven
+// here against the same predicate the guard uses, so a system-only image is rejected (400) rather
+// than falling to the text path and returning a 200 hallucinated answer.
+test("hasImageContent: image ONLY in a system message → true on full list, false after system filter (guard fires)", () => {
+  const msgs = [
+    { role: "system", content: [txtPart("context"), imgPart()] },
+    { role: "user", content: "describe it" },
+  ];
+  assert.equal(mmHasImageContent(msgs), true, "detected as multimodal on the full list");
+  assert.equal(mmHasImageContent(msgs.filter(m => m.role !== "system")), false, "no image survives the system filter → guard must 400");
+});
+test("hasImageContent: image in a USER message survives the system filter (legitimate request not rejected)", () => {
+  const msgs = [
+    { role: "system", content: "you are helpful" },
+    { role: "user", content: [txtPart("describe it"), imgPart()] },
+  ];
+  assert.equal(mmHasImageContent(msgs.filter(m => m.role !== "system")), true, "user image survives → normal multimodal path");
+});
+
 test("buildImageBlocks: data-URI parsed into an Anthropic base64 image block", () => {
   const { blocks, stats } = mmBuildImageBlocks([{ role: "user", content: [txtPart("what is this?"), imgPart("image/png")] }]);
   assert.equal(blocks.length, 2);
@@ -2903,6 +2924,19 @@ test("parsePositiveInt: '20.5' → fractional/ambiguous rejected", () => {
 
 test("parsePositiveInt: surrounding whitespace tolerated", () => {
   assert.deepEqual(parsePositiveInt("  20  ", 5), { value: 20, ok: true });
+});
+
+// ── PR #154 review round 2, gap (a): MAX_PROMPT_CHARS must fail closed like the other caps ──
+// server.mjs now derives MAX_PROMPT_CHARS via parseIntEnv → parsePositiveInt (was a raw parseInt).
+// CLAUDE_MAX_PROMPT_CHARS=unlimited previously → NaN → enforceTextBudget's `!(NaN > 0)` early-return
+// → 500k chars passed unbounded, defeating F2's text-budget guarantee. The default must be kept.
+test("parsePositiveInt: CLAUDE_MAX_PROMPT_CHARS='unlimited' → default kept, cap not lost to NaN (gap a)", () => {
+  const r = parsePositiveInt("unlimited", 150000);
+  assert.equal(r.ok, false);
+  assert.equal(r.value, 150000, "the 150k text budget must survive a bad config, not become NaN");
+});
+test("parsePositiveInt: CLAUDE_MAX_PROMPT_CHARS valid override honored", () => {
+  assert.deepEqual(parsePositiveInt("200000", 150000), { value: 200000, ok: true });
 });
 
 // ── messages guard predicate truth-table (issue #110) ────────────────────────

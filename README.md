@@ -803,6 +803,12 @@ images_unsupported_in_tui_mode`** rather than silently dropping the image and
 answering about something the model never saw. Remove the images, or run OCP
 without TUI mode, to use vision.
 
+Images must also live in a **user or assistant** message, not a `system` message
+(system content is not forwarded to the CLI as image blocks). An `image_url` part
+present only in a system message returns **`400 images_unsupported_in_system_messages`**
+for the same reason — fail loudly rather than answer about an unseen image. This matches
+the OpenAI vision spec, which does not place images in the system role.
+
 ### Limits
 
 Images bypass the text `CLAUDE_MAX_PROMPT_CHARS` budget and are instead bounded by

@@ -953,12 +953,6 @@ function buildCliArgs(cliModel, systemPrompt, opts = {}) {
   return args;
 }
 
-// ── Format messages to prompt text ──────────────────────────────────────
-// Truncation guard: if total chars exceed MAX_PROMPT_CHARS, keep the system
-// message(s) + first user message + last N messages, dropping the middle.
-// This prevents runaway context from gateway-side conversation accumulation.
-let MAX_PROMPT_CHARS = parseInt(process.env.CLAUDE_MAX_PROMPT_CHARS || "150000", 10);
-
 // Thin env wrapper over parsePositiveInt (lib/env.mjs): resolve `name` from the
 // environment fail-closed, warning on a present-but-invalid value. Keeps the pure
 // parse in a unit-testable module. (PR #154 review F3)
@@ -967,6 +961,17 @@ function parseIntEnv(name, def) {
   if (!ok) console.warn(`⚠ ${name}="${process.env[name]}" is not a valid positive integer (bytes/count, no unit suffix); ignoring and using default ${def}.`);
   return value;
 }
+
+// ── Format messages to prompt text ──────────────────────────────────────
+// Truncation guard: if total chars exceed MAX_PROMPT_CHARS, keep the system
+// message(s) + first user message + last N messages, dropping the middle.
+// This prevents runaway context from gateway-side conversation accumulation.
+// Routed through parseIntEnv (hoisted above) so a misconfigured cap fails CLOSED
+// to the default rather than NaN — CLAUDE_MAX_PROMPT_CHARS=unlimited previously →
+// NaN → enforceTextBudget's `!(NaN > 0)` early-return → 500k chars passed unbounded,
+// silently defeating F2's text-budget guarantee for multimodal requests. `let` is
+// kept for the settings API. (PR #154 review round 2, gap (a).)
+let MAX_PROMPT_CHARS = parseIntEnv("CLAUDE_MAX_PROMPT_CHARS", 150000);
 
 // ── Multimodal image caps (issue #110) ──────────────────────────────────
 // OpenAI `image_url` parts are forwarded to claude as Anthropic image blocks via
@@ -2301,8 +2306,25 @@ async function handleChatCompletions(req, res) {
         },
       });
     }
+    // Detection runs on the FULL message list, but extraction/spawn drop system messages
+    // (system role carries no image blocks to the CLI). So an image present ONLY in a
+    // system message would be detected as multimodal, survive no filter, fall to the text
+    // path, and render as "[non-text content omitted]" → 200 with a hallucinated answer —
+    // the exact silent-drop this guard exists to forbid. Fail loudly instead. OpenAI
+    // disallows images in the system role anyway, so no legitimate request is rejected.
+    // (PR #154 review round 2, gap (b).)
+    const nonSystem = messages.filter(m => m.role !== "system");
+    if (!hasImageContent(nonSystem)) {
+      return jsonResponse(res, 400, {
+        error: {
+          message: "Image inputs are only supported in user/assistant messages, not in system messages. Move the image_url part to a user message.",
+          type: "invalid_request_error",
+          code: "images_unsupported_in_system_messages",
+        },
+      });
+    }
     try {
-      buildImageBlocks(messages.filter(m => m.role !== "system"), { ...MULTIMODAL_OPTS, maxTextChars: MAX_PROMPT_CHARS });
+      buildImageBlocks(nonSystem, { ...MULTIMODAL_OPTS, maxTextChars: MAX_PROMPT_CHARS });
     } catch (e) {
       if (e instanceof MultimodalError) {
         return jsonResponse(res, e.status, { error: { message: e.message, type: e.type, code: e.code } });
