@@ -355,6 +355,11 @@ export function cacheHash(model, messages, opts = {}) {
   if (opts.temperature != null) h.update(`t:${opts.temperature}`);
   if (opts.max_tokens != null) h.update(`mt:${opts.max_tokens}`);
   if (opts.top_p != null) h.update(`tp:${opts.top_p}`);
+  // #176: fold the server's boot-config epoch into the key, so a config change that shapes
+  // answers (operator system prompt, wrapper text, allowed tools, NO_CONTEXT) invalidates
+  // the persistent cache instead of serving answers composed under the old config. Callers
+  // that omit it (older paths, tests) hash byte-identically to before.
+  if (opts.configEpoch != null) h.update(`ce:${opts.configEpoch}|`);
   // Structured-output (OpenAI response_format / json_mode) requests must never share a cache slot
   // with the conversational answer to the same prompt, nor with a different schema — the steering
   // instruction and validated JSON payload differ. Keying on the detected descriptor isolates them.

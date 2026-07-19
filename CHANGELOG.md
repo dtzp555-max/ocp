@@ -1,8 +1,34 @@
 # Changelog
 
-## v3.22.0 — 2026-07-16
+## v3.23.0 — 2026-07-17
 
-Minor release: TUI-mode latency and streaming features — **all opt-in and off by default**, so the default request path (`-p` / `--output-format stream-json`) is byte-for-byte unchanged — plus hardening from an independent (Codex) re-review of the streaming work. No new `cli.js` wire behavior and no new endpoint; the new surface is entirely OCP-owned TUI-mode configuration (env vars) and `/health` observation. Every code PR carried a fresh-context reviewer (Iron Rule 10).
+Minor release. Headline: **the default `sonnet` alias now resolves to Claude Sonnet 5** — a behavior change for every request that omits `model` (pin `claude-sonnet-4-6` by full ID to keep the previous default). Also: Windows-safe upgrade snapshots, two upgrade-system reliability fixes from a live fleet update, the `CLAUDE_SYSTEM_PROMPT` env var made functional, cache-key honesty for config changes, a billing-policy status correction (the 2026-06-15 `-p` split is PAUSED by Anthropic), and a major README restructure. No new endpoint; no new `cli.js` wire behavior. Every code PR carried a fresh-context reviewer (Iron Rule 10).
+
+### Changed
+
+- **Default `sonnet` alias → `claude-sonnet-5` (#168, contributed by @vvlasy-openclaw).** The `sonnet` alias (the model used for every `/v1/chat/completions` request that omits `model`, and OpenClaw's OCP primary via `ocp-connect`) now resolves to `claude-sonnet-5` instead of `claude-sonnet-4-6`. `claude-sonnet-4-6` remains available by full ID for pinning. Mirrors the shipped Claude CLI's own `latest_per_family` mapping (`sonnet → claude-sonnet-5`, verified from binary 2.1.211). Split out from the additive model entry (#152) per Iron Rule 11.
+- **`CLAUDE_SYSTEM_PROMPT` is now functional (#175).** The var was read, documented, and echoed on `/health.systemPrompt` but never reached a request (dead since the `APPEND_SYSTEM_PROMPT` retirement). It is now appended (last, trimmed) to the composed system prompt on the default `-p` path via the new pure `lib/prompt.mjs`; TUI-mode panes are unaffected. Unset ⇒ byte-identical composition to before. README § Environment Variables documents it, including the cache caveat below.
+
+### Fixed
+
+- **Windows-safe upgrade snapshot paths (#167, contributed by @nyxst4ck).** Snapshot directory timestamps now use `-` instead of `:` (Windows forbids `:` in names); legacy colon-named snapshots keep parsing, and `listSnapshots` now orders by **parsed timestamp** (with a deterministic name tie-breaker) so mixed legacy/new names sort chronologically — the initial revision's raw-string sort could delete the newest recovery snapshot at the format boundary and was caught in review; regression tests pin the same-hour mixed-format case.
+- **`ocp update` reliability — two live-incident fixes (#174, closes #173).** (1) The doctor now runs `git fetch --tags` (offline-tolerant) before computing `latest_version` — previously it compared against the locally cached `origin/main`, so machines that hadn't pulled since a release reported "Already at latest" forever. (2) Post-flight now asserts `/health.version` equals the upgrade target (new `postFlightOk` predicate) instead of accepting any `auth.ok` — a stale orphan process holding the port used to pass post-flight while still serving the old version; the failure message now reports the last-seen version and points at `ss -ltnp`/`lsof -i`.
+- **Response-cache key now carries a boot-config epoch (#177, closes #176).** The persistent cache keyed on model+key+params+messages but not on server config that shapes answers (`CLAUDE_SYSTEM_PROMPT`, wrapper text, `CLAUDE_ALLOWED_TOOLS`, `CLAUDE_NO_CONTEXT`) — changing any of these and restarting could serve stale-config answers until TTL expiry. A sha256 config-epoch is folded into every key; any config change is an instant whole-cache invalidation. One-time side effect: existing cache entries miss once after this upgrade.
+
+### Docs
+
+- **Billing-policy status corrected (#171).** Anthropic **paused** the announced 2026-06-15 `claude -p` billing split on its effective date (official help-article citation in README § How It Works): the default `-p` path currently bills the subscription, and TUI-mode is reframed as the ready-made **hedge** for if/when a reworked change lands. All in-force assertions of the split are now date-stamped and conditioned.
+- **LAN mode scoped to chat-class workloads (#171).** New "workload fit" paragraph: multi-device OCP is for text-in/text-out workloads; client-machine coding agents are architecturally out of scope (tools execute on the OCP host).
+- **README restructured, 1205 → ~500 lines (#172).** Operations-manual content moved to `docs/lan-mode.md`, `docs/tui-mode.md`, `docs/troubleshooting.md`, `docs/upgrading.md` (verbatim moves + two canonical dedups; zero content loss verified section-by-section). README keeps the quickstart, the release-kit-pinned reference tables, and summary stubs with links. Plus a staleness sweep (#170): 6-model examples, removal of the never-existed `ocp stop` command, `ocp-connect` claims corrected, current version examples.
+
+## v3.22.1 — 2026-07-17
+
+Minor release: TUI-mode latency and streaming features — **all opt-in and off by default**, so the default request path (`-p` / `--output-format stream-json`) is byte-for-byte unchanged — plus hardening from an independent (Codex) re-review of the streaming work, Windows `claude.exe` startup resolution, and the Claude Sonnet 5 model entry. No new `cli.js` wire behavior and no new endpoint; the new surface is entirely OCP-owned TUI-mode configuration (env vars), startup binary discovery, model metadata, and `/health` observation. Every code PR carried a fresh-context reviewer (Iron Rule 10). (Version note: v3.22.0 was prepared but never tagged; its contents ship here as v3.22.1 together with the additions below.)
+
+### Added
+
+- **Claude Sonnet 5 in the model SPOT (#152, contributed by @vvlasy-openclaw)** — `claude-sonnet-5` added to `models.json` (`contextWindow` 200000 / `maxTokens` 16384 / `reasoning` true, consistent with existing entries), exposed via `/v1/models` and the OpenClaw sync. Purely additive: the `sonnet` alias still resolves to `claude-sonnet-4-6` (the repoint is tracked separately in #168). `ocp-connect`'s model classifier now matches on the model *family* prefix (`claude-sonnet`/`claude-opus`/`claude-haiku`) instead of version-pinned prefixes, so current and future versioned IDs register with correct `reasoning`/`maxTokens` metadata. New referential-integrity tests guard that every alias target exists in `models[]`.
+- **Windows `claude.exe` startup resolution (#161, contributed by @nyxst4ck, diagnosis credit #147 @Justinsato)** — on Windows, `resolveClaude()` now discovers a native `claude.exe` (`%USERPROFILE%\.local\bin`, WinGet Links, WindowsApps, then `where.exe`) and rejects npm `.cmd`/`.bat`/`.ps1` shims, which cannot be spawned without a shell — previously startup resolved a shim and failed. A non-`.exe` `CLAUDE_BIN` on Windows is a fatal error with an actionable hint. The macOS/Linux path is byte-for-byte unchanged. Note: this is startup binary resolution only — full Windows support is not yet claimed (snapshot-path portability is tracked in #167).
 
 ### Added — TUI mode (all opt-in, default off)
 

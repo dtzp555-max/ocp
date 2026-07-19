@@ -204,6 +204,23 @@ test("cacheHash includes temperature in hash", () => {
   assert.notEqual(h2, h3);
 });
 
+// ── configEpoch (#176): a boot-config change must invalidate the persistent cache ──
+// Mutation-proof: drop the `ce:` fold in keys.mjs and the first test goes green-to-red.
+test("cacheHash: different configEpoch → different key (config change invalidates)", () => {
+  const h1 = cacheHash("sonnet", msgs1, { configEpoch: "aaaa000011112222" });
+  const h2 = cacheHash("sonnet", msgs1, { configEpoch: "bbbb000011112222" });
+  assert.notEqual(h1, h2);
+});
+
+test("cacheHash: same configEpoch is stable; absent epoch hashes byte-identically to pre-#176", () => {
+  const e1 = cacheHash("sonnet", msgs1, { configEpoch: "aaaa000011112222" });
+  const e2 = cacheHash("sonnet", msgs1, { configEpoch: "aaaa000011112222" });
+  assert.equal(e1, e2);
+  // absent-epoch calls (older callers, all pre-existing tests) must not change behavior
+  assert.equal(cacheHash("sonnet", msgs1, {}), cacheHash("sonnet", msgs1));
+  assert.notEqual(e1, cacheHash("sonnet", msgs1), "epoch-carrying key differs from legacy key");
+});
+
 test("cacheHash includes max_tokens in hash", () => {
   const h1 = cacheHash("sonnet", msgs1, {});
   const h2 = cacheHash("sonnet", msgs1, { max_tokens: 100 });
@@ -821,10 +838,102 @@ test("doctor falls back to currentVersion when origin/main unreachable (no stale
   assert.equal(result.next_action.kind, "noop");
 });
 
+// ── System-prompt operator append (CLAUDE_SYSTEM_PROMPT wiring) ─────────────
+// The var was documented + echoed on /health but never reached a request (dead
+// since APPEND_SYSTEM_PROMPT was retired — caught in PR #170 review). The wiring
+// contract lives in lib/prompt.mjs. Mutation-proof: make appendOperatorPrompt
+// return `base` unconditionally and the first test fails; make it stop trimming
+// and the whitespace test fails.
+import { appendOperatorPrompt, derivePromptCharBudget, resolvePromptCharBudget } from "./lib/prompt.mjs";
+
+console.log("\nPrompt-char budget (ADR 0009 — SPOT-derived):");
+
+// Mutation-proof: drop the ×charsPerToken and the first test fails; drop the
+// Math.max floor guard and the floor tests fail; use min() instead of max() over
+// windows and the largest-window test fails.
+test("derivePromptCharBudget: LARGEST contextWindow × 3 chars/token", () => {
+  const models = [{ contextWindow: 200000 }, { contextWindow: 100000 }];
+  assert.equal(derivePromptCharBudget(models), 600000);
+});
+
+test("derivePromptCharBudget: matches the live models.json SPOT (200k → 600k today)", () => {
+  const spot = JSON.parse(tuiReadFileSync(new URL("./models.json", import.meta.url), "utf8"));
+  assert.equal(derivePromptCharBudget(spot.models), 600000);
+});
+
+test("derivePromptCharBudget: floor wins over a tiny/absent window; empty input → floor", () => {
+  assert.equal(derivePromptCharBudget([{ contextWindow: 1000 }]), 150000, "3k chars would truncate everything — floor guards it");
+  assert.equal(derivePromptCharBudget([]), 150000);
+  assert.equal(derivePromptCharBudget(undefined), 150000);
+  assert.equal(derivePromptCharBudget([{ id: "x" }, { contextWindow: "junk" }, { contextWindow: -5 }]), 150000);
+});
+
+test("derivePromptCharBudget: charsPerToken and floor are tunable parameters", () => {
+  assert.equal(derivePromptCharBudget([{ contextWindow: 1000000 }], { charsPerToken: 3 }), 3000000);
+  assert.equal(derivePromptCharBudget([], { floor: 42 }), 42);
+});
+
+// PR #179 review regression: EMPTY env value must mean "use the default" (the old
+// `parseInt(env || "150000")` contract). Mutation-proof: switch the resolver's
+// truthiness check to `!= null` and the empty-string test fails (NaN ≠ 600000).
+test("resolvePromptCharBudget: empty/unset env → SPOT-derived default, never NaN", () => {
+  const models = [{ contextWindow: 200000 }];
+  assert.equal(resolvePromptCharBudget("", models), 600000, "CLAUDE_MAX_PROMPT_CHARS= (empty) must fall back to derived");
+  assert.equal(resolvePromptCharBudget(undefined, models), 600000);
+});
+
+test("resolvePromptCharBudget: a set env value overrides the derivation absolutely", () => {
+  const models = [{ contextWindow: 200000 }];
+  assert.equal(resolvePromptCharBudget("300000", models), 300000);
+  assert.equal(resolvePromptCharBudget("150000", models), 150000, "explicit legacy value wins over the bigger derived default");
+});
+
+console.log("\nSystem-prompt operator append:");
+
+test("appendOperatorPrompt: appends the operator prompt LAST, blank-line separated", () => {
+  assert.equal(appendOperatorPrompt("WRAPPER\n\nclient", "Answer in Chinese."), "WRAPPER\n\nclient\n\nAnswer in Chinese.");
+});
+
+test("appendOperatorPrompt: unset/empty/whitespace-only → base returned BYTE-IDENTICAL", () => {
+  const base = "WRAPPER\n\nclient sys";
+  assert.equal(appendOperatorPrompt(base, undefined), base);
+  assert.equal(appendOperatorPrompt(base, ""), base);
+  assert.equal(appendOperatorPrompt(base, "   \n "), base, "a stray space in a service unit must not inject anything");
+  assert.equal(appendOperatorPrompt(base, null), base);
+});
+
+test("appendOperatorPrompt: operator value is trimmed before appending", () => {
+  assert.equal(appendOperatorPrompt("W", "  hi  "), "W\n\nhi");
+});
+
 // ── Upgrade Tests ──
-import { runUpgrade } from "./scripts/upgrade.mjs";
+import { runUpgrade, postFlightOk } from "./scripts/upgrade.mjs";
 
 console.log("\nUpgrade:");
+
+// ── postFlightOk (issue #173) — the acceptance predicate for phase 6 ─────────
+// Mutation-proof: revert the version comparison to auth-only and the "stale process
+// still holds the port" test below goes green-to-red (that case is the 2026-07-17
+// Oracle incident: orphan answered auth.ok=true while serving the OLD version).
+test("postFlightOk: rejects a healthy-looking probe that serves the WRONG version (orphan case)", () => {
+  assert.equal(postFlightOk({ auth: { ok: true }, version: "3.21.1" }, "v3.22.1"), false);
+});
+
+test("postFlightOk: accepts auth.ok + exact target version, tolerating the leading v", () => {
+  assert.equal(postFlightOk({ auth: { ok: true }, version: "3.22.1" }, "v3.22.1"), true);
+  assert.equal(postFlightOk({ auth: { ok: true }, version: "3.22.1" }, "3.22.1"), true);
+});
+
+test("postFlightOk: auth failure rejects regardless of version", () => {
+  assert.equal(postFlightOk({ auth: { ok: false }, version: "3.22.1" }, "v3.22.1"), false);
+  assert.equal(postFlightOk({ version: "3.22.1" }, "v3.22.1"), false);
+  assert.equal(postFlightOk(null, "v3.22.1"), false);
+});
+
+test("postFlightOk: unknown/empty target degrades to the auth-only check (never blocks)", () => {
+  assert.equal(postFlightOk({ auth: { ok: true }, version: "3.22.1" }, ""), true);
+  assert.equal(postFlightOk({ auth: { ok: true }, version: "3.22.1" }, undefined), true);
+});
 
 test("upgrade --dry-run prints plan, no side effects", async () => {
   const result = await runUpgrade({
@@ -880,6 +989,41 @@ import { join as testJoin } from "node:path";
 
 console.log("\nSnapshot:");
 
+const portableSnapshotName = (isoTimestamp) => `upgrade-snapshot-${isoTimestamp.replace(/:/g, "-")}`;
+const legacyMixedSnapshot = "upgrade-snapshot-2026-05-11T09:05:00Z";
+const portableMixedSnapshot = "upgrade-snapshot-2026-05-11T09-47-00Z";
+
+function runMixedSnapshotScenario() {
+  // NTFS rejects the legacy ':' name, so exercise the real exported functions
+  // in an isolated process whose built-in fs bindings expose both formats.
+  const moduleUrl = new URL("./scripts/lib/snapshot.mjs", import.meta.url).href;
+  const script = `
+    import fs from "node:fs";
+    import { syncBuiltinESMExports } from "node:module";
+    const names = ${JSON.stringify([legacyMixedSnapshot, portableMixedSnapshot])};
+    const deleted = [];
+    fs.existsSync = () => true;
+    fs.readdirSync = () => [...names];
+    fs.statSync = () => ({ mtimeMs: 0 });
+    fs.rmSync = (path) => { deleted.push(path); };
+    syncBuiltinESMExports();
+    const { listSnapshots, gcSnapshots } = await import(${JSON.stringify(moduleUrl)});
+    const listed = listSnapshots("/virtual-home").map(snapshot => snapshot.name);
+    const gc = gcSnapshots("/virtual-home", {
+      keepCount: 1,
+      keepDays: 0,
+      now: new Date("2026-05-12T00:00:00Z")
+    });
+    process.stdout.write(JSON.stringify({
+      listed,
+      kept: gc.kept.map(snapshot => snapshot.name),
+      removed: gc.removed.map(snapshot => snapshot.name),
+      deleted
+    }));
+  `;
+  return JSON.parse(execFileSync(process.execPath, ["--input-type=module", "--eval", script], { encoding: "utf8" }));
+}
+
 test("writeSnapshot creates dir + manifest files", () => {
   const root = mkdtempSync(testJoin(tmpdir(), "ocp-snap-test-"));
   const dotOcp = testJoin(root, ".ocp");
@@ -904,13 +1048,26 @@ test("listSnapshots returns sorted by ISO timestamp", () => {
   const dotOcp = testJoin(root, ".ocp");
   tMkdirSync(dotOcp, { recursive: true });
   for (const ts of ["2026-05-01T10:00:00Z", "2026-05-02T10:00:00Z", "2026-05-03T10:00:00Z"]) {
-    tMkdirSync(testJoin(dotOcp, `upgrade-snapshot-${ts}`));
+    tMkdirSync(testJoin(dotOcp, portableSnapshotName(ts)));
   }
   const list = listSnapshots(root);
   assert.equal(list.length, 3);
   assert.ok(list[0].path.includes("2026-05-01"));
   assert.ok(list[2].path.includes("2026-05-03"));
   rmSync(root, { recursive: true, force: true });
+});
+
+test("listSnapshots sorts mixed legacy and Windows-safe names chronologically", () => {
+  const result = runMixedSnapshotScenario();
+  assert.deepEqual(result.listed, [legacyMixedSnapshot, portableMixedSnapshot]);
+});
+
+test("gcSnapshots keeps the newer Windows-safe snapshot across the format boundary", () => {
+  const result = runMixedSnapshotScenario();
+  assert.deepEqual(result.kept, [portableMixedSnapshot]);
+  assert.deepEqual(result.removed, [legacyMixedSnapshot]);
+  assert.equal(result.deleted.length, 1);
+  assert.ok(result.deleted[0].endsWith(legacyMixedSnapshot));
 });
 
 test("upgrade error after snapshot carries snapshotPath + hint", async () => {
@@ -1002,7 +1159,7 @@ test("gcSnapshots keeps last N regardless of age", () => {
   const dotOcp = testJoin(root, ".ocp");
   tMkdirSync(dotOcp, { recursive: true });
   for (const ts of ["2026-04-01T10:00:00Z", "2026-04-15T10:00:00Z", "2026-04-30T10:00:00Z", "2026-05-01T10:00:00Z", "2026-05-10T10:00:00Z"]) {
-    tMkdirSync(testJoin(dotOcp, `upgrade-snapshot-${ts}`));
+    tMkdirSync(testJoin(dotOcp, portableSnapshotName(ts)));
   }
   const result = gcSnapshots(root, { keepCount: 3, keepDays: 0, now: new Date("2026-05-11T00:00:00Z") });
   assert.equal(result.kept.length, 3);
@@ -1085,7 +1242,7 @@ test("gcSnapshots keeps snapshots newer than keepDays regardless of count", () =
   const dotOcp = testJoin(root, ".ocp");
   tMkdirSync(dotOcp, { recursive: true });
   for (const ts of ["2026-04-01T10:00:00Z", "2026-04-15T10:00:00Z", "2026-04-30T10:00:00Z", "2026-05-01T10:00:00Z", "2026-05-10T10:00:00Z"]) {
-    tMkdirSync(testJoin(dotOcp, `upgrade-snapshot-${ts}`));
+    tMkdirSync(testJoin(dotOcp, portableSnapshotName(ts)));
   }
   // keepCount=1 but keepDays=15 means anything from after 2026-04-26 is kept too
   const result = gcSnapshots(root, { keepCount: 1, keepDays: 15, now: new Date("2026-05-11T00:00:00Z") });
@@ -1099,7 +1256,7 @@ test("gcSnapshots never deletes the most recent snapshot", () => {
   const root = mkdtempSync(testJoin(tmpdir(), "ocp-gc-recent-"));
   const dotOcp = testJoin(root, ".ocp");
   tMkdirSync(dotOcp, { recursive: true });
-  tMkdirSync(testJoin(dotOcp, "upgrade-snapshot-2026-01-01T10:00:00Z"));
+  tMkdirSync(testJoin(dotOcp, portableSnapshotName("2026-01-01T10:00:00Z")));
   // Even with keepCount=0 and keepDays=0, the most recent must survive
   const result = gcSnapshots(root, { keepCount: 0, keepDays: 0, now: new Date("2026-05-11T00:00:00Z") });
   assert.equal(result.kept.length, 1);
@@ -1112,13 +1269,13 @@ test("gcSnapshots --dry-run reports plan without deleting", () => {
   const dotOcp = testJoin(root, ".ocp");
   tMkdirSync(dotOcp, { recursive: true });
   for (const ts of ["2026-04-01T10:00:00Z", "2026-04-15T10:00:00Z", "2026-05-10T10:00:00Z"]) {
-    tMkdirSync(testJoin(dotOcp, `upgrade-snapshot-${ts}`));
+    tMkdirSync(testJoin(dotOcp, portableSnapshotName(ts)));
   }
   const result = gcSnapshots(root, { keepCount: 1, keepDays: 0, dryRun: true, now: new Date("2026-05-11T00:00:00Z") });
   assert.equal(result.dryRun, true);
   assert.equal(result.removed.length, 2);
   // Files still exist
-  assert.ok(testExistsSync(testJoin(dotOcp, "upgrade-snapshot-2026-04-01T10:00:00Z")));
+  assert.ok(testExistsSync(testJoin(dotOcp, portableSnapshotName("2026-04-01T10:00:00Z"))));
   rmSync(root, { recursive: true, force: true });
 });
 
@@ -2613,21 +2770,21 @@ import { tmpdir as hTmp } from "node:os";
 console.log("\nTUI home preparation:");
 
 test("prepareTuiHome scratch mode: symlinks creds, seeds onboarded config, trusts cwd, strips history", () => {
-  const realHome = hMkdtemp(`${hTmp()}/real-`);
-  hMkdir(`${realHome}/.claude`, { recursive: true });
-  hWrite(`${realHome}/.claude/.credentials.json`, '{"token":"x"}');
-  hWrite(`${realHome}/.claude.json`, JSON.stringify({ theme: "dark", projects: { "/old/secret/project": { hasTrustDialogAccepted: true } } }));
-  const tuiHome = hMkdtemp(`${hTmp()}/tui-`);
-  const cwd = `${tuiHome}/work`;
+  const realHome = hMkdtemp(testJoin(hTmp(), "real-"));
+  hMkdir(testJoin(realHome, ".claude"), { recursive: true });
+  hWrite(testJoin(realHome, ".claude", ".credentials.json"), '{"token":"x"}');
+  hWrite(testJoin(realHome, ".claude.json"), JSON.stringify({ theme: "dark", projects: { "/old/secret/project": { hasTrustDialogAccepted: true } } }));
+  const tuiHome = hMkdtemp(testJoin(hTmp(), "tui-"));
+  const cwd = testJoin(tuiHome, "work");
   prepareTuiHome(realHome, tuiHome, cwd);
   // credentials symlinked (token never copied)
-  assert.equal(hReadlink(`${tuiHome}/.claude/.credentials.json`), `${realHome}/.claude/.credentials.json`);
-  const seed = JSON.parse(hRead(`${tuiHome}/.claude.json`, "utf8"));
+  assert.equal(hReadlink(testJoin(tuiHome, ".claude", ".credentials.json")), testJoin(realHome, ".claude", ".credentials.json"));
+  const seed = JSON.parse(hRead(testJoin(tuiHome, ".claude.json"), "utf8"));
   assert.equal(seed.hasCompletedOnboarding, true);
   assert.equal(seed.theme, "dark");                                   // onboarded config carried over
   assert.equal(seed.projects[cwd].hasTrustDialogAccepted, true);      // scratch cwd trusted
   assert.equal(seed.projects["/old/secret/project"], undefined);      // user project history stripped
-  assert.ok(hExists(`${tuiHome}/.claude/projects`));                  // own projects dir
+  assert.ok(hExists(testJoin(tuiHome, ".claude", "projects")));    // own projects dir
 });
 
 test("prepareTuiHome real mode (tuiHome===realHome): no symlink, just trusts cwd in real config", () => {
@@ -3322,8 +3479,33 @@ test("models.json aliases.haiku === 'claude-haiku-4-5-20251001' (usage-probe SPO
   assert.equal(_spotModels.aliases.haiku, "claude-haiku-4-5-20251001");
 });
 
-test("models.json aliases.sonnet === 'claude-sonnet-4-6' (default-request-model SPOT)", () => {
-  assert.equal(_spotModels.aliases.sonnet, "claude-sonnet-4-6");
+test("models.json aliases.sonnet === 'claude-sonnet-5' (default-request-model SPOT)", () => {
+  assert.equal(_spotModels.aliases.sonnet, "claude-sonnet-5");
+});
+
+// ── Referential integrity (PR #152 review) ──────────────────────────────────
+// The value-mirror assertions above only prove the alias equals a string literal —
+// they pass even if that literal points at a model that does not exist in
+// models[]. A one-line slip (edit an alias, forget the models[] entry) would leave
+// /v1/models missing the model while every `model: "<alias>"` request passes
+// validation and then fails at CLI spawn. VALID_MODELS keys on alias *names*, so
+// nothing else checks alias *targets*. This is the guard with teeth.
+const _spotModelIds = new Set(_spotModels.models.map(m => m.id));
+
+test("models.json: claude-sonnet-5 is present in models[] (the entry this PR adds)", () => {
+  assert.ok(_spotModelIds.has("claude-sonnet-5"), "claude-sonnet-5 must exist as a models[].id");
+});
+
+test("models.json: every aliases value resolves to a real models[].id (referential integrity)", () => {
+  for (const [name, target] of Object.entries(_spotModels.aliases)) {
+    assert.ok(_spotModelIds.has(target), `aliases.${name} -> '${target}' is a dangling alias (no matching models[].id)`);
+  }
+});
+
+test("models.json: every legacyAliases value resolves to a real models[].id (referential integrity)", () => {
+  for (const [name, target] of Object.entries(_spotModels.legacyAliases || {})) {
+    assert.ok(_spotModelIds.has(target), `legacyAliases.${name} -> '${target}' is a dangling alias (no matching models[].id)`);
+  }
 });
 
 // ── escapeHtml + key-name validator (issue #114) ────────────────────────────

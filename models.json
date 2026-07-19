@@ -27,6 +27,14 @@
       "maxTokens": 16384
     },
     {
+      "id": "claude-sonnet-5",
+      "displayName": "Claude Sonnet 5",
+      "openclawName": "Claude Sonnet 5 (via CLI)",
+      "reasoning": true,
+      "contextWindow": 200000,
+      "maxTokens": 16384
+    },
+    {
       "id": "claude-sonnet-4-6",
       "displayName": "Claude Sonnet 4.6",
       "openclawName": "Claude Sonnet 4.6 (via CLI)",
@@ -45,7 +53,7 @@
   ],
   "aliases": {
     "opus": "claude-opus-4-8",
-    "sonnet": "claude-sonnet-4-6",
+    "sonnet": "claude-sonnet-5",
     "haiku": "claude-haiku-4-5-20251001"
   },
   "legacyAliases": {

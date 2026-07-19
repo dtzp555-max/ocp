@@ -35,7 +35,7 @@
  */
 import { createServer } from "node:http";
 import { spawn, execFileSync, spawnSync } from "node:child_process";
-import { randomUUID, timingSafeEqual } from "node:crypto";
+import { randomUUID, timingSafeEqual, createHash as cryptoCreateHash } from "node:crypto";
 import { readFileSync, readdirSync, accessSync, existsSync, constants, chmodSync, statSync, mkdirSync, writeFileSync, rmSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
@@ -50,6 +50,7 @@ import { TuiSemaphore, SemaphoreAbortError, recordTuiEntrypoint, buildTuiHealthB
 import { TuiPanePool, resolvePoolSize, POOL_MAX_SIZE } from "./lib/tui/pool.mjs";
 import { TuiDeltaAssembler, DEFAULT_HOLDBACK_CHARS, resolveStreamHoldback } from "./lib/tui/stream.mjs";
 import { createSerialMutex, createTtlCache, isTokenExpiring, orderLabelsLastGoodFirst } from "./lib/spawn-auth.mjs";
+import { appendOperatorPrompt, resolvePromptCharBudget } from "./lib/prompt.mjs";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const _pkg = JSON.parse(readFileSync(join(__dirname, "package.json"), "utf8"));
@@ -196,17 +197,19 @@ function resolveClaude() {
 const OCP_SYSTEM_PROMPT_WRAPPER = `You are accessed via the OCP HTTP proxy. You do NOT have access to any local filesystem, working directory, shell, git status, or machine environment. Do not infer or invent such information from any context you observe. Respond only based on the conversation provided.`;
 
 // Build the full system-prompt string: OCP_SYSTEM_PROMPT_WRAPPER prepended,
-// then any system-role messages from the request appended (separated by blank line).
-// ADR 0009 Amendment 1 analogue § "OLP system prompt wrapper".
+// then any system-role messages from the request appended (separated by blank line),
+// then the operator-wide CLAUDE_SYSTEM_PROMPT appended LAST (lib/prompt.mjs — a
+// no-op returning the same string when the var is unset, so the default path is
+// byte-for-byte unchanged). ADR 0009 Amendment 1 analogue § "OLP system prompt wrapper".
 function extractSystemPrompt(messages) {
   const systemMessages = (messages ?? []).filter(m => m.role === "system");
   if (systemMessages.length === 0) {
-    return OCP_SYSTEM_PROMPT_WRAPPER;
+    return appendOperatorPrompt(OCP_SYSTEM_PROMPT_WRAPPER, SYSTEM_PROMPT);
   }
   const clientContent = systemMessages.map(m =>
     contentToText(m.content)
   ).join("\n\n");
-  return `${OCP_SYSTEM_PROMPT_WRAPPER}\n\n${clientContent}`;
+  return appendOperatorPrompt(`${OCP_SYSTEM_PROMPT_WRAPPER}\n\n${clientContent}`, SYSTEM_PROMPT);
 }
 
 // ── NDJSON line buffer parser (Phase 6c port) ─────────────────────────────
@@ -354,6 +357,19 @@ const BREAKER_HALF_OPEN_MAX = parseInt(process.env.CLAUDE_BREAKER_HALF_OPEN_MAX 
 const HEARTBEAT_INTERVAL = parseInt(process.env.CLAUDE_HEARTBEAT_INTERVAL || "0", 10);
 const BIND_ADDRESS = process.env.CLAUDE_BIND || "127.0.0.1";
 const NO_CONTEXT = process.env.CLAUDE_NO_CONTEXT === "true";
+// Config epoch for the response cache (issue #176). The cache key hashes model + messages +
+// sampling params, but the ANSWER also depends on boot-time server config that shapes the
+// composed prompt / tool surface: the operator system prompt (#175), the OCP wrapper text,
+// the allowed-tools set, and NO_CONTEXT. The cache store is SQLite-backed and survives
+// restarts, so without this an operator who changes any of these and restarts keeps serving
+// answers composed under the OLD config until TTL expiry. Folding a digest of the four into
+// every cache key makes any change an instant, whole-cache invalidation — the honest behavior.
+// Deliberately boot-time-only: runtime-mutable settings (e.g. maxPromptChars via the settings
+// API) are excluded because a const epoch cannot track them; truncation also only drops
+// context rather than changing the instruction set.
+const CONFIG_EPOCH = cryptoCreateHash("sha256")
+  .update(JSON.stringify([SYSTEM_PROMPT, OCP_SYSTEM_PROMPT_WRAPPER, ALLOWED_TOOLS, NO_CONTEXT]))
+  .digest("hex").slice(0, 16);
 // Kill-switch for the FIX-③ default-path spawn-home isolation (see resolveSpawnHome /
 // spawnHomeMode below). When "1", the -p/stream-json spawn always runs in the operator's
 // real HOME with no cwd override — byte-for-byte the pre-isolation behaviour — even if an
@@ -1143,7 +1159,13 @@ function buildCliArgs(cliModel, systemPrompt) {
 // Truncation guard: if total chars exceed MAX_PROMPT_CHARS, keep the system
 // message(s) + first user message + last N messages, dropping the middle.
 // This prevents runaway context from gateway-side conversation accumulation.
-let MAX_PROMPT_CHARS = parseInt(process.env.CLAUDE_MAX_PROMPT_CHARS || "150000", 10);
+//
+// Default is SPOT-DERIVED (ADR 0009): max(models.json contextWindow) × 3 chars/token —
+// currently 200000 × 3 = 600,000 chars — instead of the old hand-set 150000 (≈37.5k
+// English tokens), which silently under-delivered the advertised window by ~5×. The env
+// var (and the runtime settings API below) remain absolute operator overrides. If
+// models.json ever advertises a bigger window, this budget follows automatically.
+let MAX_PROMPT_CHARS = resolvePromptCharBudget(process.env.CLAUDE_MAX_PROMPT_CHARS, modelsConfig.models);
 
 // Flatten OpenAI content (string | array of parts) to plain text for the prompt.
 // Array content: concatenate text parts; replace non-text parts (e.g. image_url)
@@ -2761,8 +2783,9 @@ async function handleChatCompletions(req, res) {
       req._cacheHash = null;
       logEvent("info", "cache_skipped", { reason: "cache_control_present" });
     } else {
-      // D1: include keyId in hash to isolate per-key cache pools (v2 format)
-      const hash = cacheHash(model, messages, { keyId: req._authKeyId, temperature: parsed.temperature, max_tokens: parsed.max_tokens, top_p: parsed.top_p });
+      // D1: include keyId in hash to isolate per-key cache pools (v2 format).
+      // configEpoch (#176): any boot-config change that shapes answers invalidates the cache.
+      const hash = cacheHash(model, messages, { keyId: req._authKeyId, temperature: parsed.temperature, max_tokens: parsed.max_tokens, top_p: parsed.top_p, configEpoch: CONFIG_EPOCH });
       req._cacheHash = hash; // store for later write-back
       try {
         const cached = getCachedResponse(hash, CACHE_TTL);
