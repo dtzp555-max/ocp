@@ -27,7 +27,7 @@ One proxy. Multiple IDEs. All models. **$0 API cost.**
 - [How It Works](#how-it-works)
 - Reference: [Available Models](#available-models) · [API Endpoints](#api-endpoints) · [Environment Variables](#environment-variables)
 - Modes & operations: [LAN & multi-user](#lan--multi-user) → [`docs/lan-mode.md`](docs/lan-mode.md) · [Subscription-pool (TUI) mode](#subscription-pool-tui-mode) → [`docs/tui-mode.md`](docs/tui-mode.md) · [Upgrading](#upgrading) → [`docs/upgrading.md`](docs/upgrading.md)
-- [Built-in Usage Monitoring](#built-in-usage-monitoring) · [Response Cache](#response-cache) · [Images / Multimodal](#images--multimodal-vision) · [OpenClaw Integration](#openclaw-integration)
+- [Built-in Usage Monitoring](#built-in-usage-monitoring) · [Response Cache](#response-cache) · [Structured Outputs](#structured-outputs-openai-response_format) · [Images / Multimodal](#images--multimodal-vision) · [OpenClaw Integration](#openclaw-integration)
 - [Troubleshooting](#troubleshooting) → [`docs/troubleshooting.md`](docs/troubleshooting.md)
 - [Repository Layout](#repository-layout) · [Security](#security) · [Governance](#governance) · [Support OCP](#support-ocp) · [License](#license)
 
@@ -223,6 +223,7 @@ The canonical list lives in [`models.json`](./models.json) — the single source
 | `CLAUDE_MAX_QUEUE` | `16` | Max requests **waiting** for a `-p` concurrency slot. Beyond `CLAUDE_MAX_CONCURRENT`, requests queue (up to this cap) instead of being rejected; when the queue is **also** full, the request gets `HTTP 429` + `Retry-After` (not an opaque 500). Surfaced on `/health.concurrency` + `/health.stats.queueRejections`. |
 | `CLAUDE_QUEUE_RETRY_AFTER` | `5` | Seconds advertised in the `Retry-After` header on a `-p` concurrency-overflow `429`. |
 | `CLAUDE_MAX_PROMPT_CHARS` | *(derived)* | Prompt truncation limit in chars. Default derives from the models.json SPOT: `max(contextWindow) × 3` — currently **600,000** (≈150–200k tokens). Setting this env var (or the runtime settings API) overrides the derivation absolutely. See [ADR 0009](docs/adr/0009-spot-derived-prompt-budget.md). Note: very large prompts burn subscription-window quota quickly and slow TTFT; the TUI-mode paste path is untested beyond ~hundreds of KB. Applies to **text only** — image bytes bypass this budget (see [Images / Multimodal](#images--multimodal-vision)). |
+| `OCP_STRUCTURED_MAX_ATTEMPTS` | `3` | Max attempts (initial + retries) to coerce a schema-valid JSON reply when a request uses OpenAI `response_format`. Fail-closed: a non-numeric value keeps the default. See [Structured Outputs](#structured-outputs-openai-response_format). |
 | `CLAUDE_SESSION_TTL` | `3600000` | Session expiry (ms, default: 1 hour) |
 | `CLAUDE_CACHE_TTL` | `0` | Response cache TTL (ms, 0 = disabled). Set to e.g. `300000` for 5-min cache. See [Response Cache](#response-cache). |
 | `CLAUDE_ALLOWED_TOOLS` | `Bash,Read,...,Agent` | Comma-separated tools to pre-approve |
@@ -387,6 +388,29 @@ ocp settings cacheTTL 0                       # disable at runtime
 
 Cache is **disabled by default** (`CLAUDE_CACHE_TTL=0`). All data is stored locally in `~/.ocp/ocp.db`. **Hash format upgrade in v3.13.0:** legacy `v1` cache rows don't match new `v2`-format lookups; they orphan and are reaped by the TTL cleanup interval within one window — no migration script required.
 
+## Structured Outputs (OpenAI `response_format`)
+
+`/v1/chat/completions` honors OpenAI's [`response_format`](https://platform.openai.com/docs/api-reference/chat/create#chat-create-response_format) parameter so OpenAI-SDK clients that require machine-parseable JSON (Home Assistant AI Tasks, Honcho, BYO scripts) get JSON in `choices[].message.content` — not prose.
+
+Supported shapes:
+
+- `response_format: { "type": "json_schema", "json_schema": { "name", "strict", "schema" } }`
+- `response_format: { "type": "json_object" }`
+- `json_mode: true` — non-standard top-level alias honored by several OpenAI-compatible clients; treated as `json_object`.
+
+When a structured request is detected, OCP:
+
+1. Appends a strict JSON-only steering instruction to the request (no Markdown, no fences, no prose, must begin with `{` or `[`).
+2. Extracts the JSON from the model reply (unwraps a stray code fence / prose via a string-aware balanced slice).
+3. For `json_schema`, validates the result against the supplied schema (types, `required`, `enum`, `const`, `additionalProperties`, nullability, `items`, `min/maxItems`, and `$ref`/`$defs` + `allOf`/`anyOf`/`oneOf` composition — the shapes the official OpenAI SDK emits via `zodResponseFormat` / `client.beta.chat.completions.parse`). For `json_object`, the whole reply must parse as a single JSON value (a stray brace inside prose is not served as the answer).
+4. On a parse/validation miss, retries with a stronger instruction that names the failure, up to `OCP_STRUCTURED_MAX_ATTEMPTS` (default 3).
+5. If no valid JSON can be produced, returns OpenAI's assistant **`refusal`** field (`HTTP 200`, `message.content: null`, `message.refusal: "<reason>"`, `finish_reason: "stop"`) — the spec's own mechanism for "the model would not produce the required output" — rather than an invented error type or passing prose through. SDK clients take their written `refusal` branch.
+
+A reply that carries **more than one** top-level JSON value (e.g. `Schema: {…}` then `Answer: {…}`) is rejected as ambiguous rather than silently serving the first — OCP never serves an unvalidated or arbitrarily-chosen extraction.
+
+`message.content` for a structured request is the raw JSON string only — no fences, no reasoning, no wrapper. Non-structured requests are completely unaffected (normal conversational behaviour, streaming included). This is a Class B.1 endpoint extension authorized by ADR 0006; the pure logic lives in [`lib/structured-output.mjs`](./lib/structured-output.mjs) and is unit-tested in `test-features.mjs`.
+
+**Caching & cost.** A structured request can cost up to `OCP_STRUCTURED_MAX_ATTEMPTS` metered `claude` spawns — each retry is a fresh spawn, burning subscription-window quota today and metered credits if the (currently **paused**) 2026-06-15 billing split re-lands (see the billing-policy status note in [How It Works](#how-it-works)) — so this feature adds cost-attack surface. Two guards bound it: (a) identical **concurrent** structured requests share one flight (single-flight dedup, so N callers ≠ N× spawns), and (b) when `CLAUDE_CACHE_TTL > 0`, a **validated** result is cached on a **structured-keyed** hash (the `response_format`/schema is folded into the key, so a JSON reply never collides with the conversational answer and different schemas never share a slot). A refusal is never cached. Operators concerned about cost can lower `OCP_STRUCTURED_MAX_ATTEMPTS` to `1` (no retries) or gate the surface behind per-key quotas (`/api/keys/:id/quota`).
 ## Images / Multimodal (Vision)
 
 `POST /v1/chat/completions` accepts OpenAI-style multimodal `content` parts, so a

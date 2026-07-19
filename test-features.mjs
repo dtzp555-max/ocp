@@ -4330,6 +4330,234 @@ test("stream: /health block is additive and exposes the divergence counter", () 
   assert.equal(legacy.streamDivergences, 0);
 });
 
+// ── OpenAI Structured Outputs (response_format) — lib/structured-output.mjs ──
+import { detectStructuredOutput, validateJsonSchema, extractJsonPayload, structuredSystemInstruction, StructuredOutputError, resolveMaxAttempts } from "./lib/structured-output.mjs";
+
+test("detectStructuredOutput: json_schema shape", () => {
+  const d = detectStructuredOutput({ response_format: { type: "json_schema", json_schema: { name: "x", strict: true, schema: { type: "object" } } } });
+  assert.equal(d.mode, "schema"); assert.equal(d.strict, true); assert.deepEqual(d.schema, { type: "object" });
+});
+test("detectStructuredOutput: json_object shape", () => {
+  assert.deepEqual(detectStructuredOutput({ response_format: { type: "json_object" } }), { mode: "json_object" });
+});
+test("detectStructuredOutput: json_mode:true alias → json_object", () => {
+  assert.deepEqual(detectStructuredOutput({ json_mode: true }), { mode: "json_object" });
+});
+test("detectStructuredOutput: absent → null (non-structured untouched)", () => {
+  assert.equal(detectStructuredOutput({ messages: [] }), null);
+  assert.equal(detectStructuredOutput({ response_format: "nonsense" }), null);
+  assert.equal(detectStructuredOutput({ json_mode: false }), null);
+});
+test("cacheHash: structured marker isolates JSON requests from the conversational slot", () => {
+  const msgs = [{ role: "user", content: "list 3 fruits" }];
+  const plain = cacheHash("m", msgs, { keyId: "k" });
+  const asJson = cacheHash("m", msgs, { keyId: "k", structured: { mode: "json_object" } });
+  const asSchema = cacheHash("m", msgs, { keyId: "k", structured: { mode: "schema", schema: { type: "array" } } });
+  assert.notEqual(plain, asJson);      // JSON vs prose never collide
+  assert.notEqual(asJson, asSchema);   // different schema → different slot
+  assert.equal(plain, cacheHash("m", msgs, { keyId: "k" })); // unchanged for normal requests
+});
+
+test("validateJsonSchema: valid object passes", () => {
+  assert.deepEqual(validateJsonSchema({ name: "a", age: 3 }, { type: "object", required: ["name", "age"], properties: { name: { type: "string" }, age: { type: "integer" } } }), []);
+});
+test("validateJsonSchema: missing required property flagged", () => {
+  assert.ok(validateJsonSchema({ name: "a" }, { type: "object", required: ["name", "age"], properties: {} }).some(e => /age.*required/.test(e)));
+});
+test("validateJsonSchema: additionalProperties:false rejects extra keys", () => {
+  assert.ok(validateJsonSchema({ a: 1, b: 2 }, { type: "object", additionalProperties: false, properties: { a: { type: "integer" } } }).some(e => /b.*additional/.test(e)));
+});
+test("validateJsonSchema: enum rejects non-null value not in list", () => {
+  assert.ok(validateJsonSchema("maybe", { type: "string", enum: ["yes", "no"] }).length > 0);
+});
+test("validateJsonSchema: NULLABLE enum accepts null even when null not in enum (HA regression)", () => {
+  // type:["string","null"] + enum:["Loxone"] — a null value must be accepted (nullability > enum).
+  assert.deepEqual(validateJsonSchema(null, { type: ["string", "null"], enum: ["Loxone"] }), []);
+});
+test("validateJsonSchema: nullable enum still enforces non-null values against the enum", () => {
+  assert.ok(validateJsonSchema("Other", { type: ["string", "null"], enum: ["Loxone"] }).length > 0);
+});
+test("validateJsonSchema: type mismatch flagged", () => {
+  assert.ok(validateJsonSchema("str", { type: "integer" }).length > 0);
+});
+test("validateJsonSchema: array items + minItems", () => {
+  assert.deepEqual(validateJsonSchema([1, 2, 3], { type: "array", items: { type: "integer" }, minItems: 3 }), []);
+  assert.ok(validateJsonSchema([1], { type: "array", items: { type: "integer" }, minItems: 3 }).some(e => /minItems/.test(e)));
+});
+
+test("extractJsonPayload: clean JSON", () => {
+  const r = extractJsonPayload('{"a":1}'); assert.ok(r.ok); assert.deepEqual(r.value, { a: 1 });
+});
+test("extractJsonPayload: fenced ```json block", () => {
+  const r = extractJsonPayload('```json\n{"a":1}\n```'); assert.ok(r.ok); assert.deepEqual(r.value, { a: 1 });
+});
+test("extractJsonPayload: prose-wrapped, string-aware balanced slice", () => {
+  const r = extractJsonPayload('Sure! Here you go: {"note":"has } and { inside"} — hope that helps.');
+  assert.ok(r.ok); assert.deepEqual(r.value, { note: "has } and { inside" });
+});
+test("extractJsonPayload: array payload", () => {
+  const r = extractJsonPayload('[1,2,3]'); assert.ok(r.ok); assert.deepEqual(r.value, [1, 2, 3]);
+});
+test("extractJsonPayload: no JSON → ok:false", () => {
+  assert.equal(extractJsonPayload("I cannot help with that.").ok, false);
+});
+
+test("structuredSystemInstruction: embeds schema, forbids fences, escalates on retry", () => {
+  const first = structuredSystemInstruction({ mode: "schema", schema: { type: "object" } }, 0, "");
+  assert.ok(/code fences/.test(first) && /JSON Schema/.test(first));
+  const retry = structuredSystemInstruction({ mode: "schema", schema: { type: "object" } }, 1, "bad enum");
+  assert.ok(/REJECTED \(bad enum\)/.test(retry));
+});
+test("StructuredOutputError carries reason", () => {
+  const e = new StructuredOutputError("schema validation failed", "raw");
+  assert.equal(e.reason, "schema validation failed"); assert.ok(e instanceof Error);
+});
+
+// ── PR #153 review round 2, MUST-FIX: OCP_STRUCTURED_MAX_ATTEMPTS NaN guard must fail closed ──
+// The old `Math.max(1, parseInt(env||"3",10))` returned NaN for a non-integer value → the retry loop
+// `attempt < NaN` never ran → 0 spawns, every structured request refused. resolveMaxAttempts keeps
+// the default instead of silently bricking the feature.
+test("resolveMaxAttempts: valid integer honored", () => {
+  assert.equal(resolveMaxAttempts("5"), 5);
+  assert.equal(resolveMaxAttempts("1"), 1);
+});
+test("resolveMaxAttempts: unset/empty → default", () => {
+  assert.equal(resolveMaxAttempts(undefined), 3);
+  assert.equal(resolveMaxAttempts(""), 3);
+  assert.equal(resolveMaxAttempts(null), 3);
+});
+test("resolveMaxAttempts: non-integer / non-finite / <1 fails CLOSED to the default (not NaN, not 0)", () => {
+  let warned = 0; const warn = () => { warned++; };
+  for (const bad of ["abc", "0", "-1", "NaN", "Infinity", "  "]) {
+    const v = resolveMaxAttempts(bad, { fallback: 3, warn });
+    assert.equal(v, 3, `bad input ${JSON.stringify(bad)} must fall back to 3, got ${v}`);
+    assert.ok(Number.isFinite(v) && v >= 1, "result is always a usable positive integer");
+  }
+  assert.ok(warned > 0, "invalid values emit a startup warning");
+});
+test("resolveMaxAttempts: the retry loop is never bounded by NaN (regression: 0 spawns / silent refuse)", () => {
+  const attempts = resolveMaxAttempts("abc");
+  let ran = 0;
+  for (let attempt = 0; attempt < attempts; attempt++) ran++;
+  assert.ok(ran >= 1, "loop must execute at least once — pre-fix it ran 0 times");
+});
+
+// ── PR #153 review finding 1: $ref/$defs + strict:true must accept conforming objects ──
+// The flagship shape the OpenAI SDK emits (zodResponseFormat / client.beta.chat.completions.parse)
+// and OpenAI's own structured-outputs docs example: nested {$ref:"#/$defs/step"} + strict:true.
+// Before the fix, strict inferred additionalProperties:false on the unresolved $ref (empty props) and
+// rejected every real key. This is the exact regression the PR must not ship.
+const OPENAI_DOC_SCHEMA = {
+  type: "object",
+  properties: {
+    steps: { type: "array", items: { $ref: "#/$defs/step" } },
+    final_answer: { type: "string" },
+  },
+  $defs: {
+    step: {
+      type: "object",
+      properties: { explanation: { type: "string" }, output: { type: "string" } },
+      required: ["explanation", "output"],
+      additionalProperties: false,
+    },
+  },
+  required: ["steps", "final_answer"],
+  additionalProperties: false,
+};
+
+test("validateJsonSchema: OpenAI doc schema ($ref/$defs) + strict:true accepts a conforming reply", () => {
+  const conforming = { steps: [{ explanation: "add", output: "4" }, { explanation: "done", output: "4" }], final_answer: "4" };
+  assert.deepEqual(validateJsonSchema(conforming, OPENAI_DOC_SCHEMA, "$", true), []);
+});
+
+test("validateJsonSchema: $ref + strict:true still REJECTS a genuinely-extra key (fix didn't disable validation)", () => {
+  const extra = { steps: [{ explanation: "add", output: "4", bogus: 1 }], final_answer: "4" };
+  const errs = validateJsonSchema(extra, OPENAI_DOC_SCHEMA, "$", true);
+  assert.ok(errs.some(e => /bogus.*additional property not allowed/.test(e)), `expected the extra key rejected, got: ${JSON.stringify(errs)}`);
+});
+
+test("validateJsonSchema: $ref + strict:true still catches a missing required property", () => {
+  const missing = { steps: [{ explanation: "add" }], final_answer: "4" };
+  assert.ok(validateJsonSchema(missing, OPENAI_DOC_SCHEMA, "$", true).some(e => /output.*required/.test(e)));
+});
+
+test("validateJsonSchema: anyOf accepts a value matching one branch, rejects a value matching none", () => {
+  const schema = { anyOf: [{ type: "string" }, { type: "integer" }] };
+  assert.deepEqual(validateJsonSchema("hi", schema), []);
+  assert.deepEqual(validateJsonSchema(3, schema), []);
+  assert.ok(validateJsonSchema(true, schema).length > 0);
+});
+
+test("validateJsonSchema: allOf requires every branch to pass", () => {
+  const schema = { allOf: [{ type: "object", properties: { a: { type: "integer" } }, required: ["a"] }, { type: "object", properties: { b: { type: "string" } }, required: ["b"] }] };
+  assert.deepEqual(validateJsonSchema({ a: 1, b: "x" }, schema), []);
+  assert.ok(validateJsonSchema({ a: 1 }, schema).some(e => /b.*required/.test(e)));
+});
+
+test("validateJsonSchema: unresolvable $ref is skipped, not failed", () => {
+  assert.deepEqual(validateJsonSchema({ anything: 1 }, { $ref: "#/$defs/missing" }), []);
+});
+
+// ── PR #153 review round 2, BLOCKER: cyclic $ref must fail closed, not stack-overflow ──
+// A pure ref→ref cycle recurses independent of the data — before the fix ANY reply value (even `5`)
+// threw `RangeError: Maximum call stack size exceeded`, caught upstream as a 500 but only after
+// 1–3 metered spawns → a request-controlled cost-amplification / grief vector on an authed path.
+test("validateJsonSchema: a→b→a cyclic $ref fails closed (no stack overflow) for any value", () => {
+  const schema = { $defs: { a: { $ref: "#/$defs/b" }, b: { $ref: "#/$defs/a" } }, $ref: "#/$defs/a" };
+  let errs;
+  assert.doesNotThrow(() => { errs = validateJsonSchema(5, schema, "$", true); }, "cyclic $ref must not overflow the stack");
+  assert.ok(errs.some(e => /cyclic \$ref/.test(e)), `expected a cyclic-$ref error, got: ${JSON.stringify(errs)}`);
+});
+test("validateJsonSchema: self-referential $ref (a→a) fails closed", () => {
+  const schema = { $defs: { a: { $ref: "#/$defs/a" } }, $ref: "#/$defs/a" };
+  let errs;
+  assert.doesNotThrow(() => { errs = validateJsonSchema({ x: 1 }, schema, "$", true); });
+  assert.ok(errs.some(e => /cyclic \$ref/.test(e)));
+});
+test("validateJsonSchema: cycle routed through anyOf fails closed", () => {
+  const schema = { $defs: { a: { anyOf: [{ $ref: "#/$defs/a" }] } }, $ref: "#/$defs/a" };
+  assert.doesNotThrow(() => validateJsonSchema({ x: 1 }, schema, "$", true));
+});
+test("validateJsonSchema: a LEGITIMATE recursive schema (Node→child:Node) is NOT flagged as a cycle", () => {
+  // Data is a finite tree, so data-consuming recursion terminates — the cycle guard must not
+  // false-positive here (refChain resets across properties/items).
+  const schema = {
+    $defs: { node: { type: "object", properties: { v: { type: "integer" }, child: { $ref: "#/$defs/node" } }, required: ["v"], additionalProperties: false } },
+    $ref: "#/$defs/node",
+  };
+  const tree = { v: 1, child: { v: 2, child: { v: 3 } } };
+  assert.deepEqual(validateJsonSchema(tree, schema, "$", true), []);
+});
+
+// ── PR #153 review finding 2: never serve an unvalidated / ambiguous extraction ──
+test("extractJsonPayload: json_object mode rejects a refusal that merely CONTAINS json", () => {
+  const reply = 'I can\'t do that. For reference the schema looks like {"type":"object"} — sorry.';
+  const r = extractJsonPayload(reply, { whole: true });
+  assert.equal(r.ok, false);
+});
+
+test("extractJsonPayload: json_object mode accepts a whole-reply JSON value", () => {
+  const r = extractJsonPayload('  {"temp":21}  ', { whole: true });
+  assert.ok(r.ok); assert.deepEqual(r.value, { temp: 21 });
+});
+
+test("extractJsonPayload: schema mode rejects >1 top-level JSON value (Schema:{} Answer:{})", () => {
+  const reply = 'Schema: {"type":"object"}\n\nAnswer: {"temp":21}';
+  const r = extractJsonPayload(reply);
+  assert.equal(r.ok, false);
+  assert.ok(/more than one/.test(r.reason || ""));
+});
+
+test("extractJsonPayload: schema mode rejects two competing options rather than silently picking one", () => {
+  const r = extractJsonPayload('Option A:\n{"a":1}\nOption B:\n{"b":2}');
+  assert.equal(r.ok, false);
+});
+
+test("extractJsonPayload: single prose-wrapped value still accepted in schema mode", () => {
+  const r = extractJsonPayload('Sure, here you go: {"a":1} — done.');
+  assert.ok(r.ok); assert.deepEqual(r.value, { a: 1 });
+});
+
 // ── Cleanup ──
 // Settle the async-bodied tests registered through the sync `test()` helper BEFORE summarizing —
 // otherwise their pass/fail is not reflected in the counts (see the `pendingAsync` comment above).

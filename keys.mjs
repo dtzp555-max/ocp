@@ -360,6 +360,11 @@ export function cacheHash(model, messages, opts = {}) {
   // the persistent cache instead of serving answers composed under the old config. Callers
   // that omit it (older paths, tests) hash byte-identically to before.
   if (opts.configEpoch != null) h.update(`ce:${opts.configEpoch}|`);
+  // Structured-output (OpenAI response_format / json_mode) requests must never share a cache slot
+  // with the conversational answer to the same prompt, nor with a different schema — the steering
+  // instruction and validated JSON payload differ. Keying on the detected descriptor isolates them.
+  // Absent for normal requests → hashes are byte-identical to pre-change.
+  if (opts.structured != null) h.update(`s:${JSON.stringify(opts.structured)}`);
   for (const m of messages) {
     h.update(m.role || "");
     h.update(typeof m.content === "string" ? m.content : JSON.stringify(m.content));
