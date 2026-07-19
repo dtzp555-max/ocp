@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+### Added
+
+- **`OCP_LOCAL_TOOLS` — positive local-tools system-prompt wrapper (single-user, loopback only; default off).** The `-p` path prepends a wrapper telling the model it has no local filesystem/shell access — correct for a shared gateway, but it makes a personal instance's model (e.g. an OpenClaw agent on its own local OCP) refuse to use the server-side `claude` tools it legitimately has (which, on a loopback instance, are the operator's own machine). `=1` swaps in a positive wrapper. Changes **only the prompt**, never the tool surface (`--allowedTools`/`--disallowedTools` untouched; multi-tenant still disallows the FS surface); it does **not** enable client-side `tool_calls` (still unsupported by design). Fail-closed boot gate mirroring `OCP_TUI_FULL_TOOLS` (ADR 0007): refuses to start under `CLAUDE_AUTH_MODE=multi`, a non-loopback bind, or `PROXY_ANONYMOUS_KEY`. Inert (and logged as such) in TUI mode. Pure selection + gate logic in `lib/prompt.mjs` (unit-tested); the active wrapper is folded into the config epoch so toggling it invalidates the standard response cache. Verified end-to-end (boot the server + a fake `claude` capturing `--system-prompt`); default path byte-for-byte unchanged. No new `cli.js` wire behavior (reuses the already-cited `--system-prompt` flag).
+
 ## v3.23.0 — 2026-07-17
 
 Minor release. Headline: **the default `sonnet` alias now resolves to Claude Sonnet 5** — a behavior change for every request that omits `model` (pin `claude-sonnet-4-6` by full ID to keep the previous default). Also: Windows-safe upgrade snapshots, two upgrade-system reliability fixes from a live fleet update, the `CLAUDE_SYSTEM_PROMPT` env var made functional, cache-key honesty for config changes, a billing-policy status correction (the 2026-06-15 `-p` split is PAUSED by Anthropic), and a major README restructure. No new endpoint; no new `cli.js` wire behavior. Every code PR carried a fresh-context reviewer (Iron Rule 10).
