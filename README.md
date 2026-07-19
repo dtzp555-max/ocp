@@ -27,7 +27,7 @@ One proxy. Multiple IDEs. All models. **$0 API cost.**
 - [How It Works](#how-it-works)
 - Reference: [Available Models](#available-models) · [API Endpoints](#api-endpoints) · [Environment Variables](#environment-variables)
 - Modes & operations: [LAN & multi-user](#lan--multi-user) → [`docs/lan-mode.md`](docs/lan-mode.md) · [Subscription-pool (TUI) mode](#subscription-pool-tui-mode) → [`docs/tui-mode.md`](docs/tui-mode.md) · [Upgrading](#upgrading) → [`docs/upgrading.md`](docs/upgrading.md)
-- [Built-in Usage Monitoring](#built-in-usage-monitoring) · [Response Cache](#response-cache) · [Structured Outputs](#structured-outputs-openai-response_format) · [OpenClaw Integration](#openclaw-integration)
+- [Built-in Usage Monitoring](#built-in-usage-monitoring) · [Response Cache](#response-cache) · [Structured Outputs](#structured-outputs-openai-response_format) · [Images / Multimodal](#images--multimodal-vision) · [OpenClaw Integration](#openclaw-integration)
 - [Troubleshooting](#troubleshooting) → [`docs/troubleshooting.md`](docs/troubleshooting.md)
 - [Repository Layout](#repository-layout) · [Security](#security) · [Governance](#governance) · [Support OCP](#support-ocp) · [License](#license)
 
@@ -222,13 +222,18 @@ The canonical list lives in [`models.json`](./models.json) — the single source
 | `CLAUDE_MAX_CONCURRENT` | `8` | Max concurrent claude processes (`-p`/stream-json path) |
 | `CLAUDE_MAX_QUEUE` | `16` | Max requests **waiting** for a `-p` concurrency slot. Beyond `CLAUDE_MAX_CONCURRENT`, requests queue (up to this cap) instead of being rejected; when the queue is **also** full, the request gets `HTTP 429` + `Retry-After` (not an opaque 500). Surfaced on `/health.concurrency` + `/health.stats.queueRejections`. |
 | `CLAUDE_QUEUE_RETRY_AFTER` | `5` | Seconds advertised in the `Retry-After` header on a `-p` concurrency-overflow `429`. |
-| `CLAUDE_MAX_PROMPT_CHARS` | *(derived)* | Prompt truncation limit in chars. Default derives from the models.json SPOT: `max(contextWindow) × 3` — currently **600,000** (≈150–200k tokens). Setting this env var (or the runtime settings API) overrides the derivation absolutely. See [ADR 0009](docs/adr/0009-spot-derived-prompt-budget.md). Note: very large prompts burn subscription-window quota quickly and slow TTFT; the TUI-mode paste path is untested beyond ~hundreds of KB. |
+| `CLAUDE_MAX_PROMPT_CHARS` | *(derived)* | Prompt truncation limit in chars. Default derives from the models.json SPOT: `max(contextWindow) × 3` — currently **600,000** (≈150–200k tokens). Setting this env var (or the runtime settings API) overrides the derivation absolutely. See [ADR 0009](docs/adr/0009-spot-derived-prompt-budget.md). Note: very large prompts burn subscription-window quota quickly and slow TTFT; the TUI-mode paste path is untested beyond ~hundreds of KB. Applies to **text only** — image bytes bypass this budget (see [Images / Multimodal](#images--multimodal-vision)). |
 | `OCP_STRUCTURED_MAX_ATTEMPTS` | `3` | Max attempts (initial + retries) to coerce a schema-valid JSON reply when a request uses OpenAI `response_format`. Fail-closed: a non-numeric value keeps the default. See [Structured Outputs](#structured-outputs-openai-response_format). |
 | `CLAUDE_SESSION_TTL` | `3600000` | Session expiry (ms, default: 1 hour) |
 | `CLAUDE_CACHE_TTL` | `0` | Response cache TTL (ms, 0 = disabled). Set to e.g. `300000` for 5-min cache. See [Response Cache](#response-cache). |
 | `CLAUDE_ALLOWED_TOOLS` | `Bash,Read,...,Agent` | Comma-separated tools to pre-approve |
 | `CLAUDE_SKIP_PERMISSIONS` | `false` | Bypass all permission checks |
 | `CLAUDE_MCP_CONFIG` | *(unset)* | Path to an MCP server config JSON, passed to the spawned `claude` as `--mcp-config` (both the `-p` path and TUI `OCP_TUI_FULL_TOOLS` panes) |
+| `CLAUDE_MAX_BODY_SIZE` | `5242880` | Max request body size (bytes, default 5 MB). Base64 image payloads inflate ~33%; raise this to admit larger multimodal requests. Fail-closed parsing: a garbage value keeps the default. |
+| `CLAUDE_IMAGE_ALLOW_URL` | `false` | Allow remote `http(s)` image URLs in `image_url` parts. **Off by default** (v1 supports base64 `data:` URIs only). When on, the URL is passed through to Anthropic as a `url` image source — **OCP does not fetch it** (no OCP-side SSRF surface); unreachable/blocked URLs surface as an API error. |
+| `CLAUDE_MAX_IMAGE_BYTES` | `5242880` | Per-image decoded-byte cap (default 5 MB). Over-cap images get `HTTP 413`. |
+| `CLAUDE_MAX_IMAGES` | `20` | Max image parts per request. Over-cap gets `HTTP 413`. |
+| `CLAUDE_MAX_IMAGE_TOTAL_BYTES` | `20971520` | Aggregate decoded-byte cap across all images in a request (default 20 MB). Over-cap gets `HTTP 413`. |
 | `CLAUDE_SYSTEM_PROMPT` | *(unset)* | Operator-wide system-prompt text appended (last) to every request's composed system prompt on the default `-p` path. TUI-mode panes are unaffected (they keep the interactive CLI's own system prompt). Echoed truncated on `/health.systemPrompt`. Note: changing this value and restarting auto-invalidates the response cache (the key carries a boot-config epoch, #177). |
 | `CLAUDE_NO_CONTEXT` | `false` | Suppress CLAUDE.md and auto-memory injection (pure API mode) |
 | `PROXY_API_KEY` | *(unset)* | Bearer token for shared-mode authentication |
@@ -406,6 +411,90 @@ A reply that carries **more than one** top-level JSON value (e.g. `Schema: {…}
 `message.content` for a structured request is the raw JSON string only — no fences, no reasoning, no wrapper. Non-structured requests are completely unaffected (normal conversational behaviour, streaming included). This is a Class B.1 endpoint extension authorized by ADR 0006; the pure logic lives in [`lib/structured-output.mjs`](./lib/structured-output.mjs) and is unit-tested in `test-features.mjs`.
 
 **Caching & cost.** A structured request can cost up to `OCP_STRUCTURED_MAX_ATTEMPTS` metered `claude` spawns — each retry is a fresh spawn, burning subscription-window quota today and metered credits if the (currently **paused**) 2026-06-15 billing split re-lands (see the billing-policy status note in [How It Works](#how-it-works)) — so this feature adds cost-attack surface. Two guards bound it: (a) identical **concurrent** structured requests share one flight (single-flight dedup, so N callers ≠ N× spawns), and (b) when `CLAUDE_CACHE_TTL > 0`, a **validated** result is cached on a **structured-keyed** hash (the `response_format`/schema is folded into the key, so a JSON reply never collides with the conversational answer and different schemas never share a slot). A refusal is never cached. Operators concerned about cost can lower `OCP_STRUCTURED_MAX_ATTEMPTS` to `1` (no retries) or gate the surface behind per-key quotas (`/api/keys/:id/quota`).
+## Images / Multimodal (Vision)
+
+`POST /v1/chat/completions` accepts OpenAI-style multimodal `content` parts, so a
+message can carry images alongside text and Claude will actually see them. This
+follows OpenAI's [vision](https://platform.openai.com/docs/guides/vision) /
+[chat-completions `image_url`](https://platform.openai.com/docs/api-reference/chat/create#chat-create-messages)
+request shape — no OCP-invented fields. (Class B.1 endpoint; see ADR 0006.)
+
+Under the hood, when a request carries an image OCP feeds the conversation to the
+Claude CLI as Anthropic image blocks over `--input-format stream-json`. Text-only
+requests are completely unaffected (unchanged code path).
+
+### Supported input
+
+- **Base64 data URIs** (default, recommended):
+  `data:image/png;base64,<...>`. Media types: `image/jpeg`, `image/png`,
+  `image/gif`, `image/webp`.
+- **Remote `http(s)` URLs** — **off by default**. Set `CLAUDE_IMAGE_ALLOW_URL=1`
+  to enable; the URL is passed through to Anthropic (OCP never fetches it itself,
+  so there is no OCP-side SSRF surface).
+- Images may appear in **any** message in the history (multi-turn), not just the
+  last one.
+- Non-image, non-text parts (audio, files) are **not** yet supported and are
+  replaced with a `[non-text content omitted]` placeholder (deferred to a future
+  version).
+
+### Example (base64 data URI)
+
+```bash
+curl -X POST http://127.0.0.1:3456/v1/chat/completions \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "model": "claude-sonnet-4-6",
+    "messages": [{
+      "role": "user",
+      "content": [
+        { "type": "text", "text": "What is in this image?" },
+        { "type": "image_url",
+          "image_url": { "url": "data:image/png;base64,iVBORw0KGgoAAA..." } }
+      ]
+    }]
+  }'
+```
+
+### Not supported in TUI mode
+
+Multimodal images require the default `-p` spawn path. In **TUI / subscription-pool
+mode** (`CLAUDE_TUI_MODE=true`) the CLI is driven interactively and cannot carry
+image blocks, so a request with an `image_url` part returns **`400
+images_unsupported_in_tui_mode`** rather than silently dropping the image and
+answering about something the model never saw. Remove the images, or run OCP
+without TUI mode, to use vision.
+
+Images must also live in a **user or assistant** message, not a `system` message
+(system content is not forwarded to the CLI as image blocks). An `image_url` part
+present only in a system message returns **`400 images_unsupported_in_system_messages`**
+for the same reason — fail loudly rather than answer about an unseen image. This matches
+the OpenAI vision spec, which does not place images in the system role.
+
+### Limits
+
+Images bypass the text `CLAUDE_MAX_PROMPT_CHARS` budget and are instead bounded by
+their own byte/count caps. The **text** in a multimodal request is still subject to
+`CLAUDE_MAX_PROMPT_CHARS` (older text is truncated exactly as on the text-only
+path — only the image bytes are exempt). All numeric caps are parsed **fail-closed**:
+a malformed value (e.g. `CLAUDE_MAX_BODY_SIZE=unlimited` or `=5MB`) is rejected with
+a startup warning and the safe default is kept — a misconfigured cap can never
+silently disable the guard. Requests that violate a cap get a clear `4xx` (never a
+silent drop):
+
+| Cap | Env var | Default | Error |
+|-----|---------|---------|-------|
+| Request body | `CLAUDE_MAX_BODY_SIZE` | 5 MB | `413` request body too large |
+| Per-image bytes | `CLAUDE_MAX_IMAGE_BYTES` | 5 MB | `413` `image_too_large` |
+| Total image bytes | `CLAUDE_MAX_IMAGE_TOTAL_BYTES` | 20 MB | `413` `images_too_large` |
+| Image count | `CLAUDE_MAX_IMAGES` | 20 | `413` `too_many_images` |
+| Unsupported media type | — | — | `400` `unsupported_image_type` |
+| Malformed data URI | — | — | `400` `invalid_data_uri` |
+| Remote URL while disabled | `CLAUDE_IMAGE_ALLOW_URL` | off | `400` `remote_url_disabled` |
+
+Base64 payloads are large: a 5 MB image is ~6.7 MB as a data URI, so raise
+`CLAUDE_MAX_BODY_SIZE` (and, if needed, `CLAUDE_MAX_IMAGE_BYTES`) to admit big
+images. Vision support depends on the target model — request a current
+vision-capable Claude model.
 
 ## OpenClaw Integration
 
