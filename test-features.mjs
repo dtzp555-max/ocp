@@ -2209,8 +2209,30 @@ console.log("\nTUI command construction (proxy-purity / #4):");
 test("buildTuiCmd suppresses host CLAUDE.md + auto-memory (proxy purity, #4)", () => {
   const cmd = buildTuiCmd("/usr/bin/claude", "claude-haiku", "sid-1", "/home/u", "cli");
   // OCP is a proxy: the host's CLAUDE.md / auto-memory must never leak into the proxied turn.
+  // Primary mechanism is --safe-mode (env vars alone stopped suppressing on newer claude);
+  // the env vars remain as belt-and-braces.
+  assert.ok(/(^| )--safe-mode( |$)/.test(cmd), "default pane must pass --safe-mode (disables host CLAUDE.md/skills/plugins/hooks)");
   assert.ok(/(^| )CLAUDE_CODE_DISABLE_CLAUDE_MDS=1( |$)/.test(cmd), "must disable CLAUDE.md injection");
   assert.ok(/(^| )CLAUDE_CODE_DISABLE_AUTO_MEMORY=1( |$)/.test(cmd), "must disable auto-memory injection");
+});
+
+test("buildTuiCmd omits --safe-mode when a customization it would strip is in use", () => {
+  const save = process.env.OCP_TUI_FULL_TOOLS;
+  try {
+    delete process.env.OCP_TUI_FULL_TOOLS;
+    // streaming registers a MessageDisplay HOOK via --settings; --safe-mode would kill the hook
+    // (zero deltas), so it must be omitted on the streaming pane.
+    const streaming = buildTuiCmd("/usr/bin/claude", "m", "sid-s", "/home/u", "cli", { file: "/d/sid-s.jsonl", settings: "/d/s.json" });
+    assert.ok(!/--safe-mode/.test(streaming), "streaming pane must NOT pass --safe-mode (would disable the MessageDisplay hook)");
+    assert.ok(streaming.includes("--settings '/d/s.json'"), "streaming pane keeps its --settings hook");
+
+    // OCP_TUI_FULL_TOOLS grants an MCP/skills surface --safe-mode disables wholesale.
+    process.env.OCP_TUI_FULL_TOOLS = "1";
+    const full = buildTuiCmd("/usr/bin/claude", "m", "sid-f", "/home/u", "cli");
+    assert.ok(!/--safe-mode/.test(full), "full-tools pane must NOT pass --safe-mode (would disable MCP/skills)");
+  } finally {
+    if (save === undefined) delete process.env.OCP_TUI_FULL_TOOLS; else process.env.OCP_TUI_FULL_TOOLS = save;
+  }
 });
 
 test("buildTuiCmd keeps version pin + entrypoint label + MCP wall", () => {
@@ -4523,13 +4545,17 @@ test("stream: sink path is keyed by session_id (concurrent panes cannot interlea
   assert.ok(A.endsWith("/aaaa-1111.jsonl"));
 });
 
-test("stream: buildTuiCmd — OFF is byte-for-byte the pre-streaming argv; ON adds only env + --settings", () => {
+test("stream: buildTuiCmd — streaming ON adds env + --settings and drops --safe-mode (hook survives)", () => {
   const off = buildTuiCmd("/bin/claude", "m", "SID", "/h", "cli");
   assert.ok(!off.includes("--settings"), "no --settings when streaming is off");
   assert.ok(!off.includes("OCP_TUI_STREAM_FILE"), "no sink env when streaming is off");
+  assert.ok(off.includes("--safe-mode"), "the non-streaming pane carries --safe-mode");
   const on = buildTuiCmd("/bin/claude", "m", "SID", "/h", "cli", { file: "/d/SID.jsonl", settings: "/d/s.json" });
   assert.ok(on.includes("OCP_TUI_STREAM_FILE='/d/SID.jsonl'"), "sink delivered via the pane env");
   assert.ok(on.includes("--settings '/d/s.json'"));
+  // --safe-mode would disable the MessageDisplay hook registered by --settings, so the
+  // streaming pane must NOT carry it (it keeps the env-var suppression instead).
+  assert.ok(!on.includes("--safe-mode"), "streaming pane omits --safe-mode so the hook fires");
   // must not regress the MCP wall or the pinned effort (#156)
   assert.ok(on.includes("--strict-mcp-config") && on.includes("--disallowedTools 'mcp__*'"), "MCP wall intact");
   assert.ok(on.includes("--effort low"), "OCP_TUI_EFFORT default intact");
