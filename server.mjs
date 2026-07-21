@@ -1948,6 +1948,7 @@ async function callClaudeStreaming(model, messages, conversationId, res, authInf
   let stderr = "";
   let headersSent = false;
   let totalChars = 0;
+  let streamEndsWithNewline = false; // tracks whether emitted text ends in "\n" — see the separator guard below
   let cachedContent = ""; // accumulate for cache write-back
   let lineBuffer = "";
   let sawTextDelta = false;
@@ -1997,9 +1998,14 @@ async function callClaudeStreaming(model, messages, conversationId, res, authInf
         let text = parsed.text;
         if (parsed.fromDelta) {
           sawTextDelta = true;
-        } else if (totalChars > 0) {
+        } else if (totalChars > 0 && !streamEndsWithNewline) {
+          // Mirror the buffered path's guard (assembledText.endsWith("\n")): only inject the
+          // blank-line separator when the already-emitted text doesn't already end in a newline,
+          // so a message ending in "\n" doesn't produce a triple newline here while the buffered
+          // path produces a single. Keeps the two assembly paths byte-identical. (PR #183 review.)
           text = "\n\n" + text;
         }
+        streamEndsWithNewline = text.endsWith("\n");
         totalChars += text.length;
         if (CACHE_TTL > 0) cachedContent += text;
 
