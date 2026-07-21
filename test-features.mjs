@@ -4405,6 +4405,12 @@ test("validateJsonSchemaSafe: well-formed value passes through unchanged (byte-i
   assert.deepEqual(validateJsonSchemaSafe({ name: "a" }, schema), validateJsonSchema({ name: "a" }, schema)); // error case matches too
 });
 
+test("validateJsonSchemaSafe: re-throws a non-RangeError so genuine bugs aren't masked as a validation miss", () => {
+  // A schema whose `required` is a non-iterable makes the inner validator throw a TypeError — that's
+  // a real bug, not a deep-value overflow, and must surface (not be swallowed as "did not validate").
+  assert.throws(() => validateJsonSchemaSafe({ x: 1 }, { type: "object", required: 42 }), (e) => !(e instanceof RangeError));
+});
+
 test("validateJsonSchema: valid object passes", () => {
   assert.deepEqual(validateJsonSchema({ name: "a", age: 3 }, { type: "object", required: ["name", "age"], properties: { name: { type: "string" }, age: { type: "integer" } } }), []);
 });
