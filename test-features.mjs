@@ -3504,7 +3504,7 @@ if (process.env.OCP_TUI_LIVE === "1") {
 // Replicates tuiInputReady, tuiPromptLanded verbatim from lib/tui/session.mjs.
 // Keep in sync with the definitions there.
 function _tuiInputReady(pane) {
-  return /\? for shortcuts/.test(pane);
+  return /\? for shortcuts|shift\+tab to cycle/.test(pane);
 }
 function _tuiPromptLanded(pane, prompt) {
   const flatPane = pane.replace(/\s+/g, " ");
@@ -3522,7 +3522,12 @@ const TUI_READY_PANE = `❯ Try "how does <filepath> work?"
 const TUI_LANDED_PANE = `❯ Reply with exactly: PONG_TEST
   ? for shortcuts · ← for agents`;
 
-// Welcome splash shown before input bar is rendered — no `? for shortcuts`.
+// Newer claude 2.1.x renders the input bar with a `shift+tab to cycle` footer instead of
+// `? for shortcuts` — the matcher must accept it too, or the pane reads as never-ready.
+const TUI_READY_PANE_SHIFT_TAB = `❯ Try "how does <filepath> work?"
+  ⏵⏵ bypass permissions on (shift+tab to cycle)`;
+
+// Welcome splash shown before input bar is rendered — neither ready-state footer.
 const TUI_BOOT_PANE = `╭─ Claude Code v2.1.114 ─ Welcome back Tao! ─╮\n│ Tips for getting started │`;
 
 console.log("\nTUI readiness + paste-verify predicates (issue #130):");
@@ -3532,6 +3537,9 @@ test("tuiInputReady(READY_PANE) === true  (input bar rendered)", () => {
 });
 test("tuiInputReady(LANDED_PANE) === true  (input bar still present after paste)", () => {
   assert.equal(_tuiInputReady(TUI_LANDED_PANE), true);
+});
+test("tuiInputReady(READY_PANE_SHIFT_TAB) === true  (newer claude `shift+tab to cycle` footer)", () => {
+  assert.equal(_tuiInputReady(TUI_READY_PANE_SHIFT_TAB), true);
 });
 test("tuiInputReady(BOOT_PANE) === false  (welcome splash, no input bar yet)", () => {
   assert.equal(_tuiInputReady(TUI_BOOT_PANE), false);
