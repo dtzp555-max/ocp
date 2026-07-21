@@ -1355,7 +1355,7 @@ function parseStreamJsonLines(buffered) {
   return { events, remainder: remainder ?? "" };
 }
 
-function parseStreamJsonEvent(event, isFirstDelta) {
+function parseStreamJsonEvent(event, sawTextDelta) {
   const t = event?.type;
 
   // system/* — first-event init + other system meta (api_retry etc.)
@@ -1367,19 +1367,19 @@ function parseStreamJsonEvent(event, isFirstDelta) {
   if (t === "stream_event") {
     const inner = event.event ?? event;
     if (inner?.type === "content_block_delta" && inner.delta?.type === "text_delta") {
-      return { text: inner.delta.text ?? "" };
+      return { text: inner.delta.text ?? "", fromDelta: true };
     }
     // Other stream_event sub-types (content_block_start, message_delta, etc.) — consumed
     return null;
   }
 
-  // assistant — aggregate message (fallback when no prior content_block_delta seen)
-  // Empirically (claude CLI without --include-partial-messages, verified v2.1.104 through v2.1.158): fast/short
-  // responses may emit ONLY the aggregate assistant event, no content_block_delta events.
-  // If isFirstDelta is true, extract text here; otherwise it's a duplicate, ignore.
+  // assistant — aggregate message. Without --include-partial-messages each assistant message
+  // arrives as its own aggregate event; an agentic turn emits several (preamble + tool rounds +
+  // final answer), so accumulate EVERY one. Only guard the delta+aggregate double-count case:
+  // if streaming deltas were already seen (sawTextDelta), the aggregate duplicates them.
   // Reference: OLP commit 65f945c (assistant-aggregate fallback, fold-in).
   if (t === "assistant") {
-    if (isFirstDelta) {
+    if (!sawTextDelta) {
       const blocks = event.message?.content;
       if (Array.isArray(blocks)) {
         const text = blocks
@@ -1428,25 +1428,25 @@ test("parseStreamJsonEvent: stream_event content_block_delta yields text", () =>
     type: "stream_event",
     event: { type: "content_block_delta", delta: { type: "text_delta", text: "Hello" } }
   };
-  const result = parseStreamJsonEvent(event, true);
-  assert.deepEqual(result, { text: "Hello" });
+  const result = parseStreamJsonEvent(event, false);
+  assert.deepEqual(result, { text: "Hello", fromDelta: true });
 });
 
-test("parseStreamJsonEvent: assistant-aggregate used when isFirstDelta=true (no prior delta)", () => {
-  const event = {
-    type: "assistant",
-    message: { content: [{ type: "text", text: "Short answer." }] }
-  };
-  const result = parseStreamJsonEvent(event, true);
-  assert.deepEqual(result, { text: "Short answer." });
-});
-
-test("parseStreamJsonEvent: assistant-aggregate skipped when isFirstDelta=false (no double-count)", () => {
+test("parseStreamJsonEvent: assistant-aggregate used when no delta seen (sawTextDelta=false)", () => {
   const event = {
     type: "assistant",
     message: { content: [{ type: "text", text: "Short answer." }] }
   };
   const result = parseStreamJsonEvent(event, false);
+  assert.deepEqual(result, { text: "Short answer." });
+});
+
+test("parseStreamJsonEvent: assistant-aggregate skipped when a delta was seen (sawTextDelta=true, no double-count)", () => {
+  const event = {
+    type: "assistant",
+    message: { content: [{ type: "text", text: "Short answer." }] }
+  };
+  const result = parseStreamJsonEvent(event, true);
   assert.equal(result, null);
 });
 
@@ -1460,12 +1460,37 @@ test("parseStreamJsonEvent: stream_event + assistant → assembled without doubl
     type: "assistant",
     message: { content: [{ type: "text", text: "Streaming text." }] }
   };
-  // First event: isFirstDelta=true → yields text
-  const r1 = parseStreamJsonEvent(delta, true);
-  assert.deepEqual(r1, { text: "Streaming text." });
-  // Second event (aggregate): isFirstDelta is now false (content already emitted) → null
-  const r2 = parseStreamJsonEvent(agg, false);
+  // First event: no delta seen yet → yields text and marks fromDelta
+  const r1 = parseStreamJsonEvent(delta, false);
+  assert.deepEqual(r1, { text: "Streaming text.", fromDelta: true });
+  // Second event (aggregate): a delta was seen (sawTextDelta=true) → duplicate, null
+  const r2 = parseStreamJsonEvent(agg, true);
   assert.equal(r2, null);
+});
+
+// REGRESSION (agentic turns): without --include-partial-messages a tool-using turn emits SEVERAL
+// aggregate `assistant` events (preamble, then the final answer after tool use) and NO deltas.
+// Every one must be captured — the old first-only guard dropped the final answer.
+test("parseStreamJsonEvent: multi-message agentic turn captures preamble AND final answer", () => {
+  const preamble = {
+    type: "assistant",
+    message: { content: [
+      { type: "text", text: "I'll find the homepage repo and remove the calendar." },
+      { type: "tool_use", id: "t1", name: "Bash" },
+    ] }
+  };
+  const toolResult = { type: "user", message: { content: [{ type: "tool_result", content: "ok" }] } };
+  const finalMsg = {
+    type: "assistant",
+    message: { content: [{ type: "text", text: "Done — removed the calendar widget and pushed." }] }
+  };
+  // No deltas are ever emitted in aggregate mode, so sawTextDelta stays false throughout.
+  const r1 = parseStreamJsonEvent(preamble, false);
+  assert.deepEqual(r1, { text: "I'll find the homepage repo and remove the calendar." });
+  const r2 = parseStreamJsonEvent(toolResult, false); // user/tool_result echo — consumed
+  assert.equal(r2, null);
+  const r3 = parseStreamJsonEvent(finalMsg, false);   // <- old code returned null here (bug)
+  assert.deepEqual(r3, { text: "Done — removed the calendar widget and pushed." });
 });
 
 // (b) aggregate-only short response → assembles correctly
@@ -1480,7 +1505,7 @@ test("parseStreamJsonEvent: aggregate-only multi-block response assembles all te
       ]
     }
   };
-  const result = parseStreamJsonEvent(event, true);
+  const result = parseStreamJsonEvent(event, false);
   assert.deepEqual(result, { text: "Part one. Part two." });
 });
 
@@ -1498,8 +1523,8 @@ test("parseStreamJsonLines: partial line carried as remainder", () => {
   assert.equal(ev2[0].type, "stream_event");
   assert.equal(rem2, "");
   // Verify the reassembled event parses through parseStreamJsonEvent correctly
-  const parsed = parseStreamJsonEvent(ev2[0], true);
-  assert.deepEqual(parsed, { text: "Hi" });
+  const parsed = parseStreamJsonEvent(ev2[0], false);
+  assert.deepEqual(parsed, { text: "Hi", fromDelta: true });
 });
 
 test("parseStreamJsonLines: empty input returns no events and empty remainder", () => {
