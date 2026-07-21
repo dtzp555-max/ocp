@@ -2,7 +2,7 @@
 
 ## v3.24.0 — 2026-07-21
 
-Minor release. Headline: two long-requested **OpenAI-compat features** land — **multimodal vision** (`image_url` parts) and **structured outputs** (`response_format` / JSON schema). Also: the prompt-char budget now derives from the model SPOT instead of a hand-set constant, an agentic-turn bug that dropped the model's final answer is fixed, and `OCP_LOCAL_TOOLS` supports the OpenClaw-backend use case. Two of the six landed from external contributors (@vvlasy-openclaw). Every code PR carried a fresh-context reviewer (Iron Rule 10); no new endpoint, no new `cli.js` wire behavior.
+Minor release. Headline: two long-requested **OpenAI-compat features** land — **multimodal vision** (`image_url` parts) and **structured outputs** (`response_format` / JSON schema). Also: the prompt-char budget now derives from the model SPOT instead of a hand-set constant, an agentic-turn bug that dropped the model's final answer is fixed, and `OCP_LOCAL_TOOLS` supports the OpenClaw-backend use case. Four of the six landed from external contributors (@vvlasy-openclaw). Every code PR carried a fresh-context reviewer (Iron Rule 10); no new endpoint, no new `cli.js` wire behavior.
 
 ### Added
 
