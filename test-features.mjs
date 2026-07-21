@@ -4356,7 +4356,7 @@ test("stream: /health block is additive and exposes the divergence counter", () 
 });
 
 // ── OpenAI Structured Outputs (response_format) — lib/structured-output.mjs ──
-import { detectStructuredOutput, validateJsonSchema, extractJsonPayload, structuredSystemInstruction, StructuredOutputError, resolveMaxAttempts } from "./lib/structured-output.mjs";
+import { detectStructuredOutput, validateJsonSchema, validateJsonSchemaSafe, extractJsonPayload, structuredSystemInstruction, StructuredOutputError, resolveMaxAttempts } from "./lib/structured-output.mjs";
 
 test("detectStructuredOutput: json_schema shape", () => {
   const d = detectStructuredOutput({ response_format: { type: "json_schema", json_schema: { name: "x", strict: true, schema: { type: "object" } } } });
@@ -4381,6 +4381,34 @@ test("cacheHash: structured marker isolates JSON requests from the conversationa
   assert.notEqual(plain, asJson);      // JSON vs prose never collide
   assert.notEqual(asJson, asSchema);   // different schema → different slot
   assert.equal(plain, cacheHash("m", msgs, { keyId: "k" })); // unchanged for normal requests
+});
+
+// ── validateJsonSchemaSafe (#181): deep value must NOT crash the handler ─────
+// A recursive schema + a model reply nested ~thousands deep overflows the value-
+// depth recursion → RangeError → the handler used to surface a generic 500. The
+// safe façade turns it into a validation miss (→ retry → refusal). Mutation-proof:
+// replace the wrapper body with a bare `validateJsonSchema(...)` call and the deep
+// test throws instead of returning errors.
+test("validateJsonSchemaSafe: pathologically deep value → errors, never throws", () => {
+  const schema = { $defs: { node: { type: "object", properties: { child: { $ref: "#/$defs/node" } } } }, $ref: "#/$defs/node" };
+  let deep = {};
+  let cur = deep;
+  for (let i = 0; i < 6000; i++) { cur.child = {}; cur = cur.child; } // way past any stack limit
+  let out;
+  assert.doesNotThrow(() => { out = validateJsonSchemaSafe(deep, schema, "$", true); }, "must not throw a RangeError out to the handler");
+  assert.ok(Array.isArray(out) && out.length > 0, "returns a non-empty validation error, so the retry loop yields a refusal not a 500");
+});
+
+test("validateJsonSchemaSafe: well-formed value passes through unchanged (byte-identical to the raw validator)", () => {
+  const schema = { type: "object", required: ["name", "age"], properties: { name: { type: "string" }, age: { type: "integer" } } };
+  assert.deepEqual(validateJsonSchemaSafe({ name: "a", age: 3 }, schema), validateJsonSchema({ name: "a", age: 3 }, schema));
+  assert.deepEqual(validateJsonSchemaSafe({ name: "a" }, schema), validateJsonSchema({ name: "a" }, schema)); // error case matches too
+});
+
+test("validateJsonSchemaSafe: re-throws a non-RangeError so genuine bugs aren't masked as a validation miss", () => {
+  // A schema whose `required` is a non-iterable makes the inner validator throw a TypeError — that's
+  // a real bug, not a deep-value overflow, and must surface (not be swallowed as "did not validate").
+  assert.throws(() => validateJsonSchemaSafe({ x: 1 }, { type: "object", required: 42 }), (e) => !(e instanceof RangeError));
 });
 
 test("validateJsonSchema: valid object passes", () => {

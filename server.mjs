@@ -42,7 +42,7 @@ import { dirname, join } from "node:path";
 import { homedir } from "node:os";
 import { validateKey, recordUsage, getUsageByKey, getUsageTimeline, getRecentUsage, createKey, listKeys, revokeKey, closeDb, checkQuota, updateKeyQuota, getKeyQuota, findKey, cacheHash, getCachedResponse, setCachedResponse, clearCache, getCacheStats, hasCacheControl, singleflight, getInflightStats } from "./keys.mjs";
 import { DEFAULT_PORT } from "./lib/constants.mjs";
-import { StructuredOutputError, detectStructuredOutput, validateJsonSchema, extractJsonPayload, structuredSystemInstruction, resolveMaxAttempts } from "./lib/structured-output.mjs";
+import { StructuredOutputError, detectStructuredOutput, validateJsonSchemaSafe, extractJsonPayload, structuredSystemInstruction, resolveMaxAttempts } from "./lib/structured-output.mjs";
 import { isLoopbackBind } from "./lib/net.mjs";
 import { runTuiTurn, reapStaleTuiSessions, resolveTuiHome, bootTuiPane, tuiPaneHealthy, poolPaneName, POOL_BOOT_MS } from "./lib/tui/session.mjs";
 import { detectTuiUpstreamError } from "./lib/tui/transcript.mjs";
@@ -2732,7 +2732,10 @@ async function runStructuredCompletion(upstreamCall, model, messages, conversati
       continue;
     }
     if (structured.mode === "schema" && structured.schema) {
-      const errs = validateJsonSchema(extracted.value, structured.schema, "$", structured.strict);
+      // validateJsonSchemaSafe (#181): a pathologically deep model reply overflows the value-depth
+      // recursion; the safe façade turns that into a validation miss (→ retry → refusal) instead of
+      // a caught RangeError surfacing as a generic 500.
+      const errs = validateJsonSchemaSafe(extracted.value, structured.schema, "$", structured.strict);
       if (errs.length) {
         lastErr = "schema validation failed: " + errs.slice(0, 5).join("; ");
         logEvent("warn", "structured_retry", { attempt, reason: "schema", errors: errs.slice(0, 5) });
