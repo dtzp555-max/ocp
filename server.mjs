@@ -23,7 +23,7 @@
  *   CLAUDE_MAX_QUEUE             — max requests waiting for a -p slot before HTTP 429 (default: 16)
  *   OCP_TUI_MAX_CONCURRENT       — max concurrent interactive TUI turns, TUI-mode path (default: 2)
  *   OCP_TUI_POOL_SIZE            — pre-booted warm `claude` panes held for TUI-mode (default: 0 = off;
- *                                  max 4). Each is a live idle process; cuts ~3-4s per request.
+ *                                  max 32). Each is a live idle process; cuts ~3-4s per request.
  *   OCP_SPAWN_REAL_HOME          — "1" forces the -p spawn to use the real HOME (disables the
  *                                  latency spawn-home isolation; default: isolated when a token exists)
  *   CLAUDE_BREAKER_THRESHOLD     — failures in window before circuit opens (default: 6)

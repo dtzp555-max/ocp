@@ -58,7 +58,15 @@ turn's text into the later turn's answer — a **cross-request data leak**, not 
 ## Decision
 
 Add an **opt-in pool of pre-booted, single-use `claude` panes**, `OCP_TUI_POOL_SIZE` (default
-`0` = off, max `4`). Implementation: `lib/tui/pool.mjs`.
+`0` = off, max `32`). Implementation: `lib/tui/pool.mjs`.
+
+> **Amendment (2026-07-21):** `POOL_MAX_SIZE` raised `4 → 32`. The original cap of 4 aimed to
+> protect a small host from too many resident idle `claude` processes, but the operator already
+> controls the pool size directly via `OCP_TUI_POOL_SIZE`, so the low hard cap protected nobody
+> who couldn't already protect themselves — it only stopped an operator on capable hardware from
+> using more of their own RAM. The cap's remaining purpose is unchanged: bound a fat-fingered
+> value (e.g. `OCP_TUI_POOL_SIZE=99999999`) rather than guess. Small-host guidance ("keep it
+> small") stays in the docs; the pool remains **default-off**.
 
 ### 1. Panes are SINGLE-USE. This is the load-bearing rule.
 
@@ -154,8 +162,8 @@ tight because a *client* is blocked on it, which is not true of a pre-boot. Slow
 **A warm pane is a live idle `claude` process.** Peak process count is
 `OCP_TUI_POOL_SIZE` + `OCP_TUI_MAX_CONCURRENT` + 1 (booting replacement). This is the whole
 reason the pool is **default-off**: an operator must opt into holding processes for traffic that
-may never come. Size is clamped to `POOL_MAX_SIZE` = 4; an unparseable value **disables** the
-pool rather than guessing.
+may never come. Size is clamped to `POOL_MAX_SIZE` = 32 (see the 2026-07-21 amendment under
+Decision); an unparseable value **disables** the pool rather than guessing.
 
 Panes carry a 10-minute TTL and are health-checked at hand-out; a dead or degraded pane becomes
 a **miss** (cold path), never a hung turn.

@@ -2555,7 +2555,8 @@ function makeFakePool(opts = {}) {
 }
 const tick = () => new Promise((r) => setImmediate(r));
 // Refills are SERIALIZED (one boot at a time, re-kicked on success), so settling the pool
-// takes a chain of microtask turns, not one. 40 is far more than POOL_MAX_SIZE needs.
+// takes a chain of microtask turns, not one. 40 is ample for the small pool sizes these
+// tests construct (they pass an explicit size, never near POOL_MAX_SIZE).
 const settle = async () => { for (let i = 0; i < 40; i++) await tick(); };
 
 console.log("\nTUI warm pane pool (acquire / miss / refill / TTL / reaper exemption):");
