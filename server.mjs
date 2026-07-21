@@ -52,7 +52,7 @@ import { TuiDeltaAssembler, DEFAULT_HOLDBACK_CHARS, resolveStreamHoldback } from
 import { createSerialMutex, createTtlCache, isTokenExpiring, orderLabelsLastGoodFirst } from "./lib/spawn-auth.mjs";
 import { hasImageContent, buildImageBlocks, buildStreamJsonInput, MultimodalError } from "./lib/multimodal.mjs";
 import { parsePositiveInt } from "./lib/env.mjs";
-import { appendOperatorPrompt, derivePromptCharBudget } from "./lib/prompt.mjs";
+import { appendOperatorPrompt, derivePromptCharBudget, selectPromptWrapper, localToolsSafetyError } from "./lib/prompt.mjs";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const _pkg = JSON.parse(readFileSync(join(__dirname, "package.json"), "utf8"));
@@ -198,7 +198,27 @@ function resolveClaude() {
 // Reference: https://github.com/dtzp555-max/olp commit 97e7d16 (Phase 6c)
 const OCP_SYSTEM_PROMPT_WRAPPER = `You are accessed via the OCP HTTP proxy. You do NOT have access to any local filesystem, working directory, shell, git status, or machine environment. Do not infer or invent such information from any context you observe. Respond only based on the conversation provided.`;
 
-// Build the full system-prompt string: OCP_SYSTEM_PROMPT_WRAPPER prepended,
+// Positive counterpart used only when OCP_LOCAL_TOOLS=1 — a single-user, loopback-bound instance
+// where the operator's own model legitimately has tools (the `-p` path passes --allowedTools). Tells
+// the model it MAY use them instead of disclaiming access it actually holds. Off by default; the
+// default wrapper above is byte-for-byte unchanged. Selecting the positive wrapper does NOT expand
+// the tool surface (governed independently by --allowedTools/--disallowedTools) — it only changes the
+// prompt — and is boot-gated below (multi/non-loopback/anon → refuse) mirroring OCP_TUI_FULL_TOOLS.
+const OCP_LOCAL_TOOLS_WRAPPER = `You are accessed via the OCP HTTP proxy running on the operator's own machine. You have full access to the local filesystem, working directory, and shell through your available tools (Bash, Read, Write, Edit, Glob, Grep, etc.). Use them as needed to complete the operator's requests.`;
+
+// OCP_LOCAL_TOOLS is inert in TUI mode: the interactive (non-`-p`) path composes its own prompt via
+// callClaudeTui/messagesToPrompt and never calls extractSystemPrompt, so the wrapper is only ever
+// applied on the `-p` path. LOCAL_TOOLS_ACTIVE is the single source of truth (hoisted once, house
+// style) used by the wrapper selection, the boot gate, and the startup notice — so the flag is
+// enabled/announced/gated in exactly the mode where it has an effect. (TUI tool surface is governed
+// by OCP_TUI_FULL_TOOLS instead.)
+const LOCAL_TOOLS = process.env.OCP_LOCAL_TOOLS === "1";
+const LOCAL_TOOLS_ACTIVE = LOCAL_TOOLS && process.env.CLAUDE_TUI_MODE !== "true";
+
+// The wrapper actually prepended to each request's system prompt, chosen once at startup.
+const SYSTEM_PROMPT_WRAPPER = selectPromptWrapper(LOCAL_TOOLS_ACTIVE, OCP_SYSTEM_PROMPT_WRAPPER, OCP_LOCAL_TOOLS_WRAPPER);
+
+// Build the full system-prompt string: SYSTEM_PROMPT_WRAPPER prepended,
 // then any system-role messages from the request appended (separated by blank line),
 // then the operator-wide CLAUDE_SYSTEM_PROMPT appended LAST (lib/prompt.mjs — a
 // no-op returning the same string when the var is unset, so the default path is
@@ -206,12 +226,12 @@ const OCP_SYSTEM_PROMPT_WRAPPER = `You are accessed via the OCP HTTP proxy. You 
 function extractSystemPrompt(messages) {
   const systemMessages = (messages ?? []).filter(m => m.role === "system");
   if (systemMessages.length === 0) {
-    return appendOperatorPrompt(OCP_SYSTEM_PROMPT_WRAPPER, SYSTEM_PROMPT);
+    return appendOperatorPrompt(SYSTEM_PROMPT_WRAPPER, SYSTEM_PROMPT);
   }
   const clientContent = systemMessages.map(m =>
     contentToText(m.content)
   ).join("\n\n");
-  return appendOperatorPrompt(`${OCP_SYSTEM_PROMPT_WRAPPER}\n\n${clientContent}`, SYSTEM_PROMPT);
+  return appendOperatorPrompt(`${SYSTEM_PROMPT_WRAPPER}\n\n${clientContent}`, SYSTEM_PROMPT);
 }
 
 // ── NDJSON line buffer parser (Phase 6c port) ─────────────────────────────
@@ -374,7 +394,7 @@ const NO_CONTEXT = process.env.CLAUDE_NO_CONTEXT === "true";
 // API) are excluded because a const epoch cannot track them; truncation also only drops
 // context rather than changing the instruction set.
 const CONFIG_EPOCH = cryptoCreateHash("sha256")
-  .update(JSON.stringify([SYSTEM_PROMPT, OCP_SYSTEM_PROMPT_WRAPPER, ALLOWED_TOOLS, NO_CONTEXT]))
+  .update(JSON.stringify([SYSTEM_PROMPT, SYSTEM_PROMPT_WRAPPER, ALLOWED_TOOLS, NO_CONTEXT]))
   .digest("hex").slice(0, 16);
 // Kill-switch for the FIX-③ default-path spawn-home isolation (see resolveSpawnHome /
 // spawnHomeMode below). When "1", the -p/stream-json spawn always runs in the operator's
@@ -809,6 +829,21 @@ if (TUI_MODE && PROXY_ANONYMOUS_KEY) {
     "  could drive the operator's claude session without a named key.\n" +
     "  Remove PROXY_ANONYMOUS_KEY or disable TUI-mode. See docs/adr/0007-tui-interactive-mode.md."
   );
+  process.exit(1);
+}
+
+// OCP_LOCAL_TOOLS safety gate (mirrors the OCP_TUI_FULL_TOOLS model, ADR 0007): the positive
+// "you may use local tools" system-prompt wrapper is single-user only, so refuse to boot if it
+// could reach an untrusted caller. Fail-closed on multi-tenant auth, a non-loopback bind, or an
+// anonymous key. The pure predicate lives in lib/prompt.mjs (unit-tested); the exit stays here.
+const _localToolsBootError = localToolsSafetyError({
+  enabled: LOCAL_TOOLS_ACTIVE,
+  authMode: AUTH_MODE,
+  loopbackBind: isLoopbackBind(BIND_ADDRESS),
+  anonymousKey: !!PROXY_ANONYMOUS_KEY,
+});
+if (_localToolsBootError) {
+  console.error(`FATAL: ${_localToolsBootError}\n  See README § "Environment Variables" (OCP_LOCAL_TOOLS) and docs/adr/0007-tui-interactive-mode.md. Refusing to start.`);
   process.exit(1);
 }
 
@@ -3578,6 +3613,8 @@ server.listen(PORT, BIND_ADDRESS, () => {
   console.log(`Auth: ${PROXY_API_KEY ? "enabled (PROXY_API_KEY set)" : "disabled (no PROXY_API_KEY)"}`);
   console.log(`Auth mode: ${AUTH_MODE}${AUTH_MODE === "shared" ? " (PROXY_API_KEY)" : AUTH_MODE === "multi" ? " (per-user keys)" : " (open)"}`);
   console.log(`Bind: ${BIND_ADDRESS}${BIND_ADDRESS === "0.0.0.0" ? " ⚠ LAN-accessible" : ""}`);
+  if (LOCAL_TOOLS_ACTIVE) console.log(`Local tools: ON (OCP_LOCAL_TOOLS=1) — model told it may use local tools; single-user/loopback only`);
+  else if (LOCAL_TOOLS) console.warn(`⚠ OCP_LOCAL_TOOLS=1 is ignored in TUI mode (the -p system-prompt wrapper is not used). The TUI tool surface is governed by OCP_TUI_FULL_TOOLS.`);
   if (NO_CONTEXT) console.log(`Context: suppressed (CLAUDE_NO_CONTEXT=true — no CLAUDE.md, no auto-memory)`);
   if (CACHE_TTL > 0) console.log(`Cache: enabled (TTL=${CACHE_TTL / 1000}s)`);
   else console.log(`Cache: disabled (set CLAUDE_CACHE_TTL to enable)`);

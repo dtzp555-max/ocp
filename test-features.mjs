@@ -844,7 +844,7 @@ test("doctor falls back to currentVersion when origin/main unreachable (no stale
 // contract lives in lib/prompt.mjs. Mutation-proof: make appendOperatorPrompt
 // return `base` unconditionally and the first test fails; make it stop trimming
 // and the whitespace test fails.
-import { appendOperatorPrompt, derivePromptCharBudget, resolvePromptCharBudget } from "./lib/prompt.mjs";
+import { appendOperatorPrompt, derivePromptCharBudget, resolvePromptCharBudget, selectPromptWrapper, localToolsSafetyError } from "./lib/prompt.mjs";
 
 console.log("\nPrompt-char budget (ADR 0009 — SPOT-derived):");
 
@@ -904,6 +904,204 @@ test("appendOperatorPrompt: unset/empty/whitespace-only → base returned BYTE-I
 
 test("appendOperatorPrompt: operator value is trimmed before appending", () => {
   assert.equal(appendOperatorPrompt("W", "  hi  "), "W\n\nhi");
+});
+
+// ── OCP_LOCAL_TOOLS wrapper selection + safety gate (lib/prompt.mjs) ──────────
+console.log("\nOCP_LOCAL_TOOLS wrapper + safety gate:");
+
+const NEG = "You do NOT have access to any local filesystem";
+const POS = "You have full access to the local filesystem";
+
+test("selectPromptWrapper: default (disabled) returns the negative wrapper BYTE-IDENTICAL", () => {
+  // Mutation-proof: flip the ternary and the default path leaks the positive wrapper.
+  assert.equal(selectPromptWrapper(false, NEG, POS), NEG);
+});
+
+test("selectPromptWrapper: enabled returns the positive (local-tools) wrapper", () => {
+  assert.equal(selectPromptWrapper(true, NEG, POS), POS);
+});
+
+test("localToolsSafetyError: disabled → null regardless of an otherwise-unsafe deploy", () => {
+  // The gate must not fire when the flag is off — the default path is never blocked.
+  assert.equal(localToolsSafetyError({ enabled: false, authMode: "multi", loopbackBind: false, anonymousKey: true }), null);
+});
+
+test("localToolsSafetyError: enabled on a safe single-user loopback instance → null (boots)", () => {
+  assert.equal(localToolsSafetyError({ enabled: true, authMode: "none", loopbackBind: true, anonymousKey: false }), null);
+  assert.equal(localToolsSafetyError({ enabled: true, authMode: "shared", loopbackBind: true, anonymousKey: false }), null);
+});
+
+test("localToolsSafetyError: enabled + AUTH_MODE=multi → fatal (guest could be told it has FS)", () => {
+  const e = localToolsSafetyError({ enabled: true, authMode: "multi", loopbackBind: true, anonymousKey: false });
+  assert.ok(e && /multi/.test(e), `expected a multi-tenant fatal, got: ${e}`);
+});
+
+test("localToolsSafetyError: enabled + non-loopback bind → fatal (network-exposed)", () => {
+  const e = localToolsSafetyError({ enabled: true, authMode: "none", loopbackBind: false, anonymousKey: false });
+  assert.ok(e && /loopback/.test(e), `expected a loopback fatal, got: ${e}`);
+});
+
+test("localToolsSafetyError: enabled + anonymous key → fatal (unnamed callers)", () => {
+  const e = localToolsSafetyError({ enabled: true, authMode: "none", loopbackBind: true, anonymousKey: true });
+  assert.ok(e && /ANONYMOUS/i.test(e), `expected an anonymous-key fatal, got: ${e}`);
+});
+
+test("localToolsSafetyError: multi is checked before loopback/anon (most severe first)", () => {
+  // A deploy that trips several conditions reports the multi-tenant one — the strongest signal.
+  const e = localToolsSafetyError({ enabled: true, authMode: "multi", loopbackBind: false, anonymousKey: true });
+  assert.ok(/multi/.test(e));
+});
+
+// ── OCP_LOCAL_TOOLS INTEGRATION: boot real server.mjs, observe the -p spawn ──────────
+// The unit tests above prove the pure helpers. These close the INTEGRATION SEAM the suite
+// otherwise can't reach (server.mjs boots a listener on import): a fake `claude` captures the
+// exact --system-prompt OCP spawns it with, so we assert the SELECTED wrapper actually reaches
+// a request — and boot-gate refusals are asserted by the process exit code. Without these, the
+// wiring (extractSystemPrompt using SYSTEM_PROMPT_WRAPPER, the boot gate, the epoch fold) can be
+// silently reverted with the unit suite still green — the maintainer's #1 rejection pattern.
+import { spawn as _ltSpawn } from "node:child_process";
+import { writeFileSync as _ltWrite, chmodSync as _ltChmod, readFileSync as _ltRead, existsSync as _ltExists, rmSync as _ltRm, mkdtempSync as _ltMkdtemp } from "node:fs";
+import { tmpdir as _ltTmp } from "node:os";
+import { fileURLToPath as _ltF2P } from "node:url";
+
+const LT_SERVER = _ltF2P(new URL("./server.mjs", import.meta.url));
+const LT_POSIX = process.platform !== "win32"; // fake is a /bin/sh script; CI is POSIX
+const LT_NEG_MARK = "You do NOT have access to any local filesystem";
+const LT_POS_MARK = "You have full access to the local filesystem";
+// Fake claude: record the --system-prompt it was spawned with, bump an optional spawn counter,
+// then emit a minimal valid stream-json response so the request completes (and caches).
+const LT_FAKE = `#!/bin/sh
+prev=""
+for a in "$@"; do
+  if [ "$prev" = "--system-prompt" ]; then printf '%s' "$a" > "$SP_CAPTURE"; fi
+  prev="$a"
+done
+if [ -n "$SP_COUNTER" ]; then c=$(cat "$SP_COUNTER" 2>/dev/null || echo 0); echo $((c+1)) > "$SP_COUNTER"; fi
+printf '%s\\n' '{"type":"assistant","message":{"content":[{"type":"text","text":"OK"}]}}'
+printf '%s\\n' '{"type":"result"}'
+exit 0
+`;
+
+function ltMkdir() { return _ltMkdtemp(join(_ltTmp(), "ocp-lt-")); }
+function ltFake(dir) { const p = join(dir, "claude"); _ltWrite(p, LT_FAKE); _ltChmod(p, 0o755); return p; }
+function ltBoot(env, dir) {
+  const child = _ltSpawn(process.execPath, [LT_SERVER], {
+    env: { ...process.env, NODE_ENV: "test", OCP_DIR_OVERRIDE: dir, OCP_SKIP_AUTH_TEST: "1",
+           CLAUDE_BIND: "127.0.0.1", CLAUDE_AUTH_MODE: "none", CLAUDE_CACHE_TTL: "0", CLAUDE_TIMEOUT: "4000", ...env },
+    stdio: ["ignore", "pipe", "pipe"],
+  });
+  const buf = { out: "", err: "", exit: undefined };
+  child.stdout.on("data", d => { buf.out += d; });
+  child.stderr.on("data", d => { buf.err += d; });
+  child.on("exit", code => { buf.exit = code; });
+  return { child, buf };
+}
+async function ltWait(cond, ms = 9000) {
+  const start = Date.now();
+  while (Date.now() - start < ms) { if (cond()) return true; await new Promise(r => setTimeout(r, 40)); }
+  return false;
+}
+async function ltPost(port, body) {
+  try {
+    await fetch(`http://127.0.0.1:${port}/v1/chat/completions`, {
+      method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body),
+    });
+  } catch { /* the fake may close the socket; the spawn (and capture) already happened */ }
+}
+
+console.log("\nOCP_LOCAL_TOOLS integration (boot server.mjs):");
+
+test("integration: OCP_LOCAL_TOOLS=1 → the -p spawn receives the POSITIVE wrapper (kills the no-op mutation)", async () => {
+  if (!LT_POSIX) return; // sh fake — skip on Windows CI
+  const dir = ltMkdir(); const cap = join(dir, "sp.txt"); const fake = ltFake(dir);
+  const { child, buf } = ltBoot({ OCP_LOCAL_TOOLS: "1", CLAUDE_BIN: fake, CLAUDE_PROXY_PORT: "39321", SP_CAPTURE: cap }, dir);
+  try {
+    assert.ok(await ltWait(() => buf.out.includes("listening on") || buf.exit != null), `server did not start: ${buf.err.slice(0,200)}`);
+    await ltPost(39321, { model: "sonnet", messages: [{ role: "user", content: "hi" }] });
+    assert.ok(await ltWait(() => _ltExists(cap)), "fake claude was spawned and captured --system-prompt");
+    const sp = _ltRead(cap, "utf8");
+    assert.ok(sp.includes(LT_POS_MARK), `expected POSITIVE wrapper in --system-prompt, got: ${sp.slice(0,90)}`);
+    assert.ok(!sp.includes(LT_NEG_MARK), "positive wrapper must REPLACE the negative one, not append");
+  } finally { child.kill("SIGKILL"); _ltRm(dir, { recursive: true, force: true }); }
+});
+
+test("integration: flag OFF → the -p spawn receives the EXACT negative wrapper (default path byte-for-byte)", async () => {
+  if (!LT_POSIX) return;
+  const dir = ltMkdir(); const cap = join(dir, "sp.txt"); const fake = ltFake(dir);
+  const { child, buf } = ltBoot({ CLAUDE_BIN: fake, CLAUDE_PROXY_PORT: "39322", SP_CAPTURE: cap }, dir); // OCP_LOCAL_TOOLS unset
+  try {
+    assert.ok(await ltWait(() => buf.out.includes("listening on") || buf.exit != null), `server did not start: ${buf.err.slice(0,200)}`);
+    await ltPost(39322, { model: "sonnet", messages: [{ role: "user", content: "hi" }] });
+    assert.ok(await ltWait(() => _ltExists(cap)), "fake claude captured --system-prompt");
+    const sp = _ltRead(cap, "utf8");
+    // No system messages + no CLAUDE_SYSTEM_PROMPT → the wrapper is passed verbatim.
+    assert.equal(sp, `You are accessed via the OCP HTTP proxy. You do NOT have access to any local filesystem, working directory, shell, git status, or machine environment. Do not infer or invent such information from any context you observe. Respond only based on the conversation provided.`);
+  } finally { child.kill("SIGKILL"); _ltRm(dir, { recursive: true, force: true }); }
+});
+
+test("integration: boot gate REFUSES each unsafe config (multi / non-loopback / anon key)", async () => {
+  if (!LT_POSIX) return;
+  const dir = ltMkdir(); const fake = ltFake(dir);
+  const cases = [
+    { label: "multi", env: { CLAUDE_AUTH_MODE: "multi" } },
+    { label: "non-loopback", env: { CLAUDE_BIND: "0.0.0.0" } },
+    { label: "anon", env: { PROXY_ANONYMOUS_KEY: "pub" } },
+  ];
+  try {
+    for (const [i, c] of cases.entries()) {
+      const { child, buf } = ltBoot({ OCP_LOCAL_TOOLS: "1", CLAUDE_BIN: fake, CLAUDE_PROXY_PORT: String(39330 + i), ...c.env }, dir);
+      try {
+        assert.ok(await ltWait(() => buf.exit != null), `[${c.label}] expected the process to exit`);
+        assert.notEqual(buf.exit, 0, `[${c.label}] must exit non-zero`);
+        assert.ok(/FATAL[\s\S]*OCP_LOCAL_TOOLS/.test(buf.err), `[${c.label}] expected a local-tools FATAL, got: ${buf.err.slice(0,160)}`);
+      } finally { child.kill("SIGKILL"); }
+    }
+  } finally { _ltRm(dir, { recursive: true, force: true }); }
+});
+
+test("integration: safe single-user config BOOTS past the gate and announces local tools", async () => {
+  if (!LT_POSIX) return;
+  const dir = ltMkdir(); const fake = ltFake(dir);
+  const { child, buf } = ltBoot({ OCP_LOCAL_TOOLS: "1", CLAUDE_BIN: fake, CLAUDE_PROXY_PORT: "39340" }, dir); // loopback + none
+  try {
+    assert.ok(await ltWait(() => buf.out.includes("listening on")), `safe config must boot, got: ${buf.err.slice(0,200)}`);
+    assert.ok(buf.out.includes("Local tools: ON"), "startup must announce local tools when active");
+  } finally { child.kill("SIGKILL"); _ltRm(dir, { recursive: true, force: true }); }
+});
+
+test("integration: TUI mode → flag is announced INERT (not 'ON'), boot not refused", async () => {
+  if (!LT_POSIX) return;
+  const dir = ltMkdir(); const fake = ltFake(dir);
+  // Non-loopback would normally trip the local-tools gate; under TUI the flag is inert so the
+  // gate must NOT fire on its behalf. Use loopback here to isolate TUI's own guards from ours.
+  const { child, buf } = ltBoot({ OCP_LOCAL_TOOLS: "1", CLAUDE_TUI_MODE: "true", CLAUDE_BIN: fake, CLAUDE_PROXY_PORT: "39341" }, dir);
+  try {
+    assert.ok(await ltWait(() => buf.out.includes("listening on") || buf.exit != null), `did not start: ${buf.err.slice(0,200)}`);
+    assert.ok(!buf.out.includes("Local tools: ON"), "must NOT claim local tools are ON in TUI mode (the wrapper is unused there)");
+    assert.ok(/ignored in TUI mode/.test(buf.out + buf.err), "must warn that OCP_LOCAL_TOOLS is inert under TUI");
+  } finally { child.kill("SIGKILL"); _ltRm(dir, { recursive: true, force: true }); }
+});
+
+test("integration: toggling OCP_LOCAL_TOOLS invalidates the standard response cache (epoch fold)", async () => {
+  if (!LT_POSIX) return;
+  const dir = ltMkdir(); const fake = ltFake(dir); const counter = join(dir, "spawns.txt");
+  const req = { model: "sonnet", messages: [{ role: "user", content: "epoch-probe" }] };
+  const bootOnce = async (env, port) => {
+    const { child, buf } = ltBoot({ CLAUDE_BIN: fake, CLAUDE_PROXY_PORT: String(port), CLAUDE_CACHE_TTL: "60000", SP_COUNTER: counter, ...env }, dir);
+    try {
+      assert.ok(await ltWait(() => buf.out.includes("listening on")), `did not start: ${buf.err.slice(0,160)}`);
+      _ltWrite(counter, "0"); // reset AFTER boot so boot-time spawns (if any) don't count
+      await ltPost(port, req);
+      await ltWait(() => (Number(_ltRead(counter, "utf8")) || 0) >= 1, 3000); // give the spawn a beat
+      return Number(_ltRead(counter, "utf8")) || 0;
+    } finally { child.kill("SIGKILL"); }
+  };
+  try {
+    const off = await bootOnce({}, 39350);                       // caches "OK" under epoch(negative)
+    const on = await bootOnce({ OCP_LOCAL_TOOLS: "1" }, 39351);  // same DB, epoch(positive) → must MISS → re-spawn
+    assert.equal(off, 1, "first request (cache empty) must spawn claude");
+    assert.equal(on, 1, "after toggling the flag the identical request must NOT be served from the old cache (epoch differs → re-spawn)");
+  } finally { _ltRm(dir, { recursive: true, force: true }); }
 });
 
 // ── Upgrade Tests ──
