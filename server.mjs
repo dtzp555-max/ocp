@@ -251,8 +251,8 @@ function parseStreamJsonLines(buffered) {
 // Reference: OLP lib/providers/anthropic.mjs anthropicStreamJsonEventToIR (commit 97e7d16).
 //
 // @param {object} event — parsed NDJSON event
-// @param {boolean} isFirstDelta — true if no content has been yielded yet
-function parseStreamJsonEvent(event, isFirstDelta) {
+// @param {boolean} sawTextDelta — true if a streaming content_block_delta text was already seen
+function parseStreamJsonEvent(event, sawTextDelta) {
   const t = event?.type;
 
   // system/* — first-event init + other system meta (api_retry etc.)
@@ -264,19 +264,23 @@ function parseStreamJsonEvent(event, isFirstDelta) {
   if (t === "stream_event") {
     const inner = event.event ?? event;
     if (inner?.type === "content_block_delta" && inner.delta?.type === "text_delta") {
-      return { text: inner.delta.text ?? "" };
+      return { text: inner.delta.text ?? "", fromDelta: true };
     }
     // Other stream_event sub-types (content_block_start, message_delta, etc.) — consumed
     return null;
   }
 
-  // assistant — aggregate message (fallback when no prior content_block_delta seen)
-  // Empirically (claude CLI without --include-partial-messages, verified v2.1.104 through v2.1.158): fast/short
-  // responses may emit ONLY the aggregate assistant event, no content_block_delta events.
-  // If isFirstDelta is true, extract text here; otherwise it's a duplicate, ignore.
+  // assistant — aggregate message. claude CLI without --include-partial-messages emits NO
+  // content_block_delta events; each assistant message arrives as its own aggregate `assistant`
+  // event. An agentic/tool-using turn has SEVERAL (preamble + one per tool round + final answer),
+  // so we must accumulate the text of EVERY such event. The prior `isFirstDelta` guard kept only
+  // the FIRST message's text and dropped the rest — silently losing the post-tool-use final answer
+  // on every tool-using turn (verified v2.1.104 through v2.1.211; see PR body capture).
+  // The only real hazard is the delta+aggregate DOUBLE-COUNT: if streaming deltas were already
+  // seen (sawTextDelta), the aggregate duplicates them — ignore it.
   // Reference: OLP commit 65f945c (assistant-aggregate fallback, fold-in).
   if (t === "assistant") {
-    if (isFirstDelta) {
+    if (!sawTextDelta) {
       const blocks = event.message?.content;
       if (Array.isArray(blocks)) {
         const text = blocks
@@ -1501,7 +1505,7 @@ async function callClaude(model, messages, conversationId, keyName, res) {
     const { proc, cliModel, conversationId: convId, t0, cleanup, handleSessionFailure, markFirstByte } = ctx;
     let lineBuffer = "";
     let assembledText = "";
-    let isFirstDelta = true;
+    let sawTextDelta = false;
     let resultEventSeen = false;
     let stderr = "";
 
@@ -1511,11 +1515,18 @@ async function callClaude(model, messages, conversationId, keyName, res) {
       const { events, remainder } = parseStreamJsonLines(lineBuffer);
       lineBuffer = remainder;
       for (const event of events) {
-        const parsed = parseStreamJsonEvent(event, isFirstDelta);
+        const parsed = parseStreamJsonEvent(event, sawTextDelta);
         if (!parsed) continue;
         if (parsed.text !== undefined) {
-          assembledText += parsed.text;
-          isFirstDelta = false;
+          if (parsed.fromDelta) {
+            assembledText += parsed.text;
+            sawTextDelta = true;
+          } else {
+            // aggregate assistant message — separate successive messages so the preamble and
+            // the post-tool-use final answer don't run together.
+            if (assembledText && !assembledText.endsWith("\n")) assembledText += "\n\n";
+            assembledText += parsed.text;
+          }
         } else if (parsed.stop) {
           resultEventSeen = true;
         } else if (parsed.error) {
@@ -1939,7 +1950,7 @@ async function callClaudeStreaming(model, messages, conversationId, res, authInf
   let totalChars = 0;
   let cachedContent = ""; // accumulate for cache write-back
   let lineBuffer = "";
-  let isFirstDelta = true;
+  let sawTextDelta = false;
   let resultEventSeen = false;
   // Separate flag for is_error result — must NOT be conflated with resultEventSeen.
   // If errored===true the close handler must not cache the response or record success
@@ -1976,15 +1987,21 @@ async function callClaudeStreaming(model, messages, conversationId, res, authInf
     lineBuffer = remainder;
 
     for (const event of events) {
-      const parsed = parseStreamJsonEvent(event, isFirstDelta);
+      const parsed = parseStreamJsonEvent(event, sawTextDelta);
       if (!parsed) continue;
 
       if (parsed.text !== undefined) {
-        // content_block_delta text — forward as SSE delta
-        const text = parsed.text;
+        // Streamed delta, or an aggregate assistant-message text (agentic turns emit several).
+        // For an aggregate message after earlier text, prepend a separator so the preamble and
+        // the post-tool-use final answer don't run together in the forwarded stream.
+        let text = parsed.text;
+        if (parsed.fromDelta) {
+          sawTextDelta = true;
+        } else if (totalChars > 0) {
+          text = "\n\n" + text;
+        }
         totalChars += text.length;
         if (CACHE_TTL > 0) cachedContent += text;
-        isFirstDelta = false;
 
         if (!ensureHeaders()) continue;
         sendSSE(res, {
