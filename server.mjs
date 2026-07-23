@@ -204,7 +204,7 @@ const OCP_SYSTEM_PROMPT_WRAPPER = `You are accessed via the OCP HTTP proxy. You 
 // default wrapper above is byte-for-byte unchanged. Selecting the positive wrapper does NOT expand
 // the tool surface (governed independently by --allowedTools/--disallowedTools) — it only changes the
 // prompt — and is boot-gated below (multi/non-loopback/anon → refuse) mirroring OCP_TUI_FULL_TOOLS.
-const OCP_LOCAL_TOOLS_WRAPPER = `You are accessed via the OCP HTTP proxy running on the operator's own machine. You have full access to the local filesystem, working directory, and shell through your available tools (Bash, Read, Write, Edit, Glob, Grep, etc.). Use them as needed to complete the operator's requests.`;
+const OCP_LOCAL_TOOLS_WRAPPER = `You are accessed via the OCP HTTP proxy running on the operator's own machine. Unlike the shared-gateway posture, you may use your available local tools to act on the operator's machine as the task requires. Use only the tools you actually have — do not assume filesystem, shell, or other access beyond the tool set provided to you in this session.`;
 
 // OCP_LOCAL_TOOLS is inert in TUI mode: the interactive (non-`-p`) path composes its own prompt via
 // callClaudeTui/messagesToPrompt and never calls extractSystemPrompt, so the wrapper is only ever
