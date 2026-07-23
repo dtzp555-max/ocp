@@ -910,7 +910,7 @@ test("appendOperatorPrompt: operator value is trimmed before appending", () => {
 console.log("\nOCP_LOCAL_TOOLS wrapper + safety gate:");
 
 const NEG = "You do NOT have access to any local filesystem";
-const POS = "You have full access to the local filesystem";
+const POS = "you may use your available local tools";
 
 test("selectPromptWrapper: default (disabled) returns the negative wrapper BYTE-IDENTICAL", () => {
   // Mutation-proof: flip the ternary and the default path leaks the positive wrapper.
@@ -967,7 +967,7 @@ import { fileURLToPath as _ltF2P } from "node:url";
 const LT_SERVER = _ltF2P(new URL("./server.mjs", import.meta.url));
 const LT_POSIX = process.platform !== "win32"; // fake is a /bin/sh script; CI is POSIX
 const LT_NEG_MARK = "You do NOT have access to any local filesystem";
-const LT_POS_MARK = "You have full access to the local filesystem";
+const LT_POS_MARK = "you may use your available local tools";
 // Fake claude: record the --system-prompt it was spawned with, bump an optional spawn counter,
 // then emit a minimal valid stream-json response so the request completes (and caches).
 const LT_FAKE = `#!/bin/sh
