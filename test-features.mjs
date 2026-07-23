@@ -2389,6 +2389,42 @@ test("buildTuiCmd OCP_TUI_FULL_TOOLS=1 grants -p-equivalent tool surface (single
   }
 });
 
+test("buildTuiCmd OCP_TUI_TOOLS restricts the built-in tool availability set via --tools (opt-in)", () => {
+  const save = { OCP_TUI_TOOLS: process.env.OCP_TUI_TOOLS, OCP_TUI_FULL_TOOLS: process.env.OCP_TUI_FULL_TOOLS };
+  const restore = () => {
+    for (const k of ["OCP_TUI_TOOLS", "OCP_TUI_FULL_TOOLS"]) {
+      if (save[k] === undefined) delete process.env[k]; else process.env[k] = save[k];
+    }
+  };
+  try {
+    // unset => today's behaviour: no --tools, MCP wall intact (no regression)
+    delete process.env.OCP_TUI_TOOLS;
+    delete process.env.OCP_TUI_FULL_TOOLS;
+    const off = buildTuiCmd("/usr/bin/claude", "m", "s", "/home/u", "cli");
+    assert.ok(!off.includes("--tools"), "unset OCP_TUI_TOOLS => no --tools (default: all built-in tools available)");
+    assert.ok(off.includes("--strict-mcp-config") && off.includes("--disallowedTools 'mcp__*'"), "MCP wall intact");
+
+    // empty string is treated as unset (footgun guard)
+    process.env.OCP_TUI_TOOLS = "  ";
+    const empty = buildTuiCmd("/usr/bin/claude", "m", "s", "/home/u", "cli");
+    assert.ok(!empty.includes("--tools"), "empty/whitespace OCP_TUI_TOOLS => no --tools");
+
+    // set => --tools with the value shq'd as one arg; MCP wall still present
+    process.env.OCP_TUI_TOOLS = "Read,Glob,Grep,WebSearch,WebFetch";
+    const on = buildTuiCmd("/usr/bin/claude", "m", "s", "/home/u", "cli");
+    assert.ok(on.includes("--tools 'Read,Glob,Grep,WebSearch,WebFetch'"), "OCP_TUI_TOOLS adds --tools <value> (shq'd)");
+    assert.ok(on.includes("--strict-mcp-config") && on.includes("--disallowedTools 'mcp__*'"), "MCP wall still intact with --tools");
+
+    // OCP_TUI_TOOLS is scoped to the DEFAULT (MCP-walled) branch only — it does NOT apply to
+    // the full-tools branch (that surface is controlled by CLAUDE_ALLOWED_TOOLS).
+    process.env.OCP_TUI_FULL_TOOLS = "1";
+    const full = buildTuiCmd("/usr/bin/claude", "m", "s", "/home/u", "cli");
+    assert.ok(!full.includes("--tools "), "OCP_TUI_TOOLS is ignored under OCP_TUI_FULL_TOOLS (full-tools uses --allowedTools)");
+  } finally {
+    restore();
+  }
+});
+
 test("reaper kills ONLY this instance's own port-scoped sessions, never olp-tui-", () => {
   const killed = [];
   const fakeTmux = (args) => {
