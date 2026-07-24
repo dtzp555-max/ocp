@@ -5010,3 +5010,13 @@ runAsyncTests().then(() => Promise.all(pendingAsync)).then(() => {
   closeDb();
   process.exit(1);
 });
+
+
+test("server activeRequests counter is reconciled against live child processes", () => {
+  const src = spotReadFileSync(new URL("./server.mjs", import.meta.url), "utf8");
+  assert.ok(src.includes("function reconcileActiveRequestCounter("), "reconcile helper must exist");
+  assert.ok(src.includes("activeProcesses.delete(proc);\n    releaseActiveRequestCounter(\"process_cleanup\");\n    reconcileActiveRequestCounter(\"process_cleanup\");"), "cleanup must delete process and reconcile the counter");
+  assert.ok(src.includes("releaseActiveRequestCounter(\"spawn_throw\");"), "synchronous spawn failure must release the numeric counter");
+  assert.ok(src.includes("reconcileActiveRequestCounter(\"health_snapshot\");"), "/health must self-heal stale activeRequests before reporting");
+  assert.ok(src.includes("reconcileActiveRequestCounter(\"status_snapshot\");"), "/status must self-heal stale activeRequests before reporting");
+});
