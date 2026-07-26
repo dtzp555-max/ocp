@@ -1139,12 +1139,34 @@ test("integration: a synchronous pre-spawn throw must not leak stats.activeReque
   const n = ltSpreadThrowCount();
   assert.ok(n, "could not find an element count whose spread throws — adjust ltSpreadThrowCount");
   const dir = ltMkdir(); const fake = ltFake(dir);
-  const { child, buf } = ltBoot({
-    CLAUDE_BIN: fake, CLAUDE_PROXY_PORT: "39370",
-    CLAUDE_ALLOWED_TOOLS: Array(n).fill("x").join(","),
-  }, dir);
+  // PORTABILITY: delivering the trigger needs an env var of ~2n bytes. Linux caps a SINGLE
+  // env string at MAX_ARG_STRLEN (32 * PAGE_SIZE = 131072), and n is ~130k here, so execve
+  // rejects it with E2BIG — this test cannot run on Linux, which includes CI. It runs on
+  // macOS/BSD. Skipping loudly rather than silently: a vacuous pass would be worse than no
+  // test, and the fix it guards is genuinely unprotected on CI (tracked in #197).
+  let child, buf;
   try {
-    assert.ok(await ltWait(() => buf.out.includes("listening on"), 20000), `did not start: ${buf.err.slice(0, 200)}`);
+    ({ child, buf } = ltBoot({
+      CLAUDE_BIN: fake, CLAUDE_PROXY_PORT: "39370",
+      CLAUDE_ALLOWED_TOOLS: Array(n).fill("x").join(","),
+    }, dir));
+  } catch (e) {
+    if (e && (e.code === "E2BIG" || /E2BIG/.test(String(e.message)))) {
+      console.log(`    (SKIPPED on ${process.platform}: env of ${2 * n}B exceeds this OS's per-string execve limit — see #197)`);
+      _ltRm(dir, { recursive: true, force: true });
+      return;
+    }
+    throw e;
+  }
+  let spawnErr = null;
+  child.on("error", e => { spawnErr = e; });   // E2BIG can arrive here instead of throwing
+  try {
+    const up = await ltWait(() => buf.out.includes("listening on") || spawnErr, 20000);
+    if (spawnErr && (spawnErr.code === "E2BIG" || /E2BIG/.test(String(spawnErr.message)))) {
+      console.log(`    (SKIPPED on ${process.platform}: env of ${2 * n}B exceeds this OS's per-string execve limit — see #197)`);
+      return;
+    }
+    assert.ok(up && !spawnErr, `did not start: ${spawnErr ? spawnErr.message : buf.err.slice(0, 200)}`);
     const req = { model: "haiku", messages: [{ role: "user", content: "leak-probe" }] };
     const codes = [];
     for (let i = 0; i < 3; i++) codes.push(await ltPostStatus(39370, req));
