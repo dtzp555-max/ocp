@@ -9,14 +9,6 @@ on:
       - 'lib/**'
       - 'ocp'
       - 'ocp-connect'
-      # models.json is NOT inert data: it drives MODEL_MAP and VALID_MODELS, the default
-      # request model, and — since ADR 0009 — the global MAX_PROMPT_CHARS truncation budget.
-      # A models.json-only PR can therefore change server.mjs's runtime behavior, and before
-      # this the guardrail simply did not run on one (#198). models.schema.json is included
-      # for the same reason one level up: loosening the schema is what would let a bad
-      # models.json through.
-      - 'models.json'
-      - 'models.schema.json'
       - '.github/workflows/alignment.yml'
 
 jobs:
