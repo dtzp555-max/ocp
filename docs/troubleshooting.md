@@ -116,6 +116,16 @@ openclaw gateway restart   # so OpenClaw re-reads the config
 
 Future `ocp update` invocations sync automatically.
 
+### Response-cache hit rate drops once after upgrading to v3.25.0
+
+Only affects instances running with the response cache **on** (`CLAUDE_CACHE_TTL > 0`); it is off by default, so most installs see nothing.
+
+v3.25.0 keys the cache on the **resolved** model rather than on the string the client sent, so rows written for an alias (`opus`, `sonnet`, `haiku`, or a legacy alias like `claude-haiku-4-5`) no longer match. Those rows orphan and are reaped by the TTL cleanup interval within one window — **no migration script, no action required**; expect one window of extra misses and then normal hit rates.
+
+This is deliberate, and it is what makes an alias repoint take effect. Before v3.25.0, changing where an alias pointed (v3.25.0 itself repoints `opus` → `claude-opus-5`) left the cache serving the **old** model's answers under that alias until TTL expiry, because `models.json` is read once at boot while the SQLite cache survives the restart. If you were running with the cache on and repointed an alias in an earlier version, that is why it appeared not to take.
+
+A side effect worth knowing: an alias and its canonical id now **share** a cache slot, since both produce an identical spawn. That is a small hit-rate improvement in steady state.
+
 <a id="tui-401"></a>
 ### TUI-mode returns a permanent `Please run /login` 401 (re-login doesn't stick)
 

@@ -388,7 +388,7 @@ curl -X DELETE http://127.0.0.1:3456/cache   # clear all cached responses
 ocp settings cacheTTL 0                       # disable at runtime
 ```
 
-Cache is **disabled by default** (`CLAUDE_CACHE_TTL=0`). All data is stored locally in `~/.ocp/ocp.db`. **Hash format upgrade in v3.13.0:** legacy `v1` cache rows don't match new `v2`-format lookups; they orphan and are reaped by the TTL cleanup interval within one window — no migration script required.
+Cache is **disabled by default** (`CLAUDE_CACHE_TTL=0`). All data is stored locally in `~/.ocp/ocp.db`. **Cache keys resolve model aliases as of v3.25.0:** a request for an alias (`opus`, `sonnet`, `haiku`, or a legacy alias like `claude-haiku-4-5`) is now keyed on the canonical model it resolves to, not on the string the client sent. Two consequences, both one-time and self-healing: alias-addressed rows written before the upgrade don't match the new lookups, so they orphan and are reaped by the TTL cleanup interval within one window — no migration script required; and an alias now correctly shares a cache slot with its canonical id, since both produce an identical spawn. Rows keyed on a literal model id are unaffected. This is what makes an alias repoint (such as v3.25.0's `opus` → `claude-opus-5`) take effect immediately instead of being masked by the cache until TTL expiry. **Hash format upgrade in v3.13.0:** legacy `v1` cache rows don't match new `v2`-format lookups; they orphan and are reaped by the TTL cleanup interval within one window — no migration script required.
 
 ## Structured Outputs (OpenAI `response_format`)
 

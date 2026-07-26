@@ -1,11 +1,27 @@
 # Changelog
 
-## Unreleased
+## v3.25.0 — 2026-07-27
+
+Minor release. Headline: **Claude Opus 5** joins the model list and the `opus` alias now resolves to it. Alongside it, two `server.mjs` correctness fixes found by review rather than by users — a monotonic in-flight-counter leak, and cache keys that were hashing the alias string instead of the model it resolves to. The three TUI/prompt fixes that landed after v3.24.0 are included here too.
+
+Every code PR carried an independent fresh-context reviewer (Iron Rule 10); #192 additionally went through the external codex gate, which is what surfaced the cache-key defect. No new endpoint, no new env var, no new `cli.js` wire behavior.
 
 ### Added
 
 - **Claude Opus 5 (`claude-opus-5`), and the `opus` alias now resolves to it.** New `models.json` entry — `/v1/models` goes 6 → 7 and OpenClaw picks it up on the next `ocp update` (via `scripts/sync-openclaw.mjs`). Verified against the installed CLI rather than assumed: the compiled `claude` 2.1.220 bundle carries `latest_per_family:{fable:"claude-fable-5",opus:"claude-opus-5",sonnet:"claude-sonnet-5",haiku:"claude-haiku-4-5"}`, so repointing `opus` mirrors what the CLI itself defaults to — the same reasoning as #168 (sonnet → sonnet-5). Availability confirmed with a live `claude -p --model claude-opus-5` completion on the subscription pool. Pricing is unchanged from Opus 4.8 ($5/$25 per MTok, CLI registry `pricing:"tier_5_25"`), so the alias repoint carries no cost change. `claude-opus-4-8` is retained for pinning.
 - `contextWindow` is deliberately **200000**, not Opus 5's native 1M. Two reasons, both verified: (1) `MAX_PROMPT_CHARS` is a **single global** budget — `derivePromptCharBudget` takes `max(contextWindow) × 3` across *all* entries (`lib/prompt.mjs`), so a 1M entry would raise the truncation ceiling to 3,000,000 chars for `claude-haiku-4-5` too, which is genuinely 200k native, converting clean OCP-side truncation into an upstream API rejection; (2) OpenClaw scales its history budget linearly off this value (`contextWindow × maxHistoryShare × SAFETY_MARGIN` = `× 0.6`, plus an oversized-message threshold at `× 0.5`, per `compaction-planning` in OpenClaw 2026.7.1), and its own bundled registry hardcodes 200000 for Claude — the upstream request to raise it to 1M ([openclaw#22979](https://github.com/openclaw/openclaw/issues/22979)) was closed *not planned*. A new regression test pins the invariant so a future 1M entry has to be a deliberate, reviewed change. Raising it for real needs per-model budgets — tracked separately, ADR-level.
+
+### Fixed
+
+- **Cache keys hashed the alias, not the model it resolves to (#194).** `model` enters `cacheHash` exactly as the client sent it, so a request for `"opus"` was cached under the literal `"opus"` — and since `models.json` is read once at boot while the SQLite `response_cache` outlives a restart, repointing an alias kept serving the **old model's** answers under it until TTL expiry. That would have silently defeated this release's own `opus` repoint for anyone running with the cache on. All three call sites now hash `MODEL_MAP[model] || model`, which fixes the normal, structured **and** single-flight keys at once and covers `legacyAliases` for free, with precise invalidation (only the repointed alias's entries change key) rather than a whole-cache flush. **Also closes a latent gap from #177:** the structured and dedup keys never passed `configEpoch` at all, so a `CLAUDE_SYSTEM_PROMPT` change — the original #176 scenario — kept serving structured answers composed under the old config, live since #153. Found by the external codex review of #192.
+- **In-flight request counter leaked permanently on a pre-spawn throw (#193, reported by @konceptnet in #180).** `stats.activeRequests` was incremented ~40 lines before the child spawn, while its only decrement is reached through that process's events — so any synchronous throw in between (`buildCliArgs`, env assembly, the spawn decision, or `spawn()` itself) leaked `+1` forever, and `/health` and `/status` over-reported in-flight work monotonically. The increment now sits immediately after `activeProcesses.add(proc)`, structurally pairing it with the decrement; no reconciliation pass and no try/catch. Observability-only field, so no admission decision changes.
+- **TUI: the host `CLAUDE.md` could leak into proxied turns (#187, contributed by @sumlin).** The TUI pane now spawns with `--safe-mode`.
+- **TUI: `shift+tab to cycle` is accepted as an input-ready marker (#188, contributed by @sumlin).** Plan/auto mode renders a different idle footer than manual mode, and only the manual one was recognised.
+- **`OCP_LOCAL_TOOLS` no longer hard-codes a tool list in its wrapper (#191, closes #185).** The positive wrapper claimed a fixed set of tools regardless of `CLAUDE_ALLOWED_TOOLS`, so a narrowed tool surface was described inaccurately to the model.
+
+### Testing
+
+- The response-cache and counter fixes ship with **mutation-proven integration tests** built on the existing `ltBoot` child-process fixture (real `server.mjs`, fake `claude` binary, so no quota cost). The counter test reaches a synchronous fault *inside* `spawnClaudeProcess` from environment alone — no production fault hook — by running the child under `--stack-size=200` to lower the spread-throw threshold enough to fit Linux's `MAX_ARG_STRLEN`. Suite: **449 → 457**.
 
 ## v3.24.0 — 2026-07-21
 
