@@ -1104,6 +1104,86 @@ test("integration: toggling OCP_LOCAL_TOOLS invalidates the standard response ca
   } finally { _ltRm(dir, { recursive: true, force: true }); }
 });
 
+// ── Cache keys hash the RESOLVED model, not the alias string (#194) ──────────
+// models.json is read once at boot, so repointing an alias only takes effect on restart —
+// while the SQLite response_cache outlives it. Hashing the raw string would keep serving the
+// OLD model's answers under that alias until TTL expiry. Rather than mutate models.json
+// mid-suite, these assert the equivalent observable: an alias and its canonical target must
+// land on the SAME cache slot, which is true only if the key is resolved before hashing.
+// Mutation: change `cacheModel` back to `model` at the three cacheHash call sites in
+// server.mjs and both tests go red (2 spawns instead of 1).
+
+// Fake that emits schema-valid JSON, so the structured path caches a VALIDATED result
+// (the stock LT_FAKE returns "OK", which fails validation → refusal → never cached).
+const LT_FAKE_JSON = `#!/bin/sh
+if [ -n "$SP_COUNTER" ]; then c=$(cat "$SP_COUNTER" 2>/dev/null || echo 0); echo $((c+1)) > "$SP_COUNTER"; fi
+printf '%s\\n' '{"type":"assistant","message":{"content":[{"type":"text","text":"{\\"ok\\":true}"}]}}'
+printf '%s\\n' '{"type":"result"}'
+exit 0
+`;
+function ltFakeJson(dir) { const p = join(dir, "claude-json"); _ltWrite(p, LT_FAKE_JSON); _ltChmod(p, 0o755); return p; }
+const LT_SCHEMA = { type: "object", properties: { ok: { type: "boolean" } }, required: ["ok"], additionalProperties: false };
+
+console.log("\nCache key resolves the model alias (#194):");
+
+test("integration: an alias and its canonical target share ONE cache slot (normal path)", async () => {
+  if (!LT_POSIX) return;
+  const dir = ltMkdir(); const fake = ltFake(dir); const counter = join(dir, "spawns.txt");
+  const { child, buf } = ltBoot({ CLAUDE_BIN: fake, CLAUDE_PROXY_PORT: "39360", CLAUDE_CACHE_TTL: "60000", SP_COUNTER: counter }, dir);
+  try {
+    assert.ok(await ltWait(() => buf.out.includes("listening on")), `did not start: ${buf.err.slice(0, 200)}`);
+    _ltWrite(counter, "0");
+    const msgs = [{ role: "user", content: "alias-resolution-probe" }];
+    await ltPost(39360, { model: "sonnet", messages: msgs });                 // miss → spawn
+    await ltWait(() => (Number(_ltRead(counter, "utf8")) || 0) >= 1, 3000);
+    await ltPost(39360, { model: "claude-sonnet-5", messages: msgs });        // same resolved model → HIT
+    await new Promise(r => setTimeout(r, 600));
+    assert.equal(Number(_ltRead(counter, "utf8")) || 0, 1,
+      "the canonical id must hit the slot the alias populated — a 2nd spawn means the key still hashes the raw alias");
+  } finally { child.kill("SIGKILL"); _ltRm(dir, { recursive: true, force: true }); }
+});
+
+test("integration: an alias and its canonical target share ONE cache slot (STRUCTURED path)", async () => {
+  if (!LT_POSIX) return;
+  const dir = ltMkdir(); const fake = ltFakeJson(dir); const counter = join(dir, "spawns.txt");
+  const { child, buf } = ltBoot({ CLAUDE_BIN: fake, CLAUDE_PROXY_PORT: "39361", CLAUDE_CACHE_TTL: "60000", SP_COUNTER: counter }, dir);
+  try {
+    assert.ok(await ltWait(() => buf.out.includes("listening on")), `did not start: ${buf.err.slice(0, 200)}`);
+    _ltWrite(counter, "0");
+    const rf = { type: "json_schema", json_schema: { name: "probe", schema: LT_SCHEMA } };
+    const msgs = [{ role: "user", content: "structured-alias-probe" }];
+    await ltPost(39361, { model: "sonnet", messages: msgs, response_format: rf });
+    await ltWait(() => (Number(_ltRead(counter, "utf8")) || 0) >= 1, 4000);
+    await ltPost(39361, { model: "claude-sonnet-5", messages: msgs, response_format: rf });
+    await new Promise(r => setTimeout(r, 600));
+    assert.equal(Number(_ltRead(counter, "utf8")) || 0, 1,
+      "structured cache key must resolve the alias too — this is the path the epoch-only fix missed");
+  } finally { child.kill("SIGKILL"); _ltRm(dir, { recursive: true, force: true }); }
+});
+
+test("integration: a config change invalidates the STRUCTURED cache too (closes the #177 gap)", async () => {
+  if (!LT_POSIX) return;
+  const dir = ltMkdir(); const fake = ltFakeJson(dir); const counter = join(dir, "spawns.txt");
+  const rf = { type: "json_schema", json_schema: { name: "probe", schema: LT_SCHEMA } };
+  const req = { model: "sonnet", messages: [{ role: "user", content: "structured-epoch-probe" }], response_format: rf };
+  const bootOnce = async (env, port) => {
+    const { child, buf } = ltBoot({ CLAUDE_BIN: fake, CLAUDE_PROXY_PORT: String(port), CLAUDE_CACHE_TTL: "60000", SP_COUNTER: counter, ...env }, dir);
+    try {
+      assert.ok(await ltWait(() => buf.out.includes("listening on")), `did not start: ${buf.err.slice(0, 200)}`);
+      _ltWrite(counter, "0");
+      await ltPost(port, req);
+      await ltWait(() => (Number(_ltRead(counter, "utf8")) || 0) >= 1, 4000);
+      return Number(_ltRead(counter, "utf8")) || 0;
+    } finally { child.kill("SIGKILL"); }
+  };
+  try {
+    const off = await bootOnce({}, 39362);                        // caches under epoch(negative wrapper)
+    const on = await bootOnce({ OCP_LOCAL_TOOLS: "1" }, 39363);   // same DB, epoch differs → must re-spawn
+    assert.equal(off, 1, "first structured request (cache empty) must spawn claude");
+    assert.equal(on, 1, "structured cache must honor CONFIG_EPOCH — before #194 it omitted the epoch entirely and served the stale answer");
+  } finally { _ltRm(dir, { recursive: true, force: true }); }
+});
+
 // ── Upgrade Tests ──
 import { runUpgrade, postFlightOk } from "./scripts/upgrade.mjs";
 

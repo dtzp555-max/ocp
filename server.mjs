@@ -393,15 +393,8 @@ const NO_CONTEXT = process.env.CLAUDE_NO_CONTEXT === "true";
 // Deliberately boot-time-only: runtime-mutable settings (e.g. maxPromptChars via the settings
 // API) are excluded because a const epoch cannot track them; truncation also only drops
 // context rather than changing the instruction set.
-// The ALIAS MAP is folded in for the same reason. Cache keys hash the model string exactly as
-// the client sent it (`const model = parsed.model || aliases.sonnet`), so a request for "opus"
-// is cached under the literal "opus" — not under the canonical id it resolved to. models.json is
-// read once at boot, so repointing an alias (e.g. opus: 4-8 -> 5) only takes effect on restart,
-// and the SQLite response_cache outlives that restart. Without the alias map in the epoch, an
-// operator running CLAUDE_CACHE_TTL > 0 keeps being served the OLD model's answers for the alias
-// until TTL expiry — silently defeating the repoint. Same bug class as #176.
 const CONFIG_EPOCH = cryptoCreateHash("sha256")
-  .update(JSON.stringify([SYSTEM_PROMPT, SYSTEM_PROMPT_WRAPPER, ALLOWED_TOOLS, NO_CONTEXT, modelsConfig.aliases]))
+  .update(JSON.stringify([SYSTEM_PROMPT, SYSTEM_PROMPT_WRAPPER, ALLOWED_TOOLS, NO_CONTEXT]))
   .digest("hex").slice(0, 16);
 // Kill-switch for the FIX-③ default-path spawn-home isolation (see resolveSpawnHome /
 // spawnHomeMode below). When "1", the -p/stream-json spawn always runs in the operator's
@@ -2811,6 +2804,16 @@ async function handleChatCompletions(req, res) {
 
   const messages = parsed.messages || parsed.input || [{ role: "user", content: parsed.prompt || "" }];
   const model = parsed.model || modelsConfig.aliases.sonnet;
+  // Cache keys must hash the RESOLVED model, never the string the client happened to use.
+  // `model` is whatever was sent — a canonical id, an alias ("opus"), or a legacyAlias
+  // ("claude-opus-4"). MODEL_MAP carries all three, and models.json is read once at boot, so
+  // repointing an alias only takes effect on restart — while the SQLite response_cache outlives
+  // it. Hashing the raw string would therefore keep serving the OLD model's answers under that
+  // alias until TTL expiry, silently defeating the repoint (the #176 hazard, for aliases).
+  // Resolving first also means "opus" and "claude-opus-5" correctly share one slot: identical
+  // spawn, identical answer. Only the cache KEY is resolved — `model` is still echoed back to
+  // the client verbatim, so the wire response is unchanged.
+  const cacheModel = MODEL_MAP[model] || model;
   const stream = parsed.stream;
 
   // Validate model against known models
@@ -2907,7 +2910,7 @@ async function handleChatCompletions(req, res) {
     const promptCharsS = messages.reduce((a, m) => a + contentToText(m.content).length, 0);
     let structuredHash = null;
     if (CACHE_TTL > 0 && !conversationId && !hasCacheControl(messages)) {
-      structuredHash = cacheHash(model, messages, { keyId: req._authKeyId, temperature: parsed.temperature, max_tokens: parsed.max_tokens, top_p: parsed.top_p, structured });
+      structuredHash = cacheHash(cacheModel, messages, { keyId: req._authKeyId, temperature: parsed.temperature, max_tokens: parsed.max_tokens, top_p: parsed.top_p, structured, configEpoch: CONFIG_EPOCH });
       try {
         const cached = getCachedResponse(structuredHash, CACHE_TTL);
         if (cached) {
@@ -2926,7 +2929,7 @@ async function handleChatCompletions(req, res) {
     // one-off structured request (not stateful sessions / client-side prompt caching), independent of
     // whether OCP response caching is enabled; when caching IS on, the same key gates cache read/write.
     const dedupKey = (!conversationId && !hasCacheControl(messages))
-      ? cacheHash(model, messages, { keyId: req._authKeyId, temperature: parsed.temperature, max_tokens: parsed.max_tokens, top_p: parsed.top_p, structured })
+      ? cacheHash(cacheModel, messages, { keyId: req._authKeyId, temperature: parsed.temperature, max_tokens: parsed.max_tokens, top_p: parsed.top_p, structured, configEpoch: CONFIG_EPOCH })
       : null;
     const runStructured = async () => {
       const c = await runStructuredCompletion(upstreamCall, model, messages, conversationId, req._authKeyName, res, structured);
@@ -2975,7 +2978,7 @@ async function handleChatCompletions(req, res) {
     } else {
       // D1: include keyId in hash to isolate per-key cache pools (v2 format).
       // configEpoch (#176): any boot-config change that shapes answers invalidates the cache.
-      const hash = cacheHash(model, messages, { keyId: req._authKeyId, temperature: parsed.temperature, max_tokens: parsed.max_tokens, top_p: parsed.top_p, configEpoch: CONFIG_EPOCH });
+      const hash = cacheHash(cacheModel, messages, { keyId: req._authKeyId, temperature: parsed.temperature, max_tokens: parsed.max_tokens, top_p: parsed.top_p, configEpoch: CONFIG_EPOCH });
       req._cacheHash = hash; // store for later write-back
       try {
         const cached = getCachedResponse(hash, CACHE_TTL);
