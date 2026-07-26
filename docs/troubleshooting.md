@@ -116,6 +116,7 @@ openclaw gateway restart   # so OpenClaw re-reads the config
 
 Future `ocp update` invocations sync automatically.
 
+<a id="cache-rekey-v3250"></a>
 ### Response-cache hit rate drops once after upgrading to v3.25.0
 
 Only affects instances running with the response cache **on** (`CLAUDE_CACHE_TTL > 0`); it is off by default, so most installs see nothing.
@@ -124,7 +125,7 @@ v3.25.0 keys the cache on the **resolved** model rather than on the string the c
 
 Two different scopes, worth being precise about:
 
-- **Normal cache** — only *alias-addressed* rows rekey. Rows written under a literal model id (`claude-sonnet-5`) keep matching.
+- **Normal cache** — only *alias-addressed* rows rekey. Rows written under a literal model id (`claude-sonnet-5`) keep matching — **unless the instance runs `OCP_LOCAL_TOOLS=1`**, in which case the entire normal cache rekeys once. That is a separate mechanism: v3.25.0 also reworded the local-tools wrapper, and the wrapper text is one of the four inputs to `CONFIG_EPOCH`, which every normal cache key folds in (established behavior since v3.23.0, not new here).
 - **Structured-output cache** — **every** row rekeys, alias or literal. The same change also folds the config epoch into the structured key, which it had never included; that gap meant a `CLAUDE_SYSTEM_PROMPT` change did not invalidate structured answers either. Structured caching only exists from v3.24.0, so there is at most one release worth of rows to orphan.
 
 This is deliberate, and it is what makes an alias repoint take effect. Before v3.25.0, changing where an alias pointed (v3.25.0 itself repoints `opus` → `claude-opus-5`) left the cache serving the **old** model's answers under that alias until TTL expiry, because `models.json` is read once at boot while the SQLite cache survives the restart. If you were running with the cache on and repointed an alias in an earlier version, that is why it appeared not to take.
