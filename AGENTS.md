@@ -52,6 +52,22 @@ Runtime: Node.js (ESM, `.mjs` throughout). No build step. No bundler. `server.mj
 
 ---
 
+## Testing: reaching faults inside `server.mjs`
+
+`test-features.mjs` cannot `import` `server.mjs` (it calls `server.listen()` at top level), and that has twice led to the wrong conclusion that a class of bug is untestable. It isn't. Read this before writing "no regression test is possible here".
+
+**There is a real live-server fixture.** `ltBoot(env, dir, nodeArgs)` (around `test-features.mjs:990`) spawns the actual `server.mjs` as a child with a **fake `claude` binary**, so integration tests cost no quota. `ltPost` / `ltWait` / `ltFreePort` / `ltDiag` round it out. It already covers boot gates, cache-epoch invalidation across two boots sharing one SQLite store, and system-prompt capture.
+
+**`--stack-size` is a fault lever.** `ltBoot`'s third argument passes V8 flags to the child, which puts recursion- and argument-count-limited failures in reach at a much smaller input. `#193` needed a *synchronous throw* deep inside `spawnClaudeProcess`; `buildCliArgs` does `args.push("--allowedTools", ...ALLOWED_TOOLS)`, and under `--stack-size=200` that spread throws at ~24k elements instead of ~124k — which is what brings the trigger under Linux's `MAX_ARG_STRLEN` (131072 bytes for a single env string) so the test runs in CI rather than skipping. **No production fault hook was needed.**
+
+Three rules that made it hold up, all learned the hard way:
+
+- **Discover the threshold in a child under the same flags**, never in the test process — the parent's stack is not the one that matters.
+- **Assert that the fault actually fired**, not just that the outcome looks right. `#193` asserts HTTP 500 *and* that the body carries `call stack size exceeded`; a control mutation (trigger neutered, bug still present) proves the test fails rather than passing vacuously.
+- **Wait for the thing you are about to assert**, not a proxy for it. Waiting on `listening on` and then asserting a different line is a race (`#199`); waiting on `exit` and then reading `stderr` is another (`#203` — use `closed`, which guarantees the pipes drained).
+
+Allocate ports with `ltFreePort()`. Fixed ports have caused at least one flake here.
+
 ## Release protocol
 
 OCP follows the machine-readable `release_kit:` overlay in `CLAUDE.md` (Iron Rule 5.5). Before any version bump or tag push, re-read that YAML block and walk every item in `new_feature_doc_expectations` and `bootstrap_quirk_policy`. Tag push triggers `.github/workflows/release.yml`, which creates the GitHub Release automatically — do not create the release manually.

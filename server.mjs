@@ -2923,6 +2923,16 @@ async function handleChatCompletions(req, res) {
     const t0s = Date.now();
     const promptCharsS = messages.reduce((a, m) => a + contentToText(m.content).length, 0);
     let structuredHash = null;
+    // DO NOT collapse this with `dedupKey` below (#200). The two cacheHash calls take IDENTICAL
+    // arguments and look like obvious duplicate work — they are not interchangeable, because
+    // their GUARDS differ: this one additionally requires CACHE_TTL > 0. CLAUDE_CACHE_TTL
+    // DEFAULTS TO 0, so in the default configuration structuredHash is null while dedupKey must
+    // still be computed — it drives #153's single-flight stampede protection, which is
+    // deliberately independent of whether response caching is on. `dedupKey = structuredHash`
+    // would therefore silently disable stampede protection by default, in exactly the
+    // concurrent-AI-Task case it exists to bound. The duplicate call is the honest price of the
+    // asymmetry. If you do deduplicate it, compute once under the WEAKER guard and derive the
+    // cache lookup under the stronger one — and add a stampede test before you do.
     if (CACHE_TTL > 0 && !conversationId && !hasCacheControl(messages)) {
       structuredHash = cacheHash(cacheModel, messages, { keyId: req._authKeyId, temperature: parsed.temperature, max_tokens: parsed.max_tokens, top_p: parsed.top_p, structured, configEpoch: CONFIG_EPOCH });
       try {
@@ -2942,6 +2952,8 @@ async function handleChatCompletions(req, res) {
     // firing several AI Tasks at once) must NOT each pay N× — they share one flight. We dedup every
     // one-off structured request (not stateful sessions / client-side prompt caching), independent of
     // whether OCP response caching is enabled; when caching IS on, the same key gates cache read/write.
+    // Note the guard here is deliberately WEAKER than structuredHash's — no CACHE_TTL check. See the
+    // do-not-collapse comment above (#200).
     const dedupKey = (!conversationId && !hasCacheControl(messages))
       ? cacheHash(cacheModel, messages, { keyId: req._authKeyId, temperature: parsed.temperature, max_tokens: parsed.max_tokens, top_p: parsed.top_p, structured, configEpoch: CONFIG_EPOCH })
       : null;
