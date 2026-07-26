@@ -122,6 +122,11 @@ Only affects instances running with the response cache **on** (`CLAUDE_CACHE_TTL
 
 v3.25.0 keys the cache on the **resolved** model rather than on the string the client sent, so rows written for an alias (`opus`, `sonnet`, `haiku`, or a legacy alias like `claude-haiku-4-5`) no longer match. Those rows orphan and are reaped by the TTL cleanup interval within one window — **no migration script, no action required**; expect one window of extra misses and then normal hit rates.
 
+Two different scopes, worth being precise about:
+
+- **Normal cache** — only *alias-addressed* rows rekey. Rows written under a literal model id (`claude-sonnet-5`) keep matching.
+- **Structured-output cache** — **every** row rekeys, alias or literal. The same change also folds the config epoch into the structured key, which it had never included; that gap meant a `CLAUDE_SYSTEM_PROMPT` change did not invalidate structured answers either. Structured caching only exists from v3.24.0, so there is at most one release worth of rows to orphan.
+
 This is deliberate, and it is what makes an alias repoint take effect. Before v3.25.0, changing where an alias pointed (v3.25.0 itself repoints `opus` → `claude-opus-5`) left the cache serving the **old** model's answers under that alias until TTL expiry, because `models.json` is read once at boot while the SQLite cache survives the restart. If you were running with the cache on and repointed an alias in an earlier version, that is why it appeared not to take.
 
 A side effect worth knowing: an alias and its canonical id now **share** a cache slot, since both produce an identical spawn. That is a small hit-rate improvement in steady state.
