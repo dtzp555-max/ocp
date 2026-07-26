@@ -4299,6 +4299,24 @@ test("models.json: every aliases value resolves to a real models[].id (referenti
   }
 });
 
+// maxTokens must leave room for a visible answer once a client's thinking budget is taken out
+// (#195). OCP never enforces maxTokens itself — it is propagated to OpenClaw (setup.mjs,
+// scripts/sync-openclaw.mjs) where it CAPS the outbound request:
+//     maxTokens = Math.min(baseMaxTokens + thinkingBudget, modelMaxTokens)
+// OpenClaw's reasoning budgets are medium 8192 / high 16384, and when maxTokens <= thinkingBudget
+// it clamps thinking to maxTokens - 1024. So a model declared at 16384 running at `high` spent
+// ~15360 on thinking and left ~1024 for the actual answer — which is what this repo shipped until
+// v3.25.0. Asserting the PRINCIPLE rather than pinning per-model numbers: a value test would need
+// editing every time a model is added, and would not say why.
+const _spotHighThinkingBudget = 16384; // OpenClaw's `high` reasoning budget
+test("models.json: every maxTokens exceeds the high thinking budget, leaving room for output (#195)", () => {
+  for (const m of _spotModels.models) {
+    assert.ok(m.maxTokens > _spotHighThinkingBudget,
+      `${m.id} declares maxTokens=${m.maxTokens} <= ${_spotHighThinkingBudget}: at OpenClaw's 'high' reasoning ` +
+      `level the thinking budget would consume all but ~1024 tokens of the response`);
+  }
+});
+
 test("models.json: every legacyAliases value resolves to a real models[].id (referential integrity)", () => {
   for (const [name, target] of Object.entries(_spotModels.legacyAliases || {})) {
     assert.ok(_spotModelIds.has(target), `legacyAliases.${name} -> '${target}' is a dangling alias (no matching models[].id)`);

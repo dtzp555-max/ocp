@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+### Changed
+
+- **`maxTokens` now matches the CLI registry instead of a uniform 16384 (#195).** Every Opus entry and `claude-sonnet-5` go to **64000**, `claude-sonnet-4-6` and `claude-haiku-4-5` to **32000** — the `max_output_tokens.default` each model actually declares in the compiled CLI 2.1.220 registry. OCP never enforced this value; it is propagated to OpenClaw, where it **caps the outbound request**: `maxTokens = Math.min(baseMaxTokens + thinkingBudget, modelMaxTokens)`. OpenClaw's reasoning budgets are medium 8192 / high 16384, and when `maxTokens <= thinkingBudget` it clamps thinking to `maxTokens - 1024` — so a model declared at 16384 running at **high** reasoning spent ~15360 on thinking and left **~1024 tokens for the actual answer**. `ocp-connect`'s independent family table moves to the family floor (opus 64000, sonnet 32000, haiku 32000) since prefixes cannot distinguish versions. Expect longer answers and correspondingly higher per-request quota burn on long generations.
+
 ## v3.25.0 — 2026-07-27
 
 Minor release. Headline: **Claude Opus 5** joins the model list and the `opus` alias now resolves to it. Alongside it, two `server.mjs` correctness fixes found by review rather than by users — a monotonic in-flight-counter leak, and cache keys that were hashing the alias string instead of the model it resolves to. The three TUI/prompt fixes that landed after v3.24.0 are included here too.

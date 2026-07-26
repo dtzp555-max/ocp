@@ -129,10 +129,17 @@ provider = {
 # re-trip it. Family prefixes classify any versioned ID correctly with no per-model
 # edit. (ADR 0003: models.json is the SPOT for model existence; /v1/models does not
 # expose reasoning/maxTokens, so family classification stays here.)
+# maxTokens values are the FAMILY FLOOR of the CLI registry max_output_tokens.default
+# (opus family 64000; sonnet 32000 because sonnet-4-6 is 32000 while sonnet-5 is 64000;
+# haiku 32000). Family prefixes cannot distinguish versions, so the floor is used
+# deliberately: under-advertising caps a client lower than the model allows, which is safe,
+# whereas over-advertising would promise capacity a member of the family does not have.
+# models.json is authoritative per ADR 0003; this table only exists because /v1/models does
+# not expose maxTokens.
 model_meta = {
-    "claude-opus": {"name": "Claude Opus (OCP)", "reasoning": True, "maxTokens": 16384},
-    "claude-sonnet": {"name": "Claude Sonnet (OCP)", "reasoning": True, "maxTokens": 16384},
-    "claude-haiku": {"name": "Claude Haiku (OCP)", "reasoning": False, "maxTokens": 8192},
+    "claude-opus": {"name": "Claude Opus (OCP)", "reasoning": True, "maxTokens": 64000},
+    "claude-sonnet": {"name": "Claude Sonnet (OCP)", "reasoning": True, "maxTokens": 32000},
+    "claude-haiku": {"name": "Claude Haiku (OCP)", "reasoning": False, "maxTokens": 32000},
 }
 
 def get_model_meta(mid):
