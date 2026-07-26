@@ -247,6 +247,7 @@ OCP Connect v1.3.0
     Provider: ocp
     Models:
       • ocp/claude-opus-5
+      • ocp/claude-opus-4-8
       • ocp/claude-opus-4-7
       • ocp/claude-opus-4-6
       • ocp/claude-sonnet-5
