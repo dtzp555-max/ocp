@@ -2813,7 +2813,11 @@ async function handleChatCompletions(req, res) {
   // Resolving first also means "opus" and "claude-opus-5" correctly share one slot: identical
   // spawn, identical answer. Only the cache KEY is resolved — `model` is still echoed back to
   // the client verbatim, so the wire response is unchanged.
-  const cacheModel = MODEL_MAP[model] || model;
+  // hasOwn, not a bare lookup: MODEL_MAP is a plain object, so `MODEL_MAP["constructor"]`
+  // would return an inherited FUNCTION. Unreachable today (the VALID_MODELS gate below 400s
+  // first, and it is built from Object.keys so it holds only own keys), but a bare lookup
+  // would hand cacheHash a function the day anyone widens that gate or moves this binding.
+  const cacheModel = Object.hasOwn(MODEL_MAP, model) ? MODEL_MAP[model] : model;
   const stream = parsed.stream;
 
   // Validate model against known models

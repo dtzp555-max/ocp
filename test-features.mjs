@@ -1161,6 +1161,26 @@ test("integration: an alias and its canonical target share ONE cache slot (STRUC
   } finally { child.kill("SIGKILL"); _ltRm(dir, { recursive: true, force: true }); }
 });
 
+// MODEL_MAP is models[] + aliases + legacyAliases, so resolving covers legacyAliases for free.
+// The three tests above all use `sonnet` (a plain alias); this pins the legacyAlias leg explicitly
+// rather than leaving it covered only by construction.
+test("integration: a legacyAlias shares ONE cache slot with its canonical target", async () => {
+  if (!LT_POSIX) return;
+  const dir = ltMkdir(); const fake = ltFake(dir); const counter = join(dir, "spawns.txt");
+  const { child, buf } = ltBoot({ CLAUDE_BIN: fake, CLAUDE_PROXY_PORT: "39364", CLAUDE_CACHE_TTL: "60000", SP_COUNTER: counter }, dir);
+  try {
+    assert.ok(await ltWait(() => buf.out.includes("listening on")), `did not start: ${buf.err.slice(0, 200)}`);
+    _ltWrite(counter, "0");
+    const msgs = [{ role: "user", content: "legacy-alias-probe" }];
+    await ltPost(39364, { model: "claude-haiku-4-5", messages: msgs });            // legacyAlias
+    await ltWait(() => (Number(_ltRead(counter, "utf8")) || 0) >= 1, 3000);
+    await ltPost(39364, { model: "claude-haiku-4-5-20251001", messages: msgs });   // canonical
+    await new Promise(r => setTimeout(r, 600));
+    assert.equal(Number(_ltRead(counter, "utf8")) || 0, 1,
+      "legacyAliases live in MODEL_MAP too — resolving must collapse them onto the canonical slot");
+  } finally { child.kill("SIGKILL"); _ltRm(dir, { recursive: true, force: true }); }
+});
+
 test("integration: a config change invalidates the STRUCTURED cache too (closes the #177 gap)", async () => {
   if (!LT_POSIX) return;
   const dir = ltMkdir(); const fake = ltFakeJson(dir); const counter = join(dir, "spawns.txt");
