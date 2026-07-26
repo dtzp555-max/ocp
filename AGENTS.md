@@ -30,6 +30,7 @@ Runtime: Node.js (ESM, `.mjs` throughout). No build step. No bundler. `server.mj
 
 - `server.mjs` — the proxy itself; every request path lives here. Governed by `ALIGNMENT.md`.
 - `models.json` — single source of truth for model IDs, aliases, and context windows. See ADR 0003.
+- `models.schema.json` — the schema `models.json` declares in its `$schema`. CI validates the SPOT against it (`test-features.mjs`) using the repo's own `validateJsonSchema`, so a malformed entry fails the build instead of surfacing downstream in OpenClaw.
 - `setup.mjs` — first-time installer; reads `models.json` to derive bootstrap config.
 - `scripts/sync-openclaw.mjs` — idempotent OpenClaw registry sync invoked by `ocp update`. See ADR 0004.
 - `ocp` — user-facing CLI (install, update, start, stop, status, logs, etc.).

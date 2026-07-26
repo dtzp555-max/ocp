@@ -177,7 +177,7 @@ Any tool use happens server-side, under the `--allowedTools` set configured on t
 | `claude-sonnet-4-6` | Previous Sonnet, retained for pinning |
 | `claude-haiku-4-5-20251001` | Fastest, lightweight (default for `haiku` alias) |
 
-The canonical list lives in [`models.json`](./models.json) — the single source of truth as of v3.11.0. Both `server.mjs` (the `/v1/models` endpoint) and `setup.mjs` (the OpenClaw registration) derive from it. Adding a new model is now a one-file edit:
+The canonical list lives in [`models.json`](./models.json) — the single source of truth as of v3.11.0, validated in CI against [`models.schema.json`](./models.schema.json). Both `server.mjs` (the `/v1/models` endpoint) and `setup.mjs` (the OpenClaw registration) derive from it. Adding a new model is now a one-file edit:
 
 ```bash
 # 1. Edit models.json — add an entry

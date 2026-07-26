@@ -1,0 +1,65 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/dtzp555-max/ocp/blob/main/models.schema.json",
+  "title": "OCP models.json",
+  "description": "Schema for models.json, the single source of truth for model metadata (ADR 0003). Enforced in CI by test-features.mjs, which validates models.json against this file using the repo's own validateJsonSchema (lib/structured-output.mjs) — no new dependency. NOTE: referential integrity (every aliases/legacyAliases target must exist as a models[].id) is NOT expressible here and is covered by separate tests.",
+  "type": "object",
+  "required": ["version", "models", "aliases", "legacyAliases"],
+  "additionalProperties": false,
+  "properties": {
+    "$schema": {
+      "type": "string",
+      "description": "Relative path to this file. Editors use it for completion; CI does not read it."
+    },
+    "version": {
+      "const": 1,
+      "description": "Schema version of this document. Bump only alongside a shape change and an ADR."
+    },
+    "models": {
+      "type": "array",
+      "minItems": 1,
+      "description": "Every model OCP advertises on /v1/models, newest first. Order is load-bearing: ocp-connect uses model_ids[0] as a primary fallback.",
+      "items": {
+        "type": "object",
+        "required": ["id", "displayName", "openclawName", "reasoning", "contextWindow", "maxTokens"],
+        "additionalProperties": false,
+        "properties": {
+          "id": {
+            "type": "string",
+            "description": "Canonical CLI model id, passed verbatim to `claude --model`. Must match the id in the compiled CLI registry."
+          },
+          "displayName": {
+            "type": "string",
+            "description": "Human label. Also used as the OpenClaw agent alias by scripts/sync-openclaw.mjs."
+          },
+          "openclawName": {
+            "type": "string",
+            "description": "Label written into OpenClaw's model registry."
+          },
+          "reasoning": {
+            "type": "boolean",
+            "description": "Whether OpenClaw should treat the model as reasoning-capable."
+          },
+          "contextWindow": {
+            "type": "integer",
+            "description": "Advertised context window. GLOBAL side effect: MAX_PROMPT_CHARS derives from max(contextWindow) x 3 across ALL entries (lib/prompt.mjs derivePromptCharBudget), so raising this on ONE model raises the truncation ceiling for EVERY model. See ADR 0009. Also feeds OpenClaw's compaction budget."
+          },
+          "maxTokens": {
+            "type": "integer",
+            "description": "Advertised output cap. OCP does not enforce it; it is propagated to OpenClaw (via setup.mjs / scripts/sync-openclaw.mjs) where it bounds request and compaction budgets."
+          }
+        }
+      }
+    },
+    "aliases": {
+      "type": "object",
+      "description": "Short name -> canonical models[].id. Client-addressable, so a repoint changes routing for every request using the alias. Cache keys resolve these before hashing (server.mjs cacheModel).",
+      "additionalProperties": { "type": "string" }
+    },
+    "legacyAliases": {
+      "type": "object",
+      "description": "Retired ids kept resolvable for backward compatibility -> canonical models[].id. Also client-addressable and also resolved in cache keys.",
+      "additionalProperties": { "type": "string" }
+    }
+  }
+}

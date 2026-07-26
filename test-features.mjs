@@ -4305,6 +4305,52 @@ test("models.json: every legacyAliases value resolves to a real models[].id (ref
   }
 });
 
+// ── models.json validates against models.schema.json (#196) ─────────────────
+// models.json carried `"$schema": "./models.schema.json"` while that file had never been
+// committed, so the SPOT that ADR 0003 makes canonical had no structural validation at all —
+// a missing contextWindow or a typo'd openclawName would only surface downstream, in OpenClaw
+// or in a truncation budget. Validated with the repo's OWN validator (lib/structured-output.mjs,
+// shipped for #153) rather than a new dependency: zero deps added, and it exercises that
+// validator on a second real input.
+//
+// The schema deliberately does NOT try to express referential integrity (alias -> models[].id);
+// that is not a JSON Schema concept and is covered by the two tests directly above.
+import { validateJsonSchema as _spotValidate } from "./lib/structured-output.mjs";
+
+const _spotSchema = JSON.parse(spotReadFileSync(spotJoin(_spotDir, "models.schema.json"), "utf8"));
+
+test("models.json: the $schema reference resolves to a committed file", () => {
+  assert.equal(_spotModels.$schema, "./models.schema.json", "models.json must point at the schema");
+  assert.ok(_ltExists(spotJoin(_spotDir, "models.schema.json")),
+    "models.schema.json must exist — a dangling $schema is what #196 was filed for");
+});
+
+test("models.json validates against models.schema.json (strict)", () => {
+  const errors = _spotValidate(_spotModels, _spotSchema, "$", true);
+  assert.deepEqual(errors, [], `models.json violates its own schema:\n  ${errors.join("\n  ")}`);
+});
+
+// Guards the guard: if the schema were vacuous (e.g. `{}` or a typo'd `properties`), the test
+// above would pass on anything. Each corruption below must be caught.
+test("models.schema.json actually rejects malformed entries (guard is not vacuous)", () => {
+  const clone = () => JSON.parse(JSON.stringify(_spotModels));
+  const cases = [
+    ["missing required field", m => { delete m.models[0].contextWindow; }],
+    ["wrong scalar type", m => { m.models[0].reasoning = "yes"; }],
+    ["non-integer window", m => { m.models[0].contextWindow = 200000.5; }],
+    ["unknown extra field", m => { m.models[0].tokensPerSecond = 42; }],
+    ["alias mapped to non-string", m => { m.aliases.opus = { id: "x" }; }],
+    ["empty models array", m => { m.models = []; }],
+    ["wrong document version", m => { m.version = 2; }],
+    ["unknown top-level key", m => { m.providers = {}; }],
+  ];
+  for (const [label, corrupt] of cases) {
+    const bad = clone(); corrupt(bad);
+    const errs = _spotValidate(bad, _spotSchema, "$", true);
+    assert.ok(errs.length > 0, `schema failed to reject: ${label}`);
+  }
+});
+
 // ── escapeHtml + key-name validator (issue #114) ────────────────────────────
 // Replicated verbatim from dashboard.html so tests run without a browser.
 function escapeHtml(s) {
