@@ -1371,7 +1371,6 @@ function spawnClaudeProcess(model, messages, conversationId, keyName, releaseSlo
     promptChars = stdinPayload.length;
   }
 
-  stats.activeRequests++;
   stats.totalRequests++;
   stats.oneOffRequests++;
   if (conversationId) {
@@ -1414,6 +1413,13 @@ function spawnClaudeProcess(model, messages, conversationId, keyName, releaseSlo
 
   const proc = spawn(CLAUDE, cliArgs, spawnOpts);
   activeProcesses.add(proc);
+  // Counter drift (#180, reported by @konceptnet): increment ONLY after the spawn has
+  // succeeded and the process is registered. cleanup() below is the SOLE decrement site and is
+  // wired to this proc's exit/close/error events, so increment and decrement are now
+  // structurally paired to one process lifecycle. Incrementing before the spawn (as this did)
+  // leaked +1 permanently on any synchronous throw in between — buildCliArgs, env assembly, the
+  // spawn decision, or spawn() itself — because cleanup() was not yet attached to anything.
+  stats.activeRequests++;
 
   const t0 = Date.now();
   let gotFirstByte = false;
