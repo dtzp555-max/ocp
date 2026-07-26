@@ -1005,6 +1005,13 @@ function ltBoot(env, dir, nodeArgs = []) {
   child.on("error", e => { buf.spawnErr = e; });
   return { child, buf };
 }
+// child.kill("SIGKILL") kills server.mjs but NOT the fake `claude` grandchildren it spawned, and
+// those can still be writing sp.txt / spawns.txt into `dir` while rmSync walks it — which surfaced
+// as an intermittent ENOTEMPTY (4/200 in review). Node's own retry loop handles the window.
+function _ltRmRetry(dir) {
+  try { _ltRm(dir, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 }); }
+  catch { /* a leaked temp dir must never fail a test — the OS reaps it */ }
+}
 // Every ltBoot assertion failure should be self-diagnosing. The historical failure text was
 // `expected a local-tools FATAL, got: ` — an empty string, which says nothing about whether the
 // child never wrote, wrote to the other stream, died on a signal, or was never spawned.
@@ -1018,6 +1025,13 @@ async function ltWait(cond, ms = 9000) {
   const start = Date.now();
   while (Date.now() - start < ms) { if (cond()) return true; await new Promise(r => setTimeout(r, 40)); }
   return false;
+}
+async function ltFreePort() {
+  const srv = _ltNetServer();
+  await new Promise(r => srv.listen(0, "127.0.0.1", r));
+  const p = srv.address().port;
+  await new Promise(r => srv.close(r));
+  return p;
 }
 async function ltPost(port, body) {
   try {
@@ -1041,7 +1055,7 @@ test("integration: OCP_LOCAL_TOOLS=1 → the -p spawn receives the POSITIVE wrap
     const sp = _ltRead(cap, "utf8");
     assert.ok(sp.includes(LT_POS_MARK), `expected POSITIVE wrapper in --system-prompt, got: ${sp.slice(0,90)}`);
     assert.ok(!sp.includes(LT_NEG_MARK), "positive wrapper must REPLACE the negative one, not append");
-  } finally { child.kill("SIGKILL"); _ltRm(dir, { recursive: true, force: true }); }
+  } finally { child.kill("SIGKILL"); _ltRmRetry(dir); }
 });
 
 test("integration: flag OFF → the -p spawn receives the EXACT negative wrapper (default path byte-for-byte)", async () => {
@@ -1056,7 +1070,7 @@ test("integration: flag OFF → the -p spawn receives the EXACT negative wrapper
     const sp = _ltRead(cap, "utf8");
     // No system messages + no CLAUDE_SYSTEM_PROMPT → the wrapper is passed verbatim.
     assert.equal(sp, `You are accessed via the OCP HTTP proxy. You do NOT have access to any local filesystem, working directory, shell, git status, or machine environment. Do not infer or invent such information from any context you observe. Respond only based on the conversation provided.`);
-  } finally { child.kill("SIGKILL"); _ltRm(dir, { recursive: true, force: true }); }
+  } finally { child.kill("SIGKILL"); _ltRmRetry(dir); }
 });
 
 test("integration: boot gate REFUSES each unsafe config (multi / non-loopback / anon key)", async () => {
@@ -1074,12 +1088,12 @@ test("integration: boot gate REFUSES each unsafe config (multi / non-loopback / 
       try {
         // Wait for `closed`, not `exit`: the assertion below reads buf.err, and stderr is only
         // guaranteed drained at 'close'. This is the ordering #203 was filed for.
-        assert.ok(await ltWait(() => buf.closed), `[${c.label}] process never closed — ${ltDiag(buf)}`);
+        assert.ok(await ltWait(() => buf.closed || buf.spawnErr), `[${c.label}] process never closed — ${ltDiag(buf)}`);
         assert.notEqual(buf.exit, 0, `[${c.label}] must exit non-zero — ${ltDiag(buf)}`);
         assert.ok(/FATAL[\s\S]*OCP_LOCAL_TOOLS/.test(buf.err), `[${c.label}] expected a local-tools FATAL — ${ltDiag(buf)}`);
       } finally { child.kill("SIGKILL"); }
     }
-  } finally { _ltRm(dir, { recursive: true, force: true }); }
+  } finally { _ltRmRetry(dir); }
 });
 
 test("integration: safe single-user config BOOTS past the gate and announces local tools", async () => {
@@ -1088,9 +1102,15 @@ test("integration: safe single-user config BOOTS past the gate and announces loc
   const port = await ltFreePort();
   const { child, buf } = ltBoot({ OCP_LOCAL_TOOLS: "1", CLAUDE_BIN: fake, CLAUDE_PROXY_PORT: String(port) }, dir); // loopback + none
   try {
-    assert.ok(await ltWait(() => buf.out.includes("listening on")), `safe config must boot, got: ${buf.err.slice(0,200)}`);
-    assert.ok(buf.out.includes("Local tools: ON"), "startup must announce local tools when active");
-  } finally { child.kill("SIGKILL"); _ltRm(dir, { recursive: true, force: true }); }
+    // Same race as #199, one line over: "Local tools: ON" is written 14 console.log calls AFTER
+    // "listening on", so gating on the boot marker and then asserting the announcement can read a
+    // buffer holding only the first chunk. Wait for the line actually under assertion. Measured by
+    // review at 9/200 before this change and 0/200 after — it was the suite's top flake.
+    assert.ok(await ltWait(() => buf.out.includes("Local tools: ON") || buf.closed || buf.spawnErr),
+      `startup must announce local tools when active — ${ltDiag(buf)}`);
+    assert.ok(buf.out.includes("Local tools: ON"),
+      `startup must announce local tools when active — ${ltDiag(buf)}`);
+  } finally { child.kill("SIGKILL"); _ltRmRetry(dir); }
 });
 
 test("integration: TUI mode → flag is announced INERT (not 'ON'), boot not refused", async () => {
@@ -1113,7 +1133,7 @@ test("integration: TUI mode → flag is announced INERT (not 'ON'), boot not ref
       `must warn that OCP_LOCAL_TOOLS is inert under TUI — ${ltDiag(buf)}`);
     assert.ok(!buf.out.includes("Local tools: ON"),
       `must NOT claim local tools are ON in TUI mode (the wrapper is unused there) — ${ltDiag(buf)}`);
-  } finally { child.kill("SIGKILL"); _ltRm(dir, { recursive: true, force: true }); }
+  } finally { child.kill("SIGKILL"); _ltRmRetry(dir); }
 });
 
 test("integration: toggling OCP_LOCAL_TOOLS invalidates the standard response cache (epoch fold)", async () => {
@@ -1135,7 +1155,7 @@ test("integration: toggling OCP_LOCAL_TOOLS invalidates the standard response ca
     const on = await bootOnce({ OCP_LOCAL_TOOLS: "1" }, await ltFreePort());  // same DB, epoch(positive) → must MISS → re-spawn
     assert.equal(off, 1, "first request (cache empty) must spawn claude");
     assert.equal(on, 1, "after toggling the flag the identical request must NOT be served from the old cache (epoch differs → re-spawn)");
-  } finally { _ltRm(dir, { recursive: true, force: true }); }
+  } finally { _ltRmRetry(dir); }
 });
 
 // ── active-request counter is paired to the process lifecycle (#180 / #193) ──
@@ -1170,13 +1190,6 @@ function ltSpreadThrowCount(stackKb) {
   try {
     return Number(String(_ltExecFile(process.execPath, [`--stack-size=${stackKb}`, "-e", src], { encoding: "utf8" })).trim()) || 0;
   } catch { return 0; }
-}
-async function ltFreePort() {
-  const srv = _ltNetServer();
-  await new Promise(r => srv.listen(0, "127.0.0.1", r));
-  const p = srv.address().port;
-  await new Promise(r => srv.close(r));
-  return p;
 }
 async function ltPostStatus(port, body) {
   try {
@@ -1224,7 +1237,7 @@ test("integration: a synchronous pre-spawn throw must not leak stats.activeReque
     const active = (await r.json()).requests.active;
     assert.equal(active, 0,
       `3 requests threw before their spawn; the counter must be back to 0, got ${active} (this is the #180 leak)`);
-  } finally { child.kill("SIGKILL"); _ltRm(dir, { recursive: true, force: true }); }
+  } finally { child.kill("SIGKILL"); _ltRmRetry(dir); }
 });
 
 // ── Cache keys hash the RESOLVED model, not the alias string (#194) ──────────
@@ -1264,7 +1277,7 @@ test("integration: an alias and its canonical target share ONE cache slot (norma
     await new Promise(r => setTimeout(r, 600));
     assert.equal(Number(_ltRead(counter, "utf8")) || 0, 1,
       "the canonical id must hit the slot the alias populated — a 2nd spawn means the key still hashes the raw alias");
-  } finally { child.kill("SIGKILL"); _ltRm(dir, { recursive: true, force: true }); }
+  } finally { child.kill("SIGKILL"); _ltRmRetry(dir); }
 });
 
 test("integration: an alias and its canonical target share ONE cache slot (STRUCTURED path)", async () => {
@@ -1283,7 +1296,7 @@ test("integration: an alias and its canonical target share ONE cache slot (STRUC
     await new Promise(r => setTimeout(r, 600));
     assert.equal(Number(_ltRead(counter, "utf8")) || 0, 1,
       "structured cache key must resolve the alias too — this is the path the epoch-only fix missed");
-  } finally { child.kill("SIGKILL"); _ltRm(dir, { recursive: true, force: true }); }
+  } finally { child.kill("SIGKILL"); _ltRmRetry(dir); }
 });
 
 // MODEL_MAP is models[] + aliases + legacyAliases, so resolving covers legacyAliases for free.
@@ -1304,7 +1317,7 @@ test("integration: a legacyAlias shares ONE cache slot with its canonical target
     await new Promise(r => setTimeout(r, 600));
     assert.equal(Number(_ltRead(counter, "utf8")) || 0, 1,
       "legacyAliases live in MODEL_MAP too — resolving must collapse them onto the canonical slot");
-  } finally { child.kill("SIGKILL"); _ltRm(dir, { recursive: true, force: true }); }
+  } finally { child.kill("SIGKILL"); _ltRmRetry(dir); }
 });
 
 test("integration: a config change invalidates the STRUCTURED cache too (closes the #177 gap)", async () => {
@@ -1327,7 +1340,7 @@ test("integration: a config change invalidates the STRUCTURED cache too (closes 
     const on = await bootOnce({ OCP_LOCAL_TOOLS: "1" }, await ltFreePort());   // same DB, epoch differs → must re-spawn
     assert.equal(off, 1, "first structured request (cache empty) must spawn claude");
     assert.equal(on, 1, "structured cache must honor CONFIG_EPOCH — before #194 it omitted the epoch entirely and served the stale answer");
-  } finally { _ltRm(dir, { recursive: true, force: true }); }
+  } finally { _ltRmRetry(dir); }
 });
 
 // ── Upgrade Tests ──
