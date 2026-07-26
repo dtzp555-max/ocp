@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://github.com/dtzp555-max/ocp/blob/main/models.schema.json",
   "title": "OCP models.json",
-  "description": "Schema for models.json, the single source of truth for model metadata (ADR 0003). Enforced in CI by test-features.mjs, which validates models.json against this file using the repo's own validateJsonSchema (lib/structured-output.mjs) — no new dependency. NOTE: referential integrity (every aliases/legacyAliases target must exist as a models[].id) is NOT expressible here and is covered by separate tests.",
+  "description": "Schema for models.json, the single source of truth for model metadata (ADR 0003). Enforced in CI by test-features.mjs, which validates models.json against this file using the repo's own validateJsonSchema (lib/structured-output.mjs) — no new dependency. ⚠ ONLY A SUBSET OF DRAFT 2020-12 IS ENFORCED: type, required, const, enum, additionalProperties (boolean and schema forms), items, minItems, maxItems, anyOf/allOf/oneOf, $ref, nullable. Anything else — minimum, maxLength, pattern, uniqueItems, propertyNames, not — is SILENTLY IGNORED by that validator, so adding one here buys nothing and misleads the next reader. Add such a constraint as a test in test-features.mjs instead. NOTE: referential integrity (every aliases/legacyAliases target must exist as a models[].id) is likewise not expressible here and is covered by separate tests.",
   "type": "object",
   "required": ["version", "models", "aliases", "legacyAliases"],
   "additionalProperties": false,

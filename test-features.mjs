@@ -4330,6 +4330,21 @@ test("models.json validates against models.schema.json (strict)", () => {
   assert.deepEqual(errors, [], `models.json violates its own schema:\n  ${errors.join("\n  ")}`);
 });
 
+// Three corruptions the SCHEMA structurally cannot catch, asserted directly instead of pretending
+// the schema covers them: the validator has no uniqueItems, no minLength, and no minimum. Adding
+// those keywords to the schema would be silently ignored (see its description), so they live here.
+test("models.json: ids are unique, non-empty, and windows are positive (not schema-expressible)", () => {
+  const ids = _spotModels.models.map(m => m.id);
+  assert.equal(new Set(ids).size, ids.length, `duplicate models[].id: ${ids.filter((v, i) => ids.indexOf(v) !== i)}`);
+  for (const m of _spotModels.models) {
+    for (const f of ["id", "displayName", "openclawName"]) {
+      assert.ok(typeof m[f] === "string" && m[f].trim().length > 0, `${m.id}: ${f} must be a non-empty string`);
+    }
+    assert.ok(m.contextWindow > 0, `${m.id}: contextWindow must be positive`);
+    assert.ok(m.maxTokens > 0, `${m.id}: maxTokens must be positive`);
+  }
+});
+
 // Guards the guard: if the schema were vacuous (e.g. `{}` or a typo'd `properties`), the test
 // above would pass on anything. Each corruption below must be caught.
 test("models.schema.json actually rejects malformed entries (guard is not vacuous)", () => {
