@@ -959,7 +959,8 @@ test("localToolsSafetyError: multi is checked before loopback/anon (most severe 
 // a request — and boot-gate refusals are asserted by the process exit code. Without these, the
 // wiring (extractSystemPrompt using SYSTEM_PROMPT_WRAPPER, the boot gate, the epoch fold) can be
 // silently reverted with the unit suite still green — the maintainer's #1 rejection pattern.
-import { spawn as _ltSpawn } from "node:child_process";
+import { spawn as _ltSpawn, execFileSync as _ltExecFile } from "node:child_process";
+import { createServer as _ltNetServer } from "node:net";
 import { writeFileSync as _ltWrite, chmodSync as _ltChmod, readFileSync as _ltRead, existsSync as _ltExists, rmSync as _ltRm, mkdtempSync as _ltMkdtemp } from "node:fs";
 import { tmpdir as _ltTmp } from "node:os";
 import { fileURLToPath as _ltF2P } from "node:url";
@@ -984,8 +985,8 @@ exit 0
 
 function ltMkdir() { return _ltMkdtemp(join(_ltTmp(), "ocp-lt-")); }
 function ltFake(dir) { const p = join(dir, "claude"); _ltWrite(p, LT_FAKE); _ltChmod(p, 0o755); return p; }
-function ltBoot(env, dir) {
-  const child = _ltSpawn(process.execPath, [LT_SERVER], {
+function ltBoot(env, dir, nodeArgs = []) {
+  const child = _ltSpawn(process.execPath, [...nodeArgs, LT_SERVER], {
     env: { ...process.env, NODE_ENV: "test", OCP_DIR_OVERRIDE: dir, OCP_SKIP_AUTH_TEST: "1",
            CLAUDE_BIND: "127.0.0.1", CLAUDE_AUTH_MODE: "none", CLAUDE_CACHE_TTL: "0", CLAUDE_TIMEOUT: "4000", ...env },
     stdio: ["ignore", "pipe", "pipe"],
@@ -1111,69 +1112,82 @@ test("integration: toggling OCP_LOCAL_TOOLS invalidates the standard response ca
 // does `args.push("--allowedTools", ...ALLOWED_TOOLS)`, and a spread of enough elements throws
 // RangeError synchronously, right inside the window.
 //
-// The element count is DISCOVERED, not hard-coded: the throw threshold depends on stack size,
-// so a fixed number would silently stop triggering on a machine with a bigger stack and the
-// test would pass vacuously. We find a count that throws in THIS process, then use it for the
-// child (same binary, same default stack). The test also asserts the requests actually 500 —
-// if the trigger ever stops firing, that assert fails loudly instead of going quietly green.
-function ltSpreadThrowCount() {
-  for (const n of [1 << 16, 1 << 17, 1 << 18, 1 << 19]) {
-    try { const probe = []; probe.push("--allowedTools", ...Array(n).fill("x")); }
-    catch { return n; }
-  }
-  return null;
+// Getting there on Linux needs one more turn of the screw. The spread's cost is per ELEMENT,
+// so the naive form needs ~124k elements ≈ 250KB in one env var — and Linux caps a single env
+// string at MAX_ARG_STRLEN (32 * PAGE_SIZE = 131072 on x86-64), so execve rejects it (E2BIG).
+// Encoding around it fails too: empty items are 1 byte each, but `.filter(Boolean)`
+// (server.mjs:355) strips them, so ALLOWED_TOOLS ends up empty and the spread branch is never
+// entered at all.
+//
+// The lever is the stack: the throw threshold scales with it, and ltBoot spawns the server, so
+// the test owns its argv. Running the child under --stack-size=200 drops the threshold ~5x
+// (~24k elements ≈ 48KB), which fits Linux's limit with room to spare.
+//
+// The threshold is DISCOVERED, in a child under the SAME --stack-size (measuring it in this
+// process would report the parent's stack, which is not the one that matters), then taken with
+// 1.5x margin and hard-asserted under MAX_ARG_STRLEN. A hard-coded count would silently stop
+// triggering on another machine and the test would pass vacuously.
+const LT_STACK = 200;                 // child V8 stack (KB); lowers the spread-throw threshold
+const LT_MAX_ARG_STRLEN = 131072;     // Linux, x86-64: 32 * 4096
+function ltSpreadThrowCount(stackKb) {
+  // Binary-search the smallest element count whose spread throws, inside a child running with
+  // the stack the server will actually use.
+  const src = `const t=n=>{try{const a=[];a.push("--allowedTools",...Array(n).fill("x"));return false}catch{return true}};` +
+              `let lo=500,hi=400000;if(!t(hi)){console.log(0)}else{while(lo<hi){const m=(lo+hi)>>1;t(m)?hi=m:lo=m+1}console.log(lo)}`;
+  try {
+    return Number(String(_ltExecFile(process.execPath, [`--stack-size=${stackKb}`, "-e", src], { encoding: "utf8" })).trim()) || 0;
+  } catch { return 0; }
+}
+async function ltFreePort() {
+  const srv = _ltNetServer();
+  await new Promise(r => srv.listen(0, "127.0.0.1", r));
+  const p = srv.address().port;
+  await new Promise(r => srv.close(r));
+  return p;
 }
 async function ltPostStatus(port, body) {
   try {
     const r = await fetch(`http://127.0.0.1:${port}/v1/chat/completions`, {
       method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body),
     });
-    return r.status;
-  } catch { return 0; }
+    return { status: r.status, text: await r.text() };
+  } catch { return { status: 0, text: "" }; }
 }
 
 console.log("\nactive-request counter pairing (#180 / #193):");
 
 test("integration: a synchronous pre-spawn throw must not leak stats.activeRequests", async () => {
   if (!LT_POSIX) return;
-  const n = ltSpreadThrowCount();
-  assert.ok(n, "could not find an element count whose spread throws — adjust ltSpreadThrowCount");
+  const thr = ltSpreadThrowCount(LT_STACK);
+  assert.ok(thr > 0, `no spread-throw threshold found under --stack-size=${LT_STACK}`);
+  const n = Math.ceil(thr * 1.5);                       // margin over the measured threshold
+  const entry = Array(n).fill("x").join(",");
+  const bytes = Buffer.byteLength(entry);
+  // Hard gate: if this ever stops fitting, fail loudly rather than regress to an E2BIG skip.
+  assert.ok(bytes <= LT_MAX_ARG_STRLEN,
+    `env entry ${bytes}B exceeds MAX_ARG_STRLEN ${LT_MAX_ARG_STRLEN}B — lower LT_STACK`);
+  const port = await ltFreePort();
   const dir = ltMkdir(); const fake = ltFake(dir);
-  // PORTABILITY: delivering the trigger needs an env var of ~2n bytes. Linux caps a SINGLE
-  // env string at MAX_ARG_STRLEN (32 * PAGE_SIZE = 131072), and n is ~130k here, so execve
-  // rejects it with E2BIG — this test cannot run on Linux, which includes CI. It runs on
-  // macOS/BSD. Skipping loudly rather than silently: a vacuous pass would be worse than no
-  // test, and the fix it guards is genuinely unprotected on CI (tracked in #197).
-  let child, buf;
-  try {
-    ({ child, buf } = ltBoot({
-      CLAUDE_BIN: fake, CLAUDE_PROXY_PORT: "39370",
-      CLAUDE_ALLOWED_TOOLS: Array(n).fill("x").join(","),
-    }, dir));
-  } catch (e) {
-    if (e && (e.code === "E2BIG" || /E2BIG/.test(String(e.message)))) {
-      console.log(`    (SKIPPED on ${process.platform}: env of ${2 * n}B exceeds this OS's per-string execve limit — see #197)`);
-      _ltRm(dir, { recursive: true, force: true });
-      return;
-    }
-    throw e;
-  }
+  const { child, buf } = ltBoot({
+    CLAUDE_BIN: fake, CLAUDE_PROXY_PORT: String(port), CLAUDE_ALLOWED_TOOLS: entry,
+  }, dir, [`--stack-size=${LT_STACK}`]);
   let spawnErr = null;
-  child.on("error", e => { spawnErr = e; });   // E2BIG can arrive here instead of throwing
+  child.on("error", e => { spawnErr = e; });
   try {
     const up = await ltWait(() => buf.out.includes("listening on") || spawnErr, 20000);
-    if (spawnErr && (spawnErr.code === "E2BIG" || /E2BIG/.test(String(spawnErr.message)))) {
-      console.log(`    (SKIPPED on ${process.platform}: env of ${2 * n}B exceeds this OS's per-string execve limit — see #197)`);
-      return;
-    }
-    assert.ok(up && !spawnErr, `did not start: ${spawnErr ? spawnErr.message : buf.err.slice(0, 200)}`);
+    assert.ok(up && !spawnErr, `did not start: ${spawnErr ? spawnErr.message : buf.err.slice(0, 300)}`);
     const req = { model: "haiku", messages: [{ role: "user", content: "leak-probe" }] };
-    const codes = [];
-    for (let i = 0; i < 3; i++) codes.push(await ltPostStatus(39370, req));
-    // Non-vacuous: if the spread stopped throwing these would be 200 and the counter would be
-    // 0 for the wrong reason. Assert the fault actually fired before trusting the counter.
-    assert.deepEqual(codes, [500, 500, 500], `expected the pre-spawn throw to surface as 500s, got ${codes}`);
-    const r = await fetch(`http://127.0.0.1:39370/status`);
+    const res = [];
+    for (let i = 0; i < 3; i++) res.push(await ltPostStatus(port, req));
+    // Non-vacuous on two axes: the requests must actually fail, AND the failure must be the
+    // stack overflow from the --allowedTools spread — not some unrelated 500 that a small
+    // stack happened to produce. Without the second check a different fault would still leave
+    // the counter at 0 and the test would "pass" for the wrong reason.
+    assert.deepEqual(res.map(r => r.status), [500, 500, 500],
+      `expected the pre-spawn throw to surface as 500s, got ${res.map(r => r.status)}`);
+    assert.ok(res.every(r => /call stack size exceeded/i.test(r.text)),
+      `500s must come from the spread's RangeError; got: ${res[0].text.slice(0, 200)}`);
+    const r = await fetch(`http://127.0.0.1:${port}/status`);
     const active = (await r.json()).requests.active;
     assert.equal(active, 0,
       `3 requests threw before their spawn; the counter must be back to 0, got ${active} (this is the #180 leak)`);
