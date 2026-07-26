@@ -21,24 +21,31 @@ jobs:
       - name: Extract CHANGELOG section
         id: notes
         run: |
+          set -euo pipefail
           VERSION="${{ steps.ver.outputs.version }}"
+          NOTES=/tmp/release-notes.md
           # Extract section for this version from CHANGELOG.md
           # Pattern: "## v${VERSION}" through the next "## " or EOF
           if [ ! -f CHANGELOG.md ]; then
             echo "No CHANGELOG.md found; using minimal release notes"
-            echo "notes=Release v${VERSION}" >> $GITHUB_OUTPUT
+            # MUST write the file, not just an output: the create step consumes a FILE, so an
+            # early exit here used to leave --notes-file pointing at a path that never existed,
+            # turning "degrade to minimal notes" into a failed release job (#202).
+            echo "Release v${VERSION}" > "$NOTES"
+            echo "notes_file=$NOTES" >> $GITHUB_OUTPUT
             exit 0
           fi
           awk -v ver="v${VERSION}" '
             $0 ~ "^## " ver { found=1; print; next }
             found && /^## v/ { exit }
             found { print }
-          ' CHANGELOG.md > /tmp/release-notes.md
-          if [ ! -s /tmp/release-notes.md ]; then
+          ' CHANGELOG.md > "$NOTES"
+          if [ ! -s "$NOTES" ]; then
             echo "No matching section in CHANGELOG for v${VERSION}; using minimal notes"
-            echo "Release v${VERSION}" > /tmp/release-notes.md
+            echo "Release v${VERSION}" > "$NOTES"
           fi
-          echo "notes_file=/tmp/release-notes.md" >> $GITHUB_OUTPUT
+          echo "--- release notes (${VERSION}) ---"; cat "$NOTES"
+          echo "notes_file=$NOTES" >> $GITHUB_OUTPUT
       - name: Create GitHub Release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -49,5 +56,5 @@ jobs:
           fi
           gh release create "v${{ steps.ver.outputs.version }}" \
             --title "v${{ steps.ver.outputs.version }}" \
-            --notes-file /tmp/release-notes.md \
+            --notes-file "${{ steps.notes.outputs.notes_file }}" \
             --latest
