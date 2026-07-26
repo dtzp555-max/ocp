@@ -1,5 +1,12 @@
 # Changelog
 
+## Unreleased
+
+### Added
+
+- **Claude Opus 5 (`claude-opus-5`), and the `opus` alias now resolves to it.** New `models.json` entry — `/v1/models` goes 6 → 7 and OpenClaw picks it up on the next `ocp update` (via `scripts/sync-openclaw.mjs`). Verified against the installed CLI rather than assumed: the compiled `claude` 2.1.220 bundle carries `latest_per_family:{fable:"claude-fable-5",opus:"claude-opus-5",sonnet:"claude-sonnet-5",haiku:"claude-haiku-4-5"}`, so repointing `opus` mirrors what the CLI itself defaults to — the same reasoning as #168 (sonnet → sonnet-5). Availability confirmed with a live `claude -p --model claude-opus-5` completion on the subscription pool. Pricing is unchanged from Opus 4.8 ($5/$25 per MTok, CLI registry `pricing:"tier_5_25"`), so the alias repoint carries no cost change. `claude-opus-4-8` is retained for pinning.
+- `contextWindow` is deliberately **200000**, not Opus 5's native 1M. Two reasons, both verified: (1) `MAX_PROMPT_CHARS` is a **single global** budget — `derivePromptCharBudget` takes `max(contextWindow) × 3` across *all* entries (`lib/prompt.mjs`), so a 1M entry would raise the truncation ceiling to 3,000,000 chars for `claude-haiku-4-5` too, which is genuinely 200k native, converting clean OCP-side truncation into an upstream API rejection; (2) OpenClaw scales its history budget linearly off this value (`contextWindow × maxHistoryShare × SAFETY_MARGIN` = `× 0.6`, plus an oversized-message threshold at `× 0.5`, per `compaction-planning` in OpenClaw 2026.7.1), and its own bundled registry hardcodes 200000 for Claude — the upstream request to raise it to 1M ([openclaw#22979](https://github.com/openclaw/openclaw/issues/22979)) was closed *not planned*. A new regression test pins the invariant so a future 1M entry has to be a deliberate, reviewed change. Raising it for real needs per-model budgets — tracked separately, ADR-level.
+
 ## v3.24.0 — 2026-07-21
 
 Minor release. Headline: two long-requested **OpenAI-compat features** land — **multimodal vision** (`image_url` parts) and **structured outputs** (`response_format` / JSON schema). Also: the prompt-char budget now derives from the model SPOT instead of a hand-set constant, an agentic-turn bug that dropped the model's final answer is fixed, and `OCP_LOCAL_TOOLS` supports the OpenClaw-backend use case. Four of the six landed from external contributors (@vvlasy-openclaw). Every code PR carried a fresh-context reviewer (Iron Rule 10); no new endpoint, no new `cli.js` wire behavior.

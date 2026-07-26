@@ -1194,6 +1194,106 @@ test("integration: a synchronous pre-spawn throw must not leak stats.activeReque
   } finally { child.kill("SIGKILL"); _ltRm(dir, { recursive: true, force: true }); }
 });
 
+// ── Cache keys hash the RESOLVED model, not the alias string (#194) ──────────
+// models.json is read once at boot, so repointing an alias only takes effect on restart —
+// while the SQLite response_cache outlives it. Hashing the raw string would keep serving the
+// OLD model's answers under that alias until TTL expiry. Rather than mutate models.json
+// mid-suite, these assert the equivalent observable: an alias and its canonical target must
+// land on the SAME cache slot, which is true only if the key is resolved before hashing.
+// Mutation: change `cacheModel` back to `model` at the three cacheHash call sites in
+// server.mjs and both tests go red (2 spawns instead of 1).
+
+// Fake that emits schema-valid JSON, so the structured path caches a VALIDATED result
+// (the stock LT_FAKE returns "OK", which fails validation → refusal → never cached).
+const LT_FAKE_JSON = `#!/bin/sh
+if [ -n "$SP_COUNTER" ]; then c=$(cat "$SP_COUNTER" 2>/dev/null || echo 0); echo $((c+1)) > "$SP_COUNTER"; fi
+printf '%s\\n' '{"type":"assistant","message":{"content":[{"type":"text","text":"{\\"ok\\":true}"}]}}'
+printf '%s\\n' '{"type":"result"}'
+exit 0
+`;
+function ltFakeJson(dir) { const p = join(dir, "claude-json"); _ltWrite(p, LT_FAKE_JSON); _ltChmod(p, 0o755); return p; }
+const LT_SCHEMA = { type: "object", properties: { ok: { type: "boolean" } }, required: ["ok"], additionalProperties: false };
+
+console.log("\nCache key resolves the model alias (#194):");
+
+test("integration: an alias and its canonical target share ONE cache slot (normal path)", async () => {
+  if (!LT_POSIX) return;
+  const dir = ltMkdir(); const fake = ltFake(dir); const counter = join(dir, "spawns.txt");
+  const { child, buf } = ltBoot({ CLAUDE_BIN: fake, CLAUDE_PROXY_PORT: "39360", CLAUDE_CACHE_TTL: "60000", SP_COUNTER: counter }, dir);
+  try {
+    assert.ok(await ltWait(() => buf.out.includes("listening on")), `did not start: ${buf.err.slice(0, 200)}`);
+    _ltWrite(counter, "0");
+    const msgs = [{ role: "user", content: "alias-resolution-probe" }];
+    await ltPost(39360, { model: "sonnet", messages: msgs });                 // miss → spawn
+    await ltWait(() => (Number(_ltRead(counter, "utf8")) || 0) >= 1, 3000);
+    await ltPost(39360, { model: "claude-sonnet-5", messages: msgs });        // same resolved model → HIT
+    await new Promise(r => setTimeout(r, 600));
+    assert.equal(Number(_ltRead(counter, "utf8")) || 0, 1,
+      "the canonical id must hit the slot the alias populated — a 2nd spawn means the key still hashes the raw alias");
+  } finally { child.kill("SIGKILL"); _ltRm(dir, { recursive: true, force: true }); }
+});
+
+test("integration: an alias and its canonical target share ONE cache slot (STRUCTURED path)", async () => {
+  if (!LT_POSIX) return;
+  const dir = ltMkdir(); const fake = ltFakeJson(dir); const counter = join(dir, "spawns.txt");
+  const { child, buf } = ltBoot({ CLAUDE_BIN: fake, CLAUDE_PROXY_PORT: "39361", CLAUDE_CACHE_TTL: "60000", SP_COUNTER: counter }, dir);
+  try {
+    assert.ok(await ltWait(() => buf.out.includes("listening on")), `did not start: ${buf.err.slice(0, 200)}`);
+    _ltWrite(counter, "0");
+    const rf = { type: "json_schema", json_schema: { name: "probe", schema: LT_SCHEMA } };
+    const msgs = [{ role: "user", content: "structured-alias-probe" }];
+    await ltPost(39361, { model: "sonnet", messages: msgs, response_format: rf });
+    await ltWait(() => (Number(_ltRead(counter, "utf8")) || 0) >= 1, 4000);
+    await ltPost(39361, { model: "claude-sonnet-5", messages: msgs, response_format: rf });
+    await new Promise(r => setTimeout(r, 600));
+    assert.equal(Number(_ltRead(counter, "utf8")) || 0, 1,
+      "structured cache key must resolve the alias too — this is the path the epoch-only fix missed");
+  } finally { child.kill("SIGKILL"); _ltRm(dir, { recursive: true, force: true }); }
+});
+
+// MODEL_MAP is models[] + aliases + legacyAliases, so resolving covers legacyAliases for free.
+// The three tests above all use `sonnet` (a plain alias); this pins the legacyAlias leg explicitly
+// rather than leaving it covered only by construction.
+test("integration: a legacyAlias shares ONE cache slot with its canonical target", async () => {
+  if (!LT_POSIX) return;
+  const dir = ltMkdir(); const fake = ltFake(dir); const counter = join(dir, "spawns.txt");
+  const { child, buf } = ltBoot({ CLAUDE_BIN: fake, CLAUDE_PROXY_PORT: "39364", CLAUDE_CACHE_TTL: "60000", SP_COUNTER: counter }, dir);
+  try {
+    assert.ok(await ltWait(() => buf.out.includes("listening on")), `did not start: ${buf.err.slice(0, 200)}`);
+    _ltWrite(counter, "0");
+    const msgs = [{ role: "user", content: "legacy-alias-probe" }];
+    await ltPost(39364, { model: "claude-haiku-4-5", messages: msgs });            // legacyAlias
+    await ltWait(() => (Number(_ltRead(counter, "utf8")) || 0) >= 1, 3000);
+    await ltPost(39364, { model: "claude-haiku-4-5-20251001", messages: msgs });   // canonical
+    await new Promise(r => setTimeout(r, 600));
+    assert.equal(Number(_ltRead(counter, "utf8")) || 0, 1,
+      "legacyAliases live in MODEL_MAP too — resolving must collapse them onto the canonical slot");
+  } finally { child.kill("SIGKILL"); _ltRm(dir, { recursive: true, force: true }); }
+});
+
+test("integration: a config change invalidates the STRUCTURED cache too (closes the #177 gap)", async () => {
+  if (!LT_POSIX) return;
+  const dir = ltMkdir(); const fake = ltFakeJson(dir); const counter = join(dir, "spawns.txt");
+  const rf = { type: "json_schema", json_schema: { name: "probe", schema: LT_SCHEMA } };
+  const req = { model: "sonnet", messages: [{ role: "user", content: "structured-epoch-probe" }], response_format: rf };
+  const bootOnce = async (env, port) => {
+    const { child, buf } = ltBoot({ CLAUDE_BIN: fake, CLAUDE_PROXY_PORT: String(port), CLAUDE_CACHE_TTL: "60000", SP_COUNTER: counter, ...env }, dir);
+    try {
+      assert.ok(await ltWait(() => buf.out.includes("listening on")), `did not start: ${buf.err.slice(0, 200)}`);
+      _ltWrite(counter, "0");
+      await ltPost(port, req);
+      await ltWait(() => (Number(_ltRead(counter, "utf8")) || 0) >= 1, 4000);
+      return Number(_ltRead(counter, "utf8")) || 0;
+    } finally { child.kill("SIGKILL"); }
+  };
+  try {
+    const off = await bootOnce({}, 39362);                        // caches under epoch(negative wrapper)
+    const on = await bootOnce({ OCP_LOCAL_TOOLS: "1" }, 39363);   // same DB, epoch differs → must re-spawn
+    assert.equal(off, 1, "first structured request (cache empty) must spawn claude");
+    assert.equal(on, 1, "structured cache must honor CONFIG_EPOCH — before #194 it omitted the epoch entirely and served the stale answer");
+  } finally { _ltRm(dir, { recursive: true, force: true }); }
+});
+
 // ── Upgrade Tests ──
 import { runUpgrade, postFlightOk } from "./scripts/upgrade.mjs";
 
@@ -4157,6 +4257,10 @@ test("models.json aliases.sonnet === 'claude-sonnet-5' (default-request-model SP
   assert.equal(_spotModels.aliases.sonnet, "claude-sonnet-5");
 });
 
+test("models.json aliases.opus === 'claude-opus-5' (opus-alias SPOT)", () => {
+  assert.equal(_spotModels.aliases.opus, "claude-opus-5");
+});
+
 // ── Referential integrity (PR #152 review) ──────────────────────────────────
 // The value-mirror assertions above only prove the alias equals a string literal —
 // they pass even if that literal points at a model that does not exist in
@@ -4168,6 +4272,25 @@ const _spotModelIds = new Set(_spotModels.models.map(m => m.id));
 
 test("models.json: claude-sonnet-5 is present in models[] (the entry this PR adds)", () => {
   assert.ok(_spotModelIds.has("claude-sonnet-5"), "claude-sonnet-5 must exist as a models[].id");
+});
+
+test("models.json: claude-opus-5 is present in models[] (the entry this PR adds)", () => {
+  assert.ok(_spotModelIds.has("claude-opus-5"), "claude-opus-5 must exist as a models[].id");
+});
+
+// The prompt-char budget is GLOBAL (max across every entry × 3 chars/token), not
+// per-model — see lib/prompt.mjs derivePromptCharBudget. An entry declaring a native 1M
+// window would therefore raise the truncation ceiling for claude-haiku-4-5 too (genuinely
+// 200k), turning OCP-side truncation into an upstream API rejection.
+//
+// Asserts the MAX, deliberately, not every entry: ADR 0009 states the budget "scales
+// automatically — no code change", so a future entry with a SMALLER window (say a 128k
+// model) must stay legal and must not fail this suite. Only raising the ceiling is the
+// hazard, and that is an ADR-level decision requiring per-model budgets first.
+test("models.json: max contextWindow is 200000 (global prompt-budget ceiling)", () => {
+  const windows = _spotModels.models.map(m => m.contextWindow);
+  assert.equal(Math.max(...windows), 200000,
+    `max contextWindow re-scales MAX_PROMPT_CHARS for ALL models incl. the 200k-native haiku (see lib/prompt.mjs + ADR 0009)`);
 });
 
 test("models.json: every aliases value resolves to a real models[].id (referential integrity)", () => {
