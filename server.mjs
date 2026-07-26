@@ -1414,11 +1414,15 @@ function spawnClaudeProcess(model, messages, conversationId, keyName, releaseSlo
   const proc = spawn(CLAUDE, cliArgs, spawnOpts);
   activeProcesses.add(proc);
   // Counter drift (#180, reported by @konceptnet): increment ONLY after the spawn has
-  // succeeded and the process is registered. cleanup() below is the SOLE decrement site and is
-  // wired to this proc's exit/close/error events, so increment and decrement are now
-  // structurally paired to one process lifecycle. Incrementing before the spawn (as this did)
-  // leaked +1 permanently on any synchronous throw in between — buildCliArgs, env assembly, the
-  // spawn decision, or spawn() itself — because cleanup() was not yet attached to anything.
+  // succeeded and the process is registered. Incrementing before the spawn (as this did) leaked
+  // +1 permanently on any synchronous throw in between — buildCliArgs, env assembly, the spawn
+  // decision, or spawn() itself — because nothing was yet attached that could undo it.
+  //
+  // cleanup() is the SOLE decrement site, but note how it is reached: only 'exit' is wired HERE
+  // (below); 'close' and 'error' are wired by each CALLER (callClaude / callClaudeStreaming).
+  // That caller wiring is REQUIRED, not belt-and-braces — a FAILED spawn emits 'error' and
+  // 'close' but never 'exit', so without it a spawn failure would never decrement. A future
+  // third caller of spawnClaudeProcess must wire them too.
   stats.activeRequests++;
 
   const t0 = Date.now();

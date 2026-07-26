@@ -1104,6 +1104,60 @@ test("integration: toggling OCP_LOCAL_TOOLS invalidates the standard response ca
   } finally { _ltRm(dir, { recursive: true, force: true }); }
 });
 
+// ── active-request counter is paired to the process lifecycle (#180 / #193) ──
+// The counter used to be incremented ~40 lines before the spawn, while its only decrement
+// (cleanup()) is wired to that proc's events — so any SYNCHRONOUS throw in between leaked +1
+// permanently. Driving that fault needs no production hook and no test double: buildCliArgs
+// does `args.push("--allowedTools", ...ALLOWED_TOOLS)`, and a spread of enough elements throws
+// RangeError synchronously, right inside the window.
+//
+// The element count is DISCOVERED, not hard-coded: the throw threshold depends on stack size,
+// so a fixed number would silently stop triggering on a machine with a bigger stack and the
+// test would pass vacuously. We find a count that throws in THIS process, then use it for the
+// child (same binary, same default stack). The test also asserts the requests actually 500 —
+// if the trigger ever stops firing, that assert fails loudly instead of going quietly green.
+function ltSpreadThrowCount() {
+  for (const n of [1 << 16, 1 << 17, 1 << 18, 1 << 19]) {
+    try { const probe = []; probe.push("--allowedTools", ...Array(n).fill("x")); }
+    catch { return n; }
+  }
+  return null;
+}
+async function ltPostStatus(port, body) {
+  try {
+    const r = await fetch(`http://127.0.0.1:${port}/v1/chat/completions`, {
+      method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body),
+    });
+    return r.status;
+  } catch { return 0; }
+}
+
+console.log("\nactive-request counter pairing (#180 / #193):");
+
+test("integration: a synchronous pre-spawn throw must not leak stats.activeRequests", async () => {
+  if (!LT_POSIX) return;
+  const n = ltSpreadThrowCount();
+  assert.ok(n, "could not find an element count whose spread throws — adjust ltSpreadThrowCount");
+  const dir = ltMkdir(); const fake = ltFake(dir);
+  const { child, buf } = ltBoot({
+    CLAUDE_BIN: fake, CLAUDE_PROXY_PORT: "39370",
+    CLAUDE_ALLOWED_TOOLS: Array(n).fill("x").join(","),
+  }, dir);
+  try {
+    assert.ok(await ltWait(() => buf.out.includes("listening on"), 20000), `did not start: ${buf.err.slice(0, 200)}`);
+    const req = { model: "haiku", messages: [{ role: "user", content: "leak-probe" }] };
+    const codes = [];
+    for (let i = 0; i < 3; i++) codes.push(await ltPostStatus(39370, req));
+    // Non-vacuous: if the spread stopped throwing these would be 200 and the counter would be
+    // 0 for the wrong reason. Assert the fault actually fired before trusting the counter.
+    assert.deepEqual(codes, [500, 500, 500], `expected the pre-spawn throw to surface as 500s, got ${codes}`);
+    const r = await fetch(`http://127.0.0.1:39370/status`);
+    const active = (await r.json()).requests.active;
+    assert.equal(active, 0,
+      `3 requests threw before their spawn; the counter must be back to 0, got ${active} (this is the #180 leak)`);
+  } finally { child.kill("SIGKILL"); _ltRm(dir, { recursive: true, force: true }); }
+});
+
 // ── Upgrade Tests ──
 import { runUpgrade, postFlightOk } from "./scripts/upgrade.mjs";
 
