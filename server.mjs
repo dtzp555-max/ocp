@@ -393,8 +393,15 @@ const NO_CONTEXT = process.env.CLAUDE_NO_CONTEXT === "true";
 // Deliberately boot-time-only: runtime-mutable settings (e.g. maxPromptChars via the settings
 // API) are excluded because a const epoch cannot track them; truncation also only drops
 // context rather than changing the instruction set.
+// The ALIAS MAP is folded in for the same reason. Cache keys hash the model string exactly as
+// the client sent it (`const model = parsed.model || aliases.sonnet`), so a request for "opus"
+// is cached under the literal "opus" — not under the canonical id it resolved to. models.json is
+// read once at boot, so repointing an alias (e.g. opus: 4-8 -> 5) only takes effect on restart,
+// and the SQLite response_cache outlives that restart. Without the alias map in the epoch, an
+// operator running CLAUDE_CACHE_TTL > 0 keeps being served the OLD model's answers for the alias
+// until TTL expiry — silently defeating the repoint. Same bug class as #176.
 const CONFIG_EPOCH = cryptoCreateHash("sha256")
-  .update(JSON.stringify([SYSTEM_PROMPT, SYSTEM_PROMPT_WRAPPER, ALLOWED_TOOLS, NO_CONTEXT]))
+  .update(JSON.stringify([SYSTEM_PROMPT, SYSTEM_PROMPT_WRAPPER, ALLOWED_TOOLS, NO_CONTEXT, modelsConfig.aliases]))
   .digest("hex").slice(0, 16);
 // Kill-switch for the FIX-③ default-path spawn-home isolation (see resolveSpawnHome /
 // spawnHomeMode below). When "1", the -p/stream-json spawn always runs in the operator's
