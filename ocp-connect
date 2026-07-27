@@ -147,7 +147,11 @@ def get_model_meta(mid):
     for prefix, meta in sorted(model_meta.items(), key=lambda x: -len(x[0])):
         if mid.startswith(prefix):
             return meta
-    return {"name": mid + " (OCP)", "reasoning": False, "maxTokens": 8192}
+    # Unknown id = most likely a model newer than this script. 32000 is the LOWEST
+    # max_output_tokens.default in the CLI 2.1.220 registry (haiku/sonnet-4-6), so it is the
+    # safe floor: never over-advertises a real model, and no longer contradicts the rest of
+    # this table by sitting below every family in it.
+    return {"name": mid + " (OCP)", "reasoning": False, "maxTokens": 32000}
 
 for mid in model_ids:
     meta = get_model_meta(mid)

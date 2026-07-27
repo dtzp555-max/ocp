@@ -4299,21 +4299,27 @@ test("models.json: every aliases value resolves to a real models[].id (referenti
   }
 });
 
-// maxTokens must leave room for a visible answer once a client's thinking budget is taken out
-// (#195). OCP never enforces maxTokens itself — it is propagated to OpenClaw (setup.mjs,
-// scripts/sync-openclaw.mjs) where it CAPS the outbound request:
-//     maxTokens = Math.min(baseMaxTokens + thinkingBudget, modelMaxTokens)
-// OpenClaw's reasoning budgets are medium 8192 / high 16384, and when maxTokens <= thinkingBudget
-// it clamps thinking to maxTokens - 1024. So a model declared at 16384 running at `high` spent
-// ~15360 on thinking and left ~1024 for the actual answer — which is what this repo shipped until
-// v3.25.0. Asserting the PRINCIPLE rather than pinning per-model numbers: a value test would need
-// editing every time a model is added, and would not say why.
-const _spotHighThinkingBudget = 16384; // OpenClaw's `high` reasoning budget
-test("models.json: every maxTokens exceeds the high thinking budget, leaving room for output (#195)", () => {
+// maxTokens is ADVERTISED metadata, not an OCP-enforced limit (#195). OCP never reads it —
+// buildCliArgs passes no output-token flag to the CLI — and OpenClaw reaches a local OCP over
+// `openai-completions`, whose request field (max_completion_tokens) appears nowhere in this repo.
+// It is consumed only by clients that choose to honour it, via setup.mjs / sync-openclaw.mjs /
+// ocp-connect. So the invariant worth testing is simply that models.json tells the truth: each
+// value must equal the model's max_output_tokens.default in the CLI registry.
+//
+// Pinned per model deliberately. A threshold assertion would let every entry sit at some arbitrary
+// value above the bar and still call itself "registry-aligned" — which is the actual claim. Adding
+// a model means adding a row here, and that is the point: the row is where you record what the
+// registry said when you checked.
+const _spotRegistryMaxTokens = {           // CLI 2.1.220, id-anchored max_output_tokens.default
+  "claude-opus-5": 64000, "claude-opus-4-8": 64000, "claude-opus-4-7": 64000, "claude-opus-4-6": 64000,
+  "claude-sonnet-5": 64000, "claude-sonnet-4-6": 32000, "claude-haiku-4-5-20251001": 32000,
+};
+test("models.json: every maxTokens equals the CLI registry's max_output_tokens.default (#195)", () => {
   for (const m of _spotModels.models) {
-    assert.ok(m.maxTokens > _spotHighThinkingBudget,
-      `${m.id} declares maxTokens=${m.maxTokens} <= ${_spotHighThinkingBudget}: at OpenClaw's 'high' reasoning ` +
-      `level the thinking budget would consume all but ~1024 tokens of the response`);
+    const want = _spotRegistryMaxTokens[m.id];
+    assert.ok(want !== undefined,
+      `${m.id} has no recorded registry value — extract it id-anchored from the CLI binary and add a row`);
+    assert.equal(m.maxTokens, want, `${m.id}: models.json says ${m.maxTokens}, CLI registry says ${want}`);
   }
 });
 
