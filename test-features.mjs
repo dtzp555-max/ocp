@@ -991,7 +991,7 @@ function ltBoot(env, dir, nodeArgs = []) {
            CLAUDE_BIND: "127.0.0.1", CLAUDE_AUTH_MODE: "none", CLAUDE_CACHE_TTL: "0", CLAUDE_TIMEOUT: "4000", ...env },
     stdio: ["ignore", "pipe", "pipe"],
   });
-  const buf = { out: "", err: "", exit: undefined, signal: undefined, closed: false, spawnErr: null };
+  const buf = { out: "", err: "", exit: undefined, signal: undefined, closed: false, spawnErr: null, t0: Date.now() };
   child.stdout.on("data", d => { buf.out += d; });
   child.stderr.on("data", d => { buf.err += d; });
   // 'exit' fires when the process terminates, but its stdio pipes may still hold unread data —
@@ -999,7 +999,7 @@ function ltBoot(env, dir, nodeArgs = []) {
   // then asserts on buf.err/buf.out must wait for `closed`, not `exit != null`, or it can read
   // an empty buffer.
   child.on("exit", (code, signal) => { buf.exit = code; buf.signal = signal; });
-  child.on("close", () => { buf.closed = true; });
+  child.on("close", () => { buf.closed = true; buf.closeMs = Date.now() - buf.t0; });
   // Without a listener, a spawn 'error' is re-thrown as an uncaught exception and takes down the
   // whole runner instead of failing one test.
   child.on("error", e => { buf.spawnErr = e; });
@@ -1019,11 +1019,29 @@ function _ltRmRetry(dir) {
 // Every ltBoot assertion failure should be self-diagnosing. The historical failure text was
 // `expected a local-tools FATAL, got: ` — an empty string, which says nothing about whether the
 // child never wrote, wrote to the other stream, died on a signal, or was never spawned.
+// stdout is sampled HEAD+TAIL, not tail-only. The decisive string for "it booted instead of
+// refusing" is "Local tools: ON", and it lives in the boot banner — a tail-only sample answered
+// the wrong question for exactly the tests this exists to diagnose.
+//
+// The head is sized to the BANNER, not picked round: measured on this tree, the banner runs 1118B
+// with "Local tools: ON" at byte 581, so 900 clears it with ~5 banner lines of margin. That sizing
+// is what makes it robust — the banner is emitted first and is bounded, so however much request
+// noise follows, byte 581 stays in the head. A head of 120 does NOT reach it (verified: the string
+// landed in the elided middle), which is why this is not the obvious small window.
+// stderr stays head-only: a fatal is the first thing it writes.
+function ltHeadTail(s, head = 900, tail = 160) {
+  return s.length <= head + tail ? s : `${s.slice(0, head)}…[${s.length - head - tail}B]…${s.slice(-tail)}`;
+}
 function ltDiag(buf) {
-  return `exit=${buf.exit} signal=${buf.signal} closed=${buf.closed}` +
+  // closeMs disambiguates "died before reaching the gate" from "ran, then gated" — an exit=1
+  // with empty stderr is equally consistent with both, and they have unrelated root causes.
+  // node= is here because a Node-version-specific stderr warning (22's SQLite ExperimentalWarning)
+  // once masqueraded as "server did not start" for ~23 of 50 runs on a Linux box.
+  const ms = buf.closeMs !== undefined ? `${buf.closeMs}ms` : (buf.t0 ? `${Date.now() - buf.t0}ms(still open)` : "?");
+  return `exit=${buf.exit} signal=${buf.signal} closed=${buf.closed} closeMs=${ms} node=${process.version}` +
          (buf.spawnErr ? ` spawnErr=${buf.spawnErr.code || buf.spawnErr.message}` : "") +
-         ` | stderr(${buf.err.length}B)=${JSON.stringify(buf.err.slice(0, 200))}` +
-         ` | stdout(${buf.out.length}B)=${JSON.stringify(buf.out.slice(-200))}`;
+         ` | stderr(${buf.err.length}B)=${JSON.stringify(buf.err.slice(0, 240))}` +
+         ` | stdout(${buf.out.length}B)=${JSON.stringify(ltHeadTail(buf.out))}`;
 }
 async function ltWait(cond, ms = 9000) {
   const start = Date.now();
@@ -1106,10 +1124,12 @@ test("integration: safe single-user config BOOTS past the gate and announces loc
   const port = await ltFreePort();
   const { child, buf } = ltBoot({ OCP_LOCAL_TOOLS: "1", CLAUDE_BIN: fake, CLAUDE_PROXY_PORT: String(port) }, dir); // loopback + none
   try {
-    // Same race as #199, one line over: "Local tools: ON" is written 14 console.log calls AFTER
-    // "listening on", so gating on the boot marker and then asserting the announcement can read a
-    // buffer holding only the first chunk. Wait for the line actually under assertion. Measured by
-    // review at 9/200 before this change and 0/200 after — it was the suite's top flake.
+    // Same race as #199, one line over: "Local tools: ON" (server.mjs:3640) is written 12
+    // console.log calls after "listening on" (:3627) — 10 of them in this env, since the
+    // SYSTEM_PROMPT and MCP_CONFIG lines are conditional and unset here. Gating on the boot
+    // marker and then asserting the announcement can therefore read a buffer holding only the
+    // first chunk. Wait for the line actually under assertion. Measured by review at 8/200
+    // before this change and 0/200 after — it was the suite's top flake.
     assert.ok(await ltWait(() => buf.out.includes("Local tools: ON") || buf.closed || buf.spawnErr),
       `startup must announce local tools when active — ${ltDiag(buf)}`);
     assert.ok(buf.out.includes("Local tools: ON"),
