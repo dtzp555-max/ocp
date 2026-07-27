@@ -101,10 +101,14 @@ jobs:
             for c in $(seq 1 "$CONC"); do
               # Per-run timeout: without it a single hung child blocks `wait` until the step
               # timeout and the whole hunt yields nothing.
-              # -k: SIGTERM to `npm` may not reach the node child, let alone the server.mjs
-              # grandchildren, so follow with SIGKILL. --foreground so the timeout applies to
-              # a backgrounded job at all.
-              timeout -k 10 --foreground 300 npm test > "logs/r${r}c${c}.log" 2>&1 &
+              # -k follows SIGTERM with SIGKILL. Do NOT add --foreground: by default timeout
+              # makes itself the process-group leader and signals the GROUP, so the node child
+              # and the server.mjs grandchildren die with it; --foreground turns that off
+              # ("children of COMMAND will not be timed out", coreutils). Measured, 3 runs each:
+              # default -> 0 survivors; --foreground -> 2 survivors. Orphans would then keep
+              # competing for the runner's 4 vCPUs and inflate the very contention this
+              # experiment exists to hold still.
+              timeout -k 10 300 npm test > "logs/r${r}c${c}.log" 2>&1 &
             done
             wait
             printf '.'
