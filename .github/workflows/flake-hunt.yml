@@ -25,7 +25,7 @@ on:
   workflow_dispatch:
     inputs:
       ref:
-        description: 'Commit/branch to hunt on. Use 7f15921^ for the PRE-#204 tree — see the note below.'
+        description: 'Branch, tag, or FULL 40-char SHA. Pre-#204 control: c180987376aecca9a90dcec3605cbe1abe48ebf0'
         default: ''
       node:
         description: 'Node major version'
@@ -43,16 +43,23 @@ on:
 
 # `ref` exists because a null result on current main is UNINTERPRETABLE. #204 may already have
 # fixed #203 — if it did, 0/200 on main cannot be told apart from "didn't hunt hard enough" or
-# "wrong configuration". Running 7f15921^ (pre-#204) is the positive control: reproducing there
-# and not on main establishes both the mechanism and the fix. Hunt the control first.
+# "wrong configuration". The positive control is the commit BEFORE #204:
+#
+#     c180987376aecca9a90dcec3605cbe1abe48ebf0     (7f15921^, i.e. #207)
+#
+# Reproducing there and not on main establishes both the mechanism and the fix. Hunt the
+# control first. NOTE: actions/checkout does NOT rev-parse — it takes a branch, a tag, or a
+# FULL 40-char SHA. `7f15921^` and even the abbreviated `7f15921` both fail to resolve
+# (`git ls-remote origin '7f15921^'` returns 0 rows), so the full SHA is spelled out above.
 
 permissions:
   contents: read
 
-# Two dispatches of this would otherwise run concurrently and contend with each other, which is
-# the one variable the experiment is trying to control.
+# Deliberately NOT keyed on github.ref: the whole point is comparing a control arm against main,
+# and two hunts running at once contend for the same runner class — the one variable this
+# experiment exists to hold still. A bare group serializes dispatches from any branch.
 concurrency:
-  group: flake-hunt-${{ github.ref }}
+  group: flake-hunt
   cancel-in-progress: false
 
 jobs:
@@ -94,7 +101,10 @@ jobs:
             for c in $(seq 1 "$CONC"); do
               # Per-run timeout: without it a single hung child blocks `wait` until the step
               # timeout and the whole hunt yields nothing.
-              timeout 300 npm test > "logs/r${r}c${c}.log" 2>&1 &
+              # -k: SIGTERM to `npm` may not reach the node child, let alone the server.mjs
+              # grandchildren, so follow with SIGKILL. --foreground so the timeout applies to
+              # a backgrounded job at all.
+              timeout -k 10 --foreground 300 npm test > "logs/r${r}c${c}.log" 2>&1 &
             done
             wait
             printf '.'
@@ -114,12 +124,26 @@ jobs:
 
           total=$(ls logs/*.log 2>/dev/null | wc -l | tr -d ' ')
           clean=$(grep -l ', 0 failed ===' logs/*.log 2>/dev/null | wc -l | tr -d ' ')
+          # A round killed by the step timeout leaves truncated logs with no Results line. Those
+          # count in `total` but can never be clean, which silently depresses the clean rate and
+          # looks like a worse flake than reality. Report completions separately.
+          completed=$(grep -l '=== Results:' logs/*.log 2>/dev/null | wc -l | tr -d ' ')
 
           # #203's SIGNATURE, not just its test name. A CPU-starved runner (4 vCPU carrying
           # ~44 node processes at concurrency 4) can blow the 9s ltWait and produce the same
           # "✗ boot gate REFUSES" line with closed=false / (still open). That is contention,
           # not #203. The real one is: the child CLOSED, exited non-zero, and stderr was EMPTY.
-          sig=$(grep -l '✗.*boot gate REFUSES.*closed=true.*stderr(0B)' logs/*.log 2>/dev/null | wc -l | tr -d ' ')
+          #
+          # This pattern can only match a FUTURE reproduction. All four historic sightings predate
+          # #204's ltDiag — their text is `expected a local-tools FATAL, got: ` with no `closed=`
+          # and no `stderr(0B)` at all — so do NOT try to validate this grep against them and
+          # conclude it is broken.
+          # The `expected a local-tools FATAL` clause is not decoration: it pins the match to the
+          # THIRD assertion in that test. Without it, `exit=0` is swallowed by `.*` and the SECOND
+          # assertion ("must exit non-zero" — the gate did not refuse at all, the OPPOSITE failure)
+          # scores as a #203 signature. Verified: the loose pattern matches both exit=0 and exit=1;
+          # this one matches only exit=1.
+          sig=$(grep -l '✗.*boot gate REFUSES.*expected a local-tools FATAL.*closed=true.*stderr(0B)' logs/*.log 2>/dev/null | wc -l | tr -d ' ')
           gate=$(grep -l '✗.*boot gate REFUSES' logs/*.log 2>/dev/null | wc -l | tr -d ' ')
 
           {
@@ -131,7 +155,8 @@ jobs:
             echo
             echo "| | runs |"
             echo "|---|---|"
-            echo "| **clean (0 failed)** | **$clean / $total** |"
+            echo "| **clean (0 failed)** | **$clean / $completed completed** |"
+            echo "| suites launched (a shortfall = step timeout, not a flake) | $total |"
             echo "| #203 **signature** (gate + closed=true + stderr 0B) | **$sig** |"
             echo "| gate test failed, any cause (includes contention) | $gate |"
             echo
@@ -152,7 +177,10 @@ jobs:
           } >> "$GITHUB_STEP_SUMMARY"
 
           # Prefer a log carrying the actual signature; fall back to any failing log.
-          first=$(grep -l '✗.*boot gate REFUSES.*closed=true.*stderr(0B)' logs/*.log 2>/dev/null | head -1)
+          # INVARIANT for anyone extending this step: the `&&` list below returns 1 when $first
+          # is non-empty, so it must never be the LAST command in the script or the step exits
+          # non-zero. Today the `if` that follows returns 0 and absorbs it.
+          first=$(grep -l '✗.*boot gate REFUSES.*expected a local-tools FATAL.*closed=true.*stderr(0B)' logs/*.log 2>/dev/null | head -1)
           [ -z "$first" ] && first=$(grep -L ', 0 failed ===' logs/*.log 2>/dev/null | head -1)
           if [ -n "$first" ]; then
             {
