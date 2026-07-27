@@ -997,7 +997,7 @@ function ltBoot(env, dir, nodeArgs = []) {
   // 'exit' fires when the process terminates, but its stdio pipes may still hold unread data —
   // 'close' is the one that guarantees both are drained. A test that terminates the child and
   // then asserts on buf.err/buf.out must wait for `closed`, not `exit != null`, or it can read
-  // an empty buffer. See ltAssertBoot below.
+  // an empty buffer.
   child.on("exit", (code, signal) => { buf.exit = code; buf.signal = signal; });
   child.on("close", () => { buf.closed = true; });
   // Without a listener, a spawn 'error' is re-thrown as an uncaught exception and takes down the
@@ -1010,7 +1010,11 @@ function ltBoot(env, dir, nodeArgs = []) {
 // as an intermittent ENOTEMPTY (4/200 in review). Node's own retry loop handles the window.
 function _ltRmRetry(dir) {
   try { _ltRm(dir, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 }); }
-  catch { /* a leaked temp dir must never fail a test — the OS reaps it */ }
+  catch (e) {
+    // Never throw: this runs in a finally, so a throw here would REPLACE the real assertion
+    // error and make a flake look like a regression. LT_DEBUG surfaces it without that risk.
+    if (process.env.LT_DEBUG) console.warn(`    [ltRmRetry] ${dir}: ${e.code || e.message}`);
+  }
 }
 // Every ltBoot assertion failure should be self-diagnosing. The historical failure text was
 // `expected a local-tools FATAL, got: ` — an empty string, which says nothing about whether the
