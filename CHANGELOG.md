@@ -2,9 +2,30 @@
 
 ## Unreleased
 
+## v3.26.0 — 2026-07-27
+
+Maintenance release. One user-visible change — advertised `maxTokens` now tells the truth — and four rounds of repairs to the machinery that is supposed to catch mistakes: a schema for the model SPOT, a release-job bug that would have shipped an empty release body, and the integration-test harness that had been failing 4 runs in 5 without anyone noticing.
+
+Every PR carried an independent fresh-context reviewer (Iron Rule 10). Two reviewers refuted the author's stated rationale while the change itself stood; in both cases the rationale was rewritten rather than the finding waved off, and one reviewer retracted its own earlier finding after the evidence was re-derived. `server.mjs` is untouched in this release, so no `cli.js` citation applies.
+
 ### Changed
 
 - **`maxTokens` now matches the CLI registry instead of a uniform 16384 (#195).** Every Opus entry and `claude-sonnet-5` go to **64000**, `claude-sonnet-4-6` and `claude-haiku-4-5` to **32000** — the `max_output_tokens.default` each model declares in the compiled CLI 2.1.220 registry. This corrects **advertised metadata only**: `models.json` is the SPOT (ADR 0003) and every value in it should be the truth about the model. **It changes nothing about how OCP behaves.** OCP never enforces `maxTokens` — `buildCliArgs` passes no output-token flag to the CLI at all — and OpenClaw addresses a local OCP over `openai-completions`, whose request field (`max_completion_tokens`) appears nowhere in this repo. The value is consumed only by clients that choose to honour it, via `setup.mjs` / `scripts/sync-openclaw.mjs` / `ocp-connect`. **Expect no change in answer length or quota burn.** `ocp-connect`'s independent family table moves to the floor over each family's current `models.json` members (opus 64000, sonnet 32000, haiku 32000), since prefixes cannot distinguish versions. Its unknown-id fallback stays at **8192** — the registry's global minimum, held by `claude-3-5-haiku` and `claude-3-5-sonnet`, which are the only real ids that reach it (`claude-3-5-*` matches no family prefix).
+
+### Added
+
+- **`models.schema.json` — the model SPOT now has a schema, enforced in CI (#196).** `models.json` declares it via `$schema`, and `test-features.mjs` validates the SPOT against it using the repo's **own** `validateJsonSchema` from `lib/structured-output.mjs` — no new dependency. A malformed entry now fails the build instead of surfacing downstream in OpenClaw. The schema's description names exactly which keywords that validator enforces and which it **silently ignores** (`minimum`, `maxLength`, `pattern`, `uniqueItems`, …), so nobody adds a constraint that buys nothing; those go in `test-features.mjs` instead. Guard tests cover 8 distinct corruptions plus uniqueness and whitespace on every name field.
+
+### Fixed
+
+- **`release.yml` would have produced an empty release body on any repo state without `CHANGELOG.md` (#202).** The no-changelog branch set an output pointing at a notes file it never wrote, and the create step then read a missing path. Rare, but it fails exactly when you least want it to — during a release. The branch now writes the file.
+- **The `ltBoot` integration harness was failing 4 runs in 5 (#199, #209).** Measured with a control arm — full suite × 4 concurrent × 50 rounds against unmodified `main` and against the fix — clean runs went **42/200 → 200/200**, with `EADDRINUSE` **246 → 0**. Four distinct races: two tests gated on a stdout marker and then asserted on a **stderr** line written 12 `console.log` calls later (different pipes, nothing ordering them); every fixed port replaced with `ltFreePort()` (the old 39321–39364 range sits *inside* Linux's default ephemeral range, so CI was more exposed than a Mac); `close` instead of `exit` where a test reads a buffer after termination; and retrying teardown against grandchildren still writing into the temp dir. Diagnostics now print exit/signal/closed/elapsed/Node version plus a head+tail sample of both streams — sized so the sample provably reaches the one line that distinguishes "booted" from "refused", with a test pinning that budget so it cannot silently degrade.
+
+### Internal
+
+- **Guard comments on the asymmetric cache-key construction (#200)** — `structuredHash` and `dedupKey` carry deliberately different guards, and the resemblance invites a "cleanup" that would collapse them. Now documented at the site.
+- **`AGENTS.md` § "Testing: reaching faults inside `server.mjs`" (#197)** — writes up the fault-injection method these fixes needed, including the `--stack-size` lever and why running a flaky scenario *in isolation* removes the very concurrency that causes it.
+- **`ocp-connect` documentation corrections.** Its family table is the floor over each family's *current* `models.json` members — not over the registry family — and its unknown-id fallback stays at 8192, the registry's global minimum. Both had comments asserting otherwise. Its model table and fallback remain **untested**; tracked as #210.
 
 ## v3.25.0 — 2026-07-27
 
