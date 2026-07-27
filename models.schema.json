@@ -46,7 +46,7 @@
           },
           "maxTokens": {
             "type": "integer",
-            "description": "Advertised output cap. OCP does not enforce it; it is propagated to OpenClaw (via setup.mjs / scripts/sync-openclaw.mjs) where it bounds request and compaction budgets."
+            "description": "Advertised output cap. OCP does not enforce it: buildCliArgs passes no output-token flag to the CLI. It is propagated to OpenClaw (via setup.mjs / scripts/sync-openclaw.mjs) where it bounds REQUEST budgets only. It does NOT affect compaction: both the compaction trigger and the summarisation chunk size derive from contextWindow (minus reserveTokensFloor / softThreshold), never from this field. Verified against OpenClaw 2026.7.1."
           }
         }
       }
