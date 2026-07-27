@@ -991,7 +991,7 @@ function ltBoot(env, dir, nodeArgs = []) {
            CLAUDE_BIND: "127.0.0.1", CLAUDE_AUTH_MODE: "none", CLAUDE_CACHE_TTL: "0", CLAUDE_TIMEOUT: "4000", ...env },
     stdio: ["ignore", "pipe", "pipe"],
   });
-  const buf = { out: "", err: "", exit: undefined, signal: undefined, closed: false, spawnErr: null, t0: Date.now() };
+  const buf = { out: "", err: "", exit: undefined, signal: undefined, closed: false, closeMs: undefined, spawnErr: null, t0: Date.now() };
   child.stdout.on("data", d => { buf.out += d; });
   child.stderr.on("data", d => { buf.err += d; });
   // 'exit' fires when the process terminates, but its stdio pipes may still hold unread data —
@@ -1037,7 +1037,7 @@ function ltDiag(buf) {
   // with empty stderr is equally consistent with both, and they have unrelated root causes.
   // node= is here because a Node-version-specific stderr warning (22's SQLite ExperimentalWarning)
   // once masqueraded as "server did not start" for ~23 of 50 runs on a Linux box.
-  const ms = buf.closeMs !== undefined ? `${buf.closeMs}ms` : (buf.t0 ? `${Date.now() - buf.t0}ms(still open)` : "?");
+  const ms = buf.closeMs !== undefined ? `${buf.closeMs}ms` : `${Date.now() - buf.t0}ms(still open)`;
   return `exit=${buf.exit} signal=${buf.signal} closed=${buf.closed} closeMs=${ms} node=${process.version}` +
          (buf.spawnErr ? ` spawnErr=${buf.spawnErr.code || buf.spawnErr.message}` : "") +
          ` | stderr(${buf.err.length}B)=${JSON.stringify(buf.err.slice(0, 240))}` +
@@ -1134,6 +1134,16 @@ test("integration: safe single-user config BOOTS past the gate and announces loc
       `startup must announce local tools when active — ${ltDiag(buf)}`);
     assert.ok(buf.out.includes("Local tools: ON"),
       `startup must announce local tools when active — ${ltDiag(buf)}`);
+    // Nails ltHeadTail's head budget to the thing it exists to capture. Without this the
+    // coupling is silent: every added banner line pushes "Local tools: ON" later (Models:
+    // alone is ~18B per model), and the day it crosses 900 the diagnostic degrades back to
+    // the exact blind spot this PR fixed — with no test going red. Measured offset here is
+    // 581 of a 1118B banner, so the margin is ~17 more models.
+    const _ltOffset = buf.out.indexOf("Local tools: ON");
+    assert.ok(_ltOffset < 900,
+      `ltHeadTail's head budget (900B) no longer reaches the local-tools announcement — it is ` +
+      `now at byte ${_ltOffset}. The banner grew. Raise the head in ltHeadTail, or ltDiag will ` +
+      `silently stop showing the one line that distinguishes "booted" from "refused".`);
   } finally { child.kill("SIGKILL"); _ltRmRetry(dir); }
 });
 
