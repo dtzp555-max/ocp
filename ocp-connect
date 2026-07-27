@@ -132,8 +132,13 @@ provider = {
 # maxTokens values are the floor of the CLI registry's max_output_tokens.default over the
 # family members CURRENTLY IN models.json (opus 64000; sonnet 32000, because sonnet-4-6 is
 # 32000 while sonnet-5 is 64000; haiku 32000) — NOT over the whole registry family. The
-# registry also holds claude-opus-4-0 / -4-5 at 32000, so should a legacy opus ever be added
-# to models.json, the opus row here would over-advertise it and must drop to 32000.
+# registry also holds claude-opus-4-0 / -4-5 at 32000, which this opus row would over-advertise
+# 2x. What keeps that unreachable is NOT "the ids come from models.json" — the ids reaching
+# get_model_meta have two sources that are not this checkout: /v1/models is fetched from a
+# user-supplied base_url, so it is the REMOTE server's models.json (possibly a different OCP
+# version or a fork), and on a JSON parse failure the ids come from the hardcoded list a few
+# lines above instead. The invariant that actually holds is that no released OCP has ever
+# served a legacy opus id. Adding one to models.json breaks it and this row must drop to 32000.
 # Family prefixes cannot distinguish versions, so a floor is used deliberately:
 # under-advertising caps a client lower than the model allows, which is safe, whereas
 # over-advertising would promise capacity a member of the family does not have.
