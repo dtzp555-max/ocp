@@ -129,11 +129,14 @@ provider = {
 # re-trip it. Family prefixes classify any versioned ID correctly with no per-model
 # edit. (ADR 0003: models.json is the SPOT for model existence; /v1/models does not
 # expose reasoning/maxTokens, so family classification stays here.)
-# maxTokens values are the FAMILY FLOOR of the CLI registry max_output_tokens.default
-# (opus family 64000; sonnet 32000 because sonnet-4-6 is 32000 while sonnet-5 is 64000;
-# haiku 32000). Family prefixes cannot distinguish versions, so the floor is used
-# deliberately: under-advertising caps a client lower than the model allows, which is safe,
-# whereas over-advertising would promise capacity a member of the family does not have.
+# maxTokens values are the floor of the CLI registry's max_output_tokens.default over the
+# family members CURRENTLY IN models.json (opus 64000; sonnet 32000, because sonnet-4-6 is
+# 32000 while sonnet-5 is 64000; haiku 32000) — NOT over the whole registry family. The
+# registry also holds claude-opus-4-0 / -4-5 at 32000, so should a legacy opus ever be added
+# to models.json, the opus row here would over-advertise it and must drop to 32000.
+# Family prefixes cannot distinguish versions, so a floor is used deliberately:
+# under-advertising caps a client lower than the model allows, which is safe, whereas
+# over-advertising would promise capacity a member of the family does not have.
 # models.json is authoritative per ADR 0003; this table only exists because /v1/models does
 # not expose maxTokens.
 model_meta = {
@@ -147,11 +150,14 @@ def get_model_meta(mid):
     for prefix, meta in sorted(model_meta.items(), key=lambda x: -len(x[0])):
         if mid.startswith(prefix):
             return meta
-    # Unknown id = most likely a model newer than this script. 32000 is the LOWEST
-    # max_output_tokens.default in the CLI 2.1.220 registry (haiku/sonnet-4-6), so it is the
-    # safe floor: never over-advertises a real model, and no longer contradicts the rest of
-    # this table by sitting below every family in it.
-    return {"name": mid + " (OCP)", "reasoning": False, "maxTokens": 32000}
+    # Unknown id. 8192 is the GLOBAL MINIMUM max_output_tokens.default across all 17 records in
+    # the CLI 2.1.220 registry (distinct values: 8192 / 32000 / 64000). The two records holding
+    # it — claude-3-5-haiku and claude-3-5-sonnet, both default:8192, upper:8192 — are precisely
+    # the ones that reach this line, because "claude-3-5-*" matches none of the family prefixes
+    # above. Raising this to a family-table value would over-advertise those two by 4x. Keep 8192:
+    # under-advertising caps a client lower than a model allows, which is safe; over-advertising
+    # promises capacity that does not exist.
+    return {"name": mid + " (OCP)", "reasoning": False, "maxTokens": 8192}
 
 for mid in model_ids:
     meta = get_model_meta(mid)

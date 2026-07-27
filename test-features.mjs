@@ -4310,9 +4310,17 @@ test("models.json: every aliases value resolves to a real models[].id (referenti
 // value above the bar and still call itself "registry-aligned" — which is the actual claim. Adding
 // a model means adding a row here, and that is the point: the row is where you record what the
 // registry said when you checked.
-const _spotRegistryMaxTokens = {           // CLI 2.1.220, id-anchored max_output_tokens.default
+// Keys are models.json ids; values are the CLI 2.1.220 registry's max_output_tokens.default,
+// each extracted id-anchored (grep 'id:"<id>"' + the following bytes) — never by bare-string
+// search, which matches cross-references inside OTHER models' records and silently attributes
+// the wrong number. ONE KEY IS NOT A REGISTRY ID: models.json carries the dated haiku id, but
+// the registry record is id:"claude-haiku-4-5" (the dated string appears only as that record's
+// provider_ids.first_party). Anchor the haiku row on the SHORT id; anchoring on the dated one
+// returns nothing, which is what tempts the next reader back into a bare-string search.
+const _spotRegistryMaxTokens = {
   "claude-opus-5": 64000, "claude-opus-4-8": 64000, "claude-opus-4-7": 64000, "claude-opus-4-6": 64000,
-  "claude-sonnet-5": 64000, "claude-sonnet-4-6": 32000, "claude-haiku-4-5-20251001": 32000,
+  "claude-sonnet-5": 64000, "claude-sonnet-4-6": 32000,
+  "claude-haiku-4-5-20251001": 32000,       // registry id: claude-haiku-4-5
 };
 test("models.json: every maxTokens equals the CLI registry's max_output_tokens.default (#195)", () => {
   for (const m of _spotModels.models) {
