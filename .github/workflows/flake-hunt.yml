@@ -1,45 +1,69 @@
 name: flake hunt (#203)
 
-# Manual only. This never runs on push or PR — it exists to reproduce a flake that has
-# been seen FOUR times, always on Linux CI, and never once on macOS (0/1000+ across two
-# independent experiments). The suspected variables are the platform and the Node version,
-# so both are inputs.
+# Manual only. This never runs on push or pull_request, so it costs nothing until asked for.
 #
-# Background: an attempt to run this on a Linux VM was invalidated because Node 22 emits a
-# `node:sqlite` ExperimentalWarning on stderr, which the boot gate read as "server did not
-# start" — ~23 of 50 runs failed spuriously. That is exactly why `node` is an input here
-# rather than pinned: 22-vs-24 is a comparison worth running deliberately, not an accident
-# to stumble into. Interpret any 22 result against that known confound.
+# #203 has been seen four times, always on Linux CI, never on macOS. This is the instrument
+# for reproducing it deliberately instead of by chance on someone else's PR.
 #
-# Concurrency is the load-bearing knob, not round count. test-features.mjs makes test()
-# fire-and-forget for async bodies, so one suite run already spawns 15 concurrent
-# `server.mjs` children across 11 ltBoot tests; running several suites at once is what
-# multiplies cross-process contention. See AGENTS.md § "Testing: reaching faults inside
-# server.mjs".
+# WHAT IS AND IS NOT KNOWN ABOUT THE NOISE FLOOR — read before interpreting any result.
+# An earlier Linux VM attempt was reported as invalidated by Node 22's `node:sqlite`
+# ExperimentalWarning. That attribution was WRONG and is corrected here so nobody acts on it:
+# the boot predicate is `buf.out.includes("listening on") || buf.exit != null` — stdout only.
+# `buf.err` appears in the assertion MESSAGE, never in the condition, so a stderr warning
+# cannot fail that assertion. It was visible in the failure text and mistaken for the cause.
+# The real noise floor was pre-#204 fixed ports: that branch's control arm measured 246
+# EADDRINUSE and only 42/200 clean runs on unmodified main. #204 removed it. Node 22 is
+# therefore a PERFECTLY USABLE arm — the suite passes 462/0 under it — and is offered below.
+#
+# Concurrency is the knob, not round count: test() is fire-and-forget for async bodies, so one
+# suite run peaks at ~11-12 concurrent server.mjs children (15 total spawns; the gate test's
+# 3 cases and the 2 epoch boots are awaited serially, so they never overlap). Several suites
+# at once is what multiplies cross-process contention. See AGENTS.md § "Testing: reaching
+# faults inside server.mjs".
 
 on:
   workflow_dispatch:
     inputs:
+      ref:
+        description: 'Commit/branch to hunt on. Use 7f15921^ for the PRE-#204 tree — see the note below.'
+        default: ''
       node:
-        description: 'Node major version (24 = what CI and released OCP run; 22 has the SQLite stderr confound)'
+        description: 'Node major version'
         default: '24'
         type: choice
-        options: ['24', '22', '26']
+        options: ['24', '22', '25', '26']
       rounds:
         description: 'Rounds; each round runs <concurrency> suites at once and waits'
-        default: '25'
+        default: '50'
+        type: number
       concurrency:
         description: 'Concurrent suite processes per round (this is the knob that reproduces)'
         default: '4'
+        type: number
+
+# `ref` exists because a null result on current main is UNINTERPRETABLE. #204 may already have
+# fixed #203 — if it did, 0/200 on main cannot be told apart from "didn't hunt hard enough" or
+# "wrong configuration". Running 7f15921^ (pre-#204) is the positive control: reproducing there
+# and not on main establishes both the mechanism and the fix. Hunt the control first.
+
+permissions:
+  contents: read
+
+# Two dispatches of this would otherwise run concurrently and contend with each other, which is
+# the one variable the experiment is trying to control.
+concurrency:
+  group: flake-hunt-${{ github.ref }}
+  cancel-in-progress: false
 
 jobs:
   hunt:
-    name: 'hunt: node ${{ inputs.node }} x ${{ inputs.rounds }} rounds x ${{ inputs.concurrency }}'
+    name: 'hunt: node ${{ inputs.node }} x ${{ inputs.rounds }} x ${{ inputs.concurrency }}'
     runs-on: ubuntu-latest
-    timeout-minutes: 60
 
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref }}
 
       - uses: actions/setup-node@v4
         with:
@@ -47,26 +71,30 @@ jobs:
 
       - name: Record the environment
         run: |
-          set -euo pipefail
+          set +e -u -o pipefail
           {
+            echo "ref        $(git rev-parse HEAD)  ($(git log -1 --format=%s | cut -c1-60))"
             echo "node       $(node --version)"
             echo "kernel     $(uname -srm)"
             echo "cpus       $(nproc)"
             echo "ephemeral  $(cat /proc/sys/net/ipv4/ip_local_port_range)"
           } | tee env.txt
-          # The ephemeral range matters: the fixed ports this suite used before #204
-          # (39321-39364) sit INSIDE Linux's default 32768-60999 but OUTSIDE macOS's
-          # 49152-65535, which is independent support for "CI is more exposed than a Mac".
 
       - name: Hunt
+        timeout-minutes: 50
+        env:
+          # Inputs go through env, never interpolated into the script body: GitHub documents
+          # `inputs.*` as untrusted, and a free-text field spliced into shell is injectable.
+          ROUNDS: ${{ inputs.rounds }}
+          CONC: ${{ inputs.concurrency }}
         run: |
-          set -uo pipefail          # NOT -e: a failing suite run is the DATA, not an error
+          set +e -u -o pipefail          # a failing suite run is the DATA, not a step failure
           mkdir -p logs
-          R=${{ inputs.rounds }}
-          C=${{ inputs.concurrency }}
-          for r in $(seq 1 "$R"); do
-            for c in $(seq 1 "$C"); do
-              npm test > "logs/r${r}c${c}.log" 2>&1 &
+          for r in $(seq 1 "$ROUNDS"); do
+            for c in $(seq 1 "$CONC"); do
+              # Per-run timeout: without it a single hung child blocks `wait` until the step
+              # timeout and the whole hunt yields nothing.
+              timeout 300 npm test > "logs/r${r}c${c}.log" 2>&1 &
             done
             wait
             printf '.'
@@ -76,70 +104,74 @@ jobs:
       - name: Classify
         if: always()
         run: |
-          set -uo pipefail
+          # `set +e` is load-bearing, NOT decoration. GitHub's default shell is `bash -e {0}`,
+          # and `set -uo pipefail` does not turn errexit off — it only ADDS pipefail. Every
+          # category that counts ZERO makes grep exit 1, pipefail propagates it, and errexit
+          # kills the step before it writes any summary. The all-clean case — the one this
+          # workflow most wants to report — dies first. Verified: identical script exits 1 with
+          # 0 bytes of summary under `bash -e`, and 0 with a full summary under `set +e`.
+          set +e -u -o pipefail
 
-          # EVERY pattern is anchored on the failure marker AND on the test's name, because
-          # the categories cross-contaminate otherwise. ltDiag samples the first 900B of the
-          # child's stdout (PR #204), which is the boot banner — so a log where only the GATE
-          # test failed still contains the string "Local tools: ON", and an unanchored
-          # `grep -l 'Local tools'` scores it as an announcement failure too. Verified against
-          # real logs: 3 clean runs + 1 gate-mutation run gave
-          #   unanchored 'Local tools' -> 1 hit, attributed to the WRONG category
-          #   anchored                 -> gate=1, announce=0     (correct)
-          # A diagnostic that quotes the program's own output makes substring classification
-          # unsound; anchor on what the runner prints, not on what the child printed.
-          n() { grep -l "✗.*$1" logs/*.log 2>/dev/null | wc -l | tr -d ' '; }
-
-          total=$(ls logs/*.log | wc -l | tr -d ' ')
+          total=$(ls logs/*.log 2>/dev/null | wc -l | tr -d ' ')
           clean=$(grep -l ', 0 failed ===' logs/*.log 2>/dev/null | wc -l | tr -d ' ')
 
-          # A category scoring 0 has NOT been proven absent — it may simply not fire in this
-          # configuration. Only a non-zero count is evidence.
-          gate=$(n 'boot gate REFUSES')
-          tui=$(n 'announced INERT')
-          announce=$(n 'BOOTS past the gate')
-          # These two are runtime errors rather than named tests, so they are matched on the
-          # error string anywhere in the log, not on a ✗ line.
-          eaddr=$(grep -l 'EADDRINUSE' logs/*.log 2>/dev/null | wc -l | tr -d ' ')
-          enotempty=$(grep -l 'ENOTEMPTY' logs/*.log 2>/dev/null | wc -l | tr -d ' ')
+          # #203's SIGNATURE, not just its test name. A CPU-starved runner (4 vCPU carrying
+          # ~44 node processes at concurrency 4) can blow the 9s ltWait and produce the same
+          # "✗ boot gate REFUSES" line with closed=false / (still open). That is contention,
+          # not #203. The real one is: the child CLOSED, exited non-zero, and stderr was EMPTY.
+          sig=$(grep -l '✗.*boot gate REFUSES.*closed=true.*stderr(0B)' logs/*.log 2>/dev/null | wc -l | tr -d ' ')
+          gate=$(grep -l '✗.*boot gate REFUSES' logs/*.log 2>/dev/null | wc -l | tr -d ' ')
 
           {
             echo "## flake hunt — node ${{ inputs.node }}"
             echo
             echo '```'
-            cat env.txt
+            cat env.txt 2>/dev/null || echo "(env.txt missing — the Record step did not run)"
             echo '```'
             echo
-            echo "| category | runs affected |"
+            echo "| | runs |"
             echo "|---|---|"
             echo "| **clean (0 failed)** | **$clean / $total** |"
-            echo "| #203 boot gate | $gate |"
-            echo "| #199 TUI inert warning | $tui |"
-            echo "| \`Local tools\` announce | $announce |"
-            echo "| EADDRINUSE | $eaddr |"
-            echo "| ENOTEMPTY teardown | $enotempty |"
+            echo "| #203 **signature** (gate + closed=true + stderr 0B) | **$sig** |"
+            echo "| gate test failed, any cause (includes contention) | $gate |"
             echo
+            echo "\`sig\` is the number that answers #203. \`gate\` minus \`sig\` is runner contention."
             echo "A zero is not proof of absence — only a non-zero count is evidence."
+            echo
+            # Full histogram instead of a hand-maintained category list: a category table
+            # silently drops every failure nobody thought to enumerate, and on a hunt the
+            # unenumerated failure is exactly the interesting one.
+            # Bucket on a fixed-width prefix of the test NAME, not on `sed 's/:.*//'` — test
+            # names contain colons, so cutting at the first one collapses every
+            # `localToolsSafetyError: <case>` into one useless bucket. 72 chars keeps the
+            # cases apart while still stripping the per-run assertion detail.
+            echo "### every failing assertion, by test"
+            echo '```'
+            grep -h '✗' logs/*.log 2>/dev/null | sed 's/^ *✗ //' | cut -c1-72 | sort | uniq -c | sort -rn | head -25
+            echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
 
-          # Surface the diagnostics inline so a repro is readable without downloading.
-          # ltDiag prints exit/signal/closed/closeMs/node plus both streams (PR #204).
-          if [ "$clean" -lt "$total" ]; then
-            echo "### first failing run" >> "$GITHUB_STEP_SUMMARY"
-            echo '```' >> "$GITHUB_STEP_SUMMARY"
-            grep -h '✗' $(grep -L ', 0 failed ===' logs/*.log | head -1) | head -20 >> "$GITHUB_STEP_SUMMARY"
-            echo '```' >> "$GITHUB_STEP_SUMMARY"
+          # Prefer a log carrying the actual signature; fall back to any failing log.
+          first=$(grep -l '✗.*boot gate REFUSES.*closed=true.*stderr(0B)' logs/*.log 2>/dev/null | head -1)
+          [ -z "$first" ] && first=$(grep -L ', 0 failed ===' logs/*.log 2>/dev/null | head -1)
+          if [ -n "$first" ]; then
+            {
+              echo "### $first"
+              echo '```'
+              grep -h '✗' "$first" | head -20
+              echo '```'
+            } >> "$GITHUB_STEP_SUMMARY"
           fi
 
       - name: Upload logs
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: flake-hunt-node${{ inputs.node }}
+          name: flake-hunt-node${{ inputs.node }}-${{ github.run_attempt }}
           path: |
             logs/
             env.txt
           retention-days: 14
 
-      # This job does NOT fail on a reproduction. Reproducing is the goal, and a red X
-      # would read as "the hunt is broken" rather than "the flake was caught".
+      # This job does NOT fail on a reproduction. Reproducing is the goal, and a red X would
+      # read as "the hunt is broken" rather than "the flake was caught".
