@@ -1,0 +1,145 @@
+name: flake hunt (#203)
+
+# Manual only. This never runs on push or PR — it exists to reproduce a flake that has
+# been seen FOUR times, always on Linux CI, and never once on macOS (0/1000+ across two
+# independent experiments). The suspected variables are the platform and the Node version,
+# so both are inputs.
+#
+# Background: an attempt to run this on a Linux VM was invalidated because Node 22 emits a
+# `node:sqlite` ExperimentalWarning on stderr, which the boot gate read as "server did not
+# start" — ~23 of 50 runs failed spuriously. That is exactly why `node` is an input here
+# rather than pinned: 22-vs-24 is a comparison worth running deliberately, not an accident
+# to stumble into. Interpret any 22 result against that known confound.
+#
+# Concurrency is the load-bearing knob, not round count. test-features.mjs makes test()
+# fire-and-forget for async bodies, so one suite run already spawns 15 concurrent
+# `server.mjs` children across 11 ltBoot tests; running several suites at once is what
+# multiplies cross-process contention. See AGENTS.md § "Testing: reaching faults inside
+# server.mjs".
+
+on:
+  workflow_dispatch:
+    inputs:
+      node:
+        description: 'Node major version (24 = what CI and released OCP run; 22 has the SQLite stderr confound)'
+        default: '24'
+        type: choice
+        options: ['24', '22', '26']
+      rounds:
+        description: 'Rounds; each round runs <concurrency> suites at once and waits'
+        default: '25'
+      concurrency:
+        description: 'Concurrent suite processes per round (this is the knob that reproduces)'
+        default: '4'
+
+jobs:
+  hunt:
+    name: 'hunt: node ${{ inputs.node }} x ${{ inputs.rounds }} rounds x ${{ inputs.concurrency }}'
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ inputs.node }}
+
+      - name: Record the environment
+        run: |
+          set -euo pipefail
+          {
+            echo "node       $(node --version)"
+            echo "kernel     $(uname -srm)"
+            echo "cpus       $(nproc)"
+            echo "ephemeral  $(cat /proc/sys/net/ipv4/ip_local_port_range)"
+          } | tee env.txt
+          # The ephemeral range matters: the fixed ports this suite used before #204
+          # (39321-39364) sit INSIDE Linux's default 32768-60999 but OUTSIDE macOS's
+          # 49152-65535, which is independent support for "CI is more exposed than a Mac".
+
+      - name: Hunt
+        run: |
+          set -uo pipefail          # NOT -e: a failing suite run is the DATA, not an error
+          mkdir -p logs
+          R=${{ inputs.rounds }}
+          C=${{ inputs.concurrency }}
+          for r in $(seq 1 "$R"); do
+            for c in $(seq 1 "$C"); do
+              npm test > "logs/r${r}c${c}.log" 2>&1 &
+            done
+            wait
+            printf '.'
+          done
+          echo
+
+      - name: Classify
+        if: always()
+        run: |
+          set -uo pipefail
+
+          # EVERY pattern is anchored on the failure marker AND on the test's name, because
+          # the categories cross-contaminate otherwise. ltDiag samples the first 900B of the
+          # child's stdout (PR #204), which is the boot banner — so a log where only the GATE
+          # test failed still contains the string "Local tools: ON", and an unanchored
+          # `grep -l 'Local tools'` scores it as an announcement failure too. Verified against
+          # real logs: 3 clean runs + 1 gate-mutation run gave
+          #   unanchored 'Local tools' -> 1 hit, attributed to the WRONG category
+          #   anchored                 -> gate=1, announce=0     (correct)
+          # A diagnostic that quotes the program's own output makes substring classification
+          # unsound; anchor on what the runner prints, not on what the child printed.
+          n() { grep -l "✗.*$1" logs/*.log 2>/dev/null | wc -l | tr -d ' '; }
+
+          total=$(ls logs/*.log | wc -l | tr -d ' ')
+          clean=$(grep -l ', 0 failed ===' logs/*.log 2>/dev/null | wc -l | tr -d ' ')
+
+          # A category scoring 0 has NOT been proven absent — it may simply not fire in this
+          # configuration. Only a non-zero count is evidence.
+          gate=$(n 'boot gate REFUSES')
+          tui=$(n 'announced INERT')
+          announce=$(n 'BOOTS past the gate')
+          # These two are runtime errors rather than named tests, so they are matched on the
+          # error string anywhere in the log, not on a ✗ line.
+          eaddr=$(grep -l 'EADDRINUSE' logs/*.log 2>/dev/null | wc -l | tr -d ' ')
+          enotempty=$(grep -l 'ENOTEMPTY' logs/*.log 2>/dev/null | wc -l | tr -d ' ')
+
+          {
+            echo "## flake hunt — node ${{ inputs.node }}"
+            echo
+            echo '```'
+            cat env.txt
+            echo '```'
+            echo
+            echo "| category | runs affected |"
+            echo "|---|---|"
+            echo "| **clean (0 failed)** | **$clean / $total** |"
+            echo "| #203 boot gate | $gate |"
+            echo "| #199 TUI inert warning | $tui |"
+            echo "| \`Local tools\` announce | $announce |"
+            echo "| EADDRINUSE | $eaddr |"
+            echo "| ENOTEMPTY teardown | $enotempty |"
+            echo
+            echo "A zero is not proof of absence — only a non-zero count is evidence."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          # Surface the diagnostics inline so a repro is readable without downloading.
+          # ltDiag prints exit/signal/closed/closeMs/node plus both streams (PR #204).
+          if [ "$clean" -lt "$total" ]; then
+            echo "### first failing run" >> "$GITHUB_STEP_SUMMARY"
+            echo '```' >> "$GITHUB_STEP_SUMMARY"
+            grep -h '✗' $(grep -L ', 0 failed ===' logs/*.log | head -1) | head -20 >> "$GITHUB_STEP_SUMMARY"
+            echo '```' >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Upload logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: flake-hunt-node${{ inputs.node }}
+          path: |
+            logs/
+            env.txt
+          retention-days: 14
+
+      # This job does NOT fail on a reproduction. Reproducing is the goal, and a red X
+      # would read as "the hunt is broken" rather than "the flake was caught".
