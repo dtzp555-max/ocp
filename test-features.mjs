@@ -4333,12 +4333,22 @@ test("models.json validates against models.schema.json (strict)", () => {
 // Three corruptions the SCHEMA structurally cannot catch, asserted directly instead of pretending
 // the schema covers them: the validator has no uniqueItems, no minLength, and no minimum. Adding
 // those keywords to the schema would be silently ignored (see its description), so they live here.
-test("models.json: ids are unique, non-empty, and windows are positive (not schema-expressible)", () => {
-  const ids = _spotModels.models.map(m => m.id);
-  assert.equal(new Set(ids).size, ids.length, `duplicate models[].id: ${ids.filter((v, i) => ids.indexOf(v) !== i)}`);
+test("models.json: ids/names are unique, untrimmed-free, and windows are positive (not schema-expressible)", () => {
+  // Uniqueness applies to all three name fields, not just id. scripts/sync-openclaw.mjs maps
+  // `claude-local/<id>` -> { alias: displayName } and writes openclawName as the registry label,
+  // so a duplicate in EITHER collapses two models onto one OpenClaw entry — the same defect class
+  // as a duplicate id, which is why review flagged covering only id as a half-fix.
+  for (const f of ["id", "displayName", "openclawName"]) {
+    const vals = _spotModels.models.map(m => m[f]);
+    const dupes = vals.filter((v, i) => vals.indexOf(v) !== i);
+    assert.equal(new Set(vals).size, vals.length, `duplicate models[].${f}: ${[...new Set(dupes)]}`);
+  }
   for (const m of _spotModels.models) {
     for (const f of ["id", "displayName", "openclawName"]) {
-      assert.ok(typeof m[f] === "string" && m[f].trim().length > 0, `${m.id}: ${f} must be a non-empty string`);
+      assert.ok(typeof m[f] === "string" && m[f].length > 0, `${m.id}: ${f} must be a non-empty string`);
+      // === trim(), not trim().length: a padded id passes a trimmed check but is handed VERBATIM
+      // to `claude --model`, so " claude-opus-5" would fail upstream rather than here.
+      assert.equal(m[f], m[f].trim(), `${m.id}: ${f} has leading/trailing whitespace`);
     }
     assert.ok(m.contextWindow > 0, `${m.id}: contextWindow must be positive`);
     assert.ok(m.maxTokens > 0, `${m.id}: maxTokens must be positive`);
