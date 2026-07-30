@@ -7652,60 +7652,151 @@ test("LOW-2 (real shell, verified mechanism): ocp's doctor-check-surfacing block
 // kept serving the old version. See scripts/lib/restart-unit.mjs and the two
 // restart call sites in scripts/upgrade.mjs (runFullUpgrade phase 5, runRollback).
 //
+// Independent review of the first version of this fix (PR #221) found the
+// module resolved every AMBIGUOUS case into a wrong CONFIDENT answer instead of
+// an honest "unknown", which matters because "unknown" must never be treated as
+// safe-to-guess. This revision closes those findings; each test below that
+// exists BECAUSE of the review says so in its name (HIGH-1, MED-3, MED-4, MED-5,
+// MED-6, MED-7, MED-8).
+//
 // Every test here is BEHAVIORAL: it calls the exported resolver/planner
-// functions (or runUpgrade with injected mocks) and asserts on return values
-// or thrown messages — never on scripts/upgrade.mjs's source text.
+// functions (or runUpgrade with injected mocks / an injected command runner)
+// and asserts on return values or thrown messages — never on scripts/
+// upgrade.mjs's or scripts/lib/restart-unit.mjs's source text.
 // ═══════════════════════════════════════════════════════════════════════════
-import { resolveOwningUnit, planRestart, parseSsListenerPid, parseLsofListenerPid, parseCgroupUnit } from "./scripts/lib/restart-unit.mjs";
+import { resolveOwningUnit, planRestart, classifySsListener, classifyLsofListener, parseCgroupUnit } from "./scripts/lib/restart-unit.mjs";
 
-console.log("\nRestart-unit resolution (issue #215):");
+console.log("\nRestart-unit resolution (issue #215) — classifiers:");
 
-// ── raw-output parsers ──
+// ── classifySsListener / classifyLsofListener: three-valued (HIGH-1) ──
 
-test("parseSsListenerPid extracts the PID from `ss -lptn` output", () => {
+test("classifySsListener: single clean LISTEN row → listening(pid)", () => {
   const ss = `State  Recv-Q Send-Q  Local Address:Port   Peer Address:Port  Process\nLISTEN 0      511          0.0.0.0:3456        0.0.0.0:*     users:(("node",pid=798931,fd=19))`;
-  assert.equal(parseSsListenerPid(ss), "798931");
+  assert.deepEqual(classifySsListener(ss), { state: "listening", pid: "798931", reason: null });
 });
 
-test("parseSsListenerPid returns null when ss reports nothing listening", () => {
-  assert.equal(parseSsListenerPid(""), null);
-  assert.equal(parseSsListenerPid("State  Recv-Q Send-Q  Local Address:Port   Peer Address:Port  Process\n"), null);
+test("classifySsListener: no LISTEN row at all → not-listening (never confused with unknown)", () => {
+  assert.deepEqual(classifySsListener(""), { state: "not-listening", pid: null, reason: null });
+  assert.equal(classifySsListener("State  Recv-Q Send-Q  Local Address:Port   Peer Address:Port  Process\n").state, "not-listening");
 });
 
-test("parseLsofListenerPid extracts the PID from `lsof -iTCP -sTCP:LISTEN` output, skipping the header", () => {
+test("HIGH-1: classifySsListener never runs (null) → unknown, NOT not-listening", () => {
+  // The defect: the old code treated "tool didn't run" and "confirmed empty" identically,
+  // which silently re-ran the pre-#215 default command and reported SUCCESS.
+  const result = classifySsListener(null);
+  assert.equal(result.state, "unknown");
+  assert.notEqual(result.state, "not-listening");
+});
+
+test("HIGH-1: classifySsListener — a LISTEN row with NO owning PID (foreign-uid process) → unknown", () => {
+  // Live-verified repro from the review: `ss -lptn`'s `users:(())` PID column is omitted
+  // ENTIRELY (not printed empty — absent) when the caller cannot see the target's /proc/*/fd,
+  // which is exactly what happens when a non-root updater probes a root-owned system unit
+  // (the default for `User=` unset). This is the actual #215-shaped failure mode: it does not
+  // currently bite this fleet (system units here run as the same user as the updater) but
+  // bites the moment anyone runs OCP as root.
+  const ss = "LISTEN 0 100  172.16.2.231:40065  0.0.0.0:*";
+  const result = classifySsListener(ss);
+  assert.equal(result.state, "unknown");
+  assert.equal(result.pid, null);
+  assert.ok(/different user|privileges/.test(result.reason), `reason should explain the privilege gap; got: ${result.reason}`);
+});
+
+test("classifySsListener: two distinct PIDs answering the same port (dual-stack/SO_REUSEPORT) → unknown, not an arbitrary pick", () => {
+  // "which of several listeners" is issue #215's own diagnostic question — picking the first
+  // pid= found anywhere in the blob (the pre-review implementation) answered it by coin flip.
+  const ss = `LISTEN 0 511 0.0.0.0:3456 0.0.0.0:* users:(("node",pid=100,fd=3))\nLISTEN 0 511 [::]:3456 [::]:* users:(("node",pid=200,fd=4))`;
+  const result = classifySsListener(ss);
+  assert.equal(result.state, "unknown");
+  assert.ok(result.reason.includes("100") && result.reason.includes("200"));
+});
+
+test("classifyLsofListener: single row → listening(pid), skips the header", () => {
   const lsof = `COMMAND   PID  USER   FD   TYPE DEVICE SIZE/OFF NODE NAME\nnode    12345 opc   23u  IPv6 0x1234      0t0  TCP *:3456 (LISTEN)`;
-  assert.equal(parseLsofListenerPid(lsof), "12345");
+  assert.deepEqual(classifyLsofListener(lsof), { state: "listening", pid: "12345", reason: null });
 });
 
-test("parseLsofListenerPid returns null on empty lsof output (nothing listening)", () => {
-  assert.equal(parseLsofListenerPid(""), null);
+test("classifyLsofListener: empty output → not-listening; null (tool didn't run) → unknown", () => {
+  assert.equal(classifyLsofListener("").state, "not-listening");
+  assert.equal(classifyLsofListener(null).state, "unknown");
 });
 
-test("parseCgroupUnit resolves a SYSTEM unit from a cgroup v2 unified line", () => {
-  const cgroup = "0::/system.slice/ocp.service\n";
-  assert.deepEqual(parseCgroupUnit(cgroup), { scope: "system", unit: "ocp.service" });
+// ── parseCgroupUnit: leaf→root walk, multi-line fallback, unreadable ≠ no-unit (MED-3) ──
+
+test("parseCgroupUnit: default system.slice-nested unit resolves", () => {
+  assert.deepEqual(parseCgroupUnit("0::/system.slice/ocp.service\n"),
+    { state: "resolved", scope: "system", unit: "ocp.service", reason: null });
 });
 
-test("parseCgroupUnit resolves a USER unit and does not mistake the user manager's own unit for it", () => {
-  // Regression guard: "user@1000.service" (the systemd --user manager's own unit) is a
-  // non-leaf segment of this real path and ends in ".service" too. A naive "first .service
-  // segment after user.slice/" match would report the wrong unit. Only the LEAF segment
-  // (ocp-proxy.service) is the unit the process actually belongs to.
+test("MED-3: parseCgroupUnit resolves a custom top-level Slice= (no literal \"system.slice\" segment at all)", () => {
+  // Review's own repro table: "0::/ocp.slice/ocp.service" previously hard-ABORTED with a false
+  // "not managed by any systemd unit" diagnosis, because scope detection required the literal
+  // substring "/system.slice/". A custom Slice=ocp.slice for a SYSTEM unit has no such segment.
+  const result = parseCgroupUnit("0::/ocp.slice/ocp.service\n");
+  assert.equal(result.state, "resolved");
+  assert.equal(result.scope, "system");
+  assert.equal(result.unit, "ocp.service");
+});
+
+test("MED-3: parseCgroupUnit resolves a Delegate=yes payload scope by walking UP to the owning .service", () => {
+  // The process's own cgroup is legitimately nested BELOW the unit for Delegate=yes units —
+  // the leaf segment ("payload.scope") is not the unit. Leaf-only (pre-review) hard-aborted.
+  const result = parseCgroupUnit("0::/system.slice/ocp.service/payload.scope\n");
+  assert.equal(result.state, "resolved");
+  assert.equal(result.unit, "ocp.service");
+});
+
+test("MED-3: parseCgroupUnit's cgroup-v1 fallback is REACHABLE even when a 0::/ line is present but uninformative", () => {
+  // Pre-review: the function picked the "0::" line whenever it EXISTED, full stop — so the
+  // advertised v1 "name=systemd" fallback was dead code any time a 0::/ line existed at all,
+  // even a bare "0::/" that resolves to nothing. Every candidate line must be tried.
+  const result = parseCgroupUnit("1:name=systemd:/system.slice/ocp.service\n0::/\n");
+  assert.equal(result.state, "resolved");
+  assert.equal(result.unit, "ocp.service");
+});
+
+test("parseCgroupUnit still avoids the user@<uid>.service trap (regression guard, pre-existing coverage)", () => {
   const cgroup = "0::/user.slice/user-1000.slice/user@1000.service/app.slice/ocp-proxy.service\n";
-  assert.deepEqual(parseCgroupUnit(cgroup), { scope: "user", unit: "ocp-proxy.service" });
+  assert.deepEqual(parseCgroupUnit(cgroup), { state: "resolved", scope: "user", unit: "ocp-proxy.service", reason: null });
 });
 
-test("parseCgroupUnit returns null for a bare process not owned by any unit (session scope)", () => {
+test("parseCgroupUnit: genuinely bare process (session scope, no .service anywhere) → no-unit", () => {
   const cgroup = "0::/user.slice/user-1000.slice/user@1000.service/session.slice/session-3.scope\n";
-  assert.equal(parseCgroupUnit(cgroup), null);
+  const result = parseCgroupUnit(cgroup);
+  assert.equal(result.state, "no-unit");
 });
 
-test("parseCgroupUnit returns null for empty/root cgroup content", () => {
-  assert.equal(parseCgroupUnit(""), null);
-  assert.equal(parseCgroupUnit("0::/\n"), null);
+test("MED-3: parseCgroupUnit — UNREADABLE cgroup (null) is 'unknown', never the false-confident 'no-unit'", () => {
+  // The defect: null used to be treated identically to "read fine, found nothing", which then
+  // hard-threw claiming the PID "is not managed by any systemd unit" — a diagnosis the code
+  // has no actual evidence for. Permission-denied (hidepid=2) and a PID that exited between
+  // the ss/lsof probe and this read both look like this.
+  const result = parseCgroupUnit(null);
+  assert.equal(result.state, "unknown");
+  assert.notEqual(result.state, "no-unit");
 });
 
-// ── resolveOwningUnit: the 5 required scenarios ──
+test("MED-3: parseCgroupUnit — empty-string cgroup read is also 'unknown', not 'no-unit'", () => {
+  assert.equal(parseCgroupUnit("").state, "unknown");
+});
+
+test("MED-5: parseCgroupUnit rejects a semicolon-injected unit segment — never becomes a restart target", () => {
+  // Exact PoC from the review: a cgroup v2 delegated directory name is attacker-creatable, and
+  // this segment would otherwise be concatenated straight into `sh -c`.
+  const cgroup = "0::/user.slice/user-1000.slice/user@1000.service/app.slice/a;id.service\n";
+  const result = parseCgroupUnit(cgroup);
+  assert.notEqual(result.state, "resolved", "an unvalidated unit name must never resolve");
+  assert.equal(result.unit, null);
+});
+
+test("MED-5: parseCgroupUnit rejects a space-containing unit segment (word-splits into multiple systemctl args otherwise)", () => {
+  const cgroup = "0::/system.slice/a b c.service\n";
+  const result = parseCgroupUnit(cgroup);
+  assert.notEqual(result.state, "resolved");
+  assert.equal(result.unit, null);
+});
+
+console.log("\nRestart-unit resolution (issue #215) — resolveOwningUnit composition:");
 
 test("resolveOwningUnit: Linux system unit — the exact issue #215 scenario (mismatched vs the hard-coded user unit)", () => {
   const owner = resolveOwningUnit({
@@ -7758,30 +7849,61 @@ test("resolveOwningUnit: not-listening — nothing bound to the port, on either 
   assert.equal(resolveOwningUnit({ platform: "darwin", lsofOutput: "" }).kind, "not-listening");
 });
 
-// ── planRestart: command selection, loud warnings, and the refuse-to-guess cases ──
+test("HIGH-1: resolveOwningUnit — root-owned listener seen by a non-root updater resolves to 'unknown', end to end", () => {
+  const owner = resolveOwningUnit({
+    platform: "linux", expectedUnit: "ocp-proxy.service",
+    ssOutput: "LISTEN 0 100  172.16.2.231:40065  0.0.0.0:*",
+  });
+  assert.equal(owner.kind, "unknown");
+  assert.ok(owner.reason);
+});
 
-test("planRestart: mismatched system unit + sudo available restarts the RESOLVED unit and warns loudly, citing #215", () => {
+test("resolveOwningUnit: macOS — tool didn't run (null lsofOutput) → unknown, not not-listening", () => {
+  assert.equal(resolveOwningUnit({ platform: "darwin", lsofOutput: null }).kind, "unknown");
+});
+
+console.log("\nRestart-unit resolution (issue #215) — planRestart (refusals + MED-4/MED-7):");
+
+test("planRestart: mismatched system unit, root, restarts the RESOLVED unit with no sudo prefix and warns loudly citing #215", () => {
   const owner = resolveOwningUnit({
     platform: "linux", expectedUnit: "ocp-proxy.service",
     ssOutput: `LISTEN 0 511 0.0.0.0:3456 0.0.0.0:* users:(("node",pid=798931,fd=19))`,
     cgroupContent: "0::/system.slice/ocp.service\n",
   });
-  const plan = planRestart(owner, { expectedUnit: "ocp-proxy.service", sudoAvailable: true });
+  const plan = planRestart(owner, { expectedUnit: "ocp-proxy.service", isRoot: true });
   assert.equal(plan.cmds.length, 1);
-  assert.equal(plan.cmds[0].cmd, "sudo systemctl restart ocp.service");
+  assert.equal(plan.cmds[0].cmd, "systemctl restart ocp.service");
   assert.ok(plan.warnings.some(w => w.includes("ocp.service") && w.includes("#215")),
     "must name the resolved unit and cite #215 in the loud warning");
 });
 
-test("planRestart: system unit + sudo UNAVAILABLE aborts with an actionable message instead of guessing", () => {
+test("planRestart: mismatched system unit, not root, sudo authorized for THIS command → sudo-prefixed restart", () => {
+  const owner = resolveOwningUnit({
+    platform: "linux", expectedUnit: "ocp-proxy.service",
+    ssOutput: `LISTEN 0 511 0.0.0.0:3456 0.0.0.0:* users:(("node",pid=798931,fd=19))`,
+    cgroupContent: "0::/system.slice/ocp.service\n",
+  });
+  const plan = planRestart(owner, { expectedUnit: "ocp-proxy.service", isRoot: false, sudoAuthorized: true });
+  assert.equal(plan.cmds[0].cmd, "sudo systemctl restart ocp.service");
+});
+
+test("MED-4: planRestart — system unit, not root, sudo NOT authorized for this specific command aborts with an actionable message", () => {
   const owner = resolveOwningUnit({
     platform: "linux", expectedUnit: "ocp-proxy.service",
     ssOutput: `LISTEN 0 511 0.0.0.0:3456 0.0.0.0:* users:(("node",pid=798931,fd=19))`,
     cgroupContent: "0::/system.slice/ocp.service\n",
   });
   assert.throws(
-    () => planRestart(owner, { expectedUnit: "ocp-proxy.service", sudoAvailable: false }),
-    /sudo systemctl restart ocp\.service.*manually|non-interactive sudo is unavailable/s
+    () => planRestart(owner, { expectedUnit: "ocp-proxy.service", isRoot: false, sudoAuthorized: false }),
+    /sudo systemctl restart ocp\.service.*manually|not authorized non-interactively/s
+  );
+});
+
+test("planRestart: unknown always refuses, quoting the specific reason it couldn't tell", () => {
+  const owner = { kind: "unknown", platform: "linux", pid: null, unit: null, mismatched: false, reason: "multiple distinct PIDs (100, 200)" };
+  assert.throws(
+    () => planRestart(owner, { expectedUnit: "ocp-proxy.service" }),
+    /multiple distinct PIDs \(100, 200\)/
   );
 });
 
@@ -7793,14 +7915,17 @@ test("planRestart: no-unit refuses to restart a guessed name (must not silently 
   );
 });
 
-test("planRestart: not-listening falls back to starting the expected unit fresh (no orphan risk, no throw)", () => {
+test("MED-7: planRestart — not-listening now REFUSES rather than silently starting the default (loopback) unit", () => {
+  // Review finding: this looked like the SAFEST case (nothing to collide with) but is actually
+  // the most dangerous — if the real production listener is a SYSTEM unit that's merely down
+  // right now, falling back to the default starts the OTHER (often loopback-only) unit, and
+  // post-flight (which only curls 127.0.0.1) reports a clean SUCCESS while the host silently
+  // loses LAN reachability.
   const ownerLinux = { kind: "not-listening", platform: "linux", pid: null, unit: null, mismatched: false };
-  const planLinux = planRestart(ownerLinux, { expectedUnit: "ocp-proxy.service" });
-  assert.equal(planLinux.cmds[0].cmd, "systemctl --user restart ocp-proxy.service");
+  assert.throws(() => planRestart(ownerLinux, { expectedUnit: "ocp-proxy.service" }), /nothing is currently listening/);
 
   const ownerDarwin = { kind: "not-listening", platform: "darwin", pid: null, unit: null, mismatched: false };
-  const planDarwin = planRestart(ownerDarwin, { expectedUnit: "dev.ocp.proxy", plistPath: "/tmp/x.plist" });
-  assert.ok(planDarwin.cmds.some(c => c.cmd.includes("launchctl bootstrap")));
+  assert.throws(() => planRestart(ownerDarwin, { expectedUnit: "dev.ocp.proxy", plistPath: "/tmp/x.plist" }), /nothing is currently listening/);
 });
 
 test("planRestart: launchd always keeps the bootout+bootstrap pair (kickstart -k does not re-read plist env)", () => {
@@ -7811,7 +7936,19 @@ test("planRestart: launchd always keeps the bootout+bootstrap pair (kickstart -k
   assert.ok(plan.cmds[1].cmd.includes("launchctl bootstrap") && plan.cmds[1].cmd.includes("/tmp/dev.ocp.proxy.plist"));
 });
 
-// ── wiring: runUpgrade actually uses the resolved plan, on BOTH restart sites ──
+test("MED-5: planRestart re-validates the unit name at the shell-out boundary itself (defense in depth)", () => {
+  // Unreachable through parseCgroupUnit's own validation in normal operation — this proves the
+  // point where the string is actually concatenated into a command ALSO refuses, so a future
+  // caller that constructs an owner object by some other path (a second probe source, a bug)
+  // can't reintroduce the injection by skipping the cgroup-layer check.
+  const owner = { kind: "user-unit", platform: "linux", pid: "1", unit: "a;id.service", mismatched: false };
+  assert.throws(() => planRestart(owner, { expectedUnit: "ocp-proxy.service" }), /failed validation/);
+
+  const systemOwner = { kind: "system-unit", platform: "linux", pid: "1", unit: "a b c.service", mismatched: false };
+  assert.throws(() => planRestart(systemOwner, { expectedUnit: "ocp-proxy.service", isRoot: true }), /failed validation/);
+});
+
+console.log("\nRestart-unit resolution (issue #215) — upgrade.mjs wiring (mockOwnerProbe, both restart sites):");
 
 test("upgrade full path: mismatched system unit is restarted (not the hard-coded user unit), warning surfaces in phases", async () => {
   const result = await runUpgrade({
@@ -7822,10 +7959,10 @@ test("upgrade full path: mismatched system unit is restarted (not the hard-coded
       ssOutput: `LISTEN 0 511 0.0.0.0:3456 0.0.0.0:* users:(("node",pid=798931,fd=19))`,
       cgroupContent: "0::/system.slice/ocp.service\n",
     },
-    mockSudoAvailable: true,
+    mockIsRoot: true,
   });
   const restartCmds = result.phases.filter(p => p.name === "restart").map(p => p.cmd);
-  assert.ok(restartCmds.includes("sudo systemctl restart ocp.service"), `expected resolved-unit restart; got ${restartCmds.join(", ")}`);
+  assert.ok(restartCmds.includes("systemctl restart ocp.service"), `expected resolved-unit restart; got ${restartCmds.join(", ")}`);
   assert.ok(!restartCmds.includes("systemctl --user restart ocp-proxy.service"), "must NOT restart the wrong hard-coded unit");
   assert.ok(result.phases.some(p => p.name === "restart-resolve" && p.note.includes("#215")), "mismatch must surface loudly in phases");
 });
@@ -7844,7 +7981,7 @@ test("upgrade full path: port owned by no unit aborts the whole upgrade with an 
   }, /PID 55001.*not managed by any systemd unit/s);
 });
 
-test("upgrade full path: system unit + sudo unavailable aborts loudly rather than restarting the user unit", async () => {
+test("upgrade full path: system unit, not root, sudo not authorized aborts loudly rather than restarting the user unit", async () => {
   await assert.rejects(async () => {
     await runUpgrade({
       yes: true, dryRun: false, mockExec: true,
@@ -7854,9 +7991,51 @@ test("upgrade full path: system unit + sudo unavailable aborts loudly rather tha
         ssOutput: `LISTEN 0 511 0.0.0.0:3456 0.0.0.0:* users:(("node",pid=798931,fd=19))`,
         cgroupContent: "0::/system.slice/ocp.service\n",
       },
-      mockSudoAvailable: false,
+      mockIsRoot: false,
+      mockSudoAuthorized: false,
     });
-  }, /non-interactive sudo is unavailable/);
+  }, /not authorized non-interactively/);
+});
+
+test("HIGH-1 + MED-7 wiring: an unattributable listener (root-owned, foreign uid) aborts the upgrade instead of reporting success", async () => {
+  // This is the end-to-end version of the review's live repro: previously, this exact probe
+  // shape resolved to "not-listening" and the upgrade proceeded to run the pre-#215 default
+  // restart command, reporting SUCCESS while never having verified anything.
+  await assert.rejects(async () => {
+    await runUpgrade({
+      yes: true, dryRun: false, mockExec: true,
+      mockDoctor: { ready_to_upgrade: true, next_action: { kind: "upgrade" }, current_version: "v3.10.0", latest_version: "v3.14.0" },
+      mockPlatform: "linux",
+      mockOwnerProbe: { ssOutput: "LISTEN 0 100  172.16.2.231:40065  0.0.0.0:*" },
+    });
+  }, /could not determine what.*owns the OCP port/s);
+});
+
+test("MED-7 wiring: port genuinely not listening aborts the whole upgrade (no silent fallback to the default unit)", async () => {
+  // Wiring-level companion to the pure planRestart test above: proves runUpgrade itself
+  // refuses end to end, not just that planRestart would refuse if reached in isolation.
+  await assert.rejects(async () => {
+    await runUpgrade({
+      yes: true, dryRun: false, mockExec: true,
+      mockDoctor: { ready_to_upgrade: true, next_action: { kind: "upgrade" }, current_version: "v3.10.0", latest_version: "v3.14.0" },
+      mockPlatform: "linux",
+      mockOwnerProbe: { ssOutput: "" }, // ran cleanly, confirmed nothing listening
+    });
+  }, /nothing is currently listening/);
+});
+
+test("MED-5 wiring: an injected cgroup unit name never reaches a shell command — resolves no-unit and the upgrade refuses", async () => {
+  await assert.rejects(async () => {
+    await runUpgrade({
+      yes: true, dryRun: false, mockExec: true,
+      mockDoctor: { ready_to_upgrade: true, next_action: { kind: "upgrade" }, current_version: "v3.10.0", latest_version: "v3.14.0" },
+      mockPlatform: "linux",
+      mockOwnerProbe: {
+        ssOutput: `LISTEN 0 511 0.0.0.0:3456 0.0.0.0:* users:(("node",pid=798931,fd=19))`,
+        cgroupContent: "0::/system.slice/a;id.service\n",
+      },
+    });
+  }, /not managed by any systemd unit/); // rejected unit name → treated as no-unit, refuses
 });
 
 test("upgrade full path (no owner probe): still defaults to the historical Linux command — backward compatible", async () => {
@@ -7879,20 +8058,176 @@ test("upgrade full path (no owner probe): still defaults to the historical macOS
   assert.ok(restartCmds[1].includes("launchctl bootstrap"));
 });
 
-test("rollback path: mismatched system unit is restarted too (the SECOND restart call site)", async () => {
+console.log("\nRestart-unit resolution (issue #215) — MED-6: injected command runner drives the REAL gather+classify pipeline:");
+
+// makeFakeRun: a tiny command-router for opts.run. `handlers` maps a substring to either a
+// literal stdout string, a function(cmd)->string, or an Error instance to throw — this is what
+// lets tests drive scripts/upgrade.mjs's actual `ss`/`lsof`/`cat .../cgroup`/`sudo -n -l`
+// invocations end to end without touching a real service (review finding MED-6: this impure
+// layer — which command runs, with which flags, how a failure maps to a state — had ZERO
+// coverage in the first version of this fix, and that's exactly where the real bugs were).
+function makeFakeRun(handlers) {
+  return (cmd) => {
+    for (const key of Object.keys(handlers)) {
+      if (cmd.includes(key)) {
+        const h = handlers[key];
+        if (h instanceof Error) throw h;
+        return typeof h === "function" ? h(cmd) : h;
+      }
+    }
+    throw new Error(`test fake run: no handler matched command: ${cmd}`);
+  };
+}
+
+test("MED-6: injected runner — Linux path calls `ss`, not `lsof` (platform branches are not swapped)", async () => {
+  // This is the literal mutation the review re-derived undetected against the first version:
+  // swapping which command each platform calls. A fake run that only understands `ss` and
+  // explicitly REJECTS anything containing "lsof" makes a swap fail loudly instead of silently.
+  const run = makeFakeRun({
+    "ss -lptn": `LISTEN 0 511 0.0.0.0:3456 0.0.0.0:* users:(("node",pid=798931,fd=19))`,
+    "cat /proc/798931/cgroup": "0::/system.slice/ocp.service\n",
+    "lsof": new Error("test: lsof must not be called on Linux"),
+  });
+  const result = await runUpgrade({
+    yes: true, dryRun: false, mockExec: true,
+    mockDoctor: { ready_to_upgrade: true, next_action: { kind: "upgrade" }, current_version: "v3.10.0", latest_version: "v3.14.0" },
+    mockPlatform: "linux", mockIsRoot: true, run,
+  });
+  const restartCmds = result.phases.filter(p => p.name === "restart").map(p => p.cmd);
+  assert.deepEqual(restartCmds, ["systemctl restart ocp.service"]);
+});
+
+test("MED-6: injected runner — macOS path calls `lsof`, not `ss`", async () => {
+  const run = makeFakeRun({
+    "lsof -nP": `COMMAND   PID  USER   FD   TYPE DEVICE SIZE/OFF NODE NAME\nnode    12345 opc   23u  IPv6 0x1234      0t0  TCP *:3456 (LISTEN)`,
+    "ss ": new Error("test: ss must not be called on macOS"),
+  });
+  const result = await runUpgrade({
+    yes: true, dryRun: false, mockExec: true,
+    mockDoctor: { ready_to_upgrade: true, next_action: { kind: "upgrade" }, current_version: "v3.10.0", latest_version: "v3.14.0" },
+    mockPlatform: "darwin", run,
+  });
+  const restartCmds = result.phases.filter(p => p.name === "restart").map(p => p.cmd);
+  assert.equal(restartCmds.length, 2);
+  assert.ok(restartCmds[0].includes("launchctl bootout"));
+});
+
+test("MED-6: injected runner — ss tool missing (throws) maps to 'unknown', aborts loudly, never silently proceeds", async () => {
+  const run = makeFakeRun({
+    "ss -lptn": new Error("command not found: ss"),
+  });
+  await assert.rejects(async () => {
+    await runUpgrade({
+      yes: true, dryRun: false, mockExec: true,
+      mockDoctor: { ready_to_upgrade: true, next_action: { kind: "upgrade" }, current_version: "v3.10.0", latest_version: "v3.14.0" },
+      mockPlatform: "linux", run,
+    });
+  }, /could not determine what.*owns the OCP port.*ss did not run/s);
+});
+
+test("MED-6: injected runner — cgroup read denied (raced PID / permission) maps to 'unknown', not a false 'no-unit'", async () => {
+  const run = makeFakeRun({
+    "ss -lptn": `LISTEN 0 511 0.0.0.0:3456 0.0.0.0:* users:(("node",pid=798931,fd=19))`,
+    "cat /proc/798931/cgroup": new Error("cat: /proc/798931/cgroup: No such file or directory"),
+  });
+  await assert.rejects(async () => {
+    await runUpgrade({
+      yes: true, dryRun: false, mockExec: true,
+      mockDoctor: { ready_to_upgrade: true, next_action: { kind: "upgrade" }, current_version: "v3.10.0", latest_version: "v3.14.0" },
+      mockPlatform: "linux", run,
+    });
+  }, /could not determine what.*owns the OCP port.*could not read \/proc/s);
+});
+
+test("MED-6: injected runner — real mismatch end to end (ss+cgroup text in, sudo-authorized restart command out)", async () => {
+  const run = makeFakeRun({
+    "ss -lptn": `LISTEN 0 511 0.0.0.0:3456 0.0.0.0:* users:(("node",pid=798931,fd=19))`,
+    "cat /proc/798931/cgroup": "0::/system.slice/ocp.service\n",
+    "sudo -n -l systemctl restart ocp.service": "systemctl restart ocp.service",
+  });
+  const result = await runUpgrade({
+    yes: true, dryRun: false, mockExec: true,
+    mockDoctor: { ready_to_upgrade: true, next_action: { kind: "upgrade" }, current_version: "v3.10.0", latest_version: "v3.14.0" },
+    mockPlatform: "linux", mockIsRoot: false, run,
+  });
+  const restartCmds = result.phases.filter(p => p.name === "restart").map(p => p.cmd);
+  assert.deepEqual(restartCmds, ["sudo systemctl restart ocp.service"]);
+});
+
+test("MED-4 wiring: injected runner — sudo -n -l denies THIS specific command → refuses (not a generic sudo -n true probe)", async () => {
+  const run = makeFakeRun({
+    "ss -lptn": `LISTEN 0 511 0.0.0.0:3456 0.0.0.0:* users:(("node",pid=798931,fd=19))`,
+    "cat /proc/798931/cgroup": "0::/system.slice/ocp.service\n",
+    "sudo -n -l systemctl restart ocp.service": new Error("sudo: a password is required"),
+  });
+  await assert.rejects(async () => {
+    await runUpgrade({
+      yes: true, dryRun: false, mockExec: true,
+      mockDoctor: { ready_to_upgrade: true, next_action: { kind: "upgrade" }, current_version: "v3.10.0", latest_version: "v3.14.0" },
+      mockPlatform: "linux", mockIsRoot: false, run,
+    });
+  }, /not authorized non-interactively/);
+});
+
+test("MED-4 wiring: uid===0 short-circuits sudo entirely — no sudo probe run, plain systemctl", async () => {
+  const run = makeFakeRun({
+    "ss -lptn": `LISTEN 0 511 0.0.0.0:3456 0.0.0.0:* users:(("node",pid=798931,fd=19))`,
+    "cat /proc/798931/cgroup": "0::/system.slice/ocp.service\n",
+    "sudo": new Error("test: sudo must not be invoked when already root"),
+  });
+  const result = await runUpgrade({
+    yes: true, dryRun: false, mockExec: true,
+    mockDoctor: { ready_to_upgrade: true, next_action: { kind: "upgrade" }, current_version: "v3.10.0", latest_version: "v3.14.0" },
+    mockPlatform: "linux", mockIsRoot: true, run,
+  });
+  const restartCmds = result.phases.filter(p => p.name === "restart").map(p => p.cmd);
+  assert.deepEqual(restartCmds, ["systemctl restart ocp.service"]);
+});
+
+console.log("\nRestart-unit resolution (issue #215) — MED-8: rollback must not restart config it never restored:");
+
+test("MED-8: rollback refuses to restart a SYSTEM unit — its config was never restored, and no daemon-reload was issued for it", async () => {
+  await assert.rejects(async () => {
+    await runUpgrade({
+      rollback: true, yes: true, mockExec: true,
+      mockPlatform: "linux",
+      mockSnapshots: [{ name: "upgrade-snapshot-2026-05-11T08:30:00Z", path: "/tmp/snap-x" }],
+      mockSnapshotMeta: { fromCommit: "abc1234", fromVersion: "v3.10.0", toVersion: "v3.14.0", path: "/tmp/snap-x" },
+      mockOwnerProbe: {
+        ssOutput: `LISTEN 0 511 0.0.0.0:3456 0.0.0.0:* users:(("node",pid=798931,fd=19))`,
+        cgroupContent: "0::/system.slice/ocp.service\n",
+      },
+      mockIsRoot: true,
+    });
+  }, /rollback only restores the launchd plist and the USER-scope systemd unit file/);
+});
+
+test("MED-8: rollback DOES restart a matching USER unit, and issues daemon-reload first (Linux)", async () => {
   const result = await runUpgrade({
     rollback: true, yes: true, mockExec: true,
     mockPlatform: "linux",
     mockSnapshots: [{ name: "upgrade-snapshot-2026-05-11T08:30:00Z", path: "/tmp/snap-x" }],
     mockSnapshotMeta: { fromCommit: "abc1234", fromVersion: "v3.10.0", toVersion: "v3.14.0", path: "/tmp/snap-x" },
     mockOwnerProbe: {
-      ssOutput: `LISTEN 0 511 0.0.0.0:3456 0.0.0.0:* users:(("node",pid=798931,fd=19))`,
-      cgroupContent: "0::/system.slice/ocp.service\n",
+      ssOutput: `LISTEN 0 511 127.0.0.1:3456 0.0.0.0:* users:(("node",pid=888736,fd=19))`,
+      cgroupContent: "0::/user.slice/user-1000.slice/user@1000.service/app.slice/ocp-proxy.service\n",
     },
-    mockSudoAvailable: true,
   });
-  const restartCmds = result.phases.filter(p => p.name === "restart").map(p => p.cmd);
-  assert.ok(restartCmds.includes("sudo systemctl restart ocp.service"), `expected resolved-unit restart on rollback; got ${restartCmds.join(", ")}`);
+  const phaseNames = result.phases.map(p => p.name);
+  const reloadIdx = phaseNames.indexOf("daemon-reload");
+  const restartIdx = phaseNames.indexOf("restart");
+  assert.ok(reloadIdx !== -1, "daemon-reload phase must run on Linux rollback");
+  assert.ok(reloadIdx < restartIdx, "daemon-reload must happen BEFORE the restart, so the restored unit file is actually picked up");
+});
+
+test("MED-8: rollback on macOS does NOT run daemon-reload (systemd-only concept)", async () => {
+  const result = await runUpgrade({
+    rollback: true, yes: true, mockExec: true,
+    mockPlatform: "darwin",
+    mockSnapshots: [{ name: "upgrade-snapshot-2026-05-11T08:30:00Z", path: "/tmp/snap-x" }],
+    mockSnapshotMeta: { fromCommit: "abc1234", fromVersion: "v3.10.0", toVersion: "v3.14.0", path: "/tmp/snap-x" },
+  });
+  assert.ok(!result.phases.some(p => p.name === "daemon-reload"));
 });
 
 test("rollback path: no-unit aborts the rollback with the same actionable message, carrying phases + target for diagnosis", async () => {

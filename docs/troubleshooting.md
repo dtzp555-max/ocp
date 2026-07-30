@@ -116,6 +116,19 @@ openclaw gateway restart   # so OpenClaw re-reads the config
 
 Future `ocp update` invocations sync automatically.
 
+<a id="restart-target-refusal"></a>
+### `ocp update` (or `--rollback`) refuses to restart instead of restarting
+
+Starting with [issue #215](https://github.com/dtzp555-max/ocp/issues/215)'s fix, the full-upgrade and `--rollback` restart phases resolve which systemd/launchd unit actually owns the OCP port before touching anything, instead of restarting a hard-coded name — see [`scripts/lib/restart-unit.mjs`](../scripts/lib/restart-unit.mjs). Five messages, each a deliberate refusal rather than a silent guess:
+
+- **`could not determine what (if anything) owns the OCP port`** — usually a privilege gap: `ss`'s PID column is only populated when the caller can see the target process's `/proc/*/fd`, which is silently omitted for a system unit owned by a different user (the default for a system unit with no `User=` directive). Also covers a missing `ss`/`lsof` binary and multiple distinct PIDs answering the same port (dual-stack / `SO_REUSEPORT` — "which one" is the actual diagnostic question, so this refuses rather than picking one arbitrarily). **Fix:** re-run with elevated privileges, or check `ss -lptn "sport = :3456"` / `lsof -nP -iTCP:3456 -sTCP:LISTEN` / `cat /proc/<pid>/cgroup` by hand.
+- **`... not managed by any systemd unit`** — a PID holds the port but isn't in any systemd cgroup at all (a bare `node server.mjs`, started outside systemd). **Fix:** stop that PID manually, or bring it under systemd, then re-run.
+- **`nothing is currently listening`** — the port genuinely isn't bound to anything. This is deliberately a refusal, not an auto-start: if the real production listener is a SYSTEM unit that happens to be down right now, silently starting the default (often loopback-only) unit instead would pass post-flight — which only checks `127.0.0.1` — while the host silently loses LAN reachability. **Fix:** start the intended unit yourself, confirm it's bound the way you expect, then re-run.
+- **`requires "sudo systemctl restart <unit>"`** — the port is owned by a SYSTEM unit and `sudo -n -l systemctl restart <unit>` (checked for that *specific* command, not a generic `sudo -n true` — NOPASSWD sudoers rules are per-command) isn't authorized non-interactively. **Fix:** run the printed command manually, or grant it explicitly, e.g. `deploy ALL=(root) NOPASSWD: /bin/systemctl restart <unit>`.
+- **`rollback only restores the launchd plist and the USER-scope systemd unit file`** — `--rollback` resolved the port to a SYSTEM unit, but rollback only ever captures/restores the launchd plist and `~/.config/systemd/user/ocp-proxy.service` (see `scripts/lib/snapshot.mjs`); it never touched that unit's config, so restarting it wouldn't apply the rollback. **Fix:** roll back the system unit's config by hand if it needs it, and restart it yourself.
+
+None of these leave an orphan process behind (the whole point of the fix); the working tree/snapshot state is unaffected, so re-running after addressing the message is always safe.
+
 <a id="cache-rekey-v3250"></a>
 ### Response-cache hit rate drops once after upgrading to v3.25.0
 

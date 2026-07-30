@@ -536,6 +536,7 @@ The simplest path: ask your AI — paste `Run `ocp doctor` and follow its `next_
 - **`node: command not found` / version error** — OCP needs Node.js 22.5+ (`node --version`).
 - **`claude: command not found`** — install the Claude CLI, run `claude auth login`, then re-run `node setup.mjs`.
 - **Usage shows "unknown" / 401** — usually an expired Claude CLI session: `claude auth login && ocp restart`. For the *permanent* TUI-mode `Please run /login · API Error: 401` that re-login can't fix, see [docs/troubleshooting.md § permanent TUI-mode 401](docs/troubleshooting.md#tui-401).
+- **`ocp update` refuses to restart** (`could not determine what ... owns the OCP port`, `not managed by any systemd unit`, `nothing is currently listening`, a sudo message, or a rollback-scope message) — deliberate: the restart phase resolves which unit actually owns the port and refuses rather than guesses when it can't tell, or when guessing would be unsafe. See [docs/troubleshooting.md § restart refusal](docs/troubleshooting.md#restart-target-refusal) for what each message means and how to proceed.
 
 **Bootstrap quirks (one-time migrations):**
 
@@ -561,6 +562,7 @@ Top-level files a contributor or operator may need to know:
 | `scripts/sync-openclaw.mjs` | Idempotent OpenClaw registry sync invoked by `ocp update`. See ADR 0004. |
 | `scripts/lib/service-mode.mjs` | Pure decision layer for `setup.mjs`'s auto-start step — first install vs. `--reconfigure-only` (issue #226). |
 | `scripts/lib/install-autostart.mjs` | Injectable `installAutoStart()` — setup.mjs's auto-start install (legacy-unit migration, unit write, enable/start/bootstrap), extracted so tests can observe real run/fs calls instead of asserting on source text (issue #226). |
+| `scripts/lib/restart-unit.mjs` | Resolves which systemd/launchd unit actually owns the OCP port before the upgrade/rollback restart phase touches anything, instead of restarting a hard-coded name — refuses rather than guesses when ownership can't be determined. See [docs/upgrading.md § Restart target resolution](docs/upgrading.md#restart-target-resolution). |
 | `.claude/skills/` | Project-specific Claude Code skills. |
 | `ocp-plugin/` | OpenClaw gateway plugin (optional installation). |
 | `docs/lan-mode.md` | LAN & multi-user operations manual (server/client setup, keys, quotas, anonymous access, security model). |

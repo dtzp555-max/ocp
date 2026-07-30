@@ -74,6 +74,30 @@ ocp doctor
 If `ocp doctor` still reports problems after rollback, open a GitHub issue
 with the snapshot path and the doctor JSON output (`ocp doctor --json`).
 
+## Restart target resolution
+
+The full-upgrade and `--rollback` restart phases resolve which unit actually
+owns the OCP port (`ss`/`lsof` + `/proc/<pid>/cgroup` on Linux, launchd on
+macOS) instead of restarting a hard-coded name — see
+[`scripts/lib/restart-unit.mjs`](../scripts/lib/restart-unit.mjs). If it
+can't tell what owns the port, or what it can tell makes restarting unsafe,
+**it refuses rather than guesses**:
+
+| Message contains | Meaning | What to do |
+|---|---|---|
+| `could not determine what ... owns the OCP port` | The listener's owning PID isn't attributable (e.g. `ocp update` run by a different user than a `User=`-less system unit), a tool is missing, or multiple PIDs answer the same port. | Re-run with elevated privileges, or check `ss -lptn` / `lsof -iTCP` / `cat /proc/<pid>/cgroup` manually. |
+| `not managed by any systemd unit` | A PID holds the port but isn't in any systemd cgroup (a bare `node server.mjs`). | Stop that PID manually, or bring it under systemd, then re-run. |
+| `nothing is currently listening` | Nothing is bound to the port at all. Deliberately **not** auto-started: if the real production unit is a SYSTEM unit that happens to be down, silently starting the default (often loopback-only) unit would pass post-flight — which only checks `127.0.0.1` — while the host loses LAN reachability. | Start the intended unit manually, confirm it's the one you expect, then re-run. |
+| `requires "sudo systemctl restart <unit>"` | The port is owned by a SYSTEM unit and non-interactive sudo isn't authorized for that specific command. | Run the printed `sudo systemctl restart <unit>` manually, or grant it explicitly (e.g. `deploy ALL=(root) NOPASSWD: /bin/systemctl restart <unit>`), then re-run. |
+| `rollback only restores the launchd plist and the USER-scope systemd unit file` | Rollback resolved the port to a SYSTEM unit, but rollback (see `scripts/lib/snapshot.mjs`) never captured or restores that unit's config. | Roll back the system unit's config manually if it needs it, then restart it yourself. |
+
+If the resolved unit differs from the expected default, that's surfaced
+loudly (both on stderr and in the `restart-resolve` phase entry) rather than
+restarted silently — this is the fix for
+[issue #215](https://github.com/dtzp555-max/ocp/issues/215): a hard-coded
+restart target left an orphan `server.mjs` running when the real owner
+differed.
+
 ## OpenClaw Auto-Sync (v3.11.0+)
 
 Whenever the model list in [`models.json`](../models.json) changes, `ocp update` automatically reconciles your OpenClaw config so the model dropdown stays in sync — no more "I upgraded OCP but my Telegram bot still shows the old models" surprises.
