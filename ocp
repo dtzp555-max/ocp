@@ -721,6 +721,7 @@ cmd_update_help() {
 ocp update — Smart upgrade dispatcher
 
 Runs `ocp doctor` internally to choose the right path:
+  • Tree at latest, service stale:  restart-only (no git/npm changes) + post-flight verify
   • Patch bump (same minor):     light path (git pull + npm install + restart)
   • Cross-minor (e.g. v3.10→v3.14): full path with snapshot + post-flight
   • Old version (< v3.4.0):       fresh-install (asks first; AI passes --yes)
@@ -775,13 +776,35 @@ cmd_update() {
   fi
 
   # Doctor-driven path selection
-  local kind
-  kind=$(node "$script_dir/scripts/doctor.mjs" --json 2>/dev/null | python3 -c "import sys,json; print(json.load(sys.stdin)['next_action']['kind'])" 2>/dev/null || echo "unknown")
+  local doctor_json kind
+  doctor_json=$(node "$script_dir/scripts/doctor.mjs" --json 2>/dev/null)
+  kind=$(echo "$doctor_json" | python3 -c "import sys,json; print(json.load(sys.stdin)['next_action']['kind'])" 2>/dev/null || echo "unknown")
+
+  # Issue #214 review finding: this function used to extract ONLY `kind` from the doctor JSON
+  # and threw the rest away (stdout piped straight into python, stderr to /dev/null) — so
+  # doctor's WARN-level checks (e.g. "tree at X, service serving Y — restarting") never reached
+  # the person running `ocp update`, even though doctor.mjs computed the exact message #214
+  # asked for. Surface any WARN check here, generically, before dispatching on kind.
+  if [[ -n "$doctor_json" ]]; then
+    echo "$doctor_json" | python3 -c "
+import sys, json
+try:
+    d = json.load(sys.stdin)
+except Exception:
+    sys.exit(0)
+for c in d.get('checks', []):
+    if c.get('level') == 'WARN':
+        print(f\"⚠ {c.get('message', '')}\")
+" 2>/dev/null
+  fi
 
   case "$kind" in
     noop)
       echo "Already at latest. Nothing to do."
       return 0
+      ;;
+    restart)
+      _cmd_update_restart "$script_dir" "$@"
       ;;
     update)
       _cmd_update_light "$script_dir"
@@ -837,6 +860,42 @@ _cmd_update_light() {
 
   echo "  Restarting proxy..."
   cmd_restart > /dev/null 2>&1
+}
+
+# Issue #214: tree is already at latest, but the RUNNING SERVICE is stale — a previous update
+# half-completed (tree checked out to the new tag, then a later phase failed before the
+# restart ran). This path does NOT touch git. `_cmd_update_light`'s `git pull origin main
+# --ff-only` is NOT safe to reuse here: doctor's "tree == latest" is a VERSION-STRING
+# comparison against origin/main's package.json, not a commit comparison, so it can hold true
+# while origin/main HEAD has merged-but-unreleased commits ahead of the release tag. Pulling
+# in that state would fast-forward a production host off its release tag onto unreleased main
+# (PR #217 review, HIGH-2). This just restarts the already-correct tree and verifies it landed.
+_cmd_update_restart() {
+  local script_dir="$1"; shift
+  local target
+  target=$(python3 -c "import json; print(json.load(open('$script_dir/package.json'))['version'])" 2>/dev/null || echo "?")
+
+  # Honor --dry-run (PR #217 review, HIGH-1: the "update" reuse this replaced silently dropped
+  # every flag here, so `ocp update --dry-run` on a stale host skipped straight to a real
+  # restart despite the documented "preview the plan, don't mutate" contract).
+  local arg
+  for arg in "$@"; do
+    if [[ "$arg" == "--dry-run" ]]; then
+      echo "[dry-run] would restart the proxy and verify /health reports v$target."
+      echo "[dry-run] no git/npm operations — the tree is already at v$target."
+      return 0
+    fi
+  done
+
+  echo "Tree is already at v$target; the running service is stale — restarting (no git changes)..."
+  cmd_restart
+  echo "  Verifying restart..."
+  if node "$script_dir/scripts/upgrade.mjs" --post-flight-only "v$target"; then
+    return 0
+  else
+    echo "  Run \`ocp doctor\` or \`curl \$PROXY/health\` to inspect further."
+    return 1
+  fi
 }
 
 cmd_doctor_help() {

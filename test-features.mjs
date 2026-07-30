@@ -769,7 +769,7 @@ test("doctor detects from-version < v3.4.0 → fresh_install", async () => {
 
 test("doctor next_action.kind enum is one of allowed values", async () => {
   const result = await runDoctor({ skipNetwork: true, mockVersion: "v3.10.0", mockLatest: "v3.14.0" });
-  const ALLOWED = ["noop", "update", "upgrade", "fresh_install", "fix_oauth", "fix_service"];
+  const ALLOWED = ["noop", "restart", "update", "upgrade", "fresh_install", "fix_oauth", "fix_service"];
   assert.ok(ALLOWED.includes(result.next_action.kind), `kind=${result.next_action.kind} not in enum`);
 });
 
@@ -843,12 +843,24 @@ test("doctor falls back to currentVersion when origin/main unreachable (no stale
 // before the restart phase runs. The tree now looks fully updated, but the service (per
 // /health) still answers with the OLD version. Before this fix, the next `ocp update` run
 // compared tree==latest, found them equal, and reported kind="noop" — silently leaving the
-// stale service running. These five tests pin the cases enumerated in the issue. The fix
-// reuses kind="update" (rather than inventing a new enum value) for the "tree==latest but
-// service stale" case: bash `cmd_update`'s "update" branch already runs `_cmd_update_light`,
-// which git-pulls (a no-op — the tree is already current) and unconditionally restarts the
-// service, and `scripts/upgrade.mjs`'s "update" branch already no-ops sensibly too — so every
-// existing next_action.kind consumer already behaves correctly with no further changes.
+// stale service running.
+//
+// RETRACTED CLAIM (PR #217, first draft): that draft reused kind="update" for the
+// "tree==latest but service stale" case, reasoning that `_cmd_update_light`'s `git pull` was
+// "a no-op here since the tree is already current". That reasoning was wrong and was rejected
+// in review: doctor's "tree == latest" is a comparison of VERSION STRINGS (tree's
+// package.json vs origin/main's package.json), not of commits. Between releases, origin/main
+// can accumulate merged-but-unreleased commits while package.json stays put — so
+// "tree == latest" can hold while origin/main HEAD is genuinely ahead of the release tag, and
+// `git pull origin main --ff-only` would fast-forward a production host off its release tag
+// onto unreleased code. Reusing "update" also silently dropped `ocp update --dry-run` and
+// `--target` (`_cmd_update_light` never forwards "$@"), so a stale host would skip straight to
+// a real mutating restart despite the documented "preview the plan, don't mutate" contract.
+//
+// Fixed shape: a new, distinct kind="restart" that never touches git — bash's
+// `_cmd_update_restart` only calls `cmd_restart` + verifies via `postFlightOk`. The consumer
+// cost of the new enum value was one `case` arm in `ocp` and one entry in this file's
+// `ALLOWED` list — see the audit table in the PR body.
 console.log("\nDoctor next_action.kind reflects running-service version (#214):");
 
 test("#214: tree==latest, service reports the same version → genuinely noop", async () => {
@@ -864,14 +876,14 @@ test("#214: tree==latest, service reports the same version → genuinely noop", 
     "no stale-service warning expected when versions match");
 });
 
-test("#214: tree==latest, service reports an OLDER version → NOT noop, restarts via update kind", async () => {
+test("#214: tree==latest, service reports an OLDER version → NOT noop, restart kind (no git)", async () => {
   const result = await runDoctor({
     skipNetwork: false,
     mockVersion: "v3.26.0",
     mockLatest: "v3.26.0",
     mockHealth: { status: 200, body: { version: "3.25.0", auth: { ok: true } } }
   });
-  assert.equal(result.next_action.kind, "update");
+  assert.equal(result.next_action.kind, "restart");
   // WARN, not FAIL: ready_to_upgrade must stay true, or runUpgrade()'s pre-flight guard
   // (which only tolerates ready_to_upgrade=false for kind="fresh_install") would throw
   // instead of letting the restart proceed.
@@ -880,6 +892,28 @@ test("#214: tree==latest, service reports an OLDER version → NOT noop, restart
   assert.ok(warning, "expected a service_version_matches_tree check");
   assert.equal(warning.level, "WARN");
   assert.equal(warning.message, "tree at 3.26.0, service serving 3.25.0 — restarting");
+});
+
+test("#214: tree==latest, service reports a NEWER version → NOT auto-restarted (would downgrade)", async () => {
+  // e.g. after a tree rollback, or someone running a newer/test build. Auto-restarting here
+  // would silently DOWNGRADE a running service to match an older tree — the exact class of
+  // surprise auto-mutation this issue is about. Surfaced (WARN) but not acted on: kind stays
+  // "noop". Coverage gap flagged in PR #217 review: changing the comparison from `!== 0` to
+  // `< 0` (i.e. only reacting to a STALE/older service) is required to survive this test —
+  // the naive `!== 0` mutation treated a newer service as needing a "restart" too, which would
+  // have downgraded it.
+  const result = await runDoctor({
+    skipNetwork: false,
+    mockVersion: "v3.26.0",
+    mockLatest: "v3.26.0",
+    mockHealth: { status: 200, body: { version: "3.27.0", auth: { ok: true } } }
+  });
+  assert.equal(result.next_action.kind, "noop");
+  assert.equal(result.ready_to_upgrade, true);
+  const warning = result.checks.find(c => c.id === "service_version_matches_tree");
+  assert.ok(warning, "expected a service_version_matches_tree check even though kind stays noop");
+  assert.equal(warning.level, "WARN");
+  assert.equal(warning.message, "tree at 3.26.0, service serving 3.27.0 (NEWER than tree) — not auto-restarting");
 });
 
 test("#214: tree==latest, /health unreachable → NOT noop (still fix_service)", async () => {
@@ -1455,7 +1489,7 @@ test("integration: a config change invalidates the STRUCTURED cache too (closes 
 });
 
 // ── Upgrade Tests ──
-import { runUpgrade, postFlightOk } from "./scripts/upgrade.mjs";
+import { runUpgrade, postFlightOk, runPostFlightCheck } from "./scripts/upgrade.mjs";
 
 console.log("\nUpgrade:");
 
@@ -1481,6 +1515,91 @@ test("postFlightOk: auth failure rejects regardless of version", () => {
 test("postFlightOk: unknown/empty target degrades to the auth-only check (never blocks)", () => {
   assert.equal(postFlightOk({ auth: { ok: true }, version: "3.22.1" }, ""), true);
   assert.equal(postFlightOk({ auth: { ok: true }, version: "3.22.1" }, undefined), true);
+});
+
+// ── runPostFlightCheck (issue #214, MED-1 on PR #217 review) ────────────────
+// `_cmd_update_restart`'s bash-side `cmd_restart` has a swallowed-failure bug (its own
+// failure path only echoes and still returns 0), so a failed restart previously reported
+// success while the service kept serving the old version — the exact "reports success while
+// serving old code" complaint from #214, only partly fixed by detection alone. This function
+// is the fix: it polls /health and reuses postFlightOk() (tested above) rather than a second
+// hand-rolled predicate. opts.mockProbe/attempts/intervalMs make the retry loop itself
+// testable without a live server or real sleeps.
+console.log("\nrunPostFlightCheck (#214):");
+
+test("runPostFlightCheck: succeeds immediately when the first probe already matches target", async () => {
+  let calls = 0;
+  const result = await runPostFlightCheck("v3.26.0", {
+    attempts: 5, intervalMs: 0,
+    mockProbe: () => { calls++; return { auth: { ok: true }, version: "3.26.0" }; }
+  });
+  assert.equal(result.ok, true);
+  assert.equal(calls, 1, "must not keep polling once the target is already reached");
+});
+
+test("runPostFlightCheck: retries past a stale/unreachable probe and succeeds once the target lands", async () => {
+  let calls = 0;
+  const result = await runPostFlightCheck("v3.26.0", {
+    attempts: 5, intervalMs: 0,
+    mockProbe: () => {
+      calls++;
+      if (calls === 1) throw new Error("ECONNREFUSED"); // service mid-restart
+      if (calls === 2) return { auth: { ok: true }, version: "3.25.0" }; // old process still holding the port
+      return { auth: { ok: true }, version: "3.26.0" }; // new process finally serving
+    }
+  });
+  assert.equal(result.ok, true);
+  assert.equal(calls, 3);
+});
+
+test("runPostFlightCheck: exhausts attempts and reports ok:false + lastSeen when the target never lands", async () => {
+  let calls = 0;
+  const result = await runPostFlightCheck("v3.26.0", {
+    attempts: 3, intervalMs: 0,
+    mockProbe: () => { calls++; return { auth: { ok: true }, version: "3.25.0" }; }
+  });
+  assert.equal(result.ok, false);
+  assert.equal(result.lastSeen, "3.25.0");
+  assert.equal(calls, 3, "must try exactly `attempts` times, no more no less");
+});
+
+test("runPostFlightCheck: exhausts attempts and reports ok:false + lastSeen:null when totally unreachable", async () => {
+  const result = await runPostFlightCheck("v3.26.0", {
+    attempts: 3, intervalMs: 0,
+    mockProbe: () => { throw new Error("ECONNREFUSED"); }
+  });
+  assert.equal(result.ok, false);
+  assert.equal(result.lastSeen, null);
+});
+
+// ── runUpgrade() with kind="restart" (issue #214) ────────────────────────────
+// Mirrors the existing "update"-kind placeholder branch. Distinct from "update": no git/npm
+// text in the dry-run plan, since this path (unlike "update") never touches git — see the
+// doctor.mjs decision-block comment for why that distinction is load-bearing (HIGH-2 on PR
+// #217 review: reusing "update" here would have risked pulling unreleased origin/main commits
+// onto a production host).
+console.log("\nrunUpgrade kind=restart (#214):");
+
+test("runUpgrade restart --dry-run: plan has NO git/npm text, executed:false", async () => {
+  const result = await runUpgrade({
+    dryRun: true,
+    mockDoctor: { ready_to_upgrade: true, next_action: { kind: "restart" },
+                  current_version: "v3.26.0", latest_version: "v3.26.0" }
+  });
+  assert.equal(result.executed, false);
+  assert.ok(result.plan.some(line => line.includes("restart-only")));
+  assert.ok(!result.plan.some(line => /git pull|npm install|git checkout/.test(line)),
+    "restart path must never mention git/npm — it doesn't touch either");
+});
+
+test("runUpgrade restart (non-dry-run): reports path=restart, changed:true, delegates to bash", async () => {
+  const result = await runUpgrade({
+    mockDoctor: { ready_to_upgrade: true, next_action: { kind: "restart" },
+                  current_version: "v3.26.0", latest_version: "v3.26.0" }
+  });
+  assert.equal(result.path, "restart");
+  assert.equal(result.executed, true);
+  assert.equal(result.changed, true);
 });
 
 test("upgrade --dry-run prints plan, no side effects", async () => {

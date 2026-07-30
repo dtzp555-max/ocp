@@ -3,7 +3,9 @@
  * scripts/upgrade.mjs — OCP unified upgrade dispatcher.
  *
  * Paths:
- *   noop          current == latest, exit 0
+ *   noop          current == latest AND service already serving it, exit 0
+ *   restart       current == latest but the RUNNING SERVICE is stale (issue #214); no git/npm
+ *                 changes — cmd_restart + post-flight only; delegated to bash cmd_update
  *   light         same major.minor, patch bump only (existing fast path; delegated to bash)
  *   full          cross-minor (snapshot + setup.mjs + post-flight)
  *   fresh_install from-version < v3.4.0 (--yes required for non-interactive)
@@ -29,6 +31,39 @@ export function postFlightOk(body, target) {
   if (body?.auth?.ok !== true) return false;
   const want = String(target || "").replace(/^v/, "");
   return !want || body?.version === want;
+}
+
+// Issue #214 remediation (kind="restart"): bash's cmd_restart() already performs the actual
+// restart — it has richer fallback logic than anything worth duplicating here (launchd →
+// systemd → manual nohup, see `ocp`). What it lacked was verification: its failure path only
+// echoes and still returns 0, so a failed restart reported success while the service kept
+// serving the old version (review finding MED-1 on PR #217 — this was the "reports success
+// while serving old code" complaint from #214, only partly fixed by detection alone). This
+// polls /health and reuses postFlightOk() — the SAME acceptance predicate runFullUpgrade's
+// post-flight phase uses — rather than a second hand-rolled check. Exported so `ocp update`'s
+// bash "restart" path can invoke it via the CLI entrypoint below (`--post-flight-only`).
+// opts.mockProbe (test hook, mirrors doctor.mjs's opts.mockHealth / runFullUpgrade's
+// opts.mockExec convention): a zero-arg function called instead of the real curl, returning a
+// /health body object or throwing (to simulate unreachable) — makes the retry loop testable
+// without a live server or real sleeps.
+export async function runPostFlightCheck(target, opts = {}) {
+  const port = process.env.CLAUDE_PROXY_PORT || String(DEFAULT_PORT);
+  const attempts = opts.attempts ?? 10;
+  const intervalMs = opts.intervalMs ?? 1000;
+  const probe = opts.mockProbe || (() => {
+    const out = execSync(`curl -sf --max-time 2 http://127.0.0.1:${port}/health`).toString();
+    return JSON.parse(out);
+  });
+  let ok = false, lastSeen = null;
+  for (let i = 0; i < attempts; i++) {
+    try {
+      const body = probe();
+      lastSeen = body.version;
+      if (postFlightOk(body, target)) { ok = true; break; }
+    } catch { /* retry */ }
+    if (i < attempts - 1) await new Promise(r => setTimeout(r, intervalMs));
+  }
+  return { ok, lastSeen, target: String(target || "").replace(/^v/, "") };
 }
 
 export async function runUpgrade(opts = {}) {
@@ -68,6 +103,8 @@ export async function runUpgrade(opts = {}) {
       plan.push(`[plan] phase 5: post-flight /health + /v1/models`);
     } else if (kind === "update") {
       plan.push(`[plan] light path: git pull + npm install + restart`);
+    } else if (kind === "restart") {
+      plan.push(`[plan] restart-only path: NO git/npm changes (tree already at ${doctor.current_version}) — cmd_restart + post-flight verify`);
     } else if (kind === "fresh_install") {
       plan.push(`[plan] fresh-install ai_executable[]:`);
       for (const cmd of doctor.next_action.ai_executable) plan.push(`  - ${cmd}`);
@@ -78,6 +115,15 @@ export async function runUpgrade(opts = {}) {
   // --- non-dry-run paths ---
   if (kind === "update") {
     return { path: "update", executed: true, changed: true, plan: [...plan, "[light] delegated to bash cmd_update existing logic"] };
+  }
+
+  if (kind === "restart") {
+    // Placeholder for parity with "update" above: the real work (cmd_restart + post-flight)
+    // happens in bash's _cmd_update_restart, which `ocp`'s cmd_update case statement calls
+    // directly — this function is only reached here if something calls runUpgrade()
+    // programmatically (bypassing the bash CLI) with a mockDoctor/live doctor reporting
+    // kind="restart".
+    return { path: "restart", executed: true, changed: true, plan: [...plan, "[restart] delegated to bash cmd_update existing logic (cmd_restart + post-flight, no git)"] };
   }
 
   if (kind === "upgrade") {
@@ -341,6 +387,25 @@ if (_isMain()) {
     const cand = args[rb + 1];
     if (cand && !cand.startsWith("--")) snapshotPath = cand;
   }
+
+  // Issue #214's "restart" path: bash's _cmd_update_restart() calls `cmd_restart` itself
+  // (richer fallback logic than belongs here) and then shells out to THIS one-shot mode to
+  // verify the restart actually took, reusing postFlightOk() instead of a second predicate.
+  // Distinct from the runUpgrade() flow below — no doctor call, no plan, just poll + exit code.
+  const postFlightOnlyIdx = args.indexOf("--post-flight-only");
+  if (postFlightOnlyIdx !== -1) {
+    const postFlightTarget = args[postFlightOnlyIdx + 1];
+    const result = await runPostFlightCheck(postFlightTarget);
+    if (result.ok) {
+      console.log(`✓ service now serving v${result.target}`);
+      process.exit(0);
+    } else {
+      console.error(`✗ service did not reach v${result.target} within the post-flight budget`
+        + (result.lastSeen ? ` (last saw version=${result.lastSeen} — a stale process may still hold the port; check \`ss -ltnp\` / \`lsof -i\`)` : " (unreachable)"));
+      process.exit(1);
+    }
+  }
+
   try {
     const result = await runUpgrade({ dryRun, yes, rollback, list, gc, snapshotPath, target });
     if (result.plan) for (const line of result.plan) console.log(line);
