@@ -5723,36 +5723,55 @@ console.log("\nocp-connect model registry (#210):");
 const _ocConnectPath = spotJoin(_spotDir, "ocp-connect");
 
 // Every python harness below slices ocp-connect's source between two textual anchors and execs
-// the slice. Three failure modes were found across two rounds of #218 review and are guarded in
-// EVERY harness below:
+// the slice. Four failure modes were found across three rounds of #218 review:
 //   - MED-1a: an anchor that fails to match makes `.index()` throw — loud, fine. But if the
 //     START and END anchors are found in the WRONG order (or the slice is otherwise degenerate),
 //     python slicing silently returns `''`, and `py_compile`/`exec` on an empty string trivially
-//     "succeeds" — a vacuous pass, not a check.
+//     "succeeds" — a vacuous pass, not a check. Guarded in every harness below: each asserts its
+//     slice is non-empty and contains what it must contain before doing anything with it.
 //   - MED-1b: `.index(marker)` (no bound) matches the FIRST occurrence of `marker` in the whole
 //     file. If unrelated code elsewhere in ocp-connect ever introduces an earlier occurrence of
 //     the same text, the slice silently grows or shifts. Concretely: `for mid in model_ids:`
 //     appears twice in ocp-connect (the classify loop, and the alias-building loop 49 lines
 //     later); renaming the FIRST one makes the (unbounded) end-anchor search land on the SECOND,
-//     and the slice silently grows to include `os.makedirs` / `open(config_path` — code that was
-//     never meant to be in it. Nothing about that failure mode is loud on its own.
-//   - round-2 MED-1: round 1 shipped this comment claiming every harness asserts it does NOT
-//     "contain markers from adjacent sections it must NOT reach" — but `_OC_PROVIDER_PY` (the
-//     harness pushed closest to the real file writer, ending at "# Load or create config", the
-//     line before `if os.path.exists(config_path)`) had no such assertion at all. What stopped
-//     it before this fix was `config_path` being undefined — a NameError, not a guard: ordering
-//     luck, exactly like the 1b case. Reviewer's own mutation-proof of the FIX (copying the
-//     `os.makedirs` / `open(config_path` check the other three harnesses already had) then
-//     showed THAT check is itself insufficient: `open("/some/other/path", "w")` contains
-//     NEITHER literal marker, so it slips past a check for two specific known strings and
-//     writes a real file. Every harness below therefore also asserts a blanket `'open(' not in
-//     blk and 'os.' not in blk` — none of the intended slices legitimately need either — which
-//     is the actual "this cannot touch the filesystem" guarantee the two-marker check only
-//     approximated. The standing constraint on this repo is that ocp-connect is never run
-//     end-to-end because it writes the user's OpenClaw registry; a harness that can silently
-//     begin exec'ing that writer is the one shape that must not exist here.
-// Each harness asserts the slice is non-empty, contains what it must contain, and cannot reach
-// or perform any file I/O — before doing anything with it.
+//     and the slice silently grows to include code that was never meant to be in it. Guarded in
+//     every harness below by a narrow assertion naming the SPECIFIC adjacent-section markers
+//     each slice must never contain (`os.makedirs` / `open(config_path` / `provider = {`,
+//     depending on which section is adjacent) — this is a slice-CORRECTNESS check, distinct from
+//     the file-I/O concern below, and stays a substring check because false positives here are
+//     rare (these are long, specific strings unlikely to appear by coincidence) and a hit is
+//     genuinely informative (it means the slice boundary moved).
+//   - round-2 MED-1: `_OC_PROVIDER_PY` — the harness ending closest to ocp-connect's real config
+//     writer, right before `if os.path.exists(config_path)` — had NO 1b-style guard at all,
+//     unlike its siblings. What stopped it from actually running that writer was `config_path`
+//     being undefined (a NameError), not a guard: ordering luck. Demonstrated by mutation-proof:
+//     inserting `os.makedirs(...)` + `open(..., "w")` between the write loop and that line made
+//     `npm test` actually create a directory and write a file, all green.
+//   - round-3 MED-1: the round-2 fix — copy the 1b-style two-marker check into `_OC_PROVIDER_PY`,
+//     then (when THAT was shown bypassable by `open("<arbitrary path>", "w")`, containing
+//     neither marker) broaden it to a blanket `'open(' not in blk and 'os.' not in blk` in every
+//     harness — was ALSO bypassed, by `pathlib.Path(...).write_text(...)`, which contains
+//     neither substring either and also wrote a real file. Three rounds, one shape: no substring
+//     denylist can express "this code cannot touch the filesystem", because that is a property
+//     of what the code may DO at runtime, not of what substrings appear in its source text —
+//     and a broad enough denylist to catch every I/O idiom (pathlib, shutil, subprocess,
+//     `__import__`, tempfile, ...) starts also matching unrelated PROSE: adding "Deliberately
+//     does no os.path work." to a docstring inside the slice broke 7 unrelated tests (measured).
+//     The blanket ban has therefore been REMOVED (not weakened further) in favor of an actual
+//     capability boundary: every harness that calls `exec(blk, ns)` now passes an explicit,
+//     minimal `ns["__builtins__"]` — Python only auto-injects the real, unrestricted
+//     `__builtins__` module when the exec namespace has no `__builtins__` key at all, so
+//     supplying our own dict containing ONLY the names the slice actually calls (confirmed
+//     sufficient, and confirmed to leave real output byte-for-byte unchanged, by diffing
+//     restricted vs. unrestricted execution of the real slice) pre-empts that injection. Bare
+//     names not in that dict — `open`, `__import__` (which `import pathlib` etc. compile down
+//     to), and everything reachable only through them — raise `NameError`/`ImportError` before a
+//     single byte moves. This is a property of the CODE PATH taken at exec time, not of the
+//     source text, so it cannot be bypassed by a new I/O idiom nobody has thought of yet, and it
+//     cannot be tripped by an unrelated comment either. The standing constraint on this repo is
+//     that ocp-connect is never run end-to-end because it writes the user's OpenClaw registry; a
+//     harness that can silently begin exec'ing that writer is the one shape that must not exist
+//     here, and this is the actual guarantee that makes that true, not an approximation of it.
 
 // --- Harness 1: classify one or more model ids through ocp-connect's REAL model_meta table +
 // REAL get_model_meta() (verbatim exec — the exact slice given in #210's own harness sketch). ---
@@ -5764,12 +5783,21 @@ assert blk.strip(), "empty model_meta slice - anchor drift (see #218 review MED-
 assert 'def get_model_meta' in blk, "slice missing get_model_meta - anchor drift"
 assert 'os.makedirs' not in blk and 'open(config_path' not in blk, \\
     "slice overgrown past the intended block - anchor drift (see #218 review MED-1b)"
-assert 'open(' not in blk and 'os.' not in blk, \\
-    "slice contains a file-I/O call (open(...) / os.*) the intended block never needs - " \\
-    "refusing to exec it (see #218 round-2 review MED-1: a check for two KNOWN adjacent " \\
-    "markers is not the same guarantee as 'this slice cannot touch the filesystem' - the " \\
-    "narrower check missed an open() call to an arbitrary path with neither marker in it)"
-ns = {}
+# #218 round-3 review: a substring denylist (round 2's blanket 'open('/'os.' ban, which used to
+# be here) is NOT a capability boundary and was DROPPED, not just weakened: it scans the WHOLE
+# slice including comments, so a purely cosmetic docstring edit ("Deliberately does no os.path
+# work.") broke this test with an unreadable false positive (measured: 7 unrelated tests failed
+# from that one-line comment). Worse, it was bypassable anyway - pathlib.Path(...).write_text(
+# ...), shutil.rmtree, __import__('os').remove and others contain NEITHER 'open(' NOR 'os.' and
+# sailed straight past it, actually writing a file to disk (verified via mutation-proof).
+# Restricting __builtins__ to exactly what this block needs (sorted, len - confirmed sufficient
+# by diffing real output with/without the restriction) is the actual capability boundary:
+# pathlib/shutil/subprocess/__import__/open all NameError or ImportError before a single byte
+# moves, because Python only auto-injects the real __builtins__ module when the exec namespace
+# has no '__builtins__' key at all - supplying our own dict (with only the names this block
+# calls) pre-empts that injection, and it does so on CODE, not on the presence of a string
+# anywhere in the slice, so it cannot be fooled by an unrelated comment either way.
+ns = {"__builtins__": {"sorted": sorted, "len": len}}
 exec(blk, ns)
 ids = json.loads(sys.argv[2])
 out = {mid: ns['get_model_meta'](mid) for mid in ids}
@@ -5796,12 +5824,21 @@ assert blk.strip(), "empty model_meta slice - anchor drift (see #218 review MED-
 assert 'def get_model_meta' in blk, "slice missing get_model_meta - anchor drift"
 assert 'os.makedirs' not in blk and 'open(config_path' not in blk, \\
     "slice overgrown past the intended block - anchor drift (see #218 review MED-1b)"
-assert 'open(' not in blk and 'os.' not in blk, \\
-    "slice contains a file-I/O call (open(...) / os.*) the intended block never needs - " \\
-    "refusing to exec it (see #218 round-2 review MED-1: a check for two KNOWN adjacent " \\
-    "markers is not the same guarantee as 'this slice cannot touch the filesystem' - the " \\
-    "narrower check missed an open() call to an arbitrary path with neither marker in it)"
-ns = {}
+# #218 round-3 review: a substring denylist (round 2's blanket 'open('/'os.' ban, which used to
+# be here) is NOT a capability boundary and was DROPPED, not just weakened: it scans the WHOLE
+# slice including comments, so a purely cosmetic docstring edit ("Deliberately does no os.path
+# work.") broke this test with an unreadable false positive (measured: 7 unrelated tests failed
+# from that one-line comment). Worse, it was bypassable anyway - pathlib.Path(...).write_text(
+# ...), shutil.rmtree, __import__('os').remove and others contain NEITHER 'open(' NOR 'os.' and
+# sailed straight past it, actually writing a file to disk (verified via mutation-proof).
+# Restricting __builtins__ to exactly what this block needs (sorted, len - confirmed sufficient
+# by diffing real output with/without the restriction) is the actual capability boundary:
+# pathlib/shutil/subprocess/__import__/open all NameError or ImportError before a single byte
+# moves, because Python only auto-injects the real __builtins__ module when the exec namespace
+# has no '__builtins__' key at all - supplying our own dict (with only the names this block
+# calls) pre-empts that injection, and it does so on CODE, not on the presence of a string
+# anywhere in the slice, so it cannot be fooled by an unrelated comment either way.
+ns = {"__builtins__": {"sorted": sorted, "len": len}}
 exec(blk, ns)
 sys.stdout.write(json.dumps(ns['model_meta']))
 `;
@@ -5832,17 +5869,26 @@ assert 'for mid in model_ids' in blk, "slice missing the provider.models write l
 assert 'os.makedirs' not in blk and 'open(config_path' not in blk, \\
     "slice overgrown past the intended block - anchor drift (see #218 round-2 review MED-1: " \\
     "this harness is the one pushed closest to file I/O, and is the one that must never reach it)"
-assert 'open(' not in blk and 'os.' not in blk, \\
-    "slice contains a file-I/O call (open(...) / os.*) the intended block never needs - " \\
-    "refusing to exec it. THIS is the guard that actually matters here: this harness is closer " \\
-    "to ocp-connect's real config writer than any other in this section, the standing " \\
-    "constraint on this repo is that ocp-connect is never run end-to-end because it writes the " \\
-    "user's OpenClaw registry, and a check for two KNOWN markers (os.makedirs / " \\
-    "open(config_path) is not the same guarantee as 'this cannot touch the filesystem' - a " \\
-    "mutation-proof of exactly that narrower check found it bypassed by open() on an arbitrary " \\
-    "path with neither marker in it, and it silently wrote a real file (#218 round-2 review MED-1)"
+# #218 round-3 review: even the two-KNOWN-marker denylist above (added in round 2, itself a fix
+# for round 1 having NO guard here at all) was shown insufficient by mutation-proof:
+# open("<arbitrary path>", "w") contains neither 'os.makedirs' nor 'open(config_path' and wrote
+# a real file to disk, 473/0 green. A follow-up blanket 'open('/'os.' ban (still just a
+# denylist) was THEN shown insufficient too - pathlib.Path(...).write_text(...) contains
+# neither substring and also wrote a real file - AND it scanned comments, so it was DROPPED
+# rather than kept (a purely cosmetic docstring edit elsewhere in this slice broke 7 unrelated
+# tests with an unreadable false positive; measured). Three rounds, one shape: no substring
+# denylist can express "cannot touch the filesystem", because that is a property of what the
+# code may DO, not of what it SAYS. Restricting __builtins__ to exactly what this block needs
+# (sorted, len - confirmed sufficient by diffing real output with/without the restriction) is
+# THE capability boundary that actually matters here, since this is the harness pushed closest
+# to ocp-connect's real config writer and the standing constraint on this repo is that
+# ocp-connect is never run end-to-end: pathlib/shutil/subprocess/__import__/open all NameError
+# or ImportError before a single byte moves, because Python only auto-injects the real
+# __builtins__ module when the exec namespace has no '__builtins__' key at all - supplying our
+# own dict (with only the two names this block actually calls) pre-empts that injection, on
+# CODE rather than on text, so an unrelated comment cannot trip it either way.
 ids = json.loads(sys.argv[2])
-ns = {"model_ids": ids, "provider": {"models": []}}
+ns = {"model_ids": ids, "provider": {"models": []}, "__builtins__": {"sorted": sorted, "len": len}}
 exec(blk, ns)
 sys.stdout.write(json.dumps(ns["provider"]["models"]))
 `;
@@ -5872,11 +5918,14 @@ blk = src[si:ei]
 assert blk.strip(), "empty fallback slice - anchor drift (see #218 review MED-1a)"
 assert 'except:' in blk, "slice missing the except: branch - anchor drift"
 assert 'provider = {' not in blk, "slice overgrown past the intended block - anchor drift (see #218 review MED-1b)"
-assert 'open(' not in blk and 'os.' not in blk, \\
-    "slice contains a file-I/O call (open(...) / os.*) the intended block never needs - " \\
-    "refusing to exec it (see #218 round-2 review MED-1 — applied here too for the same " \\
-    "reason: a check for one specific adjacent marker is not 'this cannot touch the filesystem')"
-ns = {"json": json, "models_json_str": sys.argv[2]}
+# #218 round-3 review: round 2's blanket 'open('/'os.' ban used to be here — dropped, not kept,
+# per the same reasoning as the other harnesses: bypassable (pathlib etc.) AND scans comments
+# (a false-positive risk, measured elsewhere in this file). Same capability-boundary fix
+# instead. This slice's try/except body needs zero bare builtin calls (json is passed in
+# explicitly as a namespace key, not looked up as a builtin), so the restricted __builtins__
+# set is empty — confirmed by diffing real output (both the well-formed and malformed-JSON
+# branches) with/without it.
+ns = {"json": json, "models_json_str": sys.argv[2], "__builtins__": {}}
 exec(blk, ns)
 sys.stdout.write(json.dumps(ns["model_ids"]))
 `;
@@ -5963,6 +6012,12 @@ assert blk.strip(), "empty model_meta slice - anchor drift (see #218 review MED-
 assert 'def get_model_meta' in blk, "slice missing get_model_meta - anchor drift"
 assert 'os.makedirs' not in blk and 'open(config_path' not in blk, \\
     "slice overgrown past the intended block - anchor drift (see #218 review MED-1b)"
+# No __builtins__ capability boundary here (#218 round-3 review LOW): this script never
+# exec()s the slice, only py_compile.compile()s it - a syntax check, not a code path. The
+# slice's own file-write idioms (if any got in via anchor drift) would never run; only the
+# actual write calls below (os.write/os.remove on THIS script's own tempfiles, using ITS OWN
+# real builtins) do, and those are not slice content. The capability boundary in H1/H2/H3/H4/H5
+# exists because THEY exec(); this one is exempt for that reason, not by oversight.
 fd, path = tempfile.mkstemp(suffix='.py')
 os.write(fd, blk.encode())
 os.close(fd)
@@ -6060,11 +6115,17 @@ test("ocp-connect: the provider.models write loop produces the exact entry — m
   for (const entry of built) {
     const meta = classified[entry.id];
     assert.ok(meta, `provider.models has an entry for ${entry.id} that get_model_meta never classified`);
+    // JSON.stringify every operand below (#218 round-3 review: a bare template-literal
+    // interpolation renders a STRING "200000" and the NUMBER 200000 identically as `200000`,
+    // making a type-only mutation's failure message read as "200000, want 200000" — true but
+    // useless. JSON.stringify renders them as `"200000"` vs `200000`, so the type is visible.
     assert.equal(entry.maxTokens, meta.maxTokens,
-      `${entry.id}: provider.models maxTokens=${entry.maxTokens} does not match get_model_meta's ` +
-      `maxTokens=${meta.maxTokens} — the write loop is not copying the classifier's output verbatim`);
+      `${entry.id}: provider.models maxTokens=${JSON.stringify(entry.maxTokens)} does not match ` +
+      `get_model_meta's maxTokens=${JSON.stringify(meta.maxTokens)} — the write loop is not ` +
+      `copying the classifier's output verbatim`);
     assert.equal(entry.reasoning, meta.reasoning,
-      `${entry.id}: provider.models.reasoning=${entry.reasoning} does not match get_model_meta's classification`);
+      `${entry.id}: provider.models.reasoning=${JSON.stringify(entry.reasoning)} does not match ` +
+      `get_model_meta's classification (${JSON.stringify(meta.reasoning)})`);
     assert.equal(entry.name, meta.name,
       `${entry.id}: provider.models.name=${JSON.stringify(entry.name)} does not match get_model_meta's classification`);
     // MED-2: the three literal-constant fields — invisible to the meta-diff above by construction.
@@ -6073,7 +6134,7 @@ test("ocp-connect: the provider.models write loop produces the exact entry — m
     assert.deepEqual(entry.cost, _OC_EXPECTED_PROVIDER_MODEL_LITERALS.cost,
       `${entry.id}: provider.models.cost=${JSON.stringify(entry.cost)}, want ${JSON.stringify(_OC_EXPECTED_PROVIDER_MODEL_LITERALS.cost)}`);
     assert.equal(entry.contextWindow, _OC_EXPECTED_PROVIDER_MODEL_LITERALS.contextWindow,
-      `${entry.id}: provider.models.contextWindow=${entry.contextWindow}, want ${_OC_EXPECTED_PROVIDER_MODEL_LITERALS.contextWindow}`);
+      `${entry.id}: provider.models.contextWindow=${JSON.stringify(entry.contextWindow)}, want ${JSON.stringify(_OC_EXPECTED_PROVIDER_MODEL_LITERALS.contextWindow)}`);
   }
 });
 
@@ -6117,9 +6178,13 @@ assert blk.strip(), "empty model_meta slice - anchor drift (see #218 review MED-
 assert 'def get_model_meta' in blk, "slice missing get_model_meta - anchor drift"
 assert 'os.makedirs' not in blk and 'open(config_path' not in blk, \\
     "slice overgrown past the intended block - anchor drift (see #218 review MED-1b)"
-assert 'open(' not in blk and 'os.' not in blk, \\
-    "slice contains a file-I/O call (open(...) / os.*) the intended block never needs - refusing to exec it"
-ns = {}
+# #218 round-3 review: same capability-boundary fix as the other harnesses that exec this slice
+# (H1/H2/H3) — restrict __builtins__ to exactly sorted+len rather than a bypassable, comment-
+# scanning substring denylist (round 2's blanket 'open('/'os.' ban used to be here; dropped for
+# the same reasoning documented at H1 above). Confirmed the override technique below
+# (ns['model_meta'] = ... after exec) still works identically under the restriction, since it
+# never touches __builtins__.
+ns = {"__builtins__": {"sorted": sorted, "len": len}}
 exec(blk, ns)
 ns['model_meta'] = {
     "a": {"name": "SHORT", "reasoning": False, "maxTokens": 1},
@@ -6142,6 +6207,17 @@ test("ocp-connect: get_model_meta matches the LONGEST (most specific) overlappin
   // specific override). A dict in insertion order would match "a" (SHORT) first here; the sort
   // must make "ab" (LONG) win instead.
   const result = _ocClassifyWithOverlappingPrefixTable();
+  // Sentinel (#218 round-3 review R7): separates "the ns['model_meta'] override after exec()
+  // never took effect" (id "abc" fell through to the REAL, un-overridden model_meta, matched
+  // nothing, and hit the unknown-id fallback — {"name": "abc (OCP)", "maxTokens": 8192}) from
+  // "the sort picked the wrong prefix". Without this, a broken override and a broken sort would
+  // both fail the assertion below with superficially similar-looking output, and its message
+  // would misdiagnose the first as the second.
+  assert.notEqual(result.maxTokens, 8192,
+    `get_model_meta("abc") returned the unknown-id-fallback shape (maxTokens=8192, name=` +
+    `${JSON.stringify(result.name)}) instead of either synthetic table entry — the ` +
+    `ns['model_meta'] override after exec() did not take effect (get_model_meta may no longer ` +
+    `read model_meta as a module global), NOT a sort defect`);
   assert.equal(result.name, "LONG",
     `get_model_meta("abc") against {"a":SHORT,"ab":LONG} returned name=${JSON.stringify(result.name)}; ` +
     `expected the longer/more-specific prefix "ab" (LONG) to win over "a" (SHORT) — the ` +
