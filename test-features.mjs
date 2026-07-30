@@ -4376,8 +4376,17 @@ test("models.json: max contextWindow is 200000 (global prompt-budget ceiling)", 
     `max contextWindow re-scales MAX_PROMPT_CHARS for ALL models incl. the 200k-native haiku (see lib/prompt.mjs + ADR 0009)`);
 });
 
-// contextWindow vs the CLI registry (#213). The ceiling test above pins the AGGREGATE; this pins
-// each entry, because "max is 200000" cannot distinguish a deliberate cap from a typo.
+// contextWindow vs the CLI registry (#213). Be honest about what this buys, because it is less than
+// it looks: TODAY every one of the seven rows resolves to a required value of exactly 200000, so this
+// test is currently EQUIVALENT to `assert.equal(m.contextWindow, 200000)`. The table earns its place
+// for two other reasons — symmetry with the reviewed _spotRegistryMaxTokens pattern below, and
+// failure messages that tell the next maintainer what to do — NOT for extra detection power.
+// Branch 1 only starts discriminating if a model with a registry window BELOW 200000 is ever added.
+//
+// It is also a FROZEN SNAPSHOT, not a live check. If Anthropic promotes claude-opus-4-6 from 200k to
+// 1M in a CLI update, this table still says 200000, models.json still says 200000, branch 1 compares
+// equal, and the suite stays GREEN while every message here asserts something the registry no longer
+// says. This detects models.json drift only. Re-extract the table when bumping the pinned CLI.
 //
 // models.json UNDER-declares contextWindow for every native-1M model, and that is a DECISION, not
 // drift. #195/#208 established that SPOT values should be the truth about the model, so without
@@ -4389,9 +4398,10 @@ test("models.json: max contextWindow is 200000 (global prompt-budget ceiling)", 
 //
 // Values extracted id-anchored from the compiled CLI 2.1.220 registry (`grep -ao 'id:"<id>"…'` plus
 // the following bytes) — never by bare-string search, which matches cross-references inside OTHER
-// records. NOTE the haiku key is the models.json id; the registry record is id:"claude-haiku-4-5"
-// and the dated string appears there only as provider_ids.first_party, so anchoring on the dated
-// id returns nothing.
+// records. NOTE the haiku key is the models.json id; the registry record is id:"claude-haiku-4-5",
+// and the dated string appears only as a provider alias — measured, under FOUR keys (first_party,
+// anthropic_aws, anthropic_google_cloud, gateway) and never as an `id:` — so
+// `grep 'id:"claude-haiku-4-5-20251001"'` returns 0 hits.
 const _spotRegistryContextWindow = {
   "claude-opus-5": 1000000, "claude-opus-4-8": 1000000, "claude-opus-4-7": 1000000,
   "claude-opus-4-6": 200000, "claude-sonnet-5": 1000000, "claude-sonnet-4-6": 200000,
@@ -4407,19 +4417,43 @@ test("models.json: contextWindow equals the registry, or is the deliberate 20000
       `(see the comment above; the haiku row shows how a models.json id can differ from the registry id) ` +
       `and add a row. Do NOT guess, and do NOT delete this assertion.`);
     if (reg <= _SPOT_CTX_CAP) {
-      // Nothing to trade off: the model's real window fits under the cap, so any difference is a typo.
+      // PRESUMED a typo, not proven one. The model's real window fits under the cap, so there is no
+      // prompt-budget reason to differ — but this PR's own schema edit records that contextWindow also
+      // drives OpenClaw's compaction budget, and that budget is LINEAR in it (contextWindowTokens x
+      // maxHistoryShare x SAFETY_MARGIN), which OpenClaw documents as a tuning axis. So declaring
+      // BELOW the registry to compact earlier and leave more generation headroom is a coherent
+      // decision. If that is what you are doing, change this row and record why — do not delete the
+      // assertion. This deliberately tightens the latitude the aggregate test's comment above leaves
+      // for "a future entry with a SMALLER window".
       assert.equal(m.contextWindow, reg,
         `${m.id}: registry says ${reg}, which is at or below the ${_SPOT_CTX_CAP} cap, so models.json ` +
-        `must match it exactly — it says ${m.contextWindow}`);
+        // JSON.stringify, not bare interpolation: a STRING "200000" would otherwise render as
+        // `must match it exactly — it says 200000`, reading as a self-contradiction. assert.equal is
+        // strict here (the file imports `strict as assert`), so the type is the whole defect.
+        `must match it exactly — it says ${JSON.stringify(m.contextWindow)}`);
     } else {
-      // Native-1M model: the ONLY legitimate value is the cap. Declaring the true window here
-      // re-scales the global prompt budget for every other model (see above).
+      // Registry window exceeds the cap: the ONLY legitimate value is the cap itself. Declaring the
+      // true window re-scales the global prompt budget for every other model (see above).
+      // The label is DERIVED, not hardcoded: for a future 500k model a literal "(native 1M)" would be
+      // a lie, and the message would then lecture about a 1M window that does not exist.
+      const _regLabel = reg === 1000000 ? "native 1M" : `above the ${_SPOT_CTX_CAP} cap`;
       assert.equal(m.contextWindow, _SPOT_CTX_CAP,
-        `${m.id}: registry says ${reg} (native 1M), so models.json must declare exactly ` +
-        `${_SPOT_CTX_CAP} — it says ${m.contextWindow}. Raising it is not a one-line change: ` +
-        `derivePromptCharBudget takes max() across ALL entries, so this would re-scale the budget ` +
-        `for the genuinely-200k models too. See #213 and ADR 0009.`);
+        `${m.id}: registry says ${reg} (${_regLabel}), so models.json must declare exactly ` +
+        `${_SPOT_CTX_CAP} — it says ${JSON.stringify(m.contextWindow)}. If you RAISED it: ` +
+        `derivePromptCharBudget takes max() across ALL entries, so that re-scales the budget for the ` +
+        `genuinely-200k models too, and is not a one-line change. If you LOWERED it: that may be ` +
+        `deliberate OpenClaw compaction tuning — change this row and record why. See #213, ADR 0009.`);
     }
+  }
+  // Reverse direction. Both loops above walk models.json, so the mapping is ONE-WAY and a deleted
+  // entry is simply never visited: removing claude-sonnet-4-6 leaves the suite at 463 passed, 0
+  // failed (measured). It is not an alias or legacyAlias target either, so nothing else catches it —
+  // the model would silently vanish from /v1/models and from OpenClaw's registry. The table already
+  // enumerates the expected ids, so this costs one loop.
+  for (const id of Object.keys(_spotRegistryContextWindow)) {
+    assert.ok(_spotModelIds.has(id),
+      `${id} is recorded in the registry table but missing from models[] — removing a model must be ` +
+      `deliberate: drop its row here in the same commit and say why in the message.`);
   }
 });
 
