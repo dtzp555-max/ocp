@@ -4376,6 +4376,53 @@ test("models.json: max contextWindow is 200000 (global prompt-budget ceiling)", 
     `max contextWindow re-scales MAX_PROMPT_CHARS for ALL models incl. the 200k-native haiku (see lib/prompt.mjs + ADR 0009)`);
 });
 
+// contextWindow vs the CLI registry (#213). The ceiling test above pins the AGGREGATE; this pins
+// each entry, because "max is 200000" cannot distinguish a deliberate cap from a typo.
+//
+// models.json UNDER-declares contextWindow for every native-1M model, and that is a DECISION, not
+// drift. #195/#208 established that SPOT values should be the truth about the model, so without
+// this test the four capped rows read as unfixed bugs. Why they are capped: derivePromptCharBudget
+// (lib/prompt.mjs, ADR 0009) takes max(contextWindow) × 3 across ALL entries, so ONE 1e6 row would
+// raise MAX_PROMPT_CHARS from 600k to 3M for EVERY model — including claude-haiku-4-5-20251001,
+// which is genuinely 200k native — turning clean OCP-side truncation into upstream API rejections.
+// Declaring the true 1M needs per-model budgets instead of a single global max(); tracked in #213.
+//
+// Values extracted id-anchored from the compiled CLI 2.1.220 registry (`grep -ao 'id:"<id>"…'` plus
+// the following bytes) — never by bare-string search, which matches cross-references inside OTHER
+// records. NOTE the haiku key is the models.json id; the registry record is id:"claude-haiku-4-5"
+// and the dated string appears there only as provider_ids.first_party, so anchoring on the dated
+// id returns nothing.
+const _spotRegistryContextWindow = {
+  "claude-opus-5": 1000000, "claude-opus-4-8": 1000000, "claude-opus-4-7": 1000000,
+  "claude-opus-4-6": 200000, "claude-sonnet-5": 1000000, "claude-sonnet-4-6": 200000,
+  "claude-haiku-4-5-20251001": 200000,      // registry id: claude-haiku-4-5
+};
+const _SPOT_CTX_CAP = 200000;
+
+test("models.json: contextWindow equals the registry, or is the deliberate 200000 cap (#213)", () => {
+  for (const m of _spotModels.models) {
+    const reg = _spotRegistryContextWindow[m.id];
+    assert.ok(reg !== undefined,
+      `${m.id} has no recorded registry contextWindow — extract it id-anchored from the CLI binary ` +
+      `(see the comment above; the haiku row shows how a models.json id can differ from the registry id) ` +
+      `and add a row. Do NOT guess, and do NOT delete this assertion.`);
+    if (reg <= _SPOT_CTX_CAP) {
+      // Nothing to trade off: the model's real window fits under the cap, so any difference is a typo.
+      assert.equal(m.contextWindow, reg,
+        `${m.id}: registry says ${reg}, which is at or below the ${_SPOT_CTX_CAP} cap, so models.json ` +
+        `must match it exactly — it says ${m.contextWindow}`);
+    } else {
+      // Native-1M model: the ONLY legitimate value is the cap. Declaring the true window here
+      // re-scales the global prompt budget for every other model (see above).
+      assert.equal(m.contextWindow, _SPOT_CTX_CAP,
+        `${m.id}: registry says ${reg} (native 1M), so models.json must declare exactly ` +
+        `${_SPOT_CTX_CAP} — it says ${m.contextWindow}. Raising it is not a one-line change: ` +
+        `derivePromptCharBudget takes max() across ALL entries, so this would re-scale the budget ` +
+        `for the genuinely-200k models too. See #213 and ADR 0009.`);
+    }
+  }
+});
+
 test("models.json: every aliases value resolves to a real models[].id (referential integrity)", () => {
   for (const [name, target] of Object.entries(_spotModels.aliases)) {
     assert.ok(_spotModelIds.has(target), `aliases.${name} -> '${target}' is a dangling alias (no matching models[].id)`);

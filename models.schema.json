@@ -42,7 +42,7 @@
           },
           "contextWindow": {
             "type": "integer",
-            "description": "Advertised context window. GLOBAL side effect: MAX_PROMPT_CHARS derives from max(contextWindow) x 3 across ALL entries (lib/prompt.mjs derivePromptCharBudget), so raising this on ONE model raises the truncation ceiling for EVERY model. See ADR 0009. Also feeds OpenClaw's compaction budget."
+            "description": "Advertised context window. GLOBAL side effect: MAX_PROMPT_CHARS derives from max(contextWindow) x 3 across ALL entries (lib/prompt.mjs derivePromptCharBudget), so raising this on ONE model raises the truncation ceiling for EVERY model. See ADR 0009. Also feeds OpenClaw's compaction budget (unlike maxTokens, which does not). DELIBERATELY DIVERGES FROM THE CLI REGISTRY: every native-1M model is declared here at 200000, not 1000000. That is a decision, not drift — because of the max() above, one 1e6 entry would re-scale the budget for the genuinely-200k models too. Declaring true windows requires per-model budgets; tracked in issue #213. test-features.mjs pins each entry to either its registry value or the 200000 cap."
           },
           "maxTokens": {
             "type": "integer",
