@@ -777,7 +777,7 @@ cmd_update() {
 
   # Doctor-driven path selection
   local doctor_json kind
-  # `|| true` is load-bearing, not decorative: doctor.mjs:310 does
+  # `|| true` is load-bearing, not decorative: doctor.mjs:374 does
   # `process.exit(fail_count === 0 ? 0 : 1)` — ANY fail check (fix_service, fix_oauth,
   # fresh_install) makes it exit 1. `ocp:7` runs under `set -euo pipefail`, so a bare
   # `var=$(cmd)` assignment where cmd exits non-zero trips `set -e` immediately, killing
