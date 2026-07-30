@@ -4450,6 +4450,11 @@ test("models.json: contextWindow equals the registry, or is the deliberate 20000
   // failed (measured). It is not an alias or legacyAlias target either, so nothing else catches it —
   // the model would silently vanish from /v1/models and from OpenClaw's registry. The table already
   // enumerates the expected ids, so this costs one loop.
+  // Consequence worth knowing before you hit it: forward gives models[] subset-of table and this
+  // gives table subset-of models[], so the two id sets are now exactly EQUAL. Pre-recording a row
+  // for a model not yet exposed is therefore a test failure — claude-fable-5 and claude-mythos-5
+  // are both in the 2.1.220 registry at 1e6, and staging them here is not possible. Add the row in
+  // the same commit that adds the model.
   for (const id of Object.keys(_spotRegistryContextWindow)) {
     assert.ok(_spotModelIds.has(id),
       `${id} is recorded in the registry table but missing from models[] — removing a model must be ` +
@@ -4478,9 +4483,13 @@ test("models.json: every aliases value resolves to a real models[].id (referenti
 // each extracted id-anchored (grep 'id:"<id>"' + the following bytes) — never by bare-string
 // search, which matches cross-references inside OTHER models' records and silently attributes
 // the wrong number. ONE KEY IS NOT A REGISTRY ID: models.json carries the dated haiku id, but
-// the registry record is id:"claude-haiku-4-5" (the dated string appears only as that record's
-// provider_ids.first_party). Anchor the haiku row on the SHORT id; anchoring on the dated one
-// returns nothing, which is what tempts the next reader back into a bare-string search.
+// the registry record is id:"claude-haiku-4-5" — the dated string appears only as a provider
+// alias, measured under FOUR keys (first_party, anthropic_aws, anthropic_google_cloud, gateway)
+// and never as an `id:`. Anchor the haiku row on the SHORT id; anchoring on the dated one returns
+// nothing, which is what tempts the next reader back into a bare-string search.
+// NOTE this table has NO reverse check, unlike _spotRegistryContextWindow above: a row left here
+// for a model that no longer exists in models.json passes green (measured: rename a model, update
+// both tables, leave the stale row here -> 463 passed, 0 failed). Tracked separately.
 const _spotRegistryMaxTokens = {
   "claude-opus-5": 64000, "claude-opus-4-8": 64000, "claude-opus-4-7": 64000, "claude-opus-4-6": 64000,
   "claude-sonnet-5": 64000, "claude-sonnet-4-6": 32000,
