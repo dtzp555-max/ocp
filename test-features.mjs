@@ -5767,11 +5767,19 @@ const _ocConnectPath = spotJoin(_spotDir, "ocp-connect");
 //     names not in that dict — `open`, `__import__` (which `import pathlib` etc. compile down
 //     to), and everything reachable only through them — raise `NameError`/`ImportError` before a
 //     single byte moves. This is a property of the CODE PATH taken at exec time, not of the
-//     source text, so it cannot be bypassed by a new I/O idiom nobody has thought of yet, and it
-//     cannot be tripped by an unrelated comment either. The standing constraint on this repo is
-//     that ocp-connect is never run end-to-end because it writes the user's OpenClaw registry; a
-//     harness that can silently begin exec'ing that writer is the one shape that must not exist
-//     here, and this is the actual guarantee that makes that true, not an approximation of it.
+//     source text, so it is not defeated by a new I/O idiom nobody has thought of yet, and it
+//     cannot be tripped by an unrelated comment either.
+//     SCOPE, stated exactly rather than absolutely: this is a DRIFT guard, not an adversarial
+//     sandbox. Deliberate dunder traversal still reaches the filesystem — `len.__self__.open(...)`
+//     writes a real file (measured), as does `json.__builtins__['open']` in the harness that
+//     passes `json` as a namespace key. That is out of scope on purpose: the failure mode this
+//     defends against is a slice ACCIDENTALLY growing into ocp-connect's installer section, and
+//     all three real bypasses found in review were ordinary edits (`os.makedirs`, a bare
+//     `open()`, `pathlib.write_text`), not dunder walks. Nobody writes `len.__self__` by accident
+//     in an embedded python block. The standing constraint on this repo is that ocp-connect is
+//     never run end-to-end because it writes the user's OpenClaw registry; a harness that can
+//     silently begin exec'ing that writer is the one shape that must not exist here, and this
+//     closes that — for accidents, which is the whole threat model.
 
 // --- Harness 1: classify one or more model ids through ocp-connect's REAL model_meta table +
 // REAL get_model_meta() (verbatim exec — the exact slice given in #210's own harness sketch). ---
