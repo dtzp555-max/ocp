@@ -5690,13 +5690,15 @@ test("listKeys does not depend on rows left behind by an earlier or concurrent r
 // ── ocp-connect model-registry coverage (issue #210) ─────────────────────────
 // ═════════════════════════════════════════════════════════════════════════════
 // `ocp-connect` is a user-facing installer that writes model metadata straight into the
-// user's OpenClaw registry (~/.openclaw/openclaw.json) — and until now had ZERO test
-// coverage (`grep -c 'ocp-connect' test-features.mjs` -> 0). Two real defects shipped in
-// exactly this uncovered surface and were caught only by human review during #208's review:
-// the unknown-id fallback over-advertised by 4x (8192 -> 32000), and a comment describing the
-// family maxTokens table misdescribed its own scope. Meanwhile the equivalent claim on the
-// models.json side of the same feature IS pinned and mutation-verified (`_spotRegistryMaxTokens`
-// above, #195/#208). This section brings ocp-connect's classifier up to the same bar.
+// user's OpenClaw registry (~/.openclaw/openclaw.json). Before this PR, `test-features.mjs`
+// mentioned `ocp-connect` exactly once (`grep -c 'ocp-connect' test-features.mjs` -> `1`) — a
+// comment noting it as a maxTokens consumer, not a test — and exercised none of its logic. Two
+// real defects shipped in exactly this uncovered surface and were caught only by human review
+// during #208's review: the unknown-id fallback over-advertised by 4x (8192 -> 32000), and a
+// comment describing the family maxTokens table misdescribed its own scope. Meanwhile the
+// equivalent claim on the models.json side of the same feature IS pinned and mutation-verified
+// (`_spotRegistryMaxTokens` above, #195/#208). This section brings ocp-connect's classifier up
+// to the same bar.
 //
 // Harness (verified during #208's review, see #210): the REAL `model_meta` table and REAL
 // `get_model_meta()` function are sliced out of ocp-connect's own source verbatim — between two
@@ -5704,15 +5706,37 @@ test("listKeys does not depend on rows left behind by an earlier or concurrent r
 // Nothing here is a JS re-implementation ("replica") of the classifier: a change to
 // ocp-connect's table, its prefix-matching order, or its fallback is a change to what this
 // harness EXECUTES, not merely what it reads. A test that grepped ocp-connect's source text for
-// an expected number would not catch a behavioral regression — that is the antipattern this
-// suite forbids (see the module docstring above and #210).
+// an expected number would not do that — it would pin whatever string is on the page today,
+// including a wrong one, and miss any regression that changes the computed VALUE without
+// changing the literal text near it.
 //
-// Not in scope (per #210): the network/install paths of ocp-connect (connectivity probing,
-// shell-rc rewriting, launchctl/systemd env writes) — only the model-metadata classifier that
-// ocp-connect hands to OpenClaw is covered here.
+// Scope, precisely: covers the classifier (`model_meta` + `get_model_meta()`) AND the loop that
+// maps its output into `provider.models` entries (still pure in-memory — no file I/O). It does
+// NOT cover: the JSON config load/merge/write that follows, per-agent auth-profile seeding, or
+// any network/install path (connectivity probing, shell-rc rewriting, launchctl/systemd env
+// writes) — those are out of scope per #210 and untouched here. (#218 review MED-3: an earlier
+// draft of this section claimed to cover "the model metadata ocp-connect hands OpenClaw" without
+// actually reaching the mapping loop — narrowed here, and the mapping loop is now covered by a
+// dedicated test below instead of just a narrower claim.)
 console.log("\nocp-connect model registry (#210):");
 
 const _ocConnectPath = spotJoin(_spotDir, "ocp-connect");
+
+// Every python harness below slices ocp-connect's source between two textual anchors and execs
+// the slice. Two failure modes were found by #218 review and are guarded in EVERY harness below:
+//   - MED-1a: an anchor that fails to match makes `.index()` throw — loud, fine. But if the
+//     START and END anchors are found in the WRONG order (or the slice is otherwise degenerate),
+//     python slicing silently returns `''`, and `py_compile`/`exec` on an empty string trivially
+//     "succeeds" — a vacuous pass, not a check.
+//   - MED-1b: `.index(marker)` (no bound) matches the FIRST occurrence of `marker` in the whole
+//     file. If unrelated code elsewhere in ocp-connect ever introduces an earlier occurrence of
+//     the same text, the slice silently grows or shifts. Concretely: `for mid in model_ids:`
+//     appears twice in ocp-connect (the classify loop, and the alias-building loop 49 lines
+//     later); renaming the FIRST one makes the (unbounded) end-anchor search land on the SECOND,
+//     and the slice silently grows to include `os.makedirs` / `open(config_path` — code that was
+//     never meant to be in it. Nothing about that failure mode is loud on its own.
+// Each harness asserts the slice is non-empty, contains what it must contain, and does NOT
+// contain markers from adjacent sections it must NOT reach — before doing anything with it.
 
 // --- Harness 1: classify one or more model ids through ocp-connect's REAL model_meta table +
 // REAL get_model_meta() (verbatim exec — the exact slice given in #210's own harness sketch). ---
@@ -5720,6 +5744,10 @@ const _OC_CLASSIFY_PY = `
 import json, sys
 src = open(sys.argv[1]).read()
 blk = src[src.index('model_meta = {') : src.index('for mid in model_ids:')]
+assert blk.strip(), "empty model_meta slice - anchor drift (see #218 review MED-1a)"
+assert 'def get_model_meta' in blk, "slice missing get_model_meta - anchor drift"
+assert 'os.makedirs' not in blk and 'open(config_path' not in blk, \\
+    "slice overgrown past the intended block - anchor drift (see #218 review MED-1b)"
 ns = {}
 exec(blk, ns)
 ids = json.loads(sys.argv[2])
@@ -5736,7 +5764,61 @@ function _ocClassify(ids) {
   return JSON.parse(raw);
 }
 
-// --- Harness 2: drive ocp-connect's REAL /v1/models-JSON-parse try/except verbatim, with a
+// --- Harness 2: pull the REAL model_meta table itself (not a classification of a specific id)
+// out of ocp-connect, so it can be compared to a pinned snapshot BY EQUALITY (see the
+// "matches a pinned snapshot EXACTLY" test below, #218 review HIGH-2). ---
+const _OC_TABLE_PY = `
+import json, sys
+src = open(sys.argv[1]).read()
+blk = src[src.index('model_meta = {') : src.index('for mid in model_ids:')]
+assert blk.strip(), "empty model_meta slice - anchor drift (see #218 review MED-1a)"
+assert 'def get_model_meta' in blk, "slice missing get_model_meta - anchor drift"
+assert 'os.makedirs' not in blk and 'open(config_path' not in blk, \\
+    "slice overgrown past the intended block - anchor drift (see #218 review MED-1b)"
+ns = {}
+exec(blk, ns)
+sys.stdout.write(json.dumps(ns['model_meta']))
+`;
+
+function _ocModelMetaTable() {
+  const raw = execFileSync("python3", ["-c", _OC_TABLE_PY, _ocConnectPath], { encoding: "utf8" });
+  return JSON.parse(raw);
+}
+
+// --- Harness 3: drive the REAL model_meta/get_model_meta block AND the REAL loop that maps
+// get_model_meta's output into provider.models entries (the code `_ocClassify` above never
+// reaches — #218 review MED-3). Still pure in-memory: the slice stops at "# Load or create
+// config", strictly before any file read/write. `provider` is seeded as an empty
+// {"models": []} rather than sliced from ocp-connect's own `provider = {...}` (which needs
+// `base_url`/`api_key` this harness deliberately doesn't supply) — the loop only ever appends
+// to provider["models"], so this is sufficient to observe its output. ---
+const _OC_PROVIDER_PY = `
+import json, sys
+src = open(sys.argv[1]).read()
+start_marker = 'model_meta = {'
+end_marker = '\\n\\n# Load or create config'
+si = src.index(start_marker)
+ei = src.index(end_marker, si)
+blk = src[si:ei]
+assert blk.strip(), "empty slice - anchor drift (see #218 review MED-1a)"
+assert 'def get_model_meta' in blk, "slice missing get_model_meta - anchor drift"
+assert 'for mid in model_ids' in blk, "slice missing the provider.models write loop - anchor drift"
+ids = json.loads(sys.argv[2])
+ns = {"model_ids": ids, "provider": {"models": []}}
+exec(blk, ns)
+sys.stdout.write(json.dumps(ns["provider"]["models"]))
+`;
+
+function _ocBuildProviderModels(ids) {
+  const raw = execFileSync(
+    "python3",
+    ["-c", _OC_PROVIDER_PY, _ocConnectPath, JSON.stringify(ids)],
+    { encoding: "utf8" },
+  );
+  return JSON.parse(raw);
+}
+
+// --- Harness 4: drive ocp-connect's REAL /v1/models-JSON-parse try/except verbatim, with a
 // caller-supplied `models_json_str`, and return the resulting `model_ids`. This is how the
 // hardcoded three-id fallback list (used when /v1/models JSON fails to parse) is obtained below
 // — by actually running the real except: branch with malformed input, not by reading the
@@ -5749,6 +5831,9 @@ end_marker = "\\n\\n# Build provider entry"
 si = src.index(start_marker)
 ei = src.index(end_marker, si)
 blk = src[si:ei]
+assert blk.strip(), "empty fallback slice - anchor drift (see #218 review MED-1a)"
+assert 'except:' in blk, "slice missing the except: branch - anchor drift"
+assert 'provider = {' not in blk, "slice overgrown past the intended block - anchor drift (see #218 review MED-1b)"
 ns = {"json": json, "models_json_str": sys.argv[2]}
 exec(blk, ns)
 sys.stdout.write(json.dumps(ns["model_ids"]))
@@ -5769,10 +5854,20 @@ function _ocFallbackModelIds(modelsJsonStr) {
 //   grep -ao 'id:"<id>".\{0,700\}' <binary> | grep -o 'max_output_tokens:{default:[0-9]*'
 // (a 400-byte window silently truncates before reaching max_output_tokens for these particular
 // records — different window widths give different results, per the #210 extraction protocol;
-// 700 bytes was confirmed sufficient for every id below). These are exactly the ids
-// ocp-connect's own family-table comment names as the over-advertised opus-family risk.
+// 700 bytes was confirmed sufficient for every id below). All three are opus-family ids the CLI
+// registry caps at 32000 that ocp-connect's 64000 opus row would over-advertise 2x; ocp-connect's
+// own comment names only two of them (-4-0/-4-5) — claude-opus-4-1 is the same defect class and
+// was missing from that comment (#218 review MED-6: re-verified id-anchored, added here).
+//
+// On the CURRENT tree none of these three are actually reached by any passing assertion — the
+// hardcoded fallback list below resolves entirely via `_spotRegistryMaxTokens`/`legacyAliases`
+// — so this map's only current reader is the mutation-proof for the "hardcoded three-id ...
+// fallback" test (swap an id into that list and this is what gives the swapped-in id's ground
+// truth). It earns its place by making that test's coverage provable beyond models.json's own
+// members, not by being exercised on every green run (#218 review MED-5).
 const _ocKnownRegistryExtras = {
   "claude-opus-4-0": 32000,
+  "claude-opus-4-1": 32000,
   "claude-opus-4-5": 32000,
 };
 
@@ -5789,6 +5884,30 @@ function _ocRegistryTruth(id) {
   return undefined;
 }
 
+// #218 review HIGH-1: every harness above assumes bash hands python ocp-connect's python-block
+// source TEXT byte-for-byte — true only because the heredoc delimiter is QUOTED (<<'PYEOF').
+// An UNQUOTED heredoc (<<PYEOF) makes bash shell-expand $vars / $(...) / `...` in the body
+// BEFORE python ever sees it, so the running program would silently differ from the text this
+// harness reads — invisibly to every other test in this section. This is the test that actually
+// checks the premise the rest of the section depends on.
+test("ocp-connect: the model-metadata heredoc is QUOTED (<<'PYEOF') — the harness's fidelity premise", () => {
+  const ocSrc = spotReadFileSync(_ocConnectPath, "utf8");
+  // Anchor on the FULL opener line, not the bare `<<'PYEOF'` token: ocp-connect has a SECOND,
+  // unrelated heredoc later in the file (the shell-rc rewriter) that is ALSO `<<'PYEOF'`-quoted,
+  // so a bare substring check would stay true even if THIS heredoc — the one that actually feeds
+  // the model_meta/get_model_meta block every other test in this section reads — got unquoted.
+  // (Caught in review of this very test: mutating just this line to `<<PYEOF` left the naive
+  // `ocSrc.includes("<<'PYEOF'")` check trivially true because of that second heredoc.)
+  const openerLine =
+    'python3 - "$oc_config" "$base_url" "$key" "$provider_name" "$priority_choice" "$models_out" <<\'PYEOF\' && py_ok=1';
+  assert.ok(ocSrc.includes(openerLine),
+    "ocp-connect's model-metadata heredoc must stay quoted (<<'PYEOF'); an unquoted heredoc " +
+    "(<<PYEOF) lets bash shell-expand the python body before python sees it, silently " +
+    "invalidating the fidelity premise every other test in this section depends on — and note " +
+    "that ocp-connect's OTHER heredoc (the shell-rc rewriter) being quoted is not sufficient, " +
+    "this must check THIS specific opener line");
+});
+
 test("ocp-connect: `bash -n` reports no syntax errors", () => {
   execFileSync("bash", ["-n", _ocConnectPath], { encoding: "utf8" });
 });
@@ -5798,15 +5917,49 @@ test("ocp-connect: the embedded model_meta/get_model_meta python block compiles 
 import sys, py_compile, tempfile, os
 src = open(sys.argv[1]).read()
 blk = src[src.index('model_meta = {') : src.index('for mid in model_ids:')]
+assert blk.strip(), "empty model_meta slice - anchor drift (see #218 review MED-1a)"
+assert 'def get_model_meta' in blk, "slice missing get_model_meta - anchor drift"
+assert 'os.makedirs' not in blk and 'open(config_path' not in blk, \\
+    "slice overgrown past the intended block - anchor drift (see #218 review MED-1b)"
 fd, path = tempfile.mkstemp(suffix='.py')
 os.write(fd, blk.encode())
 os.close(fd)
+# py_compile's default cfile writes a .pyc into a __pycache__/ dir next to \`path\` that nothing
+# then cleans up (#218 review LOW). Route it at an explicit second tempfile instead (newer
+# CPython's py_compile refuses non-regular-file targets like os.devnull with FileExistsError,
+# so that shortcut doesn't work here) and remove both, regardless of outcome.
+cfd, cpath = tempfile.mkstemp(suffix='.pyc')
+os.close(cfd)
 try:
-    py_compile.compile(path, doraise=True)
+    py_compile.compile(path, cfile=cpath, doraise=True)
 finally:
     os.remove(path)
+    os.remove(cpath)
 `;
   execFileSync("python3", ["-c", script, _ocConnectPath], { encoding: "utf8" });
+});
+
+// Exact snapshot of ocp-connect's model_meta table — name + reasoning + maxTokens, checked by
+// EQUALITY, not just an upper bound. The <=-based tests below only forbid OVER-advertising
+// maxTokens; on their own they are blind to: a DELETED row (falls through to the unknown-id
+// 8192 fallback, which is <= every registry value, so passes silently); an UNDER-advertising
+// drift (also <= by definition — "safe" is exactly why <= alone lets it through); a wrong
+// `name` (never compared anywhere below, and it is the literal string written into the user's
+// ~/.openclaw/openclaw.json model picker); or maxTokens silently becoming a STRING (JS's `<=`
+// operator coerces `"32000" <= 32000` to `true`). This is the one assertion that catches all
+// four (#218 review HIGH-2 / MED-4).
+const _OC_EXPECTED_MODEL_META_TABLE = {
+  "claude-opus": { name: "Claude Opus (OCP)", reasoning: true, maxTokens: 64000 },
+  "claude-sonnet": { name: "Claude Sonnet (OCP)", reasoning: true, maxTokens: 32000 },
+  "claude-haiku": { name: "Claude Haiku (OCP)", reasoning: false, maxTokens: 32000 },
+};
+
+test("ocp-connect: model_meta table matches a pinned snapshot EXACTLY (name + reasoning + maxTokens, not just an upper bound)", () => {
+  const table = _ocModelMetaTable();
+  assert.deepEqual(table, _OC_EXPECTED_MODEL_META_TABLE,
+    "ocp-connect's model_meta table drifted from the pinned snapshot above — a deleted row, an " +
+    "under-advertising drift, a changed `name`, or a stringified maxTokens would all pass the " +
+    "<=-based tests below silently; this is the test that catches them");
 });
 
 test("ocp-connect: every models.json id classifies at or below its CLI-registry maxTokens (never over-advertises)", () => {
@@ -5831,6 +5984,31 @@ test("ocp-connect: reasoning classification matches models.json ground truth for
   for (const m of _spotModels.models) {
     assert.equal(classified[m.id].reasoning, m.reasoning,
       `${m.id}: ocp-connect classifies reasoning=${classified[m.id].reasoning}, models.json says ${m.reasoning}`);
+  }
+});
+
+test("ocp-connect: the provider.models write loop copies get_model_meta's output verbatim (not a hardcoded value)", () => {
+  // #218 review MED-3: the classify-based tests above call get_model_meta() directly and never
+  // exercise the loop that actually maps its return value into the provider.models entries OCP
+  // hands OpenClaw (`"maxTokens": meta["maxTokens"]` etc. — ocp-connect:169-177). A mutation to
+  // THAT mapping (e.g. hardcoding maxTokens to 999999 regardless of what get_model_meta
+  // returned) was invisible to every test above, including the one literally named "never
+  // over-advertises". This drives the real loop (Harness 3, still pure in-memory) and diffs its
+  // output against the real classifier's output for the same ids.
+  const ids = _spotModels.models.map((m) => m.id);
+  const classified = _ocClassify(ids);
+  const built = _ocBuildProviderModels(ids);
+  assert.equal(built.length, ids.length, "provider.models must have exactly one entry per requested id");
+  for (const entry of built) {
+    const meta = classified[entry.id];
+    assert.ok(meta, `provider.models has an entry for ${entry.id} that get_model_meta never classified`);
+    assert.equal(entry.maxTokens, meta.maxTokens,
+      `${entry.id}: provider.models maxTokens=${entry.maxTokens} does not match get_model_meta's ` +
+      `maxTokens=${meta.maxTokens} — the write loop is not copying the classifier's output verbatim`);
+    assert.equal(entry.reasoning, meta.reasoning,
+      `${entry.id}: provider.models.reasoning=${entry.reasoning} does not match get_model_meta's classification`);
+    assert.equal(entry.name, meta.name,
+      `${entry.id}: provider.models.name=${JSON.stringify(entry.name)} does not match get_model_meta's classification`);
   }
 });
 
@@ -5863,6 +6041,10 @@ test("ocp-connect: the hardcoded three-id JSON-parse-failure fallback never over
   const fallbackIds = _ocFallbackModelIds("not valid json{{{");
   assert.ok(Array.isArray(fallbackIds) && fallbackIds.length > 0,
     "the except: branch must set a non-empty model_ids fallback");
+  // ocp-connect's comment and #210 both describe this as a THREE-id list — assert the count
+  // itself, not just that each id it happens to contain is safe (#218 review LOW).
+  assert.equal(fallbackIds.length, 3,
+    `the hardcoded fallback is documented as a three-id list, got ${fallbackIds.length}: ${JSON.stringify(fallbackIds)}`);
 
   const classified = _ocClassify(fallbackIds);
   for (const id of fallbackIds) {
