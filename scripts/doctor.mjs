@@ -86,6 +86,15 @@ export async function runDoctor(opts = {}) {
 
   // --- service health check (mockable) ---
   let healthOk = true, oauthOk = true;
+  // Issue #214: the RUNNING SERVICE's version, as reported by /health, kept distinct from
+  // currentVersion (the tree's package.json, above). A partially-failed `ocp update` can
+  // `git checkout` the new tag and then fail before the restart phase runs, leaving the tree
+  // looking fully updated while the service still answers with the old code. null means
+  // "unknown" (skipNetwork, /health unreachable, or a body with no usable version field) —
+  // the noop decision below must degrade gracefully on unknown, same philosophy as
+  // upgrade.mjs's postFlightOk ("an empty/unknown target degrades ... rather than blocking an
+  // otherwise-good upgrade").
+  let serviceVersion = null;
   if (!opts.skipNetwork) {
     let health;
     if (opts.mockHealth !== undefined) {
@@ -114,6 +123,12 @@ export async function runDoctor(opts = {}) {
       } else {
         push("oauth_ok", "PASS", "OAuth token valid");
       }
+      // /health reports a bare semver (server.mjs `version: VERSION`, no leading "v"); only
+      // trust it when it actually parses as a version, so a missing/garbled field degrades to
+      // "unknown" (serviceVersion stays null) instead of being mistaken for a real mismatch.
+      if (typeof health.body.version === "string" && semverParts(health.body.version)) {
+        serviceVersion = health.body.version.startsWith("v") ? health.body.version : `v${health.body.version}`;
+      }
     }
   }
 
@@ -130,7 +145,25 @@ export async function runDoctor(opts = {}) {
     if (!cur) {
       kind = "fresh_install";
     } else if (semverCompare(currentVersion, latestVersion) === 0) {
-      kind = "noop";
+      // Issue #214: "tree == latest" alone is NOT "nothing to do" — the goal is the running
+      // service serving the tree's version. When serviceVersion is known (see health-check
+      // block above) and it differs from the tree, a previous update half-completed (tree
+      // checked out, restart phase never ran). Reuse kind="update" rather than invent a new
+      // enum value: it is already the exact remediation needed here (bash `cmd_update`'s
+      // "update" branch runs `_cmd_update_light`, which git-pulls — a no-op, tree is already
+      // current — and unconditionally restarts the service; `scripts/upgrade.mjs`'s "update"
+      // branch already no-ops sensibly too). A new kind would require every next_action.kind
+      // consumer (ocp's cmd_update case statement, upgrade.mjs's runUpgrade, any AI agent
+      // reading the JSON contract) to learn a value that maps to the same action anyway.
+      // Push a WARN (not FAIL) so ready_to_upgrade stays true — runUpgrade()'s pre-flight
+      // guard only tolerates ready_to_upgrade=false for kind="fresh_install".
+      if (serviceVersion && semverCompare(serviceVersion, currentVersion) !== 0) {
+        kind = "update";
+        push("service_version_matches_tree", "WARN",
+          `tree at ${currentVersion.replace(/^v/, "")}, service serving ${serviceVersion.replace(/^v/, "")} — restarting`);
+      } else {
+        kind = "noop";
+      }
     } else if (lat && cur.major === lat.major && cur.minor === lat.minor) {
       kind = "update";
     } else {

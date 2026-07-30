@@ -838,6 +838,83 @@ test("doctor falls back to currentVersion when origin/main unreachable (no stale
   assert.equal(result.next_action.kind, "noop");
 });
 
+// ── Issue #214: doctor's noop must reflect the RUNNING SERVICE's version, not just the tree ──
+// Root cause: a partially-failed `ocp update` can `git checkout` the new tag and then fail
+// before the restart phase runs. The tree now looks fully updated, but the service (per
+// /health) still answers with the OLD version. Before this fix, the next `ocp update` run
+// compared tree==latest, found them equal, and reported kind="noop" — silently leaving the
+// stale service running. These five tests pin the cases enumerated in the issue. The fix
+// reuses kind="update" (rather than inventing a new enum value) for the "tree==latest but
+// service stale" case: bash `cmd_update`'s "update" branch already runs `_cmd_update_light`,
+// which git-pulls (a no-op — the tree is already current) and unconditionally restarts the
+// service, and `scripts/upgrade.mjs`'s "update" branch already no-ops sensibly too — so every
+// existing next_action.kind consumer already behaves correctly with no further changes.
+console.log("\nDoctor next_action.kind reflects running-service version (#214):");
+
+test("#214: tree==latest, service reports the same version → genuinely noop", async () => {
+  const result = await runDoctor({
+    skipNetwork: false,
+    mockVersion: "v3.26.0",
+    mockLatest: "v3.26.0",
+    mockHealth: { status: 200, body: { version: "3.26.0", auth: { ok: true } } }
+  });
+  assert.equal(result.next_action.kind, "noop");
+  assert.equal(result.ready_to_upgrade, true);
+  assert.ok(!result.checks.some(c => c.id === "service_version_matches_tree"),
+    "no stale-service warning expected when versions match");
+});
+
+test("#214: tree==latest, service reports an OLDER version → NOT noop, restarts via update kind", async () => {
+  const result = await runDoctor({
+    skipNetwork: false,
+    mockVersion: "v3.26.0",
+    mockLatest: "v3.26.0",
+    mockHealth: { status: 200, body: { version: "3.25.0", auth: { ok: true } } }
+  });
+  assert.equal(result.next_action.kind, "update");
+  // WARN, not FAIL: ready_to_upgrade must stay true, or runUpgrade()'s pre-flight guard
+  // (which only tolerates ready_to_upgrade=false for kind="fresh_install") would throw
+  // instead of letting the restart proceed.
+  assert.equal(result.ready_to_upgrade, true);
+  const warning = result.checks.find(c => c.id === "service_version_matches_tree");
+  assert.ok(warning, "expected a service_version_matches_tree check");
+  assert.equal(warning.level, "WARN");
+  assert.equal(warning.message, "tree at 3.26.0, service serving 3.25.0 — restarting");
+});
+
+test("#214: tree==latest, /health unreachable → NOT noop (still fix_service)", async () => {
+  const result = await runDoctor({
+    skipNetwork: false,
+    mockVersion: "v3.26.0",
+    mockLatest: "v3.26.0",
+    mockHealth: { error: "ECONNREFUSED" }
+  });
+  assert.equal(result.next_action.kind, "fix_service");
+  assert.notEqual(result.next_action.kind, "noop");
+});
+
+test("#214: tree==latest, /health reachable but no version field → degrades gracefully to noop", async () => {
+  const result = await runDoctor({
+    skipNetwork: false,
+    mockVersion: "v3.26.0",
+    mockLatest: "v3.26.0",
+    mockHealth: { status: 200, body: { auth: { ok: true } } } // no `version` key
+  });
+  assert.equal(result.next_action.kind, "noop");
+  assert.equal(result.ready_to_upgrade, true);
+});
+
+test("#214: tree==latest, /health version field unparseable → degrades gracefully to noop", async () => {
+  const result = await runDoctor({
+    skipNetwork: false,
+    mockVersion: "v3.26.0",
+    mockLatest: "v3.26.0",
+    mockHealth: { status: 200, body: { version: "not-a-semver", auth: { ok: true } } }
+  });
+  assert.equal(result.next_action.kind, "noop");
+  assert.equal(result.ready_to_upgrade, true);
+});
+
 // ── System-prompt operator append (CLAUDE_SYSTEM_PROMPT wiring) ─────────────
 // The var was documented + echoed on /health but never reached a request (dead
 // since APPEND_SYSTEM_PROMPT was retired — caught in PR #170 review). The wiring
