@@ -5686,6 +5686,196 @@ test("listKeys does not depend on rows left behind by an earlier or concurrent r
   assert.equal(mine.length, 1, "exactly one test-user-1 — a shared store would accumulate duplicates");
 });
 
+// ═════════════════════════════════════════════════════════════════════════════
+// ── ocp-connect model-registry coverage (issue #210) ─────────────────────────
+// ═════════════════════════════════════════════════════════════════════════════
+// `ocp-connect` is a user-facing installer that writes model metadata straight into the
+// user's OpenClaw registry (~/.openclaw/openclaw.json) — and until now had ZERO test
+// coverage (`grep -c 'ocp-connect' test-features.mjs` -> 0). Two real defects shipped in
+// exactly this uncovered surface and were caught only by human review during #208's review:
+// the unknown-id fallback over-advertised by 4x (8192 -> 32000), and a comment describing the
+// family maxTokens table misdescribed its own scope. Meanwhile the equivalent claim on the
+// models.json side of the same feature IS pinned and mutation-verified (`_spotRegistryMaxTokens`
+// above, #195/#208). This section brings ocp-connect's classifier up to the same bar.
+//
+// Harness (verified during #208's review, see #210): the REAL `model_meta` table and REAL
+// `get_model_meta()` function are sliced out of ocp-connect's own source verbatim — between two
+// textual anchors — and exec'd in a fresh python namespace, in a child `python3` process.
+// Nothing here is a JS re-implementation ("replica") of the classifier: a change to
+// ocp-connect's table, its prefix-matching order, or its fallback is a change to what this
+// harness EXECUTES, not merely what it reads. A test that grepped ocp-connect's source text for
+// an expected number would not catch a behavioral regression — that is the antipattern this
+// suite forbids (see the module docstring above and #210).
+//
+// Not in scope (per #210): the network/install paths of ocp-connect (connectivity probing,
+// shell-rc rewriting, launchctl/systemd env writes) — only the model-metadata classifier that
+// ocp-connect hands to OpenClaw is covered here.
+console.log("\nocp-connect model registry (#210):");
+
+const _ocConnectPath = spotJoin(_spotDir, "ocp-connect");
+
+// --- Harness 1: classify one or more model ids through ocp-connect's REAL model_meta table +
+// REAL get_model_meta() (verbatim exec — the exact slice given in #210's own harness sketch). ---
+const _OC_CLASSIFY_PY = `
+import json, sys
+src = open(sys.argv[1]).read()
+blk = src[src.index('model_meta = {') : src.index('for mid in model_ids:')]
+ns = {}
+exec(blk, ns)
+ids = json.loads(sys.argv[2])
+out = {mid: ns['get_model_meta'](mid) for mid in ids}
+sys.stdout.write(json.dumps(out))
+`;
+
+function _ocClassify(ids) {
+  const raw = execFileSync(
+    "python3",
+    ["-c", _OC_CLASSIFY_PY, _ocConnectPath, JSON.stringify(ids)],
+    { encoding: "utf8" },
+  );
+  return JSON.parse(raw);
+}
+
+// --- Harness 2: drive ocp-connect's REAL /v1/models-JSON-parse try/except verbatim, with a
+// caller-supplied `models_json_str`, and return the resulting `model_ids`. This is how the
+// hardcoded three-id fallback list (used when /v1/models JSON fails to parse) is obtained below
+// — by actually running the real except: branch with malformed input, not by reading the
+// literal off the page. ---
+const _OC_FALLBACK_PY = `
+import json, sys
+src = open(sys.argv[1]).read()
+start_marker = "try:\\n    models_data = json.loads(models_json_str)"
+end_marker = "\\n\\n# Build provider entry"
+si = src.index(start_marker)
+ei = src.index(end_marker, si)
+blk = src[si:ei]
+ns = {"json": json, "models_json_str": sys.argv[2]}
+exec(blk, ns)
+sys.stdout.write(json.dumps(ns["model_ids"]))
+`;
+
+function _ocFallbackModelIds(modelsJsonStr) {
+  const raw = execFileSync(
+    "python3",
+    ["-c", _OC_FALLBACK_PY, _ocConnectPath, modelsJsonStr],
+    { encoding: "utf8" },
+  );
+  return JSON.parse(raw);
+}
+
+// Registry ground truth for ids ocp-connect's classifier might be handed but that are NOT in
+// models.json (so absent from `_spotRegistryMaxTokens` above). Manually pinned from the CLI
+// 2.1.220 binary, id-anchored:
+//   grep -ao 'id:"<id>".\{0,700\}' <binary> | grep -o 'max_output_tokens:{default:[0-9]*'
+// (a 400-byte window silently truncates before reaching max_output_tokens for these particular
+// records — different window widths give different results, per the #210 extraction protocol;
+// 700 bytes was confirmed sufficient for every id below). These are exactly the ids
+// ocp-connect's own family-table comment names as the over-advertised opus-family risk.
+const _ocKnownRegistryExtras = {
+  "claude-opus-4-0": 32000,
+  "claude-opus-4-5": 32000,
+};
+
+// Resolve the registry ground truth for an id ocp-connect might classify: directly (a
+// models.json id), via models.json's legacyAliases/aliases (e.g. the hardcoded fallback's bare
+// "claude-haiku-4" -> "claude-haiku-4-5-20251001"), or via the manually-pinned extras above.
+function _ocRegistryTruth(id) {
+  if (id in _spotRegistryMaxTokens) return _spotRegistryMaxTokens[id];
+  const viaLegacy = (_spotModels.legacyAliases || {})[id];
+  if (viaLegacy && viaLegacy in _spotRegistryMaxTokens) return _spotRegistryMaxTokens[viaLegacy];
+  const viaAlias = (_spotModels.aliases || {})[id];
+  if (viaAlias && viaAlias in _spotRegistryMaxTokens) return _spotRegistryMaxTokens[viaAlias];
+  if (id in _ocKnownRegistryExtras) return _ocKnownRegistryExtras[id];
+  return undefined;
+}
+
+test("ocp-connect: `bash -n` reports no syntax errors", () => {
+  execFileSync("bash", ["-n", _ocConnectPath], { encoding: "utf8" });
+});
+
+test("ocp-connect: the embedded model_meta/get_model_meta python block compiles (py_compile)", () => {
+  const script = `
+import sys, py_compile, tempfile, os
+src = open(sys.argv[1]).read()
+blk = src[src.index('model_meta = {') : src.index('for mid in model_ids:')]
+fd, path = tempfile.mkstemp(suffix='.py')
+os.write(fd, blk.encode())
+os.close(fd)
+try:
+    py_compile.compile(path, doraise=True)
+finally:
+    os.remove(path)
+`;
+  execFileSync("python3", ["-c", script, _ocConnectPath], { encoding: "utf8" });
+});
+
+test("ocp-connect: every models.json id classifies at or below its CLI-registry maxTokens (never over-advertises)", () => {
+  const ids = _spotModels.models.map((m) => m.id);
+  const classified = _ocClassify(ids);
+  for (const m of _spotModels.models) {
+    const got = classified[m.id];
+    assert.ok(got, `ocp-connect get_model_meta returned nothing for ${m.id}`);
+    const want = _spotRegistryMaxTokens[m.id];
+    assert.ok(want !== undefined,
+      `${m.id} has no recorded registry value — see _spotRegistryMaxTokens above`);
+    assert.ok(got.maxTokens <= want,
+      `ocp-connect over-advertises ${m.id}: classifies maxTokens=${got.maxTokens}, but the CLI ` +
+      `registry caps it at ${want} — this is the #208 defect class (unknown-id fallback raised ` +
+      `8192->32000, over-advertising by 4x)`);
+  }
+});
+
+test("ocp-connect: reasoning classification matches models.json ground truth for every id", () => {
+  const ids = _spotModels.models.map((m) => m.id);
+  const classified = _ocClassify(ids);
+  for (const m of _spotModels.models) {
+    assert.equal(classified[m.id].reasoning, m.reasoning,
+      `${m.id}: ocp-connect classifies reasoning=${classified[m.id].reasoning}, models.json says ${m.reasoning}`);
+  }
+});
+
+// 8192 is the GLOBAL MINIMUM max_output_tokens.default across all 17 records in the CLI 2.1.220
+// registry (distinct values: 8192 / 32000 / 64000 — confirmed via
+//   grep -ao 'max_output_tokens:{default:[0-9]*' <binary> | grep -oE '[0-9]+$' | sort -un
+// which counts VALUES, not id-paired records, per the #210 extraction protocol: a fixed-width
+// id-anchored window is silently incomplete, but a global "what are the distinct values" scan
+// needs no id pairing at all). Raising the unknown-id fallback above this is exactly the #208
+// defect: it over-advertised claude-3-5-haiku / claude-3-5-sonnet (both capped at 8192) by 4x.
+const _OC_REGISTRY_GLOBAL_MIN_MAX_TOKENS = 8192;
+
+test("ocp-connect: an id matching no family prefix falls back to the registry global minimum (8192)", () => {
+  const unknownId = "totally-unrecognized-model-id-zzz";
+  const classified = _ocClassify([unknownId]);
+  const got = classified[unknownId];
+  assert.equal(got.maxTokens, _OC_REGISTRY_GLOBAL_MIN_MAX_TOKENS,
+    `unknown-id fallback maxTokens=${got.maxTokens}, want the registry global minimum ${_OC_REGISTRY_GLOBAL_MIN_MAX_TOKENS}`);
+  assert.equal(got.reasoning, false, "unknown-id fallback must not claim reasoning support");
+});
+
+test("ocp-connect: the hardcoded three-id JSON-parse-failure fallback never over-advertises", () => {
+  // Control: well-formed /v1/models JSON must pass model ids through the try: branch UNCHANGED —
+  // proves this harness actually drives the real branch logic, not just a constant.
+  const controlIds = _ocFallbackModelIds(JSON.stringify({ data: [{ id: "claude-sonnet-5" }] }));
+  assert.deepEqual(controlIds, ["claude-sonnet-5"],
+    "well-formed JSON must pass model ids through the try: branch unchanged");
+
+  // The real except: branch, driven with deliberately-malformed JSON.
+  const fallbackIds = _ocFallbackModelIds("not valid json{{{");
+  assert.ok(Array.isArray(fallbackIds) && fallbackIds.length > 0,
+    "the except: branch must set a non-empty model_ids fallback");
+
+  const classified = _ocClassify(fallbackIds);
+  for (const id of fallbackIds) {
+    const want = _ocRegistryTruth(id);
+    assert.ok(want !== undefined,
+      `${id}: no recorded registry ground truth (direct, via models.json legacyAliases/aliases, ` +
+      `or _ocKnownRegistryExtras) — add one`);
+    assert.ok(classified[id].maxTokens <= want,
+      `ocp-connect's JSON-parse-failure fallback over-advertises ${id}: classifies ` +
+      `maxTokens=${classified[id].maxTokens}, registry caps it at ${want}`);
+  }
+});
+
 runAsyncTests().then(() => Promise.all(pendingAsync)).then(() => {
   closeDb();
   console.log(`\n=== Results: ${passed} passed, ${failed} failed ===\n`);
