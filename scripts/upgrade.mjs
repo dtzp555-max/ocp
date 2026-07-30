@@ -17,7 +17,74 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 import { existsSync, copyFileSync } from "node:fs";
 import { writeSnapshot, listSnapshots, readSnapshot, gcSnapshots } from "./lib/snapshot.mjs";
+import { resolveOwningUnit, planRestart, parseSsListenerPid } from "./lib/restart-unit.mjs";
 import { DEFAULT_PORT } from "../lib/constants.mjs";
+
+// Resolve which unit actually owns the OCP port and build a restart plan for it,
+// instead of blindly restarting a hard-coded name (issue #215). Gathering the
+// raw ss/lsof/cgroup/sudo probe is impure (real execSync calls); the resolution
+// itself (resolveOwningUnit / planRestart, in scripts/lib/restart-unit.mjs) is
+// pure and unit-tested directly. Three ways to reach this without touching a
+// real service, all exercised by test-features.mjs:
+//   - opts.mockOwnerProbe: skip real probing entirely, resolve from injected output
+//   - opts.mockExec (no mockOwnerProbe): skip real probing, assume the expected
+//     unit owns the port (preserves the pre-#215 command for existing mocked tests)
+//   - real run: shell out to ss/lsof/cat /proc/<pid>/cgroup/sudo -n true, each
+//     guarded so a missing tool degrades to "can't verify" rather than throwing
+function resolveRestartPlan({ opts, port }) {
+  const platform = opts.mockPlatform || process.platform;
+  const expectedUnit = platform === "darwin" ? "dev.ocp.proxy" : "ocp-proxy.service";
+
+  let owner;
+  if (opts.mockOwnerProbe) {
+    owner = resolveOwningUnit({ ...opts.mockOwnerProbe, platform: opts.mockOwnerProbe.platform || platform, expectedUnit });
+  } else if (opts.mockExec) {
+    owner = platform === "darwin"
+      ? { kind: "launchd", platform, pid: null, unit: expectedUnit, mismatched: false }
+      : { kind: "user-unit", platform, pid: null, unit: expectedUnit, mismatched: false };
+  } else {
+    const probe = { platform, expectedUnit };
+    if (platform === "darwin") {
+      try {
+        probe.lsofOutput = execSync(`lsof -nP -iTCP:${port} -sTCP:LISTEN`, { stdio: ["pipe", "pipe", "pipe"] }).toString();
+      } catch { probe.lsofOutput = ""; }
+    } else {
+      try {
+        probe.ssOutput = execSync(`ss -lptn "sport = :${port}"`, { stdio: ["pipe", "pipe", "pipe"] }).toString();
+      } catch { probe.ssOutput = ""; }
+      const listenerPid = parseSsListenerPid(probe.ssOutput);
+      if (listenerPid) {
+        try {
+          probe.cgroupContent = execSync(`cat /proc/${listenerPid}/cgroup`, { stdio: ["pipe", "pipe", "pipe"] }).toString();
+        } catch { probe.cgroupContent = ""; }
+      }
+    }
+    owner = resolveOwningUnit(probe);
+  }
+
+  let sudoAvailable = opts.mockSudoAvailable;
+  if (sudoAvailable === undefined && owner.kind === "system-unit") {
+    if (opts.mockExec || opts.mockOwnerProbe) {
+      // Never shell out to real sudo in a mocked/test run — an unset expectation
+      // here must be explicit (fail loud), not a guess about the test machine.
+      sudoAvailable = false;
+    } else {
+      try {
+        execSync("sudo -n true", { stdio: ["pipe", "pipe", "pipe"] });
+        sudoAvailable = true;
+      } catch {
+        sudoAvailable = false;
+      }
+    }
+  }
+
+  const plan = planRestart(owner, {
+    expectedUnit,
+    sudoAvailable,
+    plistPath: join(homedir(), "Library", "LaunchAgents", "dev.ocp.proxy.plist"),
+  });
+  return { owner, plan };
+}
 
 // Post-flight acceptance predicate (issue #173). A health probe passes ONLY when the server
 // is authed AND actually serving the TARGET version. auth.ok alone is not enough: a stale
@@ -159,6 +226,7 @@ async function runFullUpgrade({ doctor, opts }) {
     }
   };
   const ocpDir = opts.ocpDir || join(homedir(), "ocp");
+  const port = process.env.CLAUDE_PROXY_PORT || String(DEFAULT_PORT);
 
   try {
     // phase 1: pre-flight (doctor already passed; just record)
@@ -199,16 +267,21 @@ async function runFullUpgrade({ doctor, opts }) {
       console.error(`[heads-up] restarting OCP service in 3s — expect ~5–10s blip on requests in flight.`);
       await new Promise(r => setTimeout(r, 3000));
     }
-    if (process.platform === "darwin") {
-      exec(`launchctl bootout gui/$(id -u)/dev.ocp.proxy 2>/dev/null || true`, "restart");
-      exec(`launchctl bootstrap gui/$(id -u) ${join(homedir(), "Library", "LaunchAgents", "dev.ocp.proxy.plist")}`, "restart");
-    } else {
-      exec(`systemctl --user restart ocp-proxy.service`, "restart");
+    let restartPlan;
+    try {
+      restartPlan = resolveRestartPlan({ opts, port });
+    } catch (err) {
+      phases.push({ name: "restart", status: "fail", stderr: err.message });
+      throw err;
     }
+    for (const w of restartPlan.plan.warnings) {
+      console.error(w);
+      phases.push({ name: "restart-resolve", status: "warn", note: w });
+    }
+    for (const c of restartPlan.plan.cmds) exec(c.cmd, c.label);
 
     // phase 6: post-flight (10s budget; skipped under mockExec)
     if (!opts.mockExec) {
-      const port = process.env.CLAUDE_PROXY_PORT || String(DEFAULT_PORT);
       let ok = false;
       let lastSeen = null;
       for (let i = 0; i < 10; i++) {
@@ -365,12 +438,22 @@ async function runRollback(opts) {
     console.error(`[heads-up] restarting OCP service in 3s — expect ~5–10s blip on requests in flight.`);
     await new Promise(r => setTimeout(r, 3000));
   }
-  if (process.platform === "darwin") {
-    exec(`launchctl bootout gui/$(id -u)/dev.ocp.proxy 2>/dev/null || true`, "restart");
-    exec(`launchctl bootstrap gui/$(id -u) ${join(homedir(), "Library", "LaunchAgents", "dev.ocp.proxy.plist")}`, "restart");
-  } else {
-    exec(`systemctl --user restart ocp-proxy.service`, "restart");
+  const rollbackPort = process.env.CLAUDE_PROXY_PORT || String(DEFAULT_PORT);
+  let restartPlan;
+  try {
+    restartPlan = resolveRestartPlan({ opts, port: rollbackPort });
+  } catch (err) {
+    phases.push({ name: "restart", status: "fail", stderr: err.message });
+    throw Object.assign(
+      new Error(`rollback phase restart failed: ${err.message}`),
+      { phases, target: target.path }
+    );
   }
+  for (const w of restartPlan.plan.warnings) {
+    console.error(w);
+    phases.push({ name: "restart-resolve", status: "warn", note: w });
+  }
+  for (const c of restartPlan.plan.cmds) exec(c.cmd, c.label);
 
   return { path: "rollback", executed: true, changed: true, target: target.path, phases };
 }
