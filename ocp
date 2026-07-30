@@ -777,7 +777,19 @@ cmd_update() {
 
   # Doctor-driven path selection
   local doctor_json kind
-  doctor_json=$(node "$script_dir/scripts/doctor.mjs" --json 2>/dev/null)
+  # `|| true` is load-bearing, not decorative: doctor.mjs:310 does
+  # `process.exit(fail_count === 0 ? 0 : 1)` — ANY fail check (fix_service, fix_oauth,
+  # fresh_install) makes it exit 1. `ocp:7` runs under `set -euo pipefail`, so a bare
+  # `var=$(cmd)` assignment where cmd exits non-zero trips `set -e` immediately, killing
+  # `cmd_update` with ZERO output — exactly on the hosts that need it most (proxy down, token
+  # expired, pre-v3.4.0). `|| true` keeps the captured stdout (command substitution captures
+  # it regardless of exit code) while telling `set -e` this assignment's own exit status is
+  # fine to ignore. Splitting this out of the old single-pipeline form also incidentally fixes
+  # a pre-existing bug: piping node directly into python inside one `... || echo "unknown"`
+  # meant `pipefail` + the `||` fallback could BOTH fire on a doctor exit 1, concatenating
+  # python's real output with the literal string "unknown" (`kind` became a two-line
+  # "fix_service\nunknown", matching no case pattern and falling through to `*)`).
+  doctor_json=$(node "$script_dir/scripts/doctor.mjs" --json 2>/dev/null) || true
   kind=$(echo "$doctor_json" | python3 -c "import sys,json; print(json.load(sys.stdin)['next_action']['kind'])" 2>/dev/null || echo "unknown")
 
   # Issue #214 review finding: this function used to extract ONLY `kind` from the doctor JSON
@@ -888,7 +900,16 @@ _cmd_update_restart() {
   done
 
   echo "Tree is already at v$target; the running service is stale — restarting (no git changes)..."
-  cmd_restart
+  # Subshell + `|| true`, not a bare call (PR #217 review, MED-1): cmd_restart's success path
+  # ends by calling cmd_usage, and cmd_usage does `data=$(curl ... "$PROXY/usage") || { echo
+  # ...; exit 1; }` — a real `exit`, not a `return`. `exit` terminates the WHOLE shell process
+  # immediately; a bare `cmd_restart || true` at this call site would never even get a chance
+  # to run, because the process is already gone by the time `exit` would "return" here. Wrapping
+  # in `( ... )` contains that exit to the subshell — the restart itself still happens for real
+  # (all its side effects are external commands), but a slow/unreachable /usage call (e.g. right
+  # after a restart, before the proxy has warmed back up) can no longer take down post-flight
+  # verification with it, which is the one guarantee this whole path exists to provide.
+  ( cmd_restart ) || true
   echo "  Verifying restart..."
   if node "$script_dir/scripts/upgrade.mjs" --post-flight-only "v$target"; then
     return 0

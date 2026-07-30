@@ -303,7 +303,7 @@ Setup, the ~6-second latency floor, real-SSE streaming (`OCP_TUI_STREAM`), the w
 
 ## Upgrading
 
-Run **`ocp update`** — it smart-picks the path. A **patch bump** (e.g. `v3.21.0 → v3.21.1`) takes the light path (git pull + npm install + restart); a **cross-minor** jump (e.g. `v3.18 → v3.22`) takes the full path (pre-flight, snapshot, `setup.mjs` with plist env-merge, restart, post-flight `/health` + `/v1/models` verification). `ocp update --check` shows available updates without applying.
+Run **`ocp update`** — it smart-picks the path. If the tree is already at the latest release but the **running service** is stale (e.g. a previous update was interrupted before it restarted), it takes a **restart-only** path: no git/npm changes, just a restart + post-flight `/health` verification. A **patch bump** (e.g. `v3.21.0 → v3.21.1`) takes the light path (git pull + npm install + restart); a **cross-minor** jump (e.g. `v3.18 → v3.22`) takes the full path (pre-flight, snapshot, `setup.mjs` with plist env-merge, restart, post-flight `/health` + `/v1/models` verification). `ocp update --check` shows available updates without applying.
 
 Manual flags, rollback (`ocp update --rollback`), snapshots, and the OpenClaw model auto-sync (v3.11.0+): **[docs/upgrading.md](docs/upgrading.md)**.
 

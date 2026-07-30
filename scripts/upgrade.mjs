@@ -395,6 +395,16 @@ if (_isMain()) {
   const postFlightOnlyIdx = args.indexOf("--post-flight-only");
   if (postFlightOnlyIdx !== -1) {
     const postFlightTarget = args[postFlightOnlyIdx + 1];
+    // Fail CLOSED on a missing/malformed target (PR #217 review, LOW): postFlightOk() treats
+    // an empty/unknown target as "degrade to the auth-only check" by design (so a genuinely
+    // unknown release target never blocks a good upgrade elsewhere) — but that same degrade
+    // means an accidentally-omitted target here would report success against ANY version.
+    // `ocp`'s bash caller always passes "v$target" explicitly, so this only guards a
+    // hand-invoked or future misuse of the public flag, not anything reachable today.
+    if (!postFlightTarget || postFlightTarget.startsWith("--")) {
+      console.error(`✗ --post-flight-only requires a target version argument, e.g. --post-flight-only v3.26.0`);
+      process.exit(1);
+    }
     const result = await runPostFlightCheck(postFlightTarget);
     if (result.ok) {
       console.log(`✓ service now serving v${result.target}`);

@@ -13,6 +13,11 @@ The simplest path: ask your AI.
 
 What `ocp update` does:
 
+- **Tree already at latest, but the running service is stale** (e.g. a previous `ocp update`
+  was interrupted after checking out the new tag but before restarting — issue #214):
+  restart-only path. No git or npm operations — the tree doesn't need touching, only the
+  service does. Just `cmd_restart` + a post-flight `/health` verification against the
+  version already on disk.
 - **Patch bump** (e.g. `v3.21.0 → v3.21.1`):
   light path (git pull + npm install + restart).
 - **Cross-minor** (e.g. `v3.18 → v3.22`):
