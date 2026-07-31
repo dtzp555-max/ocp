@@ -609,6 +609,20 @@ print(k if k else '')
   echo ""
 
   # Step 5: Detect shell rc files and OS
+  #
+  # Issue #256 FOLD-IN 3 (independent review of the ocp `_curl`/_AUTH_ARGS fix): this is the only
+  # OTHER user-defined bash array in this repo's two CLI scripts (ocp's own audit was scoped to
+  # `ocp` alone -- corrected here rather than left overclaiming "the only array in the whole
+  # script" without naming which script). At the time of that review this array was NOT actually
+  # empty-expandable: all three branches below (fish / macOS / Linux-other) guarantee at least one
+  # element by construction (the macOS branch unconditionally appends ~/.zshrc; the Linux-other
+  # branch has its own explicit fallback right below, keyed off `${#rc_files[@]}` -- the LENGTH
+  # operator, which IS safe on an empty array even under bash 3.2 + set -u, unlike a bare element
+  # expansion). Still fixed with the same `${arr[@]+"${arr[@]}"}` idiom used for `_AUTH_ARGS`
+  # (verified behaviorally, same as that fix, to be a no-op when the array is non-empty): the
+  # invariant above is "one edit away" from breaking (e.g. if the macOS branch's unconditional
+  # zshrc append is ever made conditional) and re-auditing every future edit against a documented
+  # invariant is worse than removing the hazard outright.
   local rc_files=()
   local is_mac=false
   [[ "$(uname)" == "Darwin" ]] && is_mac=true
@@ -634,7 +648,7 @@ print(k if k else '')
   fi
 
   # Step 6: Remove any previously written OCP LAN lines (idempotent) from all rc files
-  for rc_file in "${rc_files[@]}"; do
+  for rc_file in "${rc_files[@]+"${rc_files[@]}"}"; do
     if [[ -f "$rc_file" ]]; then
       local tmp_rc
       tmp_rc=$(mktemp)
@@ -663,7 +677,7 @@ PYEOF
   done
 
   # Step 7: Append new config to all rc files
-  for rc_file in "${rc_files[@]}"; do
+  for rc_file in "${rc_files[@]+"${rc_files[@]}"}"; do
     {
       echo ""
       echo "# OCP LAN (added by ocp connect)"
@@ -676,7 +690,7 @@ PYEOF
   done
 
   echo "  Shell config:"
-  for rc_file in "${rc_files[@]}"; do
+  for rc_file in "${rc_files[@]+"${rc_files[@]}"}"; do
     echo "    ✓ $(basename "$rc_file")"
   done
   echo "    OPENAI_BASE_URL=$base_url/v1"
@@ -750,7 +764,7 @@ PYEOF
 
   echo ""
   echo "  Done. Reload your shell to apply:"
-  for rc_file in "${rc_files[@]}"; do
+  for rc_file in "${rc_files[@]+"${rc_files[@]}"}"; do
     echo "    source $rc_file"
   done
 }

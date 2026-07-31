@@ -9797,9 +9797,9 @@ test("#224: scripts/upgrade.mjs --resolve-restart (real subprocess, not mocked) 
 // most single-user installs run.
 //
 // Audit performed for this fix (grep for every `"${...[@]}"` / `"${...[*]}"` expansion in `ocp`,
-// per this issue's own ask): `_AUTH_ARGS` at `ocp:22` is the ONLY user-defined bash array in the
-// whole script (the only `name=(...)` assignments in the file), and it is expanded at exactly one
-// call site. Every other `[...]`-shaped expansion is one of:
+// per this issue's own ask): `_AUTH_ARGS` at `ocp:22` is the ONLY user-defined bash array IN `ocp`
+// ITSELF (the only `name=(...)` assignment in that one file), and it is expanded at exactly one
+// call site. Every other `[...]`-shaped expansion in `ocp` is one of:
 //   - `"$@"` (11 sites) — the UNBRACED special parameter. Verified directly against this host's
 //     real /bin/bash 3.2.57: `"$@"` with zero positional parameters does NOT raise "unbound
 //     variable" under `set -u`, in a function or at top level. (The braced forms `"${@}"`/
@@ -9808,10 +9808,21 @@ test("#224: scripts/upgrade.mjs --resolve-restart (real subprocess, not mocked) 
 //     form anywhere — grep confirms zero hits.)
 //   - `${BASH_SOURCE[0]}` (3 sites) — a bash-maintained array bash itself always populates for a
 //     running script; not user-controlled and never empty in this script's usage.
-// Conclusion: `ocp:22` is the only hazardous site. Fixed here with the 3.2-safe idiom
+// Conclusion: `ocp:22` is the only hazardous site IN `ocp`. Fixed here with the 3.2-safe idiom
 // `${_AUTH_ARGS[@]+"${_AUTH_ARGS[@]}"}` (verified on this host's real bash 3.2.57 to expand to
 // nothing when the array is empty, and to preserve every element, including embedded spaces,
 // when it is not — both properties re-verified below, behaviorally, not by reading the source).
+//
+// SCOPE CORRECTION (independent review, FOLD-IN 3): the paragraph above, as originally written,
+// said "_AUTH_ARGS is the ONLY user-defined array in the whole script" without naming which
+// script — this repo ships TWO bash CLI entrypoints (`ocp` and `ocp-connect`), and the audit
+// above was scoped to `ocp` only. `ocp-connect` has its own user-defined array (`rc_files`,
+// declared `ocp-connect:612`, expanded bare at four sites) with the identical affected
+// population (any bash 3.2 host) — it happened not to be a LIVE bug (every code path guarantees
+// at least one element before any expansion runs), but was "one edit away", per the same review.
+// Fixed with the same idiom in `ocp-connect` directly (see that file's own comment at its
+// declaration) rather than left as a documented-but-fragile invariant. The static lint test
+// immediately below covers BOTH files going forward, so this scope gap cannot recur silently.
 //
 // Design decision recorded here (not just the PR body): fix the expansion, do NOT add a minimum-
 // bash-version gate. A version gate would turn "one subcommand crashes" into "the tool refuses to
@@ -9857,7 +9868,21 @@ function _cuRun(args, curlCaseBody) {
     const curlStubPath = join(bin, "curl");
     testWriteFile(curlStubPath, [
       `#!/usr/bin/env bash`,
+      // Issue #256 FOLD-IN 2 (independent review): the original stub logged only `$*` (a
+      // space-flattened join of all args), which cannot distinguish "curl received zero extra
+      // args" from "curl received one spurious EMPTY-STRING arg, then the real args" -- exactly
+      // the shape of the plausible near-miss fix `${_AUTH_ARGS[@]:-}` (verified separately: on
+      // this host's real bash 3.2, that expands an EMPTY array to ONE empty-string argument, not
+      // zero -- real curl rejects a literal blank argument with "option : blank argument where
+      // content is expected", exit 2). `$*` silently absorbed that spurious empty element into
+      // the surrounding whitespace, so a test asserting only `startsWith("FAKE-CURL-CALL")` and a
+      // clean exit could not tell the two forms apart. Recording argc and each argv element on
+      // its own line (never joined) makes an inserted empty leading argument visible and
+      // countable, independent of `$*`'s own routing use below (kept unchanged -- it only
+      // selects which canned response the stub returns, it is not the safety assertion).
       `echo "FAKE-CURL-CALL $*" >> "${logPath}"`,
+      `printf 'FAKE-CURL-ARGC=%d\\n' "$#" >> "${logPath}"`,
+      `for _a in "$@"; do printf 'FAKE-CURL-ARG=%s\\n' "$_a" >> "${logPath}"; done`,
       `case "$*" in`,
       ...curlCaseBody,
       `esac`,
@@ -9885,6 +9910,17 @@ function _cuRun(args, curlCaseBody) {
   }
 }
 
+// Issue #256 FOLD-IN 2: reconstructs the EXACT argv curl actually received, from the
+// element-by-element log lines the stub above now writes (see that stub's own comment) --
+// distinguishes "zero extra arguments" from "one spurious empty-string argument, then the real
+// ones", which `$*`-based logging could not.
+function _cuArgv(log) {
+  const argcLine = log.find((l) => l.startsWith("FAKE-CURL-ARGC="));
+  const argc = argcLine ? Number(argcLine.slice("FAKE-CURL-ARGC=".length)) : null;
+  const args = log.filter((l) => l.startsWith("FAKE-CURL-ARG=")).map((l) => l.slice("FAKE-CURL-ARG=".length));
+  return { argc, args };
+}
+
 test("ocp `ocp keys` (list) must not die with 'unbound variable' when _AUTH_ARGS is empty (bash 3.2 set -u, issue #256)", () => {
   const r = _cuRun(["keys"], [
     `  *"/api/keys"*)`,
@@ -9904,6 +9940,17 @@ test("ocp `ocp keys` (list) must not die with 'unbound variable' when _AUTH_ARGS
     `_curl must actually reach curl (proves the array expansion itself did not crash first); log=${JSON.stringify(r.log)}`);
   assert.ok(r.stdout.includes("No API keys configured."),
     `expected the real list-keys output all the way through; stdout=${JSON.stringify(r.stdout)}`);
+  // Issue #256 FOLD-IN 2: pins the EXACT argv, not just "curl was reached and didn't crash" --
+  // catches the plausible near-miss `${_AUTH_ARGS[@]:-}` (passes the two assertions above, since
+  // it doesn't crash and does reach curl, but injects a spurious leading empty-string argument).
+  const { argc, args } = _cuArgv(r.log);
+  assert.equal(argc, 4,
+    `expected exactly 4 curl arguments (-sf, --max-time, 5, the URL) -- an extra leading empty ` +
+    `string (the ${"${_AUTH_ARGS[@]:-}"} near-miss) would make this 5; got argc=${argc} args=${JSON.stringify(args)}`);
+  assert.equal(args[0], "-sf",
+    `expected the first REAL argument, not an injected empty string; args=${JSON.stringify(args)}`);
+  assert.ok(args.every((a) => a !== ""),
+    `no curl argument may be an empty string; args=${JSON.stringify(args)}`);
 });
 
 test("ocp `ocp usage --by-key` must not die with 'unbound variable' when _AUTH_ARGS is empty (bash 3.2 set -u, issue #256)", () => {
@@ -9925,6 +9972,113 @@ test("ocp `ocp usage --by-key` must not die with 'unbound variable' when _AUTH_A
     `_curl must actually reach curl (proves the array expansion itself did not crash first); log=${JSON.stringify(r.log)}`);
   assert.ok(r.stdout.includes("No usage data yet."),
     `expected the real by-key usage output all the way through; stdout=${JSON.stringify(r.stdout)}`);
+  // Issue #256 FOLD-IN 2: same exact-argv pinning as the "ocp keys" test above.
+  const { argc, args } = _cuArgv(r.log);
+  assert.equal(argc, 4,
+    `expected exactly 4 curl arguments (-sf, --max-time, 15, the URL) -- an extra leading empty ` +
+    `string (the ${"${_AUTH_ARGS[@]:-}"} near-miss) would make this 5; got argc=${argc} args=${JSON.stringify(args)}`);
+  assert.equal(args[0], "-sf",
+    `expected the first REAL argument, not an injected empty string; args=${JSON.stringify(args)}`);
+  assert.ok(args.every((a) => a !== ""),
+    `no curl argument may be an empty string; args=${JSON.stringify(args)}`);
+});
+
+// ── issue #256 FOLD-IN 1 (independent review): static lint, catches what the runtime tests
+// above structurally cannot on Linux CI ────────────────────────────────────────────────────────
+// `.github/workflows/test.yml` runs on `ubuntu-latest`, whose `/bin/bash` is 5.x -- the
+// empty-array-under-set-u "unbound variable" behavior this whole issue is about NEVER fires on
+// bash >= 4.4, on ANY input. The two runtime tests above therefore pass on that CI runner WITH OR
+// WITHOUT the fix -- they are a real regression guard only on a host whose real `/bin/bash` is
+// old (this dev machine; stock macOS generally). This static check closes that gap: it scans the
+// actual source text of `ocp` and `ocp-connect` for every user-defined bash array declaration,
+// then asserts every expansion of that array is wrapped in the 3.2-safe idiom
+// (`${name[@]+"${name[@]}"}`) rather than expanded bare. A future regression that reintroduces a
+// bare `${anything[@]}` expansion of a user-defined array fails THIS check on every platform,
+// including the Linux CI runner where the runtime tests cannot see it at all.
+//
+// Deliberately narrow, per this repo's own testing-discipline note ("a textual assertion is fine
+// for a premise of the harness or a slice boundary, never the behavior under test"): this check
+// is NOT a substitute for the runtime tests above (it cannot prove the idiom actually expands
+// correctly at runtime -- that's what the behavioral tests already prove, on a real bash 3.2). It
+// is a structural guard against the ONE way this specific bug class can silently reappear in
+// source that a dynamic test on Linux CI cannot observe: a hand-edit that deletes the idiom.
+// `${#name[@]}` (the LENGTH operator, not an element expansion) is correctly excluded -- verified
+// separately (see ocp-connect's own `rc_files` audit comment) that it is safe on bash 3.2 even on
+// an empty array, so it is not part of this bug class and must not be flagged.
+console.log("\nocp/ocp-connect: no user-defined bash array expanded bare under set -u (static lint, issue #256 FOLD-IN 1):");
+
+// Finds every `name=(...)`, `name+=(...)`, `local name=(...)` bash array ASSIGNMENT in `source`
+// and returns the unique array names declared. Deliberately does not attempt full bash parsing --
+// scoped to exactly the declaration shape used anywhere in this repo's two CLI scripts today
+// (verified below: this must find at least one name in each file, or the premise itself is wrong).
+function _lintArrayDeclNames(source) {
+  const names = new Set();
+  const re = /^\s*(?:local\s+|declare\s+-a\s+)?([A-Za-z_][A-Za-z0-9_]*)\+?=\(/gm;
+  let m;
+  while ((m = re.exec(source))) names.add(m[1]);
+  return [...names];
+}
+
+// Blanks out every FULL comment line (optional leading whitespace, then `#`) so prose explaining
+// the idiom -- which necessarily has to WRITE OUT `${name[@]}` in order to describe it, exactly
+// as this file's own comments above and ocp/ocp-connect's own fix comments do -- is never mistaken
+// for a live, unguarded expansion. Deliberately line-based, not a full bash tokenizer: correct for
+// this repo's actual comment style (every explanatory comment in ocp/ocp-connect/this file is a
+// whole line starting with `#`), and a false NEGATIVE this simple approach could theoretically
+// permit (an unguarded expansion hidden after a trailing `# comment` on the SAME line as real
+// code) does not occur anywhere in either script today -- verified by the fact this function,
+// before this fix, correctly found nothing to strip on any CODE line, only on pure-comment ones.
+function _lintBlankCommentLines(source) {
+  return source.split("\n").map((line) => (/^\s*#/.test(line) ? "" : line)).join("\n");
+}
+
+// For each declared array name, removes every occurrence of the SAFE idiom
+// `${name[@]+"${name[@]}"}` from the source first (so its own inner `${name[@]}` -- which is
+// literally present as the idiom's substitution text -- is never mistaken for a bare, unguarded
+// expansion), then checks whether any `${name[@]}` / `${name[*]}` survives in what's left. A
+// survivor is an unguarded expansion. `${#name[@]}` (length) is a DIFFERENT parameter expansion
+// form entirely (no `[@]`/`[*]` immediately after `name`) and is never matched by either regex
+// below -- excluded by construction, not by a special case.
+function _lintUnguardedArrayExpansions(source, names) {
+  const code = _lintBlankCommentLines(source);
+  const findings = [];
+  for (const name of names) {
+    const escaped = name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    const guardedRe = new RegExp(`\\$\\{${escaped}\\[@\\]\\+"\\$\\{${escaped}\\[@\\]\\}"\\}`, "g");
+    const withoutGuarded = code.replace(guardedRe, "");
+    const bareRe = new RegExp(`\\$\\{${escaped}\\[[@*]\\]\\}`, "g");
+    const bareMatches = withoutGuarded.match(bareRe);
+    if (bareMatches) findings.push({ name, count: bareMatches.length });
+  }
+  return findings;
+}
+
+const _lintOcpPath = spotJoin(_spotDir, "ocp");
+const _lintOcpConnectPath = spotJoin(_spotDir, "ocp-connect");
+
+test("lint premise: array-declaration scan finds at least one array in ocp and in ocp-connect (anchor/regex-drift guard)", () => {
+  const ocpNames = _lintArrayDeclNames(_ltRead(_lintOcpPath, "utf8"));
+  const ocpConnectNames = _lintArrayDeclNames(_ltRead(_lintOcpConnectPath, "utf8"));
+  assert.ok(ocpNames.includes("_AUTH_ARGS"), `expected to find _AUTH_ARGS in ocp; found=${JSON.stringify(ocpNames)}`);
+  assert.ok(ocpConnectNames.includes("rc_files"), `expected to find rc_files in ocp-connect; found=${JSON.stringify(ocpConnectNames)}`);
+});
+
+test("ocp: every user-defined array expansion is guarded (no bare \"${name[@]}\" under set -u)", () => {
+  const source = _ltRead(_lintOcpPath, "utf8");
+  const names = _lintArrayDeclNames(source);
+  const findings = _lintUnguardedArrayExpansions(source, names);
+  assert.deepEqual(findings, [],
+    `unguarded array expansion(s) in ocp: ${JSON.stringify(findings)} -- wrap with ` +
+    `\${name[@]+"\${name[@]}"} (see _AUTH_ARGS for the pattern)`);
+});
+
+test("ocp-connect: every user-defined array expansion is guarded (no bare \"${name[@]}\" under set -u)", () => {
+  const source = _ltRead(_lintOcpConnectPath, "utf8");
+  const names = _lintArrayDeclNames(source);
+  const findings = _lintUnguardedArrayExpansions(source, names);
+  assert.deepEqual(findings, [],
+    `unguarded array expansion(s) in ocp-connect: ${JSON.stringify(findings)} -- wrap with ` +
+    `\${name[@]+"\${name[@]}"} (see rc_files for the pattern)`);
 });
 
 runAsyncTests().then(() => Promise.all(pendingAsync)).then(() => {
