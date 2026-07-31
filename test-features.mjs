@@ -9645,7 +9645,7 @@ test("ocp bash harness: '# ── dispatch' anchor slice is well-formed (premise
 //                        check) refuses loudly (exit 94) rather than silently doing something
 //                        undefined — none of this issue's tests reach that far on purpose.
 function _bwHarnessRun({
-  args = [], kind = "noop", checks = [], pythonAbsent = false,
+  args = [], kind = "noop", checks = [], pythonAbsent = false, pythonPackageJsonFails = false,
   gitPullExit = 0, gitPullOutput = "Already up to date.", postFlightExit = 0,
   overrideCmdRestart = true,
   resolveRestartExit = 0, resolveRestartStdout = [], resolveRestartStderr = [],
@@ -9673,8 +9673,32 @@ function _bwHarnessRun({
   // file (the harness's own default state below) — `_curl` dies before ever reaching the
   // network call. Every _curl-based test in this file sets a non-empty `adminKey` to route
   // around this ORTHOGONAL defect (a non-empty `_AUTH_ARGS` array never hits the empty-array
-  // path) rather than accidentally depending on it.
+  // path) rather than accidentally depending on it. (This defect is fixed upstream as of #258 —
+  // this workaround is now belt-and-braces, not load-bearing — but every call site keeps it
+  // rather than depending on the fix to stay in place.)
   adminKey = "",
+  // MEDIUM-3 (independent review round 1 on #241): this harness's package.json was always
+  // STATIC ("3.26.0"), so `old_ver === new_ver` in every pre-existing test, and a mutation
+  // swapping `"v$new_ver"` for the stale `"v$old_ver"` in the real --post-flight-only call site
+  // was UNDETECTABLE — the money test named after "the version the tree actually landed on"
+  // could not tell a fresh value from a stale one, because they were always identical. Set true
+  // to make the fake `git pull` stub, on a SUCCESSFUL "pull origin main --ff-only", overwrite
+  // the harness's package.json with version "3.27.0" (a real, observable bump from the initial
+  // "3.26.0") — combine with `postFlightExpectedTarget` below to make a stale-vs-fresh mutation
+  // actually distinguishable.
+  simulateGitPullVersionBump = false,
+  // MEDIUM-3: when set, the fake `node`'s `--post-flight-only` case becomes VERSION-AWARE: it
+  // only honors `postFlightExit` when the invocation's target argument matches this string
+  // exactly (mirroring the real predicate's "wrong version -> fail" behavior); any other target
+  // (e.g. the STALE pre-pull version, under a mutation using `$old_ver` instead of `$new_ver`)
+  // is treated as a mismatch and fails with a distinct exit code. `undefined` (the default)
+  // preserves every existing test's behavior exactly: `postFlightExit` applies unconditionally,
+  // regardless of the target argument.
+  postFlightExpectedTarget = undefined,
+  // LOW-4: when true (and overrideCmdRestart stays at its default true), the STUB cmd_restart's
+  // final line becomes `exit 0` instead of `return 0`, directly reproducing the shape the outer
+  // `( cmd_restart ) || restart_status=$?` subshell in _cmd_update_light exists to contain.
+  cmdRestartStubExits = false,
 } = {}) {
   const root = _ltMkdtemp(join(_ltTmp(), "ocp-bash-harness-"));
   try {
@@ -9710,7 +9734,21 @@ function _bwHarnessRun({
       `    exit 0`,
       `    ;;`,
       `  *"scripts/upgrade.mjs --post-flight-only"*)`,
-      `    exit ${postFlightExit}`,
+      ...(postFlightExpectedTarget === undefined ? [
+        `    exit ${postFlightExit}`,
+      ] : [
+        // MEDIUM-3: version-aware -- only the EXPECTED (post-pull) target succeeds; anything
+        // else, including a STALE pre-pull version reached via a mutation, is a mismatch.
+        `    case "$*" in`,
+        `      *${JSON.stringify(postFlightExpectedTarget)}*)`,
+        `        exit ${postFlightExit}`,
+        `        ;;`,
+        `      *)`,
+        `        echo "FAKE-NODE: post-flight target mismatch -- expected ${postFlightExpectedTarget}, got: $*" >&2`,
+        `        exit 98`,
+        `        ;;`,
+        `    esac`,
+      ]),
       `    ;;`,
       // Issue #224: the new one-shot resolver mode `cmd_restart` shells out to instead of
       // reimplementing cgroup/ss parsing a second time in bash — see scripts/upgrade.mjs's
@@ -9734,6 +9772,11 @@ function _bwHarnessRun({
       `echo "FAKE-GIT-CALL $*" >> "${logPath}"`,
       `case "$*" in`,
       `  "pull origin main --ff-only")`,
+      // MEDIUM-3: simulates a REAL version bump landing on disk, so old_ver != new_ver becomes
+      // observable — every pre-existing test leaves this false and keeps package.json static.
+      ...(simulateGitPullVersionBump ? [
+        `    printf '%s' ${JSON.stringify(JSON.stringify({ version: "3.27.0" }))} > ${JSON.stringify(join(root, "package.json"))}`,
+      ] : []),
       `    echo ${JSON.stringify(gitPullOutput)}`,
       `    exit ${gitPullExit}`,
       `    ;;`,
@@ -9818,6 +9861,31 @@ function _bwHarnessRun({
         `echo "FAKE-PYTHON3-ABSENT-CALL $*" >> "${logPath}"`,
         `exit 127`,
       ].join("\n"));
+    } else if (pythonPackageJsonFails) {
+      // MEDIUM-1 (independent review round 1 on #241): `pythonAbsent` fails EVERY python3
+      // invocation, including `cmd_update`'s own doctor-kind extraction a few lines before
+      // `_cmd_update_light` is ever reached — under a fully-absent python3, `kind` itself
+      // degrades to "unknown" and the dispatch never enters the light path at all (see the
+      // sibling #236 test above), so `pythonAbsent` cannot exercise "kind extraction succeeded,
+      // but the LATER package.json version read specifically fails" — the exact shape MEDIUM-1's
+      // finding needs (a python3 that is present and working in general, but broken/flaky for
+      // one specific call, or simply hits a transient failure reading a real package.json at
+      // that moment). This selective stub delegates to the REAL /usr/bin/python3 (absolute path,
+      // not a bare `python3` call, which would resolve back to this same stub file first on the
+      // scratch $PATH and recurse) for every invocation EXCEPT the `import json;
+      // ...package.json...` version-read shape, which fails outright — reproducing "new_ver
+      // becomes '?'" without touching the unrelated kind-extraction call.
+      mkStub("python3", [
+        `case "$*" in`,
+        `  *"package.json"*)`,
+        `    echo "FAKE-PYTHON3-PACKAGEJSON-FAIL-CALL $*" >> "${logPath}"`,
+        `    exit 1`,
+        `    ;;`,
+        `  *)`,
+        `    exec /usr/bin/python3 "$@"`,
+        `    ;;`,
+        `esac`,
+      ].join("\n"));
     }
 
     // `cmd_restart` override goes AFTER the sliced source in the SAME generated file — never
@@ -9849,7 +9917,20 @@ function _bwHarnessRun({
         `  echo "FAKE-CMD-RESTART-CALLED $*" >> "${logPath}"`,
         `  echo "Restarting proxy..."`,
         `  echo "✓ Proxy restarted successfully."`,
-        `  return 0`,
+        // LOW-4 (independent review round 1): the pre-existing #224 test that drives the REAL
+        // cmd_restart uses `resolveRestartExit: 1`, which makes it `return` (not `exit`) --
+        // that path never needed the outer `( cmd_restart ) || restart_status=$?` subshell in
+        // _cmd_update_light, since `return` behaves correctly with or without it. Nothing
+        // exercised the ACTUAL hazard the subshell exists for: a `cmd_restart` whose SUCCESS
+        // path calls `exit` (cmd_usage's own pre-existing `/usage`-probe hazard, MEDIUM-2 above)
+        // terminates the entire process immediately if not contained, silently skipping
+        // everything after it -- "Verifying restart...", the post-flight call, all of it -- with
+        // no error, just a premature clean-looking exit. `cmdRestartStubExits` reproduces that
+        // shape directly against THIS stub (independent of whatever cmd_restart's real
+        // implementation happens to do after MEDIUM-2's fix), so the outer subshell's own
+        // structural correctness in _cmd_update_light is what's under test, not cmd_restart's
+        // internals.
+        cmdRestartStubExits ? `  exit 0` : `  return 0`,
         `}`,
       ].join("\n") : "# issue #224: overrideCmdRestart=false -- the REAL cmd_restart above is used as-is",
       "",
@@ -9882,7 +9963,10 @@ function _bwHarnessRun({
     // display-command tests need stderr on a successful (status 0) run too — e.g. proving a
     // degraded-but-still-status-0 case truly carries no warning. `spawnSync` always returns
     // `{stdout, stderr, status}` regardless of exit code, so switching to it removes the gap
-    // for every caller, not just #242's.
+    // for every caller, not just #242's. (#241/PR #255's own MEDIUM-1/LOW-6 tests independently
+    // needed this exact same fix — e.g. the --target warning firing on a successful, status-0
+    // run — and originally ported a duplicate of it before this rebase; this is now the single
+    // shared fix both PRs rely on.)
     const _bwRes = spawnSync("bash", [driverPath, ...args], { cwd: root, env, encoding: "utf8" });
     const stdout = _bwRes.stdout ?? "";
     const stderr = _bwRes.stderr ?? "";
@@ -10675,6 +10759,42 @@ test("#224: cmd_restart runs the resolver's actual resolved command, not the old
     `non-zero exit code (not the old implicit success); status=${r.status}`);
 });
 
+// ── MEDIUM-2 (independent review round 1, blocking): cmd_restart's own SUCCESS path calls
+// cmd_usage as a nice-to-have post-restart display, but cmd_usage's own `/usage` probe does
+// `exit 1` (not `return 1`) if it fails -- and it fails whenever `/usage` returns non-2xx, which
+// happens right after a restart before the proxy has warmed back up (a real, demonstrated case,
+// not hypothetical). Before this fix, that turned a GENUINELY SUCCESSFUL restart into an overall
+// failure -- indistinguishable from a real restart failure to anything checking cmd_restart's own
+// exit code, which #241/PR #255 was the first caller to actually do. This harness has no
+// `curlResponses` capability (that landed on the sibling #242 branch, not yet merged here), so
+// the DEFAULT curl stub's own refusal for any URL other than "*/health*" (exit 94) already
+// reproduces "the /usage probe fails" without needing one -- `curl -sf` on a non-2xx/unreachable
+// response is exactly what makes cmd_usage's own guard fire.
+test("#241 MEDIUM-2 (the money test): a healthy restart with a merely-cosmetic /usage display failure must NOT make cmd_restart itself report failure", () => {
+  const r = _bwHarnessRun({
+    args: ["restart"], overrideCmdRestart: false,
+    resolveRestartExit: 0, resolveRestartStdout: ["true"],
+    curlHealthExit: 0,
+  });
+  assert.equal(r.status, 0,
+    `a genuinely successful restart (resolver ok, restart command ok, health check ok) must ` +
+    `report success even though the COSMETIC post-restart usage display failed; status=${r.status} ` +
+    `stdout=${JSON.stringify(r.stdout)} stderr=${JSON.stringify(r.stderr)}`);
+  assert.ok(r.stdout.includes("✓ Proxy restarted successfully."), `expected the success line; stdout=${JSON.stringify(r.stdout)}`);
+});
+
+test("#241 MEDIUM-2: the SAME scenario end-to-end through _cmd_update_light -- a healthy restart's cosmetic /usage failure must not make the light path report overall failure either", () => {
+  const r = _bwHarnessRun({
+    kind: "update", args: ["update"], overrideCmdRestart: false,
+    resolveRestartExit: 0, resolveRestartStdout: ["true"],
+    curlHealthExit: 0, postFlightExit: 0,
+  });
+  assert.equal(r.status, 0,
+    `the light path must report success when the restart genuinely succeeded and post-flight ` +
+    `passed, even though cmd_restart's own cosmetic /usage display failed; status=${r.status} ` +
+    `stdout=${JSON.stringify(r.stdout)} stderr=${JSON.stringify(r.stderr)}`);
+});
+
 test("#224: _cmd_update_light no longer swallows cmd_restart's refusal (operator sees why it failed, and the exit code is non-zero)", () => {
   const r = _bwHarnessRun({
     kind: "update",
@@ -10731,10 +10851,49 @@ test("#241 control: light path reports SUCCESS when post-flight verification con
   assert.ok(r.log.some((l) => l.includes("post-flight-only")), `post-flight verification must run; log=${JSON.stringify(r.log)}`);
 });
 
-test("#241: post-flight verification is invoked with the version the tree actually landed on (v3.26.0, from this harness's static package.json), not a hard-coded or stale value", () => {
-  const r = _bwHarnessRun({ kind: "update", args: ["update"], postFlightExit: 0 });
-  assert.ok(r.log.some((l) => l.includes("FAKE-NODE-CALL") && l.includes("--post-flight-only") && l.includes("v3.26.0")),
-    `expected the post-flight-only call to carry the real target version; log=${JSON.stringify(r.log)}`);
+// MEDIUM-3 (independent review round 1): the original version of this test used this harness's
+// STATIC package.json, where old_ver === new_ver === "3.26.0" always — a mutation swapping
+// `"v$new_ver"` for the STALE `"v$old_ver"` at the real call site was therefore UNDETECTABLE
+// (both values are identical, so the mutant and the fix produce byte-identical behavior). That
+// mutant IS the bug this test is named after: verifying against the pre-pull version would let a
+// stale process serving OLD code pass post-flight, exactly re-opening #241. Fixed with a fixture
+// where the pull ACTUALLY changes the version (simulateGitPullVersionBump) and a node stub that
+// only succeeds for the CORRECT post-pull target (postFlightExpectedTarget) — so using the stale
+// value now fails this test with a target-mismatch, not merely produces the same log line.
+test("#241 MEDIUM-3: post-flight verification target reflects the version the pull ACTUALLY landed on (v3.27.0), not the stale pre-pull version (v3.26.0)", () => {
+  const r = _bwHarnessRun({
+    kind: "update", args: ["update"],
+    simulateGitPullVersionBump: true,
+    postFlightExpectedTarget: "v3.27.0",
+    postFlightExit: 0,
+  });
+  assert.equal(r.status, 0,
+    `expected success when post-flight is checked against the CORRECT (post-pull) version -- a ` +
+    `non-zero status here means the wrong (stale) version was sent; status=${r.status} stderr=${JSON.stringify(r.stderr)} log=${JSON.stringify(r.log)}`);
+  assert.ok(r.log.some((l) => l.includes("FAKE-NODE-CALL") && l.includes("--post-flight-only") && l.includes("v3.27.0")),
+    `expected the post-flight-only call to carry v3.27.0 (the version actually landed on), not v3.26.0 (stale); log=${JSON.stringify(r.log)}`);
+});
+
+// LOW-4 (independent review round 1): the outer `( cmd_restart ) || restart_status=$?` subshell
+// in _cmd_update_light was previously untested for the one thing it exists to do -- contain a
+// naked `exit` reached through cmd_restart's success path so it does not silently kill the whole
+// process. `cmdRestartStubExits` reproduces that shape directly against the harness's OWN stub
+// (independent of cmd_restart's real internals, which MEDIUM-2 above already fixed at the
+// source), proving the containment is real: if the outer parens were ever removed, `exit 0`
+// inside the (now-unwrapped) stub would terminate the ENTIRE bash process immediately -- with
+// exit code 0, looking like a clean success -- and "Verifying restart...", the post-flight call,
+// and everything after it would simply never run. Content-based assertions (not just the exit
+// code, which would misleadingly still read as "0 = fine") are what catch that.
+test("#241 LOW-4: the outer subshell around cmd_restart actually contains an exit() reached through its success path -- post-flight still runs afterward", () => {
+  const r = _bwHarnessRun({ kind: "update", args: ["update"], cmdRestartStubExits: true, postFlightExit: 0 });
+  assert.ok(_bwCalled(r.log, "FAKE-CMD-RESTART-CALLED"), `cmd_restart (stub) must have run; log=${JSON.stringify(r.log)}`);
+  assert.ok(r.log.some((l) => l.includes("FAKE-NODE-CALL") && l.includes("--post-flight-only")),
+    `post-flight verification must STILL run after a cmd_restart that exits (not returns) -- if ` +
+    `this is missing, the outer subshell failed to contain the exit and the rest of the ` +
+    `function silently never ran; log=${JSON.stringify(r.log)}`);
+  assert.ok(r.stdout.includes("Verifying restart..."),
+    `expected to reach the post-restart verification step's own output; stdout=${JSON.stringify(r.stdout)}`);
+  assert.equal(r.status, 0, `expected a clean success given postFlightExit:0; status=${r.status} stderr=${r.stderr}`);
 });
 
 test("#241: a resolver refusal (cmd_restart itself fails) is NOT masked into success by post-flight happening to answer anyway", () => {
@@ -10753,23 +10912,85 @@ test("#241: a resolver refusal (cmd_restart itself fails) is NOT masked into suc
     `the refusal message must still reach the operator; stdout=${JSON.stringify(r.stdout)} stderr=${JSON.stringify(r.stderr)}`);
 });
 
-test("#241: --target on the light path prints an explicit no-op warning instead of being silently ignored", () => {
+// ── MEDIUM-1 (independent review round 1): on a host where the package.json version read fails
+// (python3 absent/broken specifically for that call — see #242/PR #252, the exact host class
+// this incident class targets), `new_ver` degrades to the literal "?" via ocp's own pre-existing
+// `2>/dev/null || echo "?"` fallback. Driving postFlightOk() directly: target "v?" -> the
+// predicate strips the leading "v", is left with the non-empty string "?", and demands
+// `body.version === "?"` -- never true for any real server. Before this fix, a FULLY SUCCESSFUL
+// update on such a host would report failure and tell the operator to run `ocp doctor` for no
+// real reason. The fix: skip strict post-flight verification (which cannot succeed without a
+// known target anyway) and say so explicitly instead of either blocking a real success or
+// silently claiming a verified one.
+test("#241 MEDIUM-1 (the money test): a python3 failure isolated to the package.json version read does NOT force the light path to report failure", () => {
+  const r = _bwHarnessRun({
+    kind: "update", args: ["update"], pythonPackageJsonFails: true,
+    // postFlightExit deliberately NOT set to 0 here -- if the code wrongly still called
+    // --post-flight-only with "v?", the fake node stub's DEFAULT (0) would coincidentally look
+    // like success, hiding the bug. The real defect is calling it AT ALL with an unverifiable
+    // target and then depending on postFlightOk's own real (unmocked) logic, which the sibling
+    // MEDIUM-1 control test below verifies directly.
+  });
+  assert.equal(r.status, 0,
+    `a python3 failure isolated to the version read must not turn a real restart success into a ` +
+    `reported failure; status=${r.status} stdout=${JSON.stringify(r.stdout)} stderr=${JSON.stringify(r.stderr)}`);
+  assert.ok(r.stderr.includes("Could not determine the installed version") && r.stderr.includes("skipping strict post-flight version verification"),
+    `expected an explicit degraded-mode warning telling the operator verification was skipped, not silently claimed; stderr=${JSON.stringify(r.stderr)}`);
+  assert.ok(!r.log.some((l) => l.includes("FAKE-NODE-CALL") && l.includes("--post-flight-only")),
+    `--post-flight-only must not be invoked with an unverifiable "v?" target at all; log=${JSON.stringify(r.log)}`);
+});
+
+test("#241 MEDIUM-1 control: with python3 fully healthy, the SAME scenario still runs strict post-flight verification normally", () => {
+  const r = _bwHarnessRun({ kind: "update", args: ["update"], postFlightExit: 0 });
+  assert.equal(r.status, 0, `expected success; status=${r.status} stderr=${r.stderr}`);
+  assert.ok(r.log.some((l) => l.includes("FAKE-NODE-CALL") && l.includes("--post-flight-only") && l.includes("v3.26.0")),
+    `expected the normal (non-degraded) post-flight call with the real version; log=${JSON.stringify(r.log)}`);
+  assert.ok(!r.stderr.includes("Could not determine the installed version"),
+    `must not print the degraded-mode warning when python3 is healthy; stderr=${JSON.stringify(r.stderr)}`);
+});
+
+test("#241 MEDIUM-1: postFlightOk() itself, driven directly, confirms WHY 'v?' is unverifiable -- the predicate this fix routes around", () => {
+  // Direct, unmocked exercise of the real predicate (imported at the top of this file's upgrade
+  // full-path section) -- this is the evidence for the fix above, not a duplicate of it.
+  assert.equal(postFlightOk({ auth: { ok: true }, version: "3.27.0" }, "v3.27.0"), true,
+    "a matching version must pass");
+  assert.equal(postFlightOk({ auth: { ok: true }, version: "3.27.0" }, "v?"), false,
+    "target 'v?' must NOT pass against any real version -- this is the MEDIUM-1 defect made concrete");
+  assert.equal(postFlightOk({ auth: { ok: true }, version: "3.27.0" }, ""), true,
+    "an EMPTY target degrades to the auth-only check and passes -- 'v?' is categorically different from empty, which is why substituting an empty string was considered and rejected (the CLI's own --post-flight-only entrypoint fails closed on a falsy/empty target argument by design)");
+});
+
+// LOW-6 (independent review round 1): the warning moved to stderr (a stdout warning would be
+// silently read as data by piped fleet automation), and both `--target vX.Y.Z` (two tokens) and
+// `--target=vX.Y.Z` (one token, the equals form) must be detected — the equals form is exactly
+// the silently-ignored pin this fix exists to eliminate, and the original guard only matched the
+// two-token form.
+test("#241: --target (two-token form) on the light path prints an explicit no-op warning on STDERR instead of being silently ignored", () => {
   const r = _bwHarnessRun({ kind: "update", args: ["update", "--target", "v9.9.9"] });
-  assert.ok(r.stdout.includes("--target v9.9.9 is not honored on the light/patch-bump path"),
-    `expected the explicit --target no-op warning, got: ${JSON.stringify(r.stdout)}`);
+  assert.ok(r.stderr.includes("--target v9.9.9 is not honored on the light/patch-bump path"),
+    `expected the explicit --target no-op warning on stderr, got: ${JSON.stringify(r.stderr)}`);
+  assert.ok(!r.stdout.includes("is not honored on the light/patch-bump path"),
+    `the warning must NOT also land on stdout (piped automation would read it as data); stdout=${JSON.stringify(r.stdout)}`);
   assert.ok(_bwCalled(r.log, "FAKE-GIT-CALL"), `--target must not BLOCK the ordinary light-path update; log=${JSON.stringify(r.log)}`);
 });
 
-test("#241 control: light path WITHOUT --target prints no --target warning at all", () => {
+test("#241 LOW-6: --target=vX.Y.Z (equals form, one token) is ALSO detected, not just the two-token form", () => {
+  const r = _bwHarnessRun({ kind: "update", args: ["update", "--target=v9.9.9"] });
+  assert.ok(r.stderr.includes("--target v9.9.9 is not honored on the light/patch-bump path"),
+    `expected the equals form to be recognized and its value extracted; stderr=${JSON.stringify(r.stderr)}`);
+  assert.ok(_bwCalled(r.log, "FAKE-GIT-CALL"), `--target=... must not BLOCK the ordinary light-path update; log=${JSON.stringify(r.log)}`);
+});
+
+test("#241 control: light path WITHOUT --target prints no --target warning at all (either form, either stream)", () => {
   const r = _bwHarnessRun({ kind: "update", args: ["update"] });
-  assert.ok(!r.stdout.includes("is not honored on the light/patch-bump path"),
-    `must not print the --target warning when --target was never passed; got: ${JSON.stringify(r.stdout)}`);
+  assert.ok(!r.stdout.includes("is not honored on the light/patch-bump path") && !r.stderr.includes("is not honored on the light/patch-bump path"),
+    `must not print the --target warning when --target was never passed; stdout=${JSON.stringify(r.stdout)} stderr=${JSON.stringify(r.stderr)}`);
 });
 
 test("#241: --target warning still fires under --dry-run (detected before the dry-run early-return, matching --target reaching this function per #235)", () => {
   const r = _bwHarnessRun({ kind: "update", args: ["update", "--target", "v9.9.9", "--dry-run"] });
-  assert.ok(r.stdout.includes("--target v9.9.9 is not honored on the light/patch-bump path"),
-    `expected the warning even under --dry-run, got: ${JSON.stringify(r.stdout)}`);
+  assert.ok(r.stderr.includes("--target v9.9.9 is not honored on the light/patch-bump path"),
+    `expected the warning even under --dry-run, got stderr=${JSON.stringify(r.stderr)}`);
   assert.ok(r.stdout.includes("[dry-run]"), `--dry-run itself must still be honored (no mutation); got: ${JSON.stringify(r.stdout)}`);
   assert.ok(!_bwCalled(r.log, "FAKE-GIT-CALL"), `--dry-run must still prevent the git pull; log=${JSON.stringify(r.log)}`);
 });

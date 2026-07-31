@@ -741,7 +741,26 @@ cmd_restart() {
     sleep 3
     if curl -sf --max-time 5 "$PROXY/health" > /dev/null 2>&1; then
       echo "✓ Proxy restarted successfully."
-      cmd_usage
+      # MEDIUM-2 (independent review round 1 on #241/PR #255): `cmd_usage` is called here purely
+      # as a nice-to-have post-restart display, but its OWN `/usage` probe does `exit 1` (not
+      # `return 1`) on failure — a real, non-hypothetical case right after a restart, before the
+      # proxy has warmed back up: `/usage` returns 502 whenever the upstream probe errors
+      # (server.mjs's jsonResponse(res, data.error ? 502 : 200, ...) for that route), and
+      # `curl -sf` treats any non-2xx as failure. Before this fix, that `exit 1` became THIS
+      # function's own return code — indistinguishable from a genuine restart failure to any
+      # caller checking cmd_restart's exit status. #241/PR #255 was the first caller to actually
+      # DO that (_cmd_update_light's restart_status), and it surfaced this exact conflation: a
+      # fully successful restart, with post-flight PASSING, reported as an overall failure
+      # because the cosmetic usage display happened to 502. A bare `cmd_usage || true` would NOT
+      # fix this — `exit` terminates the current process immediately, before a `||` on the
+      # calling line ever gets a chance to evaluate (it does not behave like a command returning
+      # nonzero). Wrapping the call in its OWN subshell does: `exit` inside a subshell only
+      # terminates that subshell, so `( cmd_usage ) || true` safely discards a display-only
+      # failure while a GENUINE restart failure (resolver refusal, restart command failure, or
+      # the health-check failure in the `else` branch below) still `return`s 1 on its own,
+      # unaffected — none of those paths ever reach this line. Same containment technique
+      # `_cmd_update_light` itself already relies on for the OUTER `( cmd_restart ) || ...` call.
+      ( cmd_usage ) || true
     else
       echo "✗ Proxy not responding after restart."
       return 1
@@ -852,13 +871,20 @@ Usage:
   ocp update --rollback --gc --dry-run    Preview what would be deleted
 
 Notes:
-  --target on the light/patch-bump path (a same-minor patch update): NOT
-  honored. That path always runs a plain `git pull origin main --ff-only`
-  regardless of any version requested via --target (issue #241) -- real
+  --target IS honored on the cross-minor (full) upgrade path (issue #259):
+  it pins the checkout to the exact requested release tag instead of
+  always taking the latest.
+
+  --target is NOT honored on the light/patch-bump path (a same-minor patch
+  update, issue #241): that path always runs a plain `git pull origin main
+  --ff-only` regardless of any version requested via --target -- real
   version-pinning there would mean a tag checkout instead of a fast-forward
-  pull, a different mechanism than this path's job. Passing --target on
-  that path prints a runtime warning rather than silently doing nothing
-  unexpected.
+  pull, a different mechanism than this path's job (a trade-off #259 made
+  differently for the full path, where the mechanism already IS a tag
+  checkout -- see that issue for why the two paths reach different
+  answers). Passing --target on the light path prints a runtime warning
+  (accepts both `--target vX.Y.Z` and `--target=vX.Y.Z`) rather than
+  silently doing nothing unexpected.
 EOF
 }
 
@@ -1008,20 +1034,36 @@ _cmd_update_light() {
   # requested version. Real version-pinning here would mean switching from a fast-forward pull
   # to a tag checkout (fetch tags, `git checkout vX.Y.Z`, and deciding what happens to
   # --ff-only's protections) — a different mechanism, not a one-line addition, and its own design
-  # decision deliberately left for a future PR (see #241's own scope note). What IS this PR's
-  # job: stop letting that no-op be SILENT. A user passing --target here should not reasonably
-  # conclude it pinned anything just because nothing errored — this prints a runtime warning
-  # (cmd_update_help documents the same caveat) instead.
+  # decision deliberately left for a future PR (see #241's own scope note; #259 made this exact
+  # trade-off differently for the full/cross-minor path — see cmd_update_help's own Notes: below).
+  # What IS this PR's job: stop letting that no-op be SILENT. A user passing --target here should
+  # not reasonably conclude it pinned anything just because nothing errored — this prints a
+  # runtime warning (cmd_update_help documents the same caveat) instead.
+  #
+  # LOW-6 (independent review round 1): both `--target vX.Y.Z` (two argv tokens) AND
+  # `--target=vX.Y.Z` (one token) are real, commonly-typed CLI shapes for the SAME flag — the
+  # equals form is exactly the silently-ignored pin this fix exists to eliminate, and the
+  # original version of this guard only matched the two-token form. `case` on each token catches
+  # both without a second pass. The warning itself now goes to stderr, not stdout: in piped fleet
+  # automation (`ocp update --target vX | some-log-parser`), a stdout warning would be silently
+  # read as data by whatever consumes the pipe; stderr is where a human-facing advisory belongs.
   local _args=("$@") _i _target_seen=0 _target_val=""
   for ((_i = 0; _i < ${#_args[@]}; _i++)); do
-    if [[ "${_args[_i]}" == "--target" ]]; then
-      _target_seen=1
-      _target_val="${_args[_i+1]:-<no value given>}"
-      break
-    fi
+    case "${_args[_i]}" in
+      --target)
+        _target_seen=1
+        _target_val="${_args[_i+1]:-<no value given>}"
+        break
+        ;;
+      --target=*)
+        _target_seen=1
+        _target_val="${_args[_i]#--target=}"
+        break
+        ;;
+    esac
   done
   if [[ $_target_seen -eq 1 ]]; then
-    echo "  ⚠ --target $_target_val is not honored on the light/patch-bump path — it always pulls the latest origin/main regardless. Run \`ocp update --help\` for details."
+    echo "  ⚠ --target $_target_val is not honored on the light/patch-bump path — it always pulls the latest origin/main regardless. Run \`ocp update --help\` for details." >&2
   fi
 
   # Honor --dry-run BEFORE any mutation (issue #235). This arm used to be called with NO
@@ -1097,9 +1139,29 @@ _cmd_update_light() {
   # hand-rolled check — wiring the light path up the same way is what this block does. `new_ver`
   # (re-read from package.json AFTER the git pull above, whether or not it changed) is the
   # correct verification target: it reflects whatever version the tree actually landed on.
-  echo "  Verifying restart..."
+  # MEDIUM-1 (independent review round 1): `new_ver` degrades to the literal string "?" (line
+  # ~975, pre-existing `2>/dev/null || echo "?"`) whenever THIS python3 read fails for any reason
+  # — including on the very python3-less/broken hosts issue #242 (PR #252) exists for. Driving
+  # `postFlightOk` directly shows why that is fatal here specifically: `want = String("v?" ||
+  # "").replace(/^v/, "")` strips the leading "v" and is left with the non-empty string "?", so
+  # `!want` is false and the predicate demands `body.version === "?"` — never true for any real
+  # server. `postFlightOk`'s own doc comment says an empty/unknown target should degrade to the
+  # auth-only check "rather than blocking an otherwise-good upgrade"; "v?" defeats exactly that
+  # intent because it is NOT empty. Passing an empty string instead is not an option either: the
+  # `--post-flight-only` CLI entrypoint (scripts/upgrade.mjs) deliberately fails closed on a
+  # falsy target ("Fail CLOSED on a missing/malformed target" — see its own comment) specifically
+  # to catch an accidentally-omitted flag, and relaxing that guard for a legitimate "unknown"
+  # case is a separate, more invasive design decision than this fix warrants. So: skip the
+  # strict version check entirely when we genuinely cannot determine what to check FOR, and say
+  # so explicitly rather than either (a) blocking a real success behind a check that can never
+  # pass, or (b) silently claiming a verified success that was never actually verified.
   local postflight_status=0
-  node "$script_dir/scripts/upgrade.mjs" --post-flight-only "v$new_ver" || postflight_status=$?
+  if [[ "$new_ver" == "?" ]]; then
+    echo "  ⚠ Could not determine the installed version (python3 unavailable or broken — see issue #242) — skipping strict post-flight version verification. Run \`ocp doctor\` or \`curl \$PROXY/health\` to confirm the restart actually landed." >&2
+  else
+    echo "  Verifying restart..."
+    node "$script_dir/scripts/upgrade.mjs" --post-flight-only "v$new_ver" || postflight_status=$?
+  fi
 
   # Exit-code contract (deliberately decided here, per #235's own deferral of this exact
   # question): a post-flight failure now makes this function — and therefore `ocp update` on
