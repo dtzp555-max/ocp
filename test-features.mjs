@@ -6665,6 +6665,41 @@ test("classifyMultiUnitRisk: systemctl unavailable for EITHER scope (null) → u
   assert.equal(classifyMultiUnitRisk({ platform: "linux", userShowOut: null, systemShowOut: null }).state, "unknown");
 });
 
+test("LOW-3: classifyMultiUnitRisk — systemctlNotFound=true (both scopes genuinely absent) → 'not-applicable', a state distinct from 'unknown'", () => {
+  const result = classifyMultiUnitRisk({
+    platform: "linux", userShowOut: null, systemShowOut: null, systemctlNotFound: true,
+  });
+  assert.equal(result.state, "not-applicable");
+  assert.notEqual(result.state, "unknown", "must be a genuinely distinct state, not a relabeled 'unknown'");
+});
+
+test("LOW-3: classifyMultiUnitRisk — systemctlNotFound=false (a real failure, not absence) stays 'unknown' even with null show-outs", () => {
+  const result = classifyMultiUnitRisk({
+    platform: "linux", userShowOut: null, systemShowOut: null, systemctlNotFound: false,
+  });
+  assert.equal(result.state, "unknown");
+});
+
+test("LOW-3: gatherUnitCandidates — systemctlNotFound requires BOTH scopes to fail with exit 127; an asymmetric failure (one 127, one a different error) stays 'unknown'-eligible, not 'not-applicable'", () => {
+  // If systemctl genuinely doesn't exist, BOTH calls (same binary) fail identically with exit
+  // 127 — that's the confident "not-applicable" case. A single scope failing with 127 while the
+  // other fails some OTHER way is a stranger, less confident shape that should not be
+  // upgraded to "the check doesn't apply here".
+  const notFound = () => { const e = new Error("command not found"); e.status = 127; throw e; };
+  const otherFailure = () => { throw new Error("permission denied"); };
+  const run = (cmd) => (cmd.includes("--user") ? notFound() : otherFailure());
+  const raw = gatherUnitCandidates(run, "linux");
+  assert.equal(raw.systemctlNotFound, false, "asymmetric failure (127 + non-127) must NOT be treated as a confident 'not found'");
+  assert.equal(classifyMultiUnitRisk(raw).state, "unknown");
+});
+
+test("LOW-3: gatherUnitCandidates — both scopes fail with exit 127 → systemctlNotFound=true", () => {
+  const notFound = () => { const e = new Error("command not found"); e.status = 127; throw e; };
+  const raw = gatherUnitCandidates(notFound, "linux");
+  assert.equal(raw.systemctlNotFound, true);
+  assert.equal(classifyMultiUnitRisk(raw).state, "not-applicable");
+});
+
 test("classifyMultiUnitRisk: two enabled OCP units on DIFFERENT ports → no false positive", () => {
   const userShow = `Id=a.service\nExecStart={ argv[]=/usr/bin/node /home/opc/ocp/server.mjs ; }\nEnvironment=CLAUDE_PROXY_PORT=3456`;
   const systemShow = `Id=b.service\nExecStart={ argv[]=/usr/bin/node /home/opc/ocp/server.mjs ; }\nEnvironment=CLAUDE_PROXY_PORT=9999`;
@@ -6911,6 +6946,43 @@ test("classifyMultiUnitRisk (macOS): disabledBlob unavailable (null) is PERMISSI
   assert.equal(result.state, "warn", "a missing disabledBlob must not suppress an otherwise-real conflict");
 });
 
+test("review round 4 (#230 false-claim correction): a unit disabled ONLY in the SYSTEM domain (not gui) is still excluded — proves the union genuinely incorporates system, not just gui", () => {
+  // The bug this fixes: an earlier revision never probed the system domain at all (claiming,
+  // falsely, that it required root), so a LaunchDaemon disabled via `sudo launchctl disable
+  // system/<label>` — precisely the remediation this file's OWN WARN message recommends for a
+  // LaunchDaemon conflict — kept being warned about forever. Putting the disabled entry ONLY in
+  // systemDisabledBlob (never in disabledBlob) is what distinguishes "the union really reads
+  // both domains" from a test that would pass even if systemDisabledBlob were ignored entirely.
+  const blob = plistBlob([
+    ["/Users/opc/Library/LaunchAgents/dev.ocp.proxy.plist", ocpPlist({ label: "dev.ocp.proxy", port: "3456" })],
+    ["/Library/LaunchDaemons/ai.custom.ocp.plist", ocpPlist({ label: "ai.custom.ocp", port: "3456" })],
+  ]);
+  const result = classifyMultiUnitRisk({
+    platform: "darwin",
+    plistBlob: blob,
+    disabledBlob: disabledLaunchctlBlob([["dev.ocp.proxy", false]]), // gui domain: nothing disabled
+    systemDisabledBlob: disabledLaunchctlBlob([["ai.custom.ocp", true]]), // system domain: disabled here only
+  });
+  assert.equal(result.state, "clear", "ai.custom.ocp is disabled in the SYSTEM domain only — must still be excluded, leaving one live candidate");
+});
+
+test("review round 4: systemDisabledBlob unavailable (null) is ALSO permissive — a partial gather (gui succeeds, system fails, or vice versa) still filters what it CAN determine", () => {
+  const blob = plistBlob([
+    ["/Users/opc/Library/LaunchAgents/dev.ocp.proxy.plist", ocpPlist({ label: "dev.ocp.proxy", port: "3456" })],
+    ["/Library/LaunchDaemons/ai.custom.ocp.plist", ocpPlist({ label: "ai.custom.ocp", port: "3456" })],
+  ]);
+  // gui succeeds and finds ai.custom.ocp is NOT gui-disabled (irrelevant, it's a LaunchDaemon);
+  // system read fails entirely (null) — must not escalate to "unknown", and must not silently
+  // drop the conflict just because one of the two reads failed.
+  const result = classifyMultiUnitRisk({
+    platform: "darwin",
+    plistBlob: blob,
+    disabledBlob: disabledLaunchctlBlob([["dev.ocp.proxy", false]]),
+    systemDisabledBlob: null,
+  });
+  assert.equal(result.state, "warn", "a failed system-domain read must not suppress an otherwise-real conflict — permissive, not 'unknown'");
+});
+
 console.log("\nMulti-unit boot-race pre-flight (issue #220) — gatherUnitCandidates (impure layer):");
 
 test("gatherUnitCandidates: listing fails (run throws) → showOut is null, not \"\" — never silently treated as zero enabled units", () => {
@@ -7034,13 +7106,20 @@ test("HIGH-1: gatherUnitCandidates (macOS) — a single shell command enumerates
   assert.ok(plistCmds[0].includes("/Library/LaunchDaemons"), "must scan /Library/LaunchDaemons");
 });
 
-test("gatherUnitCandidates (macOS): also issues a launchctl print-disabled read to cross-check persistent disables", () => {
+test("gatherUnitCandidates (macOS): issues launchctl print-disabled reads for BOTH the gui and system domains (review round 4: system is unprivileged too, not out of scope)", () => {
+  // Review round 4 on #230, false-claim correction: an earlier revision claimed the system
+  // domain "requires root to query" and left it unprobed. Verified false directly on a live
+  // host (uid 501, no sudo, `launchctl print-disabled system` exits 0) — and the false claim had
+  // a self-inflicted consequence, since this file's OWN WARN recommends `sudo launchctl disable
+  // system/<label>` for a LaunchDaemon conflict, so an operator who followed that advice was
+  // warned about the same, now-disabled unit forever.
   const capturedCmds = [];
   const run = (cmd) => { capturedCmds.push(cmd); return ""; };
   gatherUnitCandidates(run, "darwin");
   const disabledCmds = capturedCmds.filter(c => c.includes("print-disabled"));
-  assert.equal(disabledCmds.length, 1, "exactly one print-disabled read");
-  assert.ok(disabledCmds[0].includes("gui/"), "must query the gui/<uid> domain (covers every LaunchAgent, personal or system-wide)");
+  assert.equal(disabledCmds.length, 2, "exactly two print-disabled reads — gui domain AND system domain");
+  assert.ok(disabledCmds.some(c => c.includes("gui/")), "must query the gui/<uid> domain (covers every LaunchAgent, personal or system-wide)");
+  assert.ok(disabledCmds.some(c => /print-disabled system(\s|$|2>)/.test(c)), "must ALSO query the system domain (covers LaunchDaemons) — not just gui/<uid>");
 });
 
 test("MED-4 (real shell, verified mechanism): a non-matching TRAILING glob makes a bare for-loop throw and discard earlier real output — the trailing no-op fixes it", () => {
@@ -7298,26 +7377,55 @@ test("runDoctor: zero enabled units on either scope → no check pushed, no cras
   assert.equal(result.ready_to_upgrade, true);
 });
 
-test("MED-5: runDoctor — systemctl missing entirely (every call throws) → pushes a visible INFO line, distinguishable from a verified-clear host", async () => {
-  // Before this fix, "unknown" pushed nothing at all — indistinguishable from a genuinely
+test("MED-5: runDoctor — systemctl EXISTS but this probe fails for another reason (non-127 exit) → pushes a visible INFO line, distinguishable from a verified-clear host", async () => {
+  // Before the MED-5 fix, "unknown" pushed nothing at all — indistinguishable from a genuinely
   // clear host in the JSON output. That matters because `systemctl --user ...` fails without
   // XDG_RUNTIME_DIR/DBUS_SESSION_BUS_ADDRESS, which is exactly what `sudo`'s env_reset strips —
   // so `sudo ocp update` on a host whose OCP is a SYSTEM unit (the #215 shape) silently
   // degraded this whole check with no visible trace.
+  //
+  // LOW-3 (review round 4): the thrown error here deliberately has NO `.status` (unlike a real
+  // "command not found", which exits 127 — verified directly via execSync) — this is the
+  // "systemctl is present but something else went wrong" case (permission, timeout, transient
+  // error), which must still surface as INFO. The genuinely-absent case is the next test.
   const result = await runDoctor({
     skipNetwork: false,
     mockVersion: "v3.26.0",
     mockLatest: "v3.26.0",
     mockHealth: { status: 200, body: { version: "3.26.0", auth: { ok: true } } },
     mockPlatform: "linux",
-    run: (cmd) => { throw new Error("systemctl: command not found"); },
+    run: (cmd) => { throw new Error("systemctl: unexpected failure (not command-not-found)"); },
   });
   const check = result.checks.find(c => c.id === "multi_unit_boot_race");
-  assert.ok(check, "an 'unknown' verdict must now be visible in the output, not silently omitted");
+  assert.ok(check, "an 'unknown' verdict must still be visible in the output, not silently omitted");
   assert.equal(check.level, "INFO", "must not be WARN (no confirmed conflict) or FAIL (must never block an upgrade)");
   assert.ok(check.message.includes("could not verify"));
   assert.equal(result.ready_to_upgrade, true);
   assert.equal(result.warn_count, 0, "INFO must not be counted as a warning");
+});
+
+test("LOW-3: runDoctor — systemctl genuinely NOT INSTALLED (exit 127, verified as the real signal) → 'not-applicable', NO push at all, never repeats forever", () => {
+  // The concern this fixes: on a non-systemd Linux host (container, WSL without systemd,
+  // OpenRC), EVERY `ocp update` was pushing an unactionable "could not verify" INFO line,
+  // forever, about a check that can never work there. Verified the real signal directly:
+  // execSync on a genuinely-missing binary (given as a shell command STRING, this file's own
+  // convention) exits 127 via the shell that resolves it — not a Node-level ENOENT on the
+  // execSync call itself. A thrown Error with `.status = 127` is therefore the realistic
+  // simulation of "systemctl isn't on this host at all", distinct from the previous test's
+  // generic failure.
+  const notFound = () => { const e = new Error("systemctl: command not found"); e.status = 127; throw e; };
+  return runDoctor({
+    skipNetwork: false,
+    mockVersion: "v3.26.0",
+    mockLatest: "v3.26.0",
+    mockHealth: { status: 200, body: { version: "3.26.0", auth: { ok: true } } },
+    mockPlatform: "linux",
+    run: notFound,
+  }).then((result) => {
+    assert.ok(!result.checks.some(c => c.id === "multi_unit_boot_race"),
+      "a genuinely-absent systemctl must push NOTHING — silent like 'clear', not a permanent unactionable INFO line on every future run");
+    assert.equal(result.ready_to_upgrade, true);
+  });
 });
 
 test("runDoctor: skipNetwork=true skips the probe entirely, even when the injected run() would report a conflict", () => {
@@ -7418,6 +7526,16 @@ assert blk.strip(), "empty doctor-check-surfacing slice - anchor drift"
 assert "'WARN'" in blk and "'INFO'" in blk, "slice missing WARN/INFO handling - anchor drift"
 assert 'case "$kind"' not in blk and '_cmd_update_restart' not in blk, \\
     "slice overgrown past the intended block - anchor drift"
+# Review round 4 on #230 (LOW-1): bash's double-quoted-string escaping unescapes FOUR forms
+# (\\", \\\\, \\$, \\\`) plus a backslash-newline line continuation - this block currently uses
+# ONLY \\", so a blanket blk.replace('\\"', '"') is exact TODAY. If a future edit introduces any
+# of the other forms, this harness and real bash would silently diverge (a literal backslash
+# would leak into the "python" this harness execs, or a variable would get mangled) - assert
+# BEFORE the replace that every single backslash in the raw slice is part of a \\" pair, so that
+# drift fails loudly here instead of silently testing something bash would never actually run.
+for i, ch in enumerate(blk):
+    if ch == '\\\\' and (i + 1 >= len(blk) or blk[i + 1] != '"'):
+        raise AssertionError("slice contains a bash escape form other than \\\\\\" (\\\\\\\\, \\\\$, backtick, or line-continuation) - the blanket unescape below no longer matches what bash actually produces at runtime; update it")
 blk = blk.replace('\\\\"', '"')
 d = json.loads(sys.argv[2])
 exec(blk)
@@ -7459,6 +7577,45 @@ test("ocp cmd_update's real doctor-check-surfacing block: WARN and INFO both pri
     { level: "INFO", message: "info one" },
   ]);
   assert.equal(out, "⚠ warn one\nℹ info one\n");
+});
+
+test("LOW-2 (real shell, verified mechanism): ocp's doctor-check-surfacing block survives an ASCII-only locale where the glyphs can't be printed — set -e must not kill cmd_update silently", () => {
+  // The actual bug found on review round 4: under `set -euo pipefail` (ocp:7), a non-zero exit
+  // from this python pipeline kills `cmd_update` immediately, and `2>/dev/null` hides why.
+  // Verified directly before this fix: `env -i LC_ALL=C PYTHONUTF8=0 bash` on the block raised a
+  // UnicodeEncodeError trying to print "⚠"/"ℹ" under the C locale's ASCII-only stdout encoding,
+  // exiting 1 before even reaching the kind dispatch below it — silently aborting the whole
+  // update. This PR's own INFO addition made the block fire far more often (it used to print
+  // nothing on most healthy hosts). Reproduced against the REAL, current `ocp` file (not a
+  // hand-copied snippet): extract the actual doctor-check-surfacing if-block, wrap it in a
+  // minimal harness script, and run it under the exact failing environment.
+  const src = spotReadFileSync(join(_spotDir, "ocp"), "utf8");
+  const startMarker = '  if [[ -n "$doctor_json" ]]; then';
+  const endMarker = "\n  fi";
+  const si = src.indexOf(startMarker);
+  assert.ok(si !== -1, "anchor drift: could not find the doctor-check-surfacing if-block start");
+  const ei = src.indexOf(endMarker, si);
+  assert.ok(ei !== -1 && ei > si, "anchor drift: could not find the doctor-check-surfacing if-block end");
+  const block = src.slice(si, ei + endMarker.length);
+  assert.ok(block.includes("reconfigure"), "anchor drift: extracted block is missing the errors=\"replace\" fix entirely");
+
+  const scratch = mkdtempSync(join(tmpdir(), "ocp-low2-test-"));
+  try {
+    const scriptPath = join(scratch, "repro.sh");
+    writeFileSync(scriptPath, [
+      "#!/bin/bash",
+      "set -euo pipefail",
+      `doctor_json='{"checks":[{"level":"WARN","message":"warn msg"},{"level":"INFO","message":"info msg"}]}'`,
+      block,
+      'echo "REACHED_AFTER_BLOCK"',
+      "",
+    ].join("\n"));
+    const out = execFileSync("env", ["-i", "LC_ALL=C", "PYTHONUTF8=0", "bash", scriptPath], { encoding: "utf8" });
+    assert.ok(out.includes("REACHED_AFTER_BLOCK"),
+      "cmd_update must survive past this block even when the glyphs can't be encoded in the active locale — set -e must not silently kill it");
+  } finally {
+    rmSync(scratch, { recursive: true, force: true });
+  }
 });
 
 runAsyncTests().then(() => Promise.all(pendingAsync)).then(() => {

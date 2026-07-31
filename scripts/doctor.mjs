@@ -101,9 +101,10 @@ function semverCompare(a, b) {
 // most one BATCHED `systemctl show` call per scope covering every candidate at
 // once — never one spawn per unit; the extra `-p UnitFileState -p
 // EnvironmentFiles` properties added by this revision ride the SAME batched
-// call, zero extra spawns). macOS — 2 spawns (one enumerates every candidate
-// plist in one shell command; one reads `launchctl print-disabled` to exclude
-// units an operator has persistently disabled). A missing/erroring systemctl,
+// call, zero extra spawns). macOS — 3 spawns (one enumerates every candidate
+// plist in one shell command; two read `launchctl print-disabled` — gui/<uid>
+// and system, both unprivileged, verified — to exclude units an operator has
+// persistently disabled in either domain). A missing/erroring systemctl,
 // or an unreadable listing, degrades the WHOLE check to "unknown" — which now
 // pushes a low-severity INFO line (review finding MED-3.5) rather than nothing
 // at all, so "verified clear" and "couldn't verify" are distinguishable from
@@ -161,6 +162,18 @@ const UNIT_FILE_STATE_ALLOWLIST = new Set(["enabled", "enabled-runtime"]);
 // installs specifically is not a realistic shape this check needs to chase) —
 // degrade to "unknown" for that scope rather than issuing an oversized command.
 const MAX_UNIT_CANDIDATES = 200;
+
+// Review round 4 on #230 (LOW-3): distinguishes "systemctl doesn't exist on this host at all"
+// (a container, WSL without systemd, OpenRC, ...) from "systemctl exists but this particular
+// probe failed" (permission, timeout, transient error). Verified directly: when execSync is
+// given a full command STRING (this file's convention throughout), a missing binary is resolved
+// by the shell it spawns through, which exits 127 and reports "command not found" on stderr —
+// NOT a Node-level ENOENT on the execSync call itself (that only happens if the first execFile
+// argument is itself a missing path, not applicable here). `err.status === 127` is therefore the
+// portable, verified signal, independent of locale/shell.
+function isCommandNotFound(err) {
+  return !!err && err.status === 127;
+}
 
 function extractEnabledServiceNames(listUnitFilesOutput) {
   return String(listUnitFilesOutput)
@@ -291,22 +304,18 @@ function parsePlistCandidates(plistBlob) {
   return units;
 }
 
-// Parses `launchctl print-disabled gui/<uid>` into the set of labels an
-// operator has PERSISTENTLY disabled — real format (verified against a live
-// host): a `disabled services = { "<label>" => enabled|disabled ... }` block.
-// A RunAtLoad=true plist that's been `launchctl disable`d is inert (it will
-// NOT actually start), so warning about it would be a false positive — and
-// `launchctl disable` is the persistent, standard remediation a Mac operator
-// would reach for (the exact analogue of `systemctl --user disable` on
-// Linux). Best-effort: if disabledBlob couldn't be gathered, this returns an
-// empty set (nothing filtered) — permissive, not a reason to mark the whole
-// check "unknown", since RunAtLoad=true is already a sufficient positive
-// signal on its own and this is only a refinement that trims false positives
-// further. Scoped to the `gui/<uid>` domain only (covers every LaunchAgent
-// candidate, personal or system-wide-installed); a LaunchDaemon's disabled
-// state lives in the `system` domain, which requires root to query and is out
-// of scope for a read-only, unprivileged pre-flight probe — a documented,
-// deliberate limitation, not a silent gap (see the PR body).
+// Parses ONE `launchctl print-disabled <domain>` blob into the set of labels
+// an operator has PERSISTENTLY disabled in that domain — real format
+// (verified against a live host, both domains): a `disabled services = {
+// "<label>" => enabled|disabled ... }` block. A RunAtLoad=true plist that's
+// been `launchctl disable`d is inert (it will NOT actually start), so warning
+// about it would be a false positive — and `launchctl disable` is the
+// persistent, standard remediation a Mac operator would reach for (the exact
+// analogue of `systemctl --user disable` on Linux). Best-effort: if a blob
+// couldn't be gathered, this returns an empty set (nothing filtered from
+// THAT domain) — permissive, not a reason to mark the whole check "unknown",
+// since RunAtLoad=true is already a sufficient positive signal on its own and
+// this is only a refinement that trims false positives further.
 function parseDisabledLabels(disabledBlob) {
   const disabled = new Set();
   if (!disabledBlob) return disabled;
@@ -316,6 +325,24 @@ function parseDisabledLabels(disabledBlob) {
     if (m[2] === "disabled") disabled.add(m[1]);
   }
   return disabled;
+}
+
+// Union the gui/<uid> (LaunchAgents, personal or system-wide-installed) and
+// system (LaunchDaemons) disabled-label sets. Review round 4 on #230, false
+// claim correction: an earlier revision of this file claimed the system
+// domain "requires root to query" and left it unprobed as a "documented
+// limitation" — false (verified directly on a live host: uid 501, no sudo,
+// `launchctl print-disabled system` exits 0). The consequence was
+// self-inflicted: this file's OWN WARN recommends `sudo launchctl disable
+// system/<label>` for a LaunchDaemon conflict, so an operator who followed
+// that advice was warned about the same, now-disabled unit forever. Fixed by
+// probing both domains and filtering on the union.
+function unionDisabledLabels(...blobs) {
+  const union = new Set();
+  for (const blob of blobs) {
+    for (const label of parseDisabledLabels(blob)) union.add(label);
+  }
+  return union;
 }
 
 // Two-or-more units sharing the same PORT are the hazard (see the "Grouping
@@ -343,19 +370,28 @@ function groupAndAssessConflicts(units) {
 // many candidates to probe cheaply — MAX_UNIT_CANDIDATES), `""` or a real
 // listing means "gathered successfully, here's what's there" (including
 // legitimately empty). `null` must never be read as "confirmed nothing found".
-// raw.disabledBlob (macOS only) is best-effort and does NOT participate in
-// this discipline — see parseDisabledLabels above.
+// raw.disabledBlob / raw.systemDisabledBlob (macOS only) are best-effort and
+// do NOT participate in this discipline — see unionDisabledLabels above.
 export function classifyMultiUnitRisk(raw = {}) {
   if (raw.platform === "darwin") {
     if (raw.plistBlob == null) {
       return { state: "unknown", reason: "could not enumerate LaunchAgents/LaunchDaemons" };
     }
-    const disabledLabels = parseDisabledLabels(raw.disabledBlob);
+    const disabledLabels = unionDisabledLabels(raw.disabledBlob, raw.systemDisabledBlob);
     const units = parsePlistCandidates(raw.plistBlob).filter(u => !disabledLabels.has(u.name));
     return groupAndAssessConflicts(units);
   }
 
   if (raw.userShowOut == null || raw.systemShowOut == null) {
+    // LOW-3 (review round 4 on #230): a non-systemd Linux host (container, WSL without
+    // systemd, OpenRC) previously got "unknown" — an INFO push on every single `ocp update`,
+    // forever, about a check that can never apply there. "not-applicable" is silent (like
+    // "clear") rather than a permanent, unactionable INFO line; "unknown" is reserved for a
+    // host that DOES have systemctl but this specific probe still failed (permission, timeout,
+    // a transient error) — that case is still genuinely worth surfacing.
+    if (raw.systemctlNotFound) {
+      return { state: "not-applicable", reason: "systemctl not found — this check only applies to systemd-managed Linux hosts" };
+    }
     return {
       state: "unknown",
       reason: "systemctl unavailable, errored, or returned too many candidates for one or more scopes — cannot rule out a boot race",
@@ -408,16 +444,35 @@ export function gatherUnitCandidates(run, platform) {
       disabledBlob = run(`launchctl print-disabled gui/$(id -u) 2>/dev/null`);
     } catch { disabledBlob = null; }
 
-    return { platform, plistBlob, disabledBlob };
+    // Review round 4 on #230: `launchctl print-disabled system` is ALSO an unprivileged,
+    // read-only read (verified directly: uid 501, no sudo, exit 0, 19 entries) — the module
+    // comment above parseDisabledLabels previously claimed this domain "requires root to
+    // query", which was false and had a self-inflicted consequence: this file's OWN WARN
+    // message recommends `sudo launchctl disable system/<label>` for a LaunchDaemon conflict,
+    // so an operator who followed that advice got warned about the same (now-disabled) unit
+    // forever, on every subsequent `ocp doctor`/`ocp update`. Second spawn, same best-effort/
+    // permissive degradation as the gui-domain read above.
+    let systemDisabledBlob;
+    try {
+      systemDisabledBlob = run(`launchctl print-disabled system 2>/dev/null`);
+    } catch { systemDisabledBlob = null; }
+
+    return { platform, plistBlob, disabledBlob, systemDisabledBlob };
   }
 
   let userListing, systemListing;
+  let userNotFound = false, systemNotFound = false;
   try {
     userListing = run(`systemctl --user list-unit-files --type=service --state=enabled --no-legend --no-pager`);
-  } catch { userListing = null; }
+  } catch (err) { userListing = null; userNotFound = isCommandNotFound(err); }
   try {
     systemListing = run(`systemctl list-unit-files --type=service --state=enabled --no-legend --no-pager`);
-  } catch { systemListing = null; }
+  } catch (err) { systemListing = null; systemNotFound = isCommandNotFound(err); }
+  // Only declare "systemctl isn't on this host at all" when BOTH scopes failed that specific
+  // way — the same binary backs both calls, so a genuine absence fails both identically; a
+  // single scope failing with exit 127 while the other succeeds would mean something odder is
+  // going on and deserves the honest "unknown", not a confident "doesn't apply here".
+  const systemctlNotFound = userNotFound && systemNotFound;
 
   const userNames = userListing != null ? extractEnabledServiceNames(userListing) : [];
   const systemNames = systemListing != null ? extractEnabledServiceNames(systemListing) : [];
@@ -444,7 +499,7 @@ export function gatherUnitCandidates(run, platform) {
     }
   }
 
-  return { platform, userListing, systemListing, userShowOut, systemShowOut };
+  return { platform, userListing, systemListing, userShowOut, systemShowOut, systemctlNotFound };
 }
 
 export function detectMultiUnitBootRace(opts = {}) {
@@ -630,18 +685,22 @@ export async function runDoctor(opts = {}) {
   // Gated by skipNetwork like the health/oauth block above — this reads the live
   // systemd/launchd environment (not "network" in the curl/git sense, but the same
   // "don't touch anything live" contract skipNetwork already exists to express in
-  // tests). "clear" pushes nothing (mirrors service_version_matches_tree's own "no
-  // check id at all when there's nothing warn-worthy" convention). "unknown" DOES
-  // push a low-severity INFO line (review finding MED-3.5 on #230): before this,
-  // "verified clear" and "couldn't verify" were indistinguishable from outside the
-  // process (both pushed nothing), which matters because `systemctl --user ...`
-  // fails without XDG_RUNTIME_DIR/DBUS_SESSION_BUS_ADDRESS — exactly what `sudo`'s
-  // env_reset strips — so `sudo ocp update` on a host whose OCP is a SYSTEM unit
-  // (the #215 shape) silently degraded this whole check with no visible trace.
-  // INFO does not affect fail_count/warn_count. See the module comment above
-  // classifyMultiUnitRisk for the full design rationale (why WARN not FAIL, why
-  // grouping is by port alone, why this doesn't depend on scripts/lib/restart-
-  // unit.mjs).
+  // tests). "clear" and "not-applicable" (LOW-3 on #230: systemctl genuinely doesn't
+  // exist on this host — a container, WSL without systemd, OpenRC — so the check
+  // can never apply here) both push nothing; the latter exists specifically so such
+  // a host doesn't get an unactionable INFO line on every single `ocp update`,
+  // forever. "unknown" DOES push a low-severity INFO line (review finding MED-3.5 on
+  // #230) — reserved for a host that DOES have systemctl but this specific probe
+  // still failed (permission, timeout, a transient error): before this distinction
+  // existed, "verified clear" and "couldn't verify" were indistinguishable from
+  // outside the process (both pushed nothing), which matters because
+  // `systemctl --user ...` fails without XDG_RUNTIME_DIR/DBUS_SESSION_BUS_ADDRESS —
+  // exactly what `sudo`'s env_reset strips — so `sudo ocp update` on a host whose
+  // OCP is a SYSTEM unit (the #215 shape) silently degraded this whole check with no
+  // visible trace. INFO does not affect fail_count/warn_count. See the module
+  // comment above classifyMultiUnitRisk for the full design rationale (why WARN not
+  // FAIL, why grouping is by port alone, why this doesn't depend on
+  // scripts/lib/restart-unit.mjs).
   if (!opts.skipNetwork) {
     const multiUnit = detectMultiUnitBootRace(opts);
     if (multiUnit.state === "warn") {
