@@ -166,13 +166,29 @@ function resolveRestartPlan({ opts, port, isRollback = false, fromCommit = null 
       // reach lsof and produce the SAME (status 1, empty stdout) shape as a privilege gap or a
       // genuine non-listener — rather than lean on the netstat cross-check to untangle a
       // malformed argument from those two genuine cases, refuse to probe an invalid port at all.
+      //
+      // Second-round review finding: `Number(port)` VALIDATES the value (and, per `ToNumber`,
+      // tolerates leading/trailing whitespace — `Number(" <port> ") === <port>` as a number) but
+      // the two lines below used to interpolate the RAW STRING `port`, not the validated
+      // `portNum`. A whitespace-padded `CLAUDE_PROXY_PORT` therefore passed validation yet still
+      // reached the shell as `-iTCP: <port> ` (note the embedded spaces) — a malformed lsof
+      // invocation — and the netstat suffix became `". <port> "`, which matches no real address
+      // in `netstat`'s output. Driven live: a REAL listener on the port was read as "nothing is
+      // listening", and
+      // on `--rollback` that PROCEEDED with the launchd bootout/bootstrap pair against a port a
+      // real process still held — the exact HIGH-1 failure direction, reached through a
+      // different input. `server.mjs:348` uses `parseInt`, which tolerates the same padding and
+      // binds correctly, so this misconfiguration is invisible everywhere except here. Fixed by
+      // interpolating the already-validated `portNum` (a clean integer, no padding) in BOTH the
+      // `lsof` command and — via the `port` parameter threaded through to
+      // `netstatHasListenerOnPort` — the `netstat` suffix, instead of the untouched raw string.
       const portNum = Number(port);
       if (!Number.isInteger(portNum) || portNum <= 0) {
         probe.lsofOutput = null;
       } else {
-        try { probe.lsofOutput = run(`/usr/sbin/lsof -nP -iTCP:${port} -sTCP:LISTEN`); }
+        try { probe.lsofOutput = run(`/usr/sbin/lsof -nP -iTCP:${portNum} -sTCP:LISTEN`); }
         catch (err) {
-          const mapped = mapLsofFailureToProbeValue(err, run, port);
+          const mapped = mapLsofFailureToProbeValue(err, run, portNum);
           probe.lsofOutput = mapped.lsofOutput;
           if (mapped.netstatConfirmsListener) probe.netstatConfirmsListener = true;
           if (mapped.netstatProbeFailed) probe.netstatProbeFailed = true;

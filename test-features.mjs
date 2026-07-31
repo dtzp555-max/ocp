@@ -9017,8 +9017,30 @@ console.log("\nRestart-unit resolution (issue #233 defect 1) — macOS lsof exit
 // that shipped defect 1) found that (status===1, empty stdout) is ALSO exactly what a non-root
 // `lsof` produces against a ROOT-OWNED listener, so the fix now cross-checks with `netstat`
 // (which shows LISTEN rows regardless of owning uid) before accepting "nothing is listening".
-const NETSTAT_NO_LISTENER = "Active Internet connections (including servers)\nProto Recv-Q Send-Q  Local Address          Foreign Address        (state)\ntcp4       0      0  *.22                   *.*                    LISTEN\ntcp46      0      0  *.5900                 *.*                    LISTEN";
-const NETSTAT_HAS_LISTENER_3456 = "Active Internet connections (including servers)\nProto Recv-Q Send-Q  Local Address          Foreign Address        (state)\ntcp4       0      0  *.3456                 *.*                    LISTEN";
+//
+// FOLD-IN 1 (independent re-review of PR #240, post-HIGH-1): `netstatHasListenerOnPort`'s own
+// parsing discipline — matching the port as an EXACT trailing `.<port>` segment, and requiring
+// the row's state to actually be `LISTEN` — had no fixture able to catch a regression in either
+// check, because the original fixtures never contained a row that could tell "parsed correctly"
+// apart from "parsed sloppily": no adjacent-port row shared any digits with the target port (so
+// a substring-match regression would coincidentally agree with the real suffix-match logic), and
+// no row on the target port was in a non-LISTEN state (so dropping the state filter changed
+// nothing observable). `NETSTAT_NO_LISTENER` below adds both:
+//   - `*.13456` / `*.34567` — different ports that each contain "3456" as a SUBSTRING but do NOT
+//     end in ".3456". `endsWith(".3456")` (the shipped code) correctly excludes both; `.includes
+//     ("3456")` (mutation) would incorrectly match either — verified directly against both
+//     candidates before use.
+//   - a `TIME_WAIT` row on the mocked port itself (127.0.0.1.3456) — its address suffix DOES
+//     match, but its state does not. The shipped `\bLISTEN\b` filter correctly excludes it;
+//     dropping that filter (mutation) would incorrectly count it as a live listener. A `TIME_WAIT`
+//     row here is also the realistic shape of the actual danger dropping the filter creates: a
+//     socket the just-restarted process left behind, which must NOT be read as "still listening"
+//     (that misreading is exactly what would leave a `--rollback` stuck refusing forever).
+// `NETSTAT_HAS_LISTENER_3456` adds an `::1.3456` (IPv6 loopback) row alongside the IPv4 one, so a
+// real dual-stack netstat listing is what these tests actually exercise, not a single-family
+// simplification.
+const NETSTAT_NO_LISTENER = "Active Internet connections (including servers)\nProto Recv-Q Send-Q  Local Address          Foreign Address        (state)\ntcp4       0      0  *.22                   *.*                    LISTEN\ntcp46      0      0  *.5900                 *.*                    LISTEN\ntcp4       0      0  *.13456                *.*                    LISTEN\ntcp6       0      0  *.34567                *.*                    LISTEN\ntcp4       0      0  127.0.0.1.3456         127.0.0.1.54321        TIME_WAIT";
+const NETSTAT_HAS_LISTENER_3456 = "Active Internet connections (including servers)\nProto Recv-Q Send-Q  Local Address          Foreign Address        (state)\ntcp4       0      0  *.3456                 *.*                    LISTEN\ntcp6       0      0  ::1.3456               *.*                    LISTEN";
 
 test("issue #233 defect 1: macOS lsof exit-1/empty-stdout ('nothing matched') maps to not-listening and refuses with the CORRECT message on `ocp update` (not the false 'lsof did not run') — netstat CONFIRMS no listener (HIGH-1)", async () => {
   const lsofNotListeningErr = Object.assign(new Error("Command failed: /usr/sbin/lsof -nP -iTCP:3456 -sTCP:LISTEN"), { status: 1, stdout: "", stderr: "" });
@@ -9174,6 +9196,79 @@ test("HIGH-1: netstat is invoked at its absolute path (/usr/sbin/netstat), not a
   assert.ok(caught);
   assert.ok(/nothing is currently listening/.test(caught.message),
     `expected the not-listening refusal (proving the absolute-path netstat handler matched); got: ${caught.message}`);
+});
+
+test("FOLD-IN 1 (independent re-review of PR #240): netstat parser rejects an adjacent port that merely CONTAINS the target port's digits — mutation guard for `.includes()` replacing `.endsWith('.' + port)`", async () => {
+  // "*.13456" and "*.34567" each contain "3456" as a substring without being port 3456 itself —
+  // verified directly: "*.13456".endsWith(".3456") is false, "*.13456".includes("3456") is true.
+  // Isolated from the TIME_WAIT/state-filter concern below: every row here IS in LISTEN state, so
+  // this fixture cannot be satisfied by dropping the state filter — only a substring-match
+  // regression in the address-suffix check would misread it.
+  const netstatAdjacentPortsOnly = "Active Internet connections (including servers)\nProto Recv-Q Send-Q  Local Address          Foreign Address        (state)\ntcp4       0      0  *.13456                *.*                    LISTEN\ntcp6       0      0  *.34567                *.*                    LISTEN";
+  const lsofNotListeningErr = Object.assign(new Error("Command failed"), { status: 1, stdout: "", stderr: "" });
+  const run = makeFakeRun({ "/usr/sbin/lsof -nP": lsofNotListeningErr, "/usr/sbin/netstat": netstatAdjacentPortsOnly });
+  let caught = null;
+  try {
+    await runUpgrade({
+      yes: true, dryRun: false, mockExec: true,
+      mockDoctor: { ready_to_upgrade: true, next_action: { kind: "upgrade" }, current_version: "v3.10.0", latest_version: "v3.14.0" },
+      mockPlatform: "darwin", mockPort: "3456", run,
+    });
+  } catch (e) { caught = e; }
+  assert.ok(caught, "upgrade must refuse when nothing is listening on the mocked port");
+  assert.ok(/nothing is currently listening/.test(caught.message),
+    `an adjacent port containing the same digits must not be mistaken for the mocked port; got: ${caught.message}`);
+});
+
+test("FOLD-IN 1 (independent re-review of PR #240): netstat parser rejects a non-LISTEN row (TIME_WAIT) on the exact target port — mutation guard for dropping the \\bLISTEN\\b state filter", async () => {
+  // 127.0.0.1.3456 IS an exact address-suffix match for the mocked port — but its state is
+  // TIME_WAIT, the realistic shape of a socket the just-restarted process left behind. Isolated
+  // from the substring-match concern above: this fixture has no adjacent-port row at all, so a
+  // regression in the address-suffix check specifically would not be what makes this fail — only
+  // dropping the LISTEN state filter would. This is also the actual danger dropping the filter
+  // creates: a TIME_WAIT leftover misread as "still listening" would leave a --rollback's
+  // not-listening fallback permanently unreachable, re-running into the identical state forever.
+  const netstatTimeWaitOnly = "Active Internet connections (including servers)\nProto Recv-Q Send-Q  Local Address          Foreign Address        (state)\ntcp4       0      0  127.0.0.1.3456         127.0.0.1.54321        TIME_WAIT";
+  const lsofNotListeningErr = Object.assign(new Error("Command failed"), { status: 1, stdout: "", stderr: "" });
+  const run = makeFakeRun({ "/usr/sbin/lsof -nP": lsofNotListeningErr, "/usr/sbin/netstat": netstatTimeWaitOnly });
+  const result = await runUpgrade({
+    rollback: true, yes: true, mockExec: true,
+    mockPlatform: "darwin", mockPort: "3456", run,
+    mockSnapshots: [{ name: "upgrade-snapshot-2026-05-11T08:30:00Z", path: "/tmp/snap-x" }],
+    mockSnapshotMeta: { fromCommit: "abc1234", fromVersion: "v3.10.0", toVersion: "v3.14.0", path: "/tmp/snap-x" },
+  });
+  const restartCmds = result.phases.filter(p => p.name === "restart").map(p => p.cmd);
+  assert.equal(restartCmds.length, 2, "a TIME_WAIT socket on the target port must not block the not-listening fallback from firing");
+  assert.ok(restartCmds[0].includes("launchctl bootout"));
+});
+
+test("FOLD-IN 2 (independent re-review of PR #240): a whitespace-padded CLAUDE_PROXY_PORT with a REAL listener must refuse on --rollback, not silently proceed", async () => {
+  // Number(" 3456 ") === 3456 (ToNumber tolerates leading/trailing whitespace per the spec), so
+  // port VALIDATION passes for a padded value — but the raw, still-padded string used to reach
+  // both the lsof shell command and the netstat suffix computation unmodified. Before this fix:
+  // lsof ran as `-iTCP: 3456  -sTCP:LISTEN` (malformed — shell-split, embedded spaces) and the
+  // netstat suffix became ". 3456 ", matching no real address in netstat's output — a REAL
+  // listener was read as "nothing is listening", and on --rollback that PROCEEDED with the
+  // launchctl bootout/bootstrap pair against a port a real process still held. Verified live
+  // against this host. `server.mjs:348` uses `parseInt`, which tolerates the same padding and
+  // binds correctly, so this misconfiguration was invisible everywhere except here.
+  const lsofAmbiguousErr = Object.assign(new Error("Command failed"), { status: 1, stdout: "", stderr: "" });
+  // Keyed on the STATIC prefix only — matches both the pre-fix malformed command (raw padded
+  // port interpolated) and the post-fix clean one (portNum interpolated), so this test is driven
+  // by what `port` value reaches netstatHasListenerOnPort, not by which lsof command string ran.
+  const run = makeFakeRun({ "/usr/sbin/lsof -nP -iTCP:": lsofAmbiguousErr, "/usr/sbin/netstat": NETSTAT_HAS_LISTENER_3456 });
+  let caught = null;
+  try {
+    await runUpgrade({
+      rollback: true, yes: true, mockExec: true,
+      mockPlatform: "darwin", mockPort: " 3456 ", run,
+      mockSnapshots: [{ name: "upgrade-snapshot-2026-05-11T08:30:00Z", path: "/tmp/snap-x" }],
+      mockSnapshotMeta: { fromCommit: "abc1234", fromVersion: "v3.10.0", toVersion: "v3.14.0", path: "/tmp/snap-x" },
+    });
+  } catch (e) { caught = e; }
+  assert.ok(caught, "a padded port with a live listener must refuse, not silently proceed");
+  assert.ok(!caught.phases?.some(p => p.name === "restart" && /launchctl bootout/.test(p.cmd || "")),
+    "no bootout/bootstrap command may appear in phases — the fallback must not have fired for a port that is actually live");
 });
 
 test("HIGH-1: an invalid CLAUDE_PROXY_PORT is rejected as unknown BEFORE ever probing lsof or netstat", async () => {
