@@ -75,6 +75,18 @@
  *     defect 1's contained, surgical exit-code fix. Until it lands, `resolveOwningUnit`'s darwin
  *     branch below still returns `kind: "launchd"` for ANY listener once one is confirmed to
  *     exist — it does not yet verify that listener is actually the launchd-managed process.
+ *
+ * A FOURTH independent review (HIGH-1, against PR #240 which shipped defect 1 above) found
+ * defect 1's own fix had an unhandled ambiguity: `lsof`'s (status 1, empty stdout) signature is
+ * not unique to "nothing is listening" — a non-root `lsof` probing a ROOT-OWNED listener produces
+ * the identical signature (verified live). Pre-defect-1 this mapped to `null` -> refuse
+ * (fail-closed, if wrongly-worded); post-defect-1 it mapped to `""` -> not-listening ->
+ * (`--rollback`) `allowNotListeningFallback` -> bootout the user agent while the root daemon
+ * still held the port. The failure direction inverted. Fixed by gating the `""` mapping behind a
+ * positive `netstat` cross-check (see `classifyLsofListener`'s own comment above for the full
+ * evidence and the resulting three-way split) — this function's job is just to forward the
+ * cross-check's result through to it via `probe.netstatConfirmsListener` /
+ * `probe.netstatProbeFailed`.
  */
 
 // Anything accepted as a restart target must look like a real systemd unit name.
@@ -157,12 +169,43 @@ export function classifySsListener(ssOutput) {
 // always exits 0 and just prints no LISTEN row. That means the caller's `execSync` wrapper
 // throws on a clean "not listening" result, and MUST distinguish that (exit 1, empty stdout)
 // from a genuine failure before ever reaching this function — passing `""` for the former and
-// `null` only for the latter. See scripts/upgrade.mjs's `mapLsofFailureToProbeValue`. This
-// function itself needs no such distinction internally: it already treats `""` as
-// "not-listening" and `null` as "unknown" as of PR #221 — the defect was entirely in the caller
-// never actually producing `""` on macOS.
-export function classifyLsofListener(lsofOutput) {
+// `null` only for the latter. See scripts/upgrade.mjs's `mapLsofFailureToProbeValue`.
+//
+// HIGH-1 (independent review of PR #240, filed against this same issue): that (exit 1, empty
+// stdout) signature is ALSO exactly what a non-root `lsof` produces when a ROOT-OWNED process
+// holds the port — verified live as a non-root user against two known root-owned listeners:
+// `lsof` reported (status 1, stdout "", stderr "") for BOTH, identical to the genuine no-match
+// case. Unlike `ss` (whose LISTEN row survives with an empty `users:(())` PID column for a
+// foreign-uid process — `classifySsListener`'s own "foreign uid" branch reads that straight out
+// of `ssOutput`), `lsof` gives no partial row at all when it lacks permission, so there is
+// nothing inside `lsofOutput` itself to detect this from. The caller cross-checks with
+// `netstat`, which shows LISTEN rows for ANY owning uid without privilege (same live evidence),
+// and passes the result in via `opts`:
+//   opts.netstatConfirmsListener  netstat found a LISTEN row for this port despite lsof's empty
+//                                 read — a listener exists, but lsof could not identify who owns
+//                                 it (a privilege gap is the likely cause)
+//   opts.netstatProbeFailed       the netstat cross-check itself could not run — lsof's
+//                                 exit-1/empty-stdout result is left genuinely undecidable
+// Both only matter when `lsofOutput` is `null`; a non-null (successful) `lsofOutput` needs no
+// cross-check. A root-owned OCP deployment is not hypothetical: `scripts/doctor.mjs`'s
+// multi-unit-risk check has a dedicated branch for `/Library/LaunchDaemons`, `scope:"system"`.
+// Before this fix, this exact signature reached the `""` branch below unconditionally, so
+// `--rollback` would read a live root-owned listener as "nothing is listening" and proceed to
+// bootout+bootstrap the user agent while the root daemon still held the port.
+export function classifyLsofListener(lsofOutput, opts = {}) {
   if (lsofOutput == null) {
+    if (opts.netstatConfirmsListener) {
+      return {
+        state: "unknown", pid: null,
+        reason: "a listener exists on this port (confirmed via netstat) but lsof could not identify its owner — likely a process owned by a different user (lsof only reports rows it has permission to see); re-run with elevated privileges to identify the owner",
+      };
+    }
+    if (opts.netstatProbeFailed) {
+      return {
+        state: "unknown", pid: null,
+        reason: "lsof's result (exit 1, no output) is ambiguous between \"nothing is listening\" and \"a listener exists but is owned by a different user\", and the netstat cross-check used to tell them apart also failed to run",
+      };
+    }
     return { state: "unknown", pid: null, reason: "lsof did not run (missing tool, or the probe exec itself failed)" };
   }
   const lines = String(lsofOutput).trim().split("\n").filter(Boolean).filter(l => !/^COMMAND\s/.test(l));
@@ -273,6 +316,10 @@ export function parseCgroupUnit(cgroupContent) {
  *   ssOutput       raw `ss -lptn "sport = :<port>"` stdout, or null if the
  *                   probe itself failed to run (Linux)
  *   lsofOutput     raw `lsof -nP -iTCP:<port> -sTCP:LISTEN` stdout, or null (macOS)
+ *   netstatConfirmsListener  macOS only, only meaningful when lsofOutput is null: netstat
+ *                   found a LISTEN row for this port despite lsof's empty read (HIGH-1 on
+ *                   PR #240 — see classifyLsofListener's own comment)
+ *   netstatProbeFailed       macOS only: the netstat cross-check itself could not run
  *   cgroupContent  raw `/proc/<pid>/cgroup` content for the resolved PID, or
  *                   null if unreadable (Linux)
  *
@@ -292,7 +339,10 @@ export function resolveOwningUnit(probe = {}) {
   const expectedUnit = probe.expectedUnit;
 
   if (platform === "darwin") {
-    const listener = classifyLsofListener(probe.lsofOutput);
+    const listener = classifyLsofListener(probe.lsofOutput, {
+      netstatConfirmsListener: !!probe.netstatConfirmsListener,
+      netstatProbeFailed: !!probe.netstatProbeFailed,
+    });
     if (listener.state === "unknown") {
       return { kind: "unknown", platform, pid: null, unit: null, mismatched: false, reason: listener.reason };
     }

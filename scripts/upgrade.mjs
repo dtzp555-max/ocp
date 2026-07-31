@@ -43,14 +43,67 @@ function execRun(cmd) {
 // from a "real" failure except the (status, stdout) pair checked below. A missing binary run
 // through the shell (`execSync` always shells out for a string command) surfaces as a *shell*
 // "command not found" exit — 127, not a Node-level ENOENT — so "anything other than
-// status===1-with-empty-stdout" already covers that case; this function reserves `null` for
-// exactly those "genuinely couldn't tell" outcomes, matching the null/"" split HIGH-1 (PR #221)
-// already enforces for `ss`.
-function mapLsofFailureToProbeValue(err) {
+// status===1-with-empty-stdout" already covers that case.
+//
+// HIGH-1 (independent review of PR #240, the PR that shipped the paragraph above): that
+// (status===1, empty stdout) signature is NOT unique to "genuinely not listening" — a non-root
+// `lsof` probing a ROOT-OWNED listener produces the byte-identical (status, stdout, stderr).
+// Verified live as a non-root user, three independent instruments, against known-listening ports:
+//   port    lsof(status,stdout,stderr)   netstat LISTEN rows   tcp connect
+//   <root-owned #1>   (1, "", "")        2 rows                CONNECTED  <- ambiguous
+//   <root-owned #2>   (1, "", "")        2 rows                CONNECTED  <- ambiguous
+//   <own-uid port>    (0, <data>, "")    1 row                 CONNECTED  <- unambiguous (exit 0)
+//   <genuine no-match> (1, "", "")       0 rows                ECONNREFUSED <- the only real "" case
+// stderr is empty in BOTH the genuine no-match and the privilege-gap case — an earlier proposal
+// to key off stderr emptiness does NOT distinguish them and was rejected for that reason; it only
+// would have caught a malformed-argument case (see the port validation at the call site below).
+// A root-owned OCP deployment is a supported shape, not hypothetical: scripts/doctor.mjs's
+// multi-unit-risk check has a dedicated branch for `/Library/LaunchDaemons`, `scope:"system"`.
+// Pre-defect-1 this mapped to `null` -> refuse (fail-closed, wrongly-worded, but safe).
+// Post-defect-1 (pre-this-fix) it mapped to `""` -> not-listening -> (on `--rollback`)
+// `allowNotListeningFallback` -> bootout the user launchd agent while the root daemon still held
+// the port -> EADDRINUSE -> (plist `KeepAlive => true`, verified live) a respawn loop. The
+// failure direction inverted.
+//
+// Fix: gate the `""` mapping behind a POSITIVE liveness cross-check via `netstat`, which (unlike
+// `lsof`) reports LISTEN rows regardless of the owning uid and needs no privilege — same live
+// evidence table above. Absolute path (`/usr/sbin/netstat`) for the same restricted-PATH reason
+// as `lsof` — verified live this session that a restricted PATH omits `/usr/sbin` entirely.
+function netstatHasListenerOnPort(run, port) {
+  let out;
+  try { out = run(`/usr/sbin/netstat -an -p tcp`); }
+  catch { return null; } // netstat itself failed to run — cannot confirm either way
+  const suffix = `.${port}`;
+  return String(out).split("\n").some((line) => {
+    if (!/\bLISTEN\b/.test(line)) return false;
+    // macOS `netstat -an` columns: Proto Recv-Q Send-Q Local-Address Foreign-Address (State).
+    // Local-Address is host.port ("*.<port>", "127.0.0.1.<port>", "::1.<port>") — match on the
+    // ".<port>" suffix rather than parsing the address, since the host part varies by family.
+    const cols = line.trim().split(/\s+/);
+    const localAddr = cols[3] || "";
+    return localAddr.endsWith(suffix);
+  });
+}
+
+// Maps an lsof execSync failure to a probe result. Three outcomes, matching the evidence above:
+//   status !== 1 or stdout non-empty  -> { lsofOutput: null }                    (unambiguous failure)
+//   status===1, empty stdout, netstat CONFIRMS a LISTEN row for this port
+//                                      -> { lsofOutput: null, netstatConfirmsListener: true }
+//   status===1, empty stdout, netstat shows NO LISTEN row for this port
+//                                      -> { lsofOutput: "" }                     (genuinely not-listening)
+//   status===1, empty stdout, netstat itself failed to run
+//                                      -> { lsofOutput: null, netstatProbeFailed: true } (fail closed)
+// `classifyLsofListener` (scripts/lib/restart-unit.mjs) uses the two flags to pick the right
+// human-facing reason text for the `null` cases — see its own comment for the full rationale.
+function mapLsofFailureToProbeValue(err, run, port) {
   const status = err && typeof err.status === "number" ? err.status : null;
   const stdout = err && err.stdout != null ? String(err.stdout) : "";
-  if (status === 1 && stdout.trim() === "") return "";
-  return null;
+  if (status !== 1 || stdout.trim() !== "") return { lsofOutput: null };
+
+  const listening = netstatHasListenerOnPort(run, port);
+  if (listening === true) return { lsofOutput: null, netstatConfirmsListener: true };
+  if (listening === false) return { lsofOutput: "" };
+  return { lsofOutput: null, netstatProbeFailed: true };
 }
 
 // Resolve which unit actually owns the OCP port and build a restart plan for it, instead
@@ -106,8 +159,25 @@ function resolveRestartPlan({ opts, port, isRollback = false, fromCommit = null 
       // ("unknown"), and aborts an otherwise-healthy restart. /usr/sbin/lsof is a base-system
       // binary present on every macOS install (see mapLsofFailureToProbeValue's comment for the
       // exit-code distinction this catch now makes).
-      try { probe.lsofOutput = run(`/usr/sbin/lsof -nP -iTCP:${port} -sTCP:LISTEN`); }
-      catch (err) { probe.lsofOutput = mapLsofFailureToProbeValue(err); }
+      //
+      // Port validation (HIGH-1 follow-up, independent review of PR #240): `port` comes straight
+      // from CLAUDE_PROXY_PORT (env, unvalidated — see the two call sites below) and is
+      // interpolated directly into the `-iTCP:` flag. A non-numeric or non-positive value would
+      // reach lsof and produce the SAME (status 1, empty stdout) shape as a privilege gap or a
+      // genuine non-listener — rather than lean on the netstat cross-check to untangle a
+      // malformed argument from those two genuine cases, refuse to probe an invalid port at all.
+      const portNum = Number(port);
+      if (!Number.isInteger(portNum) || portNum <= 0) {
+        probe.lsofOutput = null;
+      } else {
+        try { probe.lsofOutput = run(`/usr/sbin/lsof -nP -iTCP:${port} -sTCP:LISTEN`); }
+        catch (err) {
+          const mapped = mapLsofFailureToProbeValue(err, run, port);
+          probe.lsofOutput = mapped.lsofOutput;
+          if (mapped.netstatConfirmsListener) probe.netstatConfirmsListener = true;
+          if (mapped.netstatProbeFailed) probe.netstatProbeFailed = true;
+        }
+      }
     } else {
       try { probe.ssOutput = run(`ss -lptn "sport = :${port}"`); } catch { probe.ssOutput = null; }
       const listener = classifySsListener(probe.ssOutput);
@@ -328,7 +398,10 @@ async function runFullUpgrade({ doctor, opts }) {
     }
   };
   const ocpDir = opts.ocpDir || join(homedir(), "ocp");
-  const port = process.env.CLAUDE_PROXY_PORT || String(DEFAULT_PORT);
+  // opts.mockPort (test hook, mirrors opts.mockPlatform): lets tests drive resolveRestartPlan's
+  // port validation (HIGH-1 follow-up below) with a deliberately malformed value without
+  // mutating the real process.env — a global that would otherwise leak across tests.
+  const port = opts.mockPort || process.env.CLAUDE_PROXY_PORT || String(DEFAULT_PORT);
 
   try {
     // phase 1: pre-flight (doctor already passed; just record)
@@ -541,7 +614,7 @@ async function runRollback(opts) {
     await new Promise(r => setTimeout(r, 3000));
   }
   const rollbackPlatform = opts.mockPlatform || process.platform;
-  const rollbackPort = process.env.CLAUDE_PROXY_PORT || String(DEFAULT_PORT);
+  const rollbackPort = opts.mockPort || process.env.CLAUDE_PROXY_PORT || String(DEFAULT_PORT);
   let restartPlan;
   try {
     restartPlan = resolveRestartPlan({ opts, port: rollbackPort, isRollback: true, fromCommit: meta.fromCommit });

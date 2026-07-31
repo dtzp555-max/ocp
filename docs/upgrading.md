@@ -86,13 +86,27 @@ found the docs previously overclaimed macOS parity):
   walk of `/proc/<pid>/cgroup` identifies the actual systemd unit (system vs.
   user scope), flags a mismatch against the hard-coded default, and refuses
   outright if the PID belongs to no unit at all (`no-unit`).
-- **macOS**: currently only listening/not-listening detection via `lsof`.
-  There is **no macOS analogue of `no-unit` yet** — if something is listening
-  on the port, the launchd bootout/bootstrap pair is treated as safe to run
-  without verifying that the `dev.ocp.proxy` launchd job is actually the
-  process holding it. Tracked as a follow-up (issue #239, design included);
-  until it lands, a bare `node server.mjs` holding the port on macOS is not
-  detected before restarting the way it is on Linux.
+- **macOS**: currently only listening/not-listening detection via `lsof`,
+  cross-checked against `netstat` when `lsof`'s result is ambiguous (see
+  below). There is **no macOS analogue of `no-unit` yet** — if something is
+  confirmed listening on the port, the launchd bootout/bootstrap pair is
+  treated as safe to run without verifying that the `dev.ocp.proxy` launchd
+  job is actually the process holding it. Tracked as a follow-up (issue
+  #239, design included); until it lands, a bare `node server.mjs` holding
+  the port on macOS is not detected before restarting the way it is on
+  Linux.
+
+  **The `lsof`/`netstat` cross-check** (issue #233 HIGH-1): a non-root
+  `lsof` probing a port held by a ROOT-OWNED process reports the exact same
+  result as a genuinely empty port — both look like "nothing matched" to
+  `lsof` itself. Before restarting anything, the resolution cross-checks
+  with `netstat` (which shows listeners regardless of owning user and needs
+  no privilege) to tell those two cases apart: a confirmed-empty port
+  proceeds as not-listening; a port `netstat` shows as occupied, but whose
+  owner `lsof` couldn't identify, refuses with `could not determine ...`
+  rather than being silently read as free. A root-owned OCP deployment is a
+  supported shape (see `scripts/doctor.mjs`'s multi-unit-risk check for
+  `/Library/LaunchDaemons`), so this is not a hypothetical edge case.
 
 If it can't tell what owns the port, or what it can tell makes restarting
 unsafe, **it refuses rather than guesses**:
@@ -104,7 +118,7 @@ on both paths.
 
 | Message contains | Meaning | What to do |
 |---|---|---|
-| `could not determine what ... owns the OCP port` | The listener's owning PID isn't attributable (e.g. `ocp update` run by a different user than a `User=`-less system unit), a tool is missing, or multiple PIDs answer the same port — across separate rows (dual-stack) or within one row (`SO_REUSEPORT`). | Re-run with elevated privileges, or check `ss -lptn` / `lsof -iTCP` / `cat /proc/<pid>/cgroup` manually. |
+| `could not determine what ... owns the OCP port` | The listener's owning PID isn't attributable — on Linux, `ocp update` run by a different user than a `User=`-less system unit; on macOS, `netstat` confirms a listener on the port but `lsof` couldn't identify its owner (issue #233 HIGH-1 — the same root-owned-listener shape, cross-platform) — a tool is missing, or multiple PIDs answer the same port (Linux: across separate rows/dual-stack or within one row/`SO_REUSEPORT`). | Re-run with elevated privileges, or check `ss -lptn` / `lsof -iTCP` / `netstat -an` / `cat /proc/<pid>/cgroup` manually. |
 | `not managed by any systemd unit` | **Linux only.** A PID holds the port but isn't in any systemd cgroup (a bare `node server.mjs`). macOS has no equivalent check yet — see "Coverage differs by platform" above (issue #239) — so a bare, unmanaged process holding the port is not currently detected before restarting on macOS the way it is on Linux. | Stop that PID manually, or bring it under systemd, then re-run. |
 | `nothing is currently listening` | Nothing is bound to the port at all. On `ocp update`, deliberately **not** auto-started: if the real production unit is a SYSTEM unit that happens to be down, silently starting the default (often loopback-only) unit would pass post-flight — which only checks `127.0.0.1` — while the host loses LAN reachability. **On `--rollback`, this is NOT a refusal** — restoring a down service is the point of a rollback, there's no post-flight check to protect, and refusing would leave the rollback stuck forever on a re-run. Rollback proceeds to start the default unit (the one its own snapshot restores) with a loud `[restart] WARNING` instead. This case is now correctly reachable on **both** platforms (issue #233 defect 1 fixed a macOS `lsof` exit-code bug that had previously collapsed this into the `could not determine ...` refusal above instead, making the rollback fallback unreachable there). | On `ocp update`: start the intended unit manually, confirm it's the one you expect, then re-run. On `--rollback`: nothing to do — it already proceeded; check the warning names the right unit. |
 | `requires "sudo systemctl restart -- <unit>"` | The port is owned by a SYSTEM unit and non-interactive sudo isn't authorized for that specific command. | Run the printed `sudo systemctl restart -- <unit>` manually, or grant it explicitly (e.g. `deploy ALL=(root) NOPASSWD: /bin/systemctl restart -- <unit>`), then re-run. |
