@@ -8757,15 +8757,41 @@ test("ocp bash harness: '# ── dispatch' anchor slice is well-formed (premise
     "the dispatch case statement was expected AFTER the anchor and is missing — anchor drift");
 });
 
-// Runs `cmd_update <args>` against a from-scratch sandbox built fresh per call (own $HOME, own
+// Runs `cmd_update <args>` (or, with overrideCmdRestart:false, any other subcommand — see
+// issue #224 tests below) against a from-scratch sandbox built fresh per call (own $HOME, own
 // $PATH, own scratch `script_dir` — never the real repo, never the calling shell's $PATH/$HOME).
 // `script_dir` doubles as the directory holding the generated driver script itself: `ocp`'s
 // functions resolve `script_dir` from `${BASH_SOURCE[0]}`, which — for a directly-executed
 // script (not `source`d) — is the file the running code was READ from, i.e. the driver file
 // this harness writes. package.json therefore lives next to driver.sh, not in a subdirectory.
+//
+// Issue #224 additions (all default to the pre-#224 behavior so every existing call site above
+// is unaffected):
+//   overrideCmdRestart   default true (unchanged): cmd_restart is replaced by the
+//                        FAKE-CMD-RESTART-CALLED stub, as before. Set false to let the REAL,
+//                        sliced cmd_restart run — the only way to exercise this issue's fix.
+//   resolveRestartExit/Stdout/Stderr   controls the fake `node`'s new
+//                        `scripts/upgrade.mjs --resolve-restart` case (Stdout/Stderr are arrays
+//                        of lines; Stdout lines are what the REAL mode prints on success — the
+//                        resolved restart command(s), one per `console.log` call).
+//   serviceStubsSucceed  default false (unchanged posture: launchctl/systemctl/pkill/nohup/
+//                        openclaw log-and-loudly-refuse, exit 95, per AGENTS.md "unreachable by
+//                        construction"). Set true only to observe a resolved restart command
+//                        actually being invoked (it still never reaches a real service — this
+//                        is still the from-scratch scratch $PATH).
+//   curlHealthExit       controls the new `curl` stub's exit for a "*/health*" URL (default 1,
+//                        i.e. "not responding" — deterministic and avoids needing to fabricate
+//                        a `/usage`-shaped JSON body for cmd_usage's own picky parser, which is
+//                        unrelated to this issue). Any curl call NOT matching "*/health*" (e.g.
+//                        cmd_usage's own `/usage` call, reached only on a successful health
+//                        check) refuses loudly (exit 94) rather than silently doing something
+//                        undefined — none of this issue's tests reach that far on purpose.
 function _bwHarnessRun({
   args = [], kind = "noop", checks = [], pythonAbsent = false,
   gitPullExit = 0, gitPullOutput = "Already up to date.", postFlightExit = 0,
+  overrideCmdRestart = true,
+  resolveRestartExit = 0, resolveRestartStdout = [], resolveRestartStderr = [],
+  serviceStubsSucceed = false, curlHealthExit = 1,
 } = {}) {
   const root = _ltMkdtemp(join(_ltTmp(), "ocp-bash-harness-"));
   try {
@@ -8803,6 +8829,16 @@ function _bwHarnessRun({
       `  *"scripts/upgrade.mjs --post-flight-only"*)`,
       `    exit ${postFlightExit}`,
       `    ;;`,
+      // Issue #224: the new one-shot resolver mode `cmd_restart` shells out to instead of
+      // reimplementing cgroup/ss parsing a second time in bash — see scripts/upgrade.mjs's
+      // `--resolve-restart` CLI entrypoint. Real behavior mirrored exactly: resolved command(s)
+      // on stdout (one per line) + exit 0 on success, refusal text on stderr + nonzero exit on
+      // failure — never both, never neither.
+      `  *"scripts/upgrade.mjs --resolve-restart"*)`,
+      ...resolveRestartStderr.map((l) => `    echo ${JSON.stringify(l)} >&2`),
+      ...resolveRestartStdout.map((l) => `    echo ${JSON.stringify(l)}`),
+      `    exit ${resolveRestartExit}`,
+      `    ;;`,
       `  *)`,
       `    echo "FAKE-NODE: refusing unhandled invocation (would run a REAL doctor.mjs/` +
         `upgrade.mjs path -- see #225 exec hazard): $*" >&2`,
@@ -8826,17 +8862,52 @@ function _bwHarnessRun({
     ].join("\n"));
 
     // Defense in depth (AGENTS.md: "any command that can mutate a running service ... should
-    // be a stub that fails loudly by default") — unreachable from the tests below (which all
-    // override `cmd_restart` wholesale, see the driver below), but must never silently succeed
-    // if a future test forgets to.
+    // be a stub that fails loudly by default") — unreachable from the pre-#224 tests below
+    // (which all override `cmd_restart` wholesale, see the driver below), but must never
+    // silently succeed if a future test forgets to. Issue #224's own tests need to observe a
+    // resolved restart command actually being run (still only ever against this harness's own
+    // fake binaries — serviceStubsSucceed never reaches a real service either), so they opt in
+    // via serviceStubsSucceed; every other call site keeps the strict refuse-and-log default.
     for (const name of ["launchctl", "systemctl", "pkill", "nohup", "openclaw"]) {
-      mkStub(name, [
+      mkStub(name, serviceStubsSucceed ? [
+        `echo "FAKE-${name.toUpperCase()}-CALL $*" >> "${logPath}"`,
+        `exit 0`,
+      ].join("\n") : [
         `echo "FAKE-${name.toUpperCase()}-CALL $*" >> "${logPath}"`,
         `echo "FAKE-${name.toUpperCase()}: refusing -- this harness must never reach a real ` +
           `service-mutating command (AGENTS.md 'unreachable by construction')" >&2`,
         `exit 95`,
       ].join("\n"));
     }
+
+    // Issue #224: `sleep` is a no-op stub purely for test speed (the real `cmd_restart` calls
+    // `sleep 3` after a successful restart command, before its own health check) — never a
+    // hazard, so always stubbed regardless of overrideCmdRestart (the pre-#224 tests never
+    // reach the real cmd_restart body at all, so this has no effect on them).
+    mkStub("sleep", [
+      `echo "FAKE-SLEEP-CALL $*" >> "${logPath}"`,
+      `exit 0`,
+    ].join("\n"));
+
+    // Issue #224: `curl` is real (unstubbed) on every pre-#224 call site above — none of them
+    // reach it, since they all override `cmd_restart` wholesale. The real `cmd_restart` DOES
+    // call curl (health check, and — on the success path — `cmd_usage`'s own `/usage` call), so
+    // it needs a deterministic stub the moment overrideCmdRestart:false is used. Only "*/health*"
+    // is recognized (controlled by curlHealthExit); anything else refuses loudly (exit 94)
+    // rather than silently doing something undefined — this issue's own tests never need
+    // cmd_usage's `/usage` call to succeed, so it's deliberately left unhandled here.
+    mkStub("curl", [
+      `echo "FAKE-CURL-CALL $*" >> "${logPath}"`,
+      `case "$*" in`,
+      `  *"/health"*)`,
+      `    exit ${curlHealthExit}`,
+      `    ;;`,
+      `  *)`,
+      `    echo "FAKE-CURL: refusing unhandled invocation: $*" >&2`,
+      `    exit 94`,
+      `    ;;`,
+      `esac`,
+    ].join("\n"));
 
     // Simulates issue #236's exact repro ("stubbed absent": a real executable file that always
     // reports command-not-found's own exit code) rather than trying to strip PATH of every
@@ -8865,15 +8936,24 @@ function _bwHarnessRun({
     // because that design skipped the exact wiring layer #225 asks this harness to cover.
     // Fixed by appending the REAL, unmodified dispatch section after the override and driving
     // it via its own argv, so the outer dispatch runs for real too.
+    //
+    // Issue #224: overrideCmdRestart:false skips this stub entirely, so the REAL cmd_restart
+    // from the sliced source (_bwFnSrc, above) is what the dispatch below actually calls — the
+    // only way to exercise this issue's fix. Still safe by construction: nothing here changes
+    // the ordering guarantee (no override is defined at all, so there's nothing to shadow), and
+    // every command the real cmd_restart can reach (node/systemctl/launchctl/pkill/nohup/sleep/
+    // curl) is one of this harness's own scratch-$PATH stubs, never a real binary.
     const driver = [
       _bwFnSrc,
       "",
-      `cmd_restart() {`,
-      `  echo "FAKE-CMD-RESTART-CALLED $*" >> "${logPath}"`,
-      `  echo "Restarting proxy..."`,
-      `  echo "✓ Proxy restarted successfully."`,
-      `  return 0`,
-      `}`,
+      overrideCmdRestart ? [
+        `cmd_restart() {`,
+        `  echo "FAKE-CMD-RESTART-CALLED $*" >> "${logPath}"`,
+        `  echo "Restarting proxy..."`,
+        `  echo "✓ Proxy restarted successfully."`,
+        `  return 0`,
+        `}`,
+      ].join("\n") : "# issue #224: overrideCmdRestart=false -- the REAL cmd_restart above is used as-is",
       "",
       `PROXY="http://127.0.0.1:1"`,
       "",
@@ -9324,6 +9404,134 @@ test("issue #233 defect 1: lsof is invoked at its absolute path (/usr/sbin/lsof)
   const restartCmds = result.phases.filter(p => p.name === "restart").map(p => p.cmd);
   assert.equal(restartCmds.length, 2);
   assert.ok(restartCmds[0].includes("launchctl bootout"));
+});
+
+// ── #224: cmd_restart itself still hard-coded a restart target, zero unit resolution ─────────
+// Everything above overrides cmd_restart wholesale (a necessary safety default — see
+// serviceStubsSucceed's own comment), so none of it exercises the REAL cmd_restart body. These
+// three tests set overrideCmdRestart:false specifically to reach it: cmd_restart must now
+// resolve its target by shelling out to `scripts/upgrade.mjs --resolve-restart` (the same
+// resolver PR #221 already wired into scripts/upgrade.mjs's own restart phases — see
+// scripts/lib/restart-unit.mjs), never falling back to a hard-coded guess, and must return a
+// real, non-zero exit code on refusal instead of always reporting success (issue #224's own
+// complaint: "cmd_restart currently has no failure exit code at all").
+console.log("\ncmd_restart resolver wiring (#224):");
+
+test("#224: cmd_restart refuses when the resolver can't determine the restart target -- no hard-coded fallback, real exit code", () => {
+  const r = _bwHarnessRun({
+    args: ["restart"],
+    overrideCmdRestart: false,
+    resolveRestartExit: 1,
+    resolveRestartStderr: ["restart aborted: MOCK-RESOLVER-REFUSAL-MARKER"],
+    // Mixed signal, deliberately: the mock ALSO leaks a would-be command on stdout even though
+    // it exits non-zero (a real `--resolve-restart` never does both, but a bug that checks the
+    // wrong thing — e.g. "did stdout have content" instead of "did the exit code say ok" — would
+    // still eval this if only the exit code were dropped). Proves the guard keys off the exit
+    // status, not stdout emptiness: this string must NEVER reach a real command.
+    resolveRestartStdout: ["systemctl restart -- SHOULD-NEVER-RUN.service"],
+  });
+  assert.notEqual(r.status, 0,
+    `cmd_restart must exit non-zero on a resolver refusal (the "no failure exit code at all" ` +
+    `bug); status=${r.status} stdout=${JSON.stringify(r.stdout)} stderr=${JSON.stringify(r.stderr)}`);
+  assert.ok((r.stdout + r.stderr).includes("MOCK-RESOLVER-REFUSAL-MARKER"),
+    `the resolver's refusal message must reach the operator, not be swallowed; ` +
+    `stdout=${JSON.stringify(r.stdout)} stderr=${JSON.stringify(r.stderr)}`);
+  assert.ok(!_bwCalled(r.log, "FAKE-SYSTEMCTL-CALL restart -- SHOULD-NEVER-RUN.service"),
+    `a leaked stdout command must NEVER run once the resolver signaled failure via its exit ` +
+    `code; log=${JSON.stringify(r.log)}`);
+  for (const name of ["SYSTEMCTL", "LAUNCHCTL", "PKILL", "NOHUP"]) {
+    assert.ok(!_bwCalled(r.log, `FAKE-${name}-CALL`),
+      `${name} must NEVER be invoked after a resolver refusal -- that would repeat issue #215's ` +
+      `hard-coded guess; log=${JSON.stringify(r.log)}`);
+  }
+});
+
+test("#224: cmd_restart runs the resolver's actual resolved command, not the old hard-coded guess", () => {
+  const r = _bwHarnessRun({
+    args: ["restart"],
+    overrideCmdRestart: false,
+    resolveRestartExit: 0,
+    resolveRestartStdout: ["systemctl restart -- ocp.service"],
+    serviceStubsSucceed: true,
+    curlHealthExit: 1, // deterministic health-check failure; this test is only about which restart command ran
+  });
+  assert.ok(_bwCalled(r.log, "FAKE-SYSTEMCTL-CALL restart -- ocp.service"),
+    `must run the resolver's resolved command verbatim; log=${JSON.stringify(r.log)}`);
+  assert.ok(!r.log.some((l) => l.startsWith("FAKE-SYSTEMCTL-CALL") && l.includes("--user restart ocp-proxy")),
+    `must NOT fall back to the old hard-coded "systemctl --user restart ocp-proxy"; log=${JSON.stringify(r.log)}`);
+  assert.ok(r.stdout.includes("systemctl restart -- ocp.service"),
+    `the resolved command must be visible to the operator, not suppressed; stdout=${JSON.stringify(r.stdout)}`);
+  assert.notEqual(r.status, 0,
+    `the health check was made to fail on purpose; cmd_restart must still report a real, ` +
+    `non-zero exit code (not the old implicit success); status=${r.status}`);
+});
+
+test("#224: _cmd_update_light no longer swallows cmd_restart's refusal (operator sees why it failed, and the exit code is non-zero)", () => {
+  const r = _bwHarnessRun({
+    kind: "update",
+    args: ["update"],
+    overrideCmdRestart: false,
+    resolveRestartExit: 1,
+    resolveRestartStderr: ["restart aborted: MOCK-RESOLVER-REFUSAL-MARKER-LIGHT"],
+    resolveRestartStdout: ["systemctl restart -- SHOULD-NEVER-RUN.service"],
+  });
+  assert.ok(r.stdout.includes("Updating OCP (light path)"),
+    `sanity check that we actually reached _cmd_update_light; stdout=${JSON.stringify(r.stdout)}`);
+  assert.notEqual(r.status, 0,
+    `ocp update (light path) must exit non-zero when the restart phase refuses; status=${r.status}`);
+  assert.ok(!_bwCalled(r.log, "FAKE-SYSTEMCTL-CALL restart -- SHOULD-NEVER-RUN.service"),
+    `a leaked stdout command must NEVER run once the resolver signaled failure via its exit ` +
+    `code; log=${JSON.stringify(r.log)}`);
+  assert.ok((r.stdout + r.stderr).includes("MOCK-RESOLVER-REFUSAL-MARKER-LIGHT"),
+    `_cmd_update_light must surface cmd_restart's refusal message instead of discarding it via ` +
+    `its old "> /dev/null 2>&1"; stdout=${JSON.stringify(r.stdout)} stderr=${JSON.stringify(r.stderr)}`);
+});
+
+// The three tests above drive `--resolve-restart` entirely through the bash harness's FAKE
+// `node` stub (by design — see the harness's own "exec hazard" comment: a real fake-node file
+// on the scratch $PATH is what makes ocp's `exec node ...` arms unreachable BY CONSTRUCTION).
+// That means none of them exercise the actual NEW code this issue adds inside
+// scripts/upgrade.mjs's own CLI entrypoint (the `--resolve-restart` argv branch) — the same
+// class of gap PR #243 named explicitly (its "N6" scope note) and deferred to #241 for
+// `--post-flight-only`. Unlike that flag, this one needs no live server and no polling loop —
+// resolveRestartPlan's real gathering layer (ss/lsof, both read-only) against a port nothing is
+// listening on is a safe, deterministic, real end-to-end exercise of the new CLI code as an
+// actual child process. `ltFreePort()` (not a literal port number) guarantees a genuinely free
+// port, so the real resolver refuses rather than resolving a command — true on every platform
+// this suite runs on, and nowhere near the real, separately-running production instance.
+//
+// Deliberately NOT pinned to a specific refusal message ("not listening" vs. "could not
+// determine..."): a genuinely free port's EXACT classification is platform/lsof-behavior
+// dependent (macOS's `lsof -iTCP:<port> -sTCP:LISTEN` exits 1 — not 0 — on a clean no-match,
+// which an unrelated, already in-review fix, PR #240, is what correctly maps to "not listening"
+// instead of "unknown"; without it this same free port reads as "could not determine"). Either
+// way is a REFUSAL, which is all this test is about: does the new `--resolve-restart` CLI
+// branch correctly turn a thrown Error into stderr+exit-1 rather than a silent success. The
+// specific listening/not-listening/unknown classification is covered exhaustively elsewhere
+// (the "Restart-unit resolution" section above) and is explicitly out of scope for #224 either
+// way.
+test("#224: scripts/upgrade.mjs --resolve-restart (real subprocess, not mocked) refuses on a genuinely free port", async () => {
+  const freePort = await ltFreePort();
+  const upgradeMjsPath = spotJoin(_spotDir, "scripts", "upgrade.mjs");
+  let stdout = "", stderr = "", status = 0;
+  try {
+    stdout = execFileSync(process.execPath, [upgradeMjsPath, "--resolve-restart"], {
+      env: { ...process.env, CLAUDE_PROXY_PORT: String(freePort) },
+      encoding: "utf8",
+    });
+  } catch (e) {
+    stdout = e.stdout ?? "";
+    stderr = e.stderr ?? "";
+    status = typeof e.status === "number" ? e.status : 1;
+  }
+  assert.notEqual(status, 0,
+    `a genuinely free port must refuse (nothing listening), not exit 0; ` +
+    `stdout=${JSON.stringify(stdout)} stderr=${JSON.stringify(stderr)}`);
+  assert.equal(stdout.trim(), "",
+    `on refusal, stdout must carry NO resolved restart command at all; stdout=${JSON.stringify(stdout)}`);
+  assert.ok(/^✗ restart aborted:/.test(stderr),
+    `expected planRestart's refusal shape on stderr (message text itself is platform-dependent ` +
+    `-- see comment above); stderr=${JSON.stringify(stderr)}`);
 });
 
 runAsyncTests().then(() => Promise.all(pendingAsync)).then(() => {

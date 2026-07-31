@@ -580,19 +580,12 @@ so an env change you made (e.g. CLAUDE_BIND, CLAUDE_CODE_OAUTH_TOKEN) actually
 takes effect. `kickstart -k` only re-execs the process and reuses launchd's
 cached env, so env edits would be silently ignored. (Linux systemctl already
 re-reads its EnvironmentFile on restart.)
-EOF
-}
 
-# macOS only: reload a launchd agent via bootout + bootstrap so plist
-# EnvironmentVariables are re-read (kickstart -k would reuse the cached env).
-# Args: <uid> <label> <plist-path>. Returns 0 iff bootstrap succeeds.
-_launchd_reload() {
-  local uid="$1" label="$2" plist="$3"
-  [[ -f "$plist" ]] || return 1
-  # bootout may legitimately fail if the agent is not currently loaded — that's fine,
-  # we only require the subsequent bootstrap to succeed (the load that re-reads env).
-  launchctl bootout "gui/$uid/$label" 2>/dev/null || true
-  launchctl bootstrap "gui/$uid" "$plist" 2>/dev/null
+The restart target (which systemd unit / launchd job actually owns the OCP
+port) is resolved automatically before anything is restarted — see issue
+#215 / #224 and scripts/lib/restart-unit.mjs. If it can't be determined
+safely, this refuses loudly instead of guessing.
+EOF
 }
 
 cmd_restart() {
@@ -601,40 +594,60 @@ cmd_restart() {
     openclaw gateway restart 2>&1
   else
     echo "Restarting proxy..."
-    # Try current service name, then legacy, then manual restart.
-    # macOS: bootout+bootstrap (re-reads plist EnvironmentVariables — see cmd_restart_help).
-    # Linux: systemctl --user restart already re-reads its EnvironmentFile.
-    local uid
-    uid=$(id -u)
-    if _launchd_reload "$uid" "dev.ocp.proxy" "$HOME/Library/LaunchAgents/dev.ocp.proxy.plist"; then
-      true
-    elif _launchd_reload "$uid" "ai.openclaw.proxy" "$HOME/Library/LaunchAgents/ai.openclaw.proxy.plist"; then
-      true
-    elif systemctl --user restart ocp-proxy 2>/dev/null; then
-      true
-    elif systemctl --user restart openclaw-proxy 2>/dev/null; then
-      true
-    else
-      echo "Service restart failed, trying kill + restart..."
-      pkill -f "server.mjs.*CLAUDE_PROXY" 2>/dev/null || pkill -f "claude-proxy/server.mjs" 2>/dev/null || true
-      sleep 1
-      local self_r script_dir
-      self_r="${BASH_SOURCE[0]}"
-      while [[ -L "$self_r" ]]; do self_r="$(readlink "$self_r")"; done
-      script_dir="$(cd "$(dirname "$self_r")" && pwd)"
-      # env -u strips test-only key-store redirection vars (A4): if the invoking shell had
-      # NODE_ENV=test + OCP_DIR_OVERRIDE exported (e.g. from a debugging session), this manual
-      # fallback would otherwise inherit them and start the daemon against a scratch/empty key
-      # store — a silent auth outage in AUTH_MODE=multi. The plist/systemd paths strip these via
-      # plist-merge's NEVER_PRESERVE; this covers the one direct-launch path OCP controls.
-      DISABLE_AUTOUPDATER=1 env -u NODE_ENV -u OCP_DIR_OVERRIDE nohup node "$script_dir/server.mjs" >> "$HOME/.ocp/logs/proxy.log" 2>&1 &
+    local self_r script_dir
+    self_r="${BASH_SOURCE[0]}"
+    while [[ -L "$self_r" ]]; do self_r="$(readlink "$self_r")"; done
+    script_dir="$(cd "$(dirname "$self_r")" && pwd)"
+
+    # Issue #224: this used to hard-code a restart cascade (dev.ocp.proxy plist -> legacy
+    # ai.openclaw.proxy plist -> `systemctl --user restart ocp-proxy` -> legacy
+    # `openclaw-proxy` -> a manual pkill+nohup fallback that didn't even keep the process
+    # under a service manager afterward) with ZERO verification of which unit actually owned
+    # the port — the exact defect class issue #215 reported and PR #221 already fixed for
+    # scripts/upgrade.mjs's own restart phases, but NOT for this bash path (both `ocp update`
+    # kinds delegate here — see #224's own analysis of _cmd_update_light/_cmd_update_restart).
+    # Rather than reimplementing cgroup/ss parsing a second time in bash, shell out to the SAME
+    # resolver PR #221 already wired into scripts/upgrade.mjs
+    # (scripts/lib/restart-unit.mjs's resolveOwningUnit()/planRestart(), via
+    # resolveRestartPlan()) through a one-shot CLI mode: `--resolve-restart` prints the
+    # resolved restart command(s) to stdout (one per line) and exits 0, or prints the
+    # actionable refusal to stderr and exits non-zero. No fallback to a guess, and no more
+    # unmanaged nohup process left behind on refusal.
+    #
+    # `|| resolve_status=$?` (not a bare assignment) is load-bearing under `set -euo pipefail`
+    # (ocp:7): a bare `var=$(cmd)` where cmd exits non-zero trips `set -e` immediately, which
+    # would abort THIS function (and everything that called it) before the refusal handling
+    # below ever runs — see the identical pattern and rationale on `doctor_json=... || true`
+    # in cmd_update. stderr is deliberately NOT captured here (no `2>&1`/`2>/dev/null`): it
+    # flows straight through to the caller in real time, so the refusal message reaches the
+    # operator even though only stdout (the resolved commands) is captured into a variable.
+    local resolve_out resolve_status=0
+    resolve_out=$(node "$script_dir/scripts/upgrade.mjs" --resolve-restart) || resolve_status=$?
+
+    if [[ $resolve_status -ne 0 ]]; then
+      echo "✗ Restart aborted (see error above)."
+      return 1
     fi
+
+    local restart_failed=0 cmd_line
+    while IFS= read -r cmd_line; do
+      [[ -z "$cmd_line" ]] && continue
+      echo "  $cmd_line"
+      eval "$cmd_line" || restart_failed=1
+    done <<< "$resolve_out"
+
+    if [[ $restart_failed -ne 0 ]]; then
+      echo "✗ Restart command failed."
+      return 1
+    fi
+
     sleep 3
     if curl -sf --max-time 5 "$PROXY/health" > /dev/null 2>&1; then
       echo "✓ Proxy restarted successfully."
       cmd_usage
     else
       echo "✗ Proxy not responding after restart."
+      return 1
     fi
   fi
 }
@@ -924,7 +937,15 @@ _cmd_update_light() {
   fi
 
   echo "  Restarting proxy..."
-  cmd_restart > /dev/null 2>&1
+  # Issue #224: this used to be `cmd_restart > /dev/null 2>&1`, discarding ALL of cmd_restart's
+  # output — including its own refusal/failure messages, which are exactly what #224 asks to
+  # make loud rather than invisible on the single most common update path. cmd_restart's own
+  # `exit`-on-failure hazard inside cmd_usage's success path (calling `exit`, not `return`, if
+  # its own `/usage` probe fails) is pre-existing and unrelated to this change — `_cmd_update_
+  # restart` already works around that specific hazard with a `( cmd_restart ) || true` subshell
+  # (see below); direct `ocp restart` has never been wrapped that way either, so this matches
+  # existing, established behavior rather than introducing a new one.
+  cmd_restart
 }
 
 # Issue #214: tree is already at latest, but the RUNNING SERVICE is stale — a previous update

@@ -744,6 +744,36 @@ if (_isMain()) {
     }
   }
 
+  // Issue #224: bash's cmd_restart() (ocp's restart phase — used directly by `ocp restart` and,
+  // via _cmd_update_light/_cmd_update_restart, by BOTH `ocp update` paths) used to hard-code a
+  // restart cascade with ZERO unit resolution — the exact defect class issue #215 reported,
+  // still live on this path even after PR #221 fixed the two scripts/upgrade.mjs call sites
+  // above (runFullUpgrade / runRollback) that already use resolveRestartPlan(). Per #224's own
+  // recommended design, `cmd_restart` shells out to THIS one-shot mode instead of reimplementing
+  // cgroup/ss parsing a second time in bash — there is ONE resolution implementation
+  // (scripts/lib/restart-unit.mjs's resolveOwningUnit()/planRestart(), wired through
+  // resolveRestartPlan() above), not two that can drift.
+  //
+  // Contract: on success, print the resolved restart command(s) to stdout, one per line, and
+  // exit 0 — bash runs them verbatim. On failure (ambiguous owner, no-unit, nothing listening,
+  // an unauthorized system-unit restart, etc.), print the actionable refusal message to stderr
+  // and exit non-zero — bash surfaces it and refuses, never falling through to a guess. Neither
+  // --dry-run nor --yes apply here: this mode never mutates anything itself, it only resolves
+  // and reports what WOULD run.
+  const resolveRestartIdx = args.indexOf("--resolve-restart");
+  if (resolveRestartIdx !== -1) {
+    const port = process.env.CLAUDE_PROXY_PORT || String(DEFAULT_PORT);
+    try {
+      const { plan } = resolveRestartPlan({ opts: {}, port });
+      for (const w of plan.warnings) console.error(w);
+      for (const c of plan.cmds) console.log(c.cmd);
+      process.exit(0);
+    } catch (err) {
+      console.error(`✗ ${err.message}`);
+      process.exit(1);
+    }
+  }
+
   try {
     const result = await runUpgrade({ dryRun, yes, rollback, list, gc, snapshotPath, target });
     if (result.plan) for (const line of result.plan) console.log(line);
