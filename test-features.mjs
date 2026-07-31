@@ -10696,6 +10696,104 @@ test("#224: _cmd_update_light no longer swallows cmd_restart's refusal (operator
     `its old "> /dev/null 2>&1"; stdout=${JSON.stringify(r.stdout)} stderr=${JSON.stringify(r.stderr)}`);
 });
 
+// ── #241: _cmd_update_light gets --post-flight-only verification + explicit --target no-op ───
+// #235 fixed the --dry-run mutation defect on the light path and deliberately deferred two more
+// items out of that PR to keep it to the minimum reviewable unit: (1) post-flight verification
+// mirroring _cmd_update_restart's own (#217) node scripts/upgrade.mjs --post-flight-only check,
+// and (2) deciding what --target should do now that "$@" reaches this function. This is the
+// fix for issue #214's actual incident, reproduced verbatim in #241: the tree lands on the new
+// version, the running service stays on the old one (cmd_restart's own success criterion is
+// just "/health responds", not "responds with the right version"), and a RETRY short-circuits at
+// doctor's kind=noop check ("Already at latest. Nothing to do.", exit 0) without ever
+// restarting -- only `curl $PROXY/health` told the truth in the real incident.
+console.log("\n_cmd_update_light post-flight verification + --target handling (#241):");
+
+test("#241 (the money test): light path reports FAILURE when post-flight verification does not confirm the new version, even though cmd_restart itself reported success", () => {
+  // overrideCmdRestart stays at its default (true): the FAKE-CMD-RESTART-CALLED stub always
+  // echoes "Restarting proxy..." / "✓ Proxy restarted successfully." and returns 0 -- exactly
+  // the pre-#241 failure mode (a restart that LOOKS successful while the service is still
+  // stale). postFlightExit:1 simulates the fake node --post-flight-only mode reporting the
+  // service never reached the target version within budget.
+  const r = _bwHarnessRun({ kind: "update", args: ["update"], postFlightExit: 1 });
+  assert.ok(r.stdout.includes("Updating OCP (light path)"), `sanity check we reached _cmd_update_light; stdout=${JSON.stringify(r.stdout)}`);
+  assert.ok(_bwCalled(r.log, "FAKE-CMD-RESTART-CALLED"), `cmd_restart must still run; log=${JSON.stringify(r.log)}`);
+  assert.ok(r.log.some((l) => l.includes("post-flight-only")), `post-flight verification must actually run; log=${JSON.stringify(r.log)}`);
+  assert.notEqual(r.status, 0,
+    `_cmd_update_light must report FAILURE when post-flight verification fails, even though ` +
+    `cmd_restart itself reported success -- this is issue #214/#241's exact incident (tree ` +
+    `updated, service stale, reported success anyway); status=${r.status}`);
+});
+
+test("#241 control: light path reports SUCCESS when post-flight verification confirms the new version (proves the money test's failure is real, not the path just always failing now)", () => {
+  const r = _bwHarnessRun({ kind: "update", args: ["update"], postFlightExit: 0 });
+  assert.equal(r.status, 0, `expected a clean exit when post-flight succeeds; status=${r.status} stderr=${r.stderr}`);
+  assert.ok(_bwCalled(r.log, "FAKE-CMD-RESTART-CALLED"), `cmd_restart must run; log=${JSON.stringify(r.log)}`);
+  assert.ok(r.log.some((l) => l.includes("post-flight-only")), `post-flight verification must run; log=${JSON.stringify(r.log)}`);
+});
+
+test("#241: post-flight verification is invoked with the version the tree actually landed on (v3.26.0, from this harness's static package.json), not a hard-coded or stale value", () => {
+  const r = _bwHarnessRun({ kind: "update", args: ["update"], postFlightExit: 0 });
+  assert.ok(r.log.some((l) => l.includes("FAKE-NODE-CALL") && l.includes("--post-flight-only") && l.includes("v3.26.0")),
+    `expected the post-flight-only call to carry the real target version; log=${JSON.stringify(r.log)}`);
+});
+
+test("#241: a resolver refusal (cmd_restart itself fails) is NOT masked into success by post-flight happening to answer anyway", () => {
+  // overrideCmdRestart:false lets the REAL cmd_restart run; the resolver refuses, so cmd_restart
+  // itself returns non-zero (restart_status). postFlightExit defaults to 0 (the fake node stub
+  // would "succeed") -- this proves the combined check does not let a lucky post-flight result
+  // paper over a restart that never actually happened.
+  const r = _bwHarnessRun({
+    kind: "update", args: ["update"], overrideCmdRestart: false,
+    resolveRestartExit: 1, resolveRestartStderr: ["restart aborted: MOCK-RESOLVER-REFUSAL-241"],
+  });
+  assert.notEqual(r.status, 0,
+    `a cmd_restart refusal must still fail the light path even when post-flight's own (mocked) ` +
+    `check would otherwise report success; status=${r.status}`);
+  assert.ok((r.stdout + r.stderr).includes("MOCK-RESOLVER-REFUSAL-241"),
+    `the refusal message must still reach the operator; stdout=${JSON.stringify(r.stdout)} stderr=${JSON.stringify(r.stderr)}`);
+});
+
+test("#241: --target on the light path prints an explicit no-op warning instead of being silently ignored", () => {
+  const r = _bwHarnessRun({ kind: "update", args: ["update", "--target", "v9.9.9"] });
+  assert.ok(r.stdout.includes("--target v9.9.9 is not honored on the light/patch-bump path"),
+    `expected the explicit --target no-op warning, got: ${JSON.stringify(r.stdout)}`);
+  assert.ok(_bwCalled(r.log, "FAKE-GIT-CALL"), `--target must not BLOCK the ordinary light-path update; log=${JSON.stringify(r.log)}`);
+});
+
+test("#241 control: light path WITHOUT --target prints no --target warning at all", () => {
+  const r = _bwHarnessRun({ kind: "update", args: ["update"] });
+  assert.ok(!r.stdout.includes("is not honored on the light/patch-bump path"),
+    `must not print the --target warning when --target was never passed; got: ${JSON.stringify(r.stdout)}`);
+});
+
+test("#241: --target warning still fires under --dry-run (detected before the dry-run early-return, matching --target reaching this function per #235)", () => {
+  const r = _bwHarnessRun({ kind: "update", args: ["update", "--target", "v9.9.9", "--dry-run"] });
+  assert.ok(r.stdout.includes("--target v9.9.9 is not honored on the light/patch-bump path"),
+    `expected the warning even under --dry-run, got: ${JSON.stringify(r.stdout)}`);
+  assert.ok(r.stdout.includes("[dry-run]"), `--dry-run itself must still be honored (no mutation); got: ${JSON.stringify(r.stdout)}`);
+  assert.ok(!_bwCalled(r.log, "FAKE-GIT-CALL"), `--dry-run must still prevent the git pull; log=${JSON.stringify(r.log)}`);
+});
+
+test("#241: cmd_update_help documents the light-path --target caveat", () => {
+  const r = _bwHarnessRun({ args: ["update", "--help"] });
+  assert.equal(r.status, 0, `expected --help to exit cleanly; status=${r.status} stderr=${r.stderr}`);
+  assert.ok(r.stdout.includes("--target"), `expected --target to be mentioned at all in help output; got: ${JSON.stringify(r.stdout)}`);
+  assert.ok(r.stdout.includes("light/patch-bump path"), `expected the help text to name the light/patch-bump path specifically, got: ${JSON.stringify(r.stdout)}`);
+  assert.ok(r.stdout.includes("NOT"), `expected the help text to explicitly say --target is NOT honored there, got: ${JSON.stringify(r.stdout)}`);
+});
+
+// ── Sibling non-regression: _cmd_update_restart's own --post-flight-only wiring (#217) is
+// untouched by this PR -- _cmd_update_light is a distinct function; this PR does not modify
+// _cmd_update_restart at all. Re-asserts the pre-existing "non-regression control" test's own
+// invariant explicitly under the #241 banner so a future reviewer sees it was checked here too.
+test("#241 non-regression: _cmd_update_restart (the sibling 'restart' kind) is unaffected -- still restarts + post-flight verifies, never touches git", () => {
+  const r = _bwHarnessRun({ kind: "restart", args: ["update"] });
+  assert.ok(!_bwCalled(r.log, "FAKE-GIT-CALL"), `restart kind must never touch git; log=${JSON.stringify(r.log)}`);
+  assert.ok(_bwCalled(r.log, "FAKE-CMD-RESTART-CALLED"), `cmd_restart must run; log=${JSON.stringify(r.log)}`);
+  assert.ok(_bwCalled(r.log, "FAKE-NODE-CALL") && r.log.some((l) => l.includes("post-flight-only")),
+    `post-flight verification must still run on the sibling path; log=${JSON.stringify(r.log)}`);
+});
+
 // The three tests above drive `--resolve-restart` entirely through the bash harness's FAKE
 // `node` stub (by design — see the harness's own "exec hazard" comment: a real fake-node file
 // on the scratch $PATH is what makes ocp's `exec node ...` arms unreachable BY CONSTRUCTION).

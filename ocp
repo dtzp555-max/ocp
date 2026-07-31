@@ -850,6 +850,15 @@ Usage:
   ocp update --rollback --dry-run     Preview rollback plan
   ocp update --rollback --gc          Delete old snapshots (keep last 5, or <30 days)
   ocp update --rollback --gc --dry-run    Preview what would be deleted
+
+Notes:
+  --target on the light/patch-bump path (a same-minor patch update): NOT
+  honored. That path always runs a plain `git pull origin main --ff-only`
+  regardless of any version requested via --target (issue #241) -- real
+  version-pinning there would mean a tag checkout instead of a fast-forward
+  pull, a different mechanism than this path's job. Passing --target on
+  that path prints a runtime warning rather than silently doing nothing
+  unexpected.
 EOF
 }
 
@@ -993,6 +1002,28 @@ _cmd_update_light() {
   local old_ver new_ver arg
   old_ver=$(python3 -c "import json; print(json.load(open('package.json'))['version'])" 2>/dev/null || echo "?")
 
+  # Issue #241 (deferred from #235's own review, kept to the minimum reviewable unit at the
+  # time): "$@" reaches this function (per #235's own fix) but --target was silently ignored —
+  # the light path always does a plain `git pull origin main --ff-only` regardless of any
+  # requested version. Real version-pinning here would mean switching from a fast-forward pull
+  # to a tag checkout (fetch tags, `git checkout vX.Y.Z`, and deciding what happens to
+  # --ff-only's protections) — a different mechanism, not a one-line addition, and its own design
+  # decision deliberately left for a future PR (see #241's own scope note). What IS this PR's
+  # job: stop letting that no-op be SILENT. A user passing --target here should not reasonably
+  # conclude it pinned anything just because nothing errored — this prints a runtime warning
+  # (cmd_update_help documents the same caveat) instead.
+  local _args=("$@") _i _target_seen=0 _target_val=""
+  for ((_i = 0; _i < ${#_args[@]}; _i++)); do
+    if [[ "${_args[_i]}" == "--target" ]]; then
+      _target_seen=1
+      _target_val="${_args[_i+1]:-<no value given>}"
+      break
+    fi
+  done
+  if [[ $_target_seen -eq 1 ]]; then
+    echo "  ⚠ --target $_target_val is not honored on the light/patch-bump path — it always pulls the latest origin/main regardless. Run \`ocp update --help\` for details."
+  fi
+
   # Honor --dry-run BEFORE any mutation (issue #235). This arm used to be called with NO
   # forwarding at all — `cmd_update`'s `update)` case did `_cmd_update_light "$script_dir"`,
   # dropping every flag including --dry-run — so `ocp update --dry-run` on the single most
@@ -1038,13 +1069,51 @@ _cmd_update_light() {
   echo "  Restarting proxy..."
   # Issue #224: this used to be `cmd_restart > /dev/null 2>&1`, discarding ALL of cmd_restart's
   # output — including its own refusal/failure messages, which are exactly what #224 asks to
-  # make loud rather than invisible on the single most common update path. cmd_restart's own
-  # `exit`-on-failure hazard inside cmd_usage's success path (calling `exit`, not `return`, if
-  # its own `/usage` probe fails) is pre-existing and unrelated to this change — `_cmd_update_
-  # restart` already works around that specific hazard with a `( cmd_restart ) || true` subshell
-  # (see below); direct `ocp restart` has never been wrapped that way either, so this matches
-  # existing, established behavior rather than introducing a new one.
-  cmd_restart
+  # make loud rather than invisible on the single most common update path. `( cmd_restart ) ||
+  # restart_status=$?` (a subshell, not a bare call) contains cmd_restart's own `exit`-on-failure
+  # hazard inside cmd_usage's success path (calling `exit`, not `return`, if its own `/usage`
+  # probe fails — see cmd_restart's own comment block) the same way `_cmd_update_restart`'s `(
+  # cmd_restart ) || true` already does for the sibling "restart" kind, but CAPTURES the real
+  # exit status instead of discarding it: #224 already made cmd_restart's own refusal exit
+  # non-zero and surface its message, and that signal needs to survive into this function's own
+  # exit code below, not be silently absorbed the way a bare `|| true` would.
+  local restart_status=0
+  ( cmd_restart ) || restart_status=$?
+
+  # Issue #241: this is the fix for the actual incident. The light/patch-bump path — the single
+  # most common `ocp update` invocation — used to end at cmd_restart's own return, with NO
+  # verification that the RUNNING SERVICE actually ended up serving the version the tree just
+  # landed on. cmd_restart's own success criterion (see its own body) is just "does /health
+  # respond" — it does not check the reported version at all, so a stale process that kept the
+  # port (an orphaned nohup fallback from a prior half-completed update, or a restart command
+  # that silently no-op'd) can report "✓ Proxy restarted successfully." while still serving old
+  # code. That is issue #214's original complaint ("reports success while serving old code"),
+  # and the exact incident #241 records: the tree lands on the new version, the running process
+  # stays on the old one, and a RETRY short-circuits at doctor's kind=noop check ("Already at
+  # latest. Nothing to do.", exit 0) without ever restarting — only `curl $PROXY/health` told the
+  # truth. `_cmd_update_restart` (#217) already closed this exact gap for the sibling "restart"
+  # kind via `node scripts/upgrade.mjs --post-flight-only`, which reuses postFlightOk() (compares
+  # /health's reported version against the target, not just auth.ok) instead of a second
+  # hand-rolled check — wiring the light path up the same way is what this block does. `new_ver`
+  # (re-read from package.json AFTER the git pull above, whether or not it changed) is the
+  # correct verification target: it reflects whatever version the tree actually landed on.
+  echo "  Verifying restart..."
+  local postflight_status=0
+  node "$script_dir/scripts/upgrade.mjs" --post-flight-only "v$new_ver" || postflight_status=$?
+
+  # Exit-code contract (deliberately decided here, per #235's own deferral of this exact
+  # question): a post-flight failure now makes this function — and therefore `ocp update` on
+  # this path — return non-zero, matching `_cmd_update_restart`'s own "print + return 1" pattern
+  # rather than the old implicit-success-regardless-of-outcome behavior. Checked as a combined
+  # condition (either signal failing is a failure) rather than only the post-flight result alone,
+  # so a resolver refusal that cmd_restart already reported (restart_status non-zero) is never
+  # silently overridden into success by a post-flight probe that happens to answer anyway (e.g.
+  # a DIFFERENT, unrelated process already serving the right version on the same port).
+  if [[ $restart_status -ne 0 || $postflight_status -ne 0 ]]; then
+    echo "  Run \`ocp doctor\` or \`curl \$PROXY/health\` to inspect further."
+    return 1
+  fi
+  return 0
 }
 
 # Issue #214: tree is already at latest, but the RUNNING SERVICE is stale — a previous update
