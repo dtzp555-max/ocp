@@ -817,6 +817,19 @@ cmd_update() {
   # hosts. sys.stdout.reconfigure(errors="replace") makes stdout tolerant of an unencodable
   # glyph (degrades to "?" instead of raising) without changing 2>/dev/null's existing behavior
   # for any OTHER failure mode. Verified fixed under the same env -i reproduction.
+  # Issue #236: the block's own comment above states the general hazard correctly (a non-zero
+  # exit from this pipeline kills `cmd_update` immediately under `set -euo pipefail`, and
+  # `2>/dev/null` hides why) and then fixed exactly ONE instance of it — an unencodable-glyph
+  # UnicodeEncodeError under a C-locale stdout. A host with no `python3` on PATH at all hits the
+  # SAME `set -e` exposure a different way: bash's own command-not-found is exit 127, printing
+  # NOTHING (this block's stdout carries the WARN/INFO lines; nothing has been emitted yet), and
+  # `cmd_update` dies right here — before ever reaching the `case "$kind" in` dispatch below, on
+  # a perfectly healthy host (kind=noop). Verified: `env -i PATH=/nonexistent-marker bash` on the
+  # pre-fix block exits 127 with empty output. `|| true` (matching `doctor_json=... || true` a
+  # few lines above, the fix for the identical exposure on the PRECEDING python3 call) makes this
+  # block's own failure — for ANY reason: command-not-found, a stdin JSON error the inner
+  # try/except doesn't already swallow, a future exit code this comment didn't anticipate —
+  # non-fatal to `cmd_update`, same as its sibling.
   if [[ -n "$doctor_json" ]]; then
     echo "$doctor_json" | python3 -c "
 import sys, json
@@ -831,7 +844,7 @@ for c in d.get('checks', []):
         print(f\"⚠ {c.get('message', '')}\")
     elif level == 'INFO':
         print(f\"ℹ {c.get('message', '')}\")
-" 2>/dev/null
+" 2>/dev/null || true
   fi
 
   case "$kind" in
@@ -843,7 +856,7 @@ for c in d.get('checks', []):
       _cmd_update_restart "$script_dir" "$@"
       ;;
     update)
-      _cmd_update_light "$script_dir"
+      _cmd_update_light "$script_dir" "$@"
       ;;
     upgrade|fresh_install)
       exec node "$script_dir/scripts/upgrade.mjs" "$@"
@@ -862,11 +875,27 @@ for c in d.get('checks', []):
 
 # Existing light-path body extracted into a helper so cmd_update can call it conditionally.
 _cmd_update_light() {
-  local script_dir="$1"
+  local script_dir="$1"; shift
   echo "Updating OCP (light path)..."
   cd "$script_dir"
-  local old_ver new_ver
+  local old_ver new_ver arg
   old_ver=$(python3 -c "import json; print(json.load(open('package.json'))['version'])" 2>/dev/null || echo "?")
+
+  # Honor --dry-run BEFORE any mutation (issue #235). This arm used to be called with NO
+  # forwarding at all — `cmd_update`'s `update)` case did `_cmd_update_light "$script_dir"`,
+  # dropping every flag including --dry-run — so `ocp update --dry-run` on the single most
+  # common upgrade path (an ordinary same-minor patch bump) silently ran a real `git pull` and a
+  # real restart despite ocp:732's documented "Preview the plan, don't mutate" contract.
+  # _cmd_update_restart (added by #217, for the sibling "restart" kind) already got this right;
+  # mirrors its --dry-run loop verbatim rather than inventing a second shape for the same flag.
+  for arg in "$@"; do
+    if [[ "$arg" == "--dry-run" ]]; then
+      echo "[dry-run] would pull latest from origin/main, install deps, and restart the proxy."
+      echo "[dry-run] currently v$old_ver; no git/npm/restart operations performed."
+      return 0
+    fi
+  done
+
   echo "  Pulling latest from GitHub..."
   if ! git pull origin main --ff-only 2>&1 | sed 's/^/    /'; then
     echo "  ✗ Git pull failed. Resolve conflicts manually in: $script_dir"

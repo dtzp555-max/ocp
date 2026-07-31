@@ -8420,6 +8420,290 @@ test("MED-F: rollback's SYSTEM-unit refusal recommends a bare (no-sudo) command 
     "already root must not be told to prefix the manual command with sudo");
 });
 
+// ═════════════════════════════════════════════════════════════════════════════
+// ── ocp bash CLI wiring harness (issue #225) ──────────────────────────────────
+// ═════════════════════════════════════════════════════════════════════════════
+// `ocp` is a bash script; everything above tests JS. Before this section, `test-features.mjs`
+// had no way to exercise `ocp`'s own dispatch/argument-forwarding wiring — the exact layer an
+// independent review of PR #217 found to be 0/2 on mutation-catching (surviving mutations: the
+// `--dry-run` guard _cmd_update_restart's review round added, and "$@" forwarding in a case
+// arm), versus 9/9 on the JS layer (doctor.mjs, restart-unit.mjs, ocp-connect, service-mode).
+// One of the two survivors was deleting the exact guard PR #217 spent three review rounds
+// adding. This harness closes that gap and is the regression test for issues #235 and #236,
+// found by the same review pass that produced #225.
+//
+// Harness shape (the "proven shape" #225 itself prescribes): slice ONLY the function
+// definitions out of `ocp` — everything before the `# ── dispatch` section header — and run
+// that slice in a real `bash` child process, with `cmd_restart` overridden as a shell function
+// (defined AFTER the sliced source, in the same generated file — bash resolves whichever
+// definition of a name appears LAST, so simple textual ordering gives the same "source, then
+// override" semantics issue #225 prescribes without a separate `source` command) and every
+// other externally-hazardous command replaced by a REAL EXECUTABLE FILE on a scratch $PATH.
+//
+// Why real files, not shell functions, for node/git/launchctl/systemctl/pkill/nohup/openclaw:
+// `ocp`'s `upgrade|fresh_install)` kind arm does exactly `exec node "$script_dir/scripts/
+// upgrade.mjs" "$@"` (also reached via `--rollback` and via `cmd_doctor`). Bash's `exec`
+// replaces the process image via a normal PATH lookup for an executable — it does NOT consult
+// the shell function table at all, so a `node() { ... }` shell-function override would be
+// silently bypassed at exactly that line, and the REAL `scripts/upgrade.mjs` would run (which,
+// under `--yes`, `execSync`s `mv ~/.ocp …` and `rm -rf <ocpDir>`). A previous attempt at this
+// harness took a reviewing host's production OCP down this exact way, in miniature, by
+// defining a `cmd_restart` shell-function stub BEFORE sourcing the real `ocp` (the real
+// definition, sourced afterward, silently won). Putting a real fake-node FILE ahead of the
+// real node on a from-scratch $PATH — never inheriting the calling shell's $PATH — makes the
+// `exec` arm unreachable BY CONSTRUCTION: whether `node` is reached via a plain call, a
+// pipeline, or `exec`, the executable that answers is this harness's own, and its default case
+// for any invocation it doesn't explicitly recognize (`scripts/doctor.mjs --json` or
+// `scripts/upgrade.mjs --post-flight-only`) refuses loudly (exit 97) rather than silently
+// succeeding or falling through to a real script that doesn't exist in the scratch tree anyway.
+// `launchctl`/`systemctl`/`pkill`/`nohup`/`openclaw` get the same scratch-$PATH treatment as
+// defense in depth, even though the tests below only ever reach them (if at all) through the
+// `cmd_restart` shell-function override, which never calls them for real.
+//
+// Anchor-drift guard (AGENTS.md "Testing discipline"): "dispatch" is a unique word among this
+// file's own repeated "# ── <section> ──" header-comment convention (usage/status/health/.../
+// restart/update/doctor/help each get one; only this one is named "dispatch"), so a plain
+// `.indexOf` is safe from the multi-header collision the ocp-connect harness above guards
+// against with paired start/end anchors. Still guarded: slice non-empty, slice contains the
+// four function signatures every test below depends on, slice does NOT contain the dispatch
+// case statement itself (overgrown-slice guard), and the REMOVED tail DOES contain it (confirms
+// the boundary is where this comment claims, not merely "found A/B in either order").
+console.log("\nocp bash CLI wiring (#225, #235, #236):");
+
+const _bwOcpPath = spotJoin(_spotDir, "ocp");
+const _bwFullSrc = _ltRead(_bwOcpPath, "utf8");
+const _BW_DISPATCH_ANCHOR = "# ── dispatch";
+const _bwDispatchIdx = _bwFullSrc.indexOf(_BW_DISPATCH_ANCHOR);
+// Guard against a negative-index slice (`.slice(0, -1)` would silently return "everything but
+// the last char" instead of throwing) BEFORE computing the slice, not after.
+const _bwFnSrc = _bwDispatchIdx === -1 ? "" : _bwFullSrc.slice(0, _bwDispatchIdx);
+
+test("ocp bash harness: '# ── dispatch' anchor slice is well-formed (premise, #225)", () => {
+  assert.notEqual(_bwDispatchIdx, -1,
+    "'# ── dispatch' anchor not found in ocp — reformatted? update the harness anchor");
+  assert.ok(_bwFnSrc.trim().length > 0, "function-definitions slice is empty — anchor drift");
+  for (const marker of ["cmd_update()", "_cmd_update_light()", "_cmd_update_restart()", "cmd_restart()"]) {
+    assert.ok(_bwFnSrc.includes(marker), `function-definitions slice missing ${marker} — anchor drift`);
+  }
+  assert.ok(!_bwFnSrc.includes('case "$subcmd" in'),
+    "function-definitions slice overgrown into the dispatch case statement — anchor drift");
+  assert.ok(_bwFullSrc.slice(_bwDispatchIdx > -1 ? _bwDispatchIdx : 0).includes('case "$subcmd" in'),
+    "the dispatch case statement was expected AFTER the anchor and is missing — anchor drift");
+});
+
+// Runs `cmd_update <args>` against a from-scratch sandbox built fresh per call (own $HOME, own
+// $PATH, own scratch `script_dir` — never the real repo, never the calling shell's $PATH/$HOME).
+// `script_dir` doubles as the directory holding the generated driver script itself: `ocp`'s
+// functions resolve `script_dir` from `${BASH_SOURCE[0]}`, which — for a directly-executed
+// script (not `source`d) — is the file the running code was READ from, i.e. the driver file
+// this harness writes. package.json therefore lives next to driver.sh, not in a subdirectory.
+function _bwHarnessRun({
+  args = [], kind = "noop", checks = [], pythonAbsent = false,
+  gitPullExit = 0, gitPullOutput = "Already up to date.", postFlightExit = 0,
+} = {}) {
+  const root = _ltMkdtemp(join(_ltTmp(), "ocp-bash-harness-"));
+  try {
+    const home = join(root, "home");
+    const bin = join(root, "bin");
+    tMkdirSync(home, { recursive: true });
+    tMkdirSync(bin, { recursive: true });
+
+    testWriteFile(join(root, "package.json"), JSON.stringify({ version: "3.26.0" }));
+    const logPath = join(root, "log.txt");
+    testWriteFile(logPath, "");
+    const doctorJsonPath = join(root, "doctor.json");
+    testWriteFile(doctorJsonPath, JSON.stringify({
+      current_version: "v3.26.0", latest_version: "v3.26.0", next_action: { kind }, checks,
+    }));
+
+    const mkStub = (name, body) => {
+      const p = join(bin, name);
+      testWriteFile(p, `#!/usr/bin/env bash\n${body}\n`);
+      _ltChmod(p, 0o755);
+    };
+
+    // Recognizes exactly the two `node` invocations these two bugs' code paths can reach
+    // (doctor.mjs --json for the kind decision, upgrade.mjs --post-flight-only for
+    // _cmd_update_restart's verification step) and refuses anything else LOUDLY — including
+    // the `upgrade|fresh_install)` exec arm and `--rollback`, which this suite never exercises
+    // on purpose (see the exec-hazard note above the harness).
+    mkStub("node", [
+      `echo "FAKE-NODE-CALL $*" >> "${logPath}"`,
+      `case "$*" in`,
+      `  *"scripts/doctor.mjs --json"*)`,
+      `    cat "${doctorJsonPath}"`,
+      `    exit 0`,
+      `    ;;`,
+      `  *"scripts/upgrade.mjs --post-flight-only"*)`,
+      `    exit ${postFlightExit}`,
+      `    ;;`,
+      `  *)`,
+      `    echo "FAKE-NODE: refusing unhandled invocation (would run a REAL doctor.mjs/` +
+        `upgrade.mjs path -- see #225 exec hazard): $*" >&2`,
+      `    exit 97`,
+      `    ;;`,
+      `esac`,
+    ].join("\n"));
+
+    mkStub("git", [
+      `echo "FAKE-GIT-CALL $*" >> "${logPath}"`,
+      `case "$*" in`,
+      `  "pull origin main --ff-only")`,
+      `    echo ${JSON.stringify(gitPullOutput)}`,
+      `    exit ${gitPullExit}`,
+      `    ;;`,
+      `  *)`,
+      `    echo "FAKE-GIT: unhandled invocation: $*" >&2`,
+      `    exit 96`,
+      `    ;;`,
+      `esac`,
+    ].join("\n"));
+
+    // Defense in depth (AGENTS.md: "any command that can mutate a running service ... should
+    // be a stub that fails loudly by default") — unreachable from the tests below (which all
+    // override `cmd_restart` wholesale, see the driver below), but must never silently succeed
+    // if a future test forgets to.
+    for (const name of ["launchctl", "systemctl", "pkill", "nohup", "openclaw"]) {
+      mkStub(name, [
+        `echo "FAKE-${name.toUpperCase()}-CALL $*" >> "${logPath}"`,
+        `echo "FAKE-${name.toUpperCase()}: refusing -- this harness must never reach a real ` +
+          `service-mutating command (AGENTS.md 'unreachable by construction')" >&2`,
+        `exit 95`,
+      ].join("\n"));
+    }
+
+    // Simulates issue #236's exact repro ("stubbed absent": a real executable file that always
+    // reports command-not-found's own exit code) rather than trying to strip PATH of every
+    // directory that might contain a real python3 — the issue's own reviewer used the identical
+    // technique. Omitted entirely (not merely present-but-broken) when pythonAbsent is false, so
+    // the real /usr/bin/python3 answers instead (present on both this repo's macOS dev hosts and
+    // its Linux CI runners).
+    if (pythonAbsent) {
+      mkStub("python3", [
+        `echo "FAKE-PYTHON3-ABSENT-CALL $*" >> "${logPath}"`,
+        `exit 127`,
+      ].join("\n"));
+    }
+
+    // `cmd_restart` override goes AFTER the sliced source in the SAME generated file — never
+    // before (the #217 incident this harness exists to never repeat). Bash resolves whichever
+    // definition of a function name is executed LAST, so plain top-to-bottom ordering in one
+    // file gives the same guarantee as "define the stub after `source`" without an actual
+    // `source` call.
+    const driver = [
+      _bwFnSrc,
+      "",
+      `cmd_restart() {`,
+      `  echo "FAKE-CMD-RESTART-CALLED $*" >> "${logPath}"`,
+      `  echo "Restarting proxy..."`,
+      `  echo "✓ Proxy restarted successfully."`,
+      `  return 0`,
+      `}`,
+      "",
+      `PROXY="http://127.0.0.1:1"`,
+      "",
+      `cmd_update "$@"`,
+      "",
+    ].join("\n");
+    const driverPath = join(root, "driver.sh");
+    testWriteFile(driverPath, driver);
+
+    const env = {
+      HOME: home,
+      // From-scratch $PATH, never the calling shell's: our stubs first, then just enough of
+      // the real system to resolve bash builtins' external helpers (cat/sed/python3 when
+      // pythonAbsent is false) and nothing that could contain a second, real node/git.
+      PATH: `${bin}:/usr/bin:/bin`,
+      OCP_TEST_LOG: logPath,
+      OCP_ADMIN_KEY: "",
+    };
+
+    let stdout = "", stderr = "", status = 0;
+    try {
+      stdout = execFileSync("bash", [driverPath, ...args], { cwd: root, env, encoding: "utf8" });
+    } catch (e) {
+      stdout = e.stdout ?? "";
+      stderr = e.stderr ?? "";
+      status = typeof e.status === "number" ? e.status : 1;
+    }
+    const log = testExistsSync(logPath) ? _ltRead(logPath, "utf8").split("\n").filter(Boolean) : [];
+    return { stdout, stderr, status, log };
+  } finally {
+    _ltRm(root, { recursive: true, force: true });
+  }
+}
+
+function _bwCalled(log, prefix) {
+  return log.some((l) => l.startsWith(prefix));
+}
+
+// ── #235: `ocp update --dry-run` must not mutate on the patch-bump ("update" kind) path ──────
+test("#235: cmd_update kind=update --dry-run does NOT pull or restart (the money test)", () => {
+  const r = _bwHarnessRun({ kind: "update", args: ["--dry-run"] });
+  assert.equal(r.status, 0, `expected a clean exit, got status=${r.status} stderr=${r.stderr}`);
+  assert.ok(!_bwCalled(r.log, "FAKE-GIT-CALL"), `git must NOT run under --dry-run; log=${JSON.stringify(r.log)}`);
+  assert.ok(!_bwCalled(r.log, "FAKE-CMD-RESTART-CALLED"), `cmd_restart must NOT run under --dry-run; log=${JSON.stringify(r.log)}`);
+  assert.ok(r.stdout.includes("[dry-run]"), `expected a [dry-run] preview line in stdout, got: ${JSON.stringify(r.stdout)}`);
+});
+
+test("#235: cmd_update kind=update --dry-run still honors dry-run when --dry-run is NOT the first flag ('\"$@\"', not just $1)", () => {
+  const r = _bwHarnessRun({ kind: "update", args: ["--yes", "--dry-run"] });
+  assert.ok(!_bwCalled(r.log, "FAKE-GIT-CALL"), `git must NOT run; log=${JSON.stringify(r.log)}`);
+  assert.ok(!_bwCalled(r.log, "FAKE-CMD-RESTART-CALLED"), `cmd_restart must NOT run; log=${JSON.stringify(r.log)}`);
+  assert.ok(r.stdout.includes("[dry-run]"), `expected a [dry-run] line, got: ${JSON.stringify(r.stdout)}`);
+});
+
+test("#235 control: cmd_update kind=update with NO --dry-run DOES pull and restart (proves the money test above can fail)", () => {
+  const r = _bwHarnessRun({ kind: "update", args: [] });
+  assert.equal(r.status, 0, `expected a clean exit, got status=${r.status} stderr=${r.stderr}`);
+  assert.ok(_bwCalled(r.log, "FAKE-GIT-CALL pull origin main --ff-only"), `git pull must run; log=${JSON.stringify(r.log)}`);
+  assert.ok(_bwCalled(r.log, "FAKE-CMD-RESTART-CALLED"), `cmd_restart must run; log=${JSON.stringify(r.log)}`);
+  assert.ok(!r.stdout.includes("[dry-run]"), `must NOT print a dry-run preview when actually mutating, got: ${JSON.stringify(r.stdout)}`);
+});
+
+// ── Sibling non-regression: the "restart" kind's pre-existing --dry-run guard (PR #217) ──────
+test("non-regression: cmd_update kind=restart --dry-run still does not restart (pre-existing #217 guard, unaffected by #235's fix)", () => {
+  const r = _bwHarnessRun({ kind: "restart", args: ["--dry-run"] });
+  assert.ok(!_bwCalled(r.log, "FAKE-GIT-CALL"), `git must NOT run; log=${JSON.stringify(r.log)}`);
+  assert.ok(!_bwCalled(r.log, "FAKE-CMD-RESTART-CALLED"), `cmd_restart must NOT run; log=${JSON.stringify(r.log)}`);
+  assert.ok(r.stdout.includes("[dry-run]"), `expected a [dry-run] line, got: ${JSON.stringify(r.stdout)}`);
+});
+
+test("non-regression control: cmd_update kind=restart with NO --dry-run DOES restart + post-flight verify", () => {
+  const r = _bwHarnessRun({ kind: "restart", args: [] });
+  assert.ok(!_bwCalled(r.log, "FAKE-GIT-CALL"), `restart kind must never touch git; log=${JSON.stringify(r.log)}`);
+  assert.ok(_bwCalled(r.log, "FAKE-CMD-RESTART-CALLED"), `cmd_restart must run; log=${JSON.stringify(r.log)}`);
+  assert.ok(_bwCalled(r.log, "FAKE-NODE-CALL") && r.log.some((l) => l.includes("post-flight-only")),
+    `post-flight verification must run; log=${JSON.stringify(r.log)}`);
+});
+
+// ── #236: the WARN/INFO block must not kill cmd_update when python3 is absent ────────────────
+test("#236: cmd_update survives an absent python3 — no silent 127 death before the kind dispatch even runs", () => {
+  const r = _bwHarnessRun({ kind: "noop", pythonAbsent: true });
+  // Before the fix: bash's own command-not-found for the WARN/INFO block's python3 is exit 127,
+  // with NOTHING printed yet (the case "$kind" in dispatch below it — the ONLY place this
+  // function prints anything at that point — never runs). That exact signature is the
+  // regression to detect; asserting its NEGATION is the actual behavioral check (not merely
+  // "did not throw").
+  assert.ok(
+    !(r.status === 127 && r.stdout === ""),
+    `cmd_update died silently (status=127, empty stdout) — the #236 regression is back. ` +
+    `stderr=${JSON.stringify(r.stderr)} log=${JSON.stringify(r.log)}`,
+  );
+  assert.ok(r.stdout.length > 0, `expected SOME output even in degraded mode, got empty stdout (log=${JSON.stringify(r.log)})`);
+});
+
+test("#236 control: cmd_update with python3 PRESENT reaches the kind dispatch and prints WARN/INFO lines", () => {
+  const r = _bwHarnessRun({
+    kind: "noop",
+    checks: [{ level: "WARN", message: "control-warn-marker" }, { level: "INFO", message: "control-info-marker" }],
+  });
+  assert.equal(r.status, 0, `expected a clean exit, got status=${r.status} stderr=${r.stderr}`);
+  assert.ok(r.stdout.includes("control-warn-marker"), `expected the WARN line surfaced, got: ${JSON.stringify(r.stdout)}`);
+  assert.ok(r.stdout.includes("control-info-marker"), `expected the INFO line surfaced, got: ${JSON.stringify(r.stdout)}`);
+  assert.ok(r.stdout.includes("Already at latest"), `expected the noop-kind message, got: ${JSON.stringify(r.stdout)}`);
+});
+
 runAsyncTests().then(() => Promise.all(pendingAsync)).then(() => {
   closeDb();
   console.log(`\n=== Results: ${passed} passed, ${failed} failed ===\n`);
