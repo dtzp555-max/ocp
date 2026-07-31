@@ -2079,6 +2079,79 @@ test("G7: darwin mergePlistEnv actually runs — a pre-existing operator env var
     `expected the pre-existing operator env var to survive the rewrite; got:\n${finalContent}`);
 });
 
+// ── G8-G10 (added — independent review of this PR found these while verifying G1-G7) ──
+// A fresh-context reviewer applied the same "is this actually load-bearing and actually
+// unguarded" test G1-G7 used to every other property in the template and found two more real
+// survivors before approving. Both close the same class of gap #231 described, just on
+// properties #231's own list happened not to name.
+test("G8: darwin plist's KeepAlive is literally <true/> (job must respawn after a crash, not die permanently)", () => {
+  // Same defect class as G5 (Restart=always) — G5's own linux property, mapped onto darwin's
+  // launchd equivalent. A mutation flipping this to <false/> survived the full suite (650/0)
+  // until this test was added: nothing previously read KeepAlive out of the written plist.
+  let plistContent = null;
+  installAutoStart(baseInstallOpts({
+    platform: "darwin",
+    servicePlan: resolveServicePlan([], "darwin"),
+    writeFile: (path, content) => { if (path.endsWith("dev.ocp.proxy.plist")) plistContent = content; },
+  }));
+  assert.ok(plistContent, "expected the plist to be written");
+  const m = plistContent.match(/<key>KeepAlive<\/key>\s*<(true|false)\/>/);
+  assert.ok(m, `expected a KeepAlive key/value pair; got:\n${plistContent}`);
+  assert.equal(m[1], "true", `KeepAlive must be <true/> (launchd must respawn the proxy after a crash); got <${m[1]}/>`);
+});
+
+test("G9: darwin plist writes injected secrets under their real key names (OCP_ADMIN_KEY/PROXY_ANONYMOUS_KEY/CLAUDE_BIN)", () => {
+  // baseInstallOpts()'s default config leaves all three *_INJECT fields null, so every G1-G7
+  // test above writes a plist with NO secrets in it — the conditional inject branches
+  // (install-autostart.mjs's CLAUDE_BIN_INJECT/OCP_ADMIN_KEY_INJECT/PROXY_ANON_KEY_INJECT
+  // ternaries) were dead code as far as this suite could tell. This matters because G3's own
+  // justification for chmod 0600 is that these files "carry OCP_ADMIN_KEY/PROXY_ANONYMOUS_KEY"
+  // — chmod without content is a lock on an empty box. Renaming the plist key (independently
+  // reproduced during review) survives every G1-G8 test above; only this one catches it.
+  let plistContent = null;
+  installAutoStart(baseInstallOpts({
+    platform: "darwin",
+    servicePlan: resolveServicePlan([], "darwin"),
+    config: {
+      PORT: 3456, BIND_ADDRESS: "127.0.0.1", AUTH_MODE_CONFIG: "multi",
+      CLAUDE_BIN_INJECT: "/custom/claude/bin",
+      OCP_ADMIN_KEY_INJECT: "ocp_admin_test_token",
+      PROXY_ANON_KEY_INJECT: "ocp_anon_test_token",
+    },
+    writeFile: (path, content) => { if (path.endsWith("dev.ocp.proxy.plist")) plistContent = content; },
+  }));
+  assert.ok(plistContent, "expected the plist to be written");
+  assert.match(plistContent, /<key>CLAUDE_BIN<\/key>\s*<string>\/custom\/claude\/bin<\/string>/,
+    `expected CLAUDE_BIN under its real key name; got:\n${plistContent}`);
+  assert.match(plistContent, /<key>OCP_ADMIN_KEY<\/key>\s*<string>ocp_admin_test_token<\/string>/,
+    `expected OCP_ADMIN_KEY under its real key name; got:\n${plistContent}`);
+  assert.match(plistContent, /<key>PROXY_ANONYMOUS_KEY<\/key>\s*<string>ocp_anon_test_token<\/string>/,
+    `expected PROXY_ANONYMOUS_KEY under its real key name; got:\n${plistContent}`);
+});
+
+test("G10: linux systemd unit writes injected secrets under their real Environment= names (OCP_ADMIN_KEY/PROXY_ANONYMOUS_KEY/CLAUDE_BIN)", () => {
+  // Same gap as G9, other platform: baseInstallOpts()'s default config means the systemd
+  // template's inject ternaries are equally dead code across every prior test.
+  let unitContent = null;
+  installAutoStart(baseInstallOpts({
+    platform: "linux",
+    config: {
+      PORT: 3456, BIND_ADDRESS: "127.0.0.1", AUTH_MODE_CONFIG: "multi",
+      CLAUDE_BIN_INJECT: "/custom/claude/bin",
+      OCP_ADMIN_KEY_INJECT: "ocp_admin_test_token",
+      PROXY_ANON_KEY_INJECT: "ocp_anon_test_token",
+    },
+    writeFile: (path, content) => { if (path.endsWith("ocp-proxy.service")) unitContent = content; },
+  }));
+  assert.ok(unitContent, "expected the systemd unit file to be written");
+  assert.match(unitContent, /^Environment=CLAUDE_BIN=\/custom\/claude\/bin$/m,
+    `expected CLAUDE_BIN under its real Environment= name; got:\n${unitContent}`);
+  assert.match(unitContent, /^Environment=OCP_ADMIN_KEY=ocp_admin_test_token$/m,
+    `expected OCP_ADMIN_KEY under its real Environment= name; got:\n${unitContent}`);
+  assert.match(unitContent, /^Environment=PROXY_ANONYMOUS_KEY=ocp_anon_test_token$/m,
+    `expected PROXY_ANONYMOUS_KEY under its real Environment= name; got:\n${unitContent}`);
+});
+
 test("upgrade full path's reconfigure phase invokes setup.mjs with --reconfigure-only", async () => {
   const result = await runUpgrade({
     yes: true,
