@@ -7579,24 +7579,27 @@ test("ocp cmd_update's real doctor-check-surfacing block: WARN and INFO both pri
   assert.equal(out, "⚠ warn one\nℹ info one\n");
 });
 
-test("LOW-2 (real shell, verified mechanism): ocp's doctor-check-surfacing block survives an ASCII-only locale where the glyphs can't be printed — set -e must not kill cmd_update silently", () => {
+test("LOW-2 (real shell, verified mechanism): ocp's doctor-check-surfacing block survives a stdout encoding that can't represent the WARN/INFO glyphs — set -e must not kill cmd_update silently", () => {
   // The actual bug found on review round 4: under `set -euo pipefail` (ocp:7), a non-zero exit
   // from this python pipeline kills `cmd_update` immediately, and `2>/dev/null` hides why.
-  // Verified directly before this fix: forcing an ASCII-only locale on the block raised a
-  // UnicodeEncodeError trying to print "⚠"/"ℹ" under the C locale's ASCII-only stdout encoding,
-  // exiting 1 before even reaching the kind dispatch below it — silently aborting the whole
-  // update. This PR's own INFO addition made the block fire far more often (it used to print
-  // nothing on most healthy hosts). Reproduced against the REAL, current `ocp` file (not a
-  // hand-copied snippet): extract the actual doctor-check-surfacing if-block, wrap it in a
-  // minimal harness script, and run it under the exact failing environment.
+  // Verified directly before this fix (originally via `env -i LC_ALL=C`, an ASCII-only C
+  // locale): a UnicodeEncodeError printing "⚠"/"ℹ" exits 1 before even reaching the kind
+  // dispatch below it — silently aborting the whole update. This PR's own INFO addition made
+  // the block fire far more often (it used to print nothing on most healthy hosts). Reproduced
+  // against the REAL, current `ocp` file (not a hand-copied snippet): extract the actual
+  // doctor-check-surfacing if-block, wrap it in a minimal harness script, and run it under an
+  // environment that can't encode the glyphs.
   //
-  // Deliberately does NOT use `env -i` (full environment wipe): that strips PATH along with the
-  // locale, and this repo's own CI (Linux) failed to locate bash/python3 under the resulting
-  // fallback path — an environment-portability false failure, not the bug under test. The
-  // portable form instead starts from the CURRENT process's env (keeping PATH intact) and
-  // overrides only the locale-related variables that actually matter for reproducing the
-  // encoding bug — re-verified to reproduce the pre-fix failure and pass post-fix identically to
-  // the `env -i` form before switching to it.
+  // PYTHONIOENCODING=ascii (rather than forcing LC_ALL=C or using `env -i`) is the portable
+  // choice: it directly controls Python's own stdout encoder on every platform uniformly,
+  // whereas locale-based reproduction depends on the OS's installed locale data/libc, which
+  // this repo's own CI caught diverging — `env -i` additionally stripped PATH, breaking
+  // bash/python3 lookup on that Linux runner (a portability false failure, not the bug under
+  // test); a PATH-preserving `LC_ALL=C` override then still behaved differently under this
+  // repo's Linux CI than on the macOS dev machine it was authored on. PYTHONIOENCODING is
+  // read directly by CPython's IO layer regardless of OS locale, so it reproduces identically
+  // on both. Verified both directions before switching: throws pre-fix (reconfigure stripped),
+  // passes post-fix.
   const src = spotReadFileSync(join(_spotDir, "ocp"), "utf8");
   const startMarker = '  if [[ -n "$doctor_json" ]]; then';
   const endMarker = "\n  fi";
@@ -7618,10 +7621,10 @@ test("LOW-2 (real shell, verified mechanism): ocp's doctor-check-surfacing block
       'echo "REACHED_AFTER_BLOCK"',
       "",
     ].join("\n"));
-    const childEnv = { ...process.env, LC_ALL: "C", LANG: "C", LANGUAGE: "", PYTHONUTF8: "0", PYTHONIOENCODING: "" };
+    const childEnv = { ...process.env, PYTHONIOENCODING: "ascii" };
     const out = execFileSync("bash", [scriptPath], { encoding: "utf8", env: childEnv });
     assert.ok(out.includes("REACHED_AFTER_BLOCK"),
-      "cmd_update must survive past this block even when the glyphs can't be encoded in the active locale — set -e must not silently kill it");
+      "cmd_update must survive past this block even when stdout can't encode the glyphs — set -e must not silently kill it");
   } finally {
     rmSync(scratch, { recursive: true, force: true });
   }
