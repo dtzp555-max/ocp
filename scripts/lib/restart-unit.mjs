@@ -39,6 +39,22 @@
  *   - unit-name VALIDATION at the point a cgroup-derived string is accepted,
  *     closing a shell-injection path (an attacker-influenced cgroup segment
  *     like `a;id.service` or `a b c.service` must never reach a `sh -c` call).
+ *
+ * A second round of independent review (still PR #221) found that the refusal posture itself
+ * introduced a regression and a residual gap, both fixed here:
+ *   - HIGH-A: the "not-listening" refusal above is right for the UPGRADE path but wrong for
+ *     ROLLBACK, whose whole point is restoring a down service and which has no health gate to
+ *     protect. `planRestart`'s `opts.allowNotListeningFallback` (set only on the rollback call
+ *     site in scripts/upgrade.mjs) falls through to the default unit with a loud warning
+ *     instead of a refusal that would otherwise never clear on a re-run.
+ *   - MED-C: `UNIT_NAME_RE` rejected shell metacharacters (MED-5) but still permitted a LEADING
+ *     "-", which a getopt-style parser (systemctl included) treats as another OPTION wherever
+ *     it appears in argv — `-Hattacker@example.com.service` becomes `-H`/`--host` (SSH to an
+ *     attacker-chosen target), `-Mevil.service` becomes `-M`/`--machine`. Fixed by excluding
+ *     "-" from the first character's class, plus `--` before the unit name at every shell-out
+ *     site (defense in depth, matching MED-5's own posture).
+ *   - MED-D: the SO_REUSEPORT multi-PID detection used a non-global regex match and silently
+ *     under-counted the same-row case; see the note beside `classifySsListener`'s `matchAll`.
  */
 
 // Anything accepted as a restart target must look like a real systemd unit name.
@@ -46,7 +62,18 @@
 // under cgroup v2 delegation, and this module's whole job is deciding what string
 // gets concatenated into a shell command downstream. A segment that fails this
 // check is treated exactly like "no unit found here" — never partially trusted.
-const UNIT_NAME_RE = /^[A-Za-z0-9:_.@-]+\.service$/;
+//
+// MED-C (PR #221 round-2 review): the original character class (`[A-Za-z0-9:_.@-]+`)
+// permits a LEADING "-", which closes the shell-injection path (MED-5) but leaves an
+// argv-injection path wide open — `getopt`-style parsers (systemctl included) treat a
+// leading-dash argv word as an OPTION regardless of where the parser is in the argument
+// list, not as the unit name. `-Hattacker@example.com.service` turns `systemctl restart
+// <that>` into `systemctl restart -Hattacker@example.com.service`, and `-H`/`--host`
+// takes `[user@]host` and connects over SSH; `-Mevil.service` retargets `-M`/`--machine`
+// to a container. Same threat model as MED-5 (the segment is cgroup-v2-delegation
+// attacker-creatable) — different injection class, so it needs its own guard: the first
+// character must come from a class that EXCLUDES "-", the rest may still include it.
+const UNIT_NAME_RE = /^[A-Za-z0-9:_.@][A-Za-z0-9:_.@-]*\.service$/;
 
 // --- Linux: classify `ss -lptn "sport = :<port>"` output ---
 // Returns one of three states — never conflates "confirmed empty" with "couldn't tell":
@@ -56,9 +83,16 @@ const UNIT_NAME_RE = /^[A-Za-z0-9:_.@-]+\.service$/;
 //                     but no PID is attributable (foreign-uid process — the `ss`
 //                     `users:(())` column requires visibility into the target's
 //                     /proc/*/fd and is silently omitted otherwise), OR more than
-//                     one distinct PID answers (dual-stack / SO_REUSEPORT — "which
-//                     one" is issue #215's own diagnostic question; picking the
-//                     first match arbitrarily was the exact defect this replaces).
+//                     one distinct PID answers — across separate rows (dual-stack,
+//                     e.g. one IPv4 + one IPv6 LISTEN row) OR within a SINGLE row's
+//                     `users:(())` group (SO_REUSEPORT, several processes sharing one
+//                     socket) — "which one" is issue #215's own diagnostic question,
+//                     and picking the first match arbitrarily was the exact defect
+//                     this replaces. (MED-D, PR #221 round-2 review: the first cut of
+//                     this fix used a non-global `pid=` match, so only the same-row
+//                     SO_REUSEPORT shape still silently returned the FIRST pid as if
+//                     unambiguous — dual-stack's separate rows already worked. Both
+//                     shapes now converge on "unknown" via matchAll below.)
 export function classifySsListener(ssOutput) {
   if (ssOutput == null) {
     return { state: "unknown", pid: null, reason: "ss did not run (missing tool, or the probe exec itself failed)" };
@@ -68,9 +102,18 @@ export function classifySsListener(ssOutput) {
     return { state: "not-listening", pid: null, reason: null };
   }
   const pids = new Set();
+  // MED-D (PR #221 round-2 review): this was `line.match(/pid=(\d+)/)` — a NON-global match,
+  // so only the FIRST "pid=" in each line was ever collected. That silently under-counted the
+  // exact SO_REUSEPORT case this module exists to catch: multiple processes sharing one port
+  // via SO_REUSEPORT appear as MULTIPLE "pid=" entries inside a SINGLE ss row's `users:(())`
+  // group (e.g. `users:(("node",pid=100,fd=19),("node",pid=101,fd=19))`), not as multiple
+  // separate rows. Dual-stack (IPv4 + IPv6, two separate rows) was already caught correctly,
+  // since each row contributed its own single pid to the set — only the same-row multi-pid
+  // shape was silently reported as "listening" with the FIRST pid, as if the row were
+  // unambiguous. matchAll collects every "pid=" per line, so both shapes now converge on the
+  // same "unknown" (2+ distinct pids) outcome instead of one being a false-confident answer.
   for (const line of listenLines) {
-    const m = line.match(/pid=(\d+)/);
-    if (m) pids.add(m[1]);
+    for (const m of line.matchAll(/pid=(\d+)/g)) pids.add(m[1]);
   }
   if (pids.size === 1) {
     return { state: "listening", pid: [...pids][0], reason: null };
@@ -317,6 +360,35 @@ export function planRestart(owner, opts = {}) {
   }
 
   if (owner.kind === "not-listening") {
+    // HIGH-A (PR #221 round-2 review): this refusal is correct for the UPGRADE path (below),
+    // where a silent fallback risks starting the WRONG unit — the real LAN listener could be a
+    // SYSTEM unit that's merely down, and post-flight (127.0.0.1-only) can't tell the
+    // difference. On ROLLBACK the calculus inverts: the single most common reason to roll back
+    // IS "the service is down"; the rollback path has no doctor health gate at all (unlike
+    // upgrade); and rollback's own snapshot only ever restores opts.expectedUnit's config in
+    // the first place (scripts/lib/snapshot.mjs) — there is no "other" unit it could
+    // accidentally start instead of the real one. Refusing unconditionally here left a rollback
+    // PERMANENTLY stuck: re-running hits this exact same "nothing is listening" state forever
+    // (nothing about re-running changes it), and the message's own advice — "start the intended
+    // unit manually" — named exactly the question this state has no way to answer. So on
+    // rollback specifically (opts.allowNotListeningFallback), fall through to starting the
+    // default unit with a loud warning instead of a permanent refusal; the upgrade path's
+    // refusal is untouched.
+    if (opts.allowNotListeningFallback) {
+      warnings.push(
+        `[restart] WARNING: nothing was listening on the OCP port before this rollback restart. ` +
+        `Starting the default unit ("${opts.expectedUnit}") anyway: unlike the upgrade path, ` +
+        `rollback has no doctor health gate and its own snapshot only ever restores ` +
+        `"${opts.expectedUnit}"'s config in the first place (scripts/lib/snapshot.mjs), so there ` +
+        `is no other candidate unit to weigh this against — refusing here would leave the ` +
+        `rollback stuck (re-running hits this identical state). If a different unit is meant to ` +
+        `own this port long-term, start it manually instead and ignore this one.`
+      );
+      if (owner.platform === "darwin") {
+        return { action: "launchd", warnings, cmds: launchdCmds(opts) };
+      }
+      return { action: "user-unit", warnings, cmds: [{ cmd: `systemctl --user restart -- ${opts.expectedUnit}`, label: "restart" }] };
+    }
     throw new Error(
       `restart aborted: nothing is currently listening on the OCP port, so there is nothing to ` +
       `confirm the correct restart target against. This is deliberately a refusal, not a fallback ` +
@@ -349,26 +421,31 @@ export function planRestart(owner, opts = {}) {
       throw new Error(`restart aborted: resolved unit name "${owner.unit}" failed validation — refusing to shell out with it.`);
     }
     if (opts.isRoot) {
-      return { action: "system-unit", warnings, cmds: [{ cmd: `systemctl restart ${owner.unit}`, label: "restart" }] };
+      // MED-C (PR #221 round-2 review): "--" stops systemctl's getopt-style parser from
+      // treating a leading-dash unit name (e.g. "-Hattacker@example.com.service") as another
+      // OPTION rather than the restart argument. UNIT_NAME_RE already rejects a leading "-" —
+      // this is defense in depth at the actual shell-out boundary, the same posture MED-5 took
+      // for shell-metacharacter injection.
+      return { action: "system-unit", warnings, cmds: [{ cmd: `systemctl restart -- ${owner.unit}`, label: "restart" }] };
     }
     if (!opts.sudoAuthorized) {
       throw new Error(
         `restart aborted: "${owner.unit}" is a SYSTEM unit and requires ` +
-        `"sudo systemctl restart ${owner.unit}", but that specific command is not authorized ` +
-        `non-interactively ("sudo -n -l systemctl restart ${owner.unit}" failed). Run it manually ` +
-        `and re-run the upgrade, or grant it explicitly (e.g. "deploy ALL=(root) NOPASSWD: ` +
-        `/bin/systemctl restart ${owner.unit}") — restarting the user-level unit instead would ` +
-        `repeat issue #215.`
+        `"sudo systemctl restart -- ${owner.unit}", but that specific command is not authorized ` +
+        `non-interactively ("sudo -n -l systemctl restart -- ${owner.unit}" failed). Run it ` +
+        `manually and re-run the upgrade, or grant it explicitly (e.g. "deploy ALL=(root) ` +
+        `NOPASSWD: /bin/systemctl restart -- ${owner.unit}") — restarting the user-level unit ` +
+        `instead would repeat issue #215.`
       );
     }
-    return { action: "system-unit", warnings, cmds: [{ cmd: `sudo systemctl restart ${owner.unit}`, label: "restart" }] };
+    return { action: "system-unit", warnings, cmds: [{ cmd: `sudo systemctl restart -- ${owner.unit}`, label: "restart" }] };
   }
 
   if (owner.kind === "user-unit") {
     if (!UNIT_NAME_RE.test(owner.unit)) {
       throw new Error(`restart aborted: resolved unit name "${owner.unit}" failed validation — refusing to shell out with it.`);
     }
-    return { action: "user-unit", warnings, cmds: [{ cmd: `systemctl --user restart ${owner.unit}`, label: "restart" }] };
+    return { action: "user-unit", warnings, cmds: [{ cmd: `systemctl --user restart -- ${owner.unit}`, label: "restart" }] };
   }
 
   throw new Error(`restart aborted: unrecognized owner.kind "${owner.kind}"`);

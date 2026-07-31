@@ -7872,7 +7872,7 @@ test("planRestart: mismatched system unit, root, restarts the RESOLVED unit with
   });
   const plan = planRestart(owner, { expectedUnit: "ocp-proxy.service", isRoot: true });
   assert.equal(plan.cmds.length, 1);
-  assert.equal(plan.cmds[0].cmd, "systemctl restart ocp.service");
+  assert.equal(plan.cmds[0].cmd, "systemctl restart -- ocp.service");
   assert.ok(plan.warnings.some(w => w.includes("ocp.service") && w.includes("#215")),
     "must name the resolved unit and cite #215 in the loud warning");
 });
@@ -7884,7 +7884,7 @@ test("planRestart: mismatched system unit, not root, sudo authorized for THIS co
     cgroupContent: "0::/system.slice/ocp.service\n",
   });
   const plan = planRestart(owner, { expectedUnit: "ocp-proxy.service", isRoot: false, sudoAuthorized: true });
-  assert.equal(plan.cmds[0].cmd, "sudo systemctl restart ocp.service");
+  assert.equal(plan.cmds[0].cmd, "sudo systemctl restart -- ocp.service");
 });
 
 test("MED-4: planRestart — system unit, not root, sudo NOT authorized for this specific command aborts with an actionable message", () => {
@@ -7962,8 +7962,8 @@ test("upgrade full path: mismatched system unit is restarted (not the hard-coded
     mockIsRoot: true,
   });
   const restartCmds = result.phases.filter(p => p.name === "restart").map(p => p.cmd);
-  assert.ok(restartCmds.includes("systemctl restart ocp.service"), `expected resolved-unit restart; got ${restartCmds.join(", ")}`);
-  assert.ok(!restartCmds.includes("systemctl --user restart ocp-proxy.service"), "must NOT restart the wrong hard-coded unit");
+  assert.ok(restartCmds.includes("systemctl restart -- ocp.service"), `expected resolved-unit restart; got ${restartCmds.join(", ")}`);
+  assert.ok(!restartCmds.includes("systemctl --user restart -- ocp-proxy.service"), "must NOT restart the wrong hard-coded unit");
   assert.ok(result.phases.some(p => p.name === "restart-resolve" && p.note.includes("#215")), "mismatch must surface loudly in phases");
 });
 
@@ -8044,7 +8044,7 @@ test("upgrade full path (no owner probe): still defaults to the historical Linux
     mockDoctor: { ready_to_upgrade: true, next_action: { kind: "upgrade" }, current_version: "v3.10.0", latest_version: "v3.14.0" },
   });
   const restartCmds = result.phases.filter(p => p.name === "restart").map(p => p.cmd);
-  assert.deepEqual(restartCmds, ["systemctl --user restart ocp-proxy.service"]);
+  assert.deepEqual(restartCmds, ["systemctl --user restart -- ocp-proxy.service"]);
 });
 
 test("upgrade full path (no owner probe): still defaults to the historical macOS bootout+bootstrap pair — backward compatible", async () => {
@@ -8094,7 +8094,7 @@ test("MED-6: injected runner — Linux path calls `ss`, not `lsof` (platform bra
     mockPlatform: "linux", mockIsRoot: true, run,
   });
   const restartCmds = result.phases.filter(p => p.name === "restart").map(p => p.cmd);
-  assert.deepEqual(restartCmds, ["systemctl restart ocp.service"]);
+  assert.deepEqual(restartCmds, ["systemctl restart -- ocp.service"]);
 });
 
 test("MED-6: injected runner — macOS path calls `lsof`, not `ss`", async () => {
@@ -8143,7 +8143,7 @@ test("MED-6: injected runner — real mismatch end to end (ss+cgroup text in, su
   const run = makeFakeRun({
     "ss -lptn": `LISTEN 0 511 0.0.0.0:3456 0.0.0.0:* users:(("node",pid=798931,fd=19))`,
     "cat /proc/798931/cgroup": "0::/system.slice/ocp.service\n",
-    "sudo -n -l systemctl restart ocp.service": "systemctl restart ocp.service",
+    "sudo -n -l systemctl restart -- ocp.service": "systemctl restart -- ocp.service",
   });
   const result = await runUpgrade({
     yes: true, dryRun: false, mockExec: true,
@@ -8151,14 +8151,14 @@ test("MED-6: injected runner — real mismatch end to end (ss+cgroup text in, su
     mockPlatform: "linux", mockIsRoot: false, run,
   });
   const restartCmds = result.phases.filter(p => p.name === "restart").map(p => p.cmd);
-  assert.deepEqual(restartCmds, ["sudo systemctl restart ocp.service"]);
+  assert.deepEqual(restartCmds, ["sudo systemctl restart -- ocp.service"]);
 });
 
 test("MED-4 wiring: injected runner — sudo -n -l denies THIS specific command → refuses (not a generic sudo -n true probe)", async () => {
   const run = makeFakeRun({
     "ss -lptn": `LISTEN 0 511 0.0.0.0:3456 0.0.0.0:* users:(("node",pid=798931,fd=19))`,
     "cat /proc/798931/cgroup": "0::/system.slice/ocp.service\n",
-    "sudo -n -l systemctl restart ocp.service": new Error("sudo: a password is required"),
+    "sudo -n -l systemctl restart -- ocp.service": new Error("sudo: a password is required"),
   });
   await assert.rejects(async () => {
     await runUpgrade({
@@ -8181,7 +8181,7 @@ test("MED-4 wiring: uid===0 short-circuits sudo entirely — no sudo probe run, 
     mockPlatform: "linux", mockIsRoot: true, run,
   });
   const restartCmds = result.phases.filter(p => p.name === "restart").map(p => p.cmd);
-  assert.deepEqual(restartCmds, ["systemctl restart ocp.service"]);
+  assert.deepEqual(restartCmds, ["systemctl restart -- ocp.service"]);
 });
 
 console.log("\nRestart-unit resolution (issue #215) — MED-8: rollback must not restart config it never restored:");
@@ -8243,6 +8243,181 @@ test("rollback path: no-unit aborts the rollback with the same actionable messag
       },
     });
   }, /not managed by any systemd unit/);
+});
+
+console.log("\nRestart-unit resolution (issue #215) — round-2 review: HIGH-A, MED-C, MED-D, MED-E, MED-F:");
+
+// ── HIGH-A: rollback must not refuse forever on "not-listening" ──
+
+test("HIGH-A: planRestart — rollback (allowNotListeningFallback) falls back to the default USER unit on Linux, with a loud warning", () => {
+  const owner = { kind: "not-listening", platform: "linux", pid: null, unit: null, mismatched: false };
+  const plan = planRestart(owner, { expectedUnit: "ocp-proxy.service", allowNotListeningFallback: true });
+  assert.equal(plan.cmds.length, 1);
+  assert.equal(plan.cmds[0].cmd, "systemctl --user restart -- ocp-proxy.service");
+  assert.ok(plan.warnings.some(w => w.includes("nothing was listening")),
+    "must warn loudly rather than silently falling back");
+});
+
+test("HIGH-A: planRestart — rollback (allowNotListeningFallback) falls back to the launchd bootout+bootstrap pair on macOS", () => {
+  const owner = { kind: "not-listening", platform: "darwin", pid: null, unit: null, mismatched: false };
+  const plan = planRestart(owner, { expectedUnit: "dev.ocp.proxy", plistPath: "/tmp/dev.ocp.proxy.plist", allowNotListeningFallback: true });
+  assert.equal(plan.cmds.length, 2);
+  assert.ok(plan.cmds[0].cmd.includes("launchctl bootout"));
+  assert.ok(plan.cmds[1].cmd.includes("launchctl bootstrap") && plan.cmds[1].cmd.includes("/tmp/dev.ocp.proxy.plist"));
+  assert.ok(plan.warnings.some(w => w.includes("nothing was listening")));
+});
+
+test("HIGH-A: planRestart — WITHOUT allowNotListeningFallback (the default; the upgrade path), not-listening still refuses (regression guard)", () => {
+  const owner = { kind: "not-listening", platform: "linux", pid: null, unit: null, mismatched: false };
+  assert.throws(() => planRestart(owner, { expectedUnit: "ocp-proxy.service" }), /nothing is currently listening/);
+});
+
+test("HIGH-A wiring: rollback with nothing listening on the port PROCEEDS instead of refusing forever (runUpgrade({rollback:true}) end to end)", async () => {
+  // Before this fix: identical to the upgrade-path refusal, and re-running hit the exact same
+  // "nothing is listening" state forever — the down service IS the reason to roll back.
+  const result = await runUpgrade({
+    rollback: true, yes: true, mockExec: true,
+    mockPlatform: "linux",
+    mockSnapshots: [{ name: "upgrade-snapshot-2026-05-11T08:30:00Z", path: "/tmp/snap-x" }],
+    mockSnapshotMeta: { fromCommit: "abc1234", fromVersion: "v3.10.0", toVersion: "v3.14.0", path: "/tmp/snap-x" },
+    mockOwnerProbe: { ssOutput: "" }, // ran cleanly, confirmed nothing listening — the down-service rollback case
+  });
+  const restartCmds = result.phases.filter(p => p.name === "restart").map(p => p.cmd);
+  assert.deepEqual(restartCmds, ["systemctl --user restart -- ocp-proxy.service"]);
+  assert.ok(result.phases.some(p => p.name === "restart-resolve" && p.note.includes("nothing was listening")),
+    "the fallback must surface loudly in phases, not silently");
+});
+
+// ── MED-C: UNIT_NAME_RE must reject a leading "-" (argv injection, not just shell metacharacters) ──
+
+test("MED-C: parseCgroupUnit rejects a leading-dash unit segment — never resolves it as a restart target", () => {
+  // "-Hattacker@example.com.service" would otherwise become `systemctl restart -Hattacker@...`,
+  // and systemctl's getopt-style parser reads a leading-dash argv word as an OPTION regardless
+  // of its position — -H/--host connects over SSH to an attacker-chosen target.
+  const cgroup = "0::/system.slice/-Hattacker@example.com.service\n";
+  const result = parseCgroupUnit(cgroup);
+  assert.notEqual(result.state, "resolved", "a leading-dash segment must never resolve to a restart target");
+  assert.equal(result.unit, null);
+});
+
+test("MED-C: parseCgroupUnit rejects a leading-dash '-M' (machine) segment too, not just '-H' (host)", () => {
+  const cgroup = "0::/system.slice/-Mevil.service\n";
+  const result = parseCgroupUnit(cgroup);
+  assert.notEqual(result.state, "resolved");
+  assert.equal(result.unit, null);
+});
+
+test("MED-C: planRestart re-validates and rejects a leading-dash unit name at the shell-out boundary (defense in depth, mirrors MED-5)", () => {
+  const userOwner = { kind: "user-unit", platform: "linux", pid: "1", unit: "-Hattacker@example.com.service", mismatched: false };
+  assert.throws(() => planRestart(userOwner, { expectedUnit: "ocp-proxy.service" }), /failed validation/);
+
+  const systemOwner = { kind: "system-unit", platform: "linux", pid: "1", unit: "-Mevil.service", mismatched: false };
+  assert.throws(() => planRestart(systemOwner, { expectedUnit: "ocp-proxy.service", isRoot: true }), /failed validation/);
+});
+
+// ── MED-D: SO_REUSEPORT (multiple PIDs in ONE ss row) must be "unknown", same as dual-stack ──
+
+test("MED-D: classifySsListener — SO_REUSEPORT (two PIDs inside ONE row's users:(()) group) → unknown, not the first PID picked arbitrarily", () => {
+  // The bug: `line.match(/pid=(\d+)/)` is non-global, so only the FIRST "pid=" per line was
+  // ever collected — this exact shape (one row, multiple processes sharing the port via
+  // SO_REUSEPORT) silently resolved to {state:"listening", pid:"100"} pre-fix. Dual-stack
+  // (separate rows, already covered above at "two distinct PIDs...") was never affected.
+  const ss = `LISTEN 0 511 0.0.0.0:3456 0.0.0.0:* users:(("node",pid=100,fd=19),("node",pid=101,fd=19))`;
+  const result = classifySsListener(ss);
+  assert.equal(result.state, "unknown");
+  assert.ok(result.reason.includes("100") && result.reason.includes("101"),
+    `reason should name both PIDs; got: ${result.reason}`);
+});
+
+// ── MED-E: rollback's daemon-reload must be best-effort, and only when it's about to restart ──
+// ── the USER-scope unit rollback actually restores ──
+
+test("MED-E: rollback's daemon-reload FAILURE is best-effort — the rollback still proceeds to restart, not aborted", async () => {
+  const run = () => { throw new Error("Failed to connect to bus: No such file or directory (no XDG_RUNTIME_DIR)"); };
+  const result = await runUpgrade({
+    rollback: true, yes: true, mockExec: true, run,
+    mockPlatform: "linux",
+    mockSnapshots: [{ name: "upgrade-snapshot-2026-05-11T08:30:00Z", path: "/tmp/snap-x" }],
+    mockSnapshotMeta: { fromCommit: "abc1234", fromVersion: "v3.10.0", toVersion: "v3.14.0", path: "/tmp/snap-x" },
+    mockOwnerProbe: {
+      ssOutput: `LISTEN 0 511 127.0.0.1:3456 0.0.0.0:* users:(("node",pid=888736,fd=19))`,
+      cgroupContent: "0::/user.slice/user-1000.slice/user@1000.service/app.slice/ocp-proxy.service\n",
+    },
+  });
+  const reloadPhase = result.phases.find(p => p.name === "daemon-reload");
+  assert.ok(reloadPhase, "daemon-reload must still be attempted");
+  assert.equal(reloadPhase.status, "warn", "a failed daemon-reload must be logged as a WARNING, not abort the rollback");
+  const restartCmds = result.phases.filter(p => p.name === "restart").map(p => p.cmd);
+  assert.deepEqual(restartCmds, ["systemctl --user restart -- ocp-proxy.service"],
+    "rollback must still proceed to restart despite daemon-reload failing");
+});
+
+test("MED-E: rollback's daemon-reload is never attempted when the resolved owner is a SYSTEM unit (the refusal short-circuits first)", async () => {
+  let caught = null;
+  try {
+    await runUpgrade({
+      rollback: true, yes: true, mockExec: true,
+      mockPlatform: "linux", mockIsRoot: true,
+      mockSnapshots: [{ name: "upgrade-snapshot-2026-05-11T08:30:00Z", path: "/tmp/snap-x" }],
+      mockSnapshotMeta: { fromCommit: "abc1234", fromVersion: "v3.10.0", toVersion: "v3.14.0", path: "/tmp/snap-x" },
+      mockOwnerProbe: {
+        ssOutput: `LISTEN 0 511 0.0.0.0:3456 0.0.0.0:* users:(("node",pid=798931,fd=19))`,
+        cgroupContent: "0::/system.slice/ocp.service\n",
+      },
+    });
+  } catch (e) {
+    caught = e;
+  }
+  assert.ok(caught, "rollback must reject for a SYSTEM unit");
+  assert.ok(!caught.phases.some(p => p.name === "daemon-reload"),
+    "daemon-reload must not appear at all — the refusal happens before it would run");
+});
+
+// ── MED-F: the SYSTEM-unit rollback refusal must say the tree already moved + the exact command ──
+
+test("MED-F: rollback's SYSTEM-unit refusal names the exact from-commit and the exact manual restart command (sudo-prefixed when not root)", async () => {
+  let caught = null;
+  try {
+    await runUpgrade({
+      rollback: true, yes: true, mockExec: true,
+      mockPlatform: "linux", mockIsRoot: false, mockSudoAuthorized: true,
+      mockSnapshots: [{ name: "upgrade-snapshot-2026-05-11T08:30:00Z", path: "/tmp/snap-x" }],
+      mockSnapshotMeta: { fromCommit: "deadbee123", fromVersion: "v3.10.0", toVersion: "v3.14.0", path: "/tmp/snap-x" },
+      mockOwnerProbe: {
+        ssOutput: `LISTEN 0 511 0.0.0.0:3456 0.0.0.0:* users:(("node",pid=798931,fd=19))`,
+        cgroupContent: "0::/system.slice/ocp.service\n",
+      },
+    });
+  } catch (e) {
+    caught = e;
+  }
+  assert.ok(caught);
+  assert.ok(caught.message.includes("deadbee123"),
+    "must name the exact commit the working tree was already rolled back to");
+  assert.ok(caught.message.includes("sudo systemctl restart -- ocp.service"),
+    "must print the exact manual command to run, matching the upgrade-path refusals' own posture");
+});
+
+test("MED-F: rollback's SYSTEM-unit refusal recommends a bare (no-sudo) command when the caller is already root", async () => {
+  let caught = null;
+  try {
+    await runUpgrade({
+      rollback: true, yes: true, mockExec: true,
+      mockPlatform: "linux", mockIsRoot: true,
+      mockSnapshots: [{ name: "upgrade-snapshot-2026-05-11T08:30:00Z", path: "/tmp/snap-x" }],
+      mockSnapshotMeta: { fromCommit: "deadbee123", fromVersion: "v3.10.0", toVersion: "v3.14.0", path: "/tmp/snap-x" },
+      mockOwnerProbe: {
+        ssOutput: `LISTEN 0 511 0.0.0.0:3456 0.0.0.0:* users:(("node",pid=798931,fd=19))`,
+        cgroupContent: "0::/system.slice/ocp.service\n",
+      },
+    });
+  } catch (e) {
+    caught = e;
+  }
+  assert.ok(caught);
+  assert.ok(caught.message.includes("systemctl restart -- ocp.service"));
+  assert.ok(!caught.message.includes("sudo systemctl restart -- ocp.service"),
+    "already root must not be told to prefix the manual command with sudo");
 });
 
 runAsyncTests().then(() => Promise.all(pendingAsync)).then(() => {

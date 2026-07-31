@@ -83,13 +83,18 @@ macOS) instead of restarting a hard-coded name — see
 can't tell what owns the port, or what it can tell makes restarting unsafe,
 **it refuses rather than guesses**:
 
+**On `--rollback` these refusals differ in one place**: "nothing is currently
+listening" is a refusal on `ocp update`, but a warning-then-proceed on
+`--rollback` — see the note in the table below. The other four are refusals
+on both paths.
+
 | Message contains | Meaning | What to do |
 |---|---|---|
-| `could not determine what ... owns the OCP port` | The listener's owning PID isn't attributable (e.g. `ocp update` run by a different user than a `User=`-less system unit), a tool is missing, or multiple PIDs answer the same port. | Re-run with elevated privileges, or check `ss -lptn` / `lsof -iTCP` / `cat /proc/<pid>/cgroup` manually. |
+| `could not determine what ... owns the OCP port` | The listener's owning PID isn't attributable (e.g. `ocp update` run by a different user than a `User=`-less system unit), a tool is missing, or multiple PIDs answer the same port — across separate rows (dual-stack) or within one row (`SO_REUSEPORT`). | Re-run with elevated privileges, or check `ss -lptn` / `lsof -iTCP` / `cat /proc/<pid>/cgroup` manually. |
 | `not managed by any systemd unit` | A PID holds the port but isn't in any systemd cgroup (a bare `node server.mjs`). | Stop that PID manually, or bring it under systemd, then re-run. |
-| `nothing is currently listening` | Nothing is bound to the port at all. Deliberately **not** auto-started: if the real production unit is a SYSTEM unit that happens to be down, silently starting the default (often loopback-only) unit would pass post-flight — which only checks `127.0.0.1` — while the host loses LAN reachability. | Start the intended unit manually, confirm it's the one you expect, then re-run. |
-| `requires "sudo systemctl restart <unit>"` | The port is owned by a SYSTEM unit and non-interactive sudo isn't authorized for that specific command. | Run the printed `sudo systemctl restart <unit>` manually, or grant it explicitly (e.g. `deploy ALL=(root) NOPASSWD: /bin/systemctl restart <unit>`), then re-run. |
-| `rollback only restores the launchd plist and the USER-scope systemd unit file` | Rollback resolved the port to a SYSTEM unit, but rollback (see `scripts/lib/snapshot.mjs`) never captured or restores that unit's config. | Roll back the system unit's config manually if it needs it, then restart it yourself. |
+| `nothing is currently listening` | Nothing is bound to the port at all. On `ocp update`, deliberately **not** auto-started: if the real production unit is a SYSTEM unit that happens to be down, silently starting the default (often loopback-only) unit would pass post-flight — which only checks `127.0.0.1` — while the host loses LAN reachability. **On `--rollback`, this is NOT a refusal** — restoring a down service is the point of a rollback, there's no post-flight check to protect, and refusing would leave the rollback stuck forever on a re-run. Rollback proceeds to start the default unit (the one its own snapshot restores) with a loud `[restart] WARNING` instead. | On `ocp update`: start the intended unit manually, confirm it's the one you expect, then re-run. On `--rollback`: nothing to do — it already proceeded; check the warning names the right unit. |
+| `requires "sudo systemctl restart -- <unit>"` | The port is owned by a SYSTEM unit and non-interactive sudo isn't authorized for that specific command. | Run the printed `sudo systemctl restart -- <unit>` manually, or grant it explicitly (e.g. `deploy ALL=(root) NOPASSWD: /bin/systemctl restart -- <unit>`), then re-run. |
+| `rollback only restores the launchd plist and the USER-scope systemd unit file` | `--rollback` resolved the port to a SYSTEM unit. Rollback (see `scripts/lib/snapshot.mjs`) never captured or restores that unit's OWN config, so that part of the refusal stands — but the message also names the exact commit the working tree was already rolled back to and the exact manual restart command, since on a host where that unit runs from the same working tree (common — see issue #215), the code-level rollback is otherwise complete. | Run the printed manual restart command; separately roll back the system unit's own config by hand if that also needs it. |
 
 If the resolved unit differs from the expected default, that's surfaced
 loudly (both on stderr and in the `restart-resolve` phase entry) rather than
@@ -97,6 +102,18 @@ restarted silently — this is the fix for
 [issue #215](https://github.com/dtzp555-max/ocp/issues/215): a hard-coded
 restart target left an orphan `server.mjs` running when the real owner
 differed.
+
+**On safety of re-running**: none of the cases above leave an orphan process
+behind — nothing new starts until a plan gets past every check above. The
+working tree, however, has typically already moved by the time any of these
+fire: `ocp update`'s full-upgrade path has already done the git checkout,
+`npm install`, and `setup.mjs --reconfigure-only` (which, since
+[#226](https://github.com/dtzp555-max/ocp/issues/226), only writes the
+service unit/plist and never enables-at-boot or starts anything, so it can't
+create an orphan either); `--rollback` has already done the git checkout to
+the snapshot's from-commit, the config-file restore, and `npm install`. So
+re-running is safe from a corruption standpoint, but you're re-running
+against the tree these phases already produced, not your original one.
 
 ## OpenClaw Auto-Sync (v3.11.0+)
 

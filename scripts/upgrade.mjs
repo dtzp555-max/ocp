@@ -52,7 +52,7 @@ function execRun(cmd) {
 // launchd plist and the USER-scope systemd unit file — never a SYSTEM unit's config, and
 // issues no daemon-reload for one either. If resolution finds the port owned by a system
 // unit, rollback must refuse rather than restart config it never touched.
-function resolveRestartPlan({ opts, port, isRollback = false }) {
+function resolveRestartPlan({ opts, port, isRollback = false, fromCommit = null }) {
   const platform = opts.mockPlatform || process.platform;
   const expectedUnit = platform === "darwin" ? "dev.ocp.proxy" : "ocp-proxy.service";
   const run = opts.run || execRun;
@@ -99,7 +99,11 @@ function resolveRestartPlan({ opts, port, isRollback = false }) {
   if (sudoAuthorized === undefined && owner.kind === "system-unit" && !isRoot) {
     const isBareProduction = !opts.run && !opts.mockExec && !opts.mockOwnerProbe;
     if (opts.run || isBareProduction) {
-      try { run(`sudo -n -l systemctl restart ${owner.unit}`); sudoAuthorized = true; }
+      // MED-C (PR #221 round-2 review): "--" matches the actual restart command's shape
+      // (scripts/lib/restart-unit.mjs's planRestart) — a sudoers rule authorizing one must
+      // authorize the other, and a leading-dash unit name must not be read as another sudo/
+      // systemctl option here either.
+      try { run(`sudo -n -l systemctl restart -- ${owner.unit}`); sudoAuthorized = true; }
       catch { sudoAuthorized = false; }
     } else {
       // Mocked/test context with no injected runner and no explicit answer — never shell
@@ -109,13 +113,27 @@ function resolveRestartPlan({ opts, port, isRollback = false }) {
   }
 
   if (isRollback && owner.kind === "system-unit") {
+    // MED-F (PR #221 round-2 review): this refusal is still correct — rollback never restored
+    // this unit's OWN config (bind address, environment; see scripts/lib/snapshot.mjs), so
+    // restarting it would not, by itself, prove the rollback landed. But the original message
+    // stopped short of telling the operator what it DOES know: the `git-checkout` phase (which
+    // ran before this check, unconditionally) already moved the working tree to fromCommit, and
+    // on a host shaped like issue #215's own — both units pointing at that SAME working tree —
+    // that IS the code this unit runs; only its own config was left untouched. Naming the exact
+    // manual command matches the posture the upgrade-path refusals already take (see planRestart's
+    // "requires sudo systemctl restart" message) instead of leaving the operator to derive it.
+    const manualCmd = isRoot ? `systemctl restart -- ${owner.unit}` : `sudo systemctl restart -- ${owner.unit}`;
     throw new Error(
       `rollback aborted: the OCP port is owned by a SYSTEM unit ("${owner.unit}"), but rollback only ` +
       `restores the launchd plist and the USER-scope systemd unit file ` +
       `(~/.config/systemd/user/ocp-proxy.service — see scripts/lib/snapshot.mjs). It never touched ` +
-      `this unit's config, so restarting it here would not apply the rollback and could mask that ` +
-      `the rollback didn't reach the running service. Roll back "${owner.unit}" manually if it needs ` +
-      `it too.`
+      `this unit's OWN config, so this refusal stands for that config. However: the working tree ` +
+      `has ALREADY been rolled back to ${fromCommit || "the snapshot's from-commit"} (the ` +
+      `git-checkout phase, which ran before this check) — if "${owner.unit}" runs from that same ` +
+      `tree (the common shape: one working tree, two units differing only in bind/env — see issue ` +
+      `#215's own host), the rollback is otherwise complete and only a restart is outstanding. Run ` +
+      `\`${manualCmd}\` manually to pick that up; separately revert "${owner.unit}"'s own config by ` +
+      `hand if it also needs to change.`
     );
   }
 
@@ -124,6 +142,12 @@ function resolveRestartPlan({ opts, port, isRollback = false }) {
     isRoot,
     sudoAuthorized,
     plistPath: join(homedir(), "Library", "LaunchAgents", "dev.ocp.proxy.plist"),
+    // HIGH-A (PR #221 round-2 review): scope the "not-listening" refusal to the upgrade path.
+    // Rollback's whole point is restoring a down service, it has no doctor health gate to
+    // protect (see runUpgrade: "no doctor needed; snapshot is authoritative"), and refusing here
+    // left rollback permanently stuck — re-running hits this identical state forever. See
+    // scripts/lib/restart-unit.mjs's planRestart for the fallback itself.
+    allowNotListeningFallback: isRollback,
   });
   return { owner, plan };
 }
@@ -476,26 +500,15 @@ async function runRollback(opts) {
 
   exec(`npm --prefix ${ocpDir} install --no-audit --no-fund`, "npm-install");
 
-  // MED-8 (PR #221 review): the just-restored ~/.config/systemd/user/ocp-proxy.service is a
-  // unit-FILE change, not just an EnvironmentFile edit — systemd caches the parsed unit
-  // definition and does not pick up file content changes on `restart` alone. This exact
-  // requirement is documented at docs/runbooks/tui-flip-rollback.md:13 and already followed
-  // by setup.mjs (which calls the same command right after writing this same file). Skipped
-  // on darwin, where there is no systemd unit to reload — only the plist, which bootout+
-  // bootstrap already re-reads in full.
-  const rollbackPlatform = opts.mockPlatform || process.platform;
-  if (rollbackPlatform !== "darwin") {
-    exec(`systemctl --user daemon-reload`, "daemon-reload");
-  }
-
   if (!opts.mockExec) {
     console.error(`[heads-up] restarting OCP service in 3s — expect ~5–10s blip on requests in flight.`);
     await new Promise(r => setTimeout(r, 3000));
   }
+  const rollbackPlatform = opts.mockPlatform || process.platform;
   const rollbackPort = process.env.CLAUDE_PROXY_PORT || String(DEFAULT_PORT);
   let restartPlan;
   try {
-    restartPlan = resolveRestartPlan({ opts, port: rollbackPort, isRollback: true });
+    restartPlan = resolveRestartPlan({ opts, port: rollbackPort, isRollback: true, fromCommit: meta.fromCommit });
   } catch (err) {
     phases.push({ name: "restart", status: "fail", stderr: err.message });
     throw Object.assign(
@@ -503,6 +516,46 @@ async function runRollback(opts) {
       { phases, target: target.path }
     );
   }
+
+  // MED-8 (PR #221 review): the just-restored ~/.config/systemd/user/ocp-proxy.service is a
+  // unit-FILE change, not just an EnvironmentFile edit — systemd caches the parsed unit
+  // definition and does not pick up file content changes on `restart` alone. This exact
+  // requirement is documented at docs/runbooks/tui-flip-rollback.md:13 and already followed
+  // by setup.mjs (which calls the same command right after writing this same file).
+  //
+  // MED-E (PR #221 round-2 review): this used to run UNCONDITIONALLY on every non-darwin
+  // rollback, BEFORE resolution — even when the resolved owner turned out to be a system unit
+  // (whose config this daemon-reload has nothing to do with, and where the very next step
+  // refuses anyway) and even as a hard failure that could abort the whole rollback. `systemctl
+  // --user` needs a running user manager + XDG_RUNTIME_DIR, which a root or non-login-session
+  // rollback (the #215 host's own shape) may not have — it died here with "rollback phase
+  // daemon-reload failed" before ever reaching the informative refusal the operator actually
+  // needed to see. Now: gated on actually being about to restart the USER-scope unit rollback
+  // restores (the only case this command is even relevant to), computed AFTER resolution so it
+  // never runs ahead of a refusal, and best-effort (a failure here is logged and the restart
+  // attempt still proceeds — losing the "picks up the freshly-restored unit file" guarantee is
+  // strictly better than aborting a rollback over it).
+  if (restartPlan.plan.action === "user-unit" && rollbackPlatform !== "darwin") {
+    // Same opts.run seam as resolveRestartPlan's own gathering code (mockExec-without-run is
+    // "skip everything, this is a bookkeeping-only test"; an explicit opts.run means a test
+    // wants to drive THIS specific command end to end without touching git/npm/the real
+    // restart too — matching the convention MED-6 established rather than adding a third,
+    // narrower mock flag).
+    if (opts.mockExec && !opts.run) {
+      phases.push({ name: "daemon-reload", cmd: "systemctl --user daemon-reload", status: "skipped-mock" });
+    } else {
+      const run = opts.run || execRun;
+      try {
+        run(`systemctl --user daemon-reload`);
+        phases.push({ name: "daemon-reload", cmd: "systemctl --user daemon-reload", status: "ok" });
+      } catch (err) {
+        const detail = err.stderr?.toString().trim() || err.message;
+        phases.push({ name: "daemon-reload", cmd: "systemctl --user daemon-reload", status: "warn", stderr: detail });
+        console.error(`[rollback] warn: daemon-reload failed (best-effort, continuing): ${detail}`);
+      }
+    }
+  }
+
   for (const w of restartPlan.plan.warnings) {
     console.error(w);
     phases.push({ name: "restart-resolve", status: "warn", note: w });
