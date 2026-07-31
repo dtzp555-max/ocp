@@ -7625,6 +7625,14 @@ test("LOW-2 (real shell, verified mechanism): ocp's doctor-check-surfacing block
     const out = execFileSync("bash", [scriptPath], { encoding: "utf8", env: childEnv });
     assert.ok(out.includes("REACHED_AFTER_BLOCK"),
       "cmd_update must survive past this block even when stdout can't encode the glyphs — set -e must not silently kill it");
+      // Surviving is not enough: errors="replace" must DEGRADE the output (glyph -> "?"), not
+      // swallow it. Without this a "fix" that emitted nothing would pass. It also stops the test
+      // going silently vacuous if the fixture ever gains a non-ASCII character: PYTHONIOENCODING
+      // =ascii is stricter on stdin than any real locale, so json.load() would raise, the
+      // pre-existing `except Exception: sys.exit(0)` would swallow it, and REACHED_AFTER_BLOCK
+      // would still print with nothing proven. (#230 review round 4.)
+      assert.ok(out.includes("warn msg") && out.includes("info msg"),
+        "the messages must still be printed, degraded — surviving while emitting nothing is not the fix");
   } finally {
     rmSync(scratch, { recursive: true, force: true });
   }
