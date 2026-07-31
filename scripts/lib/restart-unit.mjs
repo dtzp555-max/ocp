@@ -87,6 +87,38 @@
  * evidence and the resulting three-way split) — this function's job is just to forward the
  * cross-check's result through to it via `probe.netstatConfirmsListener` /
  * `probe.netstatProbeFailed`.
+ *
+ * Issue #237 (independent review of the `v3.26.0..main` batch, filed alongside #234) found a
+ * different kind of gap than any of the four above: every prior fix made the resolver more
+ * HONEST about what it found, but never verified that what it found is actually OCP. Once
+ * `parseCgroupUnit` resolves a real, well-formed systemd unit name, `resolveOwningUnit` only ever
+ * compares that NAME against the hard-coded `expectedUnit` — a mismatch (`owner.mismatched`)
+ * produces a WARNING in `planRestart`, never a refusal. A port misconfigured onto a port some
+ * unrelated systemd-managed service already holds (`nginx.service`, say) resolves exactly like a
+ * legitimate but renamed OCP unit does: `kind: "system-unit"`, a real unit name, `mismatched:
+ * true`. `planRestart` then proceeds to build `sudo systemctl restart -- nginx.service`. This is
+ * the safety INVERSE of #215: #215 restarted the wrong thing because the resolver GUESSED at an
+ * identity it had no basis for; #237 restarts the wrong thing because the resolver correctly
+ * identifies a real unit that simply isn't ours, and acts on that identification anyway.
+ *
+ * Fix: `classifyCmdlineOwner` reads `/proc/<pid>/cmdline` (NUL-separated argv) for the SAME PID
+ * the cgroup probe already resolved — gathered in the same probe pass in scripts/upgrade.mjs's
+ * `resolveRestartPlan`, no separate resolution round-trip — and checks whether that process
+ * actually invokes `server.mjs`, mirroring scripts/doctor.mjs's own #230 `fingerprintSystemdUnit`
+ * serverArg check so the two "is this an OCP unit" tests can't drift apart. A CONFIRMED-foreign
+ * process (cmdline read cleanly, no server.mjs anywhere in it) short-circuits `resolveOwningUnit`
+ * straight to a new terminal `kind: "foreign-process"`, which `planRestart` refuses
+ * unconditionally — before ever reaching the mismatch-warning/sudo/system-unit machinery below,
+ * regardless of root or sudo authorization. An UNREADABLE cmdline (permission denied, PID raced)
+ * is `kind: "unknown"`, the same fail-closed terminal state every other probe failure in this file
+ * already uses — never treated as "confirmed foreign" (a false-confident answer) nor silently
+ * skipped (which would defeat the point of the check).
+ *
+ * Deliberately NOT covered by this fix (same "minimum reviewable unit" posture as defect 2 in the
+ * THIRD review above): macOS. `/proc/<pid>/cmdline` doesn't exist there, and the darwin branch
+ * below still returns `kind: "launchd"` for any confirmed listener without identifying the actual
+ * process at all (issue #233 defect 2, already tracked as its own follow-up) — extending identity
+ * verification to macOS is that same follow-up's job, not this one's.
  */
 
 // Anything accepted as a restart target must look like a real systemd unit name.
@@ -303,6 +335,51 @@ export function parseCgroupUnit(cgroupContent) {
   return { state: "no-unit", scope: null, unit: null, reason: "no cgroup line yielded a recognizable systemd unit" };
 }
 
+// --- Linux: classify /proc/<pid>/cmdline content as OCP's own server.mjs, or a foreign process ---
+// (issue #237)
+//
+// parseCgroupUnit answers "what UNIT owns this port" — never "is the process behind that unit
+// actually OCP's server.mjs". A well-formed, real systemd unit name (nginx.service, say) resolves
+// cleanly through parseCgroupUnit exactly like a legitimately-renamed OCP unit does; nothing in
+// that resolution path can tell the two apart. classifyCmdlineOwner reads /proc/<pid>/cmdline for
+// the SAME pid parseCgroupUnit's cgroup content came from (NUL-separated argv — not
+// space-separated, so a path containing a literal space is never misread as two tokens) and
+// checks whether that process actually invokes server.mjs, using the exact same test
+// scripts/doctor.mjs's #230 fingerprintSystemdUnit already uses for its own ExecStart argv[]
+// check (`a === "server.mjs" || a.endsWith("/server.mjs")`) — so "doctor.mjs would recognize this
+// as an OCP unit" and "this resolver treats it as a restart candidate" can't silently drift apart
+// into two different definitions of the same question.
+//
+// Returns one of three states — same "unknown must never be treated as safe-to-guess" posture as
+// every other classifier in this file:
+//   "ocp"      cmdline contains an argv token that is exactly "server.mjs" or ends with
+//              "/server.mjs".
+//   "foreign"  cmdline was read successfully and contains NO such token — a confident, positive
+//              "this is not us" signal (the nginx.service scenario issue #237 reports).
+//   "unknown"  /proc/<pid>/cmdline could not be read at all (permission denied — a non-root
+//              updater probing a root-owned PID under hidepid=2, the same gap parseCgroupUnit's
+//              own "unknown" state exists for — or the PID exited between the cgroup read and
+//              this one). Must NOT be read as "foreign": a false-confident "definitely not OCP"
+//              diagnosis on a process we simply couldn't inspect is exactly the wrong-but-
+//              confident answer this file's classifiers all exist to eliminate.
+export function classifyCmdlineOwner(cmdlineContent) {
+  if (cmdlineContent == null) {
+    return { state: "unknown", reason: "could not read /proc/<pid>/cmdline (permission denied, or the process exited between probes)" };
+  }
+  const argv = String(cmdlineContent).split("\0").filter(Boolean);
+  if (argv.length === 0) {
+    return { state: "unknown", reason: "empty /proc/<pid>/cmdline read" };
+  }
+  const serverArg = argv.find(a => a === "server.mjs" || a.endsWith("/server.mjs"));
+  if (!serverArg) {
+    return {
+      state: "foreign",
+      reason: `owning process's argv (${argv.join(" ")}) does not invoke server.mjs at all — this is not an OCP process`,
+    };
+  }
+  return { state: "ocp", reason: null };
+}
+
 /**
  * Resolve the owner of `probe.platform`'s OCP port from already-collected raw
  * command output. Never shells out — pass real output in from the caller.
@@ -322,17 +399,32 @@ export function parseCgroupUnit(cgroupContent) {
  *   netstatProbeFailed       macOS only: the netstat cross-check itself could not run
  *   cgroupContent  raw `/proc/<pid>/cgroup` content for the resolved PID, or
  *                   null if unreadable (Linux)
+ *   cmdlineContent raw `/proc/<pid>/cmdline` content for the resolved PID (Linux only; issue
+ *                   #237). Three states, same convention as cgroupContent:
+ *                     a string     classified via classifyCmdlineOwner
+ *                     null         the probe was ATTEMPTED and failed to read — treated as
+ *                                  "unknown" (see classifyCmdlineOwner)
+ *                     undefined    the caller never attempted this probe at all — the check is
+ *                                  SKIPPED entirely, preserving pre-#237 behavior. This is the
+ *                                  legacy/back-compat lane: scripts/upgrade.mjs's own gather
+ *                                  layer always populates this field one way or another now, so
+ *                                  in real production use it is a string or null, never
+ *                                  undefined — "undefined" only arises from a caller (or test)
+ *                                  that hasn't been wired to this check, and must not newly
+ *                                  refuse restarts that were safe before this field existed.
  *
  * Returns { kind, platform, pid, unit, scope?, mismatched, reason? }, kind one of:
- *   "system-unit"    Linux, port owned by a system-scope systemd unit
- *   "user-unit"      Linux, port owned by a user-scope systemd unit
- *   "launchd"        macOS, port is held by a process (launchd is the only
- *                    restart mechanism this repo drives on macOS)
- *   "no-unit"        Linux, a PID holds the port but isn't in any systemd unit
- *                    (a bare `node server.mjs`, most likely)
- *   "not-listening"  the tool ran cleanly and found nothing bound to the port
- *   "unknown"        could not determine ownership (see `reason`) — must never
- *                     be treated as equivalent to "not-listening"
+ *   "system-unit"      Linux, port owned by a system-scope systemd unit
+ *   "user-unit"        Linux, port owned by a user-scope systemd unit
+ *   "launchd"          macOS, port is held by a process (launchd is the only
+ *                      restart mechanism this repo drives on macOS)
+ *   "no-unit"          Linux, a PID holds the port but isn't in any systemd unit
+ *                      (a bare `node server.mjs`, most likely)
+ *   "foreign-process"  Linux, a real systemd unit owns the port but its process is CONFIRMED not
+ *                      to be OCP's server.mjs (issue #237 — e.g. nginx.service)
+ *   "not-listening"    the tool ran cleanly and found nothing bound to the port
+ *   "unknown"          could not determine ownership (see `reason`) — must never
+ *                       be treated as equivalent to "not-listening"
  */
 export function resolveOwningUnit(probe = {}) {
   const platform = probe.platform || process.platform;
@@ -366,6 +458,28 @@ export function resolveOwningUnit(probe = {}) {
   }
   if (cgroupResult.state === "no-unit") {
     return { kind: "no-unit", platform, pid: listener.pid, unit: null, mismatched: false };
+  }
+
+  // issue #237: a well-formed systemd unit name is not proof the process behind it is OCP's own
+  // server.mjs — verify the actual running process before ever treating this as a restart
+  // candidate. probe.cmdlineContent === undefined means the caller never attempted this probe at
+  // all (skip the check, preserve pre-#237 behavior for callers not yet wired to it); a string or
+  // null means it WAS attempted, and gets classified/treated-as-unknown respectively. See
+  // classifyCmdlineOwner's own comment for the full three-state rationale.
+  if (probe.cmdlineContent !== undefined) {
+    const cmdlineResult = classifyCmdlineOwner(probe.cmdlineContent);
+    if (cmdlineResult.state === "unknown") {
+      return {
+        kind: "unknown", platform, pid: listener.pid, unit: cgroupResult.unit, mismatched: false,
+        reason: `resolved unit "${cgroupResult.unit}" via cgroup, but could not confirm the owning process is OCP's server.mjs — ${cmdlineResult.reason}`,
+      };
+    }
+    if (cmdlineResult.state === "foreign") {
+      return {
+        kind: "foreign-process", platform, pid: listener.pid, unit: cgroupResult.unit, mismatched: false,
+        reason: `"${cgroupResult.unit}" (${cgroupResult.scope}-scope) owns the OCP port, but its process is not OCP's server.mjs — ${cmdlineResult.reason}`,
+      };
+    }
   }
 
   const mismatched = !!expectedUnit && cgroupResult.unit !== expectedUnit;
@@ -486,6 +600,28 @@ export function planRestart(owner, opts = {}) {
       `(a bare "node server.mjs"?). Restarting "${opts.expectedUnit}" here would spawn a second, ` +
       `orphaned process that cannot bind the port — exactly issue #215. Stop PID ${owner.pid} manually ` +
       `(or bring it under systemd) and re-run the upgrade.`
+    );
+  }
+
+  // issue #237: a real, well-formed systemd unit is not proof it's OCP's own. Unlike
+  // `mismatched` (a NAME comparison against the hard-coded expectedUnit, which only ever warns —
+  // see the warnings.push at the top of this function), this is a POSITIVE confirmation from the
+  // owning process's own /proc/<pid>/cmdline that it is definitely not server.mjs. This is the
+  // safety inverse of #215: #215 restarted the wrong thing because the resolver guessed at an
+  // identity it had no basis for; this restarts the wrong thing because the resolver correctly
+  // identifies a real unit that simply isn't ours — bouncing an unrelated production service
+  // (nginx.service, say) is outside OCP's legitimate blast radius regardless of root/sudo
+  // authorization, so this refuses unconditionally, before any of the system-unit/user-unit
+  // machinery below ever runs.
+  if (owner.kind === "foreign-process") {
+    // owner.reason (built by resolveOwningUnit) already names the unit, its scope, and the
+    // cmdline evidence — no need to re-preface it with another "the OCP port is owned by X" here.
+    throw new Error(
+      `restart aborted: ${owner.reason}. Restarting an unrelated service this tooling does not ` +
+      `manage is outside OCP's legitimate blast radius — refusing rather than repeating issue ` +
+      `#215's failure mode in the opposite direction (see issue #237). Verify what's actually ` +
+      `bound to this port (\`ss -lptn\` / \`cat /proc/${owner.pid}/cmdline\`) and either free the ` +
+      `port for OCP or point CLAUDE_PROXY_PORT elsewhere.`
     );
   }
 

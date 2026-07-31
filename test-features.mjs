@@ -7919,7 +7919,7 @@ test("LOW-2 (real shell, verified mechanism): ocp's doctor-check-surfacing block
 // and asserts on return values or thrown messages — never on scripts/
 // upgrade.mjs's or scripts/lib/restart-unit.mjs's source text.
 // ═══════════════════════════════════════════════════════════════════════════
-import { resolveOwningUnit, planRestart, classifySsListener, classifyLsofListener, parseCgroupUnit } from "./scripts/lib/restart-unit.mjs";
+import { resolveOwningUnit, planRestart, classifySsListener, classifyLsofListener, parseCgroupUnit, classifyCmdlineOwner } from "./scripts/lib/restart-unit.mjs";
 
 console.log("\nRestart-unit resolution (issue #215) — classifiers:");
 
@@ -8049,6 +8049,119 @@ test("MED-5: parseCgroupUnit rejects a space-containing unit segment (word-split
   const result = parseCgroupUnit(cgroup);
   assert.notEqual(result.state, "resolved");
   assert.equal(result.unit, null);
+});
+
+console.log("\nRestart-unit resolution (issue #237) — classifyCmdlineOwner:");
+
+// issue #237: a well-formed, real systemd unit name is not proof the process behind it is OCP's
+// own server.mjs — parseCgroupUnit resolving "nginx.service" tells you WHICH unit owns the port,
+// never WHETHER that unit is ours. classifyCmdlineOwner reads the SAME PID's /proc/<pid>/cmdline
+// (NUL-separated argv) and answers exactly that, mirroring doctor.mjs's #230
+// fingerprintSystemdUnit's own serverArg check (`a === "server.mjs" || a.endsWith("/server.mjs")`)
+// so "doctor.mjs would call this an OCP unit" and "this resolver treats it as a restart candidate"
+// are the same test, not two that can drift apart.
+
+test("classifyCmdlineOwner: argv invokes server.mjs directly → ocp", () => {
+  const cmdline = "node\0server.mjs\0--port\0" + "3456" + "\0";
+  assert.deepEqual(classifyCmdlineOwner(cmdline), { state: "ocp", reason: null });
+});
+
+test("classifyCmdlineOwner: argv invokes an absolute path ending in /server.mjs → ocp", () => {
+  const cmdline = "/usr/bin/node\0/home/opc/ocp/server.mjs\0";
+  assert.deepEqual(classifyCmdlineOwner(cmdline), { state: "ocp", reason: null });
+});
+
+test("classifyCmdlineOwner: nginx's real cmdline (no server.mjs anywhere) → foreign, names the argv in the reason", () => {
+  // The literal issue #237 scenario: CLAUDE_PROXY_PORT misconfigured onto a port nginx already
+  // holds. nginx is a real, systemd-managed unit — parseCgroupUnit resolves it cleanly to
+  // "nginx.service" — but its process is definitely not OCP.
+  const cmdline = "nginx: master process /usr/sbin/nginx -g daemon off;\0";
+  const result = classifyCmdlineOwner(cmdline);
+  assert.equal(result.state, "foreign");
+  assert.ok(result.reason.includes("does not invoke server.mjs"));
+  assert.ok(result.reason.includes("nginx"), `reason should name the actual argv; got: ${result.reason}`);
+});
+
+test("classifyCmdlineOwner: NUL is the argv separator, not a space — a path containing a literal space is not two tokens", () => {
+  // /proc/<pid>/cmdline is NUL-separated; naively splitting on whitespace would tear
+  // "/opt/my ocp/server.mjs" into two tokens, neither of which ends in "/server.mjs" as typed.
+  const cmdline = "/usr/bin/node\0/opt/my ocp/server.mjs\0";
+  assert.deepEqual(classifyCmdlineOwner(cmdline), { state: "ocp", reason: null });
+});
+
+test("classifyCmdlineOwner: unreadable cmdline (null) → unknown, never the false-confident 'foreign'", () => {
+  // Same "unknown must never be treated as safe-to-guess" posture as parseCgroupUnit's own
+  // null-handling: permission denied (hidepid=2, a non-root updater against a root-owned PID) or
+  // the PID exiting between the cgroup read and this one both look like this. A false "definitely
+  // NOT OCP" diagnosis on a process we simply could not inspect would be exactly the
+  // wrong-but-confident answer every classifier in this file exists to eliminate.
+  const result = classifyCmdlineOwner(null);
+  assert.equal(result.state, "unknown");
+  assert.notEqual(result.state, "foreign");
+});
+
+test("classifyCmdlineOwner: empty-string cmdline read is also 'unknown', not 'foreign'", () => {
+  assert.equal(classifyCmdlineOwner("").state, "unknown");
+});
+
+console.log("\nRestart-unit resolution (issue #237) — resolveOwningUnit + planRestart refuse a FOREIGN process holding the port:");
+
+test("resolveOwningUnit: a real systemd unit (nginx.service) whose process is confirmed NOT server.mjs resolves to 'foreign-process', not 'system-unit'", () => {
+  const owner = resolveOwningUnit({
+    platform: "linux",
+    expectedUnit: "ocp-proxy.service",
+    ssOutput: `LISTEN 0 511 0.0.0.0:80 0.0.0.0:* users:(("nginx",pid=445001,fd=6))`,
+    cgroupContent: "0::/system.slice/nginx.service\n",
+    cmdlineContent: "nginx: master process /usr/sbin/nginx -g daemon off;\0",
+  });
+  assert.equal(owner.kind, "foreign-process");
+  assert.equal(owner.unit, "nginx.service");
+  assert.equal(owner.pid, "445001");
+  assert.ok(owner.reason.includes("nginx.service"));
+});
+
+test("planRestart: 'foreign-process' always refuses — never constructs a restart command, even when root/sudo-authorized", () => {
+  const owner = {
+    kind: "foreign-process", platform: "linux", pid: "445001", unit: "nginx.service", mismatched: false,
+    reason: `"nginx.service" (system-scope) owns the OCP port, but its process is not OCP's server.mjs`,
+  };
+  assert.throws(
+    () => planRestart(owner, { expectedUnit: "ocp-proxy.service", isRoot: true, sudoAuthorized: true }),
+    /nginx\.service.*not OCP's server\.mjs/s
+  );
+});
+
+test("resolveOwningUnit + planRestart, end to end: a probe attempted but FAILED to read cmdline (null, not absent) refuses as unknown, never proceeds", () => {
+  // Distinguishes "the caller never attempted this probe" (undefined — legacy callers, backward
+  // compatible, see the test below) from "the caller attempted it and it failed" (null — the same
+  // permission/race gap parseCgroupUnit's own cgroupContent:null case exists for). A failed
+  // probe must refuse, not silently skip the check it was trying to perform.
+  const owner = resolveOwningUnit({
+    platform: "linux",
+    expectedUnit: "ocp-proxy.service",
+    ssOutput: `LISTEN 0 511 0.0.0.0:80 0.0.0.0:* users:(("nginx",pid=445001,fd=6))`,
+    cgroupContent: "0::/system.slice/nginx.service\n",
+    cmdlineContent: null,
+  });
+  assert.equal(owner.kind, "unknown");
+  assert.throws(() => planRestart(owner, { expectedUnit: "ocp-proxy.service", isRoot: true }), /could not determine|could not confirm/);
+});
+
+test("resolveOwningUnit: cmdlineContent ABSENT (undefined, not null) preserves pre-#237 behavior — backward compatible for callers not wired to the new check", () => {
+  // A caller that never attempts the cmdline probe at all (an older test fixture, or any future
+  // caller of this pure function that hasn't been updated) must not be newly refused just because
+  // a field it never populated is missing — production's own gather layer (scripts/upgrade.mjs)
+  // now ALWAYS attempts this probe, so in real use cmdlineContent is a string or explicitly null,
+  // never undefined. This is what keeps issue #215's own pre-existing mismatch-warning coverage
+  // (the "ocp.service" test just above) passing unmodified.
+  const owner = resolveOwningUnit({
+    platform: "linux",
+    expectedUnit: "ocp-proxy.service",
+    ssOutput: `LISTEN 0 511 0.0.0.0:3456 0.0.0.0:* users:(("node",pid=798931,fd=19))`,
+    cgroupContent: "0::/system.slice/ocp.service\n",
+  });
+  assert.equal(owner.kind, "system-unit");
+  assert.equal(owner.mismatched, true);
 });
 
 console.log("\nRestart-unit resolution (issue #215) — resolveOwningUnit composition:");
@@ -8222,6 +8335,53 @@ test("upgrade full path: mismatched system unit is restarted (not the hard-coded
   assert.ok(result.phases.some(p => p.name === "restart-resolve" && p.note.includes("#215")), "mismatch must surface loudly in phases");
 });
 
+test("#237: upgrade full path — a FOREIGN systemd unit (nginx.service) holding the port must refuse, never restart it, even when root", async () => {
+  // This is the headline #237 scenario, driven end to end through the SAME runUpgrade() path the
+  // test right above exercises for a legitimate mismatch: CLAUDE_PROXY_PORT collides with a port
+  // nginx already owns. Pre-#237, this probe shape resolves to kind:"system-unit",
+  // mismatched:true — the same shape as the "ocp.service" test above — and, being root, proceeds
+  // straight to `systemctl restart -- nginx.service`. That is the exact "restart the wrong,
+  // unrelated production service" failure #237 reports; refusing here is the whole point of this
+  // PR.
+  await assert.rejects(async () => {
+    await runUpgrade({
+      yes: true, dryRun: false, mockExec: true,
+      mockDoctor: { ready_to_upgrade: true, next_action: { kind: "upgrade" }, current_version: "v3.10.0", latest_version: "v3.14.0" },
+      mockPlatform: "linux",
+      mockOwnerProbe: {
+        ssOutput: `LISTEN 0 511 0.0.0.0:3456 0.0.0.0:* users:(("nginx",pid=445001,fd=6))`,
+        cgroupContent: "0::/system.slice/nginx.service\n",
+        cmdlineContent: "nginx: master process /usr/sbin/nginx -g daemon off;\0",
+      },
+      mockIsRoot: true,
+      mockSudoAuthorized: true,
+    });
+  }, /nginx\.service.*not OCP's server\.mjs/s);
+});
+
+test("#237: the foreign-unit refusal fires before any restart command is ever constructed — no 'restart' phase with a cmd field", async () => {
+  let caught = null;
+  try {
+    await runUpgrade({
+      yes: true, dryRun: false, mockExec: true,
+      mockDoctor: { ready_to_upgrade: true, next_action: { kind: "upgrade" }, current_version: "v3.10.0", latest_version: "v3.14.0" },
+      mockPlatform: "linux",
+      mockOwnerProbe: {
+        ssOutput: `LISTEN 0 511 0.0.0.0:3456 0.0.0.0:* users:(("nginx",pid=445001,fd=6))`,
+        cgroupContent: "0::/system.slice/nginx.service\n",
+        cmdlineContent: "nginx: master process /usr/sbin/nginx -g daemon off;\0",
+      },
+      mockIsRoot: true,
+      mockSudoAuthorized: true,
+    });
+  } catch (e) {
+    caught = e;
+  }
+  assert.ok(caught, "must reject when the port owner is a confirmed-foreign process");
+  assert.ok(!(caught.phases || []).some(p => p.name === "restart" && p.cmd),
+    `no restart COMMAND may ever be constructed for a foreign unit; phases=${JSON.stringify(caught.phases)}`);
+});
+
 test("upgrade full path: port owned by no unit aborts the whole upgrade with an actionable message (does not claim success)", async () => {
   await assert.rejects(async () => {
     await runUpgrade({
@@ -8341,6 +8501,11 @@ test("MED-6: injected runner — Linux path calls `ss`, not `lsof` (platform bra
   const run = makeFakeRun({
     "ss -lptn": `LISTEN 0 511 0.0.0.0:3456 0.0.0.0:* users:(("node",pid=798931,fd=19))`,
     "cat /proc/798931/cgroup": "0::/system.slice/ocp.service\n",
+    // issue #237: resolveOwningUnit now also reads cmdline for the resolved PID — this fixture's
+    // scenario is a legitimately-renamed OCP unit (not the foreign-process case #237 covers
+    // elsewhere), so its cmdline must actually look like server.mjs or this test would newly
+    // (and wrongly) refuse as "foreign".
+    "cat /proc/798931/cmdline": "/usr/bin/node\0/opt/ocp/server.mjs\0",
     "lsof": new Error("test: lsof must not be called on Linux"),
   });
   const result = await runUpgrade({
@@ -8398,6 +8563,8 @@ test("MED-6: injected runner — real mismatch end to end (ss+cgroup text in, su
   const run = makeFakeRun({
     "ss -lptn": `LISTEN 0 511 0.0.0.0:3456 0.0.0.0:* users:(("node",pid=798931,fd=19))`,
     "cat /proc/798931/cgroup": "0::/system.slice/ocp.service\n",
+    // issue #237: see the "Linux path calls ss" test above for why this handler is required now.
+    "cat /proc/798931/cmdline": "/usr/bin/node\0/opt/ocp/server.mjs\0",
     "sudo -n -l systemctl restart -- ocp.service": "systemctl restart -- ocp.service",
   });
   const result = await runUpgrade({
@@ -8409,10 +8576,36 @@ test("MED-6: injected runner — real mismatch end to end (ss+cgroup text in, su
   assert.deepEqual(restartCmds, ["sudo systemctl restart -- ocp.service"]);
 });
 
+test("#237: injected runner — REAL gather layer reads /proc/<pid>/cmdline and refuses a foreign process end to end (not just the pure functions)", async () => {
+  // Every test above that exercises the #237 refusal uses mockOwnerProbe, which bypasses
+  // scripts/upgrade.mjs's own gather layer (the `run(...)` calls) entirely. Per this repo's own
+  // documented lesson (independent review of PR #221, finding MED-6 — see the "real mismatch end
+  // to end" test just above): the IMPURE gather layer — which command runs, with which flags —
+  // had ZERO coverage in the first cut of #215's fix, and that's exactly where the real defects
+  // lived (a platform-branch swap survived undetected). This test drives the ACTUAL `cat
+  // /proc/<pid>/cmdline` invocation scripts/upgrade.mjs's resolveRestartPlan() now makes, via a
+  // fake command router — proving the wiring itself (not just resolveOwningUnit/planRestart in
+  // isolation) refuses a foreign systemd unit.
+  const run = makeFakeRun({
+    "ss -lptn": `LISTEN 0 511 0.0.0.0:3456 0.0.0.0:* users:(("nginx",pid=445001,fd=6))`,
+    "cat /proc/445001/cgroup": "0::/system.slice/nginx.service\n",
+    "cat /proc/445001/cmdline": "nginx: master process /usr/sbin/nginx -g daemon off;\0",
+  });
+  await assert.rejects(async () => {
+    await runUpgrade({
+      yes: true, dryRun: false, mockExec: true,
+      mockDoctor: { ready_to_upgrade: true, next_action: { kind: "upgrade" }, current_version: "v3.10.0", latest_version: "v3.14.0" },
+      mockPlatform: "linux", mockIsRoot: true, run,
+    });
+  }, /nginx\.service.*not OCP's server\.mjs/s);
+});
+
 test("MED-4 wiring: injected runner — sudo -n -l denies THIS specific command → refuses (not a generic sudo -n true probe)", async () => {
   const run = makeFakeRun({
     "ss -lptn": `LISTEN 0 511 0.0.0.0:3456 0.0.0.0:* users:(("node",pid=798931,fd=19))`,
     "cat /proc/798931/cgroup": "0::/system.slice/ocp.service\n",
+    // issue #237: see the "Linux path calls ss" test above for why this handler is required now.
+    "cat /proc/798931/cmdline": "/usr/bin/node\0/opt/ocp/server.mjs\0",
     "sudo -n -l systemctl restart -- ocp.service": new Error("sudo: a password is required"),
   });
   await assert.rejects(async () => {
@@ -8428,6 +8621,8 @@ test("MED-4 wiring: uid===0 short-circuits sudo entirely — no sudo probe run, 
   const run = makeFakeRun({
     "ss -lptn": `LISTEN 0 511 0.0.0.0:3456 0.0.0.0:* users:(("node",pid=798931,fd=19))`,
     "cat /proc/798931/cgroup": "0::/system.slice/ocp.service\n",
+    // issue #237: see the "Linux path calls ss" test above for why this handler is required now.
+    "cat /proc/798931/cmdline": "/usr/bin/node\0/opt/ocp/server.mjs\0",
     "sudo": new Error("test: sudo must not be invoked when already root"),
   });
   const result = await runUpgrade({

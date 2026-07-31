@@ -199,6 +199,11 @@ function resolveRestartPlan({ opts, port, isRollback = false, fromCommit = null 
       const listener = classifySsListener(probe.ssOutput);
       if (listener.state === "listening") {
         try { probe.cgroupContent = run(`cat /proc/${listener.pid}/cgroup`); } catch { probe.cgroupContent = null; }
+        // issue #237: read cmdline in the SAME gather step, keyed off the same listener.pid — no
+        // separate resolution pass. resolveOwningUnit (scripts/lib/restart-unit.mjs) uses this to
+        // confirm the owning process is actually OCP's server.mjs before ever treating a resolved
+        // unit as a restart candidate, instead of acting on a real-but-foreign unit name.
+        try { probe.cmdlineContent = run(`cat /proc/${listener.pid}/cmdline`); } catch { probe.cmdlineContent = null; }
       }
     }
     owner = resolveOwningUnit(probe);
