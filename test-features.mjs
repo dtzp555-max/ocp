@@ -12,7 +12,7 @@ import { createHash } from "node:crypto";
 import { strict as assert } from "node:assert";
 import { join } from "node:path";
 import { pathToFileURL } from "node:url";
-import { execFileSync } from "node:child_process";
+import { execFileSync, spawnSync } from "node:child_process";
 import { homedir } from "node:os";
 
 process.env.HOME = homedir(); // normalize HOME so homedir()-derived paths are stable across shells
@@ -9302,6 +9302,31 @@ function _bwHarnessRun({
   overrideCmdRestart = true,
   resolveRestartExit = 0, resolveRestartStdout = [], resolveRestartStderr = [],
   serviceStubsSucceed = false, curlHealthExit = 1,
+  // Issue #242: generic curl response fixtures for the nine read-only display commands
+  // (usage/logs/models/sessions/clear/keys/settings), none of which existed as a harness
+  // capability before this issue (every prior call site here only ever needed the `/health`
+  // arm). Each entry is `{ match, body, exit }`: `match` is matched as a `case "$*" in
+  // *"<match>"*)` substring against curl's full argv (so it discriminates by URL/path, same
+  // technique the pre-existing `/health` arm already uses), `body` is written to its own
+  // fixture file and `cat`, `exit` defaults to 0. Checked BEFORE the `/health` arm and the
+  // default refusal, in the order given — callers needing more than one endpoint per test
+  // should list the more specific match first (e.g. "/api/usage" before "/usage", since the
+  // latter is a substring of the former). Purely additive: an empty array (the default)
+  // leaves every existing call site's curl stub byte-identical to before this issue.
+  curlResponses = [],
+  // Issue #242 test-setup note (NOT a fix for a #242/#241 defect — a separate, pre-existing,
+  // previously-undiscovered one, found incidentally while adding these tests, out of scope for
+  // both PRs and left for its own issue): `_curl()`'s `curl "${_AUTH_ARGS[@]}" "$@"` references
+  // an EMPTY bash array under `set -u`. GNU bash 3.2.57 (macOS's default `/bin/bash` — the last
+  // GPLv2 release, which is what `execFileSync("bash", ...)` resolves to here, verified via
+  // `bash --version`) raises "unbound variable" for `"${arr[@]}"` when `arr` has zero elements,
+  // even though POSIX/bash>=4.4 treat that as expanding to nothing. Reproduced directly against
+  // the unmodified `ocp` functions slice with `OCP_ADMIN_KEY` unset and no `~/.ocp/admin-key`
+  // file (the harness's own default state below) — `_curl` dies before ever reaching the
+  // network call. Every _curl-based test in this file sets a non-empty `adminKey` to route
+  // around this ORTHOGONAL defect (a non-empty `_AUTH_ARGS` array never hits the empty-array
+  // path) rather than accidentally depending on it.
+  adminKey = "",
 } = {}) {
   const root = _ltMkdtemp(join(_ltTmp(), "ocp-bash-harness-"));
   try {
@@ -9406,9 +9431,24 @@ function _bwHarnessRun({
     // is recognized (controlled by curlHealthExit); anything else refuses loudly (exit 94)
     // rather than silently doing something undefined — this issue's own tests never need
     // cmd_usage's `/usage` call to succeed, so it's deliberately left unhandled here.
+    //
+    // Issue #242: curlResponses (see its own doc comment above) adds arbitrary fixture arms,
+    // checked BEFORE "/health" and the default refusal, for the nine display commands' own
+    // curl calls (/api/usage, /usage, /logs, /v1/models, /sessions, /api/keys, /settings).
+    const curlResponseFiles = curlResponses.map((r, i) => {
+      const p = join(root, `curl-resp-${i}.json`);
+      testWriteFile(p, r.body ?? "");
+      return { match: r.match, exit: r.exit ?? 0, path: p };
+    });
     mkStub("curl", [
       `echo "FAKE-CURL-CALL $*" >> "${logPath}"`,
       `case "$*" in`,
+      ...curlResponseFiles.flatMap((r) => [
+        `  *${JSON.stringify(r.match)}*)`,
+        `    cat ${JSON.stringify(r.path)}`,
+        `    exit ${r.exit}`,
+        `    ;;`,
+      ]),
       `  *"/health"*)`,
       `    exit ${curlHealthExit}`,
       `    ;;`,
@@ -9480,20 +9520,25 @@ function _bwHarnessRun({
       // pythonAbsent is false) and nothing that could contain a second, real node/git.
       PATH: `${bin}:/usr/bin:/bin`,
       OCP_TEST_LOG: logPath,
-      OCP_ADMIN_KEY: "",
+      OCP_ADMIN_KEY: adminKey,
     };
 
     // `args[0]` is now the top-level SUBCOMMAND, since the real dispatch runs for real (see the
     // driver-assembly comment above) — callers below pass `["update", ...flags]`, matching a
     // real `ocp update ...` invocation's argv shape.
-    let stdout = "", stderr = "", status = 0;
-    try {
-      stdout = execFileSync("bash", [driverPath, ...args], { cwd: root, env, encoding: "utf8" });
-    } catch (e) {
-      stdout = e.stdout ?? "";
-      stderr = e.stderr ?? "";
-      status = typeof e.status === "number" ? e.status : 1;
-    }
+    //
+    // Issue #242 fix: `execFileSync` (used here originally) only returns stdout — on a ZERO
+    // exit status it discards stderr entirely (only the `catch` branch's `e.stderr` ever
+    // captured it, i.e. only on a NONZERO exit). Every pre-#242 test here happened to only
+    // assert on stderr in a nonzero-exit (refusal) scenario, so this never surfaced. #242's own
+    // display-command tests need stderr on a successful (status 0) run too — e.g. proving a
+    // degraded-but-still-status-0 case truly carries no warning. `spawnSync` always returns
+    // `{stdout, stderr, status}` regardless of exit code, so switching to it removes the gap
+    // for every caller, not just #242's.
+    const _bwRes = spawnSync("bash", [driverPath, ...args], { cwd: root, env, encoding: "utf8" });
+    const stdout = _bwRes.stdout ?? "";
+    const stderr = _bwRes.stderr ?? "";
+    const status = typeof _bwRes.status === "number" ? _bwRes.status : 1;
     const log = testExistsSync(logPath) ? _ltRead(logPath, "utf8").split("\n").filter(Boolean) : [];
     return { stdout, stderr, status, log };
   } finally {
@@ -9586,6 +9631,226 @@ test("#236 control: cmd_update with python3 PRESENT reaches the kind dispatch an
   assert.ok(r.stdout.includes("control-warn-marker"), `expected the WARN line surfaced, got: ${JSON.stringify(r.stdout)}`);
   assert.ok(r.stdout.includes("control-info-marker"), `expected the INFO line surfaced, got: ${JSON.stringify(r.stdout)}`);
   assert.ok(r.stdout.includes("Already at latest"), `expected the noop-kind message, got: ${JSON.stringify(r.stdout)}`);
+});
+
+// ═════════════════════════════════════════════════════════════════════════════
+// Issue #242 (audit follow-up to #236): nine MORE `<curl-or-var> | python3 -c "..."` call sites
+// across the read-only display commands (usage/logs/models/sessions/clear/keys/settings) have
+// the identical shape #236 fixed exactly once for cmd_update's own doctor-json formatter — a
+// bare pipeline, not inside an if/while, that `set -euo pipefail` (ocp:7) kills SILENTLY the
+// instant python3 exits non-zero, whether because python3 is missing (exit 127) or because the
+// formatter itself chokes on the response body (malformed JSON). Fixed via one shared helper,
+// `_pyfail` (defined near the top of `ocp`, alongside `_json`/`_bar`), rather than nine
+// independent inline fallbacks: it prints an unmistakable warning AND echoes the raw
+// (unformatted) response so no information is lost in degraded mode — load-bearing for
+// `cmd_keys add` in particular, the only place a newly created key is ever shown.
+//
+// Each site below gets two tests: the MONEY test (pythonAbsent:true — must NOT reproduce #236's
+// signature of silent death, and must show the raw data, not a blank screen) and a CONTROL test
+// (real python3 — the formatted, happy-path output must be byte-for-byte unaffected by this
+// fix). Two representative sites (cmd_clear, cmd_keys add — chosen because one is the
+// "underlying mutation already happened, only reporting fails" case and the other is the
+// highest-stakes "only view of a value" case) also get a THIRD test proving the fallback also
+// catches a REAL (non-stubbed) python3 crashing on malformed JSON, not merely "python3 missing"
+// — this is real /usr/bin/python3 on this harness's scratch $PATH, not a fake stub, genuinely
+// exercising `json.loads` raising a `JSONDecodeError`.
+console.log("\nocp display commands survive an absent/broken python3 formatter (#242):");
+
+test("#242 cmd_usage --by-key: absent python3 shows the raw usage-by-key JSON instead of dying silently", () => {
+  const r = _bwHarnessRun({
+    args: ["usage", "--by-key"], pythonAbsent: true, adminKey: "test-admin-key-marker",
+    curlResponses: [{ match: "/api/usage", body: JSON.stringify({ byKey: [{ key_name: "laptop-marker", requests: 10, successes: 9, errors: 1, avg_elapsed_ms: 2500, last_request: "2026-08-01T00:00:00Z" }] }) }],
+  });
+  assert.ok(!(r.status === 127 && r.stdout === ""), `must not reproduce #236's silent-127 signature; status=${r.status} stdout=${JSON.stringify(r.stdout)}`);
+  assert.ok(r.stderr.includes("python3 is unavailable or failed to format the response"), `expected the _pyfail warning on stderr, got: ${JSON.stringify(r.stderr)}`);
+  assert.ok(r.stdout.includes("laptop-marker"), `expected the raw byKey JSON (still containing the real data) on stdout, got: ${JSON.stringify(r.stdout)}`);
+});
+
+test("#242 control: cmd_usage --by-key with python3 PRESENT still prints the formatted table (unaffected by the fix)", () => {
+  const r = _bwHarnessRun({
+    args: ["usage", "--by-key"], adminKey: "test-admin-key-marker",
+    curlResponses: [{ match: "/api/usage", body: JSON.stringify({ byKey: [{ key_name: "laptop-marker", requests: 10, successes: 9, errors: 1, avg_elapsed_ms: 2500, last_request: "2026-08-01T00:00:00Z" }] }) }],
+  });
+  assert.equal(r.status, 0, `expected a clean exit, got status=${r.status} stderr=${r.stderr}`);
+  assert.ok(r.stdout.includes("Usage by Key"), `expected the formatted header, got: ${JSON.stringify(r.stdout)}`);
+  assert.ok(r.stdout.includes("laptop-marker"), `expected the formatted row, got: ${JSON.stringify(r.stdout)}`);
+  assert.ok(!r.stderr.includes("python3 is unavailable"), `must not print the degraded-mode warning on the happy path; stderr=${JSON.stringify(r.stderr)}`);
+});
+
+test("#242 cmd_usage (main): absent python3 shows the raw plan JSON instead of dying silently", () => {
+  const body = JSON.stringify({
+    plan: {
+      currentSession: { percent: "12%", resetsIn: "3h", resetsAtHuman: "3:00 PM" },
+      weeklyLimits: { allModels: { percent: "40%", resetsIn: "2d", resetsAtHuman: "Mon 9:00 AM" } },
+      extraUsage: { status: "allowed" },
+    },
+    proxy: { uptime: "5h", totalRequests: 42, activeRequests: 0, errors: 0, timeouts: 0 },
+    models: {},
+  });
+  const r = _bwHarnessRun({ args: ["usage"], pythonAbsent: true, curlResponses: [{ match: "/usage", body }] });
+  assert.ok(!(r.status === 127 && r.stdout === ""), `must not reproduce #236's silent-127 signature; status=${r.status} stdout=${JSON.stringify(r.stdout)}`);
+  assert.ok(r.stderr.includes("python3 is unavailable or failed to format the response"), `expected the _pyfail warning, got: ${JSON.stringify(r.stderr)}`);
+  assert.ok(r.stdout.includes("allowed"), `expected the raw plan JSON on stdout, got: ${JSON.stringify(r.stdout)}`);
+});
+
+test("#242 control: cmd_usage (main) with python3 PRESENT still prints the formatted panel", () => {
+  const body = JSON.stringify({
+    plan: {
+      currentSession: { percent: "12%", resetsIn: "3h", resetsAtHuman: "3:00 PM" },
+      weeklyLimits: { allModels: { percent: "40%", resetsIn: "2d", resetsAtHuman: "Mon 9:00 AM" } },
+      extraUsage: { status: "allowed" },
+    },
+    proxy: { uptime: "5h", totalRequests: 42, activeRequests: 0, errors: 0, timeouts: 0 },
+    models: {},
+  });
+  const r = _bwHarnessRun({ args: ["usage"], curlResponses: [{ match: "/usage", body }] });
+  assert.equal(r.status, 0, `expected a clean exit, got status=${r.status} stderr=${r.stderr}`);
+  assert.ok(r.stdout.includes("Plan Usage Limits"), `expected the formatted header, got: ${JSON.stringify(r.stdout)}`);
+  assert.ok(r.stdout.includes("Proxy: up 5h"), `expected the formatted proxy line, got: ${JSON.stringify(r.stdout)}`);
+});
+
+test("#242 cmd_logs: absent python3 shows the raw log-entries JSON instead of dying silently", () => {
+  const body = JSON.stringify({ entries: [{ raw: "2026-08-01 00:00:00 ERROR test-log-entry-marker" }], level: "error" });
+  const r = _bwHarnessRun({ args: ["logs"], pythonAbsent: true, curlResponses: [{ match: "/logs?n=20&level=error", body }] });
+  assert.ok(!(r.status === 127 && r.stdout === ""), `must not reproduce #236's silent-127 signature; status=${r.status} stdout=${JSON.stringify(r.stdout)}`);
+  assert.ok(r.stderr.includes("python3 is unavailable or failed to format the response"), `expected the _pyfail warning, got: ${JSON.stringify(r.stderr)}`);
+  assert.ok(r.stdout.includes("test-log-entry-marker"), `expected the raw entries JSON on stdout, got: ${JSON.stringify(r.stdout)}`);
+});
+
+test("#242 control: cmd_logs with python3 PRESENT still prints the formatted log line", () => {
+  const body = JSON.stringify({ entries: [{ raw: "2026-08-01 00:00:00 ERROR test-log-entry-marker" }], level: "error" });
+  const r = _bwHarnessRun({ args: ["logs"], curlResponses: [{ match: "/logs?n=20&level=error", body }] });
+  assert.equal(r.status, 0, `expected a clean exit, got status=${r.status} stderr=${r.stderr}`);
+  assert.ok(r.stdout.includes("test-log-entry-marker"), `expected the formatted log line, got: ${JSON.stringify(r.stdout)}`);
+});
+
+test("#242 cmd_models: absent python3 shows the raw models JSON instead of dying silently", () => {
+  const body = JSON.stringify({ data: [{ id: "claude-sonnet-5-marker" }] });
+  const r = _bwHarnessRun({ args: ["models"], pythonAbsent: true, curlResponses: [{ match: "/v1/models", body }] });
+  assert.ok(!(r.status === 127 && r.stdout === ""), `must not reproduce #236's silent-127 signature; status=${r.status} stdout=${JSON.stringify(r.stdout)}`);
+  assert.ok(r.stderr.includes("python3 is unavailable or failed to format the response"), `expected the _pyfail warning, got: ${JSON.stringify(r.stderr)}`);
+  assert.ok(r.stdout.includes("claude-sonnet-5-marker"), `expected the raw models JSON on stdout, got: ${JSON.stringify(r.stdout)}`);
+});
+
+test("#242 control: cmd_models with python3 PRESENT still prints the formatted list", () => {
+  const body = JSON.stringify({ data: [{ id: "claude-sonnet-5-marker" }] });
+  const r = _bwHarnessRun({ args: ["models"], curlResponses: [{ match: "/v1/models", body }] });
+  assert.equal(r.status, 0, `expected a clean exit, got status=${r.status} stderr=${r.stderr}`);
+  assert.equal(r.stdout.trim(), "claude-sonnet-5-marker", `expected the formatted model id line, got: ${JSON.stringify(r.stdout)}`);
+});
+
+test("#242 cmd_sessions: absent python3 shows the raw sessions JSON instead of dying silently", () => {
+  const body = JSON.stringify({ sessions: [{ id: "abcdefabcdefabcdef0123456789", model: "claude-sonnet-5", messages: 3, lastUsed: "2026-08-01T00:00:00Z" }] });
+  const r = _bwHarnessRun({ args: ["sessions"], pythonAbsent: true, curlResponses: [{ match: "/sessions", body }] });
+  assert.ok(!(r.status === 127 && r.stdout === ""), `must not reproduce #236's silent-127 signature; status=${r.status} stdout=${JSON.stringify(r.stdout)}`);
+  assert.ok(r.stderr.includes("python3 is unavailable or failed to format the response"), `expected the _pyfail warning, got: ${JSON.stringify(r.stderr)}`);
+  assert.ok(r.stdout.includes("abcdefabcdefabcdef0123456789"), `expected the raw sessions JSON on stdout, got: ${JSON.stringify(r.stdout)}`);
+});
+
+test("#242 control: cmd_sessions with python3 PRESENT still prints the formatted session row", () => {
+  const body = JSON.stringify({ sessions: [{ id: "abcdefabcdefabcdef0123456789", model: "claude-sonnet-5", messages: 3, lastUsed: "2026-08-01T00:00:00Z" }] });
+  const r = _bwHarnessRun({ args: ["sessions"], curlResponses: [{ match: "/sessions", body }] });
+  assert.equal(r.status, 0, `expected a clean exit, got status=${r.status} stderr=${r.stderr}`);
+  assert.ok(r.stdout.includes("model=claude-sonnet-5"), `expected the formatted session row, got: ${JSON.stringify(r.stdout)}`);
+});
+
+test("#242 cmd_clear: absent python3 still reports the clear happened (the DELETE already ran) with the raw count JSON, not a silent death", () => {
+  const r = _bwHarnessRun({ args: ["clear"], pythonAbsent: true, curlResponses: [{ match: "/sessions", body: JSON.stringify({ cleared: 7 }) }] });
+  assert.ok(!(r.status === 127 && r.stdout === ""), `must not reproduce #236's silent-127 signature; status=${r.status} stdout=${JSON.stringify(r.stdout)}`);
+  assert.ok(r.stderr.includes("Sessions were cleared, but the count could not be formatted"), `expected the clear-specific fallback message (not a generic one), got stderr=${JSON.stringify(r.stderr)}`);
+  assert.ok(r.stdout.includes('"cleared": 7') || r.stdout.includes('"cleared":7') || r.stdout.includes("cleared"), `expected the raw {"cleared":7} JSON on stdout, got: ${JSON.stringify(r.stdout)}`);
+});
+
+test("#242 control: cmd_clear with python3 PRESENT still prints 'Cleared N sessions.'", () => {
+  const r = _bwHarnessRun({ args: ["clear"], curlResponses: [{ match: "/sessions", body: JSON.stringify({ cleared: 7 }) }] });
+  assert.equal(r.status, 0, `expected a clean exit, got status=${r.status} stderr=${r.stderr}`);
+  assert.ok(r.stdout.includes("Cleared 7 sessions."), `expected the formatted count line, got: ${JSON.stringify(r.stdout)}`);
+});
+
+test("#242 cmd_clear: python3 PRESENT but the response is malformed JSON — the fallback fires for a REAL crash, not just a missing binary", () => {
+  // Real (unstubbed) /usr/bin/python3 on this harness's scratch $PATH — json.loads() genuinely
+  // raises json.decoder.JSONDecodeError on this body, a different failure mode than
+  // pythonAbsent:true's exit-127 stub. Proves _pyfail's `||` guard is keyed on the PIPELINE's
+  // exit status, not merely "is python3 on PATH".
+  const r = _bwHarnessRun({ args: ["clear"], curlResponses: [{ match: "/sessions", body: "not-json-at-all" }] });
+  assert.notEqual(r.status, 0, `a malformed response must not be silently reported as success; status=${r.status}`);
+  assert.ok(r.stderr.includes("Sessions were cleared, but the count could not be formatted"), `expected the clear-specific fallback message, got stderr=${JSON.stringify(r.stderr)}`);
+  assert.ok(r.stdout.includes("not-json-at-all"), `expected the raw (malformed) response echoed back, got: ${JSON.stringify(r.stdout)}`);
+});
+
+test("#242 cmd_keys add: absent python3 shows the raw JSON — the ONLY place the new key is ever shown must not be lost", () => {
+  const r = _bwHarnessRun({
+    args: ["keys", "add", "laptop-marker"], pythonAbsent: true, adminKey: "test-admin-key-marker",
+    curlResponses: [{ match: "/api/keys", body: JSON.stringify({ name: "laptop-marker", key: "sk-marker-abc123" }) }],
+  });
+  assert.ok(!(r.status === 127 && r.stdout === ""), `must not reproduce #236's silent-127 signature; status=${r.status} stdout=${JSON.stringify(r.stdout)}`);
+  assert.ok(r.stderr.includes("python3 is unavailable or failed to format the response"), `expected the _pyfail warning, got: ${JSON.stringify(r.stderr)}`);
+  assert.ok(r.stdout.includes("sk-marker-abc123"), `THE KEY ITSELF must still be visible in the raw fallback output — losing it here means it can never be retrieved again; got: ${JSON.stringify(r.stdout)}`);
+});
+
+test("#242 control: cmd_keys add with python3 PRESENT still prints the formatted key panel", () => {
+  const r = _bwHarnessRun({
+    args: ["keys", "add", "laptop-marker"], adminKey: "test-admin-key-marker",
+    curlResponses: [{ match: "/api/keys", body: JSON.stringify({ name: "laptop-marker", key: "sk-marker-abc123" }) }],
+  });
+  assert.equal(r.status, 0, `expected a clean exit, got status=${r.status} stderr=${r.stderr}`);
+  assert.ok(r.stdout.includes("Key created for"), `expected the formatted success header, got: ${JSON.stringify(r.stdout)}`);
+  assert.ok(r.stdout.includes("sk-marker-abc123"), `expected the formatted key line, got: ${JSON.stringify(r.stdout)}`);
+});
+
+test("#242 cmd_keys add: python3 PRESENT but the response is malformed JSON — the key-loss-prevention fallback fires for a REAL crash too", () => {
+  const r = _bwHarnessRun({
+    args: ["keys", "add", "laptop-marker"], adminKey: "test-admin-key-marker",
+    curlResponses: [{ match: "/api/keys", body: "not-json-at-all" }],
+  });
+  assert.notEqual(r.status, 0, `a malformed response must not be silently reported as success; status=${r.status}`);
+  assert.ok(r.stderr.includes("Could not format the new key response"), `expected the key-specific fallback message, got stderr=${JSON.stringify(r.stderr)}`);
+  assert.ok(r.stdout.includes("not-json-at-all"), `expected the raw (malformed) response echoed back rather than losing it, got: ${JSON.stringify(r.stdout)}`);
+});
+
+test("#242 cmd_keys revoke: absent python3 shows the raw revoke JSON instead of dying silently", () => {
+  const r = _bwHarnessRun({
+    args: ["keys", "revoke", "laptop-marker"], pythonAbsent: true, adminKey: "test-admin-key-marker",
+    curlResponses: [{ match: "/api/keys/laptop-marker", body: JSON.stringify({ revoked: true, idOrName: "laptop-marker" }) }],
+  });
+  assert.ok(!(r.status === 127 && r.stdout === ""), `must not reproduce #236's silent-127 signature; status=${r.status} stdout=${JSON.stringify(r.stdout)}`);
+  assert.ok(r.stderr.includes("python3 is unavailable or failed to format the response"), `expected the _pyfail warning, got: ${JSON.stringify(r.stderr)}`);
+  assert.ok(r.stdout.includes("laptop-marker"), `expected the raw revoke JSON on stdout, got: ${JSON.stringify(r.stdout)}`);
+});
+
+test("#242 control: cmd_keys revoke with python3 PRESENT still prints the formatted confirmation", () => {
+  const r = _bwHarnessRun({
+    args: ["keys", "revoke", "laptop-marker"], adminKey: "test-admin-key-marker",
+    curlResponses: [{ match: "/api/keys/laptop-marker", body: JSON.stringify({ revoked: true, idOrName: "laptop-marker" }) }],
+  });
+  assert.equal(r.status, 0, `expected a clean exit, got status=${r.status} stderr=${r.stderr}`);
+  assert.ok(r.stdout.includes("revoked"), `expected the formatted revoke confirmation, got: ${JSON.stringify(r.stdout)}`);
+});
+
+test("#242 cmd_settings (GET): absent python3 shows the raw settings JSON instead of dying silently", () => {
+  const body = JSON.stringify({
+    timeout: { value: 60000, unit: "ms", desc: "x" }, firstByteTimeout: { value: 15000, unit: "ms", desc: "x" },
+    maxConcurrent: { value: 4, unit: "", desc: "x" }, sessionTTL: { value: 600000, unit: "ms", desc: "x" },
+    maxPromptChars: { value: 100000, unit: "", desc: "x" },
+    tiers: { opus: { base: 30000, perPromptChar: 0.001 }, sonnet: { base: 20000, perPromptChar: 0.0005 }, haiku: { base: 15000, perPromptChar: 0.0002 } },
+  });
+  const r = _bwHarnessRun({ args: ["settings"], pythonAbsent: true, curlResponses: [{ match: "/settings", body }] });
+  assert.ok(!(r.status === 127 && r.stdout === ""), `must not reproduce #236's silent-127 signature; status=${r.status} stdout=${JSON.stringify(r.stdout)}`);
+  assert.ok(r.stderr.includes("python3 is unavailable or failed to format the response"), `expected the _pyfail warning, got: ${JSON.stringify(r.stderr)}`);
+  assert.ok(r.stdout.includes("maxPromptChars"), `expected the raw settings JSON on stdout, got: ${JSON.stringify(r.stdout)}`);
+});
+
+test("#242 control: cmd_settings (GET) with python3 PRESENT still prints the formatted panel", () => {
+  const body = JSON.stringify({
+    timeout: { value: 60000, unit: "ms", desc: "x" }, firstByteTimeout: { value: 15000, unit: "ms", desc: "x" },
+    maxConcurrent: { value: 4, unit: "", desc: "x" }, sessionTTL: { value: 600000, unit: "ms", desc: "x" },
+    maxPromptChars: { value: 100000, unit: "", desc: "x" },
+    tiers: { opus: { base: 30000, perPromptChar: 0.001 }, sonnet: { base: 20000, perPromptChar: 0.0005 }, haiku: { base: 15000, perPromptChar: 0.0002 } },
+  });
+  const r = _bwHarnessRun({ args: ["settings"], curlResponses: [{ match: "/settings", body }] });
+  assert.equal(r.status, 0, `expected a clean exit, got status=${r.status} stderr=${r.stderr}`);
+  assert.ok(r.stdout.includes("OCP Settings"), `expected the formatted header, got: ${JSON.stringify(r.stdout)}`);
+  assert.ok(r.stdout.includes("Timeout Tiers"), `expected the formatted tiers section, got: ${JSON.stringify(r.stdout)}`);
 });
 
 console.log("\nRestart-unit resolution (issue #233 defect 1) — macOS lsof exit-code handling:");

@@ -36,6 +36,41 @@ _curl() {
 
 _json() { python3 -m json.tool 2>/dev/null || cat; }
 
+# Issue #242 (audit follow-up to #236): shared graceful-degradation fallback for the read-only
+# display commands' `<curl-or-var> | python3 -c "..."` pipelines (usage/logs/models/sessions/
+# clear/keys/settings). Under `set -euo pipefail` (ocp:7), a bare pipeline like this that is NOT
+# inside an if/while condition kills the WHOLE `ocp` invocation the instant python3 exits
+# non-zero — whether because python3 isn't on PATH (bash's own command-not-found, exit 127,
+# exactly #236's repro one level up) or because the formatter itself choked on the response body
+# (malformed JSON, an unexpected shape) — and it does so SILENTLY, because python3 is always the
+# last stage of the pipeline and nothing downstream of it has printed anything yet.
+#
+# Silence is the wrong failure mode here specifically because these are DISPLAY commands: their
+# entire job is to show the operator something. A blank `ocp usage` on a python3-less host reads
+# as "you have no usage," not "the formatter is broken" — the two are indistinguishable without
+# this fix, and the wrong one is what a user will assume. The underlying API call already
+# succeeded by the time python3 runs (curl/`_curl` is always upstream of it in every one of these
+# pipelines) — only the pretty-printing failed — so the right degraded behavior is: say so loudly,
+# and show the real (unformatted) response instead of nothing, so no information is lost even in
+# degraded mode. This matters most for `cmd_keys add`, where the formatted-only view is the ONLY
+# place the newly created key is ever shown ("you won't see it again").
+#
+# `$2` (raw) is optional: call sites that have already captured the upstream response in a
+# variable pass it; call sites with nothing meaningful to fall back to (none currently) may omit
+# it. Returns 1 (never `exit`) so `... || _pyfail "<label>" "$raw"` at each call site degrades
+# that ONE command gracefully without repeating this message nine times, and without ever using
+# `exit` from a nested function (which would be a hazard for any future caller of these functions
+# from a context expecting a `return`, per the `cmd_restart`/`cmd_usage` `exit`-vs-`return`
+# lesson documented at cmd_restart's own comment block).
+_pyfail() {
+  local label="$1" raw="${2:-}"
+  echo "⚠ ${label}: python3 is unavailable or failed to format the response (install/repair python3 for pretty output)." >&2
+  if [[ -n "$raw" ]]; then
+    echo "$raw"
+  fi
+  return 1
+}
+
 _bar() {
   local pct=$1 width=20
   local filled=$(( pct * width / 100 ))
@@ -81,7 +116,7 @@ else:
     for k in by_key:
         avg_t = f'{k[\"avg_elapsed_ms\"]/1000:.1f}s' if k['avg_elapsed_ms'] else '-'
         print(f'  {k[\"key_name\"]:<20} {k[\"requests\"]:>5} {k[\"successes\"]:>4} {k[\"errors\"]:>4} {avg_t:>9} {k[\"last_request\"]:<20}')
-"
+" || _pyfail "Could not format per-key usage data" "$data"
     return
   fi
 
@@ -132,7 +167,7 @@ else:
 
 print()
 print(f'Proxy: up {px[\"uptime\"]} | {px[\"totalRequests\"]} reqs | {px[\"activeRequests\"]} active | {px[\"errors\"]} err | {px[\"timeouts\"]} timeout')
-"
+" || _pyfail "Could not format usage data" "$data"
 }
 
 # ── status ───────────────────────────────────────────────────────────────
@@ -184,7 +219,9 @@ EOF
 cmd_logs() {
   local n=${1:-20}
   local level=${2:-error}
-  curl -sf --max-time 10 "$PROXY/logs?n=$n&level=$level" | python3 -c "
+  local data
+  data=$(curl -sf --max-time 10 "$PROXY/logs?n=$n&level=$level") || { echo "Error: proxy unreachable"; return 1; }
+  echo "$data" | python3 -c "
 import sys, json
 d = json.loads(sys.stdin.read())
 entries = d.get('entries', [])
@@ -204,7 +241,7 @@ else:
             if model: parts.append(model)
             if extra: parts.append(extra)
             print(' | '.join(parts))
-"
+" || _pyfail "Could not format log entries" "$data"
 }
 
 # ── models ───────────────────────────────────────────────────────────────
@@ -217,12 +254,14 @@ EOF
 }
 
 cmd_models() {
-  curl -sf --max-time 5 "$PROXY/v1/models" | python3 -c "
+  local data
+  data=$(curl -sf --max-time 5 "$PROXY/v1/models") || { echo "Error: proxy unreachable"; return 1; }
+  echo "$data" | python3 -c "
 import sys, json
 d = json.loads(sys.stdin.read())
 for m in d.get('data', []):
     print(f\"  {m['id']}\")
-"
+" || _pyfail "Could not format model list" "$data"
 }
 
 # ── sessions ─────────────────────────────────────────────────────────────
@@ -235,7 +274,9 @@ EOF
 }
 
 cmd_sessions() {
-  curl -sf --max-time 5 "$PROXY/sessions" | python3 -c "
+  local data
+  data=$(curl -sf --max-time 5 "$PROXY/sessions") || { echo "Error: proxy unreachable"; return 1; }
+  echo "$data" | python3 -c "
 import sys, json
 d = json.loads(sys.stdin.read())
 sessions = d.get('sessions', [])
@@ -244,7 +285,7 @@ if not sessions:
 else:
     for s in sessions:
         print(f\"  {s['id'][:16]}...  model={s['model']}  msgs={s['messages']}  last={s['lastUsed']}\")
-"
+" || _pyfail "Could not format session list" "$data"
 }
 
 # ── clear ────────────────────────────────────────────────────────────────
@@ -258,10 +299,16 @@ EOF
 
 cmd_clear() {
   local result
-  result=$(curl -sf --max-time 5 -X DELETE "$PROXY/sessions")
+  result=$(curl -sf --max-time 5 -X DELETE "$PROXY/sessions") || { echo "Error: proxy unreachable"; return 1; }
+  # The DELETE above already ran (the clear itself, if the proxy answered, already happened) —
+  # only the count formatting can still fail python3-absent/malformed, so the fallback below
+  # says so explicitly rather than implying the clear itself didn't happen (issue #242).
   local count
-  count=$(echo "$result" | python3 -c "import sys,json; print(json.loads(sys.stdin.read())['cleared'])")
-  echo "Cleared $count sessions."
+  if count=$(echo "$result" | python3 -c "import sys,json; print(json.loads(sys.stdin.read())['cleared'])" 2>/dev/null); then
+    echo "Cleared $count sessions."
+  else
+    _pyfail "Sessions were cleared, but the count could not be formatted" "$result"
+  fi
 }
 
 # ── keys ────────────────────────────────────────────────────────────────
@@ -289,6 +336,12 @@ cmd_keys() {
       result=$(_curl -sf --max-time 5 -X POST "$PROXY/api/keys" \
         -H "Content-Type: application/json" \
         -d "{\"name\": \"$2\"}" 2>&1) || { echo "Error: proxy unreachable or unauthorized"; exit 1; }
+      # Issue #242: this is the highest-stakes of the nine `_pyfail` sites — the formatted view
+      # below is the ONLY place the newly created key is ever shown ("you won't see it again").
+      # A silent death here (python3 missing/broken) would mean the key was created (the POST
+      # above already succeeded) but never seen, with no way to retrieve it again short of
+      # revoking and recreating. _pyfail's raw-JSON dump is load-bearing for this site
+      # specifically: it is what keeps the key from being lost.
       echo "$result" | python3 -c "
 import sys, json
 d = json.loads(sys.stdin.read())
@@ -301,18 +354,20 @@ if 'key' in d:
     print(f'  Configure in IDE: OPENAI_API_KEY={d[\"key\"]}')
 else:
     print(f'✗ {d.get(\"error\", \"Unknown error\")}')
-"
+" || _pyfail "Could not format the new key response — the raw response above still contains the key" "$result"
       ;;
     revoke)
       if [[ -z "${2:-}" ]]; then echo "Usage: ocp keys revoke <name|id>"; return 1; fi
-      _curl -sf --max-time 5 -X DELETE "$PROXY/api/keys/$2" | python3 -c "
+      local result
+      result=$(_curl -sf --max-time 5 -X DELETE "$PROXY/api/keys/$2") || { echo "Error: proxy unreachable or unauthorized"; return 1; }
+      echo "$result" | python3 -c "
 import sys, json
 d = json.loads(sys.stdin.read())
 if d.get('revoked'):
     print(f'✓ Key \"{d[\"idOrName\"]}\" revoked.')
 else:
     print(f'✗ Key not found or already revoked.')
-"
+" || _pyfail "Could not format the revoke response" "$result"
       ;;
     --help|-h)
       cmd_keys_help
@@ -710,7 +765,9 @@ EOF
 cmd_settings() {
   if [[ -z "${1:-}" ]]; then
     # GET — show all settings
-    curl -sf --max-time 5 "$PROXY/settings" | python3 -c "
+    local data
+    data=$(curl -sf --max-time 5 "$PROXY/settings") || { echo "Error: proxy unreachable"; return 1; }
+    echo "$data" | python3 -c "
 import sys, json
 d = json.loads(sys.stdin.read())
 print('OCP Settings')
@@ -727,7 +784,7 @@ print('Timeout Tiers (first-byte):')
 for tier in ('opus','sonnet','haiku'):
     info = t.get(tier, {})
     print(f'  {tier:<8} base={info.get(\"base\",\"?\"):>6}ms  perChar={info.get(\"perPromptChar\",\"?\")}')
-"
+" || _pyfail "Could not format settings" "$data"
   elif [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
     cmd_settings_help
   elif [[ -z "${2:-}" ]]; then
