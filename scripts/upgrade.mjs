@@ -28,6 +28,31 @@ function execRun(cmd) {
   return execSync(cmd, { stdio: ["pipe", "pipe", "pipe"] }).toString();
 }
 
+// issue #233 defect 1: `lsof -nP -iTCP:<port> -sTCP:LISTEN` signals "nothing matched" via
+// **exit code 1 with empty stdout** — that's normal, documented lsof behavior, not a probe
+// failure. execSync throws on any nonzero exit, so the old code's single `catch { ... = null }`
+// mapped that clean "not listening" result to the SAME thing as a genuinely missing tool: both
+// became `null` -> resolveOwningUnit's "unknown" -> planRestart's unconditional refusal. That
+// made `opts.allowNotListeningFallback` (the rollback recovery path #221 added specifically for
+// a down service) unreachable on macOS, and produced a false "lsof did not run" diagnosis on a
+// host where lsof ran perfectly cleanly. Verified live on this host:
+//   `/usr/sbin/lsof -nP -iTCP:59999 -sTCP:LISTEN; echo $?` -> (no output), exit 1
+//   `/usr/sbin/lsof -nP -iTCP:3456  -sTCP:LISTEN; echo $?` -> (one row), exit 0
+// and, via `execSync`'s own error shape for the exit-1 case: `err.status === 1`,
+// `err.stdout === ""`, `err.stderr === ""` — no ENOENT, no code, nothing else distinguishes it
+// from a "real" failure except the (status, stdout) pair checked below. A missing binary run
+// through the shell (`execSync` always shells out for a string command) surfaces as a *shell*
+// "command not found" exit — 127, not a Node-level ENOENT — so "anything other than
+// status===1-with-empty-stdout" already covers that case; this function reserves `null` for
+// exactly those "genuinely couldn't tell" outcomes, matching the null/"" split HIGH-1 (PR #221)
+// already enforces for `ss`.
+function mapLsofFailureToProbeValue(err) {
+  const status = err && typeof err.status === "number" ? err.status : null;
+  const stdout = err && err.stdout != null ? String(err.stdout) : "";
+  if (status === 1 && stdout.trim() === "") return "";
+  return null;
+}
+
 // Resolve which unit actually owns the OCP port and build a restart plan for it, instead
 // of blindly restarting a hard-coded name (issue #215). The resolution logic itself
 // (resolveOwningUnit / planRestart, in scripts/lib/restart-unit.mjs) is pure and unit-
@@ -65,13 +90,24 @@ function resolveRestartPlan({ opts, port, isRollback = false, fromCommit = null 
       ? { kind: "launchd", platform, pid: null, unit: expectedUnit, mismatched: false }
       : { kind: "user-unit", platform, pid: null, unit: expectedUnit, mismatched: false };
   } else {
-    // Gather via `run` (real execSync in production, injected in tests). Every catch sets
-    // the field to null (never ""): resolveOwningUnit treats null as "couldn't verify"
-    // (kind "unknown") and "" as "ran cleanly, found nothing" (kind "not-listening") — those
-    // are different facts and collapsing them into one was HIGH-1 on PR #221.
+    // Gather via `run` (real execSync in production, injected in tests). resolveOwningUnit
+    // treats null as "couldn't verify" (kind "unknown") and "" as "ran cleanly, found nothing"
+    // (kind "not-listening") — those are different facts and collapsing them into one was
+    // HIGH-1 on PR #221 (Linux `ss`, which never throws on "no match" — a clean empty read IS
+    // the not-listening signal, no catch involved) and issue #233 defect 1 (macOS `lsof`, which
+    // DOES throw on "no match" via exit 1 — see mapLsofFailureToProbeValue above for why the
+    // catch below cannot just set null unconditionally the way every other catch in this
+    // function does).
     const probe = { platform, expectedUnit };
     if (platform === "darwin") {
-      try { probe.lsofOutput = run(`lsof -nP -iTCP:${port} -sTCP:LISTEN`); } catch { probe.lsofOutput = null; }
+      // Absolute path: `lsof` lives in /usr/sbin on macOS, which restricted PATHs (a launchd
+      // job's `default environment`, a minimal update-runner PATH) omit entirely — a bare
+      // `lsof` then fails as "command not found" (exit 127 via the shell), maps to `null`
+      // ("unknown"), and aborts an otherwise-healthy restart. /usr/sbin/lsof is a base-system
+      // binary present on every macOS install (see mapLsofFailureToProbeValue's comment for the
+      // exit-code distinction this catch now makes).
+      try { probe.lsofOutput = run(`/usr/sbin/lsof -nP -iTCP:${port} -sTCP:LISTEN`); }
+      catch (err) { probe.lsofOutput = mapLsofFailureToProbeValue(err); }
     } else {
       try { probe.ssOutput = run(`ss -lptn "sport = :${port}"`); } catch { probe.ssOutput = null; }
       const listener = classifySsListener(probe.ssOutput);

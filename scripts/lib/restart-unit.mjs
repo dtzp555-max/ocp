@@ -55,6 +55,26 @@
  *     site (defense in depth, matching MED-5's own posture).
  *   - MED-D: the SO_REUSEPORT multi-PID detection used a non-global regex match and silently
  *     under-counted the same-row case; see the note beside `classifySsListener`'s `matchAll`.
+ *
+ * A THIRD independent review (issue #233, filed after PR #221 merged) found the Linux/macOS
+ * halves of this fix were not actually symmetric, despite `classifyLsofListener` below already
+ * having the same three-valued shape as `classifySsListener`:
+ *   - Defect 1: unlike `ss`, `lsof -iTCP:<port> -sTCP:LISTEN` EXITS NONZERO (status 1) on a clean
+ *     "nothing matched" result, with empty stdout — verified live. The gather layer in
+ *     scripts/upgrade.mjs had one `catch { lsofOutput = null }`, so that clean not-listening
+ *     result and a genuinely missing/failing tool both became `null` -> `classifyLsofListener`'s
+ *     "unknown" -> `planRestart` throwing unconditionally. This function's own null/""
+ *     three-valued contract was never actually reachable end-to-end on macOS as a result — fixed
+ *     at the gather layer (scripts/upgrade.mjs's `mapLsofFailureToProbeValue`), not here:
+ *     `classifyLsofListener` already treated `""` and `null` correctly the whole time.
+ *   - Defect 2 (macOS ownership/no-unit determination — a real listener existing is not proof
+ *     the `dev.ocp.proxy` launchd job is the one holding it, analogous to Linux's `no-unit`
+ *     state below): deliberately NOT part of this fix. Tracked in a follow-up issue rather than
+ *     bundled here, per Iron Rule 11 (minimum reviewable unit) — a new pure classifier plus a
+ *     cross-platform command-choice decision deserves its own dedicated review, separate from
+ *     defect 1's contained, surgical exit-code fix. Until it lands, `resolveOwningUnit`'s darwin
+ *     branch below still returns `kind: "launchd"` for ANY listener once one is confirmed to
+ *     exist — it does not yet verify that listener is actually the launchd-managed process.
  */
 
 // Anything accepted as a restart target must look like a real systemd unit name.
@@ -131,6 +151,16 @@ export function classifySsListener(ssOutput) {
 }
 
 // --- macOS: classify `lsof -nP -iTCP:<port> -sTCP:LISTEN` output --- (same three states as ss)
+//
+// NOTE for callers (issue #233 defect 1): unlike `ss`, `lsof` with an `-i` filter that matches
+// nothing EXITS 1, not 0 — a real, run-it-yourself-verified difference from `ss -lptn`, which
+// always exits 0 and just prints no LISTEN row. That means the caller's `execSync` wrapper
+// throws on a clean "not listening" result, and MUST distinguish that (exit 1, empty stdout)
+// from a genuine failure before ever reaching this function — passing `""` for the former and
+// `null` only for the latter. See scripts/upgrade.mjs's `mapLsofFailureToProbeValue`. This
+// function itself needs no such distinction internally: it already treats `""` as
+// "not-listening" and `null` as "unknown" as of PR #221 — the defect was entirely in the caller
+// never actually producing `""` on macOS.
 export function classifyLsofListener(lsofOutput) {
   if (lsofOutput == null) {
     return { state: "unknown", pid: null, reason: "lsof did not run (missing tool, or the probe exec itself failed)" };

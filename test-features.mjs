@@ -8998,6 +8998,88 @@ test("#236 control: cmd_update with python3 PRESENT reaches the kind dispatch an
   assert.ok(r.stdout.includes("Already at latest"), `expected the noop-kind message, got: ${JSON.stringify(r.stdout)}`);
 });
 
+console.log("\nRestart-unit resolution (issue #233 defect 1) — macOS lsof exit-code handling:");
+
+// Background: `lsof -nP -iTCP:<port> -sTCP:LISTEN` EXITS 1 with EMPTY stdout when nothing
+// matches (verified live: `/usr/sbin/lsof -nP -iTCP:59999 -sTCP:LISTEN; echo $?` -> exit 1, no
+// output). `execSync` throws on any nonzero exit, and the pre-fix `scripts/upgrade.mjs` had one
+// `catch { lsofOutput = null }` for every lsof failure — so that clean "not listening" result
+// and a genuinely missing/failing tool both became `null` -> `resolveOwningUnit`'s "unknown" ->
+// `planRestart`'s unconditional refusal, with the wrong diagnosis text ("lsof did not run") on
+// top. `opts.allowNotListeningFallback` (the rollback recovery path PR #221 added) was therefore
+// unreachable on macOS: a rollback against a down service hit "unknown" every time and stayed
+// stuck on re-run. These tests drive the REAL gather pipeline (`opts.run`, not `mockOwnerProbe`)
+// so the fix is exercised exactly where the bug lived — the impure catch in
+// `scripts/upgrade.mjs`, not `classifyLsofListener` (which already handled "" vs null correctly).
+
+test("issue #233 defect 1: macOS lsof exit-1/empty-stdout ('nothing matched') maps to not-listening and refuses with the CORRECT message on `ocp update` (not the false 'lsof did not run')", async () => {
+  const lsofNotListeningErr = Object.assign(new Error("Command failed: /usr/sbin/lsof -nP -iTCP:3456 -sTCP:LISTEN"), { status: 1, stdout: "", stderr: "" });
+  const run = makeFakeRun({ "/usr/sbin/lsof -nP": lsofNotListeningErr });
+  let caught = null;
+  try {
+    await runUpgrade({
+      yes: true, dryRun: false, mockExec: true,
+      mockDoctor: { ready_to_upgrade: true, next_action: { kind: "upgrade" }, current_version: "v3.10.0", latest_version: "v3.14.0" },
+      mockPlatform: "darwin", run,
+    });
+  } catch (e) { caught = e; }
+  assert.ok(caught, "upgrade must refuse when nothing is listening");
+  assert.ok(/nothing is currently listening/.test(caught.message), `expected the not-listening refusal; got: ${caught.message}`);
+  assert.ok(!/lsof did not run/.test(caught.message), `must not fall back to the false "lsof did not run" diagnosis; got: ${caught.message}`);
+});
+
+test("issue #233 defect 1: macOS rollback recovers via the not-listening fallback — previously unreachable (collapsed into 'unknown' forever)", async () => {
+  const lsofNotListeningErr = Object.assign(new Error("Command failed: /usr/sbin/lsof -nP -iTCP:3456 -sTCP:LISTEN"), { status: 1, stdout: "", stderr: "" });
+  const run = makeFakeRun({ "/usr/sbin/lsof -nP": lsofNotListeningErr });
+  const result = await runUpgrade({
+    rollback: true, yes: true, mockExec: true,
+    mockPlatform: "darwin", run,
+    mockSnapshots: [{ name: "upgrade-snapshot-2026-05-11T08:30:00Z", path: "/tmp/snap-x" }],
+    mockSnapshotMeta: { fromCommit: "abc1234", fromVersion: "v3.10.0", toVersion: "v3.14.0", path: "/tmp/snap-x" },
+  });
+  const restartCmds = result.phases.filter(p => p.name === "restart").map(p => p.cmd);
+  assert.equal(restartCmds.length, 2);
+  assert.ok(restartCmds[0].includes("launchctl bootout"));
+  assert.ok(restartCmds[1].includes("launchctl bootstrap"));
+  assert.ok(result.phases.some(p => p.name === "restart-resolve" && p.note && p.note.includes("nothing was listening")),
+    "the fallback must surface loudly in phases, not silently");
+});
+
+test("issue #233 defect 1 control: a genuine lsof failure (missing binary, exit 127) still maps to unknown and refuses — the fix is not overly permissive", async () => {
+  const lsofMissingErr = Object.assign(new Error("Command failed: /usr/sbin/lsof -nP -iTCP:3456 -sTCP:LISTEN"), { status: 127, stdout: "", stderr: "/bin/sh: /usr/sbin/lsof: No such file or directory" });
+  const run = makeFakeRun({ "/usr/sbin/lsof -nP": lsofMissingErr });
+  let caught = null;
+  try {
+    await runUpgrade({
+      yes: true, dryRun: false, mockExec: true,
+      mockDoctor: { ready_to_upgrade: true, next_action: { kind: "upgrade" }, current_version: "v3.10.0", latest_version: "v3.14.0" },
+      mockPlatform: "darwin", run,
+    });
+  } catch (e) { caught = e; }
+  assert.ok(caught, "upgrade must refuse when it genuinely cannot tell what owns the port");
+  assert.ok(/could not determine what.*owns the OCP port/s.test(caught.message), `expected the "could not determine" refusal; got: ${caught.message}`);
+  assert.ok(!/nothing is currently listening/.test(caught.message), `must not be mistaken for not-listening; got: ${caught.message}`);
+});
+
+test("issue #233 defect 1: lsof is invoked at its absolute path (/usr/sbin/lsof), not a bare 'lsof' a restricted PATH can fail to resolve", async () => {
+  // Live-verified on this host: `which lsof` (a restricted, sbin-less PATH) fails, while
+  // `/usr/sbin/lsof` runs cleanly — this is the exact gap the fix closes. The fake run below
+  // registers ONLY the absolute-path form; a bare "lsof" command would match no handler, throw
+  // makeFakeRun's own "no handler matched" error (no `.status`), map to null/"unknown", and this
+  // test would fail with a refusal instead of a successful restart plan.
+  const run = makeFakeRun({
+    "/usr/sbin/lsof -nP -iTCP:": `COMMAND   PID  USER   FD   TYPE DEVICE SIZE/OFF NODE NAME\nnode    12345 opc   23u  IPv6 0x1234      0t0  TCP *:3456 (LISTEN)`,
+  });
+  const result = await runUpgrade({
+    yes: true, dryRun: false, mockExec: true,
+    mockDoctor: { ready_to_upgrade: true, next_action: { kind: "upgrade" }, current_version: "v3.10.0", latest_version: "v3.14.0" },
+    mockPlatform: "darwin", run,
+  });
+  const restartCmds = result.phases.filter(p => p.name === "restart").map(p => p.cmd);
+  assert.equal(restartCmds.length, 2);
+  assert.ok(restartCmds[0].includes("launchctl bootout"));
+});
+
 runAsyncTests().then(() => Promise.all(pendingAsync)).then(() => {
   closeDb();
   console.log(`\n=== Results: ${passed} passed, ${failed} failed ===\n`);

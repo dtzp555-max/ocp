@@ -562,7 +562,7 @@ Top-level files a contributor or operator may need to know:
 | `scripts/sync-openclaw.mjs` | Idempotent OpenClaw registry sync invoked by `ocp update`. See ADR 0004. |
 | `scripts/lib/service-mode.mjs` | Pure decision layer for `setup.mjs`'s auto-start step — first install vs. `--reconfigure-only` (issue #226). |
 | `scripts/lib/install-autostart.mjs` | Injectable `installAutoStart()` — setup.mjs's auto-start install (legacy-unit migration, unit write, enable/start/bootstrap), extracted so tests can observe real run/fs calls instead of asserting on source text (issue #226). |
-| `scripts/lib/restart-unit.mjs` | Resolves which systemd/launchd unit actually owns the OCP port before the upgrade/rollback restart phase touches anything, instead of restarting a hard-coded name — refuses rather than guesses when ownership can't be determined. See [docs/upgrading.md § Restart target resolution](docs/upgrading.md#restart-target-resolution). |
+| `scripts/lib/restart-unit.mjs` | Resolves which systemd unit actually owns the OCP port (Linux), or whether the port is listening at all (macOS), before the upgrade/rollback restart phase touches anything — refuses rather than guesses when it can't tell. **Coverage is Linux-complete but macOS-partial**: macOS has no unit-ownership/`no-unit` determination yet (issue #239). See [docs/upgrading.md § Restart target resolution](docs/upgrading.md#restart-target-resolution). |
 | `.claude/skills/` | Project-specific Claude Code skills. |
 | `ocp-plugin/` | OpenClaw gateway plugin (optional installation). |
 | `docs/lan-mode.md` | LAN & multi-user operations manual (server/client setup, keys, quotas, anonymous access, security model). |
