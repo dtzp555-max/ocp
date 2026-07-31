@@ -6858,6 +6858,21 @@ test("MED-3: classifyMultiUnitRisk (macOS) — a maliciously-crafted <Label> is 
   assert.equal(result.state, "clear", "the malformed Label must be dropped entirely, leaving only one valid unit");
 });
 
+test("review round 3 (#230 'definitive answer'): a Label starting with '-' is rejected, defense in depth beyond buildDisableHint's own rendering safety", () => {
+  // Reviewer confirmed the CURRENT renderings are already safe against this shape (the label is
+  // always the trailing component of a domain/label token, never a standalone argv word) — but
+  // that safety property lives in buildDisableHint's format strings, not in this validator, so a
+  // FUTURE rendering (e.g. a bare `launchctl bootout <label>`) would reopen it. Rejecting a
+  // leading '-' here costs nothing (no real launchd label starts with one) and removes the
+  // dependency on the rendering detail entirely.
+  const blob = plistBlob([
+    ["/Users/opc/Library/LaunchAgents/dev.ocp.proxy.plist", ocpPlist({ label: "dev.ocp.proxy", port: "3456" })],
+    ["/Library/LaunchDaemons/dash.plist", ocpPlist({ label: "-Hattacker@example.com", port: "3456" })],
+  ]);
+  const result = classifyMultiUnitRisk({ platform: "darwin", plistBlob: blob });
+  assert.equal(result.state, "clear", "a Label starting with '-' must be dropped entirely, leaving only one valid unit");
+});
+
 test("classifyMultiUnitRisk (macOS): default port when CLAUDE_PROXY_PORT key is absent from the plist", () => {
   const blob = plistBlob([
     ["/Users/opc/Library/LaunchAgents/dev.ocp.proxy.plist", ocpPlist({ label: "dev.ocp.proxy" })],
@@ -6955,6 +6970,40 @@ test("HIGH-1/HIGH-2: gatherUnitCandidates batches ALL candidates into ONE show c
   assert.equal(systemShowCmds.length, 1, "exactly one batched show call for the system scope");
   assert.ok(userShowCmds[0].includes("a.service") && userShowCmds[0].includes("b.service") && userShowCmds[0].includes("c.service"),
     "all three user-scope candidates must appear in the SAME show command");
+
+  // HIGH-2 RECURRENCE (review round 3 on #230): the round-2 fix asserted `--state=enabled` on
+  // the LISTING commands but captured the SHOW command three lines later and asserted nothing
+  // about its CONTENTS — so `-p UnitFileState` / `-p EnvironmentFiles` / `-p Environment` could
+  // each be silently dropped from the real command with the whole suite staying green. Losing
+  // `-p UnitFileState` is the worst of the three: `props.UnitFileState` becomes `undefined`,
+  // the allowlist's documented "permissive when absent" fires, and the HIGH-2 defense-in-depth
+  // gate this round exists to add evaporates — right back to the single point of failure
+  // (`--state=enabled` alone) this round was supposed to remove. Losing `-p Environment` is
+  // worse still under MED-7's port-only grouping: every OCP unit falls back to port 3456 and
+  // bind "(default bind)", collapsing every OCP unit on the host into one fabricated WARN.
+  //
+  // extractShowProperties tokenizes the command and returns the EXACT argument following each
+  // `-p` flag — NOT a substring check. `cmd.includes("-p Environment")` would be a VACUOUS
+  // check here: that literal 14-character sequence is itself a PREFIX of "-p EnvironmentFiles"
+  // ("-p Environment" + "Files" = "-p EnvironmentFiles"), so it stays true even if the bare
+  // `-p Environment` flag is deleted outright, as long as `-p EnvironmentFiles` remains — the
+  // same vacuous-substring shape already caught once in this PR (the /Library/LaunchAgents
+  // mutation). Token-array membership doesn't have that failure mode: "Environment" and
+  // "EnvironmentFiles" are distinct array elements, never substrings of each other as tokens.
+  function extractShowProperties(cmd) {
+    const tokens = cmd.split(/\s+/);
+    const props = [];
+    for (let i = 0; i < tokens.length - 1; i++) {
+      if (tokens[i] === "-p") props.push(tokens[i + 1]);
+    }
+    return props;
+  }
+  const userShowProps = extractShowProperties(userShowCmds[0]);
+  const systemShowProps = extractShowProperties(systemShowCmds[0]);
+  for (const prop of ["Id", "ExecStart", "Environment", "UnitFileState", "EnvironmentFiles"]) {
+    assert.ok(userShowProps.includes(prop), `user-scope show command must request -p ${prop} (exact token match)`);
+    assert.ok(systemShowProps.includes(prop), `system-scope show command must request -p ${prop} (exact token match)`);
+  }
 
   // HIGH-2: the entire "only ENABLED units are candidates" precondition rests on this literal
   // flag being present in BOTH listing commands. A control mutation deleting it survived the
@@ -7129,6 +7178,91 @@ test("MED-7: runDoctor — same port, DIFFERENT working tree → NOW a WARN, mes
   assert.equal(check.level, "WARN");
   assert.ok(check.message.includes("DIFFERENT working trees"), "message must call out that the trees differ");
   assert.ok(check.message.includes("ocp-A") && check.message.includes("ocp-B"), "message must name both trees");
+
+  // Discretionary review finding on #230: when trees differ, these are two SEPARATE installs —
+  // nominating one as "the stray one" is a judgement this check has no basis for making (it
+  // would contradict the PR's own stated "does not assert which unit is correct" principle).
+  // Must NOT single one out; must offer both disable commands and let the operator decide.
+  assert.ok(!check.message.includes("the stray one"), "must not nominate a 'stray' unit when the trees genuinely differ — that's two separate installs, not drifted config on one");
+  assert.ok(check.message.includes("systemctl --user disable a.service"), "must offer the user-scope unit's own disable command");
+  assert.ok(check.message.includes("systemctl disable b.service"), "must offer the system-scope unit's own disable command too — neither is nominated over the other");
+});
+
+test("MED-7 remediation adaptation: buildDisableHint STILL nominates a target when trees are the SAME (drifted config on one install, matches the field incident's real remediation)", async () => {
+  const result = await runDoctor({
+    skipNetwork: false,
+    mockVersion: "v3.26.0",
+    mockLatest: "v3.26.0",
+    mockHealth: { status: 200, body: { version: "3.26.0", auth: { ok: true } } },
+    mockPlatform: "linux",
+    run: (cmd) => {
+      if (cmd.includes("--user list-unit-files")) return "ocp-proxy.service enabled\n";
+      if (cmd.includes("list-unit-files")) return "ocp.service enabled\n";
+      if (cmd.includes("--user show")) return FIELD_INCIDENT_USER_SHOW;
+      if (cmd.includes("systemctl show")) return FIELD_INCIDENT_SYSTEM_SHOW;
+      throw new Error("unexpected: " + cmd);
+    },
+  });
+  const check = result.checks.find(c => c.id === "multi_unit_boot_race");
+  assert.ok(check.message.includes("the stray one"), "same-tree case (the field incident's own shape) should still nominate a target — the check has a reasonable basis here");
+});
+
+test("PICK_always_first guard: pickDisableTarget prefers the user-scope unit even when it is NOT first in gather order", () => {
+  // Every other test in this file happens to have the user-scope unit gathered FIRST (matching
+  // the real glob/listing order), which cannot distinguish "prefer user scope" from a naive
+  // "just take group[0]" — this test deliberately reverses the order (system-scope plist listed
+  // BEFORE the personal LaunchAgent in the fixture blob) so the two formulas actually diverge.
+  const blob = plistBlob([
+    ["/Library/LaunchDaemons/ai.custom.ocp.plist", ocpPlist({ label: "ai.custom.ocp", port: "3456", bind: "0.0.0.0" })],
+    ["/Users/opc/Library/LaunchAgents/dev.ocp.proxy.plist", ocpPlist({ label: "dev.ocp.proxy", port: "3456", bind: "127.0.0.1" })],
+  ]);
+  return runDoctor({
+    skipNetwork: false,
+    mockVersion: "v3.26.0",
+    mockLatest: "v3.26.0",
+    mockHealth: { status: 200, body: { version: "3.26.0", auth: { ok: true } } },
+    mockPlatform: "darwin",
+    run: (cmd) => {
+      if (cmd.includes("for f in")) return blob;
+      if (cmd.includes("print-disabled")) return disabledLaunchctlBlob([["dev.ocp.proxy", false], ["ai.custom.ocp", false]]);
+      throw new Error("unexpected: " + cmd);
+    },
+  }).then((result) => {
+    const check = result.checks.find(c => c.id === "multi_unit_boot_race");
+    assert.ok(check.message.includes("gui/$(id -u)/dev.ocp.proxy"),
+      "must nominate the user-scope unit (dev.ocp.proxy) even though the system-scope one (ai.custom.ocp) is first in gather order");
+    assert.ok(!check.message.includes("system/ai.custom.ocp"),
+      "must not nominate the system-scope unit just because it's positionally first");
+  });
+});
+
+test("DOMAIN_always_gui guard: two conflicting LaunchDaemons (no LaunchAgent involved) render the system-domain disable command", () => {
+  // No test previously exercised this branch at all — the reviewer rendered it by hand to
+  // confirm the code was right. Two system-scope units (both LaunchDaemons) means
+  // pickDisableTarget's ".find(scope==='user')" finds nothing and falls to group[0], which here
+  // has domain:"system" — the ONLY way to reach buildDisableCommand's `sudo launchctl disable
+  // system/<label>` branch.
+  const blob = plistBlob([
+    ["/Library/LaunchDaemons/com.company.a.plist", ocpPlist({ label: "com.company.a", port: "3456" })],
+    ["/Library/LaunchDaemons/com.company.b.plist", ocpPlist({ label: "com.company.b", port: "3456" })],
+  ]);
+  return runDoctor({
+    skipNetwork: false,
+    mockVersion: "v3.26.0",
+    mockLatest: "v3.26.0",
+    mockHealth: { status: 200, body: { version: "3.26.0", auth: { ok: true } } },
+    mockPlatform: "darwin",
+    run: (cmd) => {
+      if (cmd.includes("for f in")) return blob;
+      if (cmd.includes("print-disabled")) return disabledLaunchctlBlob([["com.company.a", false], ["com.company.b", false]]);
+      throw new Error("unexpected: " + cmd);
+    },
+  }).then((result) => {
+    const check = result.checks.find(c => c.id === "multi_unit_boot_race");
+    assert.ok(check, "two enabled LaunchDaemons on the same port must warn");
+    assert.ok(check.message.includes("sudo launchctl disable system/com.company.a"),
+      "must render the SYSTEM-domain disable command when the nominated target is a LaunchDaemon");
+  });
 });
 
 test("runDoctor: exactly one enabled OCP unit → no multi_unit_boot_race check pushed", async () => {
@@ -7252,6 +7386,79 @@ test("MED-3: runDoctor on darwin — a maliciously-labeled plist never reaches t
   // Only ONE valid unit remains once the malformed Label is rejected → clear, no WARN at all,
   // so the dangerous string can never appear in doctor's output at all.
   assert.ok(!result.checks.some(c => c.id === "multi_unit_boot_race"));
+});
+
+console.log("\nocp `cmd_update` doctor-check surfacing (issue #220, MED-5 recurrence):");
+
+// #230 review (round 3): doctor.mjs's multi_unit_boot_race INFO line reached `ocp doctor`
+// (which prints every check regardless of level — see doctor.mjs's text-mode printer) but
+// never `ocp update`'s OWN doctor-check-surfacing block (`ocp`, ~:800-816), which filtered on
+// WARN only — the exact #214 discarded-check shape recurring one level up, on the very fix
+// meant to make "unknown" visible.
+//
+// This slices and execs the REAL bash-embedded python block — same anchor-slice technique as
+// the ocp-connect harnesses above (#210/#218) — rather than reimplementing the filter or
+// grepping for a string, so a regression in the ACTUAL logic fails this test, not a copy of it.
+//
+// Unlike ocp-connect's harnesses (whose python block lives in a QUOTED heredoc <<'PYEOF' and
+// therefore needs no unescaping at all), this block lives inside a bash DOUBLE-QUOTED
+// `python3 -c "..."` argument, so literal `"` characters in the source are backslash-escaped
+// (`\"`) — bash unescapes them before python3 ever sees the argument. Reversing that
+// (`blk.replace('\\"', '"')`, inside the slice itself) is what makes the slice valid, runnable
+// python matching what bash ACTUALLY executes at runtime, not a JS reconstruction of it.
+const _OCP_CHECK_SURFACE_PY = `
+import json, sys
+src = open(sys.argv[1]).read()
+start_marker = "for c in d.get('checks', []):"
+end_marker = "\\n\\" 2>/dev/null"
+si = src.index(start_marker)
+ei = src.index(end_marker, si)
+blk = src[si:ei]
+assert blk.strip(), "empty doctor-check-surfacing slice - anchor drift"
+assert "'WARN'" in blk and "'INFO'" in blk, "slice missing WARN/INFO handling - anchor drift"
+assert 'case "$kind"' not in blk and '_cmd_update_restart' not in blk, \\
+    "slice overgrown past the intended block - anchor drift"
+blk = blk.replace('\\\\"', '"')
+d = json.loads(sys.argv[2])
+exec(blk)
+`;
+
+function _ocpSurfaceChecks(checks) {
+  return execFileSync(
+    "python3",
+    ["-c", _OCP_CHECK_SURFACE_PY, join(_spotDir, "ocp"), JSON.stringify({ checks })],
+    { encoding: "utf8" },
+  );
+}
+
+test("ocp cmd_update's real doctor-check-surfacing block: WARN is surfaced (pre-existing #214 behavior, preserved)", () => {
+  const out = _ocpSurfaceChecks([{ level: "WARN", message: "tree at X, service serving Y — restarting" }]);
+  assert.ok(out.includes("tree at X, service serving Y — restarting"));
+  assert.ok(out.startsWith("⚠"));
+});
+
+test("MED-5 recurrence fix: ocp cmd_update's real doctor-check-surfacing block now ALSO surfaces INFO, not just WARN", () => {
+  const out = _ocpSurfaceChecks([{ level: "INFO", message: "could not verify: systemctl unavailable" }]);
+  assert.ok(out.includes("could not verify: systemctl unavailable"),
+    "an INFO-level check (e.g. multi_unit_boot_race's 'could not verify' line) must reach `ocp update`'s output, not just `ocp doctor`'s");
+  assert.ok(out.startsWith("ℹ"), "INFO gets its own glyph, distinct from WARN's ⚠");
+});
+
+test("ocp cmd_update's real doctor-check-surfacing block: PASS/FAIL are still NOT printed (this block is for actionable WARN/INFO only)", () => {
+  const out = _ocpSurfaceChecks([
+    { level: "PASS", message: "service responding on /health" },
+    { level: "FAIL", message: "some fail" },
+  ]);
+  assert.equal(out, "", "PASS/FAIL checks must not be echoed by this block — the case-statement dispatch right after already handles FAIL/kind; this block is only for WARN/INFO context lines");
+});
+
+test("ocp cmd_update's real doctor-check-surfacing block: WARN and INFO both print together, in checks order, skipping PASS in between", () => {
+  const out = _ocpSurfaceChecks([
+    { level: "WARN", message: "warn one" },
+    { level: "PASS", message: "pass one" },
+    { level: "INFO", message: "info one" },
+  ]);
+  assert.equal(out, "⚠ warn one\nℹ info one\n");
 });
 
 runAsyncTests().then(() => Promise.all(pendingAsync)).then(() => {

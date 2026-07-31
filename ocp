@@ -797,6 +797,15 @@ cmd_update() {
   # doctor's WARN-level checks (e.g. "tree at X, service serving Y — restarting") never reached
   # the person running `ocp update`, even though doctor.mjs computed the exact message #214
   # asked for. Surface any WARN check here, generically, before dispatching on kind.
+  #
+  # #230 review finding (MED-5 recurrence): this filter was WARN-only, so doctor.mjs's
+  # multi_unit_boot_race INFO line (pushed when the boot-race check ran but couldn't reach a
+  # verdict — e.g. `sudo ocp update` on a host whose OCP is a system unit, where sudo's
+  # env_reset strips XDG_RUNTIME_DIR/DBUS_SESSION_BUS_ADDRESS and breaks `systemctl --user`)
+  # was visible on `ocp doctor` (which prints every check regardless of level) but silently
+  # absent from `ocp update` — the exact #214 discarded-check defect recurring one level up.
+  # INFO gets its own glyph (not reused WARN styling) so the two severities stay visually
+  # distinct to the operator.
   if [[ -n "$doctor_json" ]]; then
     echo "$doctor_json" | python3 -c "
 import sys, json
@@ -805,8 +814,11 @@ try:
 except Exception:
     sys.exit(0)
 for c in d.get('checks', []):
-    if c.get('level') == 'WARN':
+    level = c.get('level')
+    if level == 'WARN':
         print(f\"⚠ {c.get('message', '')}\")
+    elif level == 'INFO':
+        print(f\"ℹ {c.get('message', '')}\")
 " 2>/dev/null
   fi
 

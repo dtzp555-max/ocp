@@ -84,6 +84,17 @@ function semverCompare(a, b) {
 // in the WARN message (same tree vs different trees) to help diagnose the
 // hazard, but no longer gates whether it fires.
 //
+// KNOWN LIMITATION (review round 3 on #230, discretionary): grouping by port
+// alone means two units bound to distinct, SPECIFIC, non-wildcard addresses on
+// the same port (e.g. 127.0.0.1:3456 and 192.168.1.5:3456) will warn even
+// though they don't actually contend — each can bind its own address without
+// colliding. This is a deliberate false-positive-tolerant tradeoff, not an
+// oversight: distinguishing "genuinely non-contending" from "contends because
+// at least one side is a wildcard (0.0.0.0/::/unset)" reliably requires
+// knowing this host's real default-bind semantics when CLAUDE_BIND is unset,
+// which this check does not attempt to model. Accepted as a rare, WARN-only
+// (never FAIL) false positive rather than adding that inference.
+//
 // Cost: Linux — up to 4 real subprocess spawns total regardless of host size
 // (two `list-unit-files` calls to enumerate enabled *.service names, then at
 // most one BATCHED `systemctl show` call per scope covering every candidate at
@@ -111,7 +122,17 @@ const UNIT_NAME_RE = /^[A-Za-z0-9:_.@-]+\.service$/;
 // is to hand `ocp doctor` output to an AI agent, which can make a
 // command-injection-shaped string in that output actionable, not just
 // cosmetically broken.
-const LAUNCHD_LABEL_RE = /^[A-Za-z0-9_.@-]+$/;
+// Leading "-" is rejected (first char excludes it; interior/trailing "-" is still allowed for
+// labels like "...login-item-helper") even though review round 3 on #230 confirmed the CURRENT
+// renderings are already safe against an option-injection-shaped label: `buildDisableHint`
+// always emits the label as the TRAILING component of a `<domain>/<label>` token (never a
+// standalone argv word), and this regex already excludes "/" and whitespace, so a label like
+// "-Hattacker@example.com" can't break out of that token or split into extra shell words. That
+// safety property lives in buildDisableHint's two format strings, not in this validator — a
+// future rendering (e.g. `launchctl bootout <label>` with no `domain/` prefix) would reopen it.
+// Rejecting a leading "-" here costs nothing (no real launchd label starts with one) and removes
+// the dependency on that rendering detail entirely.
+const LAUNCHD_LABEL_RE = /^[A-Za-z0-9_.@][A-Za-z0-9_.@-]*$/;
 // Only these UnitFileState values mean "would actually start at boot" for the
 // purposes of this check. Defense in depth (review finding HIGH-2 on #230): a
 // mutation that deleted `--state=enabled` from the LISTING command survived
@@ -120,6 +141,18 @@ const LAUNCHD_LABEL_RE = /^[A-Za-z0-9_.@-]+$/;
 // PERMISSIVE when the property is absent (older systemd, or a caller that
 // didn't request it) — this is a second check, not the only one, and must not
 // newly reject unit shapes the primary --state=enabled filter already handled.
+//
+// NOTE on "enabled-runtime" (review round 3 on #230, discretionary observation):
+// `--state=enabled` at the LISTING stage is an EXACT string match, so it can
+// never itself surface an "enabled-runtime" unit (its enable-symlinks live
+// under /run and are runtime-only) — this allowlist entry is unreachable via
+// the normal gather path today, and "enabled-runtime" does NOT survive a
+// reboot, so admitting it here is more permissive than the strict "would
+// start at the NEXT boot" framing this check's name implies. Kept anyway,
+// deliberately: a runtime-enabled unit CAN be racing another enabled unit for
+// the port RIGHT NOW (a real, current hazard), just not a persistent one, and
+// keeping the allowlist correct for a future caller that lists by a broader
+// state filter costs nothing today.
 const UNIT_FILE_STATE_ALLOWLIST = new Set(["enabled", "enabled-runtime"]);
 // ARG_MAX / cost safety cap: past this many enabled *.service units in one scope,
 // a single batched `systemctl show <all names> ...` command line risks becoming
@@ -424,26 +457,51 @@ export function detectMultiUnitBootRace(opts = {}) {
 // "user"-scope one (matches the actual remediation used on the field-incident
 // host — the stray USER unit was disabled, the SYSTEM unit kept), else the
 // first unit encountered (deterministic: gather always processes scopes/
-// directories in the same fixed order).
+// directories in the same fixed order). ONLY called for the same-working-tree
+// case (see describeMultiUnitConflict below) — nominating a "stray" unit only
+// makes sense when both units are drifted config on ONE install; see MED-7.
 function pickDisableTarget(group) {
   return group.find(u => u.scope === "user") || group[0];
 }
 
-// Platform- and domain-aware remediation command (review finding MED-3.3 on
-// #230: the previous revision always printed a `systemctl` command, including
-// on macOS, where that binary does not exist).
+// Platform- and domain-aware remediation command for ONE unit (review finding
+// MED-3.3 on #230: the previous revision always printed a `systemctl` command,
+// including on macOS, where that binary does not exist). Factored out of the
+// old buildDisableHint so both the same-tree (nominates one target) and
+// different-tree (lists every unit's command, nominates none — see MED-7
+// below) message shapes can share it.
+function buildDisableCommand(unit) {
+  if (unit.platform === "darwin") {
+    return unit.domain === "system"
+      ? `sudo launchctl disable system/${unit.name}`
+      : `launchctl disable gui/$(id -u)/${unit.name}`;
+  }
+  return unit.scope === "user"
+    ? `systemctl --user disable ${unit.name}`
+    : `systemctl disable ${unit.name}`;
+}
+
+// Same-working-tree case: both units are drifted config on ONE install (the
+// field incident's own shape), so nominating the likely-stray one (preferring
+// user-scope, matching the real remediation used there) is reasonable.
 function buildDisableHint(group) {
   const target = pickDisableTarget(group);
-  if (target.platform === "darwin") {
-    const cmd = target.domain === "system"
-      ? `sudo launchctl disable system/${target.name}`
-      : `launchctl disable gui/$(id -u)/${target.name}`;
-    return `disable the stray one — e.g. "${cmd}" (reversible: the plist is preserved, only a persistent disable flag is set; undo with the same command substituting "enable" for "disable")`;
-  }
-  if (target.scope === "user") {
-    return `disable the stray one — e.g. "systemctl --user disable ${target.name}" (reversible: the unit file is preserved, only the boot-enable link is removed)`;
-  }
-  return `disable whichever is not your intended target — e.g. "systemctl disable ${target.name}" (reversible: the unit file is preserved)`;
+  const cmd = buildDisableCommand(target);
+  const reversibleNote = target.platform === "darwin"
+    ? `(reversible: the plist is preserved, only a persistent disable flag is set; undo with the same command substituting "enable" for "disable")`
+    : `(reversible: the unit file is preserved${target.scope === "user" ? ", only the boot-enable link is removed" : ""})`;
+  return `disable the stray one — e.g. "${cmd}" ${reversibleNote}`;
+}
+
+// Different-working-tree case (review finding MED-7 on #230): these are two
+// SEPARATE installs, not one install's drifted config, so nominating either
+// one as "the stray one" is a judgement this check has no basis for making —
+// it directly contradicts the PR's own stated principle ("does not assert
+// which of two conflicting units is correct"). Lists every unit's disable
+// command instead of picking one.
+function buildNeutralDisableHint(group) {
+  const options = group.map(u => `"${buildDisableCommand(u)}"`).join(" or ");
+  return `this check cannot tell which install you intend to keep — decide, then disable whichever you don't want: ${options} (reversible either way — the losing unit's file/plist is preserved)`;
 }
 
 // Actionable WARN text: names every conflicting unit, the difference that
@@ -455,11 +513,13 @@ function describeMultiUnitConflict(groups) {
   return groups.map(group => {
     const port = group[0].port;
     const trees = [...new Set(group.map(u => u.workingTree))];
-    const treeNote = trees.length === 1
-      ? ` (same working tree: ${trees[0] || "(unresolved)"})`
-      : ` — DIFFERENT working trees (${trees.map(t => t || "(unresolved)").join(" vs ")}): different code may be racing for this port, not just different config`;
     const names = group.map(u => `${u.scope}-scope "${u.name}" (bind ${u.bind})`).join(" and ");
-    return `${group.length} enabled units target OCP port ${port}${treeNote}: ${names} — boot race: whichever starts first wins the port and the other silently orphans (issue #215). Pick one and ${buildDisableHint(group)}.`;
+    if (trees.length === 1) {
+      const treeNote = ` (same working tree: ${trees[0] || "(unresolved)"})`;
+      return `${group.length} enabled units target OCP port ${port}${treeNote}: ${names} — boot race: whichever starts first wins the port and the other silently orphans (issue #215). Pick one and ${buildDisableHint(group)}.`;
+    }
+    const treeNote = ` — DIFFERENT working trees (${trees.map(t => t || "(unresolved)").join(" vs ")}): these are two SEPARATE OCP installs racing for the same port, not just drifted config on one install`;
+    return `${group.length} enabled units target OCP port ${port}${treeNote}: ${names} — boot race: whichever starts first wins the port and the other silently orphans (issue #215). ${buildNeutralDisableHint(group)}.`;
   }).join(" | ");
 }
 
