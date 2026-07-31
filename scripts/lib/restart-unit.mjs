@@ -117,8 +117,10 @@
  * Deliberately NOT covered by this fix (same "minimum reviewable unit" posture as defect 2 in the
  * THIRD review above): macOS. `/proc/<pid>/cmdline` doesn't exist there, and the darwin branch
  * below still returns `kind: "launchd"` for any confirmed listener without identifying the actual
- * process at all (issue #233 defect 2, already tracked as its own follow-up) — extending identity
- * verification to macOS is that same follow-up's job, not this one's.
+ * process at all. That gap was originally reported as issue #233 defect 2; #233 itself is now
+ * CLOSED (split per Iron Rule 11 into its own dedicated review) and the live tracker for this
+ * specific work is issue #239 — extending identity verification to macOS is #239's job, not this
+ * one's.
  */
 
 // Anything accepted as a restart target must look like a real systemd unit name.
