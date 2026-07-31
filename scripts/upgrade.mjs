@@ -37,7 +37,7 @@ function execRun(cmd) {
 // a down service) unreachable on macOS, and produced a false "lsof did not run" diagnosis on a
 // host where lsof ran perfectly cleanly. Verified live on this host:
 //   `/usr/sbin/lsof -nP -iTCP:59999 -sTCP:LISTEN; echo $?` -> (no output), exit 1
-//   `/usr/sbin/lsof -nP -iTCP:3456  -sTCP:LISTEN; echo $?` -> (one row), exit 0
+//   `/usr/sbin/lsof -nP -iTCP:<the OCP port> -sTCP:LISTEN; echo $?` -> (one row), exit 0
 // and, via `execSync`'s own error shape for the exit-1 case: `err.status === 1`,
 // `err.stdout === ""`, `err.stderr === ""` — no ENOENT, no code, nothing else distinguishes it
 // from a "real" failure except the (status, stdout) pair checked below. A missing binary run
