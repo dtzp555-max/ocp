@@ -71,7 +71,7 @@ Allocate ports with `ltFreePort()`. Fixed ports have caused at least one flake h
 
 ## Testing discipline: what counts as a test
 
-Enforced as a review condition on recent test PRs (#204, #205, #208, #216, #218; #221 still in review), never written down. Its only written form was inside #210: "This is behavioral, so a mutation to the table or the fallback fails it. A source-grep test would not — and per this repo's standing rule, a test that greps source is not a test." Written down now (#223). Line numbers below are `test-features.mjs` unless noted.
+Enforced as a review condition on recent test PRs (#204, #205, #208, #216, #218, #221), never written down. Its only written form was inside #210: "This is behavioral, so a mutation to the table or the fallback fails it. A source-grep test would not — and per this repo's standing rule, a test that greps source is not a test." Written down now (#223). Line numbers below are `test-features.mjs` unless noted.
 
 - **Behavioral, not textual.** A test asserting on the *source text* of the thing it tests is not a test — it passes when the code is deleted and re-added wrong, and breaks on reformatting. Assert on behavior: call the function, run the process, read the output. The ocp-connect section (#210, #218, ~5690) `exec()`s the real `model_meta`/`get_model_meta()` sliced from `ocp-connect`'s source instead of grepping for a number. Exception this suite relies on: a textual assertion is fine for a *premise of the harness or a slice boundary*, never the behavior under test — see the heredoc-quoting check (`:5992`) and the kept `os.makedirs`/`open(config_path` anchor-drift guards (`:5792-5793`).
 

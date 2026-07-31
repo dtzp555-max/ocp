@@ -1664,12 +1664,17 @@ test("upgrade full path executes 5 phases", async () => {
 // #215: on a host where a competing systemd/launchd unit already owns the OCP port, an
 // upgrade's reconfigure step (setup.mjs) must not enable-at-boot or start the service it
 // writes config for — that races/duplicates whatever phase 5 (restart) resolves to run, and
-// re-arms the boot race #215 describes. #221 fixes phase 5's target resolution (still open,
-// unmerged as of this section); this covers the layering fix so phase 4 stops performing
-// phase 5's job in the first place. NOTE: phase 5, as it exists on `main` right now, is still
-// the pre-#221 hard-coded restart — so on the actual #215 host, this fix alone does not stop
-// the orphan (phase 5 still unconditionally starts `ocp-proxy.service` a few lines later); it
-// removes the `enable` re-arm and phase 4's premature `start`, which is half the defect family.
+// re-arms the boot race #215 describes. #221 (merged) fixes phase 5's target resolution ON
+// LINUX — phase 5 no longer hard-codes a restart target, it resolves the unit that actually
+// owns the port from live process/cgroup state; this section covers the layering fix so
+// phase 4 stops performing phase 5's job in the first place. Together the two close the #215
+// orphan for this (cross-minor upgrade) path — on Linux. ON MACOS, phase 5's resolution (its
+// lsof/netstat cross-check, #240) now correctly tells a genuinely empty port apart from an
+// ambiguous one — but even a CONFIRMED listener is still restarted over without verifying
+// it's actually the `dev.ocp.proxy` job (open: #239). The same #215 defect shape also
+// persists, on both platforms, on the separate bash `cmd_restart` cascade used by the
+// patch-bump ("update") and plain-restart ("restart") kinds — tracked separately as #224,
+// not touched by either fix.
 //
 // planServiceActions() / resolveServicePlan() are imported directly (not replicated, unlike
 // the setup.mjs inject helpers above) because scripts/lib/service-mode.mjs is a real
@@ -6828,9 +6833,9 @@ test("ocp-connect: the hardcoded three-id JSON-parse-failure fallback never over
 //
 // This is a STATIC config cross-reference (which units WOULD start at boot,
 // and do any two collide) — deliberately independent of scripts/lib/
-// restart-unit.mjs (PR #221, not yet on main), which resolves a DIFFERENT,
-// live-PID question for the restart phase. See the PR body for the explicit
-// dependency decision.
+// restart-unit.mjs (PR #221, merged), which resolves a DIFFERENT, live-PID
+// question for the restart phase. See the PR body for the explicit
+// independence decision.
 //
 // Every test here is BEHAVIORAL: it calls the exported classifier/gatherer (or
 // runDoctor with an injected opts.run) and asserts on return values / pushed

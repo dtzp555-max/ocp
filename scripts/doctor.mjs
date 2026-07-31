@@ -44,16 +44,16 @@ function semverCompare(a, b) {
 // `ocp doctor` surfaced this; it was found by hand while diagnosing an unrelated
 // update failure. See issue #215 for the live evidence table.
 //
-// Relationship to scripts/lib/restart-unit.mjs: introduced on PR #221's branch
-// (issue #215's OTHER half; NOT YET on main as of this writing — #221 is still
-// in review) to resolve which unit CURRENTLY owns the port from LIVE
-// process/cgroup state (ss/lsof + /proc/<pid>/cgroup) for the upgrade restart
-// phase — a live-PID question. This check answers a different, STATIC question
-// — which units WOULD start at boot, and are any two of them configured to
-// collide on the same port — by reading unit-file config (`systemctl show`
-// ExecStart/Environment, or plist content on macOS), never a live PID. No logic
-// is shared or duplicated between the two; this module intentionally does not
-// import restart-unit.mjs and does not depend on #221 landing first.
+// Relationship to scripts/lib/restart-unit.mjs: introduced by PR #221 (merged)
+// — issue #215's OTHER half — to resolve which unit CURRENTLY owns the port
+// from LIVE process/cgroup state (ss/lsof + /proc/<pid>/cgroup) for the
+// upgrade restart phase — a live-PID question. This check answers a
+// different, STATIC question — which units WOULD start at boot, and are any
+// two of them configured to collide on the same port — by reading unit-file
+// config (`systemctl show` ExecStart/Environment, or plist content on macOS),
+// never a live PID. No logic is shared or duplicated between the two; this
+// module intentionally does not import restart-unit.mjs — the two checks are
+// independent by design, not because one was waiting on the other to land.
 //
 // WARN, never FAIL: scripts/upgrade.mjs's runUpgrade() pre-flight guard only
 // tolerates ready_to_upgrade=false for next_action.kind="fresh_install" — a

@@ -30,16 +30,26 @@ What `ocp update` does:
   unit (because a different unit already owns the port) stays disabled across an upgrade.
   Running the installer's reconfigure step with a bare `setup.mjs` (no flag) would
   start/enable the unit itself, before the restart phase gets a chance to run — on the host
-  that motivated issue #215, that reproduces the orphan process #215 describes and re-arms
-  its boot race. **This alone does not stop the #215 orphan**, though: the restart phase
-  that runs next is, as of this writing, still a hard-coded `systemctl --user restart
-  ocp-proxy.service` — it does not yet resolve which unit actually owns the port (that fix,
-  #221, is a separate PR). So on the #215 host specifically, the restart phase still starts
-  `ocp-proxy` unconditionally a few steps later; --reconfigure-only removes the boot-race
-  re-arm (`enable`) and phase 4 racing ahead of phase 5 (its premature `start`), which is
-  half of the #215/#226 defect family, not the orphan itself. A first install
-  (`node setup.mjs`, no flags) is unaffected and still enables + starts the service, which
-  is that path's actual job.
+  that motivated issue #215, that would reproduce the orphan process #215 describes and
+  re-arm its boot race. `--reconfigure-only` removes that half of the risk (phase 4 no
+  longer races ahead of phase 5 with a premature `enable`/`start`); the restart phase that
+  runs next closes most of the other half. **On Linux**, it no longer hard-codes a restart
+  target — it resolves which unit actually owns the port from live process/cgroup state
+  before restarting it (PR #221, merged). **macOS coverage is narrower** — see
+  [Restart target resolution](#restart-target-resolution) below for exactly what is and
+  isn't verified there. A first install (`node setup.mjs`, no flags) is unaffected and still
+  enables + starts the service, which is that path's actual job.
+
+  The same #215 defect shape is **not yet fully fixed**: the "tree already at latest" and
+  patch-bump paths above both delegate to bash's `cmd_restart()`, a hard-coded
+  try-these-names-in-order cascade that does not do the live-ownership resolution described
+  above — tracked separately as
+  [#224](https://github.com/dtzp555-max/ocp/issues/224). And on the cross-minor path just
+  described, a narrower gap remains on macOS even after that resolution runs (see
+  [Restart target resolution](#restart-target-resolution) below): a *confirmed* listener
+  there is still restarted over without verifying it is actually the `dev.ocp.proxy` job —
+  its own open item, tracked as
+  [#239](https://github.com/dtzp555-max/ocp/issues/239).
 - **Old version** (< v3.4.0):
   fresh-install. Pre-v3.4 lacked admin-key/usage-db, so there is nothing to
   migrate. Your OAuth token (managed by the Claude Code CLI, not OCP) is
@@ -124,7 +134,7 @@ on both paths.
 | `requires "sudo systemctl restart -- <unit>"` | The port is owned by a SYSTEM unit and non-interactive sudo isn't authorized for that specific command. | Run the printed `sudo systemctl restart -- <unit>` manually, or grant it explicitly (e.g. `deploy ALL=(root) NOPASSWD: /bin/systemctl restart -- <unit>`), then re-run. |
 | `rollback only restores the launchd plist and the USER-scope systemd unit file` | `--rollback` resolved the port to a SYSTEM unit. Rollback (see `scripts/lib/snapshot.mjs`) never captured or restores that unit's OWN config, so that part of the refusal stands — but the message also names the exact commit the working tree was already rolled back to and the exact manual restart command, since on a host where that unit runs from the same working tree (common — see issue #215), the code-level rollback is otherwise complete. | Run the printed manual restart command; separately roll back the system unit's own config by hand if that also needs it. |
 
-> **Upgrading with an existing `NOPASSWD` sudoers rule — read this if you granted one before v3.27.0.**
+> **Upgrading with an existing `NOPASSWD` sudoers rule — read this if you granted one before PR #221.**
 > The probe now sends `systemctl restart -- <unit>`; it previously sent `systemctl restart <unit>`.
 > `sudoers(5)`: *"If a Cmnd has associated command line arguments, the arguments in the Cmnd must
 > match those given by the user on the command line."* So a rule written as

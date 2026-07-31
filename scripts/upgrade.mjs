@@ -441,16 +441,23 @@ async function runFullUpgrade({ doctor, opts }) {
     // migration are both gated on --reconfigure-only inside setup.mjs; see
     // scripts/lib/service-mode.mjs); must not enable-at-boot or start (issue #226). Enabling
     // re-arms the boot race #215 describes on a host with a competing unit for the same port.
-    // CORRECTION (review finding M2): this does NOT by itself stop #215's orphan. Phase 5
-    // below is still the pre-#221 hard-coded `systemctl --user restart ocp-proxy.service` —
-    // #221 (restart-target-ownership resolution) is a separate PR, open/unmerged as of this
-    // change. On the #215 host, phase 5 still unconditionally starts `ocp-proxy` a few lines
-    // down, regardless of what phase 4 does. What this fix removes is phase 4's premature
-    // `enable` (the boot-race re-arm) and its premature `start` (racing ahead of whatever
-    // phase 5 does) — half of the #215/#226 defect family, not all of it. --reconfigure-only
-    // is setup.mjs's opt-in mode for exactly this call site; a bare first install still calls
-    // setup.mjs without it (scripts/doctor.mjs's fresh_install path), so it keeps enabling +
-    // starting, which is that path's actual job.
+    // UPDATE: together with #221 (merged), this closes MOST of #215's orphan for THIS path.
+    // Phase 5 below no longer hard-codes `systemctl --user restart ocp-proxy.service` — ON
+    // LINUX it calls resolveRestartPlan() (scripts/lib/restart-unit.mjs), which resolves which
+    // unit actually owns the port from live process/cgroup state before restarting it. ON
+    // MACOS, resolveRestartPlan()'s lsof/netstat cross-check (mapLsofFailureToProbeValue /
+    // netstatHasListenerOnPort above, #240) now correctly tells a genuinely empty port apart
+    // from an ambiguous one (a listener lsof can't identify the owner of) — but even a
+    // CONFIRMED listener is still restarted over without verifying it's actually the
+    // `dev.ocp.proxy` job (open: #239). What this phase-4 fix removes is phase 4's premature
+    // `enable` (the boot-race re-arm) and its premature `start` (racing ahead of phase 5's
+    // resolution); #221 is what makes phase 5 itself restart the right unit on Linux.
+    // --reconfigure-only is setup.mjs's opt-in mode for exactly this call site; a bare first
+    // install still calls setup.mjs without it (scripts/doctor.mjs's fresh_install path), so
+    // it keeps enabling + starting, which is that path's actual job.
+    // The same #215 defect shape persists on the SEPARATE bash `cmd_restart` cascade used by
+    // the patch-bump ("update") and plain-restart ("restart") kinds — tracked as #224, not
+    // fixed by this module.
     exec(`node ${ocpDir}/setup.mjs --reconfigure-only`, "reconfigure");
 
     // phase 5: restart (heads-up note printed before invoking)

@@ -14,9 +14,10 @@
 // was looking for (co-location, not containment) and passed at 506/0. The actual fix, per that
 // review, is this file: move the imperative body into something an injected `run`/fs layer can
 // observe, the same seam `scripts/upgrade.mjs` already uses (`opts.mockExec`) and `doctor.mjs`
-// uses (`opts.mockHealth`) — NOT `scripts/lib/restart-unit.mjs`, which does not exist on `main`
-// (it ships only in #221, a separate, still-unmerged PR; an earlier draft of this module
-// wrongly cited it as precedent).
+// uses (`opts.mockHealth`) — NOT `scripts/lib/restart-unit.mjs`'s shape (a pure decision layer
+// unit-tested by injecting fake command OUTPUT, rather than an injectable run/fs seam like
+// this module's): `scripts/lib/restart-unit.mjs` has since merged (#221) but was not yet on
+// `main` when an earlier draft of this module wrongly cited it as precedent.
 //
 // installAutoStart() performs every action setup.mjs's Step 7 used to perform inline: legacy-
 // unit migration (gated on !servicePlan.reconfigureOnly — issue #226 review finding H1),

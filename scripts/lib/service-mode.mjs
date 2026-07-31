@@ -18,13 +18,18 @@
 // ocp.service) already owns the listening port, that unconditional `start` produces exactly
 // the orphan #215 describes, and `enable` re-arms the boot race #215 calls "the part that
 // makes it more than cosmetic" — both BEFORE phase 5 (whose job is restarting) ever runs.
-// NOTE (review correction): phase 5, as it exists on `main` at the time of this PR, is still
-// the pre-#221 hard-coded `systemctl --user restart ocp-proxy.service` — #221 (the
-// restart-target-ownership resolution) is a separate, still-open/unmerged PR. This PR's fix
-// removes phase 4's `enable` re-arm and its `start`, but on the #215 host specifically, phase
-// 5 STILL unconditionally starts the (possibly wrong) `ocp-proxy` unit a few lines later. This
-// module does not, by itself, stop that orphan — it removes half of the #215/#226 defect
-// family (the premature enable + the premature start-before-resolution), not all of it.
+// UPDATE (#221, merged): phase 5 no longer hard-codes `systemctl --user restart
+// ocp-proxy.service` — ON LINUX it now calls resolveRestartPlan() (scripts/lib/
+// restart-unit.mjs) to resolve which unit actually owns the port from live process/cgroup
+// state before restarting it. Together with #221, this module's fix (removing phase 4's
+// premature `enable`/`start`) closes the #215 orphan for the cross-minor upgrade path — ON
+// LINUX. ON MACOS, resolveRestartPlan()'s lsof/netstat cross-check (scripts/upgrade.mjs,
+// #240) now correctly tells a genuinely empty port apart from an ambiguous one (a listener
+// lsof can't identify the owner of) — but even a CONFIRMED listener is still restarted over
+// without verifying it's actually the `dev.ocp.proxy` job (open: #239). The same #215 defect
+// shape also persists, on both platforms, on the separate bash `cmd_restart` cascade used by
+// the patch-bump and plain-restart paths — tracked separately as #224, not touched by either
+// fix.
 // The macOS branch has the same phase-4-does-phase-5's-job shape: `launchctl bootstrap` both
 // loads AND starts the job (RunAtLoad=true in the plist).
 //
@@ -69,9 +74,9 @@ export function planServiceActions(platform, opts) {
       // enable-and-start install action should.
       enable: !reconfigureOnly,
       // starting now is phase 5's job (restart), not phase 4's (reconfigure) — see #226.
-      // (See the module-level note above: phase 5 today is still the pre-#221 hard-coded
-      // restart, so removing this `start` does not by itself resolve unit ownership — it only
-      // stops phase 4 from racing ahead of whatever phase 5 does.)
+      // (See the module-level note above: phase 5 now resolves unit ownership itself via
+      // resolveRestartPlan() (#221, merged); this `start` removal's job is only to stop
+      // phase 4 from racing ahead of phase 5's resolution, not to resolve ownership itself.)
       start: !reconfigureOnly,
     };
   }
