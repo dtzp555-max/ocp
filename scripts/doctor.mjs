@@ -44,48 +44,83 @@ function semverCompare(a, b) {
 // `ocp doctor` surfaced this; it was found by hand while diagnosing an unrelated
 // update failure. See issue #215 for the live evidence table.
 //
-// Relationship to scripts/lib/restart-unit.mjs (PR #221, issue #215's OTHER
-// half): that module resolves which unit CURRENTLY owns the port from LIVE
+// Relationship to scripts/lib/restart-unit.mjs: introduced on PR #221's branch
+// (issue #215's OTHER half; NOT YET on main as of this writing — #221 is still
+// in review) to resolve which unit CURRENTLY owns the port from LIVE
 // process/cgroup state (ss/lsof + /proc/<pid>/cgroup) for the upgrade restart
 // phase — a live-PID question. This check answers a different, STATIC question
 // — which units WOULD start at boot, and are any two of them configured to
-// collide — by reading unit-file config (`systemctl show` ExecStart/Environment,
-// or plist content on macOS), never a live PID. No logic is shared or
-// duplicated between the two; this module intentionally does not import
-// restart-unit.mjs. See the PR body for the explicit dependency decision.
+// collide on the same port — by reading unit-file config (`systemctl show`
+// ExecStart/Environment, or plist content on macOS), never a live PID. No logic
+// is shared or duplicated between the two; this module intentionally does not
+// import restart-unit.mjs and does not depend on #221 landing first.
 //
 // WARN, never FAIL: scripts/upgrade.mjs's runUpgrade() pre-flight guard only
 // tolerates ready_to_upgrade=false for next_action.kind="fresh_install" — a
 // FAIL here would block every future `ocp update` on an affected host,
-// including the update that might fix the drift. The two units' config could
-// also legitimately differ for reasons this check cannot know (e.g. a
-// deliberate blue/green setup on a non-standard port) — WARN surfaces the
-// hazard without itself becoming a new outage vector.
+// including the update that might fix the drift. The units' config could also
+// legitimately differ for reasons this check cannot know (e.g. a deliberate
+// blue/green setup) — WARN surfaces the hazard without itself becoming a new
+// outage vector.
 //
 // Enumeration strategy: matching on unit NAME is fragile (a host may name a
 // unit anything — the field incident's units were "ocp.service" and
 // "ocp-proxy.service", nothing guarantees that pattern elsewhere), so instead
 // every ENABLED unit's config is read and fingerprinted by whether its
 // ExecStart (Linux) / ProgramArguments (macOS) actually invokes server.mjs, and
-// from where. Two units only count as conflicting when they share BOTH the
-// resolved port AND the resolved working tree — matching the field incident's
-// own shape ("both pointed at the same working tree and the same port") and
-// deliberately excluding same-port-different-tree or same-tree-different-port,
-// neither of which is this failure mode.
+// from where.
 //
-// Cost: capped at 4 real subprocess spawns total regardless of host size (two
-// `list-unit-files` calls to enumerate enabled *.service names, then at most
-// one BATCHED `systemctl show` call per scope covering every candidate at
-// once — never one spawn per unit). A missing/erroring systemctl, or an
-// unreadable listing, degrades the WHOLE check to "unknown" (no push) rather
-// than a false all-clear or a crash — see classifyMultiUnitRisk's null-vs-""
-// discipline below, which mirrors restart-unit.mjs's own "ss returned nothing
-// we could parse" vs "ss never ran" distinction (ss/lsof there, systemctl here,
-// same reasoning: an absent/foreign-uid PID column silently degrades, and the
-// caller must not read that as "confirmed clean").
+// Grouping key: PORT ALONE (review finding MED-3.7 on #230 — see PR body for
+// the full discussion). #220's own text is "detect when more than one enabled
+// unit ... targets the OCP port" and #215's is "points at the same port"; an
+// earlier revision of this check additionally required the working tree to
+// match, reasoning from the single observed incident's shape rather than the
+// stated requirement, and did so without flagging the narrowing as a
+// narrowing. That was wrong on the merits too: two units on the same port from
+// DIFFERENT trees still race for the port and would serve DIFFERENT code to
+// whoever wins — arguably a worse outcome than the field incident, not a
+// lesser one, and a host in that state has two entirely separate installs
+// nobody may even realize both auto-start. Working tree is therefore reported
+// in the WARN message (same tree vs different trees) to help diagnose the
+// hazard, but no longer gates whether it fires.
+//
+// Cost: Linux — up to 4 real subprocess spawns total regardless of host size
+// (two `list-unit-files` calls to enumerate enabled *.service names, then at
+// most one BATCHED `systemctl show` call per scope covering every candidate at
+// once — never one spawn per unit; the extra `-p UnitFileState -p
+// EnvironmentFiles` properties added by this revision ride the SAME batched
+// call, zero extra spawns). macOS — 2 spawns (one enumerates every candidate
+// plist in one shell command; one reads `launchctl print-disabled` to exclude
+// units an operator has persistently disabled). A missing/erroring systemctl,
+// or an unreadable listing, degrades the WHOLE check to "unknown" — which now
+// pushes a low-severity INFO line (review finding MED-3.5) rather than nothing
+// at all, so "verified clear" and "couldn't verify" are distinguishable from
+// outside the process, not just internally. See classifyMultiUnitRisk's
+// null-vs-"" discipline below, which mirrors restart-unit.mjs's own "ss
+// returned nothing we could parse" vs "ss never ran" distinction.
 // ═══════════════════════════════════════════════════════════════════════════
 
 const UNIT_NAME_RE = /^[A-Za-z0-9:_.@-]+\.service$/;
+// launchd labels are reverse-DNS-style identifiers (e.g. "dev.ocp.proxy",
+// "homebrew.mxcl.postgresql@17" — "@" is a real, observed character in the
+// wild). Same trust-boundary class as UNIT_NAME_RE above and PR #221's MED-5
+// finding on restart-unit.mjs: a <Label> is attacker-creatable by anyone who
+// can drop a plist, and review finding MED-3.3 on #230 found an earlier
+// revision of this file interpolated an unvalidated Label straight into a
+// copy-pasteable shell command in the WARN message — README.md's own guidance
+// is to hand `ocp doctor` output to an AI agent, which can make a
+// command-injection-shaped string in that output actionable, not just
+// cosmetically broken.
+const LAUNCHD_LABEL_RE = /^[A-Za-z0-9_.@-]+$/;
+// Only these UnitFileState values mean "would actually start at boot" for the
+// purposes of this check. Defense in depth (review finding HIGH-2 on #230): a
+// mutation that deleted `--state=enabled` from the LISTING command survived
+// the full suite untouched, because nothing re-derived "enabled" from each
+// unit's OWN config — this allowlist is that second, independent gate. Stays
+// PERMISSIVE when the property is absent (older systemd, or a caller that
+// didn't request it) — this is a second check, not the only one, and must not
+// newly reject unit shapes the primary --state=enabled filter already handled.
+const UNIT_FILE_STATE_ALLOWLIST = new Set(["enabled", "enabled-runtime"]);
 // ARG_MAX / cost safety cap: past this many enabled *.service units in one scope,
 // a single batched `systemctl show <all names> ...` command line risks becoming
 // unwieldy for no real benefit (a host with 200+ enabled units enabling two OCP
@@ -119,13 +154,18 @@ function parseSystemctlShowBlocks(showOutput) {
 }
 
 // Fingerprint one `systemctl show` property block as an OCP server.mjs unit, or
-// null if it plainly isn't one. ExecStart's structured form from `systemctl show`
-// looks like "{ path=... ; argv[]=/usr/bin/node /home/opc/ocp/server.mjs ; ... }" —
-// pull argv[] out of that if present, else fall back to treating the whole
-// property as the argv string (keeps this tolerant of older systemd's plainer
-// ExecStart rendering rather than hard-requiring the structured form).
+// null if it plainly isn't one (or isn't confidently determinable). ExecStart's
+// structured form from `systemctl show` looks like
+// "{ path=... ; argv[]=/usr/bin/node /home/opc/ocp/server.mjs ; ... }" — pull
+// argv[] out of that if present, else fall back to treating the whole property
+// as the argv string (tolerant of older systemd's plainer ExecStart rendering).
 function fingerprintSystemdUnit(props, scope) {
   if (!UNIT_NAME_RE.test(props.Id || "")) return null; // never trust an unvalidated Id downstream
+
+  // HIGH-2 defense in depth — see UNIT_FILE_STATE_ALLOWLIST above.
+  const state = props.UnitFileState;
+  if (state && !UNIT_FILE_STATE_ALLOWLIST.has(state)) return null;
+
   const execStart = props.ExecStart || "";
   const argvMatch = execStart.match(/argv\[\]=([^;]+)/);
   const argv = (argvMatch ? argvMatch[1] : execStart).trim().split(/\s+/).filter(Boolean);
@@ -133,13 +173,22 @@ function fingerprintSystemdUnit(props, scope) {
   if (!serverArg) return null; // not an OCP unit — doesn't invoke server.mjs at all
   const workingTree = serverArg === "server.mjs" ? "" : serverArg.slice(0, -"/server.mjs".length);
 
+  // MED-6 (review of #230): `systemctl show -p Environment` reflects only literal
+  // `Environment=` directives — it does NOT expand `EnvironmentFile=`. setup.mjs itself only
+  // ever writes literal Environment= lines, but a hand-edited unit could use either. If a
+  // candidate's real port might be set via a file we cannot read here, assuming DEFAULT_PORT
+  // would fabricate a port match (or a mismatch) with no real evidence behind it — drop the
+  // candidate rather than guess (same "unknown must never be treated as safe-to-guess"
+  // philosophy this file already applies elsewhere).
+  if (props.EnvironmentFiles && props.EnvironmentFiles.trim()) return null;
+
   const env = props.Environment || "";
   const portMatch = env.match(/CLAUDE_PROXY_PORT=(\S+)/);
   const port = portMatch ? portMatch[1].replace(/^"|"$/g, "") : String(DEFAULT_PORT);
   const bindMatch = env.match(/CLAUDE_BIND=(\S+)/);
   const bind = bindMatch ? bindMatch[1].replace(/^"|"$/g, "") : "(default bind)";
 
-  return { name: props.Id, scope, port, workingTree, bind };
+  return { name: props.Id, scope, platform: "linux", port, workingTree, bind };
 }
 
 // macOS equivalent. setup.mjs only EVER writes one LaunchAgent
@@ -148,8 +197,14 @@ function fingerprintSystemdUnit(props, scope) {
 // definitions) is far less likely to arise from OCP's own tooling here than on
 // Linux, where a hand-rolled system-scope unit is exactly what the field
 // incident found. It is not impossible — an operator can hand-create a second
-// LaunchAgent or a system LaunchDaemon pointing at the same server.mjs — so
-// this still checks rather than silently skipping the platform.
+// LaunchAgent, or a package installer can drop one system-wide under
+// /Library/LaunchAgents, or a LaunchDaemon under /Library/LaunchDaemons — so
+// this still checks rather than silently skipping the platform, and scans all
+// three locations (review finding MED-3.4 on #230: an earlier revision only
+// scanned the two locations LEAST likely to be populated on an ordinary Mac —
+// Apple's own daemons live under /System/Library, so /Library/LaunchDaemons is
+// normally empty — and never scanned /Library/LaunchAgents at all, which is
+// exactly where a system-wide installer drops one).
 //
 // plistBlob is a single pre-concatenated blob (one shell command, see
 // gatherUnitCandidates) with each file's content prefixed by a
@@ -170,12 +225,30 @@ function parsePlistCandidates(plistBlob) {
     if (!serverArg) continue; // not an OCP unit
     const workingTree = serverArg === "server.mjs" ? "" : serverArg.slice(0, -"/server.mjs".length);
     const labelMatch = content.match(/<key>Label<\/key>\s*<string>([^<]*)<\/string>/);
+    const label = labelMatch ? labelMatch[1] : null;
+    // Defense in depth (see LAUNCHD_LABEL_RE above): reject the whole candidate, exactly like
+    // an unvalidated systemd Id is rejected on the Linux side, rather than trust an unvalidated
+    // Label into any downstream message or command.
+    if (!label || !LAUNCHD_LABEL_RE.test(label)) continue;
     const portMatch = content.match(/<key>CLAUDE_PROXY_PORT<\/key>\s*<string>([^<]*)<\/string>/);
     const bindMatch = content.match(/<key>CLAUDE_BIND<\/key>\s*<string>([^<]*)<\/string>/);
-    const scope = path.includes("/LaunchDaemons/") ? "system" : "user";
+    const isDaemon = path.includes("/LaunchDaemons/");
+    // scope: display grouping only ("is this personal-to-me or system-wide"). domain: the
+    // launchctl disable-command TARGET, which is a different axis — review finding MED-3.3 on
+    // #230 found the WARN message printed a `systemctl` command on macOS (a binary that does
+    // not exist there) at all, so the fix must get the macOS command right, not just avoid
+    // Linux syntax. A LaunchDaemon runs in launchd's `system` domain (`sudo launchctl disable
+    // system/<label>`); a LaunchAgent — whether personal (~/Library) or installed system-wide
+    // (/Library) — loads into the CURRENT USER's `gui/<uid>` domain, and launchctl's
+    // disabled-overrides database (see parseDisabledLabels below) is tracked per that domain
+    // regardless of which directory installed the plist.
+    const scope = isDaemon || path.startsWith("/Library/LaunchAgents/") ? "system" : "user";
+    const domain = isDaemon ? "system" : "gui";
     units.push({
-      name: labelMatch ? labelMatch[1] : path,
+      name: label,
       scope,
+      domain,
+      platform: "darwin",
       port: portMatch ? portMatch[1] : String(DEFAULT_PORT),
       workingTree,
       bind: bindMatch ? bindMatch[1] : "(default bind)",
@@ -184,17 +257,41 @@ function parsePlistCandidates(plistBlob) {
   return units;
 }
 
-// Two-or-more units sharing BOTH port and working tree are the actual hazard
-// shape (see the module comment above); anything else — a lone OCP unit, or
-// two units that merely happen to share a port with a DIFFERENT tree, or the
-// same tree on a DIFFERENT port — is not this failure mode and must not warn.
+// Parses `launchctl print-disabled gui/<uid>` into the set of labels an
+// operator has PERSISTENTLY disabled — real format (verified against a live
+// host): a `disabled services = { "<label>" => enabled|disabled ... }` block.
+// A RunAtLoad=true plist that's been `launchctl disable`d is inert (it will
+// NOT actually start), so warning about it would be a false positive — and
+// `launchctl disable` is the persistent, standard remediation a Mac operator
+// would reach for (the exact analogue of `systemctl --user disable` on
+// Linux). Best-effort: if disabledBlob couldn't be gathered, this returns an
+// empty set (nothing filtered) — permissive, not a reason to mark the whole
+// check "unknown", since RunAtLoad=true is already a sufficient positive
+// signal on its own and this is only a refinement that trims false positives
+// further. Scoped to the `gui/<uid>` domain only (covers every LaunchAgent
+// candidate, personal or system-wide-installed); a LaunchDaemon's disabled
+// state lives in the `system` domain, which requires root to query and is out
+// of scope for a read-only, unprivileged pre-flight probe — a documented,
+// deliberate limitation, not a silent gap (see the PR body).
+function parseDisabledLabels(disabledBlob) {
+  const disabled = new Set();
+  if (!disabledBlob) return disabled;
+  const re = /"([^"]+)"\s*=>\s*(enabled|disabled)/g;
+  let m;
+  while ((m = re.exec(String(disabledBlob))) !== null) {
+    if (m[2] === "disabled") disabled.add(m[1]);
+  }
+  return disabled;
+}
+
+// Two-or-more units sharing the same PORT are the hazard (see the "Grouping
+// key" discussion in the module comment above — port alone, not port+tree).
 function groupAndAssessConflicts(units) {
   if (units.length < 2) return { state: "clear" };
   const groups = new Map();
   for (const u of units) {
-    const key = `${u.port}::${u.workingTree}`;
-    if (!groups.has(key)) groups.set(key, []);
-    groups.get(key).push(u);
+    if (!groups.has(u.port)) groups.set(u.port, []);
+    groups.get(u.port).push(u);
   }
   const conflicting = [...groups.values()].filter(g => g.length >= 2);
   if (conflicting.length === 0) return { state: "clear" };
@@ -206,18 +303,22 @@ function groupAndAssessConflicts(units) {
 // gather-vs-classify split so the decision logic is directly unit-testable
 // without a live systemd/launchd instance.
 //
-// raw.userShowOut / raw.systemShowOut (Linux) and raw.plistBlob (macOS) follow
-// a strict three-value discipline, same as restart-unit.mjs's ss/lsof/cgroup
-// probes: `null` means "could not gather this" (tool missing, command failed,
-// or too many candidates to probe cheaply — MAX_UNIT_CANDIDATES), `""` or a
-// real listing means "gathered successfully, here's what's there" (including
+// raw.userShowOut / raw.systemShowOut / raw.plistBlob follow a strict
+// three-value discipline, same as restart-unit.mjs's ss/lsof/cgroup probes:
+// `null` means "could not gather this" (tool missing, command failed, or too
+// many candidates to probe cheaply — MAX_UNIT_CANDIDATES), `""` or a real
+// listing means "gathered successfully, here's what's there" (including
 // legitimately empty). `null` must never be read as "confirmed nothing found".
+// raw.disabledBlob (macOS only) is best-effort and does NOT participate in
+// this discipline — see parseDisabledLabels above.
 export function classifyMultiUnitRisk(raw = {}) {
   if (raw.platform === "darwin") {
     if (raw.plistBlob == null) {
       return { state: "unknown", reason: "could not enumerate LaunchAgents/LaunchDaemons" };
     }
-    return groupAndAssessConflicts(parsePlistCandidates(raw.plistBlob));
+    const disabledLabels = parseDisabledLabels(raw.disabledBlob);
+    const units = parsePlistCandidates(raw.plistBlob).filter(u => !disabledLabels.has(u.name));
+    return groupAndAssessConflicts(units);
   }
 
   if (raw.userShowOut == null || raw.systemShowOut == null) {
@@ -238,19 +339,42 @@ export function classifyMultiUnitRisk(raw = {}) {
 // null/""/text discipline classifyMultiUnitRisk expects. `run` defaults to
 // real execSync in production; tests inject a fake runner that pattern-matches
 // on the command string — the exact shape PR #221's resolveRestartPlan uses,
-// adopted here specifically because that PR's review (MED-6) found the
-// UNTESTED impure layer was where the real defects hid, not the pure
-// classifier.
+// adopted here specifically because that PR's review found the UNTESTED
+// impure layer was where the real defects hid, not the pure classifier (this
+// PR's own review — HIGH-1 on #230 — found the same thing had happened here:
+// two tests asserted on the command string FROM INSIDE the injected fake,
+// where the assertion's throw was swallowed by this function's own try/catch
+// before it could reach the test framework. Fixed by having tests capture the
+// command string and assert on it AFTER calling this function — see
+// test-features.mjs).
+//
+// MED-4 (review of #230), verified on a real host: `for f in <dir>/*.plist; do
+// [ -f "$f" ] && ...; done` exits non-zero when the LAST glob in the list
+// expands to nothing (the shell leaves it as a literal, unmatched pattern, and
+// `[ -f ]` on a literal glob string is false) — and on an ordinary Mac,
+// /Library/LaunchDaemons is normally EMPTY (Apple's own daemons live under
+// /System/Library), so this was the common case, not an edge case. execSync
+// throws on that non-zero exit and DISCARDS the stdout already produced by
+// earlier, successful iterations — silently turning a working scan into
+// "unknown" on nearly every real Mac. Fixed with a trailing `; :` (`:` is the
+// shell no-op builtin, always exit 0) so the loop's own exit status never
+// determines the command's.
 export function gatherUnitCandidates(run, platform) {
   if (platform === "darwin") {
     let plistBlob;
     try {
       plistBlob = run(
-        `for f in "$HOME/Library/LaunchAgents"/*.plist /Library/LaunchDaemons/*.plist; do ` +
-        `[ -f "$f" ] && { echo "===OCP-DOCTOR-FILE:$f==="; cat "$f"; }; done 2>/dev/null`
+        `for f in "$HOME/Library/LaunchAgents"/*.plist /Library/LaunchAgents/*.plist /Library/LaunchDaemons/*.plist; do ` +
+        `[ -f "$f" ] && { echo "===OCP-DOCTOR-FILE:$f==="; cat "$f"; }; done 2>/dev/null; :`
       );
     } catch { plistBlob = null; }
-    return { platform, plistBlob };
+
+    let disabledBlob;
+    try {
+      disabledBlob = run(`launchctl print-disabled gui/$(id -u) 2>/dev/null`);
+    } catch { disabledBlob = null; }
+
+    return { platform, plistBlob, disabledBlob };
   }
 
   let userListing, systemListing;
@@ -272,7 +396,7 @@ export function gatherUnitCandidates(run, platform) {
       userShowOut = null;
     } else {
       try {
-        userShowOut = run(`systemctl --user show ${userNames.join(" ")} -p Id -p ExecStart -p Environment --no-pager`);
+        userShowOut = run(`systemctl --user show ${userNames.join(" ")} -p Id -p ExecStart -p Environment -p UnitFileState -p EnvironmentFiles --no-pager`);
       } catch { userShowOut = null; }
     }
   }
@@ -281,7 +405,7 @@ export function gatherUnitCandidates(run, platform) {
       systemShowOut = null;
     } else {
       try {
-        systemShowOut = run(`systemctl show ${systemNames.join(" ")} -p Id -p ExecStart -p Environment --no-pager`);
+        systemShowOut = run(`systemctl show ${systemNames.join(" ")} -p Id -p ExecStart -p Environment -p UnitFileState -p EnvironmentFiles --no-pager`);
       } catch { systemShowOut = null; }
     }
   }
@@ -296,19 +420,46 @@ export function detectMultiUnitBootRace(opts = {}) {
   return classifyMultiUnitRisk(raw);
 }
 
+// Picks which unit in a conflicting group to suggest disabling: prefer a
+// "user"-scope one (matches the actual remediation used on the field-incident
+// host — the stray USER unit was disabled, the SYSTEM unit kept), else the
+// first unit encountered (deterministic: gather always processes scopes/
+// directories in the same fixed order).
+function pickDisableTarget(group) {
+  return group.find(u => u.scope === "user") || group[0];
+}
+
+// Platform- and domain-aware remediation command (review finding MED-3.3 on
+// #230: the previous revision always printed a `systemctl` command, including
+// on macOS, where that binary does not exist).
+function buildDisableHint(group) {
+  const target = pickDisableTarget(group);
+  if (target.platform === "darwin") {
+    const cmd = target.domain === "system"
+      ? `sudo launchctl disable system/${target.name}`
+      : `launchctl disable gui/$(id -u)/${target.name}`;
+    return `disable the stray one — e.g. "${cmd}" (reversible: the plist is preserved, only a persistent disable flag is set; undo with the same command substituting "enable" for "disable")`;
+  }
+  if (target.scope === "user") {
+    return `disable the stray one — e.g. "systemctl --user disable ${target.name}" (reversible: the unit file is preserved, only the boot-enable link is removed)`;
+  }
+  return `disable whichever is not your intended target — e.g. "systemctl disable ${target.name}" (reversible: the unit file is preserved)`;
+}
+
 // Actionable WARN text: names every conflicting unit, the difference that
-// matters (bind address — the field incident's actual LAN-reachability hazard),
-// and the operator fix used to resolve the real host (disable the stray unit;
-// the file is preserved, the fix is reversible).
+// matters (bind address — the field incident's actual LAN-reachability
+// hazard — plus whether the units share one working tree or point at
+// different ones, see the "Grouping key" discussion above), and a
+// platform-correct, reversible remediation command.
 function describeMultiUnitConflict(groups) {
   return groups.map(group => {
     const port = group[0].port;
+    const trees = [...new Set(group.map(u => u.workingTree))];
+    const treeNote = trees.length === 1
+      ? ` (same working tree: ${trees[0] || "(unresolved)"})`
+      : ` — DIFFERENT working trees (${trees.map(t => t || "(unresolved)").join(" vs ")}): different code may be racing for this port, not just different config`;
     const names = group.map(u => `${u.scope}-scope "${u.name}" (bind ${u.bind})`).join(" and ");
-    const userUnit = group.find(u => u.scope === "user");
-    const disableHint = userUnit
-      ? `disable the stray one — e.g. "systemctl --user disable ${userUnit.name}" (reversible: the unit file is preserved, only the boot-enable link is removed)`
-      : `disable whichever is not your intended target — e.g. "systemctl disable <unit>" (reversible: the unit file is preserved)`;
-    return `${group.length} enabled units target OCP port ${port}: ${names} — boot race: whichever starts first wins the port and the other silently orphans (issue #215). Pick one and ${disableHint}.`;
+    return `${group.length} enabled units target OCP port ${port}${treeNote}: ${names} — boot race: whichever starts first wins the port and the other silently orphans (issue #215). Pick one and ${buildDisableHint(group)}.`;
   }).join(" | ");
 }
 
@@ -418,16 +569,24 @@ export async function runDoctor(opts = {}) {
   // Gated by skipNetwork like the health/oauth block above — this reads the live
   // systemd/launchd environment (not "network" in the curl/git sense, but the same
   // "don't touch anything live" contract skipNetwork already exists to express in
-  // tests). Only pushed when there's a confirmed conflict to report — "clear" and
-  // "unknown" both push nothing, mirroring service_version_matches_tree's own
-  // "no check id at all when there's nothing warn-worthy" convention elsewhere in
-  // this file. See the module comment above classifyMultiUnitRisk for the full
-  // design rationale (why WARN not FAIL, why port+workingTree must both match,
-  // why this doesn't depend on scripts/lib/restart-unit.mjs).
+  // tests). "clear" pushes nothing (mirrors service_version_matches_tree's own "no
+  // check id at all when there's nothing warn-worthy" convention). "unknown" DOES
+  // push a low-severity INFO line (review finding MED-3.5 on #230): before this,
+  // "verified clear" and "couldn't verify" were indistinguishable from outside the
+  // process (both pushed nothing), which matters because `systemctl --user ...`
+  // fails without XDG_RUNTIME_DIR/DBUS_SESSION_BUS_ADDRESS — exactly what `sudo`'s
+  // env_reset strips — so `sudo ocp update` on a host whose OCP is a SYSTEM unit
+  // (the #215 shape) silently degraded this whole check with no visible trace.
+  // INFO does not affect fail_count/warn_count. See the module comment above
+  // classifyMultiUnitRisk for the full design rationale (why WARN not FAIL, why
+  // grouping is by port alone, why this doesn't depend on scripts/lib/restart-
+  // unit.mjs).
   if (!opts.skipNetwork) {
     const multiUnit = detectMultiUnitBootRace(opts);
     if (multiUnit.state === "warn") {
       push("multi_unit_boot_race", "WARN", describeMultiUnitConflict(multiUnit.groups));
+    } else if (multiUnit.state === "unknown") {
+      push("multi_unit_boot_race", "INFO", `could not verify: ${multiUnit.reason}`);
     }
   }
 
