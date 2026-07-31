@@ -614,6 +614,21 @@ cmd_restart() {
     # actionable refusal to stderr and exits non-zero. No fallback to a guess, and no more
     # unmanaged nohup process left behind on refusal.
     #
+    # Scope narrowing (independent review of this change, corrected here rather than only in
+    # the PR): delegating fully to the JS resolver drops the legacy `ai.openclaw.proxy` plist /
+    # `openclaw-proxy` unit fallback this function used to try. That is NOT because PR #221
+    # already established this precedent for its own two callers — it didn't: scripts/
+    # upgrade.mjs's restart phases never had a legacy-name fallback to begin with (verified
+    # against PR #221's own diff), so this PR is the first to actually drop it. It's justified on
+    # its own terms instead: `dev.ocp.proxy` / `ocp-proxy.service` are the current names, any host
+    # still on the legacy label should already have been migrated by setup.mjs's install-
+    # autostart step (scripts/lib/install-autostart.mjs removes the legacy plist/unit on every
+    # `ocp update`/reconfigure), and on Linux the live cgroup walk is strictly BETTER than the old
+    # two-name hard-coded list regardless — it discovers whatever unit actually holds the port by
+    # reading its cgroup, not by checking it against a fixed name. Flagged as a residual item:
+    # confirm no fleet host is still running under the legacy macOS launchd label before relying
+    # on this for such a host.
+    #
     # `|| resolve_status=$?` (not a bare assignment) is load-bearing under `set -euo pipefail`
     # (ocp:7): a bare `var=$(cmd)` where cmd exits non-zero trips `set -e` immediately, which
     # would abort THIS function (and everything that called it) before the refusal handling
