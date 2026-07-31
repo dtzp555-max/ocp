@@ -1792,6 +1792,108 @@ test("#257: an unparseable --target is refused with a clear message rather than 
   assert.ok(/not a parseable/.test(caught.message), `expected an actionable message, got: ${caught.message}`);
 });
 
+// ── #257 SECURITY (independent review finding, HIGH) ────────────────────────────────────────────
+// A shell-metacharacter --target payload used to be accepted by the OLD unanchored regex (it
+// matched only a PREFIX of the string, silently discarding the rest), and the raw string --
+// metacharacters included -- was then interpolated into an `execSync` template string, which
+// runs through /bin/sh. The injected command executed DURING VALIDATION, before the tag was
+// ultimately (and separately) refused -- so a test that only asserts "the pin was refused" would
+// have passed against the vulnerable code; the refusal was never protection, it just happened to
+// also occur. This test asserts BOTH: the pin is refused, AND the payload's injected command
+// never ran (a marker file inside a disposable scratch directory -- never touching the real ~/ocp
+// tree or any real credential -- must not exist afterward).
+//
+// mockExec:false is deliberate and required here: mockExec:true would skip the real git call
+// entirely (tagExists defaults to true), which means the vulnerable shell-interpolation line
+// would never even run under mockExec -- the vulnerability could only ever be demonstrated (or
+// ruled out) with real execution. Safe to run for real: this specific payload's own trailing
+// `; false` guarantees the compound shell command's exit status is non-zero, so validation
+// refuses (throws) immediately after -- BEFORE runFullUpgrade's `try` block / phase 1 is ever
+// reached -- meaning no snapshot, no npm install, no setup.mjs, no restart ever runs, regardless
+// of whether the code being tested is the vulnerable version or the fixed one. `ocpDir` points at
+// a throwaway temp directory created fresh for this test and removed in `finally` -- it does not
+// need to be a real git repository (the injected command runs via the shell's `;` separator
+// regardless of whether the preceding `git` invocation succeeds).
+//
+// Belt-and-braces note, verified directly (mutation-tested, not assumed): even if the
+// tag-existence guard itself were ever neutered by a future regression, this specific test setup
+// has a SECOND, independent safety net -- `ocpDir` is a plain empty directory, not a real git
+// repository, so `runFullUpgrade`'s very next real command (phase 2's `git -C ${ocpDir}
+// rev-parse HEAD`, to compute the snapshot's fromCommit) fails immediately with "not a git
+// repository", aborting before `writeSnapshot()` -- which targets the REAL homedir(), not
+// ocpDir -- is ever reached. Confirmed empirically: neutering the tag-existence throw and
+// re-running this test does NOT create any file under the real ~/.ocp/upgrade-snapshot-*/.
+test("#257 SECURITY: a --target shell-metacharacter payload is refused AND never reaches a shell (marker file must not exist)", async () => {
+  const scratchDir = _ltMkdtemp(join(_ltTmp(), "ocp-257-injection-"));
+  try {
+    const markerPath = join(scratchDir, "PWNED");
+    const payload = `v3.99.0 ; touch ${markerPath} ; false`;
+    let caught = null;
+    try {
+      await runUpgrade({
+        yes: true, dryRun: false, mockExec: false, ocpDir: scratchDir,
+        target: payload,
+        mockDoctor: { ready_to_upgrade: true, next_action: { kind: "upgrade" },
+                      current_version: "v3.10.0", latest_version: "v3.14.0" },
+      });
+    } catch (e) { caught = e; }
+    assert.ok(caught, "a shell-metacharacter --target payload must be refused, not silently accepted");
+    assert.ok(!_ltExists(markerPath),
+      `SECURITY: the payload's injected command must NEVER execute -- a marker file at ` +
+      `${markerPath} would prove --target reached a real shell. A refusal message alone does ` +
+      `NOT prove this: the vulnerable code also refused this exact payload, AFTER the injected ` +
+      `command had already run (verified independently before this fix).`);
+  } finally {
+    _ltRm(scratchDir, { recursive: true, force: true });
+  }
+});
+
+// Isolates the ANCHORED-REGEX layer specifically (the OLD unanchored `/^(\d+)\.(\d+)\.(\d+)/`,
+// with no trailing `$`, matched only a PREFIX and silently discarded everything after it). This
+// is deliberately a DIFFERENT test from the SECURITY test above: a metacharacter payload is
+// caught by rebuild-from-parts (below) even if the anchor alone regresses, so a test built
+// around a metacharacter payload cannot, by itself, prove the anchor is doing anything. This
+// payload carries no metacharacters at all -- just a valid vX.Y.Z prefix followed by ordinary
+// trailing text -- so it isolates: does the validator REJECT malformed input, or does it
+// silently truncate and accept a truthy-looking prefix?
+test("#257: trailing garbage after a valid-looking vX.Y.Z prefix is refused, not silently truncated and accepted", async () => {
+  let caught = null;
+  try {
+    await runUpgrade({
+      yes: true, dryRun: false, mockExec: true,
+      target: "v3.12.0-drift-extra-text",
+      mockDoctor: { ready_to_upgrade: true, next_action: { kind: "upgrade" },
+                    current_version: "v3.10.0", latest_version: "v3.14.0" },
+    });
+  } catch (e) { caught = e; }
+  assert.ok(caught, "a --target with trailing garbage after a valid-looking prefix must be refused, not silently truncated and accepted as the prefix alone");
+  assert.ok(/not a parseable/.test(caught.message), `expected an actionable message, got: ${caught.message}`);
+});
+
+// Isolates the REBUILD-FROM-PARSED-INTEGERS layer specifically. A leading zero is the cleanest
+// input that distinguishes "return the raw string unchanged (only prefixing 'v' if missing)"
+// (the pre-review-fix approach) from "rebuild v${major}.${minor}.${patch} from the PARSED
+// integers" (this fix): both accept "v03.12.0" as parseable and both agree it's newer than
+// v3.10.0, but only the rebuilt form produces the CANONICAL "v3.12.0" a real release tag would
+// actually be named -- the raw/prefix-only form would silently carry "v03.12.0" through to
+// `git checkout`/`rev-parse --verify refs/tags/v03.12.0`, which does not match any real tag
+// (`v3.12.0`), on a real repository. This is a correctness property distinct from the injection
+// fix above, but is exactly what the review's "return a NORMALIZED string" requirement covers.
+test("#257: --target with a leading zero (v03.12.0) is normalized to the canonical v3.12.0, not passed through with the zero preserved", async () => {
+  const result = await runUpgrade({
+    yes: true, dryRun: false, mockExec: true,
+    target: "v03.12.0",
+    mockDoctor: { ready_to_upgrade: true, next_action: { kind: "upgrade" },
+                  current_version: "v3.10.0", latest_version: "v3.14.0" },
+  });
+  assert.equal(result.target, "v3.12.0", `expected the canonical, zero-stripped form; got ${JSON.stringify(result.target)}`);
+  const fetchInstallCmds = result.phases.filter((p) => p.name === "fetch+install").map((p) => p.cmd);
+  assert.ok(fetchInstallCmds.some((c) => c.includes("checkout v3.12.0")),
+    `expected checkout of the CANONICAL v3.12.0, not the raw v03.12.0; got cmds=${JSON.stringify(fetchInstallCmds)}`);
+  assert.ok(!fetchInstallCmds.some((c) => c.includes("v03.12.0")),
+    `must not carry the raw, non-canonical 'v03.12.0' through to git; got cmds=${JSON.stringify(fetchInstallCmds)}`);
+});
+
 test("#257: --dry-run preview for the full path shows the PINNED target, not doctor.latest_version", async () => {
   const result = await runUpgrade({
     dryRun: true, target: "v3.12.0",

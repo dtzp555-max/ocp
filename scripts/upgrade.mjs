@@ -12,7 +12,7 @@
  *   rollback      restore from snapshot
  */
 import { runDoctor } from "./doctor.mjs";
-import { execSync } from "node:child_process";
+import { execSync, execFileSync } from "node:child_process";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { existsSync, copyFileSync } from "node:fs";
@@ -379,8 +379,29 @@ export async function runPostFlightCheck(target, opts = {}) {
 // Kept pure (no git access) so `runUpgrade`'s --dry-run preview can call this too without ever
 // shelling out — a preview does not need to confirm the tag actually exists, only the real
 // execution path does (see runFullUpgrade's own tag-existence check, right after this is called).
+//
+// SECURITY (independent review finding, HIGH — fixed here): the regex below is anchored at BOTH
+// ends (`^...$`), not just the start. The original, unanchored form (`^(\d+)\.(\d+)\.(\d+)` with
+// no trailing `$`) happily matched a PREFIX of an arbitrary string — e.g.
+// `_targetSemverParts("3.99.0 ; touch /tmp/PWNED ; false")` returned `{major:3,minor:99,patch:0}`,
+// silently discarding everything from the space onward. Because `resolveUpgradeTarget` (below,
+// pre-fix) returned the RAW input string rather than a value rebuilt from the parsed integers,
+// that discarded suffix survived downstream, where it was interpolated directly into an
+// `execSync` template string in `runFullUpgrade` (`git -C ${ocpDir} rev-parse --verify
+// refs/tags/${pinnedTarget}` and `git -C ${ocpDir} checkout ${upgradeTarget}`) — `execSync` runs
+// its argument through `/bin/sh`, so the `; touch ... ; false` portion executed as an
+// independent shell command regardless of whether the `git` portion succeeded. Verified: the
+// crafted payload above made the tag-existence check "cleanly" refuse (git's own exit code was
+// masked by the trailing `; false`), while the injected `touch` ran anyway, during validation,
+// before the refusal was ever reported. The fix has two independent layers, both required
+// ("belt and braces" per review): (1) this anchor makes ANY string containing extra characters
+// fail to parse at all, so it never reaches `resolveUpgradeTarget`'s return; (2) even if this
+// anchor is ever loosened again by a future edit, `runFullUpgrade` now invokes `git` via
+// `execFileSync(file, [args...])` (see below) instead of a shell template string, which never
+// invokes `/bin/sh` at all — a malformed argv element is passed to `git` as a single, inert
+// argument, never parsed as shell syntax.
 function _targetSemverParts(v) {
-  const m = String(v).replace(/^v/, "").match(/^(\d+)\.(\d+)\.(\d+)/);
+  const m = String(v).match(/^v?(\d+)\.(\d+)\.(\d+)$/);
   return m ? { major: +m[1], minor: +m[2], patch: +m[3] } : null;
 }
 function _targetSemverCompare(a, b) {
@@ -392,7 +413,15 @@ function _targetSemverCompare(a, b) {
 }
 function resolveUpgradeTarget({ target: rawTarget, currentVersion }) {
   if (!rawTarget) return { target: null, pinned: false };
-  const requested = rawTarget.startsWith("v") ? rawTarget : `v${rawTarget}`;
+  const parsed = _targetSemverParts(rawTarget);
+  if (!parsed) {
+    throw new Error(`--target ${rawTarget} is not a parseable vX.Y.Z version`);
+  }
+  // SECURITY: rebuilt from the PARSED INTEGER PARTS, never `rawTarget` itself (see the security
+  // note above `_targetSemverParts`) — this is what makes a shell-metacharacter payload
+  // structurally impossible to carry downstream, independent of whether the anchored regex
+  // above is ever loosened by a future edit.
+  const requested = `v${parsed.major}.${parsed.minor}.${parsed.patch}`;
   const cmp = _targetSemverCompare(requested, currentVersion);
   if (cmp === null) {
     throw new Error(`--target ${rawTarget} is not a parseable vX.Y.Z version`);
@@ -506,6 +535,32 @@ async function runFullUpgrade({ doctor, opts }) {
       );
     }
   };
+  // SECURITY (issue #257 review, HIGH): argv-form sibling of `exec` above, for the one command in
+  // this function whose arguments can carry a user-supplied value (`upgradeTarget`, from
+  // `--target`) — `execFileSync(file, args)` never invokes `/bin/sh`, so an argv element can
+  // never be reinterpreted as shell syntax, unlike `exec`'s template-string form. `cmd` (the
+  // human-readable display string recorded into `phases`, e.g. for existing tests asserting on
+  // `.cmd.includes("checkout vX.Y.Z")`) is built via `.join(" ")` purely for bookkeeping/display
+  // — it is NEVER itself executed.
+  const execArgv = (file, args, label) => {
+    const cmd = [file, ...args].join(" ");
+    if (opts.mockExec) {
+      phases.push({ name: label, cmd, status: "skipped-mock" });
+      return "";
+    }
+    try {
+      const out = execFileSync(file, args, { stdio: ["pipe", "pipe", "pipe"] }).toString();
+      phases.push({ name: label, cmd, status: "ok" });
+      return out;
+    } catch (err) {
+      const detail = err.stderr?.toString().trim();
+      phases.push({ name: label, cmd, status: "fail", stderr: detail });
+      throw Object.assign(
+        new Error(`phase ${label} failed: ${detail || err.message}`),
+        { phases, cmd }
+      );
+    }
+  };
   const ocpDir = opts.ocpDir || join(homedir(), "ocp");
   // opts.mockPort (test hook, mirrors opts.mockPlatform): lets tests drive resolveRestartPlan's
   // port validation (HIGH-1 follow-up below) with a deliberately malformed value without
@@ -530,8 +585,14 @@ async function runFullUpgrade({ doctor, opts }) {
       : opts.mockExec
         ? true
         : (() => {
+            // SECURITY: argv form, never a shell template string (see the security note above
+            // resolveUpgradeTarget) — execFileSync passes `pinnedTarget` as ONE inert argument to
+            // `git` directly, with no `/bin/sh` in between to reinterpret it. Defense in depth:
+            // by the time execution reaches here, `pinnedTarget` is already normalized (rebuilt
+            // from parsed integers, never raw input), so this would already be safe even as a
+            // shell string — this is the second, independent layer, not reliance on the first.
             try {
-              execSync(`git -C ${ocpDir} rev-parse --verify refs/tags/${pinnedTarget}`, { stdio: ["pipe", "pipe", "pipe"] });
+              execFileSync("git", ["-C", ocpDir, "rev-parse", "--verify", `refs/tags/${pinnedTarget}`], { stdio: ["pipe", "pipe", "pipe"] });
               return true;
             } catch { return false; }
           })();
@@ -560,9 +621,13 @@ async function runFullUpgrade({ doctor, opts }) {
     // phase 3: fetch + install
     // Issue #257: checkout `upgradeTarget` (the validated --target pin, when given), not
     // unconditionally `doctor.latest_version` — this is the actual fix; everything above is
-    // resolving/validating what that value should be.
+    // resolving/validating what that value should be. SECURITY (review, HIGH): the checkout uses
+    // `execArgv` (argv form), not `exec` (shell template string) — `upgradeTarget` can carry
+    // user-supplied content via --target, so it must never be concatenated into a string that
+    // reaches `/bin/sh`. `fetch`/`npm install` carry no user-supplied value, so they stay on the
+    // plain `exec` helper.
     exec(`git -C ${ocpDir} fetch --tags --quiet`, "fetch+install");
-    exec(`git -C ${ocpDir} checkout ${upgradeTarget}`, "fetch+install");
+    execArgv("git", ["-C", ocpDir, "checkout", upgradeTarget], "fetch+install");
     exec(`npm --prefix ${ocpDir} install --no-audit --no-fund`, "fetch+install");
 
     // phase 4: reconfigure — writes the service unit/plist ONLY (config + legacy-unit
