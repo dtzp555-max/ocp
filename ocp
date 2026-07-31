@@ -220,7 +220,7 @@ cmd_logs() {
   local n=${1:-20}
   local level=${2:-error}
   local data
-  data=$(curl -sf --max-time 10 "$PROXY/logs?n=$n&level=$level") || { echo "Error: proxy unreachable"; return 1; }
+  data=$(curl -sf --max-time 10 "$PROXY/logs?n=$n&level=$level") || { echo "Error: proxy unreachable" >&2; return 1; }
   echo "$data" | python3 -c "
 import sys, json
 d = json.loads(sys.stdin.read())
@@ -255,7 +255,7 @@ EOF
 
 cmd_models() {
   local data
-  data=$(curl -sf --max-time 5 "$PROXY/v1/models") || { echo "Error: proxy unreachable"; return 1; }
+  data=$(curl -sf --max-time 5 "$PROXY/v1/models") || { echo "Error: proxy unreachable" >&2; return 1; }
   echo "$data" | python3 -c "
 import sys, json
 d = json.loads(sys.stdin.read())
@@ -275,7 +275,7 @@ EOF
 
 cmd_sessions() {
   local data
-  data=$(curl -sf --max-time 5 "$PROXY/sessions") || { echo "Error: proxy unreachable"; return 1; }
+  data=$(curl -sf --max-time 5 "$PROXY/sessions") || { echo "Error: proxy unreachable" >&2; return 1; }
   echo "$data" | python3 -c "
 import sys, json
 d = json.loads(sys.stdin.read())
@@ -299,12 +299,16 @@ EOF
 
 cmd_clear() {
   local result
-  result=$(curl -sf --max-time 5 -X DELETE "$PROXY/sessions") || { echo "Error: proxy unreachable"; return 1; }
+  result=$(curl -sf --max-time 5 -X DELETE "$PROXY/sessions") || { echo "Error: proxy unreachable" >&2; return 1; }
   # The DELETE above already ran (the clear itself, if the proxy answered, already happened) —
   # only the count formatting can still fail python3-absent/malformed, so the fallback below
   # says so explicitly rather than implying the clear itself didn't happen (issue #242).
+  # No `2>/dev/null` here (independent review, PR #252 round 1): the other eight `_pyfail` sites
+  # deliberately let python3's own traceback flow through to stderr alongside the `_pyfail`
+  # warning for maximum diagnostic information; this site used to suppress it inconsistently
+  # with no stated reason. Matched to the others rather than inventing an exception.
   local count
-  if count=$(echo "$result" | python3 -c "import sys,json; print(json.loads(sys.stdin.read())['cleared'])" 2>/dev/null); then
+  if count=$(echo "$result" | python3 -c "import sys,json; print(json.loads(sys.stdin.read())['cleared'])"); then
     echo "Cleared $count sessions."
   else
     _pyfail "Sessions were cleared, but the count could not be formatted" "$result"
@@ -354,12 +358,12 @@ if 'key' in d:
     print(f'  Configure in IDE: OPENAI_API_KEY={d[\"key\"]}')
 else:
     print(f'✗ {d.get(\"error\", \"Unknown error\")}')
-" || _pyfail "Could not format the new key response — the raw response above still contains the key" "$result"
+" || _pyfail "Could not format the new key response — the raw response below still contains the key" "$result"
       ;;
     revoke)
       if [[ -z "${2:-}" ]]; then echo "Usage: ocp keys revoke <name|id>"; return 1; fi
       local result
-      result=$(_curl -sf --max-time 5 -X DELETE "$PROXY/api/keys/$2") || { echo "Error: proxy unreachable or unauthorized"; return 1; }
+      result=$(_curl -sf --max-time 5 -X DELETE "$PROXY/api/keys/$2") || { echo "Error: proxy unreachable or unauthorized" >&2; return 1; }
       echo "$result" | python3 -c "
 import sys, json
 d = json.loads(sys.stdin.read())
@@ -373,7 +377,18 @@ else:
       cmd_keys_help
       ;;
     "")
-      _curl -sf --max-time 5 "$PROXY/api/keys" | python3 -c "
+      # Issue #242 review round 1 (the "10th site"): this was the ONE call site the original
+      # audit found already carrying SOME fallback -- but that fallback was a single umbrella
+      # `2>/dev/null || { generic message; exit 1; }` covering BOTH a curl failure AND a python3
+      # failure with the SAME misdiagnosis-prone text ("proxy unreachable or key management not
+      # available") regardless of which one actually happened -- the identical class of problem
+      # the other nine sites were fixed for, just with a fallback present instead of absent.
+      # Split the same way as every other site: capture curl's own result first (so a genuine
+      # unreachable proxy still gets its own accurate message), then let python3's failure route
+      # through the shared `_pyfail` helper (raw JSON preserved, not swallowed by `2>/dev/null`).
+      local data
+      data=$(_curl -sf --max-time 5 "$PROXY/api/keys") || { echo "Error: proxy unreachable or key management not available" >&2; return 1; }
+      echo "$data" | python3 -c "
 import sys, json
 d = json.loads(sys.stdin.read())
 keys = d.get('keys', [])
@@ -386,7 +401,7 @@ else:
     for k in keys:
         status = '✗ revoked' if k['revoked'] else '✓ active'
         print(f'  {k[\"name\"]:<20} {k[\"keyPreview\"]:<20} {status}  {k[\"created_at\"]}')
-" 2>/dev/null || { echo "Error: proxy unreachable or key management not available"; exit 1; }
+" || _pyfail "Could not format the API keys list" "$data"
       ;;
     *)
       echo "Unknown subcommand: $1"; cmd_keys_help; return 1 ;;
@@ -766,7 +781,7 @@ cmd_settings() {
   if [[ -z "${1:-}" ]]; then
     # GET — show all settings
     local data
-    data=$(curl -sf --max-time 5 "$PROXY/settings") || { echo "Error: proxy unreachable"; return 1; }
+    data=$(curl -sf --max-time 5 "$PROXY/settings") || { echo "Error: proxy unreachable" >&2; return 1; }
     echo "$data" | python3 -c "
 import sys, json
 d = json.loads(sys.stdin.read())

@@ -9827,6 +9827,39 @@ test("#242 control: cmd_keys revoke with python3 PRESENT still prints the format
   assert.ok(r.stdout.includes("revoked"), `expected the formatted revoke confirmation, got: ${JSON.stringify(r.stdout)}`);
 });
 
+// ── The "10th site" (independent review, PR #252 round 1): `ocp keys` (list/"") already carried
+// SOME fallback before this PR, but it was one umbrella `2>/dev/null || { generic message; exit
+// 1; }` covering a curl failure and a python3 failure with the SAME misleading text regardless of
+// which actually happened — the identical misdiagnosis class the other nine sites were fixed for.
+test("#242 (10th site) cmd_keys list: absent python3 shows the raw keys JSON instead of the generic 'proxy unreachable' misdiagnosis", () => {
+  const r = _bwHarnessRun({
+    args: ["keys"], pythonAbsent: true, adminKey: "test-admin-key-marker",
+    curlResponses: [{ match: "/api/keys", body: JSON.stringify({ keys: [{ name: "laptop-marker", keyPreview: "sk-ab..12", revoked: false, created_at: "2026-08-01" }] }) }],
+  });
+  assert.ok(!(r.status === 127 && r.stdout === ""), `must not reproduce #236's silent-127 signature; status=${r.status} stdout=${JSON.stringify(r.stdout)}`);
+  assert.ok(r.stderr.includes("python3 is unavailable or failed to format the response"), `expected the _pyfail warning (not the old generic 'proxy unreachable' text), got: ${JSON.stringify(r.stderr)}`);
+  assert.ok(!r.stderr.includes("proxy unreachable or key management not available"), `must NOT misattribute a python3 failure to the proxy; stderr=${JSON.stringify(r.stderr)}`);
+  assert.ok(r.stdout.includes("laptop-marker"), `expected the raw keys JSON on stdout, got: ${JSON.stringify(r.stdout)}`);
+});
+
+test("#242 (10th site) control: cmd_keys list with python3 PRESENT still prints the formatted table", () => {
+  const r = _bwHarnessRun({
+    args: ["keys"], adminKey: "test-admin-key-marker",
+    curlResponses: [{ match: "/api/keys", body: JSON.stringify({ keys: [{ name: "laptop-marker", keyPreview: "sk-ab..12", revoked: false, created_at: "2026-08-01" }] }) }],
+  });
+  assert.equal(r.status, 0, `expected a clean exit, got status=${r.status} stderr=${r.stderr}`);
+  assert.ok(r.stdout.includes("API Keys") && r.stdout.includes("laptop-marker"), `expected the formatted keys table, got: ${JSON.stringify(r.stdout)}`);
+});
+
+test("#242 (10th site) control: cmd_keys list with a genuinely unreachable proxy still reports THAT (not a python3 message)", () => {
+  // No curlResponses registered for "/api/keys" -> the harness's default curl stub refuses any
+  // unhandled invocation (exit 94) -- close enough to "unreachable" for this assertion's purpose
+  // (proving the curl-failure branch's own message is unaffected by this site's restructuring).
+  const r = _bwHarnessRun({ args: ["keys"], adminKey: "test-admin-key-marker" });
+  assert.notEqual(r.status, 0, `expected a non-zero exit; status=${r.status}`);
+  assert.ok(r.stderr.includes("proxy unreachable or key management not available"), `expected the curl-failure message preserved, got stderr=${JSON.stringify(r.stderr)}`);
+});
+
 test("#242 cmd_settings (GET): absent python3 shows the raw settings JSON instead of dying silently", () => {
   const body = JSON.stringify({
     timeout: { value: 60000, unit: "ms", desc: "x" }, firstByteTimeout: { value: 15000, unit: "ms", desc: "x" },
@@ -9851,6 +9884,57 @@ test("#242 control: cmd_settings (GET) with python3 PRESENT still prints the for
   assert.equal(r.status, 0, `expected a clean exit, got status=${r.status} stderr=${r.stderr}`);
   assert.ok(r.stdout.includes("OCP Settings"), `expected the formatted header, got: ${JSON.stringify(r.stdout)}`);
   assert.ok(r.stdout.includes("Timeout Tiers"), `expected the formatted tiers section, got: ${JSON.stringify(r.stdout)}`);
+});
+
+// ── Independent review, PR #252 round 1, fix 3: the "Error: proxy unreachable" guards THIS PR
+// introduced (logs/models/sessions/settings/clear/keys-revoke) used to write to stdout, unlike
+// `cmd_usage`'s own PRE-EXISTING guards (left untouched, per the review — see the money/control
+// tests above, none of which touch that wording). `ocp models` piped into a consumer would read
+// a stdout error line as data. No `curlResponses` entry is registered for the relevant URL below,
+// so the harness's default curl stub refuses (exit 94) -- functionally equivalent to "unreachable"
+// for the purpose of exercising this guard.
+console.log("\nocp display commands: 'proxy unreachable' guards write to stderr, not stdout (#242 review fix 3):");
+
+test("#242 fix-3 cmd_logs: 'Error: proxy unreachable' goes to stderr, stdout stays empty", () => {
+  const r = _bwHarnessRun({ args: ["logs"] });
+  assert.notEqual(r.status, 0);
+  assert.ok(r.stderr.includes("Error: proxy unreachable"), `expected the message on stderr, got: ${JSON.stringify(r.stderr)}`);
+  assert.equal(r.stdout, "", `stdout must stay clean of the error text (a consumer piping this output would read it as data); got: ${JSON.stringify(r.stdout)}`);
+});
+
+test("#242 fix-3 cmd_models: 'Error: proxy unreachable' goes to stderr, stdout stays empty", () => {
+  const r = _bwHarnessRun({ args: ["models"] });
+  assert.notEqual(r.status, 0);
+  assert.ok(r.stderr.includes("Error: proxy unreachable"), `expected the message on stderr, got: ${JSON.stringify(r.stderr)}`);
+  assert.equal(r.stdout, "", `stdout must stay clean; got: ${JSON.stringify(r.stdout)}`);
+});
+
+test("#242 fix-3 cmd_sessions: 'Error: proxy unreachable' goes to stderr, stdout stays empty", () => {
+  const r = _bwHarnessRun({ args: ["sessions"] });
+  assert.notEqual(r.status, 0);
+  assert.ok(r.stderr.includes("Error: proxy unreachable"), `expected the message on stderr, got: ${JSON.stringify(r.stderr)}`);
+  assert.equal(r.stdout, "", `stdout must stay clean; got: ${JSON.stringify(r.stdout)}`);
+});
+
+test("#242 fix-3 cmd_settings (GET): 'Error: proxy unreachable' goes to stderr, stdout stays empty", () => {
+  const r = _bwHarnessRun({ args: ["settings"] });
+  assert.notEqual(r.status, 0);
+  assert.ok(r.stderr.includes("Error: proxy unreachable"), `expected the message on stderr, got: ${JSON.stringify(r.stderr)}`);
+  assert.equal(r.stdout, "", `stdout must stay clean; got: ${JSON.stringify(r.stdout)}`);
+});
+
+test("#242 fix-3 cmd_clear: 'Error: proxy unreachable' goes to stderr, stdout stays empty", () => {
+  const r = _bwHarnessRun({ args: ["clear"] });
+  assert.notEqual(r.status, 0);
+  assert.ok(r.stderr.includes("Error: proxy unreachable"), `expected the message on stderr, got: ${JSON.stringify(r.stderr)}`);
+  assert.equal(r.stdout, "", `stdout must stay clean; got: ${JSON.stringify(r.stdout)}`);
+});
+
+test("#242 fix-3 cmd_keys revoke: 'Error: proxy unreachable or unauthorized' goes to stderr, stdout stays empty", () => {
+  const r = _bwHarnessRun({ args: ["keys", "revoke", "laptop-marker"], adminKey: "test-admin-key-marker" });
+  assert.notEqual(r.status, 0);
+  assert.ok(r.stderr.includes("Error: proxy unreachable or unauthorized"), `expected the message on stderr, got: ${JSON.stringify(r.stderr)}`);
+  assert.equal(r.stdout, "", `stdout must stay clean; got: ${JSON.stringify(r.stdout)}`);
 });
 
 console.log("\nRestart-unit resolution (issue #233 defect 1) — macOS lsof exit-code handling:");
