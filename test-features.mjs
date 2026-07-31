@@ -7582,13 +7582,21 @@ test("ocp cmd_update's real doctor-check-surfacing block: WARN and INFO both pri
 test("LOW-2 (real shell, verified mechanism): ocp's doctor-check-surfacing block survives an ASCII-only locale where the glyphs can't be printed — set -e must not kill cmd_update silently", () => {
   // The actual bug found on review round 4: under `set -euo pipefail` (ocp:7), a non-zero exit
   // from this python pipeline kills `cmd_update` immediately, and `2>/dev/null` hides why.
-  // Verified directly before this fix: `env -i LC_ALL=C PYTHONUTF8=0 bash` on the block raised a
+  // Verified directly before this fix: forcing an ASCII-only locale on the block raised a
   // UnicodeEncodeError trying to print "⚠"/"ℹ" under the C locale's ASCII-only stdout encoding,
   // exiting 1 before even reaching the kind dispatch below it — silently aborting the whole
   // update. This PR's own INFO addition made the block fire far more often (it used to print
   // nothing on most healthy hosts). Reproduced against the REAL, current `ocp` file (not a
   // hand-copied snippet): extract the actual doctor-check-surfacing if-block, wrap it in a
   // minimal harness script, and run it under the exact failing environment.
+  //
+  // Deliberately does NOT use `env -i` (full environment wipe): that strips PATH along with the
+  // locale, and this repo's own CI (Linux) failed to locate bash/python3 under the resulting
+  // fallback path — an environment-portability false failure, not the bug under test. The
+  // portable form instead starts from the CURRENT process's env (keeping PATH intact) and
+  // overrides only the locale-related variables that actually matter for reproducing the
+  // encoding bug — re-verified to reproduce the pre-fix failure and pass post-fix identically to
+  // the `env -i` form before switching to it.
   const src = spotReadFileSync(join(_spotDir, "ocp"), "utf8");
   const startMarker = '  if [[ -n "$doctor_json" ]]; then';
   const endMarker = "\n  fi";
@@ -7610,7 +7618,8 @@ test("LOW-2 (real shell, verified mechanism): ocp's doctor-check-surfacing block
       'echo "REACHED_AFTER_BLOCK"',
       "",
     ].join("\n"));
-    const out = execFileSync("env", ["-i", "LC_ALL=C", "PYTHONUTF8=0", "bash", scriptPath], { encoding: "utf8" });
+    const childEnv = { ...process.env, LC_ALL: "C", LANG: "C", LANGUAGE: "", PYTHONUTF8: "0", PYTHONIOENCODING: "" };
+    const out = execFileSync("bash", [scriptPath], { encoding: "utf8", env: childEnv });
     assert.ok(out.includes("REACHED_AFTER_BLOCK"),
       "cmd_update must survive past this block even when the glyphs can't be encoded in the active locale — set -e must not silently kill it");
   } finally {
