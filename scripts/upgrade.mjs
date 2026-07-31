@@ -354,6 +354,59 @@ export async function runPostFlightCheck(target, opts = {}) {
   return { ok, lastSeen, target: String(target || "").replace(/^v/, "") };
 }
 
+// Issue #257: `--target` was parsed from argv (see `_isMain()` below) and threaded into
+// `runUpgrade(opts)`, but `opts.target` was never actually READ anywhere in `runUpgrade`,
+// `runFullUpgrade`, `runFreshInstall`, or `runRollback` — the full (cross-minor) upgrade path
+// always checked out `doctor.latest_version`, silently ignoring any pin. This is the fix for
+// that path specifically.
+//
+// Scope, decided here rather than left implicit: this does NOT let `--target` bypass doctor's
+// own kind selection (current-vs-latest comparison, decided before either caller below ever
+// runs) — it only decides WHICH tag gets checked out once doctor has ALREADY chosen the
+// "upgrade" kind. Whether `--target` should be able to force an upgrade doctor wouldn't
+// otherwise recommend (e.g. an arbitrary downgrade) is the larger design question the issue
+// itself raises ("does --target bypass doctor's own kind selection entirely?") and explicitly
+// defers — out of scope for this fix, which closes the "dead code" bug, not that open question.
+// Consistency with the light path's own --target handling (issue #241, PR #255, still under
+// review as of this PR): that path made --target a warning-only no-op because its mechanism
+// (`git pull origin main --ff-only`) has no tag-checkout step to redirect at all — honoring a
+// pin there means SWAPPING mechanisms (pull -> tag checkout), a separate design decision #255
+// deliberately deferred. The full path's mechanism ALREADY is a tag checkout
+// (`git checkout ${target}` below) — redirecting which tag is a small, in-mechanism change, not
+// a mechanism swap, which is why this PR reaches a different, still-coherent answer instead of
+// mirroring #255's no-op for consistency's own sake.
+//
+// Kept pure (no git access) so `runUpgrade`'s --dry-run preview can call this too without ever
+// shelling out — a preview does not need to confirm the tag actually exists, only the real
+// execution path does (see runFullUpgrade's own tag-existence check, right after this is called).
+function _targetSemverParts(v) {
+  const m = String(v).replace(/^v/, "").match(/^(\d+)\.(\d+)\.(\d+)/);
+  return m ? { major: +m[1], minor: +m[2], patch: +m[3] } : null;
+}
+function _targetSemverCompare(a, b) {
+  const A = _targetSemverParts(a), B = _targetSemverParts(b);
+  if (!A || !B) return null; // unparseable -- caller must treat as "cannot compare", not 0
+  if (A.major !== B.major) return A.major - B.major;
+  if (A.minor !== B.minor) return A.minor - B.minor;
+  return A.patch - B.patch;
+}
+function resolveUpgradeTarget({ target: rawTarget, currentVersion }) {
+  if (!rawTarget) return { target: null, pinned: false };
+  const requested = rawTarget.startsWith("v") ? rawTarget : `v${rawTarget}`;
+  const cmp = _targetSemverCompare(requested, currentVersion);
+  if (cmp === null) {
+    throw new Error(`--target ${rawTarget} is not a parseable vX.Y.Z version`);
+  }
+  if (cmp <= 0) {
+    throw new Error(
+      `--target ${requested} is not newer than the current version (${currentVersion}) — the ` +
+      `upgrade path only moves forward; use \`ocp update --rollback\` to go back to a previous ` +
+      `snapshot instead`
+    );
+  }
+  return { target: requested, pinned: true };
+}
+
 export async function runUpgrade(opts = {}) {
   const dryRun = !!opts.dryRun;
   const yes = !!opts.yes;
@@ -384,8 +437,15 @@ export async function runUpgrade(opts = {}) {
   if (dryRun) {
     plan.push(`[plan] would proceed with ${kind} path`);
     if (kind === "upgrade") {
+      // Issue #257: preview must show what the real run would ACTUALLY check out, not always
+      // doctor.latest_version — otherwise `--dry-run --target vX.Y.Z` promises one thing and the
+      // real (non-dry-run) invocation, right below, does another. resolveUpgradeTarget() throws
+      // on an invalid/non-forward target even here — a preview should not claim to plan something
+      // the real run would refuse.
+      const { target: previewPinned } = resolveUpgradeTarget({ target: opts.target, currentVersion: doctor.current_version });
+      const previewTarget = previewPinned || doctor.latest_version;
       plan.push(`[plan] phase 1: snapshot to ~/.ocp/upgrade-snapshot-<ts>/`);
-      plan.push(`[plan] phase 2: git checkout ${doctor.latest_version} && npm install`);
+      plan.push(`[plan] phase 2: git checkout ${previewTarget} && npm install`);
       plan.push(`[plan] phase 3: node setup.mjs --reconfigure-only`);
       plan.push(`[plan] phase 4: launchctl bootout/bootstrap`);
       plan.push(`[plan] phase 5: post-flight /health + /v1/models`);
@@ -452,9 +512,41 @@ async function runFullUpgrade({ doctor, opts }) {
   // mutating the real process.env — a global that would otherwise leak across tests.
   const port = opts.mockPort || process.env.CLAUDE_PROXY_PORT || String(DEFAULT_PORT);
 
+  // Issue #257: resolve --target BEFORE any mutation (deliberately outside the try/catch below,
+  // and before phase 1 is even recorded) — an invalid or unknown pin must refuse loudly with no
+  // snapshot taken and no git/npm command run, not fail partway through. resolveUpgradeTarget()
+  // itself only checks shape + direction (pure, no git); the tag's actual EXISTENCE is checked
+  // here, separately, because that part legitimately needs git and is execution-only (the
+  // --dry-run preview above deliberately does not need to confirm existence, only shape).
+  // opts.mockTargetExists (test hook, same convention as opts.mockPort/opts.mockPlatform) lets
+  // tests drive both branches without a real git tree; absent that, opts.mockExec defaults to
+  // "assume it exists" (matching this function's existing mockExec-is-bookkeeping-only
+  // convention below — every other real git/npm call in this function is already skipped the
+  // same way under mockExec).
+  const { target: pinnedTarget } = resolveUpgradeTarget({ target: opts.target, currentVersion: doctor.current_version });
+  if (pinnedTarget) {
+    const tagExists = opts.mockTargetExists !== undefined
+      ? opts.mockTargetExists
+      : opts.mockExec
+        ? true
+        : (() => {
+            try {
+              execSync(`git -C ${ocpDir} rev-parse --verify refs/tags/${pinnedTarget}`, { stdio: ["pipe", "pipe", "pipe"] });
+              return true;
+            } catch { return false; }
+          })();
+    if (!tagExists) {
+      throw new Error(
+        `--target ${pinnedTarget} is not a known release tag (checked refs/tags/${pinnedTarget} ` +
+        `in ${ocpDir}). Run \`git -C ${ocpDir} tag -l\` to see available versions.`
+      );
+    }
+  }
+  const upgradeTarget = pinnedTarget || doctor.latest_version;
+
   try {
     // phase 1: pre-flight (doctor already passed; just record)
-    phases.push({ name: "pre-flight", status: "ok", note: `kind=upgrade from=${doctor.current_version} to=${doctor.latest_version}` });
+    phases.push({ name: "pre-flight", status: "ok", note: `kind=upgrade from=${doctor.current_version} to=${upgradeTarget}` });
 
     // phase 2: snapshot
     const fromCommit = opts.mockExec
@@ -462,12 +554,15 @@ async function runFullUpgrade({ doctor, opts }) {
       : execSync(`git -C ${ocpDir} rev-parse HEAD`).toString().trim();
     snapshotPath = opts.mockExec
       ? "/tmp/mock-snapshot"
-      : writeSnapshot({ homeDir: homedir(), fromCommit, fromVersion: doctor.current_version, toVersion: doctor.latest_version });
+      : writeSnapshot({ homeDir: homedir(), fromCommit, fromVersion: doctor.current_version, toVersion: upgradeTarget });
     phases.push({ name: "snapshot", path: snapshotPath, status: "ok" });
 
     // phase 3: fetch + install
+    // Issue #257: checkout `upgradeTarget` (the validated --target pin, when given), not
+    // unconditionally `doctor.latest_version` — this is the actual fix; everything above is
+    // resolving/validating what that value should be.
     exec(`git -C ${ocpDir} fetch --tags --quiet`, "fetch+install");
-    exec(`git -C ${ocpDir} checkout ${doctor.latest_version}`, "fetch+install");
+    exec(`git -C ${ocpDir} checkout ${upgradeTarget}`, "fetch+install");
     exec(`npm --prefix ${ocpDir} install --no-audit --no-fund`, "fetch+install");
 
     // phase 4: reconfigure — writes the service unit/plist ONLY (config + legacy-unit
@@ -520,14 +615,18 @@ async function runFullUpgrade({ doctor, opts }) {
           const out = execSync(`curl -sf --max-time 2 http://127.0.0.1:${port}/health`).toString();
           const body = JSON.parse(out);
           lastSeen = body.version;
-          if (postFlightOk(body, doctor.latest_version)) { ok = true; break; }
+          // Issue #257: verify against upgradeTarget (the validated pin, when given) — checking
+          // against doctor.latest_version unconditionally would report a PINNED upgrade as
+          // "failed" once the service correctly landed on the (older, requested) target, or
+          // wrongly "succeeded" if some other process happened to already be serving latest.
+          if (postFlightOk(body, upgradeTarget)) { ok = true; break; }
         } catch { /* retry */ }
         await new Promise(r => setTimeout(r, 1000));
       }
       if (!ok) {
         phases.push({
           name: "post-flight", status: "fail",
-          message: `health did not return auth.ok=true AND version=${doctor.latest_version} within 10s`
+          message: `health did not return auth.ok=true AND version=${upgradeTarget} within 10s`
             + (lastSeen ? ` (last saw version=${lastSeen} — a stale process may still hold the port; check \`ss -ltnp\` / \`lsof -i\`)` : ""),
         });
         throw new Error("post-flight failed");
@@ -548,7 +647,11 @@ async function runFullUpgrade({ doctor, opts }) {
       console.error(`[gc] warn: snapshot GC failed: ${e.message}`);
     }
 
-    return { path: "upgrade", executed: true, changed: true, snapshotPath, phases };
+    // `target` (issue #257): the ACTUAL version this upgrade landed on — the validated --target
+    // pin when one was given, doctor.latest_version otherwise. Observable/testable independent
+    // of the real (non-mockExec) git/curl branches above, which this suite never exercises for
+    // real (see this file's own test-features.mjs coverage note).
+    return { path: "upgrade", executed: true, changed: true, snapshotPath, phases, target: upgradeTarget };
   } catch (err) {
     if (snapshotPath && !err.snapshotPath) {
       Object.assign(err, {

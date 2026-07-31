@@ -1660,6 +1660,167 @@ test("upgrade full path executes 5 phases", async () => {
   }
 });
 
+// ── --target on the FULL (cross-minor) upgrade path (issue #257) ───────────────────────────────
+// `--target` was parsed from argv and threaded into runUpgrade(opts), but opts.target was never
+// actually READ anywhere in runUpgrade / runFullUpgrade / runFreshInstall / runRollback — the
+// full path always checked out doctor.latest_version regardless of any pin. Fixed narrowly: this
+// does NOT let --target bypass doctor's own kind selection (current-vs-latest, decided before
+// runFullUpgrade is ever called) — it only decides WHICH tag gets checked out once doctor has
+// ALREADY chosen the "upgrade" kind. See scripts/upgrade.mjs's own comment above
+// resolveUpgradeTarget() for the full scope reasoning and the (deliberate) divergence from
+// PR #255's light-path no-op.
+//
+// Coverage note (stated explicitly, not left implicit): every test below uses mockExec:true or
+// the --dry-run path, matching EVERY existing runFullUpgrade test in this file (see "upgrade
+// full path executes 5 phases" right above, and the entire "Restart-unit resolution ... upgrade
+// wiring" section later in this file) — none of them ever drive the REAL (non-mockExec) git
+// checkout / npm install / curl post-flight branches, because doing so would mean real git/npm
+// mutation and a real network probe against whatever happens to be at ~/ocp on the host running
+// this suite. The wiring for --target inside those specific real branches (the post-flight
+// curl-check target and writeSnapshot's toVersion field) shares the exact same `upgradeTarget`
+// local variable as the checkout command and the returned `result.target` field, both of which
+// ARE exercised below — but is not independently exercised by an automated test, for the same
+// reason nothing else in this function's real branches is.
+console.log("\n--target on the full upgrade path (issue #257):");
+
+test("#257 (the money test): --target on a cross-minor upgrade is honored -- checkout uses the pinned tag, not doctor.latest_version", async () => {
+  const result = await runUpgrade({
+    yes: true, dryRun: false, mockExec: true,
+    target: "v3.12.0",
+    mockDoctor: { ready_to_upgrade: true, next_action: { kind: "upgrade" },
+                  current_version: "v3.10.0", latest_version: "v3.14.0" },
+  });
+  const fetchInstallCmds = result.phases.filter(p => p.name === "fetch+install").map(p => p.cmd);
+  assert.ok(fetchInstallCmds.some(c => c.includes("checkout v3.12.0")),
+    `expected checkout of the PINNED target v3.12.0, got cmds=${JSON.stringify(fetchInstallCmds)}`);
+  assert.ok(!fetchInstallCmds.some(c => c.includes("checkout v3.14.0")),
+    `must NOT silently checkout doctor.latest_version (v3.14.0) when --target was given; got cmds=${JSON.stringify(fetchInstallCmds)}`);
+  assert.equal(result.target, "v3.12.0", `result.target must record the actual pinned target used; got ${JSON.stringify(result.target)}`);
+});
+
+test("#257 control: without --target, the full upgrade path still checks out doctor.latest_version (unchanged default)", async () => {
+  const result = await runUpgrade({
+    yes: true, dryRun: false, mockExec: true,
+    mockDoctor: { ready_to_upgrade: true, next_action: { kind: "upgrade" },
+                  current_version: "v3.10.0", latest_version: "v3.14.0" },
+  });
+  const fetchInstallCmds = result.phases.filter(p => p.name === "fetch+install").map(p => p.cmd);
+  assert.ok(fetchInstallCmds.some(c => c.includes("checkout v3.14.0")),
+    `expected the unchanged default (checkout latest_version); got cmds=${JSON.stringify(fetchInstallCmds)}`);
+  assert.equal(result.target, "v3.14.0", `result.target must fall back to doctor.latest_version; got ${JSON.stringify(result.target)}`);
+});
+
+test("#257: --target without a leading 'v' is normalized before checkout (matches the vX.Y.Z tag convention)", async () => {
+  const result = await runUpgrade({
+    yes: true, dryRun: false, mockExec: true,
+    target: "3.12.0",
+    mockDoctor: { ready_to_upgrade: true, next_action: { kind: "upgrade" },
+                  current_version: "v3.10.0", latest_version: "v3.14.0" },
+  });
+  const fetchInstallCmds = result.phases.filter(p => p.name === "fetch+install").map(p => p.cmd);
+  assert.ok(fetchInstallCmds.some(c => c.includes("checkout v3.12.0")),
+    `expected the normalized 'v3.12.0', got cmds=${JSON.stringify(fetchInstallCmds)}`);
+});
+
+test("#257: a --target that is not a known release tag is refused BEFORE any mutation (no snapshot taken)", async () => {
+  let caught = null;
+  try {
+    await runUpgrade({
+      yes: true, dryRun: false, mockExec: true,
+      target: "v3.12.0", mockTargetExists: false,
+      mockDoctor: { ready_to_upgrade: true, next_action: { kind: "upgrade" },
+                    current_version: "v3.10.0", latest_version: "v3.14.0" },
+    });
+  } catch (e) { caught = e; }
+  assert.ok(caught, "must reject a --target that is not a known release tag");
+  assert.ok(/not a known release tag/.test(caught.message), `expected an actionable message, got: ${caught.message}`);
+  assert.equal(caught.snapshotPath, undefined,
+    `must refuse BEFORE ever taking a snapshot (no partial mutation); got snapshotPath=${JSON.stringify(caught.snapshotPath)}`);
+  assert.equal(caught.phases, undefined,
+    `must refuse before phase bookkeeping even starts; got phases=${JSON.stringify(caught.phases)}`);
+});
+
+test("#257: a --target that IS a known release tag (mockTargetExists:true) proceeds normally", async () => {
+  const result = await runUpgrade({
+    yes: true, dryRun: false, mockExec: true,
+    target: "v3.12.0", mockTargetExists: true,
+    mockDoctor: { ready_to_upgrade: true, next_action: { kind: "upgrade" },
+                  current_version: "v3.10.0", latest_version: "v3.14.0" },
+  });
+  assert.equal(result.target, "v3.12.0");
+});
+
+test("#257: --target older than current_version is refused -- the full upgrade path only moves forward", async () => {
+  let caught = null;
+  try {
+    await runUpgrade({
+      yes: true, dryRun: false, mockExec: true,
+      target: "v3.9.0",
+      mockDoctor: { ready_to_upgrade: true, next_action: { kind: "upgrade" },
+                    current_version: "v3.10.0", latest_version: "v3.14.0" },
+    });
+  } catch (e) { caught = e; }
+  assert.ok(caught, "must reject a --target older than current_version");
+  assert.ok(/not newer than the current version/.test(caught.message), `expected an actionable message, got: ${caught.message}`);
+});
+
+test("#257: --target equal to current_version is refused (not a forward upgrade)", async () => {
+  let caught = null;
+  try {
+    await runUpgrade({
+      yes: true, dryRun: false, mockExec: true,
+      target: "v3.10.0",
+      mockDoctor: { ready_to_upgrade: true, next_action: { kind: "upgrade" },
+                    current_version: "v3.10.0", latest_version: "v3.14.0" },
+    });
+  } catch (e) { caught = e; }
+  assert.ok(caught, "must reject a --target equal to current_version");
+  assert.ok(/not newer than the current version/.test(caught.message), `expected an actionable message, got: ${caught.message}`);
+});
+
+test("#257: an unparseable --target is refused with a clear message rather than reaching git with a bad ref", async () => {
+  let caught = null;
+  try {
+    await runUpgrade({
+      yes: true, dryRun: false, mockExec: true,
+      target: "banana",
+      mockDoctor: { ready_to_upgrade: true, next_action: { kind: "upgrade" },
+                    current_version: "v3.10.0", latest_version: "v3.14.0" },
+    });
+  } catch (e) { caught = e; }
+  assert.ok(caught, "must reject an unparseable --target");
+  assert.ok(/not a parseable/.test(caught.message), `expected an actionable message, got: ${caught.message}`);
+});
+
+test("#257: --dry-run preview for the full path shows the PINNED target, not doctor.latest_version", async () => {
+  const result = await runUpgrade({
+    dryRun: true, target: "v3.12.0",
+    mockDoctor: { ready_to_upgrade: true, next_action: { kind: "upgrade" },
+                  current_version: "v3.10.0", latest_version: "v3.14.0" },
+  });
+  assert.ok(result.plan.some((l) => l.includes("checkout v3.12.0")), `expected preview to show the pinned target; plan=${JSON.stringify(result.plan)}`);
+  assert.ok(!result.plan.some((l) => l.includes("checkout v3.14.0")), `preview must not show latest_version when --target pins elsewhere; plan=${JSON.stringify(result.plan)}`);
+});
+
+test("#257 control: --dry-run preview without --target still shows doctor.latest_version (unchanged default)", async () => {
+  const result = await runUpgrade({
+    dryRun: true,
+    mockDoctor: { ready_to_upgrade: true, next_action: { kind: "upgrade" },
+                  current_version: "v3.10.0", latest_version: "v3.14.0" },
+  });
+  assert.ok(result.plan.some((l) => l.includes("checkout v3.14.0")), `expected the unchanged default preview; plan=${JSON.stringify(result.plan)}`);
+});
+
+test("#257: --dry-run with an invalid --target still throws (dry-run skips MUTATION, not validation)", async () => {
+  await assert.rejects(async () => {
+    await runUpgrade({
+      dryRun: true, target: "v3.9.0",
+      mockDoctor: { ready_to_upgrade: true, next_action: { kind: "upgrade" },
+                    current_version: "v3.10.0", latest_version: "v3.14.0" },
+    });
+  }, /not newer than the current version/);
+});
+
 // ── Reconfigure-only service mode (#226) ──────────────────────────────────
 // #215: on a host where a competing systemd/launchd unit already owns the OCP port, an
 // upgrade's reconfigure step (setup.mjs) must not enable-at-boot or start the service it
