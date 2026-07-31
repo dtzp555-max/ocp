@@ -18,8 +18,20 @@ elif [[ -f "$HOME/.ocp/admin-key" ]]; then
 fi
 
 # Wrapper: curl with optional auth
+#
+# Issue #256: on the default single-user install (no OCP_ADMIN_KEY, no ~/.ocp/admin-key)
+# _AUTH_ARGS stays an empty array. GNU bash 3.2.57 -- the last GPLv2 release, which is what
+# macOS ships as /bin/bash for licensing reasons and cannot be updated -- raises "unbound
+# variable" for "${arr[@]}" on a zero-element array under `set -u` (ocp:7), even though POSIX
+# and bash >= 4.4 correctly expand this to nothing. `${_AUTH_ARGS[@]+"${_AUTH_ARGS[@]}"}` is the
+# 3.2-safe idiom: it expands to nothing when the array is empty/unset, and to the array's
+# elements (word-preserving, same as a plain "${_AUTH_ARGS[@]}") otherwise, on every bash version
+# from 3.2 through current. Audited: this is the only user-defined array expansion anywhere in
+# this script (grep for `[@]`/`[*]`) -- every other such expansion is either the unbraced special
+# parameter "$@" (safe on this bash even when empty) or bash's own always-populated
+# ${BASH_SOURCE[0]}.
 _curl() {
-  curl "${_AUTH_ARGS[@]}" "$@"
+  curl "${_AUTH_ARGS[@]+"${_AUTH_ARGS[@]}"}" "$@"
 }
 
 _json() { python3 -m json.tool 2>/dev/null || cat; }
