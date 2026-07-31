@@ -6562,6 +6562,366 @@ test("ocp-connect: the hardcoded three-id JSON-parse-failure fallback never over
   }
 });
 
+// ═══════════════════════════════════════════════════════════════════════════
+// ── Multi-unit boot-race pre-flight check (issue #220, incident #215) ──
+// New section — kept self-contained (own imports, own console.log header) so a
+// rebase against concurrent test-features.mjs PRs is a clean insert (main moves
+// frequently and other PRs touch this file — see AGENTS.md testing notes).
+//
+// Background: on a real host, a system-scope systemd unit and a user-scope
+// systemd unit were BOTH enabled and both pointed at the same server.mjs
+// working tree and the same OCP port, with drifted config (different bind
+// address, different CLAUDE_BIN). Whichever won the boot race silently decided
+// the host's LAN reachability, and nothing in `ocp doctor` surfaced it. See
+// scripts/doctor.mjs's classifyMultiUnitRisk / gatherUnitCandidates /
+// detectMultiUnitBootRace and issue #215 for the live evidence.
+//
+// This is a STATIC config cross-reference (which units WOULD start at boot,
+// and do any two collide) — deliberately independent of scripts/lib/
+// restart-unit.mjs (PR #221), which resolves a DIFFERENT, live-PID question
+// for the restart phase. See the PR body for the explicit dependency decision.
+//
+// Every test here is BEHAVIORAL: it calls the exported classifier/gatherer (or
+// runDoctor with an injected opts.run) and asserts on return values / pushed
+// checks — never on scripts/doctor.mjs's source text.
+// ═══════════════════════════════════════════════════════════════════════════
+import { classifyMultiUnitRisk, gatherUnitCandidates } from "./scripts/doctor.mjs";
+
+console.log("\nMulti-unit boot-race pre-flight (issue #220) — classifyMultiUnitRisk:");
+
+// Realistic `systemctl show <units> -p Id -p ExecStart -p Environment` output, matching the
+// exact field-incident shape from issue #215: system unit ocp.service (bind 0.0.0.0), user
+// unit ocp-proxy.service (bind 127.0.0.1), same working tree, same port.
+const FIELD_INCIDENT_USER_SHOW =
+  `Id=ocp-proxy.service\n` +
+  `ExecStart={ path=/usr/bin/node ; argv[]=/usr/bin/node /home/opc/ocp/server.mjs ; ignore_errors=no }\n` +
+  `Environment=CLAUDE_PROXY_PORT=3456 CLAUDE_BIND=127.0.0.1 CLAUDE_BIN=/usr/bin/claude`;
+const FIELD_INCIDENT_SYSTEM_SHOW =
+  `Id=ocp.service\n` +
+  `ExecStart={ path=/home/opc/.npm-global/bin/node ; argv[]=/home/opc/.npm-global/bin/node /home/opc/ocp/server.mjs ; ignore_errors=no }\n` +
+  `Environment=CLAUDE_PROXY_PORT=3456 CLAUDE_BIND=0.0.0.0 CLAUDE_BIN=/home/opc/.npm-global/bin/claude`;
+
+test("classifyMultiUnitRisk: reproduces the exact issue #215 field incident — WARN, both units named, bind addresses captured", () => {
+  const result = classifyMultiUnitRisk({
+    platform: "linux",
+    userShowOut: FIELD_INCIDENT_USER_SHOW,
+    systemShowOut: FIELD_INCIDENT_SYSTEM_SHOW,
+  });
+  assert.equal(result.state, "warn");
+  assert.equal(result.groups.length, 1);
+  const group = result.groups[0];
+  assert.equal(group.length, 2);
+  const names = group.map(u => u.name).sort();
+  assert.deepEqual(names, ["ocp-proxy.service", "ocp.service"]);
+  const byName = Object.fromEntries(group.map(u => [u.name, u]));
+  assert.equal(byName["ocp-proxy.service"].scope, "user");
+  assert.equal(byName["ocp-proxy.service"].bind, "127.0.0.1");
+  assert.equal(byName["ocp.service"].scope, "system");
+  assert.equal(byName["ocp.service"].bind, "0.0.0.0");
+});
+
+test("classifyMultiUnitRisk: only ONE enabled OCP unit → clear (no boot race possible)", () => {
+  const result = classifyMultiUnitRisk({
+    platform: "linux",
+    userShowOut: FIELD_INCIDENT_USER_SHOW,
+    systemShowOut: "",
+  });
+  assert.equal(result.state, "clear");
+});
+
+test("classifyMultiUnitRisk: ZERO enabled units (both scopes empty) → clear, no crash", () => {
+  const result = classifyMultiUnitRisk({ platform: "linux", userShowOut: "", systemShowOut: "" });
+  assert.equal(result.state, "clear");
+});
+
+test("classifyMultiUnitRisk: systemctl unavailable for EITHER scope (null) → unknown, never a false all-clear", () => {
+  // null means "couldn't gather" (missing binary, non-zero exit) — must never be conflated
+  // with "" (ran fine, confirmed nothing enabled). Conflating the two is exactly the false
+  // all-clear this check must not produce.
+  assert.equal(classifyMultiUnitRisk({ platform: "linux", userShowOut: null, systemShowOut: "" }).state, "unknown");
+  assert.equal(classifyMultiUnitRisk({ platform: "linux", userShowOut: "", systemShowOut: null }).state, "unknown");
+  assert.equal(classifyMultiUnitRisk({ platform: "linux", userShowOut: null, systemShowOut: null }).state, "unknown");
+});
+
+test("classifyMultiUnitRisk: two enabled OCP units on DIFFERENT ports → no false positive", () => {
+  const userShow = `Id=a.service\nExecStart={ argv[]=/usr/bin/node /home/opc/ocp/server.mjs ; }\nEnvironment=CLAUDE_PROXY_PORT=3456`;
+  const systemShow = `Id=b.service\nExecStart={ argv[]=/usr/bin/node /home/opc/ocp/server.mjs ; }\nEnvironment=CLAUDE_PROXY_PORT=9999`;
+  const result = classifyMultiUnitRisk({ platform: "linux", userShowOut: userShow, systemShowOut: systemShow });
+  assert.equal(result.state, "clear", "same tree but different port is not the #215 failure shape");
+});
+
+test("classifyMultiUnitRisk: two enabled OCP units on the SAME port but DIFFERENT working tree → no false positive", () => {
+  const userShow = `Id=a.service\nExecStart={ argv[]=/usr/bin/node /home/opc/ocp/server.mjs ; }\nEnvironment=CLAUDE_PROXY_PORT=3456`;
+  const systemShow = `Id=b.service\nExecStart={ argv[]=/usr/bin/node /home/opc/other-ocp-install/server.mjs ; }\nEnvironment=CLAUDE_PROXY_PORT=3456`;
+  const result = classifyMultiUnitRisk({ platform: "linux", userShowOut: userShow, systemShowOut: systemShow });
+  assert.equal(result.state, "clear", "same port but a different install directory is not the #215 failure shape");
+});
+
+test("classifyMultiUnitRisk: enabled units that AREN'T OCP (no server.mjs in ExecStart) never count toward a group", () => {
+  const userShow = `Id=nginx.service\nExecStart={ argv[]=/usr/sbin/nginx -g daemon\\ off\\; ; }\nEnvironment=`;
+  const systemShow = `Id=cron.service\nExecStart={ argv[]=/usr/sbin/cron -f ; }\nEnvironment=`;
+  const result = classifyMultiUnitRisk({ platform: "linux", userShowOut: userShow, systemShowOut: systemShow });
+  assert.equal(result.state, "clear");
+});
+
+test("classifyMultiUnitRisk: absent CLAUDE_PROXY_PORT/CLAUDE_BIND degrades to documented defaults, still groups correctly", () => {
+  const userShow = `Id=a.service\nExecStart={ argv[]=/usr/bin/node /home/opc/ocp/server.mjs ; }\nEnvironment=`;
+  const systemShow = `Id=b.service\nExecStart={ argv[]=/usr/bin/node /home/opc/ocp/server.mjs ; }\nEnvironment=`;
+  const result = classifyMultiUnitRisk({ platform: "linux", userShowOut: userShow, systemShowOut: systemShow });
+  assert.equal(result.state, "warn");
+  assert.equal(result.groups[0][0].port, "3456", "absent CLAUDE_PROXY_PORT must default to DEFAULT_PORT, not crash/mismatch");
+  assert.ok(result.groups[0].every(u => u.bind === "(default bind)"));
+});
+
+test("classifyMultiUnitRisk: an unvalidated/malformed unit Id is rejected, never trusted into a group", () => {
+  // Defense in depth (same trust-boundary class as PR #221's MED-5 finding on restart-unit.mjs):
+  // a systemd `Id=` should always be a safe unit name, but this must not blindly assume that —
+  // it re-validates at the point the name would be surfaced/used, exactly like restart-unit.mjs
+  // re-checks its own resolved unit name before it reaches a shell command.
+  const userShow = `Id=a;rm -rf ~.service\nExecStart={ argv[]=/usr/bin/node /home/opc/ocp/server.mjs ; }\nEnvironment=CLAUDE_PROXY_PORT=3456`;
+  const systemShow = `Id=b.service\nExecStart={ argv[]=/usr/bin/node /home/opc/ocp/server.mjs ; }\nEnvironment=CLAUDE_PROXY_PORT=3456`;
+  const result = classifyMultiUnitRisk({ platform: "linux", userShowOut: userShow, systemShowOut: systemShow });
+  assert.equal(result.state, "clear", "the malformed Id must be dropped entirely, leaving only one valid unit");
+});
+
+console.log("\nMulti-unit boot-race pre-flight (issue #220) — macOS (launchd):");
+
+function plistBlob(files) {
+  return files.map(([path, content]) => `===OCP-DOCTOR-FILE:${path}===\n${content}`).join("\n");
+}
+function ocpPlist({ label, port, bind }) {
+  return `<key>RunAtLoad</key><true/>` +
+    `<key>Label</key><string>${label}</string>` +
+    `<key>ProgramArguments</key><array><string>/usr/bin/node</string><string>/Users/opc/ocp/server.mjs</string></array>` +
+    (port ? `<key>CLAUDE_PROXY_PORT</key><string>${port}</string>` : "") +
+    (bind ? `<key>CLAUDE_BIND</key><string>${bind}</string>` : "");
+}
+
+test("classifyMultiUnitRisk (macOS): two enabled plists, same tree+port → WARN — the launchd analogue of the field incident", () => {
+  const blob = plistBlob([
+    ["/Users/opc/Library/LaunchAgents/dev.ocp.proxy.plist", ocpPlist({ label: "dev.ocp.proxy", port: "3456", bind: "127.0.0.1" })],
+    ["/Library/LaunchDaemons/ai.custom.ocp.plist", ocpPlist({ label: "ai.custom.ocp", port: "3456", bind: "0.0.0.0" })],
+  ]);
+  const result = classifyMultiUnitRisk({ platform: "darwin", plistBlob: blob });
+  assert.equal(result.state, "warn");
+  assert.equal(result.groups[0].length, 2);
+  const scopes = result.groups[0].map(u => u.scope).sort();
+  assert.deepEqual(scopes, ["system", "user"], "LaunchDaemons path classifies as system scope, LaunchAgents as user");
+});
+
+test("classifyMultiUnitRisk (macOS): only the standard single OCP LaunchAgent present → clear (the common case)", () => {
+  const blob = plistBlob([
+    ["/Users/opc/Library/LaunchAgents/dev.ocp.proxy.plist", ocpPlist({ label: "dev.ocp.proxy", port: "3456", bind: "127.0.0.1" })],
+  ]);
+  assert.equal(classifyMultiUnitRisk({ platform: "darwin", plistBlob: blob }).state, "clear");
+});
+
+test("classifyMultiUnitRisk (macOS): zero plist files at all → clear, no crash", () => {
+  assert.equal(classifyMultiUnitRisk({ platform: "darwin", plistBlob: "" }).state, "clear");
+});
+
+test("classifyMultiUnitRisk (macOS): plist enumeration unavailable/unreadable (null) → unknown, never a false all-clear", () => {
+  assert.equal(classifyMultiUnitRisk({ platform: "darwin", plistBlob: null }).state, "unknown");
+});
+
+test("classifyMultiUnitRisk (macOS): a plist without RunAtLoad=true never counts (wouldn't actually auto-start)", () => {
+  const disabledPlist = `<key>Label</key><string>dev.ocp.proxy</string>` +
+    `<key>ProgramArguments</key><array><string>/usr/bin/node</string><string>/Users/opc/ocp/server.mjs</string></array>`;
+  const blob = plistBlob([
+    ["/Users/opc/Library/LaunchAgents/dev.ocp.proxy.plist", ocpPlist({ label: "dev.ocp.proxy", port: "3456" })],
+    ["/Library/LaunchDaemons/stopped.plist", disabledPlist],
+  ]);
+  assert.equal(classifyMultiUnitRisk({ platform: "darwin", plistBlob: blob }).state, "clear");
+});
+
+console.log("\nMulti-unit boot-race pre-flight (issue #220) — gatherUnitCandidates (impure layer, PR #221 MED-6 lesson):");
+
+// PR #221's independent review (MED-6) found the IMPURE gathering layer had zero coverage and
+// that's exactly where the real defects lived (a platform-branch swap and a null-handling bug
+// both survived mutation undetected in that PR's first draft). These tests drive
+// gatherUnitCandidates directly with a fake `run` that pattern-matches on command strings —
+// the same lesson applied here before it could repeat.
+
+test("gatherUnitCandidates: listing fails (run throws) → showOut is null, not \"\" — never silently treated as zero enabled units", () => {
+  const run = (cmd) => { throw new Error(`systemctl: command not found`); };
+  const raw = gatherUnitCandidates(run, "linux");
+  assert.equal(raw.userShowOut, null);
+  assert.equal(raw.systemShowOut, null);
+});
+
+test("gatherUnitCandidates: listing succeeds with zero candidates → showOut is \"\" (confirmed empty), skips the show call entirely", () => {
+  let showCalled = false;
+  const run = (cmd) => {
+    if (/list-unit-files/.test(cmd)) return ""; // no enabled .service units at all
+    showCalled = true;
+    return "should not be reached";
+  };
+  const raw = gatherUnitCandidates(run, "linux");
+  assert.equal(raw.userShowOut, "");
+  assert.equal(raw.systemShowOut, "");
+  assert.equal(showCalled, false, "show must not be invoked with an empty candidate list");
+});
+
+test("gatherUnitCandidates: listing succeeds with candidates, but the show call fails → showOut is null (unknown), not \"\"", () => {
+  const run = (cmd) => {
+    if (/list-unit-files/.test(cmd)) return "ocp-proxy.service enabled\n";
+    if (/show/.test(cmd)) throw new Error("systemctl show: timed out");
+    throw new Error("unexpected: " + cmd);
+  };
+  const raw = gatherUnitCandidates(run, "linux");
+  assert.equal(raw.userShowOut, null);
+  assert.equal(raw.systemShowOut, null);
+});
+
+test("gatherUnitCandidates: batches ALL candidates into ONE show call per scope — never one spawn per unit", () => {
+  let userShowCalls = 0, systemShowCalls = 0;
+  const run = (cmd) => {
+    if (cmd.includes("--user list-unit-files")) return "a.service enabled\nb.service enabled\nc.service enabled\n";
+    if (cmd.includes("list-unit-files")) return "d.service enabled\ne.service enabled\n";
+    if (cmd.includes("--user show")) {
+      userShowCalls++;
+      assert.ok(cmd.includes("a.service") && cmd.includes("b.service") && cmd.includes("c.service"),
+        "all three user-scope candidates must appear in the SAME show command");
+      return "Id=a.service\nExecStart={ argv[]=/bin/true ; }\nEnvironment=";
+    }
+    if (cmd.includes("systemctl show")) {
+      systemShowCalls++;
+      return "Id=d.service\nExecStart={ argv[]=/bin/true ; }\nEnvironment=";
+    }
+    throw new Error("unexpected: " + cmd);
+  };
+  gatherUnitCandidates(run, "linux");
+  assert.equal(userShowCalls, 1, "exactly one batched show call for the user scope");
+  assert.equal(systemShowCalls, 1, "exactly one batched show call for the system scope");
+});
+
+test("gatherUnitCandidates (macOS): a single shell command enumerates both LaunchAgents and LaunchDaemons", () => {
+  let calls = 0;
+  const run = (cmd) => {
+    calls++;
+    assert.ok(cmd.includes("LaunchAgents") && cmd.includes("LaunchDaemons"), "both dirs scanned in one command");
+    return "";
+  };
+  gatherUnitCandidates(run, "darwin");
+  assert.equal(calls, 1, "macOS enumeration costs exactly one subprocess spawn");
+});
+
+test("gatherUnitCandidates: past MAX_UNIT_CANDIDATES enabled units in one scope, skip `show` and degrade to unknown rather than an oversized command line", () => {
+  // Cost safety cap (see MAX_UNIT_CANDIDATES in scripts/doctor.mjs): a host with 200+ enabled
+  // *.service units is not a realistic "two OCP installs" shape this check needs to chase —
+  // degrade that SCOPE to null (unknown) instead of building an unbounded `systemctl show`
+  // command line. This must not crash, and must not silently treat the capped scope as "zero
+  // enabled units" (a false all-clear).
+  const manyNames = Array.from({ length: 201 }, (_, i) => `unit-${i}.service`).join(" enabled\n") + " enabled\n";
+  let showCalled = false;
+  const run = (cmd) => {
+    if (cmd.includes("--user list-unit-files")) return manyNames;
+    if (cmd.includes("list-unit-files")) return ""; // system scope: nothing enabled
+    if (cmd.includes("show")) { showCalled = true; return "should not be reached"; }
+    throw new Error("unexpected: " + cmd);
+  };
+  const raw = gatherUnitCandidates(run, "linux");
+  assert.equal(showCalled, false, "must not attempt an oversized batched show call");
+  assert.equal(raw.userShowOut, null, "capped scope must degrade to unknown (null), never '' (false all-clear)");
+  assert.equal(classifyMultiUnitRisk(raw).state, "unknown");
+});
+
+console.log("\nMulti-unit boot-race pre-flight (issue #220) — full pipeline via runDoctor:");
+
+test("runDoctor: two conflicting enabled units → pushes an actionable multi_unit_boot_race WARN (not FAIL)", async () => {
+  const result = await runDoctor({
+    skipNetwork: false,
+    mockVersion: "v3.26.0",
+    mockLatest: "v3.26.0",
+    mockHealth: { status: 200, body: { version: "3.26.0", auth: { ok: true } } },
+    mockPlatform: "linux",
+    run: (cmd) => {
+      if (cmd.includes("--user list-unit-files")) return "ocp-proxy.service enabled\n";
+      if (cmd.includes("list-unit-files")) return "ocp.service enabled\n";
+      if (cmd.includes("--user show")) return FIELD_INCIDENT_USER_SHOW;
+      if (cmd.includes("systemctl show")) return FIELD_INCIDENT_SYSTEM_SHOW;
+      throw new Error("unexpected: " + cmd);
+    },
+  });
+  const check = result.checks.find(c => c.id === "multi_unit_boot_race");
+  assert.ok(check, "expected a multi_unit_boot_race check to be pushed");
+  assert.equal(check.level, "WARN", "must be WARN, never FAIL — a FAIL would block runUpgrade() for every kind except fresh_install");
+  assert.ok(check.message.includes("ocp-proxy.service") && check.message.includes("ocp.service"),
+    "message must name BOTH units");
+  assert.ok(check.message.includes("127.0.0.1") && check.message.includes("0.0.0.0"),
+    "message must name the bind-address difference — the actual LAN-reachability hazard");
+  assert.ok(check.message.includes("disable"), "message must say what to do (disable the stray unit)");
+  // WARN must not flip ready_to_upgrade to false — runUpgrade()'s pre-flight guard
+  // (scripts/upgrade.mjs) only tolerates ready_to_upgrade=false for kind="fresh_install".
+  assert.equal(result.ready_to_upgrade, true);
+});
+
+test("runDoctor: exactly one enabled OCP unit → no multi_unit_boot_race check pushed", async () => {
+  const result = await runDoctor({
+    skipNetwork: false,
+    mockVersion: "v3.26.0",
+    mockLatest: "v3.26.0",
+    mockHealth: { status: 200, body: { version: "3.26.0", auth: { ok: true } } },
+    mockPlatform: "linux",
+    run: (cmd) => {
+      if (cmd.includes("--user list-unit-files")) return "ocp-proxy.service enabled\n";
+      if (cmd.includes("list-unit-files")) return ""; // system scope: nothing enabled
+      if (cmd.includes("--user show")) return FIELD_INCIDENT_USER_SHOW;
+      throw new Error("unexpected: " + cmd);
+    },
+  });
+  assert.ok(!result.checks.some(c => c.id === "multi_unit_boot_race"));
+});
+
+test("runDoctor: zero enabled units on either scope → no check pushed, no crash", async () => {
+  const result = await runDoctor({
+    skipNetwork: false,
+    mockVersion: "v3.26.0",
+    mockLatest: "v3.26.0",
+    mockHealth: { status: 200, body: { version: "3.26.0", auth: { ok: true } } },
+    mockPlatform: "linux",
+    run: (cmd) => {
+      if (cmd.includes("list-unit-files")) return "";
+      throw new Error("unexpected: " + cmd);
+    },
+  });
+  assert.ok(!result.checks.some(c => c.id === "multi_unit_boot_race"));
+  assert.equal(result.ready_to_upgrade, true);
+});
+
+test("runDoctor: systemctl missing entirely (every call throws) → degrades honestly, no check pushed, no crash", async () => {
+  const result = await runDoctor({
+    skipNetwork: false,
+    mockVersion: "v3.26.0",
+    mockLatest: "v3.26.0",
+    mockHealth: { status: 200, body: { version: "3.26.0", auth: { ok: true } } },
+    mockPlatform: "linux",
+    run: (cmd) => { throw new Error("systemctl: command not found"); },
+  });
+  assert.ok(!result.checks.some(c => c.id === "multi_unit_boot_race"),
+    "a missing systemctl must degrade to 'can't tell', never a false all-clear that fabricates a WARN or a crash that aborts doctor entirely");
+  assert.equal(result.ready_to_upgrade, true);
+});
+
+test("runDoctor: skipNetwork=true skips the probe entirely, even when the injected run() would report a conflict", () => {
+  // Proves the gate: skipNetwork must short-circuit before `run` is ever consulted — a test
+  // suite running with skipNetwork:true (the vast majority of this file's ~30 pre-existing
+  // doctor tests) must never touch a live systemctl/launchd, matching the existing
+  // service_running/oauth_ok block's own skipNetwork gate immediately above it in doctor.mjs.
+  let runCalled = false;
+  const result = runDoctor({
+    skipNetwork: true,
+    mockVersion: "v3.26.0",
+    mockLatest: "v3.26.0",
+    mockPlatform: "linux",
+    run: () => { runCalled = true; return FIELD_INCIDENT_USER_SHOW; },
+  });
+  return result.then((r) => {
+    assert.equal(runCalled, false, "run() must never be invoked when skipNetwork is true");
+    assert.ok(!r.checks.some(c => c.id === "multi_unit_boot_race"));
+  });
+});
+
 runAsyncTests().then(() => Promise.all(pendingAsync)).then(() => {
   closeDb();
   console.log(`\n=== Results: ${passed} passed, ${failed} failed ===\n`);
