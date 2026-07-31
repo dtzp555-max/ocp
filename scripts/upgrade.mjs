@@ -98,7 +98,7 @@ export async function runUpgrade(opts = {}) {
     if (kind === "upgrade") {
       plan.push(`[plan] phase 1: snapshot to ~/.ocp/upgrade-snapshot-<ts>/`);
       plan.push(`[plan] phase 2: git checkout ${doctor.latest_version} && npm install`);
-      plan.push(`[plan] phase 3: node setup.mjs`);
+      plan.push(`[plan] phase 3: node setup.mjs --reconfigure-only`);
       plan.push(`[plan] phase 4: launchctl bootout/bootstrap`);
       plan.push(`[plan] phase 5: post-flight /health + /v1/models`);
     } else if (kind === "update") {
@@ -178,8 +178,13 @@ async function runFullUpgrade({ doctor, opts }) {
     exec(`git -C ${ocpDir} checkout ${doctor.latest_version}`, "fetch+install");
     exec(`npm --prefix ${ocpDir} install --no-audit --no-fund`, "fetch+install");
 
-    // phase 4: reconfigure
-    exec(`node ${ocpDir}/setup.mjs`, "reconfigure");
+    // phase 4: reconfigure — writes the service unit/plist ONLY; must not enable-at-boot or
+    // start (issue #226). Enabling/starting here bypasses phase 5's restart-target resolution
+    // (#221) and can re-arm the boot race #215 describes on a host with a competing unit for
+    // the same port. --reconfigure-only is setup.mjs's opt-in mode for exactly this call site
+    // (see scripts/lib/service-mode.mjs); a bare first install still calls setup.mjs without
+    // it (scripts/doctor.mjs's fresh_install path), so it keeps enabling + starting.
+    exec(`node ${ocpDir}/setup.mjs --reconfigure-only`, "reconfigure");
 
     // phase 5: restart (heads-up note printed before invoking)
     if (!opts.mockExec) {

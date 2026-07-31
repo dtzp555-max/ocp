@@ -3,8 +3,10 @@
  * OCP (Open Claude Proxy) setup
  *
  * Automatically configures OpenClaw to use Claude CLI as a model provider.
- * Run: node setup.mjs [--port N] [--default-model opus|sonnet|haiku] [--dry-run]
+ * Run: node setup.mjs [--port N] [--default-model opus|sonnet|haiku] [--dry-run] [--reconfigure-only]
  *      (default port = DEFAULT_PORT from lib/constants.mjs)
+ *      --reconfigure-only: write the service unit/plist but do not enable-at-boot or start it
+ *        now (used by `ocp update`'s reconfigure phase; see scripts/lib/service-mode.mjs)
  *
  * What it does:
  *   1. Verifies claude CLI is installed and authenticated
@@ -15,6 +17,7 @@
  */
 import { readFileSync, writeFileSync, existsSync, mkdirSync, unlinkSync, readdirSync, chmodSync } from "node:fs";
 import { mergePlistEnv, mergeSystemdEnv } from "./scripts/lib/plist-merge.mjs";
+import { planServiceActions } from "./scripts/lib/service-mode.mjs";
 import { execSync } from "node:child_process";
 import { join, dirname } from "node:path";
 import { homedir } from "node:os";
@@ -38,6 +41,13 @@ const PORT = parseInt(opt("port", String(DEFAULT_PORT)), 10);
 const DEFAULT_MODEL = opt("default-model", "opus"); // opus | sonnet | haiku
 const DRY_RUN = flag("dry-run");
 const SKIP_START = flag("no-start");
+// --reconfigure-only (issue #226): write the service unit / plist, but never enable-at-boot
+// or start-now. For use by scripts/upgrade.mjs's phase 4 ("reconfigure"), so an upgrade's
+// installer step stops performing phase 5's job (starting the service) — see
+// scripts/lib/service-mode.mjs for the full reasoning. Not used on a first install: that path
+// (scripts/doctor.mjs's fresh_install ai_executable) invokes `node setup.mjs` bare, and must
+// keep enabling + starting — that IS a first install's job.
+const RECONFIGURE_ONLY = flag("reconfigure-only");
 const PROVIDER_NAME = opt("provider-name", "claude-local");
 const BIND_ADDRESS = opt("bind", "127.0.0.1");
 const AUTH_MODE_CONFIG = opt("auth-mode", "none");
@@ -369,6 +379,14 @@ if (!DRY_RUN) {
   console.log("\n🔄 Installing auto-start on login...\n");
 
   const platform = process.platform;
+  // Tracks whether THIS run actually arms "start automatically on login/boot" — used to keep
+  // the banner below honest under --reconfigure-only. Defaults true: on macOS, writing the
+  // plist into ~/Library/LaunchAgents is itself what arms next-login auto-start (launchd scans
+  // that directory at every login regardless of whether `bootstrap` ran this session), so
+  // reconfigure-only doesn't change that half. On Linux, auto-start-on-boot is the systemd
+  // `enable` step specifically — writing the unit file alone does not arm it — so the Linux
+  // branch below flips this to false when --reconfigure-only skips `enable`.
+  let autoStartArmed = true;
   // Use stable symlink path instead of versioned Cellar path (e.g. /opt/homebrew/opt/node/bin/node
   // instead of /opt/homebrew/Cellar/node/25.8.0/bin/node) so the plist survives node upgrades.
   let nodeBin = process.execPath;
@@ -469,10 +487,15 @@ if (!DRY_RUN) {
       log(`Plist written: ${plistPath} (mode 600)`);
     }
 
-    // Bootout first (in case it was already loaded) then bootstrap
-    try { execSync(`launchctl bootout gui/$(id -u) "${plistPath}" 2>/dev/null`); } catch { /* ignore */ }
-    execSync(`launchctl bootstrap gui/$(id -u) "${plistPath}"`);
-    log(`launchctl loaded dev.ocp.proxy`);
+    const darwinActions = planServiceActions(platform, { reconfigureOnly: RECONFIGURE_ONLY });
+    if (darwinActions.bootstrap) {
+      // Bootout first (in case it was already loaded) then bootstrap
+      try { execSync(`launchctl bootout gui/$(id -u) "${plistPath}" 2>/dev/null`); } catch { /* ignore */ }
+      execSync(`launchctl bootstrap gui/$(id -u) "${plistPath}"`);
+      log(`launchctl loaded dev.ocp.proxy`);
+    } else {
+      log(`Plist written (reconfigure-only: launchctl bootstrap left to the upgrade flow's restart phase)`);
+    }
 
   } else if (platform === "linux") {
     // Linux: systemd user service
@@ -510,19 +533,43 @@ WantedBy=default.target
       log(`Service file written: ${servicePath} (mode 600)`);
     }
 
-    execSync(`systemctl --user daemon-reload`);
-    execSync(`systemctl --user enable ocp-proxy`);
-    execSync(`systemctl --user start ocp-proxy`);
-    log(`systemd user service enabled and started`);
+    const linuxActions = planServiceActions(platform, { reconfigureOnly: RECONFIGURE_ONLY });
+    if (linuxActions.daemonReload) execSync(`systemctl --user daemon-reload`);
+    if (linuxActions.enable) execSync(`systemctl --user enable ocp-proxy`);
+    if (linuxActions.start) execSync(`systemctl --user start ocp-proxy`);
+    if (linuxActions.enable && linuxActions.start) {
+      log(`systemd user service enabled and started`);
+    } else {
+      // Note: only `start` is "left to" the restart phase (it issues `systemctl restart`,
+      // which starts a not-yet-running unit fine). `enable` is not deferred to anything — it
+      // is simply left untouched here, preserving whatever it already was.
+      log(`Service file written + daemon-reload'd (reconfigure-only: enable left as-is; start left to the upgrade flow's restart phase)`);
+    }
+    // Unlike the darwin branch, Linux auto-start-on-boot IS the `enable` step — a written but
+    // un-enabled unit file will not start at next boot on its own.
+    autoStartArmed = linuxActions.enable;
 
   } else {
     warn(`Auto-start not supported on ${platform} — start manually with: bash ${startPath}`);
+    autoStartArmed = false; // nothing was written or loaded on this platform
   }
 
-  console.log("\n✅ Auto-start installed — proxy will start automatically on login\n");
+  if (autoStartArmed) {
+    console.log("\n✅ Auto-start installed — proxy will start automatically on login\n");
+  } else if (RECONFIGURE_ONLY) {
+    // --reconfigure-only intentionally leaves auto-start-on-boot state untouched (issue #226)
+    // — it neither arms nor disarms it, so whatever this unit's enablement already was (set by
+    // the original first install, or by an operator's manual override) is preserved. The
+    // upgrade flow's restart phase runs next and starts the service; it does not call `enable`.
+    console.log("\n✅ Service config written (--reconfigure-only) — auto-start-on-boot state left as-is; the upgrade flow's restart phase starts the service next\n");
+  }
+  // else: unsupported platform — the warn() above already explained it; nothing further to add.
 
   // ── Step 8: Post-install health verification ───────────────────────────
-  if (!SKIP_START) {
+  // Skipped under --reconfigure-only too: nothing was started above, so there is nothing
+  // yet to verify — the upgrade flow's own post-flight phase (phase 6) checks the real
+  // post-restart state after phase 5 actually restarts the service.
+  if (!SKIP_START && !RECONFIGURE_ONLY) {
     console.log("⏳ Waiting for server to bind...\n");
     await new Promise(r => setTimeout(r, 3000));
 

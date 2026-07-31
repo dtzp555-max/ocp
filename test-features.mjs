@@ -773,6 +773,18 @@ test("doctor next_action.kind enum is one of allowed values", async () => {
   assert.ok(ALLOWED.includes(result.next_action.kind), `kind=${result.next_action.kind} not in enum`);
 });
 
+// #226 premise-check: a first install genuinely must enable + start the service (that IS its
+// job) — only scripts/upgrade.mjs's reconfigure phase should opt into --reconfigure-only.
+// This guards against the flag's use accidentally spreading to fresh_install's real command.
+test("doctor fresh_install's setup.mjs step does NOT carry --reconfigure-only (first install must enable+start)", async () => {
+  const result = await runDoctor({ skipNetwork: true, mockVersion: "v3.2.0", mockLatest: "v3.14.0" });
+  assert.equal(result.next_action.kind, "fresh_install");
+  const setupStep = result.next_action.ai_executable.find(c => c.includes("setup.mjs"));
+  assert.ok(setupStep, "fresh_install ai_executable must include a setup.mjs step");
+  assert.ok(!setupStep.includes("--reconfigure-only"),
+    `fresh_install must call setup.mjs bare (enable+start) — got: ${setupStep}`);
+});
+
 test("doctor noop when current==latest", async () => {
   const result = await runDoctor({ skipNetwork: true, mockVersion: "v3.14.0", mockLatest: "v3.14.0" });
   assert.equal(result.next_action.kind, "noop");
@@ -1646,6 +1658,71 @@ test("upgrade full path executes 5 phases", async () => {
   for (const expected of ["pre-flight", "snapshot", "fetch+install", "reconfigure", "restart", "post-flight"]) {
     assert.ok(phaseNames.includes(expected), `missing phase: ${expected}; got ${phaseNames.join(",")}`);
   }
+});
+
+// ── Reconfigure-only service mode (#226) ──────────────────────────────────
+// #215: on a host where a competing systemd/launchd unit already owns the OCP port, an
+// upgrade's reconfigure step (setup.mjs) must not enable-at-boot or start the service it
+// writes config for — that races/duplicates whatever phase 5 (restart) resolves to run, and
+// re-arms the boot race #215 describes. #221 fixes phase 5's target resolution; this section
+// covers the layering fix so phase 4 stops performing phase 5's job in the first place.
+//
+// planServiceActions() is imported directly (not replicated, unlike the setup.mjs inject
+// helpers above) because scripts/lib/service-mode.mjs is a real side-effect-free module —
+// setup.mjs itself still cannot be imported, but the decision was deliberately extracted out
+// of it into something that can be.
+import { planServiceActions } from "./scripts/lib/service-mode.mjs";
+
+console.log("\nReconfigure-only service mode (#226):");
+
+test("planServiceActions(linux) default: daemon-reload + enable + start (first-install behavior)", () => {
+  const actions = planServiceActions("linux");
+  assert.deepEqual(actions, { daemonReload: true, enable: true, start: true });
+});
+
+test("planServiceActions(linux, reconfigureOnly): daemon-reload stays true, enable+start become false", () => {
+  const actions = planServiceActions("linux", { reconfigureOnly: true });
+  assert.deepEqual(actions, { daemonReload: true, enable: false, start: false });
+});
+
+test("planServiceActions(darwin) default: bootstrap true (first-install behavior)", () => {
+  const actions = planServiceActions("darwin");
+  assert.deepEqual(actions, { bootstrap: true });
+});
+
+test("planServiceActions(darwin, reconfigureOnly): bootstrap false (plist written, not loaded)", () => {
+  const actions = planServiceActions("darwin", { reconfigureOnly: true });
+  assert.deepEqual(actions, { bootstrap: false });
+});
+
+test("planServiceActions on an unsupported platform returns {} regardless of reconfigureOnly", () => {
+  assert.deepEqual(planServiceActions("win32"), {});
+  assert.deepEqual(planServiceActions("win32", { reconfigureOnly: true }), {});
+});
+
+test("upgrade full path's reconfigure phase invokes setup.mjs with --reconfigure-only", async () => {
+  const result = await runUpgrade({
+    yes: true,
+    dryRun: false,
+    mockExec: true,
+    mockDoctor: { ready_to_upgrade: true, next_action: { kind: "upgrade" },
+                  current_version: "v3.10.0", latest_version: "v3.14.0" }
+  });
+  const reconfigurePhase = result.phases.find(p => p.name === "reconfigure");
+  assert.ok(reconfigurePhase, "reconfigure phase must be present");
+  assert.ok(reconfigurePhase.cmd.includes("setup.mjs"), `expected a setup.mjs invocation, got: ${reconfigurePhase.cmd}`);
+  assert.ok(reconfigurePhase.cmd.includes("--reconfigure-only"),
+    `reconfigure phase must pass --reconfigure-only so it does not enable/start — got: ${reconfigurePhase.cmd}`);
+});
+
+test("upgrade --dry-run plan text for the 'upgrade' kind names --reconfigure-only", async () => {
+  const result = await runUpgrade({
+    dryRun: true,
+    mockDoctor: { ready_to_upgrade: true, next_action: { kind: "upgrade" },
+                  current_version: "v3.10.0", latest_version: "v3.14.0" }
+  });
+  assert.ok(result.plan.some(line => line.includes("--reconfigure-only")),
+    `dry-run plan should mention --reconfigure-only; got: ${result.plan.join(" | ")}`);
 });
 
 // ── Snapshot Tests ──

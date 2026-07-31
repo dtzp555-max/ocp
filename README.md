@@ -303,7 +303,7 @@ Setup, the ~6-second latency floor, real-SSE streaming (`OCP_TUI_STREAM`), the w
 
 ## Upgrading
 
-Run **`ocp update`** — it smart-picks the path. If the tree is already at the latest release but the **running service** is stale (e.g. a previous update was interrupted before it restarted), it takes a **restart-only** path: no git/npm changes, just a restart + post-flight `/health` verification. A **patch bump** (e.g. `v3.21.0 → v3.21.1`) takes the light path (git pull + npm install + restart); a **cross-minor** jump (e.g. `v3.18 → v3.22`) takes the full path (pre-flight, snapshot, `setup.mjs` with plist env-merge, restart, post-flight `/health` + `/v1/models` verification). `ocp update --check` shows available updates without applying.
+Run **`ocp update`** — it smart-picks the path. If the tree is already at the latest release but the **running service** is stale (e.g. a previous update was interrupted before it restarted), it takes a **restart-only** path: no git/npm changes, just a restart + post-flight `/health` verification. A **patch bump** (e.g. `v3.21.0 → v3.21.1`) takes the light path (git pull + npm install + restart); a **cross-minor** jump (e.g. `v3.18 → v3.22`) takes the full path (pre-flight, snapshot, `setup.mjs --reconfigure-only` — writes the service unit/plist with env-merge but does not itself start anything — then a dedicated restart phase, then post-flight `/health` + `/v1/models` verification). `ocp update --check` shows available updates without applying.
 
 Manual flags, rollback (`ocp update --rollback`), snapshots, and the OpenClaw model auto-sync (v3.11.0+): **[docs/upgrading.md](docs/upgrading.md)**.
 
@@ -559,6 +559,7 @@ Top-level files a contributor or operator may need to know:
 | `ocp` / `ocp-connect` | User-facing CLI wrappers (server-side / client-side respectively). |
 | `dashboard.html` | Static dashboard served from `/dashboard`. |
 | `scripts/sync-openclaw.mjs` | Idempotent OpenClaw registry sync invoked by `ocp update`. See ADR 0004. |
+| `scripts/lib/service-mode.mjs` | Pure decision layer for `setup.mjs`'s auto-start step — first install vs. `--reconfigure-only` (issue #226). |
 | `.claude/skills/` | Project-specific Claude Code skills. |
 | `ocp-plugin/` | OpenClaw gateway plugin (optional installation). |
 | `docs/lan-mode.md` | LAN & multi-user operations manual (server/client setup, keys, quotas, anonymous access, security model). |
