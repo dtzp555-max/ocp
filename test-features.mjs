@@ -1108,12 +1108,25 @@ exit 0
 
 function ltMkdir() { return _ltMkdtemp(join(_ltTmp(), "ocp-lt-")); }
 function ltFake(dir) { const p = join(dir, "claude"); _ltWrite(p, LT_FAKE); _ltChmod(p, 0o755); return p; }
+// #248 mutation-table support: a deterministic, non-timing-based measurement of what ltTest's
+// serialization actually guarantees. Timing-based reproduction of "the queue isn't serializing"
+// became unreliable once the ltWait cap (below) was raised to 10x in response to review — the
+// adaptive wait got good enough at absorbing even self-inflicted concurrency that a bypassed
+// queue often no longer produces an observable assertion failure under available load, which
+// would make a mutation of ltTest's queue non-load-bearing by the letter of a timing-only test
+// even though the code is genuinely doing less work. Counting ACTUAL concurrent children sidesteps
+// that: it's a fact about how many server.mjs processes were alive at once, not a race against
+// wall-clock luck. See the assertion at the end of this integration block.
+let _ltActiveBoots = 0;
+let _ltPeakBoots = 0;
 function ltBoot(env, dir, nodeArgs = []) {
   const child = _ltSpawn(process.execPath, [...nodeArgs, LT_SERVER], {
     env: { ...process.env, NODE_ENV: "test", OCP_DIR_OVERRIDE: dir, OCP_SKIP_AUTH_TEST: "1",
            CLAUDE_BIND: "127.0.0.1", CLAUDE_AUTH_MODE: "none", CLAUDE_CACHE_TTL: "0", CLAUDE_TIMEOUT: "4000", ...env },
     stdio: ["ignore", "pipe", "pipe"],
   });
+  _ltActiveBoots++;
+  _ltPeakBoots = Math.max(_ltPeakBoots, _ltActiveBoots);
   const buf = { out: "", err: "", exit: undefined, signal: undefined, closed: false, closeMs: undefined, spawnErr: null, t0: Date.now() };
   child.stdout.on("data", d => { buf.out += d; });
   child.stderr.on("data", d => { buf.err += d; });
@@ -1122,7 +1135,7 @@ function ltBoot(env, dir, nodeArgs = []) {
   // then asserts on buf.err/buf.out must wait for `closed`, not `exit != null`, or it can read
   // an empty buffer.
   child.on("exit", (code, signal) => { buf.exit = code; buf.signal = signal; });
-  child.on("close", () => { buf.closed = true; buf.closeMs = Date.now() - buf.t0; });
+  child.on("close", () => { buf.closed = true; buf.closeMs = Date.now() - buf.t0; _ltActiveBoots--; });
   // Without a listener, a spawn 'error' is re-thrown as an uncaught exception and takes down the
   // whole runner instead of failing one test.
   child.on("error", e => { buf.spawnErr = e; });
@@ -1166,10 +1179,36 @@ function ltDiag(buf) {
          ` | stderr(${buf.err.length}B)=${JSON.stringify(buf.err.slice(0, 240))}` +
          ` | stdout(${buf.out.length}B)=${JSON.stringify(ltHeadTail(buf.out))}`;
 }
+// #248: a plain `Date.now() - start < ms` ceiling is wall-clock-fixed and blows through under
+// host contention — not because the child is genuinely slower by a bounded factor, but because
+// THIS process's own event loop stalls under the same CPU pressure, so the 40ms `setTimeout`
+// below fires late. That lateness is directly measurable (the actual gap between consecutive
+// ticks vs. the 40ms requested), and it is the same signal that is starving the `server.mjs`
+// child we're waiting on — so instead of a bigger constant, feed the measured overshoot back
+// into the deadline. A quiet host (overshoot ~0) leaves the ceiling exactly where it was; a
+// contended one gets exactly as much extra patience as the contention actually cost it.
+// Capped so a genuinely wedged process still fails the assertion instead of hanging
+// indefinitely — NOT a guarantee that this cap covers any possible level of host contention,
+// there isn't one. It's sized against what was actually measured, not assumed: the issue's own
+// report showed a 9000ms ceiling reading back at closeMs≈11509ms (~1.3x) under two overlapping
+// `npm test` runs; an independent reviewer of this PR measured ~3.56x (closeMs≈32056ms against
+// 9000ms) under a matched-control 2-competing-suite test; validating this fix on an unusually
+// loaded shared dev host (several concurrent, unrelated agent sessions observed via `ps`) saw
+// total waits equivalent to ~2x-4x nominal on individual assertions. 10x is headroom over the
+// worst of those, not a proof of sufficiency for arbitrary contention — a host busy enough to
+// exceed it will still fail loudly (not hang forever), just after a longer wait.
 async function ltWait(cond, ms = 9000) {
   const start = Date.now();
-  while (Date.now() - start < ms) { if (cond()) return true; await new Promise(r => setTimeout(r, 40)); }
-  return false;
+  let deadline = start + ms;
+  const hardCap = start + ms * 10;
+  while (Date.now() < deadline) {
+    if (cond()) return true;
+    const before = Date.now();
+    await new Promise(r => setTimeout(r, 40));
+    const overshoot = (Date.now() - before) - 40;
+    if (overshoot > 0) deadline = Math.min(deadline + overshoot, hardCap);
+  }
+  return cond();
 }
 async function ltFreePort() {
   const srv = _ltNetServer();
@@ -1186,9 +1225,55 @@ async function ltPost(port, body) {
   } catch { /* the fake may close the socket; the spawn (and capture) already happened */ }
 }
 
+// #248: `test()` settles an async body's promise before printing/counting it (see the
+// `pendingAsync` comment at the top of this file), but it does NOT wait for that promise before
+// returning — every `test(name, async () => {...})` call in this ltBoot block starts running
+// its body (and therefore spawns its own `server.mjs` child) as soon as it is registered. With
+// ~11 such tests in this file, one `npm test` invocation alone could have ~11-12 real server
+// children alive at once, competing for CPU/IO with each other before a second suite process
+// even enters the picture. `ltTest` chains these bodies onto a private queue so at most one is
+// EXECUTING (i.e. has actually called ltFreePort/ltBoot) at a time within this process — the
+// rest of the suite (plain `test()`/`testAsync()`) is untouched and keeps its existing
+// concurrency. This does not by itself make the suite contention-proof against a SIBLING
+// `npm test` process; that's what the adaptive ltWait ceiling above is for. Together: this
+// suite stops manufacturing its own worst-case concurrency, and what contention remains (from
+// something else on the host) is tolerated rather than blown through.
+//
+// The queue's STARTING point matters too, not just the chain between its own 11 members. An
+// independent reviewer of this PR caught that seeding `_ltQueue` with an already-resolved
+// promise lets the FIRST ltTest body start on the very next microtask — i.e. essentially
+// immediately after this synchronous top-level pass finishes registering every test() in the
+// file — which puts it in a burst alongside every OTHER async test body's own first resumption
+// (not just this block's, which are correctly deferred; every plain test()/testAsync() body
+// elsewhere already started running synchronously up to its own first await at REGISTRATION
+// time, and its continuation is one microtask away too). The reviewer reproduced this: under
+// two competing full suites, the first entry in the queue failed reproducibly while later
+// entries did not. Seeding the queue with a snapshot of pendingAsync (everything already
+// registered by the time this line runs) makes the first ltTest body wait for those to settle
+// first, the same way each subsequent ltTest already waits for its predecessor. It does not
+// (cannot, without a much larger change to how this whole file schedules tests) shield the
+// first entry from async tests registered LATER in the file, whose own first synchronous slice
+// already ran during the same top-level pass — that residual exposure is why the ltWait fix
+// above exists, not a gap this queue is meant to close by itself.
+let _ltQueue = Promise.allSettled([...pendingAsync]).then(() => {});
+function ltTest(name, fn) {
+  test(name, () => {
+    const run = _ltQueue.then(fn, fn);
+    // A test's own promise settles as soon as its assertions finish; its `finally { child.kill
+    // ("SIGKILL"); ... }` only SENDS the signal — 'close' (and _ltActiveBoots's decrement) fires
+    // asynchronously afterward, so without this the NEXT queued test could call ltBoot() while
+    // the PREVIOUS one's child is still mid-teardown, briefly pushing _ltActiveBoots to 2 (a
+    // false claim of "at most one at a time" — caught by the peak-count regression test below).
+    // Draining to 0 here, not in the individual finally blocks, keeps the guarantee in ONE
+    // place instead of requiring every ltBoot-based test to get its own teardown wait right.
+    _ltQueue = run.catch(() => {}).then(() => ltWait(() => _ltActiveBoots === 0, 5000));
+    return run;
+  });
+}
+
 console.log("\nOCP_LOCAL_TOOLS integration (boot server.mjs):");
 
-test("integration: OCP_LOCAL_TOOLS=1 → the -p spawn receives the POSITIVE wrapper (kills the no-op mutation)", async () => {
+ltTest("integration: OCP_LOCAL_TOOLS=1 → the -p spawn receives the POSITIVE wrapper (kills the no-op mutation)", async () => {
   if (!LT_POSIX) return; // sh fake — skip on Windows CI
   const dir = ltMkdir(); const cap = join(dir, "sp.txt"); const fake = ltFake(dir);
   const port = await ltFreePort();
@@ -1203,7 +1288,7 @@ test("integration: OCP_LOCAL_TOOLS=1 → the -p spawn receives the POSITIVE wrap
   } finally { child.kill("SIGKILL"); _ltRmRetry(dir); }
 });
 
-test("integration: flag OFF → the -p spawn receives the EXACT negative wrapper (default path byte-for-byte)", async () => {
+ltTest("integration: flag OFF → the -p spawn receives the EXACT negative wrapper (default path byte-for-byte)", async () => {
   if (!LT_POSIX) return;
   const dir = ltMkdir(); const cap = join(dir, "sp.txt"); const fake = ltFake(dir);
   const port = await ltFreePort();
@@ -1218,7 +1303,7 @@ test("integration: flag OFF → the -p spawn receives the EXACT negative wrapper
   } finally { child.kill("SIGKILL"); _ltRmRetry(dir); }
 });
 
-test("integration: boot gate REFUSES each unsafe config (multi / non-loopback / anon key)", async () => {
+ltTest("integration: boot gate REFUSES each unsafe config (multi / non-loopback / anon key)", async () => {
   if (!LT_POSIX) return;
   const dir = ltMkdir(); const fake = ltFake(dir);
   const cases = [
@@ -1236,12 +1321,19 @@ test("integration: boot gate REFUSES each unsafe config (multi / non-loopback / 
         assert.ok(await ltWait(() => buf.closed || buf.spawnErr), `[${c.label}] process never closed — ${ltDiag(buf)}`);
         assert.notEqual(buf.exit, 0, `[${c.label}] must exit non-zero — ${ltDiag(buf)}`);
         assert.ok(/FATAL[\s\S]*OCP_LOCAL_TOOLS/.test(buf.err), `[${c.label}] expected a local-tools FATAL — ${ltDiag(buf)}`);
-      } finally { child.kill("SIGKILL"); }
+      } finally {
+      child.kill("SIGKILL");
+      // bootOnce calls twice sequentially within one test; without waiting for THIS boot's
+      // 'close', the next `await bootOnce(...)` could spawn its own child while this one is
+      // still mid-teardown — a false "two at once" that ltTest's between-TEST draining doesn't
+      // cover, because both boots happen inside a single test body.
+      await ltWait(() => buf.closed, 5000);
+    }
     }
   } finally { _ltRmRetry(dir); }
 });
 
-test("integration: safe single-user config BOOTS past the gate and announces local tools", async () => {
+ltTest("integration: safe single-user config BOOTS past the gate and announces local tools", async () => {
   if (!LT_POSIX) return;
   const dir = ltMkdir(); const fake = ltFake(dir);
   const port = await ltFreePort();
@@ -1270,7 +1362,7 @@ test("integration: safe single-user config BOOTS past the gate and announces loc
   } finally { child.kill("SIGKILL"); _ltRmRetry(dir); }
 });
 
-test("integration: TUI mode → flag is announced INERT (not 'ON'), boot not refused", async () => {
+ltTest("integration: TUI mode → flag is announced INERT (not 'ON'), boot not refused", async () => {
   if (!LT_POSIX) return;
   const dir = ltMkdir(); const fake = ltFake(dir);
   // Non-loopback would normally trip the local-tools gate; under TUI the flag is inert so the
@@ -1293,7 +1385,7 @@ test("integration: TUI mode → flag is announced INERT (not 'ON'), boot not ref
   } finally { child.kill("SIGKILL"); _ltRmRetry(dir); }
 });
 
-test("integration: toggling OCP_LOCAL_TOOLS invalidates the standard response cache (epoch fold)", async () => {
+ltTest("integration: toggling OCP_LOCAL_TOOLS invalidates the standard response cache (epoch fold)", async () => {
   if (!LT_POSIX) return;
   const dir = ltMkdir(); const fake = ltFake(dir); const counter = join(dir, "spawns.txt");
   const req = { model: "sonnet", messages: [{ role: "user", content: "epoch-probe" }] };
@@ -1305,7 +1397,14 @@ test("integration: toggling OCP_LOCAL_TOOLS invalidates the standard response ca
       await ltPost(port, req);
       await ltWait(() => (Number(_ltRead(counter, "utf8")) || 0) >= 1, 3000); // give the spawn a beat
       return Number(_ltRead(counter, "utf8")) || 0;
-    } finally { child.kill("SIGKILL"); }
+    } finally {
+      child.kill("SIGKILL");
+      // bootOnce calls twice sequentially within one test; without waiting for THIS boot's
+      // 'close', the next `await bootOnce(...)` could spawn its own child while this one is
+      // still mid-teardown — a false "two at once" that ltTest's between-TEST draining doesn't
+      // cover, because both boots happen inside a single test body.
+      await ltWait(() => buf.closed, 5000);
+    }
   };
   try {
     const off = await bootOnce({}, await ltFreePort());                       // caches "OK" under epoch(negative)
@@ -1359,7 +1458,7 @@ async function ltPostStatus(port, body) {
 
 console.log("\nactive-request counter pairing (#180 / #193):");
 
-test("integration: a synchronous pre-spawn throw must not leak stats.activeRequests", async () => {
+ltTest("integration: a synchronous pre-spawn throw must not leak stats.activeRequests", async () => {
   if (!LT_POSIX) return;
   const thr = ltSpreadThrowCount(LT_STACK);
   assert.ok(thr > 0, `no spread-throw threshold found under --stack-size=${LT_STACK}`);
@@ -1419,7 +1518,7 @@ const LT_SCHEMA = { type: "object", properties: { ok: { type: "boolean" } }, req
 
 console.log("\nCache key resolves the model alias (#194):");
 
-test("integration: an alias and its canonical target share ONE cache slot (normal path)", async () => {
+ltTest("integration: an alias and its canonical target share ONE cache slot (normal path)", async () => {
   if (!LT_POSIX) return;
   const dir = ltMkdir(); const fake = ltFake(dir); const counter = join(dir, "spawns.txt");
   const port = await ltFreePort();
@@ -1437,7 +1536,7 @@ test("integration: an alias and its canonical target share ONE cache slot (norma
   } finally { child.kill("SIGKILL"); _ltRmRetry(dir); }
 });
 
-test("integration: an alias and its canonical target share ONE cache slot (STRUCTURED path)", async () => {
+ltTest("integration: an alias and its canonical target share ONE cache slot (STRUCTURED path)", async () => {
   if (!LT_POSIX) return;
   const dir = ltMkdir(); const fake = ltFakeJson(dir); const counter = join(dir, "spawns.txt");
   const port = await ltFreePort();
@@ -1459,7 +1558,7 @@ test("integration: an alias and its canonical target share ONE cache slot (STRUC
 // MODEL_MAP is models[] + aliases + legacyAliases, so resolving covers legacyAliases for free.
 // The three tests above all use `sonnet` (a plain alias); this pins the legacyAlias leg explicitly
 // rather than leaving it covered only by construction.
-test("integration: a legacyAlias shares ONE cache slot with its canonical target", async () => {
+ltTest("integration: a legacyAlias shares ONE cache slot with its canonical target", async () => {
   if (!LT_POSIX) return;
   const dir = ltMkdir(); const fake = ltFake(dir); const counter = join(dir, "spawns.txt");
   const port = await ltFreePort();
@@ -1477,7 +1576,7 @@ test("integration: a legacyAlias shares ONE cache slot with its canonical target
   } finally { child.kill("SIGKILL"); _ltRmRetry(dir); }
 });
 
-test("integration: a config change invalidates the STRUCTURED cache too (closes the #177 gap)", async () => {
+ltTest("integration: a config change invalidates the STRUCTURED cache too (closes the #177 gap)", async () => {
   if (!LT_POSIX) return;
   const dir = ltMkdir(); const fake = ltFakeJson(dir); const counter = join(dir, "spawns.txt");
   const rf = { type: "json_schema", json_schema: { name: "probe", schema: LT_SCHEMA } };
@@ -1490,7 +1589,14 @@ test("integration: a config change invalidates the STRUCTURED cache too (closes 
       await ltPost(port, req);
       await ltWait(() => (Number(_ltRead(counter, "utf8")) || 0) >= 1, 4000);
       return Number(_ltRead(counter, "utf8")) || 0;
-    } finally { child.kill("SIGKILL"); }
+    } finally {
+      child.kill("SIGKILL");
+      // bootOnce calls twice sequentially within one test; without waiting for THIS boot's
+      // 'close', the next `await bootOnce(...)` could spawn its own child while this one is
+      // still mid-teardown — a false "two at once" that ltTest's between-TEST draining doesn't
+      // cover, because both boots happen inside a single test body.
+      await ltWait(() => buf.closed, 5000);
+    }
   };
   try {
     const off = await bootOnce({}, await ltFreePort());                        // caches under epoch(negative wrapper)
@@ -1498,6 +1604,26 @@ test("integration: a config change invalidates the STRUCTURED cache too (closes 
     assert.equal(off, 1, "first structured request (cache empty) must spawn claude");
     assert.equal(on, 1, "structured cache must honor CONFIG_EPOCH — before #194 it omitted the epoch entirely and served the stale answer");
   } finally { _ltRmRetry(dir); }
+});
+
+// Deterministic close for the ltTest serialization claim: a fact about how many server.mjs
+// children were EVER alive at once during this block, not a race against wall-clock luck (see
+// the comment on _ltPeakBoots above ltBoot's definition). Registered last in the ltTest chain —
+// by construction it only runs once every OTHER ltTest body in this block has settled, so
+// _ltPeakBoots holds its final value by the time this reads it. Mutation-proof: bypass the
+// _ltQueue chain (return fn() directly from ltTest, or seed the chain with a stale/no-op
+// promise) and multiple ltBoot calls overlap, pushing this above 1.
+ltTest("integration: ltTest serialization keeps peak concurrent server.mjs children at 1 (#248)", async () => {
+  // The predecessor's own test body resolves as soon as its assertions finish, but its
+  // `finally { child.kill("SIGKILL"); ... }` only SENDS the signal — 'close' (and this file's
+  // own decrement) fires asynchronously afterward. Being queued last guarantees no NEW ltBoot
+  // call will happen after this point, but not that the trailing cleanup of the second-to-last
+  // one has already landed, so wait for it rather than reading _ltActiveBoots synchronously.
+  await ltWait(() => _ltActiveBoots === 0, 5000);
+  assert.equal(_ltActiveBoots, 0,
+    `all boots in this block must have closed by the time the last queued test runs, got ${_ltActiveBoots} still active`);
+  assert.equal(_ltPeakBoots, 1,
+    `ltTest must serialize ltBoot-spawned children to 1 at a time; peak observed was ${_ltPeakBoots}`);
 });
 
 // ── Upgrade Tests ──
