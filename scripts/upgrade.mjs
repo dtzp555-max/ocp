@@ -178,12 +178,20 @@ async function runFullUpgrade({ doctor, opts }) {
     exec(`git -C ${ocpDir} checkout ${doctor.latest_version}`, "fetch+install");
     exec(`npm --prefix ${ocpDir} install --no-audit --no-fund`, "fetch+install");
 
-    // phase 4: reconfigure — writes the service unit/plist ONLY; must not enable-at-boot or
-    // start (issue #226). Enabling/starting here bypasses phase 5's restart-target resolution
-    // (#221) and can re-arm the boot race #215 describes on a host with a competing unit for
-    // the same port. --reconfigure-only is setup.mjs's opt-in mode for exactly this call site
-    // (see scripts/lib/service-mode.mjs); a bare first install still calls setup.mjs without
-    // it (scripts/doctor.mjs's fresh_install path), so it keeps enabling + starting.
+    // phase 4: reconfigure — writes the service unit/plist ONLY (config + legacy-unit
+    // migration are both gated on --reconfigure-only inside setup.mjs; see
+    // scripts/lib/service-mode.mjs); must not enable-at-boot or start (issue #226). Enabling
+    // re-arms the boot race #215 describes on a host with a competing unit for the same port.
+    // CORRECTION (review finding M2): this does NOT by itself stop #215's orphan. Phase 5
+    // below is still the pre-#221 hard-coded `systemctl --user restart ocp-proxy.service` —
+    // #221 (restart-target-ownership resolution) is a separate PR, open/unmerged as of this
+    // change. On the #215 host, phase 5 still unconditionally starts `ocp-proxy` a few lines
+    // down, regardless of what phase 4 does. What this fix removes is phase 4's premature
+    // `enable` (the boot-race re-arm) and its premature `start` (racing ahead of whatever
+    // phase 5 does) — half of the #215/#226 defect family, not all of it. --reconfigure-only
+    // is setup.mjs's opt-in mode for exactly this call site; a bare first install still calls
+    // setup.mjs without it (scripts/doctor.mjs's fresh_install path), so it keeps enabling +
+    // starting, which is that path's actual job.
     exec(`node ${ocpDir}/setup.mjs --reconfigure-only`, "reconfigure");
 
     // phase 5: restart (heads-up note printed before invoking)

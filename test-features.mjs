@@ -1664,14 +1664,20 @@ test("upgrade full path executes 5 phases", async () => {
 // #215: on a host where a competing systemd/launchd unit already owns the OCP port, an
 // upgrade's reconfigure step (setup.mjs) must not enable-at-boot or start the service it
 // writes config for — that races/duplicates whatever phase 5 (restart) resolves to run, and
-// re-arms the boot race #215 describes. #221 fixes phase 5's target resolution; this section
-// covers the layering fix so phase 4 stops performing phase 5's job in the first place.
+// re-arms the boot race #215 describes. #221 fixes phase 5's target resolution (still open,
+// unmerged as of this section); this covers the layering fix so phase 4 stops performing
+// phase 5's job in the first place. NOTE: phase 5, as it exists on `main` right now, is still
+// the pre-#221 hard-coded restart — so on the actual #215 host, this fix alone does not stop
+// the orphan (phase 5 still unconditionally starts `ocp-proxy.service` a few lines later); it
+// removes the `enable` re-arm and phase 4's premature `start`, which is half the defect family.
 //
-// planServiceActions() is imported directly (not replicated, unlike the setup.mjs inject
-// helpers above) because scripts/lib/service-mode.mjs is a real side-effect-free module —
-// setup.mjs itself still cannot be imported, but the decision was deliberately extracted out
-// of it into something that can be.
-import { planServiceActions } from "./scripts/lib/service-mode.mjs";
+// planServiceActions() / resolveServicePlan() are imported directly (not replicated, unlike
+// the setup.mjs inject helpers above) because scripts/lib/service-mode.mjs is a real
+// side-effect-free module — setup.mjs itself still cannot be imported, but the decision
+// (including the --reconfigure-only argv parse itself, per resolveServicePlan) was
+// deliberately extracted out of it into something that can be.
+import { planServiceActions, resolveServicePlan } from "./scripts/lib/service-mode.mjs";
+import { readFileSync as setupSrcRead } from "node:fs";
 
 console.log("\nReconfigure-only service mode (#226):");
 
@@ -1698,6 +1704,100 @@ test("planServiceActions(darwin, reconfigureOnly): bootstrap false (plist writte
 test("planServiceActions on an unsupported platform returns {} regardless of reconfigureOnly", () => {
   assert.deepEqual(planServiceActions("win32"), {});
   assert.deepEqual(planServiceActions("win32", { reconfigureOnly: true }), {});
+});
+
+test("planServiceActions(platform, null) does not throw (review-flagged robustness gap)", () => {
+  assert.doesNotThrow(() => planServiceActions("linux", null));
+  assert.deepEqual(planServiceActions("linux", null), { daemonReload: true, enable: true, start: true });
+});
+
+// ── resolveServicePlan: the argv-parse-to-decision seam (review finding H2 / MX1) ──────────
+// Closes the gap where the --reconfigure-only argv parse lived as an untestable setup.mjs
+// top-level const, separate from the tested planServiceActions() decision — a mutation to
+// that const (e.g. hardcoding it to `false`) previously left the full suite green.
+test("resolveServicePlan([], 'linux'): reconfigureOnly false, full enable+start plan", () => {
+  const plan = resolveServicePlan([], "linux");
+  assert.deepEqual(plan, { reconfigureOnly: false, daemonReload: true, enable: true, start: true });
+});
+
+test("resolveServicePlan(['--reconfigure-only'], 'linux'): reconfigureOnly true, enable+start false", () => {
+  const plan = resolveServicePlan(["--reconfigure-only"], "linux");
+  assert.deepEqual(plan, { reconfigureOnly: true, daemonReload: true, enable: false, start: false });
+});
+
+test("resolveServicePlan([], 'darwin'): reconfigureOnly false, bootstrap true", () => {
+  const plan = resolveServicePlan([], "darwin");
+  assert.deepEqual(plan, { reconfigureOnly: false, bootstrap: true });
+});
+
+test("resolveServicePlan(['--reconfigure-only'], 'darwin'): reconfigureOnly true, bootstrap false", () => {
+  const plan = resolveServicePlan(["--reconfigure-only"], "darwin");
+  assert.deepEqual(plan, { reconfigureOnly: true, bootstrap: false });
+});
+
+test("resolveServicePlan refuses --reconfigure-only=true rather than silently parsing as false (fails-open guard)", () => {
+  assert.throws(() => resolveServicePlan(["--reconfigure-only=true"], "linux"), /takes no value/);
+});
+
+test("resolveServicePlan refuses --reconfigure-only=false rather than silently parsing as false", () => {
+  assert.throws(() => resolveServicePlan(["--reconfigure-only=false"], "linux"), /takes no value/);
+});
+
+test("resolveServicePlan tolerates other unrelated argv alongside the bare flag", () => {
+  const plan = resolveServicePlan(["--port", "3456", "--reconfigure-only", "--bind", "0.0.0.0"], "linux");
+  assert.equal(plan.reconfigureOnly, true);
+});
+
+// ── setup.mjs wiring: source-shape assertions (review finding H2 / MX2, MX3, and H1) ──────
+// setup.mjs has top-level side effects and cannot be imported or executed in this suite (see
+// module comment above). These read its actual source text and assert the SPECIFIC guard ↔
+// call pairing is present — not merely that a token like "execSync" appears somewhere, which
+// a source-level assertion the task's own conventions rightly call "not a test". Each regex
+// requires the guard condition and the gated call to be adjacent/bound in source, so a
+// mutation that strips the `if (...)` (making the call unconditional, i.e. literally
+// reintroducing #226) breaks the match. This is a deliberate, narrow exception to
+// "behavioral, not textual" made specifically because setup.mjs itself is not executable
+// here — the DECISION these guards consume (servicePlan) is fully behaviorally tested above;
+// this only confirms setup.mjs's imperative body actually consults it.
+const setupSrc = setupSrcRead(new URL("./setup.mjs", import.meta.url), "utf8");
+
+test("setup.mjs actually calls resolveServicePlan(args, platform) — not a disconnected/hardcoded value", () => {
+  // Anchored to the actual assignment statement, not a bare call expression — a prose comment
+  // elsewhere in the file legitimately contains the substring "resolveServicePlan(args,
+  // platform)" too, and matching only the call expression would pass vacuously against that
+  // comment even if the REAL call were mutated to e.g. resolveServicePlan([], platform).
+  assert.ok(/const\s+servicePlan\s*=\s*resolveServicePlan\(args,\s*platform\);/.test(setupSrc),
+    "setup.mjs must assign `const servicePlan = resolveServicePlan(args, platform);` to wire the flag to behavior");
+});
+
+test("setup.mjs's systemd `enable` call is guarded by servicePlan.enable", () => {
+  assert.ok(/if\s*\(servicePlan\.enable\)\s*execSync\(`systemctl --user enable ocp-proxy`\);/.test(setupSrc),
+    "the `systemctl --user enable ocp-proxy` call must be gated on servicePlan.enable");
+});
+
+test("setup.mjs's systemd `start` call is guarded by servicePlan.start", () => {
+  assert.ok(/if\s*\(servicePlan\.start\)\s*execSync\(`systemctl --user start ocp-proxy`\);/.test(setupSrc),
+    "the `systemctl --user start ocp-proxy` call must be gated on servicePlan.start");
+});
+
+test("setup.mjs's launchctl bootstrap block is guarded by servicePlan.bootstrap", () => {
+  const m = setupSrc.match(/if\s*\(servicePlan\.bootstrap\)\s*\{([\s\S]*?)\}\s*else\s*\{/);
+  assert.ok(m, "expected an `if (servicePlan.bootstrap) { ... } else {` block");
+  assert.ok(m[1].includes("launchctl bootstrap gui"),
+    "the launchctl bootstrap call must be inside the servicePlan.bootstrap-guarded block");
+});
+
+test("setup.mjs's legacy-unit migration is gated on !servicePlan.reconfigureOnly (review finding H1)", () => {
+  // Landmark-bounded slice: from the "Uninstall legacy service names" comment up to the start
+  // of the main plist-write block ("// macOS: launchd") — the region that must be entirely
+  // inside the !reconfigureOnly gate.
+  const region = setupSrc.match(/Uninstall legacy service names[\s\S]*?\/\/ macOS: launchd/);
+  assert.ok(region, "legacy-migration region landmark not found in setup.mjs");
+  const block = region[0];
+  assert.ok(/if\s*\(!servicePlan\.reconfigureOnly\)\s*\{/.test(block),
+    "legacy-unit migration must be wrapped in `if (!servicePlan.reconfigureOnly) { ... }`");
+  assert.ok(block.includes("ai.openclaw.proxy.plist"), "darwin legacy-plist removal must be inside the gated region");
+  assert.ok(block.includes("openclaw-proxy.service"), "linux legacy-service removal must be inside the gated region");
 });
 
 test("upgrade full path's reconfigure phase invokes setup.mjs with --reconfigure-only", async () => {

@@ -17,7 +17,7 @@
  */
 import { readFileSync, writeFileSync, existsSync, mkdirSync, unlinkSync, readdirSync, chmodSync } from "node:fs";
 import { mergePlistEnv, mergeSystemdEnv } from "./scripts/lib/plist-merge.mjs";
-import { planServiceActions } from "./scripts/lib/service-mode.mjs";
+import { resolveServicePlan } from "./scripts/lib/service-mode.mjs";
 import { execSync } from "node:child_process";
 import { join, dirname } from "node:path";
 import { homedir } from "node:os";
@@ -47,7 +47,10 @@ const SKIP_START = flag("no-start");
 // scripts/lib/service-mode.mjs for the full reasoning. Not used on a first install: that path
 // (scripts/doctor.mjs's fresh_install ai_executable) invokes `node setup.mjs` bare, and must
 // keep enabling + starting — that IS a first install's job.
-const RECONFIGURE_ONLY = flag("reconfigure-only");
+// NOT parsed as a bare `flag()` const here like the others above: the parse itself is folded
+// into scripts/lib/service-mode.mjs's resolveServicePlan(args, platform) (called below, once
+// `platform` is known), so the argv-to-behavior path is one tested function rather than a
+// setup.mjs-local assignment that no test can reach.
 const PROVIDER_NAME = opt("provider-name", "claude-local");
 const BIND_ADDRESS = opt("bind", "127.0.0.1");
 const AUTH_MODE_CONFIG = opt("auth-mode", "none");
@@ -379,14 +382,11 @@ if (!DRY_RUN) {
   console.log("\n🔄 Installing auto-start on login...\n");
 
   const platform = process.platform;
-  // Tracks whether THIS run actually arms "start automatically on login/boot" — used to keep
-  // the banner below honest under --reconfigure-only. Defaults true: on macOS, writing the
-  // plist into ~/Library/LaunchAgents is itself what arms next-login auto-start (launchd scans
-  // that directory at every login regardless of whether `bootstrap` ran this session), so
-  // reconfigure-only doesn't change that half. On Linux, auto-start-on-boot is the systemd
-  // `enable` step specifically — writing the unit file alone does not arm it — so the Linux
-  // branch below flips this to false when --reconfigure-only skips `enable`.
-  let autoStartArmed = true;
+  const platformSupported = platform === "darwin" || platform === "linux";
+  // Single tested seam bridging argv → behavior (see scripts/lib/service-mode.mjs). Computed
+  // once here (platform is now known) and used for every reconfigure-only-sensitive decision
+  // below — the action gates, the post-install banner, and Step 8's verification gate.
+  const servicePlan = resolveServicePlan(args, platform);
   // Use stable symlink path instead of versioned Cellar path (e.g. /opt/homebrew/opt/node/bin/node
   // instead of /opt/homebrew/Cellar/node/25.8.0/bin/node) so the plist survives node upgrades.
   let nodeBin = process.execPath;
@@ -412,22 +412,37 @@ if (!DRY_RUN) {
   // without an explicit mode that parent lands at the umask default (world-listable 0755).
   if (!existsSync(ocpLogsDir)) mkdirSync(ocpLogsDir, { recursive: true, mode: 0o700 });
 
-  // Uninstall legacy service names if present (upgrade path)
-  if (platform === "darwin") {
-    const legacyPlist = join(HOME, "Library", "LaunchAgents", "ai.openclaw.proxy.plist");
-    if (existsSync(legacyPlist)) {
-      try { execSync(`launchctl bootout gui/$(id -u) "${legacyPlist}" 2>/dev/null`); } catch { /* ignore */ }
-      try { unlinkSync(legacyPlist); } catch { /* ignore */ }
-      log(`Removed legacy plist: ai.openclaw.proxy`);
-    }
-  } else if (platform === "linux") {
-    const legacyService = join(HOME, ".config", "systemd", "user", "openclaw-proxy.service");
-    if (existsSync(legacyService)) {
-      try { execSync(`systemctl --user stop openclaw-proxy 2>/dev/null`); } catch { /* ignore */ }
-      try { execSync(`systemctl --user disable openclaw-proxy 2>/dev/null`); } catch { /* ignore */ }
-      try { unlinkSync(legacyService); } catch { /* ignore */ }
-      try { execSync(`systemctl --user daemon-reload`); } catch { /* ignore */ }
-      log(`Removed legacy systemd service: openclaw-proxy`);
+  // Uninstall legacy service names if present (upgrade path). Gated on !reconfigureOnly
+  // (issue #226 review, finding H1): stopping, disabling, and deleting a service is exactly
+  // the phase-5-shaped action this PR exists to keep out of phase 4 — regardless of WHICH
+  // unit it targets, "only write config" cannot also mean "and stop/disable/delete a
+  // different one". Left ungated, a host that auto-started via the legacy unit would end this
+  // run with NO enabled unit at all (legacy disabled+deleted here, new unit's `enable` skipped
+  // by reconfigure-only) — invisible until the next reboot. Reconfigure-only therefore leaves
+  // any pre-v3.4.0 legacy unit untouched; migrating away from it remains a bare
+  // `node setup.mjs` (first install / fresh_install) job, same as it always was. In practice
+  // this is very close to unreachable via scripts/upgrade.mjs's phase 4 specifically — doctor
+  // gates that cross-minor "upgrade" path (the only caller of --reconfigure-only) at
+  // >= v3.4.0, already past the v3.1.0 rename that produced these legacy names — but the
+  // gate lives here regardless, since the contract ("reconfigure-only touches only this
+  // unit's own config") should hold even where it's never exercised.
+  if (!servicePlan.reconfigureOnly) {
+    if (platform === "darwin") {
+      const legacyPlist = join(HOME, "Library", "LaunchAgents", "ai.openclaw.proxy.plist");
+      if (existsSync(legacyPlist)) {
+        try { execSync(`launchctl bootout gui/$(id -u) "${legacyPlist}" 2>/dev/null`); } catch { /* ignore */ }
+        try { unlinkSync(legacyPlist); } catch { /* ignore */ }
+        log(`Removed legacy plist: ai.openclaw.proxy`);
+      }
+    } else if (platform === "linux") {
+      const legacyService = join(HOME, ".config", "systemd", "user", "openclaw-proxy.service");
+      if (existsSync(legacyService)) {
+        try { execSync(`systemctl --user stop openclaw-proxy 2>/dev/null`); } catch { /* ignore */ }
+        try { execSync(`systemctl --user disable openclaw-proxy 2>/dev/null`); } catch { /* ignore */ }
+        try { unlinkSync(legacyService); } catch { /* ignore */ }
+        try { execSync(`systemctl --user daemon-reload`); } catch { /* ignore */ }
+        log(`Removed legacy systemd service: openclaw-proxy`);
+      }
     }
   }
 
@@ -487,13 +502,14 @@ if (!DRY_RUN) {
       log(`Plist written: ${plistPath} (mode 600)`);
     }
 
-    const darwinActions = planServiceActions(platform, { reconfigureOnly: RECONFIGURE_ONLY });
-    if (darwinActions.bootstrap) {
+    if (servicePlan.bootstrap) {
       // Bootout first (in case it was already loaded) then bootstrap
       try { execSync(`launchctl bootout gui/$(id -u) "${plistPath}" 2>/dev/null`); } catch { /* ignore */ }
       execSync(`launchctl bootstrap gui/$(id -u) "${plistPath}"`);
       log(`launchctl loaded dev.ocp.proxy`);
     } else {
+      // Does NOT touch launchd's persistent enable/disable state either way (see
+      // scripts/lib/service-mode.mjs) — only skips loading/starting the job THIS session.
       log(`Plist written (reconfigure-only: launchctl bootstrap left to the upgrade flow's restart phase)`);
     }
 
@@ -533,11 +549,10 @@ WantedBy=default.target
       log(`Service file written: ${servicePath} (mode 600)`);
     }
 
-    const linuxActions = planServiceActions(platform, { reconfigureOnly: RECONFIGURE_ONLY });
-    if (linuxActions.daemonReload) execSync(`systemctl --user daemon-reload`);
-    if (linuxActions.enable) execSync(`systemctl --user enable ocp-proxy`);
-    if (linuxActions.start) execSync(`systemctl --user start ocp-proxy`);
-    if (linuxActions.enable && linuxActions.start) {
+    if (servicePlan.daemonReload) execSync(`systemctl --user daemon-reload`);
+    if (servicePlan.enable) execSync(`systemctl --user enable ocp-proxy`);
+    if (servicePlan.start) execSync(`systemctl --user start ocp-proxy`);
+    if (servicePlan.enable && servicePlan.start) {
       log(`systemd user service enabled and started`);
     } else {
       // Note: only `start` is "left to" the restart phase (it issues `systemctl restart`,
@@ -545,31 +560,36 @@ WantedBy=default.target
       // is simply left untouched here, preserving whatever it already was.
       log(`Service file written + daemon-reload'd (reconfigure-only: enable left as-is; start left to the upgrade flow's restart phase)`);
     }
-    // Unlike the darwin branch, Linux auto-start-on-boot IS the `enable` step — a written but
-    // un-enabled unit file will not start at next boot on its own.
-    autoStartArmed = linuxActions.enable;
 
   } else {
     warn(`Auto-start not supported on ${platform} — start manually with: bash ${startPath}`);
-    autoStartArmed = false; // nothing was written or loaded on this platform
   }
 
-  if (autoStartArmed) {
-    console.log("\n✅ Auto-start installed — proxy will start automatically on login\n");
-  } else if (RECONFIGURE_ONLY) {
-    // --reconfigure-only intentionally leaves auto-start-on-boot state untouched (issue #226)
-    // — it neither arms nor disarms it, so whatever this unit's enablement already was (set by
-    // the original first install, or by an operator's manual override) is preserved. The
-    // upgrade flow's restart phase runs next and starts the service; it does not call `enable`.
+  // Banner: only claim "will start automatically" when this run actually attempted to
+  // load/start it (bare install/first-run — not --reconfigure-only, which never runs
+  // `enable`/`start`/`bootstrap` on either platform). This applies uniformly to both
+  // platforms: a first-install bootstrap/enable+start failing against a disabled unit would
+  // already have thrown and killed the script before reaching this banner, so reaching it on
+  // the non-reconfigure-only path is real evidence, not an assumption — whereas
+  // reconfigure-only never attempts either action, so it never gets to claim that evidence
+  // (previously this banner over-claimed unconditionally on darwin; see #226 review M1).
+  if (!platformSupported) {
+    // warn() above already explained it; nothing further to add.
+  } else if (servicePlan.reconfigureOnly) {
+    // Leaves auto-start-on-boot/login state untouched either way (issue #226) — whatever this
+    // unit's enablement already was (first install, or an operator's manual override) is
+    // preserved, not re-asserted. The upgrade flow's restart phase runs next and starts the
+    // service; it does not call `enable` (Linux) or touch launchd's disabled state (macOS).
     console.log("\n✅ Service config written (--reconfigure-only) — auto-start-on-boot state left as-is; the upgrade flow's restart phase starts the service next\n");
+  } else {
+    console.log("\n✅ Auto-start installed — proxy will start automatically on login\n");
   }
-  // else: unsupported platform — the warn() above already explained it; nothing further to add.
 
   // ── Step 8: Post-install health verification ───────────────────────────
   // Skipped under --reconfigure-only too: nothing was started above, so there is nothing
   // yet to verify — the upgrade flow's own post-flight phase (phase 6) checks the real
   // post-restart state after phase 5 actually restarts the service.
-  if (!SKIP_START && !RECONFIGURE_ONLY) {
+  if (!SKIP_START && !servicePlan.reconfigureOnly) {
     console.log("⏳ Waiting for server to bind...\n");
     await new Promise(r => setTimeout(r, 3000));
 
