@@ -4955,7 +4955,7 @@ test("models.json: contextWindow equals the registry, or is the deliberate 20000
   // the same commit that adds the model.
   for (const id of Object.keys(_spotRegistryContextWindow)) {
     assert.ok(_spotModelIds.has(id),
-      `${id} is recorded in the registry table but missing from models[] — removing a model must be ` +
+      `'${id}' is recorded in the registry table but missing from models[] — removing a model must be ` +
       `deliberate: drop its row here in the same commit and say why in the message.`);
   }
 });
@@ -4985,9 +4985,13 @@ test("models.json: every aliases value resolves to a real models[].id (referenti
 // alias, measured under FOUR keys (first_party, anthropic_aws, anthropic_google_cloud, gateway)
 // and never as an `id:`. Anchor the haiku row on the SHORT id; anchoring on the dated one returns
 // nothing, which is what tempts the next reader back into a bare-string search.
-// NOTE this table has NO reverse check, unlike _spotRegistryContextWindow above: a row left here
-// for a model that no longer exists in models.json passes green (measured: rename a model, update
-// both tables, leave the stale row here -> 463 passed, 0 failed). Tracked separately.
+// UPDATE (#222): this table now has a reverse check too, mirroring _spotRegistryContextWindow
+// above (see the reverse-direction loop inside the test below). Before this fix, a row left here
+// for a model that no longer exists in models.json passed green — both loops walked models.json,
+// so the mapping was one-way and an orphaned row was never visited. Measured on this suite pre-fix:
+// rename a model, update BOTH tables for the new id, and leave the OLD id's row behind here only
+// -> 633 passed, 0 failed (the wrong-repro trap — renaming without adding the new id anywhere
+// fails the FORWARD check instead and masks this gap entirely; see #222 for both repros).
 const _spotRegistryMaxTokens = {
   "claude-opus-5": 64000, "claude-opus-4-8": 64000, "claude-opus-4-7": 64000, "claude-opus-4-6": 64000,
   "claude-sonnet-5": 64000, "claude-sonnet-4-6": 32000,
@@ -4999,6 +5003,22 @@ test("models.json: every maxTokens equals the CLI registry's max_output_tokens.d
     assert.ok(want !== undefined,
       `${m.id} has no recorded registry value — extract it id-anchored from the CLI binary and add a row`);
     assert.equal(m.maxTokens, want, `${m.id}: models.json says ${m.maxTokens}, CLI registry says ${want}`);
+  }
+  // Reverse direction (#222), mirroring _spotRegistryContextWindow's reverse check above. Both
+  // loops here and above walk models.json, so without this the mapping is ONE-WAY and a
+  // renamed/removed model's row is simply never visited: a rename that updates this table for
+  // the new id but leaves the OLD id's row behind passed green with no reverse check (measured
+  // pre-fix: 633 passed, 0 failed on this suite). The stale row isn't just untidy — this table
+  // is the record of what the CLI registry said at 2.1.220, and an orphaned row is a claim about
+  // a model nobody can check. Same consequence as the contextWindow table: forward gives
+  // models[] subset-of table and this gives table subset-of models[], so the two id sets are now
+  // exactly EQUAL — pre-recording a row for a model not yet exposed (claude-fable-5,
+  // claude-mythos-5 — both present in the 2.1.220 registry) is a test failure, not prep. Add
+  // the row in the same commit that adds the model.
+  for (const id of Object.keys(_spotRegistryMaxTokens)) {
+    assert.ok(_spotModelIds.has(id),
+      `'${id}' is recorded in the registry table but missing from models[] — removing/renaming a ` +
+      `model must be deliberate: drop its row here in the same commit and say why in the message.`);
   }
 });
 
