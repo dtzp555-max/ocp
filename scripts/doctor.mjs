@@ -86,12 +86,13 @@ function semverCompare(a, b) {
 //
 // KNOWN LIMITATION (review round 3 on #230, discretionary): grouping by port
 // alone means two units bound to distinct, SPECIFIC, non-wildcard addresses on
-// the same port (e.g. 127.0.0.1:3456 and 192.168.1.5:3456) will warn even
-// though they don't actually contend — each can bind its own address without
-// colliding. This is a deliberate false-positive-tolerant tradeoff, not an
-// oversight: distinguishing "genuinely non-contending" from "contends because
-// at least one side is a wildcard (0.0.0.0/::/unset)" reliably requires
-// knowing this host's real default-bind semantics when CLAUDE_BIND is unset,
+// the SAME port (e.g. one on loopback and another on a specific LAN address)
+// will warn even though they don't actually contend — each can bind its own
+// address without colliding. This is a deliberate false-positive-tolerant
+// tradeoff, not an oversight: distinguishing "genuinely non-contending" from
+// "contends because at least one side is a wildcard (0.0.0.0/::/unset)"
+// reliably requires knowing this host's real default-bind semantics when
+// CLAUDE_BIND is unset,
 // which this check does not attempt to model. Accepted as a rare, WARN-only
 // (never FAIL) false positive rather than adding that inference.
 //
