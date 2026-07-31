@@ -1217,6 +1217,100 @@ async function ltFreePort() {
   await new Promise(r => srv.close(r));
   return p;
 }
+// #219: ltFreePort()'s bind-then-close-then-return-the-number is a textbook TOCTOU — the port
+// is unowned between our close() and the child's own listen(), and anything (a sibling
+// ltFreePort() in this same process, a concurrent suite process, or an unrelated outbound
+// connection) can take it in that window. Closing the window entirely would mean the CHILD
+// binds :0 itself and reports the port it actually got — but the banner's port comes from the
+// configured value, not `server.address().port` (server.mjs:3638), so that fix lives in
+// server.mjs and is out of scope here (test-infra only; no cli.js citation would apply to it
+// either way, and out-of-scope server.mjs changes are exactly what this repo's governance
+// exists to prevent). That leaves narrowing the window's IMPACT: detect a collision and retry
+// with a FRESH port rather than reusing the one that just lost the race.
+//
+// A collided child is silent, not crashed: server.mjs installs a process-wide
+// `uncaughtException` handler that logs and swallows (server.mjs:3553), so a failed
+// `server.listen()` never reaches "listening on", never exits, and never closes on its own —
+// it just hangs until something kills it. The only signal is on stderr, written by that
+// handler's `logEvent("error", "uncaught_exception", {...})`
+// (server.mjs:862-869 -> console.error(JSON.stringify({level:"error", event:"uncaught_exception",
+// error: "listen EADDRINUSE: ..."}))). LT_EADDRINUSE_RE below is that exact shape.
+//
+// The probe window (LT_COLLISION_PROBE_MS) only has to catch the DEFINITIVE collision
+// signature, not decide whether a slow-but-healthy boot will eventually succeed. On any other
+// signal (success, a non-collision exit, or the probe window simply elapsing) this returns
+// immediately and lets the caller's own existing ltWait(...) call — already present in every
+// test body — do the rest, unchanged: a slow-but-uncollided boot is not retried here. This is
+// NOT a claim of being unaffected by #248's contention -- ltBootFresh's own probe is itself a
+// wait, so under heavy contention this function's total worst-case time does grow (bounded by
+// LT_COLLISION_PROBE_MS x maxAttempts). What it IS orthogonal to is #248's actual fix: this
+// function doesn't touch ltWait's ceiling/backoff logic, which is shared by every caller in the
+// file and is #248's territory. The two changes are independent even though both, separately,
+// make ltBoot-based tests take longer to fail under contention.
+//
+// maxAttempts=3, each with a FRESH port (never the one that just collided): the issue measured
+// 7/300 (~2.3%) on Linux CI at 4-way concurrency. Treating attempts as independent draws,
+// P(all 3 collide) ~= 0.023^3 ~= 1.2e-5 -- roughly a 2000x reduction in the residual failure
+// rate for the same host conditions that produced 7/300.
+const LT_EADDRINUSE_RE = /"event":"uncaught_exception"[^\n]*EADDRINUSE/;
+// Generous, not tight: reaching server.listen() at all needs the same startup work (module
+// load, sqlite open, etc.) that a successful boot needs, so under host contention the collision
+// signature can be just as slow to appear as "listening on" is. A too-short probe doesn't cause
+// a false positive, only a false NEGATIVE — it falls through to "not (yet) collided" and hands
+// back to the caller's own wait, which is safe but forfeits the retry; too short was observed
+// directly while validating this fix: an earlier 5000ms probe made the deterministic regression
+// test below fail (the outer wait timed out with the EADDRINUSE line already present in stderr
+// by the time the failure was reported — the probe had simply given up before noticing it).
+// 20000ms was re-tested and passed reliably, repeatedly, under the same host/load conditions
+// that made 5000ms fail -- but re-running the suite later, alongside heavier ambient contention
+// from other concurrent sessions on the same dev host (multiple full `npm test` runs from
+// unrelated agent worktrees observed via `ps` while validating this fix), 20000ms ALSO proved
+// too short (closeMs~54s, still open). test.yml runs this on an isolated ubuntu-latest runner
+// with nothing else scheduled on it (see that workflow's own comment), so CI is not exposed to
+// this class of contention -- the risk is specific to a shared dev host running several agent
+// sessions at once, which is exactly the scenario #248 and #219 both exist because of. Set
+// generously enough to absorb that, since the cost of a slow PASS here is just wall-clock time,
+// not correctness: the end-to-end total this test can take is bounded by LT_COLLISION_PROBE_MS
+// (this attempt's probe) plus whatever the retry's own boot needs, which is a separate, explicit
+// ceiling at the call site below — not this constant.
+const LT_COLLISION_PROBE_MS = 45000;
+// onPort(port, attempt), if given, runs after the port is drawn but before the child spawns —
+// test-only instrumentation (this whole function is test-side, not server.mjs, so there's no
+// "production hook" concern here) that lets a dedicated regression test occupy the exact port
+// just handed back and DETERMINISTICALLY reproduce the race window instead of waiting on rare
+// natural timing. See "ltBootFresh recovers from a forced port collision" below.
+async function ltBootFresh(env, dir, nodeArgs = [], maxAttempts = 3, onPort = null) {
+  let last = null;
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    const port = await ltFreePort();
+    if (onPort) await onPort(port, attempt);
+    const result = ltBoot({ ...env, CLAUDE_PROXY_PORT: String(port) }, dir, nodeArgs);
+    const { buf } = result;
+    // Every terminal signal ends the probe promptly, not just a clean exit: buf.exit stays null
+    // on a SIGKILL/SIGTERM death (Node reports code=null there), so buf.exit != null alone would
+    // miss it and burn the full LT_COLLISION_PROBE_MS on a child that already died. buf.closed
+    // (fires on 'close', after any exit/signal) and buf.spawnErr (fires on 'error', e.g. ENOENT)
+    // catch those. This also means an attempt's own buf.spawnErr is populated BEFORE this
+    // function returns, so a caller doesn't need its own late-attached listener to see it.
+    await ltWait(() =>
+      buf.out.includes("listening on") || buf.exit != null || buf.closed || buf.spawnErr ||
+      LT_EADDRINUSE_RE.test(buf.err),
+      LT_COLLISION_PROBE_MS);
+    last = { ...result, port };
+    if (!LT_EADDRINUSE_RE.test(buf.err)) return last; // success, a different failure, or just still booting
+    if (process.env.LT_DEBUG) console.warn(`    [ltBootFresh] port ${port} collided (EADDRINUSE), retry ${attempt}/${maxAttempts}`);
+    result.child.kill("SIGKILL"); // this attempt is dead on a bad port; free it before redrawing
+    // Same gap as ltTest's between-test drain and bootOnce's sequential-boot fix (#248):
+    // kill() only SENDS the signal, 'close' (and _ltActiveBoots's decrement) fires
+    // asynchronously after. Without waiting here, the NEXT attempt's ltBoot() call — a couple
+    // lines up, next loop iteration — could overlap this collided child's still-in-flight
+    // teardown, pushing _ltActiveBoots above 1 even though only one attempt is ever meant to be
+    // "live" at a time. Caught by the #248 peak-concurrency regression test once this test
+    // (added by #219) joined that same ltTest queue.
+    await ltWait(() => buf.closed, 5000);
+  }
+  return last; // attempts exhausted — hand back the last (still-collided) attempt for the caller to diagnose
+}
 async function ltPost(port, body) {
   try {
     await fetch(`http://127.0.0.1:${port}/v1/chat/completions`, {
@@ -1273,11 +1367,46 @@ function ltTest(name, fn) {
 
 console.log("\nOCP_LOCAL_TOOLS integration (boot server.mjs):");
 
+// #219 regression: the natural race is rare by construction (the issue measured 7/300 on Linux
+// CI) -- too rare to gate a mutation on. This forces it deterministically: occupy the EXACT
+// port ltFreePort() just handed back, in the same window a sibling process would exploit, so
+// the first real server.mjs child hits a genuine EADDRINUSE (not a simulated one) and
+// ltBootFresh's retry path is exercised end to end against real processes and a real socket
+// collision -- port drawn for real, child spawned for real, collision forced for real, retry
+// for real, success for real. Wrapped in ltTest (#248), same as every other test in this block
+// spawning a real server.mjs child -- this one is no exception, and being unwrapped would both
+// let it race the others and put it back outside #248's peak-concurrency guarantee.
+ltTest("integration: ltBootFresh recovers from a forced port collision by retrying on a fresh port (#219)", async () => {
+  if (!LT_POSIX) return;
+  const dir = ltMkdir(); const fake = ltFake(dir);
+  let blocker = null;
+  const { child, buf, port } = await ltBootFresh({ CLAUDE_BIN: fake }, dir, [], 3, async (p, attempt) => {
+    if (attempt === 1) {
+      blocker = _ltNetServer();
+      await new Promise(r => blocker.listen(p, "127.0.0.1", r));
+    }
+  });
+  try {
+    // A generous explicit ceiling: this attempt already paid the LT_COLLISION_PROBE_MS cost for
+    // the forced first-attempt collision before ever reaching this line, and the retry's own
+    // boot still has to do the full startup work under whatever host contention is present.
+    assert.ok(await ltWait(() => buf.out.includes("listening on") || buf.exit != null, 45000),
+      `expected the retry to recover onto a fresh port after the forced collision — ${ltDiag(buf)}`);
+    assert.ok(buf.out.includes("listening on"),
+      `boot must ultimately succeed after the forced first-attempt collision — ${ltDiag(buf)}`);
+    assert.ok(blocker && blocker.address() && blocker.address().port !== port,
+      `the recovered boot must be on a DIFFERENT port than the one that was deliberately occupied`);
+  } finally {
+    child.kill("SIGKILL");
+    if (blocker) await new Promise(r => blocker.close(r));
+    _ltRmRetry(dir);
+  }
+});
+
 ltTest("integration: OCP_LOCAL_TOOLS=1 → the -p spawn receives the POSITIVE wrapper (kills the no-op mutation)", async () => {
   if (!LT_POSIX) return; // sh fake — skip on Windows CI
   const dir = ltMkdir(); const cap = join(dir, "sp.txt"); const fake = ltFake(dir);
-  const port = await ltFreePort();
-  const { child, buf } = ltBoot({ OCP_LOCAL_TOOLS: "1", CLAUDE_BIN: fake, CLAUDE_PROXY_PORT: String(port), SP_CAPTURE: cap }, dir);
+  const { child, buf, port } = await ltBootFresh({ OCP_LOCAL_TOOLS: "1", CLAUDE_BIN: fake, SP_CAPTURE: cap }, dir);
   try {
     assert.ok(await ltWait(() => buf.out.includes("listening on") || buf.exit != null), `server did not start: ${buf.err.slice(0,200)}`);
     await ltPost(port, { model: "sonnet", messages: [{ role: "user", content: "hi" }] });
@@ -1291,8 +1420,7 @@ ltTest("integration: OCP_LOCAL_TOOLS=1 → the -p spawn receives the POSITIVE wr
 ltTest("integration: flag OFF → the -p spawn receives the EXACT negative wrapper (default path byte-for-byte)", async () => {
   if (!LT_POSIX) return;
   const dir = ltMkdir(); const cap = join(dir, "sp.txt"); const fake = ltFake(dir);
-  const port = await ltFreePort();
-  const { child, buf } = ltBoot({ CLAUDE_BIN: fake, CLAUDE_PROXY_PORT: String(port), SP_CAPTURE: cap }, dir); // OCP_LOCAL_TOOLS unset
+  const { child, buf, port } = await ltBootFresh({ CLAUDE_BIN: fake, SP_CAPTURE: cap }, dir); // OCP_LOCAL_TOOLS unset
   try {
     assert.ok(await ltWait(() => buf.out.includes("listening on") || buf.exit != null), `server did not start: ${buf.err.slice(0,200)}`);
     await ltPost(port, { model: "sonnet", messages: [{ role: "user", content: "hi" }] });
@@ -1313,8 +1441,7 @@ ltTest("integration: boot gate REFUSES each unsafe config (multi / non-loopback 
   ];
   try {
     for (const c of cases) {
-      const port = await ltFreePort();
-      const { child, buf } = ltBoot({ OCP_LOCAL_TOOLS: "1", CLAUDE_BIN: fake, CLAUDE_PROXY_PORT: String(port), ...c.env }, dir);
+      const { child, buf } = await ltBootFresh({ OCP_LOCAL_TOOLS: "1", CLAUDE_BIN: fake, ...c.env }, dir);
       try {
         // Wait for `closed`, not `exit`: the assertion below reads buf.err, and stderr is only
         // guaranteed drained at 'close'. This is the ordering #203 was filed for.
@@ -1336,8 +1463,7 @@ ltTest("integration: boot gate REFUSES each unsafe config (multi / non-loopback 
 ltTest("integration: safe single-user config BOOTS past the gate and announces local tools", async () => {
   if (!LT_POSIX) return;
   const dir = ltMkdir(); const fake = ltFake(dir);
-  const port = await ltFreePort();
-  const { child, buf } = ltBoot({ OCP_LOCAL_TOOLS: "1", CLAUDE_BIN: fake, CLAUDE_PROXY_PORT: String(port) }, dir); // loopback + none
+  const { child, buf } = await ltBootFresh({ OCP_LOCAL_TOOLS: "1", CLAUDE_BIN: fake }, dir); // loopback + none
   try {
     // Same race as #199, one line over: "Local tools: ON" (server.mjs:3640) is written 12
     // console.log calls after "listening on" (:3627) — 10 of them in this env, since the
@@ -1367,8 +1493,7 @@ ltTest("integration: TUI mode → flag is announced INERT (not 'ON'), boot not r
   const dir = ltMkdir(); const fake = ltFake(dir);
   // Non-loopback would normally trip the local-tools gate; under TUI the flag is inert so the
   // gate must NOT fire on its behalf. Use loopback here to isolate TUI's own guards from ours.
-  const port = await ltFreePort();
-  const { child, buf } = ltBoot({ OCP_LOCAL_TOOLS: "1", CLAUDE_TUI_MODE: "true", CLAUDE_BIN: fake, CLAUDE_PROXY_PORT: String(port) }, dir);
+  const { child, buf } = await ltBootFresh({ OCP_LOCAL_TOOLS: "1", CLAUDE_TUI_MODE: "true", CLAUDE_BIN: fake }, dir);
   try {
     // Wait for the line actually under assertion, not for a proxy signal. "listening on" and the
     // inert-flag warning are written independently, so gating on the former and then asserting
@@ -1389,8 +1514,8 @@ ltTest("integration: toggling OCP_LOCAL_TOOLS invalidates the standard response 
   if (!LT_POSIX) return;
   const dir = ltMkdir(); const fake = ltFake(dir); const counter = join(dir, "spawns.txt");
   const req = { model: "sonnet", messages: [{ role: "user", content: "epoch-probe" }] };
-  const bootOnce = async (env, port) => {
-    const { child, buf } = ltBoot({ CLAUDE_BIN: fake, CLAUDE_PROXY_PORT: String(port), CLAUDE_CACHE_TTL: "60000", SP_COUNTER: counter, ...env }, dir);
+  const bootOnce = async (env) => {
+    const { child, buf, port } = await ltBootFresh({ CLAUDE_BIN: fake, CLAUDE_CACHE_TTL: "60000", SP_COUNTER: counter, ...env }, dir);
     try {
       assert.ok(await ltWait(() => buf.out.includes("listening on")), `did not start: ${buf.err.slice(0,160)}`);
       _ltWrite(counter, "0"); // reset AFTER boot so boot-time spawns (if any) don't count
@@ -1407,8 +1532,8 @@ ltTest("integration: toggling OCP_LOCAL_TOOLS invalidates the standard response 
     }
   };
   try {
-    const off = await bootOnce({}, await ltFreePort());                       // caches "OK" under epoch(negative)
-    const on = await bootOnce({ OCP_LOCAL_TOOLS: "1" }, await ltFreePort());  // same DB, epoch(positive) → must MISS → re-spawn
+    const off = await bootOnce({});                       // caches "OK" under epoch(negative)
+    const on = await bootOnce({ OCP_LOCAL_TOOLS: "1" });  // same DB, epoch(positive) → must MISS → re-spawn
     assert.equal(off, 1, "first request (cache empty) must spawn claude");
     assert.equal(on, 1, "after toggling the flag the identical request must NOT be served from the old cache (epoch differs → re-spawn)");
   } finally { _ltRmRetry(dir); }
@@ -1468,16 +1593,19 @@ ltTest("integration: a synchronous pre-spawn throw must not leak stats.activeReq
   // Hard gate: if this ever stops fitting, fail loudly rather than regress to an E2BIG skip.
   assert.ok(bytes <= LT_MAX_ARG_STRLEN,
     `env entry ${bytes}B exceeds MAX_ARG_STRLEN ${LT_MAX_ARG_STRLEN}B — lower LT_STACK`);
-  const port = await ltFreePort();
   const dir = ltMkdir(); const fake = ltFake(dir);
-  const { child, buf } = ltBoot({
-    CLAUDE_BIN: fake, CLAUDE_PROXY_PORT: String(port), CLAUDE_ALLOWED_TOOLS: entry,
+  const { child, buf, port } = await ltBootFresh({
+    CLAUDE_BIN: fake, CLAUDE_ALLOWED_TOOLS: entry,
   }, dir, [`--stack-size=${LT_STACK}`]);
-  let spawnErr = null;
-  child.on("error", e => { spawnErr = e; });
+  // Read buf.spawnErr directly rather than attaching a fresh child.on("error", ...) listener
+  // here: ltBootFresh's internal wait can already resolve on the collision-probe path before
+  // control returns to this line, and Node does not replay an 'error' event to a listener
+  // attached after it already fired. ltBoot() attaches its own listener at spawn time
+  // (test-features.mjs, inside ltBoot), so buf.spawnErr is populated promptly regardless of
+  // when this test itself gets a chance to look at it.
   try {
-    const up = await ltWait(() => buf.out.includes("listening on") || spawnErr, 20000);
-    assert.ok(up && !spawnErr, `did not start: ${spawnErr ? spawnErr.message : buf.err.slice(0, 300)}`);
+    const up = await ltWait(() => buf.out.includes("listening on") || buf.spawnErr, 20000);
+    assert.ok(up && !buf.spawnErr, `did not start: ${buf.spawnErr ? buf.spawnErr.message : buf.err.slice(0, 300)}`);
     const req = { model: "haiku", messages: [{ role: "user", content: "leak-probe" }] };
     const res = [];
     for (let i = 0; i < 3; i++) res.push(await ltPostStatus(port, req));
@@ -1521,8 +1649,7 @@ console.log("\nCache key resolves the model alias (#194):");
 ltTest("integration: an alias and its canonical target share ONE cache slot (normal path)", async () => {
   if (!LT_POSIX) return;
   const dir = ltMkdir(); const fake = ltFake(dir); const counter = join(dir, "spawns.txt");
-  const port = await ltFreePort();
-  const { child, buf } = ltBoot({ CLAUDE_BIN: fake, CLAUDE_PROXY_PORT: String(port), CLAUDE_CACHE_TTL: "60000", SP_COUNTER: counter }, dir);
+  const { child, buf, port } = await ltBootFresh({ CLAUDE_BIN: fake, CLAUDE_CACHE_TTL: "60000", SP_COUNTER: counter }, dir);
   try {
     assert.ok(await ltWait(() => buf.out.includes("listening on")), `did not start: ${buf.err.slice(0, 200)}`);
     _ltWrite(counter, "0");
@@ -1539,8 +1666,7 @@ ltTest("integration: an alias and its canonical target share ONE cache slot (nor
 ltTest("integration: an alias and its canonical target share ONE cache slot (STRUCTURED path)", async () => {
   if (!LT_POSIX) return;
   const dir = ltMkdir(); const fake = ltFakeJson(dir); const counter = join(dir, "spawns.txt");
-  const port = await ltFreePort();
-  const { child, buf } = ltBoot({ CLAUDE_BIN: fake, CLAUDE_PROXY_PORT: String(port), CLAUDE_CACHE_TTL: "60000", SP_COUNTER: counter }, dir);
+  const { child, buf, port } = await ltBootFresh({ CLAUDE_BIN: fake, CLAUDE_CACHE_TTL: "60000", SP_COUNTER: counter }, dir);
   try {
     assert.ok(await ltWait(() => buf.out.includes("listening on")), `did not start: ${buf.err.slice(0, 200)}`);
     _ltWrite(counter, "0");
@@ -1561,8 +1687,7 @@ ltTest("integration: an alias and its canonical target share ONE cache slot (STR
 ltTest("integration: a legacyAlias shares ONE cache slot with its canonical target", async () => {
   if (!LT_POSIX) return;
   const dir = ltMkdir(); const fake = ltFake(dir); const counter = join(dir, "spawns.txt");
-  const port = await ltFreePort();
-  const { child, buf } = ltBoot({ CLAUDE_BIN: fake, CLAUDE_PROXY_PORT: String(port), CLAUDE_CACHE_TTL: "60000", SP_COUNTER: counter }, dir);
+  const { child, buf, port } = await ltBootFresh({ CLAUDE_BIN: fake, CLAUDE_CACHE_TTL: "60000", SP_COUNTER: counter }, dir);
   try {
     assert.ok(await ltWait(() => buf.out.includes("listening on")), `did not start: ${buf.err.slice(0, 200)}`);
     _ltWrite(counter, "0");
@@ -1581,8 +1706,8 @@ ltTest("integration: a config change invalidates the STRUCTURED cache too (close
   const dir = ltMkdir(); const fake = ltFakeJson(dir); const counter = join(dir, "spawns.txt");
   const rf = { type: "json_schema", json_schema: { name: "probe", schema: LT_SCHEMA } };
   const req = { model: "sonnet", messages: [{ role: "user", content: "structured-epoch-probe" }], response_format: rf };
-  const bootOnce = async (env, port) => {
-    const { child, buf } = ltBoot({ CLAUDE_BIN: fake, CLAUDE_PROXY_PORT: String(port), CLAUDE_CACHE_TTL: "60000", SP_COUNTER: counter, ...env }, dir);
+  const bootOnce = async (env) => {
+    const { child, buf, port } = await ltBootFresh({ CLAUDE_BIN: fake, CLAUDE_CACHE_TTL: "60000", SP_COUNTER: counter, ...env }, dir);
     try {
       assert.ok(await ltWait(() => buf.out.includes("listening on")), `did not start: ${buf.err.slice(0, 200)}`);
       _ltWrite(counter, "0");
@@ -1599,8 +1724,8 @@ ltTest("integration: a config change invalidates the STRUCTURED cache too (close
     }
   };
   try {
-    const off = await bootOnce({}, await ltFreePort());                        // caches under epoch(negative wrapper)
-    const on = await bootOnce({ OCP_LOCAL_TOOLS: "1" }, await ltFreePort());   // same DB, epoch differs → must re-spawn
+    const off = await bootOnce({});                        // caches under epoch(negative wrapper)
+    const on = await bootOnce({ OCP_LOCAL_TOOLS: "1" });   // same DB, epoch differs → must re-spawn
     assert.equal(off, 1, "first structured request (cache empty) must spawn claude");
     assert.equal(on, 1, "structured cache must honor CONFIG_EPOCH — before #194 it omitted the epoch entirely and served the stale answer");
   } finally { _ltRmRetry(dir); }
