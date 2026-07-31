@@ -8468,6 +8468,22 @@ test("MED-F: rollback's SYSTEM-unit refusal recommends a bare (no-sudo) command 
 // four function signatures every test below depends on, slice does NOT contain the dispatch
 // case statement itself (overgrown-slice guard), and the REMOVED tail DOES contain it (confirms
 // the boundary is where this comment claims, not merely "found A/B in either order").
+//
+// Scope, stated exactly (not merely implied by what's tested): this harness's `node` stub
+// recognizes `scripts/doctor.mjs --json` (drives the kind decision) and `scripts/upgrade.mjs
+// --post-flight-only` (drives _cmd_update_restart's verification step) by pattern-matching the
+// invoking ARGV and returning a canned exit code — it never actually runs `scripts/upgrade.mjs`
+// itself. This deliberately does NOT cover #225's own N6 finding: the real argv-parsing inside
+// `scripts/upgrade.mjs`'s `_isMain()` CLI entrypoint (the `postFlightOnlyIdx = args.indexOf(...)`
+// block, `scripts/upgrade.mjs` around line 598) that decides what "--post-flight-only" even
+// means before `runPostFlightCheck`/`postFlightOk` (already covered directly, by name, elsewhere
+// in this file — see the "upgrade full path" section's imports) get called. #225 explicitly
+// flagged N6 as requiring a DECISION ("either invoke the real CLI end-to-end ... or refactor
+// scripts/upgrade.mjs to accept an injectable ocpDir/homedir() override — whoever picks this up
+// should decide which") rather than assuming either path is free. This PR's decision: defer,
+// same as PR #217's own manual pass did for the same finding — invoking the real CLI end-to-end
+// risks exactly the mutation hazard this harness's `node` stub exists to prevent, and building
+// the injectable-override refactor is its own, separable unit of work. Tracked in #241.
 console.log("\nocp bash CLI wiring (#225, #235, #236):");
 
 const _bwOcpPath = spotJoin(_spotDir, "ocp");
@@ -8590,6 +8606,15 @@ function _bwHarnessRun({
     // definition of a function name is executed LAST, so plain top-to-bottom ordering in one
     // file gives the same guarantee as "define the stub after `source`" without an actual
     // `source` call.
+    //
+    // Independent-review finding (MEDIUM-1): an earlier revision of this harness ran ONLY the
+    // sliced function-definitions region and then called `cmd_update "$@"` directly, which
+    // never executes ocp's own OUTER dispatch (the `case "$subcmd" in ... update) cmd_update
+    // "$@" ;; ...` block after `# ── dispatch`). Dropping "$@" at THAT outer arm fully
+    // reintroduces #235's bug class yet left the suite green under the direct-call design,
+    // because that design skipped the exact wiring layer #225 asks this harness to cover.
+    // Fixed by appending the REAL, unmodified dispatch section after the override and driving
+    // it via its own argv, so the outer dispatch runs for real too.
     const driver = [
       _bwFnSrc,
       "",
@@ -8602,7 +8627,7 @@ function _bwHarnessRun({
       "",
       `PROXY="http://127.0.0.1:1"`,
       "",
-      `cmd_update "$@"`,
+      _bwFullSrc.slice(_bwDispatchIdx > -1 ? _bwDispatchIdx : _bwFullSrc.length),
       "",
     ].join("\n");
     const driverPath = join(root, "driver.sh");
@@ -8618,6 +8643,9 @@ function _bwHarnessRun({
       OCP_ADMIN_KEY: "",
     };
 
+    // `args[0]` is now the top-level SUBCOMMAND, since the real dispatch runs for real (see the
+    // driver-assembly comment above) — callers below pass `["update", ...flags]`, matching a
+    // real `ocp update ...` invocation's argv shape.
     let stdout = "", stderr = "", status = 0;
     try {
       stdout = execFileSync("bash", [driverPath, ...args], { cwd: root, env, encoding: "utf8" });
@@ -8638,8 +8666,11 @@ function _bwCalled(log, prefix) {
 }
 
 // ── #235: `ocp update --dry-run` must not mutate on the patch-bump ("update" kind) path ──────
+// args[0]="update" drives this through ocp's REAL top-level dispatch (`case "$subcmd" in ...
+// update) cmd_update "$@" ;;`), not a direct call to cmd_update — see the driver-assembly
+// comment in _bwHarnessRun for why that distinction is load-bearing (MEDIUM-1 finding).
 test("#235: cmd_update kind=update --dry-run does NOT pull or restart (the money test)", () => {
-  const r = _bwHarnessRun({ kind: "update", args: ["--dry-run"] });
+  const r = _bwHarnessRun({ kind: "update", args: ["update", "--dry-run"] });
   assert.equal(r.status, 0, `expected a clean exit, got status=${r.status} stderr=${r.stderr}`);
   assert.ok(!_bwCalled(r.log, "FAKE-GIT-CALL"), `git must NOT run under --dry-run; log=${JSON.stringify(r.log)}`);
   assert.ok(!_bwCalled(r.log, "FAKE-CMD-RESTART-CALLED"), `cmd_restart must NOT run under --dry-run; log=${JSON.stringify(r.log)}`);
@@ -8647,30 +8678,42 @@ test("#235: cmd_update kind=update --dry-run does NOT pull or restart (the money
 });
 
 test("#235: cmd_update kind=update --dry-run still honors dry-run when --dry-run is NOT the first flag ('\"$@\"', not just $1)", () => {
-  const r = _bwHarnessRun({ kind: "update", args: ["--yes", "--dry-run"] });
+  const r = _bwHarnessRun({ kind: "update", args: ["update", "--yes", "--dry-run"] });
   assert.ok(!_bwCalled(r.log, "FAKE-GIT-CALL"), `git must NOT run; log=${JSON.stringify(r.log)}`);
   assert.ok(!_bwCalled(r.log, "FAKE-CMD-RESTART-CALLED"), `cmd_restart must NOT run; log=${JSON.stringify(r.log)}`);
   assert.ok(r.stdout.includes("[dry-run]"), `expected a [dry-run] line, got: ${JSON.stringify(r.stdout)}`);
 });
 
 test("#235 control: cmd_update kind=update with NO --dry-run DOES pull and restart (proves the money test above can fail)", () => {
-  const r = _bwHarnessRun({ kind: "update", args: [] });
+  const r = _bwHarnessRun({ kind: "update", args: ["update"] });
   assert.equal(r.status, 0, `expected a clean exit, got status=${r.status} stderr=${r.stderr}`);
   assert.ok(_bwCalled(r.log, "FAKE-GIT-CALL pull origin main --ff-only"), `git pull must run; log=${JSON.stringify(r.log)}`);
   assert.ok(_bwCalled(r.log, "FAKE-CMD-RESTART-CALLED"), `cmd_restart must run; log=${JSON.stringify(r.log)}`);
   assert.ok(!r.stdout.includes("[dry-run]"), `must NOT print a dry-run preview when actually mutating, got: ${JSON.stringify(r.stdout)}`);
 });
 
+test("#235 acceptance (independent-review MEDIUM-1): this money test runs through ocp's REAL outer dispatch, not a direct cmd_update call", () => {
+  // A mutation dropping "$@" at the OUTER `update) cmd_update "$@" ;;` arm (as opposed to the
+  // inner kind-dispatch arm #235 itself fixed) fully reintroduces the bug's observable
+  // behavior — git+restart fire under --dry-run because no flags ever reach cmd_update at all.
+  // Demonstrated by hand (file-backup mutation, restored + shasum-verified) in the PR
+  // description; this test is the automated guard that mutation is caught by, since it drives
+  // the real dispatch end to end rather than skipping straight to the inner function.
+  const r = _bwHarnessRun({ kind: "update", args: ["update", "--dry-run"] });
+  assert.ok(!_bwCalled(r.log, "FAKE-GIT-CALL") && !_bwCalled(r.log, "FAKE-CMD-RESTART-CALLED"),
+    `--dry-run must survive ocp's real outer dispatch and prevent mutation; log=${JSON.stringify(r.log)}`);
+});
+
 // ── Sibling non-regression: the "restart" kind's pre-existing --dry-run guard (PR #217) ──────
 test("non-regression: cmd_update kind=restart --dry-run still does not restart (pre-existing #217 guard, unaffected by #235's fix)", () => {
-  const r = _bwHarnessRun({ kind: "restart", args: ["--dry-run"] });
+  const r = _bwHarnessRun({ kind: "restart", args: ["update", "--dry-run"] });
   assert.ok(!_bwCalled(r.log, "FAKE-GIT-CALL"), `git must NOT run; log=${JSON.stringify(r.log)}`);
   assert.ok(!_bwCalled(r.log, "FAKE-CMD-RESTART-CALLED"), `cmd_restart must NOT run; log=${JSON.stringify(r.log)}`);
   assert.ok(r.stdout.includes("[dry-run]"), `expected a [dry-run] line, got: ${JSON.stringify(r.stdout)}`);
 });
 
 test("non-regression control: cmd_update kind=restart with NO --dry-run DOES restart + post-flight verify", () => {
-  const r = _bwHarnessRun({ kind: "restart", args: [] });
+  const r = _bwHarnessRun({ kind: "restart", args: ["update"] });
   assert.ok(!_bwCalled(r.log, "FAKE-GIT-CALL"), `restart kind must never touch git; log=${JSON.stringify(r.log)}`);
   assert.ok(_bwCalled(r.log, "FAKE-CMD-RESTART-CALLED"), `cmd_restart must run; log=${JSON.stringify(r.log)}`);
   assert.ok(_bwCalled(r.log, "FAKE-NODE-CALL") && r.log.some((l) => l.includes("post-flight-only")),
@@ -8679,7 +8722,7 @@ test("non-regression control: cmd_update kind=restart with NO --dry-run DOES res
 
 // ── #236: the WARN/INFO block must not kill cmd_update when python3 is absent ────────────────
 test("#236: cmd_update survives an absent python3 — no silent 127 death before the kind dispatch even runs", () => {
-  const r = _bwHarnessRun({ kind: "noop", pythonAbsent: true });
+  const r = _bwHarnessRun({ kind: "noop", args: ["update"], pythonAbsent: true });
   // Before the fix: bash's own command-not-found for the WARN/INFO block's python3 is exit 127,
   // with NOTHING printed yet (the case "$kind" in dispatch below it — the ONLY place this
   // function prints anything at that point — never runs). That exact signature is the
@@ -8696,6 +8739,7 @@ test("#236: cmd_update survives an absent python3 — no silent 127 death before
 test("#236 control: cmd_update with python3 PRESENT reaches the kind dispatch and prints WARN/INFO lines", () => {
   const r = _bwHarnessRun({
     kind: "noop",
+    args: ["update"],
     checks: [{ level: "WARN", message: "control-warn-marker" }, { level: "INFO", message: "control-info-marker" }],
   });
   assert.equal(r.status, 0, `expected a clean exit, got status=${r.status} stderr=${r.stderr}`);
