@@ -96,6 +96,24 @@ on both paths.
 | `requires "sudo systemctl restart -- <unit>"` | The port is owned by a SYSTEM unit and non-interactive sudo isn't authorized for that specific command. | Run the printed `sudo systemctl restart -- <unit>` manually, or grant it explicitly (e.g. `deploy ALL=(root) NOPASSWD: /bin/systemctl restart -- <unit>`), then re-run. |
 | `rollback only restores the launchd plist and the USER-scope systemd unit file` | `--rollback` resolved the port to a SYSTEM unit. Rollback (see `scripts/lib/snapshot.mjs`) never captured or restores that unit's OWN config, so that part of the refusal stands — but the message also names the exact commit the working tree was already rolled back to and the exact manual restart command, since on a host where that unit runs from the same working tree (common — see issue #215), the code-level rollback is otherwise complete. | Run the printed manual restart command; separately roll back the system unit's own config by hand if that also needs it. |
 
+> **Upgrading with an existing `NOPASSWD` sudoers rule — read this if you granted one before v3.27.0.**
+> The probe now sends `systemctl restart -- <unit>`; it previously sent `systemctl restart <unit>`.
+> `sudoers(5)`: *"If a Cmnd has associated command line arguments, the arguments in the Cmnd must
+> match those given by the user on the command line."* So a rule written as
+> `deploy ALL=(root) NOPASSWD: /bin/systemctl restart ocp.service` **no longer matches**, and a host
+> where the restart previously succeeded will now hit the `requires "sudo systemctl restart -- <unit>"`
+> refusal instead. Nothing is broken and nothing is started — the upgrade refuses and prints the
+> command — but it needs a one-character-class edit to the rule:
+>
+> ```
+> -deploy ALL=(root) NOPASSWD: /bin/systemctl restart ocp.service
+> +deploy ALL=(root) NOPASSWD: /bin/systemctl restart -- ocp.service
+> ```
+>
+> This affects **only argument-scoped rules**. A rule with no arguments
+> (`NOPASSWD: /bin/systemctl`) authorizes any arguments and is unaffected — so the operators who
+> scoped their grant most tightly are the ones who need the edit.
+
 If the resolved unit differs from the expected default, that's surfaced
 loudly (both on stderr and in the `restart-resolve` phase entry) rather than
 restarted silently — this is the fix for
