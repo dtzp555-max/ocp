@@ -8475,6 +8475,53 @@ test("MED-8: rollback DOES restart a matching USER unit, and issues daemon-reloa
   assert.ok(reloadIdx < restartIdx, "daemon-reload must happen BEFORE the restart, so the restored unit file is actually picked up");
 });
 
+console.log("\nRestart-unit resolution (issue #234) — rollback guard must key on UNIT IDENTITY, not scope:");
+
+// Found by a second independent review of #221, post-merge. The SYSTEM-unit refusal above
+// (MED-8) keys on `owner.kind === "system-unit"` — SCOPE, not IDENTITY. Rollback's restore step
+// (scripts/lib/snapshot.mjs's tryCopy calls / runRollback's own tryCopy calls in
+// scripts/upgrade.mjs) only ever writes `expectedUnit`'s own file — never any OTHER unit's,
+// user-scope included. A user-scope unit under a DIFFERENT name is just as untouched by the
+// restore as a system unit is, and slipped through this refusal unrefused before the #234 fix,
+// letting rollback restart config it never touched while "ocp-proxy.service"'s freshly-restored
+// file went unused — silently dropping the rollback's configuration half. See issue #234.
+
+test("#234: rollback aborts when a DIFFERENT user-scope unit owns the port than the one whose config was restored", async () => {
+  await assert.rejects(async () => {
+    await runUpgrade({
+      rollback: true, yes: true, mockExec: true,
+      mockPlatform: "linux",
+      mockSnapshots: [{ name: "upgrade-snapshot-2026-05-11T08:30:00Z", path: "/tmp/snap-x" }],
+      mockSnapshotMeta: { fromCommit: "abc1234", fromVersion: "v3.10.0", toVersion: "v3.14.0", path: "/tmp/snap-x" },
+      mockOwnerProbe: {
+        ssOutput: `LISTEN 0 511 127.0.0.1:3456 0.0.0.0:* users:(("node",pid=888736,fd=19))`,
+        cgroupContent: "0::/user.slice/user-1000.slice/user@1000.service/app.slice/custom-ocp.service\n",
+      },
+    });
+  }, /rollback aborted: the OCP port is owned by a DIFFERENT user-scope unit \("custom-ocp\.service"\), but rollback only ever restores "ocp-proxy\.service"'s own config/);
+});
+
+test("#234: the mismatched-user-unit refusal never actually restarts the wrong unit (no restart COMMAND runs, only the bookkeeping failure phase)", async () => {
+  let caught = null;
+  try {
+    await runUpgrade({
+      rollback: true, yes: true, mockExec: true,
+      mockPlatform: "linux",
+      mockSnapshots: [{ name: "upgrade-snapshot-2026-05-11T08:30:00Z", path: "/tmp/snap-x" }],
+      mockSnapshotMeta: { fromCommit: "abc1234", fromVersion: "v3.10.0", toVersion: "v3.14.0", path: "/tmp/snap-x" },
+      mockOwnerProbe: {
+        ssOutput: `LISTEN 0 511 127.0.0.1:3456 0.0.0.0:* users:(("node",pid=888736,fd=19))`,
+        cgroupContent: "0::/user.slice/user-1000.slice/user@1000.service/app.slice/custom-ocp.service\n",
+      },
+    });
+  } catch (e) {
+    caught = e;
+  }
+  assert.ok(caught, "rollback must reject on a mismatched user-scope unit");
+  assert.ok(!caught.phases.some(p => p.name === "restart" && p.cmd),
+    `no restart COMMAND may run against a unit whose config was never restored; phases=${JSON.stringify(caught.phases)}`);
+});
+
 test("MED-8: rollback on macOS does NOT run daemon-reload (systemd-only concept)", async () => {
   const result = await runUpgrade({
     rollback: true, yes: true, mockExec: true,

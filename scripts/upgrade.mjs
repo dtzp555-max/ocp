@@ -259,6 +259,34 @@ function resolveRestartPlan({ opts, port, isRollback = false, fromCommit = null 
     );
   }
 
+  // issue #234 (second independent review of #221, post-merge): the refusal above only fires for
+  // a SYSTEM-scope mismatch — it keys on `owner.kind`, i.e. SCOPE, not on unit IDENTITY. But
+  // rollback's restore step (scripts/lib/snapshot.mjs's tryCopy calls / runRollback's own tryCopy
+  // calls above) only EVER writes `expectedUnit`'s own file — never any other unit's, user-scope
+  // included. A user-scope unit under a DIFFERENT name from `expectedUnit` is exactly as untouched
+  // by the restore as a system unit is: nothing above this line has EVER written its config, and
+  // restarting it would restart whatever config was already there before the rollback started,
+  // while "${expectedUnit}"'s just-restored file sits on disk unused. That is precisely the field
+  // report in #234 — "restored: ocp-proxy.service, restarted: ocp.service" — except here the
+  // restarted unit is user-scope too, so the SYSTEM-unit check above never even sees it. Guard on
+  // IDENTITY (owner.unit !== expectedUnit) for this case, exactly as issue #234 prescribes,
+  // instead of extending the scope check to somehow cover it.
+  if (isRollback && owner.kind === "user-unit" && owner.unit !== expectedUnit) {
+    const manualCmd = `systemctl --user restart -- ${owner.unit}`;
+    throw new Error(
+      `rollback aborted: the OCP port is owned by a DIFFERENT user-scope unit ("${owner.unit}"), but ` +
+      `rollback only ever restores "${expectedUnit}"'s own config (scripts/lib/snapshot.mjs's ` +
+      `tryCopy calls / runRollback's own tryCopy calls in scripts/upgrade.mjs always target that ` +
+      `exact file, never "${owner.unit}"'s). Restarting "${owner.unit}" would not make the rollback ` +
+      `take effect: it would restart config the rollback never touched, while "${expectedUnit}"'s ` +
+      `freshly-restored file sits unused. The working tree has ALREADY been rolled back to ` +
+      `${fromCommit || "the snapshot's from-commit"} (the git-checkout phase, which ran before this ` +
+      `check) — if "${owner.unit}" runs from that same tree, only a restart is outstanding: run ` +
+      `\`${manualCmd}\` manually to pick that up, and separately reconcile "${owner.unit}"'s own ` +
+      `config against "${expectedUnit}"'s restored file by hand if they differ.`
+    );
+  }
+
   const plan = planRestart(owner, {
     expectedUnit,
     isRoot,
