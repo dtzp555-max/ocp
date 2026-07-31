@@ -560,6 +560,7 @@ Top-level files a contributor or operator may need to know:
 | `dashboard.html` | Static dashboard served from `/dashboard`. |
 | `scripts/sync-openclaw.mjs` | Idempotent OpenClaw registry sync invoked by `ocp update`. See ADR 0004. |
 | `scripts/lib/service-mode.mjs` | Pure decision layer for `setup.mjs`'s auto-start step — first install vs. `--reconfigure-only` (issue #226). |
+| `scripts/lib/install-autostart.mjs` | Injectable `installAutoStart()` — setup.mjs's auto-start install (legacy-unit migration, unit write, enable/start/bootstrap), extracted so tests can observe real run/fs calls instead of asserting on source text (issue #226). |
 | `.claude/skills/` | Project-specific Claude Code skills. |
 | `ocp-plugin/` | OpenClaw gateway plugin (optional installation). |
 | `docs/lan-mode.md` | LAN & multi-user operations manual (server/client setup, keys, quotas, anonymous access, security model). |

@@ -2,9 +2,14 @@
 // install). Extracted so the enable/start decision is unit-testable without executing
 // setup.mjs, which has top-level side effects and cannot be imported (confirmed against
 // test-features.mjs's own "setup.mjs cannot be imported (top-level side effects run the
-// installer)" comment — this is NOT documented in AGENTS.md, which only covers server.mjs's
-// testing seams; corrected here after a review caught the file citing AGENTS.md for a claim
-// it doesn't make).
+// installer)" comment — this specific claim about setup.mjs is not itself written in
+// AGENTS.md; a review caught an earlier draft of this comment wrongly attributing it there).
+// AGENTS.md DOES have a directly-relevant, general testing-discipline section — "Testing
+// discipline: what counts as a test" — but it is not the server.mjs-scoped section right
+// above it in that file; it covers ocp-connect and bash `cmd_restart` alike, and it is
+// exactly the section this module's own tests (and scripts/lib/install-autostart.mjs's) have
+// to answer to: behavioral, not textual; mutation-proven; restored from a file backup, never
+// `git checkout`.
 //
 // Issue #226: setup.mjs's Linux branch used to unconditionally run
 //   systemctl --user daemon-reload / enable ocp-proxy / start ocp-proxy

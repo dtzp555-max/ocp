@@ -1677,7 +1677,6 @@ test("upgrade full path executes 5 phases", async () => {
 // (including the --reconfigure-only argv parse itself, per resolveServicePlan) was
 // deliberately extracted out of it into something that can be.
 import { planServiceActions, resolveServicePlan } from "./scripts/lib/service-mode.mjs";
-import { readFileSync as setupSrcRead } from "node:fs";
 
 console.log("\nReconfigure-only service mode (#226):");
 
@@ -1748,56 +1747,182 @@ test("resolveServicePlan tolerates other unrelated argv alongside the bare flag"
   assert.equal(plan.reconfigureOnly, true);
 });
 
-// ── setup.mjs wiring: source-shape assertions (review finding H2 / MX2, MX3, and H1) ──────
-// setup.mjs has top-level side effects and cannot be imported or executed in this suite (see
-// module comment above). These read its actual source text and assert the SPECIFIC guard ↔
-// call pairing is present — not merely that a token like "execSync" appears somewhere, which
-// a source-level assertion the task's own conventions rightly call "not a test". Each regex
-// requires the guard condition and the gated call to be adjacent/bound in source, so a
-// mutation that strips the `if (...)` (making the call unconditional, i.e. literally
-// reintroducing #226) breaks the match. This is a deliberate, narrow exception to
-// "behavioral, not textual" made specifically because setup.mjs itself is not executable
-// here — the DECISION these guards consume (servicePlan) is fully behaviorally tested above;
-// this only confirms setup.mjs's imperative body actually consults it.
-const setupSrc = setupSrcRead(new URL("./setup.mjs", import.meta.url), "utf8");
+// ── installAutoStart: behavioral tests (review round 2 — replaces source-shape assertions) ──
+// Round 1 of this review response added source-text regex assertions here, on the premise
+// that setup.mjs's top-level side effects make it unimportable/unexecutable. The premise was
+// real; the fix was wrong. AGENTS.md's "Testing discipline: what counts as a test" section
+// (general — it covers ocp-connect and bash `cmd_restart`, NOT scoped to server.mjs the way
+// the OTHER testing section is) says exactly why: a source-text assertion "passes when the
+// code is deleted and re-added wrong, and breaks on reformatting." Both failure modes were
+// demonstrated against the actual PR: a reviewer mutation emptied the H1 gate
+// (`if (!servicePlan.reconfigureOnly) { }`) while leaving the migration code in an adjacent,
+// now-unguarded block — the landmark-bounded regex found every string it searched for
+// (co-location, not containment) and the suite stayed green. Fix: the imperative Step 7 body
+// moved into scripts/lib/install-autostart.mjs's installAutoStart(), an injectable function —
+// the same seam scripts/upgrade.mjs already uses (opts.mockExec) and doctor.mjs uses
+// (opts.mockHealth). These tests call the REAL function with fake run/fs primitives and
+// assert on which commands/files were actually touched, not on source shape.
+import { installAutoStart } from "./scripts/lib/install-autostart.mjs";
 
-test("setup.mjs actually calls resolveServicePlan(args, platform) — not a disconnected/hardcoded value", () => {
-  // Anchored to the actual assignment statement, not a bare call expression — a prose comment
-  // elsewhere in the file legitimately contains the substring "resolveServicePlan(args,
-  // platform)" too, and matching only the call expression would pass vacuously against that
-  // comment even if the REAL call were mutated to e.g. resolveServicePlan([], platform).
-  assert.ok(/const\s+servicePlan\s*=\s*resolveServicePlan\(args,\s*platform\);/.test(setupSrc),
-    "setup.mjs must assign `const servicePlan = resolveServicePlan(args, platform);` to wire the flag to behavior");
+function baseInstallOpts(overrides = {}) {
+  return {
+    platform: "linux",
+    servicePlan: resolveServicePlan([], "linux"),
+    paths: {
+      HOME: "/fake/home",
+      OPENCLAW_DIR: "/fake/home/.openclaw",
+      serverPath: "/fake/repo/server.mjs",
+      startPath: "/fake/repo/start.sh",
+    },
+    config: {
+      PORT: 3456, BIND_ADDRESS: "127.0.0.1", AUTH_MODE_CONFIG: "none",
+      CLAUDE_BIN_INJECT: null, OCP_ADMIN_KEY_INJECT: null, PROXY_ANON_KEY_INJECT: null,
+    },
+    run: () => "",
+    writeFile: () => {},
+    readFile: () => "",
+    existsPath: () => false,
+    makeDir: () => {},
+    chmodPath: () => {},
+    unlinkPath: () => {},
+    log: () => {},
+    warn: () => {},
+    print: () => {},
+    ...overrides,
+  };
+}
+
+console.log("\ninstallAutoStart (behavioral, review round 2):");
+
+test("installAutoStart(linux, reconfigureOnly): run gets daemon-reload but never enable or start", () => {
+  const calls = [];
+  installAutoStart(baseInstallOpts({
+    servicePlan: resolveServicePlan(["--reconfigure-only"], "linux"),
+    run: (cmd) => { calls.push(cmd); return ""; },
+  }));
+  assert.ok(calls.some(c => c.includes("daemon-reload")), `expected a daemon-reload call; got ${JSON.stringify(calls)}`);
+  assert.ok(!calls.some(c => c.includes("enable ocp-proxy")), `enable must never run under --reconfigure-only; calls=${JSON.stringify(calls)}`);
+  assert.ok(!calls.some(c => c.includes("start ocp-proxy")), `start must never run under --reconfigure-only; calls=${JSON.stringify(calls)}`);
 });
 
-test("setup.mjs's systemd `enable` call is guarded by servicePlan.enable", () => {
-  assert.ok(/if\s*\(servicePlan\.enable\)\s*execSync\(`systemctl --user enable ocp-proxy`\);/.test(setupSrc),
-    "the `systemctl --user enable ocp-proxy` call must be gated on servicePlan.enable");
+test("installAutoStart(linux, first install): run gets daemon-reload, enable, AND start (positive-path control)", () => {
+  const calls = [];
+  installAutoStart(baseInstallOpts({
+    servicePlan: resolveServicePlan([], "linux"),
+    run: (cmd) => { calls.push(cmd); return ""; },
+  }));
+  assert.ok(calls.some(c => c.includes("daemon-reload")));
+  assert.ok(calls.some(c => c.includes("enable ocp-proxy")), `expected enable on a first install; calls=${JSON.stringify(calls)}`);
+  assert.ok(calls.some(c => c.includes("start ocp-proxy")), `expected start on a first install; calls=${JSON.stringify(calls)}`);
 });
 
-test("setup.mjs's systemd `start` call is guarded by servicePlan.start", () => {
-  assert.ok(/if\s*\(servicePlan\.start\)\s*execSync\(`systemctl --user start ocp-proxy`\);/.test(setupSrc),
-    "the `systemctl --user start ocp-proxy` call must be gated on servicePlan.start");
+test("installAutoStart(darwin, reconfigureOnly): run never receives bootstrap or bootout for the new plist", () => {
+  const calls = [];
+  installAutoStart(baseInstallOpts({
+    platform: "darwin",
+    servicePlan: resolveServicePlan(["--reconfigure-only"], "darwin"),
+    run: (cmd) => { calls.push(cmd); return ""; },
+  }));
+  assert.ok(!calls.some(c => c.includes("bootstrap")), `bootstrap must never run under --reconfigure-only; calls=${JSON.stringify(calls)}`);
+  assert.ok(!calls.some(c => c.includes("bootout")), `bootout for the new plist must never run under --reconfigure-only; calls=${JSON.stringify(calls)}`);
 });
 
-test("setup.mjs's launchctl bootstrap block is guarded by servicePlan.bootstrap", () => {
-  const m = setupSrc.match(/if\s*\(servicePlan\.bootstrap\)\s*\{([\s\S]*?)\}\s*else\s*\{/);
-  assert.ok(m, "expected an `if (servicePlan.bootstrap) { ... } else {` block");
-  assert.ok(m[1].includes("launchctl bootstrap gui"),
-    "the launchctl bootstrap call must be inside the servicePlan.bootstrap-guarded block");
+test("installAutoStart(darwin, first install): run gets bootout then bootstrap (positive-path control)", () => {
+  const calls = [];
+  installAutoStart(baseInstallOpts({
+    platform: "darwin",
+    servicePlan: resolveServicePlan([], "darwin"),
+    run: (cmd) => { calls.push(cmd); return ""; },
+  }));
+  assert.ok(calls.some(c => c.includes("bootout")), `expected bootout on a first install; calls=${JSON.stringify(calls)}`);
+  assert.ok(calls.some(c => c.includes("bootstrap")), `expected bootstrap on a first install; calls=${JSON.stringify(calls)}`);
 });
 
-test("setup.mjs's legacy-unit migration is gated on !servicePlan.reconfigureOnly (review finding H1)", () => {
-  // Landmark-bounded slice: from the "Uninstall legacy service names" comment up to the start
-  // of the main plist-write block ("// macOS: launchd") — the region that must be entirely
-  // inside the !reconfigureOnly gate.
-  const region = setupSrc.match(/Uninstall legacy service names[\s\S]*?\/\/ macOS: launchd/);
-  assert.ok(region, "legacy-migration region landmark not found in setup.mjs");
-  const block = region[0];
-  assert.ok(/if\s*\(!servicePlan\.reconfigureOnly\)\s*\{/.test(block),
-    "legacy-unit migration must be wrapped in `if (!servicePlan.reconfigureOnly) { ... }`");
-  assert.ok(block.includes("ai.openclaw.proxy.plist"), "darwin legacy-plist removal must be inside the gated region");
-  assert.ok(block.includes("openclaw-proxy.service"), "linux legacy-service removal must be inside the gated region");
+// ── H1, proven behaviorally: legacy-unit migration must not run under --reconfigure-only ──
+// This is the exact scenario the review's "empty gate" mutation targeted: a host with a
+// legacy plist/service present, running --reconfigure-only. Unlike the deleted source
+// assertion, this calls the real installAutoStart() and observes real (faked) run/unlink
+// calls — a mutation that empties the gate, or moves the migration code outside it, makes
+// these calls actually happen, which these tests actually catch.
+test("installAutoStart(darwin, reconfigureOnly, legacy plist present): legacy bootout/unlink never happen (H1)", () => {
+  const legacyPath = "/fake/home/Library/LaunchAgents/ai.openclaw.proxy.plist";
+  const calls = [];
+  const unlinked = [];
+  installAutoStart(baseInstallOpts({
+    platform: "darwin",
+    servicePlan: resolveServicePlan(["--reconfigure-only"], "darwin"),
+    existsPath: (p) => p === legacyPath, // only the legacy plist "exists"; the new one is a fresh write
+    run: (cmd) => { calls.push(cmd); return ""; },
+    unlinkPath: (p) => { unlinked.push(p); },
+  }));
+  assert.ok(!calls.some(c => c.includes("ai.openclaw.proxy")), `legacy bootout must never run under --reconfigure-only; calls=${JSON.stringify(calls)}`);
+  assert.ok(!unlinked.includes(legacyPath), `legacy plist must never be unlinked under --reconfigure-only; unlinked=${JSON.stringify(unlinked)}`);
+});
+
+test("installAutoStart(darwin, first install, legacy plist present): legacy IS migrated away (positive-path control)", () => {
+  const legacyPath = "/fake/home/Library/LaunchAgents/ai.openclaw.proxy.plist";
+  const calls = [];
+  const unlinked = [];
+  installAutoStart(baseInstallOpts({
+    platform: "darwin",
+    servicePlan: resolveServicePlan([], "darwin"),
+    existsPath: (p) => p === legacyPath,
+    run: (cmd) => { calls.push(cmd); return ""; },
+    unlinkPath: (p) => { unlinked.push(p); },
+  }));
+  assert.ok(calls.some(c => c.includes("ai.openclaw.proxy")), "legacy bootout must run on a bare install with a legacy plist present");
+  assert.ok(unlinked.includes(legacyPath), "legacy plist must be unlinked on a bare install");
+});
+
+test("installAutoStart(linux, reconfigureOnly, legacy service present): stop/disable/unlink never happen; daemon-reload runs exactly once (H1)", () => {
+  const legacyPath = "/fake/home/.config/systemd/user/openclaw-proxy.service";
+  const calls = [];
+  const unlinked = [];
+  installAutoStart(baseInstallOpts({
+    platform: "linux",
+    servicePlan: resolveServicePlan(["--reconfigure-only"], "linux"),
+    existsPath: (p) => p === legacyPath,
+    run: (cmd) => { calls.push(cmd); return ""; },
+    unlinkPath: (p) => { unlinked.push(p); },
+  }));
+  assert.ok(!calls.some(c => c.includes("stop openclaw-proxy")), `legacy stop must never run under --reconfigure-only; calls=${JSON.stringify(calls)}`);
+  assert.ok(!calls.some(c => c.includes("disable openclaw-proxy")), `legacy disable must never run under --reconfigure-only; calls=${JSON.stringify(calls)}`);
+  assert.ok(!unlinked.includes(legacyPath), `legacy service file must never be unlinked under --reconfigure-only; unlinked=${JSON.stringify(unlinked)}`);
+  const daemonReloadCount = calls.filter(c => c.includes("daemon-reload")).length;
+  assert.equal(daemonReloadCount, 1,
+    `expected exactly one daemon-reload (main write path only, not a second one from legacy migration) — got ${daemonReloadCount}: ${JSON.stringify(calls)}`);
+});
+
+test("installAutoStart(linux, first install, legacy service present): stop/disable/unlink DO happen (positive-path control)", () => {
+  const legacyPath = "/fake/home/.config/systemd/user/openclaw-proxy.service";
+  const calls = [];
+  const unlinked = [];
+  installAutoStart(baseInstallOpts({
+    platform: "linux",
+    servicePlan: resolveServicePlan([], "linux"),
+    existsPath: (p) => p === legacyPath,
+    run: (cmd) => { calls.push(cmd); return ""; },
+    unlinkPath: (p) => { unlinked.push(p); },
+  }));
+  assert.ok(calls.some(c => c.includes("stop openclaw-proxy")), "legacy stop must run on a bare install with a legacy service present");
+  assert.ok(calls.some(c => c.includes("disable openclaw-proxy")), "legacy disable must run on a bare install with a legacy service present");
+  assert.ok(unlinked.includes(legacyPath), "legacy service file must be unlinked on a bare install");
+});
+
+test("installAutoStart(unsupported platform): no run/write/unlink calls at all, regardless of reconfigureOnly", () => {
+  const calls = [];
+  const unlinked = [];
+  const written = [];
+  installAutoStart(baseInstallOpts({
+    platform: "win32",
+    servicePlan: resolveServicePlan(["--reconfigure-only"], "win32"),
+    run: (cmd) => { calls.push(cmd); return ""; },
+    unlinkPath: (p) => { unlinked.push(p); },
+    writeFile: (p) => { written.push(p); },
+  }));
+  assert.equal(calls.length, 0);
+  assert.equal(unlinked.length, 0);
+  assert.equal(written.length, 0);
 });
 
 test("upgrade full path's reconfigure phase invokes setup.mjs with --reconfigure-only", async () => {
