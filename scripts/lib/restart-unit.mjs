@@ -114,13 +114,42 @@
  * already uses — never treated as "confirmed foreign" (a false-confident answer) nor silently
  * skipped (which would defeat the point of the check).
  *
- * Deliberately NOT covered by this fix (same "minimum reviewable unit" posture as defect 2 in the
- * THIRD review above): macOS. `/proc/<pid>/cmdline` doesn't exist there, and the darwin branch
- * below still returns `kind: "launchd"` for any confirmed listener without identifying the actual
- * process at all. That gap was originally reported as issue #233 defect 2; #233 itself is now
- * CLOSED (split per Iron Rule 11 into its own dedicated review) and the live tracker for this
- * specific work is issue #239 — extending identity verification to macOS is #239's job, not this
- * one's.
+ * At the time #237 landed, macOS was deliberately NOT covered (same "minimum reviewable unit"
+ * posture as defect 2 in the THIRD review above): `/proc/<pid>/cmdline` doesn't exist there, and
+ * the darwin branch used to return `kind: "launchd"` for any confirmed listener without
+ * identifying the actual process at all. That gap was originally reported as issue #233 defect 2;
+ * #233 itself was CLOSED (split per Iron Rule 11 into its own dedicated review) and tracked
+ * onward as issue #239.
+ *
+ * issue #239 (this fix): extends identity verification to macOS. The core asymmetry Linux and
+ * macOS have to work around is structural, not incidental — Linux has a pid -> cgroup -> unit-name
+ * REVERSE lookup (`/proc/<pid>/cgroup`), so resolution walks from "here's the pid holding the
+ * port" to "here's what unit that is". launchd has no equivalent (there is no
+ * `/proc/<pid>/launchd-label` file), so resolution has to run the OTHER direction: ask launchd
+ * what pid it believes owns the ONE label this repo manages (`dev.ocp.proxy`, hardcoded — there's
+ * no multi-label ambiguity to resolve the way Linux has system-vs-user scope) via `launchctl print
+ * gui/<uid>/dev.ocp.proxy`, and compare that pid against the pid `lsof`/`netstat` found actually
+ * holding the port. A mismatch — or the label not being registered, or registered but not
+ * currently running — means the port's holder is not verified to be `dev.ocp.proxy`: the macOS
+ * analogue of Linux's `no-unit`, via the same terminal `kind` (not a fourth, platform-only state).
+ *
+ * `classifyLaunchdJob` does that pid-and-argv extraction (verified live against the production
+ * host — see its own comment for the exact `launchctl print` output shapes, both registered and
+ * "Could not find service"). `classifyLaunchdArgv` then applies the SAME "does this argv invoke
+ * server.mjs" predicate `classifyCmdlineOwner` uses on Linux (factored out as `findServerMjsArg`
+ * below and called by both) to the job's own argv — mirroring #237's identity check, not
+ * reinventing a third notion of "is this OCP": a hand-edited or compromised plist could register
+ * the SAME label against a different program, and pid-matching alone would not catch that. A
+ * confirmed pid match whose argv does NOT invoke server.mjs resolves to the same `foreign-process`
+ * kind #237 introduced for Linux, reusing that terminal state and its refusal in `planRestart`
+ * rather than adding a platform-specific twin.
+ *
+ * `probe.launchdPrintOutput === undefined` (as opposed to `null`) means the caller never attempted
+ * this probe — same legacy/back-compat convention `probe.cmdlineContent` uses on the Linux side:
+ * skip the check, preserve pre-#239 behavior, rather than newly refuse restarts that were "safe"
+ * before this field existed. `planRestart`'s `no-unit` and `foreign-process` refusal messages are
+ * platform-branched (`owner.platform === "darwin"`) since the Linux wording names `systemd`,
+ * `/proc/<pid>/cgroup`, and `/proc/<pid>/cmdline` — none of which exist on macOS.
  */
 
 // Anything accepted as a restart target must look like a real systemd unit name.
@@ -194,6 +223,16 @@ export function classifySsListener(ssOutput) {
     state: "unknown", pid: null,
     reason: `${pids.size} distinct PIDs (${[...pids].sort().join(", ")}) are listening on this port (dual-stack / SO_REUSEPORT) — cannot determine which one to restart`,
   };
+}
+
+// Shared identity predicate (issue #239): does this argv actually invoke server.mjs? Used by
+// BOTH platforms' "is this OCP" checks — classifyCmdlineOwner below (Linux, argv sourced from
+// /proc/<pid>/cmdline, NUL-separated) and classifyLaunchdArgv further down (macOS, argv sourced
+// from `launchctl print`'s "arguments = { ... }" block, one token per line) — so "what counts as
+// OCP" cannot silently drift into two different definitions across platforms. Mirrors
+// scripts/doctor.mjs's own #230 fingerprintSystemdUnit / parsePlistCandidates serverArg check.
+function findServerMjsArg(argv) {
+  return argv.find(a => a === "server.mjs" || a.endsWith("/server.mjs"));
 }
 
 // --- macOS: classify `lsof -nP -iTCP:<port> -sTCP:LISTEN` output --- (same three states as ss)
@@ -337,6 +376,72 @@ export function parseCgroupUnit(cgroupContent) {
   return { state: "no-unit", scope: null, unit: null, reason: "no cgroup line yielded a recognizable systemd unit" };
 }
 
+// --- macOS: classify `launchctl print gui/<uid>/dev.ocp.proxy` output --- (issue #239)
+//
+// Linux has a pid -> cgroup -> unit-name REVERSE lookup (/proc/<pid>/cgroup), so parseCgroupUnit
+// above walks from "here's the pid holding the port" to "here's what unit that is". macOS/launchd
+// has no equivalent (there is no /proc/<pid>/launchd-label file), and this repo manages exactly
+// ONE label (dev.ocp.proxy, hardcoded — no multi-label ambiguity to resolve the way Linux has
+// system-vs-user scope), so this runs the OTHER direction: ask launchd what pid IT believes owns
+// the label, for resolveOwningUnit to compare against the pid lsof/netstat found actually holding
+// the port.
+//
+// Verified live against the production host (read-only `launchctl print`, never mutated):
+//   registered + running:  exit 0, a "pid = <N>" line, and an "arguments = { ... }" block with one
+//                          argv token per line (no shell-splitting ambiguity — the same guarantee
+//                          NUL-separation gives /proc/<pid>/cmdline on Linux, via a different
+//                          mechanism: launchctl's own line-per-token rendering). Example, captured
+//                          live against the real dev.ocp.proxy job on this host:
+//                            pid = 55416
+//                            arguments = {
+//                                /opt/homebrew/Cellar/node/26.5.0/bin/node
+//                                /Users/taodeng/ocp/server.mjs
+//                            }
+//   label not registered:  nonzero exit (113 observed on this host — Apple does not document
+//                          launchctl's exit codes, so this is NOT asserted on anywhere in this
+//                          codebase, matching this file's standing posture of trusting the MESSAGE
+//                          over an undocumented exit code), EMPTY stdout, stderr:
+//                            Bad request.
+//                            Could not find service "<label>" in domain for user gui: <uid>
+//                          — the gather layer (scripts/upgrade.mjs's
+//                          mapLaunchctlPrintFailureToProbeValue) turns that SPECIFIC, expected
+//                          failure into "" (this function's own not-registered sentinel), matching
+//                          the same "the tool ran and told us something meaningful, but execSync
+//                          still threw on the nonzero exit" shape lsof's own "nothing matched"
+//                          case already has (defect 1 / PR #240).
+//
+// Returns one of four states — same "unknown must never be treated as safe-to-guess" posture as
+// every other classifier in this file:
+//   "unknown"          printOutput === null — the probe didn't run, or failed some way OTHER than
+//                      the specific "not registered" signature above
+//   "not-registered"   printOutput is a non-null string that trims to empty — the gather layer's
+//                      sentinel for launchctl's "Could not find service" failure
+//   "not-running"      printOutput is non-empty but no "pid = <N>" line was found — the label IS
+//                      registered but has no live process right now (e.g. a mid-restart window);
+//                      NOT proof the port's current holder is this job
+//   "running"          a "pid = <N>" line was found; pid and argv (parsed from the
+//                      "arguments = { ... }" block) are both returned for the caller to verify
+//                      against the actual port-holding pid and against server.mjs identity
+export function classifyLaunchdJob(printOutput) {
+  if (printOutput == null) {
+    return {
+      state: "unknown", pid: null, argv: null,
+      reason: "launchctl print did not run (missing tool, probe failed, or a failure other than \"not registered\")",
+    };
+  }
+  const text = String(printOutput);
+  if (!text.trim()) {
+    return { state: "not-registered", pid: null, argv: null, reason: null };
+  }
+  const pidMatch = text.match(/^\s*pid\s*=\s*(\d+)\s*$/m);
+  if (!pidMatch) {
+    return { state: "not-running", pid: null, argv: null, reason: null };
+  }
+  const argsBlock = text.match(/\barguments\s*=\s*\{([^}]*)\}/);
+  const argv = argsBlock ? argsBlock[1].split("\n").map(s => s.trim()).filter(Boolean) : [];
+  return { state: "running", pid: pidMatch[1], argv, reason: null };
+}
+
 // --- Linux: classify /proc/<pid>/cmdline content as OCP's own server.mjs, or a foreign process ---
 // (issue #237)
 //
@@ -372,11 +477,38 @@ export function classifyCmdlineOwner(cmdlineContent) {
   if (argv.length === 0) {
     return { state: "unknown", reason: "empty /proc/<pid>/cmdline read" };
   }
-  const serverArg = argv.find(a => a === "server.mjs" || a.endsWith("/server.mjs"));
+  const serverArg = findServerMjsArg(argv);
   if (!serverArg) {
     return {
       state: "foreign",
       reason: `owning process's argv (${argv.join(" ")}) does not invoke server.mjs at all — this is not an OCP process`,
+    };
+  }
+  return { state: "ocp", reason: null };
+}
+
+// --- macOS: classify a launchd job's argv as OCP's own server.mjs, or a foreign process ---
+// (issue #239, mirroring classifyCmdlineOwner's #237 check)
+//
+// classifyLaunchdJob (above) answers "is a process running under the dev.ocp.proxy label, and
+// what pid/argv does launchd say it has" — it does NOT answer "does that argv actually invoke
+// server.mjs". A hand-edited or compromised plist could register the SAME label against a
+// DIFFERENT program; nothing about classifyLaunchdJob's own contract catches that — the same gap
+// classifyCmdlineOwner exists to close for a real-but-foreign systemd unit name (#237). Takes the
+// pre-parsed argv classifyLaunchdJob already extracted from the "arguments = { ... }" block (one
+// token per line — no separate probe or parse pass) and applies the EXACT SAME "does this argv
+// invoke server.mjs" predicate classifyCmdlineOwner uses on Linux (findServerMjsArg, this file's
+// top) — deliberately reusing that function rather than reimplementing the check, so "what counts
+// as OCP" cannot drift into a third definition across platforms.
+//
+// Returns the same two terminal states classifyCmdlineOwner uses: "ocp" / "foreign".
+export function classifyLaunchdArgv(argv) {
+  const list = Array.isArray(argv) ? argv : [];
+  const serverArg = findServerMjsArg(list);
+  if (!serverArg) {
+    return {
+      state: "foreign",
+      reason: `owning process's argv (${list.join(" ")}) does not invoke server.mjs at all — this is not an OCP process`,
     };
   }
   return { state: "ocp", reason: null };
@@ -414,16 +546,35 @@ export function classifyCmdlineOwner(cmdlineContent) {
  *                                  undefined — "undefined" only arises from a caller (or test)
  *                                  that hasn't been wired to this check, and must not newly
  *                                  refuse restarts that were safe before this field existed.
+ *   launchdPrintOutput  raw `launchctl print gui/<uid>/<expectedUnit>` stdout for the ONE label
+ *                   this repo manages (macOS only; issue #239). Same three-state convention as
+ *                   cmdlineContent above:
+ *                     a string     classified via classifyLaunchdJob (then, if "running",
+ *                                  classifyLaunchdArgv against its argv)
+ *                     null         the probe was ATTEMPTED and failed some way other than the
+ *                                  specific "not registered" signature — treated as "unknown"
+ *                     undefined    the caller never attempted this probe at all — the check is
+ *                                  SKIPPED entirely, preserving pre-#239 behavior. Legacy/
+ *                                  back-compat lane, same convention as cmdlineContent's: real
+ *                                  production use (scripts/upgrade.mjs's gather layer) always
+ *                                  populates this field one way or another; "undefined" only
+ *                                  arises from a caller (or test) not yet wired to this check.
  *
  * Returns { kind, platform, pid, unit, scope?, mismatched, reason? }, kind one of:
  *   "system-unit"      Linux, port owned by a system-scope systemd unit
  *   "user-unit"        Linux, port owned by a user-scope systemd unit
- *   "launchd"          macOS, port is held by a process (launchd is the only
- *                      restart mechanism this repo drives on macOS)
- *   "no-unit"          Linux, a PID holds the port but isn't in any systemd unit
- *                      (a bare `node server.mjs`, most likely)
- *   "foreign-process"  Linux, a real systemd unit owns the port but its process is CONFIRMED not
- *                      to be OCP's server.mjs (issue #237 — e.g. nginx.service)
+ *   "launchd"          macOS, port is held by a process CONFIRMED to be the dev.ocp.proxy launchd
+ *                      job (issue #239 — pid match against launchd's own bookkeeping, plus an
+ *                      argv check; see classifyLaunchdJob/classifyLaunchdArgv)
+ *   "no-unit"          a PID holds the port but isn't verified to be managed by any (systemd
+ *                      unit | the dev.ocp.proxy launchd job) — a bare `node server.mjs`, most
+ *                      likely, but on macOS also covers "label not registered", "label registered
+ *                      but not running", and "label running under a DIFFERENT pid than the one
+ *                      holding the port" — all collapse to this same terminal state rather than
+ *                      each getting its own platform-only kind
+ *   "foreign-process"  a real unit/job owns the port but its process is CONFIRMED not to be OCP's
+ *                      server.mjs (issue #237 on Linux — e.g. nginx.service; issue #239 on macOS —
+ *                      a launchd label whose registered argv doesn't invoke server.mjs)
  *   "not-listening"    the tool ran cleanly and found nothing bound to the port
  *   "unknown"          could not determine ownership (see `reason`) — must never
  *                       be treated as equivalent to "not-listening"
@@ -443,6 +594,41 @@ export function resolveOwningUnit(probe = {}) {
     if (listener.state === "not-listening") {
       return { kind: "not-listening", platform, pid: null, unit: null, mismatched: false };
     }
+
+    // issue #239: a confirmed listener is not proof it's dev.ocp.proxy — ask launchd what pid it
+    // believes owns the ONE label this repo manages and compare against the pid actually holding
+    // the port. probe.launchdPrintOutput === undefined means the caller never attempted this
+    // probe at all — same legacy/back-compat convention as probe.cmdlineContent on the Linux side
+    // (issue #237): skip the check, preserve pre-#239 behavior, instead of newly refusing
+    // restarts that were "safe" before this field existed.
+    if (probe.launchdPrintOutput === undefined) {
+      return { kind: "launchd", platform, pid: listener.pid, unit: expectedUnit || "dev.ocp.proxy", mismatched: false };
+    }
+    const job = classifyLaunchdJob(probe.launchdPrintOutput);
+    if (job.state === "unknown") {
+      return { kind: "unknown", platform, pid: listener.pid, unit: null, mismatched: false, reason: job.reason };
+    }
+    if (job.state !== "running" || String(job.pid) !== String(listener.pid)) {
+      // Not registered, registered-but-not-running, or registered with a DIFFERENT live pid — in
+      // every case the process holding the port is not verified to be dev.ocp.proxy. Collapses to
+      // the same "no-unit" terminal state Linux uses for "a pid holds the port but isn't in any
+      // (verified) unit" — deliberately not a fourth, macOS-only kind.
+      return { kind: "no-unit", platform, pid: listener.pid, unit: null, mismatched: false };
+    }
+
+    // issue #239 (mirroring #237): the label being registered and its pid matching the port's
+    // holder is still not proof that process actually runs server.mjs — a hand-edited or
+    // compromised plist could register the SAME label to launch a different program. Check the
+    // job's own argv (from the SAME `launchctl print` call above — no separate probe) exactly
+    // like classifyCmdlineOwner does for the Linux cgroup-resolved unit.
+    const argvResult = classifyLaunchdArgv(job.argv);
+    if (argvResult.state === "foreign") {
+      return {
+        kind: "foreign-process", platform, pid: listener.pid, unit: expectedUnit || "dev.ocp.proxy", mismatched: false,
+        reason: `"${expectedUnit || "dev.ocp.proxy"}" (launchd, pid ${job.pid}) owns the OCP port, but its process is not OCP's server.mjs — ${argvResult.reason}`,
+      };
+    }
+
     return { kind: "launchd", platform, pid: listener.pid, unit: expectedUnit || "dev.ocp.proxy", mismatched: false };
   }
 
@@ -550,8 +736,9 @@ export function planRestart(owner, opts = {}) {
   if (owner.kind === "unknown") {
     throw new Error(
       `restart aborted: could not determine what (if anything) owns the OCP port — ${owner.reason}. ` +
-      `Verify manually (\`ss -lptn\` / \`lsof -iTCP\` / \`cat /proc/<pid>/cgroup\`, with elevated ` +
-      `privileges if needed) before retrying. Guessing here is exactly issue #215's failure mode.`
+      `Verify manually (\`ss -lptn\` / \`lsof -iTCP\` / \`cat /proc/<pid>/cgroup\` on Linux, ` +
+      `\`launchctl print gui/$(id -u)/${opts.expectedUnit}\` on macOS, with elevated privileges if ` +
+      `needed) before retrying. Guessing here is exactly issue #215's failure mode.`
     );
   }
 
@@ -597,6 +784,22 @@ export function planRestart(owner, opts = {}) {
   }
 
   if (owner.kind === "no-unit") {
+    // issue #239: on macOS this state ALSO covers "label not registered", "label registered but
+    // not running", and "label running under a different pid than the port's holder" (all
+    // collapsed into the same terminal kind by resolveOwningUnit's darwin branch) — the Linux
+    // wording below names "systemd" and recommends a "/proc/<pid>/cgroup"-shaped remedy, neither
+    // of which exists on macOS, so the message is platform-branched rather than reused verbatim.
+    if (owner.platform === "darwin") {
+      throw new Error(
+        `restart aborted: PID ${owner.pid} holds the OCP port but is not confirmed to be managed ` +
+        `by the "${opts.expectedUnit}" launchd job (issue #239 — a confirmed listener alone is not ` +
+        `proof it's ours; launchd's own bookkeeping for that label either doesn't show it running, ` +
+        `or shows a DIFFERENT pid than the one actually holding the port). Restarting ` +
+        `"${opts.expectedUnit}" here would spawn a second, orphaned process that cannot bind the ` +
+        `port — exactly issue #215. Stop PID ${owner.pid} manually (or bring it under launchd as ` +
+        `"${opts.expectedUnit}") and re-run the upgrade.`
+      );
+    }
     throw new Error(
       `restart aborted: PID ${owner.pid} holds the OCP port but is not managed by any systemd unit ` +
       `(a bare "node server.mjs"?). Restarting "${opts.expectedUnit}" here would spawn a second, ` +
@@ -605,25 +808,32 @@ export function planRestart(owner, opts = {}) {
     );
   }
 
-  // issue #237: a real, well-formed systemd unit is not proof it's OCP's own. Unlike
-  // `mismatched` (a NAME comparison against the hard-coded expectedUnit, which only ever warns —
-  // see the warnings.push at the top of this function), this is a POSITIVE confirmation from the
-  // owning process's own /proc/<pid>/cmdline that it is definitely not server.mjs. This is the
-  // safety inverse of #215: #215 restarted the wrong thing because the resolver guessed at an
-  // identity it had no basis for; this restarts the wrong thing because the resolver correctly
-  // identifies a real unit that simply isn't ours — bouncing an unrelated production service
-  // (nginx.service, say) is outside OCP's legitimate blast radius regardless of root/sudo
-  // authorization, so this refuses unconditionally, before any of the system-unit/user-unit
-  // machinery below ever runs.
+  // issue #237 (Linux) / issue #239 (macOS): a real, well-formed unit/job name is not proof it's
+  // OCP's own. Unlike `mismatched` (a NAME comparison against the hard-coded expectedUnit, which
+  // only ever warns — see the warnings.push at the top of this function), this is a POSITIVE
+  // confirmation from the owning process's own argv (read from /proc/<pid>/cmdline on Linux, from
+  // `launchctl print`'s "arguments = { ... }" block on macOS — see classifyCmdlineOwner /
+  // classifyLaunchdArgv) that it is definitely not server.mjs. This is the safety inverse of #215:
+  // #215 restarted the wrong thing because the resolver guessed at an identity it had no basis
+  // for; this restarts the wrong thing because the resolver correctly identifies a real unit/job
+  // that simply isn't ours — bouncing an unrelated production service (nginx.service, or a
+  // relabeled non-OCP launchd job) is outside OCP's legitimate blast radius regardless of
+  // root/sudo authorization, so this refuses unconditionally, before any of the
+  // system-unit/user-unit/launchd machinery below ever runs.
   if (owner.kind === "foreign-process") {
-    // owner.reason (built by resolveOwningUnit) already names the unit, its scope, and the
-    // cmdline evidence — no need to re-preface it with another "the OCP port is owned by X" here.
+    // owner.reason (built by resolveOwningUnit) already names the unit/job, its scope, and the
+    // argv evidence — no need to re-preface it with another "the OCP port is owned by X" here.
+    // The verification commands are platform-branched: /proc/<pid>/cmdline and `ss` don't exist
+    // on macOS, and lsof/launchctl don't exist on Linux.
+    const verifyCmd = owner.platform === "darwin"
+      ? `\`lsof -nP -iTCP:<port> -sTCP:LISTEN\` / \`launchctl print gui/$(id -u)/${opts.expectedUnit}\``
+      : `\`ss -lptn\` / \`cat /proc/${owner.pid}/cmdline\``;
     throw new Error(
       `restart aborted: ${owner.reason}. Restarting an unrelated service this tooling does not ` +
       `manage is outside OCP's legitimate blast radius — refusing rather than repeating issue ` +
-      `#215's failure mode in the opposite direction (see issue #237). Verify what's actually ` +
-      `bound to this port (\`ss -lptn\` / \`cat /proc/${owner.pid}/cmdline\`) and either free the ` +
-      `port for OCP or point CLAUDE_PROXY_PORT elsewhere.`
+      `#215's failure mode in the opposite direction (see issue #237 / #239). Verify what's ` +
+      `actually bound to this port (${verifyCmd}) and either free the port for OCP or point ` +
+      `CLAUDE_PROXY_PORT elsewhere.`
     );
   }
 

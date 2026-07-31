@@ -8182,7 +8182,7 @@ test("LOW-2 (real shell, verified mechanism): ocp's doctor-check-surfacing block
 // and asserts on return values or thrown messages — never on scripts/
 // upgrade.mjs's or scripts/lib/restart-unit.mjs's source text.
 // ═══════════════════════════════════════════════════════════════════════════
-import { resolveOwningUnit, planRestart, classifySsListener, classifyLsofListener, parseCgroupUnit, classifyCmdlineOwner } from "./scripts/lib/restart-unit.mjs";
+import { resolveOwningUnit, planRestart, classifySsListener, classifyLsofListener, parseCgroupUnit, classifyCmdlineOwner, classifyLaunchdJob, classifyLaunchdArgv } from "./scripts/lib/restart-unit.mjs";
 
 console.log("\nRestart-unit resolution (issue #215) — classifiers:");
 
@@ -8367,6 +8367,95 @@ test("classifyCmdlineOwner: empty-string cmdline read is also 'unknown', not 'fo
   assert.equal(classifyCmdlineOwner("").state, "unknown");
 });
 
+console.log("\nRestart-unit resolution (issue #239) — classifyLaunchdJob:");
+
+// issue #239: macOS has no /proc/<pid>/cgroup reverse lookup, so ownership resolution runs the
+// OTHER direction from Linux — ask launchd what pid IT believes owns the ONE label this repo
+// manages, via `launchctl print gui/<uid>/dev.ocp.proxy`. classifyLaunchdJob is the pure
+// classifier for that command's raw stdout, mirroring parseCgroupUnit's role on the Linux side.
+// Fixture shapes below are taken from a live capture against the real dev.ocp.proxy job (see this
+// function's own comment in scripts/lib/restart-unit.mjs) and from the live "Could not find
+// service" probe against a deliberately nonexistent label.
+
+const LAUNCHCTL_PRINT_LIVE_SAMPLE =
+  "gui/501/dev.ocp.proxy = {\n" +
+  "\tactive count = 1\n" +
+  "\tpath = /Users/tester/Library/LaunchAgents/dev.ocp.proxy.plist\n" +
+  "\ttype = LaunchAgent\n" +
+  "\tstate = running\n\n" +
+  "\tprogram = /opt/homebrew/Cellar/node/26.5.0/bin/node\n" +
+  "\targuments = {\n" +
+  "\t\t/opt/homebrew/Cellar/node/26.5.0/bin/node\n" +
+  "\t\t/Users/tester/ocp/server.mjs\n" +
+  "\t}\n\n" +
+  "\tdomain = gui/501 [100018]\n" +
+  "\tpid = 55416\n" +
+  "\tlast exit code = (never exited)\n" +
+  "}";
+
+test("classifyLaunchdJob: full live-shaped capture (registered + running) → running, correct pid and argv", () => {
+  const result = classifyLaunchdJob(LAUNCHCTL_PRINT_LIVE_SAMPLE);
+  assert.equal(result.state, "running");
+  assert.equal(result.pid, "55416");
+  assert.deepEqual(result.argv, ["/opt/homebrew/Cellar/node/26.5.0/bin/node", "/Users/tester/ocp/server.mjs"]);
+});
+
+test("classifyLaunchdJob: not-registered — the gather layer's sentinel for launchctl's \"Could not find service\" failure is an EMPTY string, not null", () => {
+  // scripts/upgrade.mjs's mapLaunchctlPrintFailureToProbeValue turns the live "Could not find
+  // service ..." nonzero-exit failure into "" — this function's job is just to classify that
+  // sentinel correctly, not to talk to launchctl itself.
+  assert.deepEqual(classifyLaunchdJob(""), { state: "not-registered", pid: null, argv: null, reason: null });
+  assert.equal(classifyLaunchdJob("   \n").state, "not-registered", "whitespace-only output must also count as empty");
+});
+
+test("classifyLaunchdJob: registered but NOT running — no \"pid = \" line anywhere in a non-empty blob → not-running", () => {
+  const blob = "gui/501/dev.ocp.proxy = {\n\tstate = not running\n\tpath = /Users/tester/Library/LaunchAgents/dev.ocp.proxy.plist\n}";
+  const result = classifyLaunchdJob(blob);
+  assert.equal(result.state, "not-running");
+  assert.equal(result.pid, null);
+});
+
+test("classifyLaunchdJob: printOutput === null (probe didn't run / failed some other way) → unknown, never a false 'not-registered'", () => {
+  // Same "unknown must never be treated as safe-to-guess" posture as every other classifier in
+  // this file: null means genuinely couldn't tell, distinct from "" (a string, positively
+  // confirmed empty by the gather layer's specific "Could not find service" mapping).
+  const result = classifyLaunchdJob(null);
+  assert.equal(result.state, "unknown");
+  assert.notEqual(result.state, "not-registered");
+  assert.ok(result.reason);
+});
+
+console.log("\nRestart-unit resolution (issue #239) — classifyLaunchdArgv:");
+
+// issue #239 (mirroring #237): classifyLaunchdJob answers "is a process running under the label,
+// and what pid/argv does launchd say it has" — never "does that argv actually invoke server.mjs".
+// classifyLaunchdArgv closes that gap using the EXACT SAME predicate classifyCmdlineOwner uses on
+// Linux (findServerMjsArg) — reused, not reimplemented.
+
+test("classifyLaunchdArgv: argv invokes server.mjs directly → ocp", () => {
+  assert.deepEqual(classifyLaunchdArgv(["node", "server.mjs"]), { state: "ocp", reason: null });
+});
+
+test("classifyLaunchdArgv: argv invokes an absolute path ending in /server.mjs → ocp", () => {
+  assert.deepEqual(classifyLaunchdArgv(["/opt/homebrew/bin/node", "/Users/tester/ocp/server.mjs"]), { state: "ocp", reason: null });
+});
+
+test("classifyLaunchdArgv: a hand-edited/hijacked label running a DIFFERENT program → foreign, names the argv in the reason", () => {
+  // The macOS analogue of #237's nginx scenario: the dev.ocp.proxy LABEL is registered and
+  // running, its pid matches the port's holder, but its ProgramArguments were changed (by hand,
+  // or by a compromised installer) to launch something that isn't server.mjs at all.
+  const result = classifyLaunchdArgv(["/usr/bin/python3", "/opt/some-other-daemon/main.py"]);
+  assert.equal(result.state, "foreign");
+  assert.ok(result.reason.includes("does not invoke server.mjs"));
+  assert.ok(result.reason.includes("main.py"), `reason should name the actual argv; got: ${result.reason}`);
+});
+
+test("classifyLaunchdArgv: empty or non-array argv → foreign, never throws", () => {
+  assert.equal(classifyLaunchdArgv([]).state, "foreign");
+  assert.equal(classifyLaunchdArgv(null).state, "foreign");
+  assert.equal(classifyLaunchdArgv(undefined).state, "foreign");
+});
+
 console.log("\nRestart-unit resolution (issue #237) — resolveOwningUnit + planRestart refuse a FOREIGN process holding the port:");
 
 test("resolveOwningUnit: a real systemd unit (nginx.service) whose process is confirmed NOT server.mjs resolves to 'foreign-process', not 'system-unit'", () => {
@@ -8491,6 +8580,144 @@ test("HIGH-1: resolveOwningUnit — root-owned listener seen by a non-root updat
 
 test("resolveOwningUnit: macOS — tool didn't run (null lsofOutput) → unknown, not not-listening", () => {
   assert.equal(resolveOwningUnit({ platform: "darwin", lsofOutput: null }).kind, "unknown");
+});
+
+test("resolveOwningUnit: launchdPrintOutput ABSENT (undefined, not null) preserves pre-#239 behavior — backward compatible for callers not wired to the new check", () => {
+  // Mirrors the Linux-side "cmdlineContent ABSENT" test below (issue #237's own back-compat
+  // guarantee) — the SAME test right above this one ("macOS launchd — port held, resolves to the
+  // known label") already exercises this implicitly (it never sets launchdPrintOutput at all),
+  // but this test names the guarantee explicitly and would fail loudly if a future change made
+  // the field required rather than optional.
+  const owner = resolveOwningUnit({
+    platform: "darwin",
+    expectedUnit: "dev.ocp.proxy",
+    lsofOutput: `COMMAND   PID  USER   FD   TYPE DEVICE SIZE/OFF NODE NAME\nnode    12345 opc   23u  IPv6 0x1234      0t0  TCP *:3456 (LISTEN)`,
+    // launchdPrintOutput deliberately omitted — undefined, not null.
+  });
+  assert.equal(owner.kind, "launchd");
+  assert.equal(owner.pid, "12345");
+});
+
+console.log("\nRestart-unit resolution (issue #239) — resolveOwningUnit darwin composition (launchd identity verification):");
+
+test("#239: resolveOwningUnit — launchd job registered, running, matching pid, argv invokes server.mjs → launchd", () => {
+  const owner = resolveOwningUnit({
+    platform: "darwin",
+    expectedUnit: "dev.ocp.proxy",
+    lsofOutput: `COMMAND   PID  USER   FD   TYPE DEVICE SIZE/OFF NODE NAME\nnode    55416 tester 23u  IPv6 0x1234      0t0  TCP *:3456 (LISTEN)`,
+    launchdPrintOutput: LAUNCHCTL_PRINT_LIVE_SAMPLE,
+  });
+  assert.equal(owner.kind, "launchd");
+  assert.equal(owner.pid, "55416");
+  assert.equal(owner.unit, "dev.ocp.proxy");
+});
+
+test("#239: resolveOwningUnit — label NOT REGISTERED (launchdPrintOutput \"\") but a PID still holds the port → no-unit", () => {
+  // The literal issue #239 scenario: cmd_restart's nohup fallback bootout'd the launchd job
+  // successfully but a subsequent bootstrap failed, leaving a bare `node server.mjs` holding the
+  // port with dev.ocp.proxy no longer registered with launchd at all.
+  const owner = resolveOwningUnit({
+    platform: "darwin",
+    expectedUnit: "dev.ocp.proxy",
+    lsofOutput: `COMMAND   PID  USER   FD   TYPE DEVICE SIZE/OFF NODE NAME\nnode    55416 tester 23u  IPv6 0x1234      0t0  TCP *:3456 (LISTEN)`,
+    launchdPrintOutput: "",
+  });
+  assert.equal(owner.kind, "no-unit");
+  assert.equal(owner.pid, "55416");
+});
+
+test("#239: resolveOwningUnit — label registered but NOT RUNNING (no \"pid = \" line) → no-unit", () => {
+  const notRunningBlob = "gui/501/dev.ocp.proxy = {\n\tstate = not running\n\tpath = /Users/tester/Library/LaunchAgents/dev.ocp.proxy.plist\n}";
+  const owner = resolveOwningUnit({
+    platform: "darwin",
+    expectedUnit: "dev.ocp.proxy",
+    lsofOutput: `COMMAND   PID  USER   FD   TYPE DEVICE SIZE/OFF NODE NAME\nnode    55416 tester 23u  IPv6 0x1234      0t0  TCP *:3456 (LISTEN)`,
+    launchdPrintOutput: notRunningBlob,
+  });
+  assert.equal(owner.kind, "no-unit");
+});
+
+test("#239: resolveOwningUnit — launchd reports a DIFFERENT pid than the one holding the port → no-unit, not a false 'launchd'", () => {
+  // launchd says dev.ocp.proxy is running as pid 55416; lsof says the port is actually held by
+  // pid 99999. Neither probe is wrong on its own — the mismatch itself is the signal that the
+  // port's holder is not verified to be dev.ocp.proxy.
+  const owner = resolveOwningUnit({
+    platform: "darwin",
+    expectedUnit: "dev.ocp.proxy",
+    lsofOutput: `COMMAND   PID  USER   FD   TYPE DEVICE SIZE/OFF NODE NAME\nnode    99999 tester 23u  IPv6 0x1234      0t0  TCP *:3456 (LISTEN)`,
+    launchdPrintOutput: LAUNCHCTL_PRINT_LIVE_SAMPLE, // pid = 55416 inside this fixture
+  });
+  assert.equal(owner.kind, "no-unit");
+  assert.equal(owner.pid, "99999", "owner.pid must reflect the ACTUAL port holder (lsof), not launchd's belief");
+});
+
+test("#239: resolveOwningUnit — pid matches, but the job's own argv does NOT invoke server.mjs → foreign-process, not launchd", () => {
+  // A hijacked/hand-edited dev.ocp.proxy plist: the label is registered, running, and its pid
+  // genuinely matches the port's holder — but that process isn't server.mjs at all. This is the
+  // macOS analogue of #237's nginx.service scenario, and resolves to the SAME terminal kind.
+  const hijackedBlob =
+    "gui/501/dev.ocp.proxy = {\n\tstate = running\n\tprogram = /usr/bin/python3\n\t" +
+    "arguments = {\n\t\t/usr/bin/python3\n\t\t/opt/some-other-daemon/main.py\n\t}\n\tpid = 55416\n}";
+  const owner = resolveOwningUnit({
+    platform: "darwin",
+    expectedUnit: "dev.ocp.proxy",
+    lsofOutput: `COMMAND   PID  USER   FD   TYPE DEVICE SIZE/OFF NODE NAME\npython3 55416 tester 23u  IPv6 0x1234      0t0  TCP *:3456 (LISTEN)`,
+    launchdPrintOutput: hijackedBlob,
+  });
+  assert.equal(owner.kind, "foreign-process");
+  assert.ok(owner.reason.includes("main.py"), `reason should name the actual argv; got: ${owner.reason}`);
+  assert.ok(owner.reason.includes("not OCP's server.mjs"));
+});
+
+test("#239: resolveOwningUnit — launchctl print probe genuinely failed (launchdPrintOutput null) → unknown, never a false 'no-unit'", () => {
+  // Same "unknown must never be treated as safe-to-guess" posture as every other probe-failure
+  // case in this file: a genuine probe failure (permission error, launchctl itself missing) must
+  // not collapse into the SAME confident answer a positively-confirmed "not registered" gets.
+  const owner = resolveOwningUnit({
+    platform: "darwin",
+    expectedUnit: "dev.ocp.proxy",
+    lsofOutput: `COMMAND   PID  USER   FD   TYPE DEVICE SIZE/OFF NODE NAME\nnode    55416 tester 23u  IPv6 0x1234      0t0  TCP *:3456 (LISTEN)`,
+    launchdPrintOutput: null,
+  });
+  assert.equal(owner.kind, "unknown");
+  assert.notEqual(owner.kind, "no-unit");
+  assert.ok(owner.reason);
+});
+
+console.log("\nRestart-unit resolution (issue #239) — planRestart darwin-specific refusal wording:");
+
+test("#239: planRestart — darwin no-unit refusal says \"launchd\", NOT \"systemd\" (issue #239's own explicit ask)", () => {
+  const owner = { kind: "no-unit", platform: "darwin", pid: "55416", unit: null, mismatched: false };
+  assert.throws(
+    () => planRestart(owner, { expectedUnit: "dev.ocp.proxy" }),
+    /PID 55416.*launchd job.*issue #239/s
+  );
+  // Control: the wording must actually differ from the Linux message, not just additionally
+  // mention launchd — "systemd" must not appear anywhere in the darwin refusal.
+  try {
+    planRestart(owner, { expectedUnit: "dev.ocp.proxy" });
+    assert.fail("must throw");
+  } catch (e) {
+    assert.ok(!/systemd/.test(e.message), `darwin no-unit message must not mention systemd; got: ${e.message}`);
+  }
+});
+
+test("#239: planRestart — darwin foreign-process refusal names lsof/launchctl, never ss or /proc", () => {
+  const owner = {
+    kind: "foreign-process", platform: "darwin", pid: "55416", unit: "dev.ocp.proxy", mismatched: false,
+    reason: `"dev.ocp.proxy" (launchd, pid 55416) owns the OCP port, but its process is not OCP's server.mjs — owning process's argv (/usr/bin/python3 /opt/some-other-daemon/main.py) does not invoke server.mjs at all — this is not an OCP process`,
+  };
+  assert.throws(
+    () => planRestart(owner, { expectedUnit: "dev.ocp.proxy" }),
+    /lsof -nP -iTCP.*launchctl print gui/s
+  );
+  try {
+    planRestart(owner, { expectedUnit: "dev.ocp.proxy" });
+    assert.fail("must throw");
+  } catch (e) {
+    assert.ok(!/\bss -lptn\b/.test(e.message) && !/\/proc\//.test(e.message),
+      `darwin foreign-process message must not reference Linux-only tools/paths; got: ${e.message}`);
+  }
 });
 
 console.log("\nRestart-unit resolution (issue #215) — planRestart (refusals + MED-4/MED-7):");
@@ -8757,6 +8984,17 @@ function makeFakeRun(handlers) {
   };
 }
 
+// issue #239: `launchctl print` output for a registered, RUNNING dev.ocp.proxy job whose argv
+// invokes server.mjs and whose pid matches the lsof fixtures' pid (12345) used throughout this
+// section — the "everything matches, restart proceeds" fixture, reused across the macOS
+// gather-layer tests below exactly the way the Linux `cat /proc/<pid>/cmdline` fixture strings
+// ("/usr/bin/node\0/opt/ocp/server.mjs\0") are reused for the equivalent Linux tests. Shape
+// verified live against the real dev.ocp.proxy job on a real host (see scripts/lib/restart-
+// unit.mjs's classifyLaunchdJob comment for the captured output this mirrors).
+const LAUNCHCTL_PRINT_RUNNING_OCP_12345 =
+  "gui/501/dev.ocp.proxy = {\n\tstate = running\n\tprogram = /opt/homebrew/bin/node\n\t" +
+  "arguments = {\n\t\t/opt/homebrew/bin/node\n\t\t/Users/tester/ocp/server.mjs\n\t}\n\tpid = 12345\n}";
+
 test("MED-6: injected runner — Linux path calls `ss`, not `lsof` (platform branches are not swapped)", async () => {
   // This is the literal mutation the review re-derived undetected against the first version:
   // swapping which command each platform calls. A fake run that only understands `ss` and
@@ -8783,6 +9021,11 @@ test("MED-6: injected runner — Linux path calls `ss`, not `lsof` (platform bra
 test("MED-6: injected runner — macOS path calls `lsof`, not `ss`", async () => {
   const run = makeFakeRun({
     "lsof -nP": `COMMAND   PID  USER   FD   TYPE DEVICE SIZE/OFF NODE NAME\nnode    12345 opc   23u  IPv6 0x1234      0t0  TCP *:3456 (LISTEN)`,
+    // issue #239: resolveOwningUnit now also gathers launchd's own bookkeeping for the resolved
+    // pid — this fixture's scenario is the legitimate case (matching pid, argv invokes
+    // server.mjs), not the #239 no-unit/foreign-process cases covered elsewhere, so this handler
+    // must be present or the test would newly (and wrongly) refuse as "unknown".
+    "launchctl print": LAUNCHCTL_PRINT_RUNNING_OCP_12345,
     "ss ": new Error("test: ss must not be called on macOS"),
   });
   const result = await runUpgrade({
@@ -8793,6 +9036,111 @@ test("MED-6: injected runner — macOS path calls `lsof`, not `ss`", async () =>
   const restartCmds = result.phases.filter(p => p.name === "restart").map(p => p.cmd);
   assert.equal(restartCmds.length, 2);
   assert.ok(restartCmds[0].includes("launchctl bootout"));
+});
+
+console.log("\nRestart-unit resolution (issue #239) — MED-6-style: injected runner drives the REAL macOS launchctl-print gather layer:");
+
+// Every #239 test above (resolveOwningUnit / classifyLaunchdJob / classifyLaunchdArgv / planRestart)
+// exercises the PURE functions in isolation. Per this repo's own documented lesson (independent
+// review of PR #221, finding MED-6 — see the console.log heading above): the IMPURE gather layer —
+// which command runs, with which flags, how a failure maps to a probe value — is exactly where
+// real defects have lived (a platform-branch swap, an exit-code mismapping, both survived mutation
+// undetected in earlier rounds). These tests drive scripts/upgrade.mjs's ACTUAL
+// `launchctl print gui/$(id -u)/dev.ocp.proxy` invocation via a fake command router, end to end
+// through runUpgrade — not just resolveOwningUnit/planRestart called directly.
+
+test("#239 MED-6: injected runner — launchctl print \"Could not find service\" (label not registered) refuses as no-unit end to end", async () => {
+  const launchctlNotRegisteredErr = Object.assign(
+    new Error("Command failed: launchctl print gui/501/dev.ocp.proxy"),
+    { status: 113, stdout: "", stderr: 'Bad request.\nCould not find service "dev.ocp.proxy" in domain for user gui: 501\n' }
+  );
+  const run = makeFakeRun({
+    "lsof -nP": `COMMAND   PID  USER   FD   TYPE DEVICE SIZE/OFF NODE NAME\nnode    55416 tester 23u  IPv6 0x1234      0t0  TCP *:3456 (LISTEN)`,
+    "launchctl print": launchctlNotRegisteredErr,
+  });
+  await assert.rejects(async () => {
+    await runUpgrade({
+      yes: true, dryRun: false, mockExec: true,
+      mockDoctor: { ready_to_upgrade: true, next_action: { kind: "upgrade" }, current_version: "v3.10.0", latest_version: "v3.14.0" },
+      mockPlatform: "darwin", run,
+    });
+  }, /PID 55416.*launchd job.*issue #239/s);
+});
+
+test("#239 MED-6: injected runner — a genuine launchctl failure (missing tool, no \"Could not find service\" text) maps to unknown, refuses — not silently treated as not-registered", async () => {
+  const launchctlMissingErr = Object.assign(
+    new Error("Command failed: launchctl print gui/501/dev.ocp.proxy"),
+    { status: 127, stdout: "", stderr: "/bin/sh: launchctl: command not found" }
+  );
+  const run = makeFakeRun({
+    "lsof -nP": `COMMAND   PID  USER   FD   TYPE DEVICE SIZE/OFF NODE NAME\nnode    55416 tester 23u  IPv6 0x1234      0t0  TCP *:3456 (LISTEN)`,
+    "launchctl print": launchctlMissingErr,
+  });
+  await assert.rejects(async () => {
+    await runUpgrade({
+      yes: true, dryRun: false, mockExec: true,
+      mockDoctor: { ready_to_upgrade: true, next_action: { kind: "upgrade" }, current_version: "v3.10.0", latest_version: "v3.14.0" },
+      mockPlatform: "darwin", run,
+    });
+  }, /could not determine what.*owns the OCP port.*launchctl print did not run/s);
+});
+
+test("#239 MED-6: injected runner — launchd reports a pid mismatch end to end (real listener, real print output, wrong pid inside it) refuses as no-unit", async () => {
+  const run = makeFakeRun({
+    "lsof -nP": `COMMAND   PID  USER   FD   TYPE DEVICE SIZE/OFF NODE NAME\nnode    99999 tester 23u  IPv6 0x1234      0t0  TCP *:3456 (LISTEN)`,
+    "launchctl print": LAUNCHCTL_PRINT_RUNNING_OCP_12345, // pid = 12345 inside this fixture, not 99999
+  });
+  await assert.rejects(async () => {
+    await runUpgrade({
+      yes: true, dryRun: false, mockExec: true,
+      mockDoctor: { ready_to_upgrade: true, next_action: { kind: "upgrade" }, current_version: "v3.10.0", latest_version: "v3.14.0" },
+      mockPlatform: "darwin", run,
+    });
+  }, /PID 99999.*launchd job/s);
+});
+
+test("#239 MED-6: injected runner — a real listener whose launchd job argv does NOT invoke server.mjs refuses as foreign-process end to end, even for rollback", async () => {
+  const hijackedBlob =
+    "gui/501/dev.ocp.proxy = {\n\tstate = running\n\tprogram = /usr/bin/python3\n\t" +
+    "arguments = {\n\t\t/usr/bin/python3\n\t\t/opt/some-other-daemon/main.py\n\t}\n\tpid = 12345\n}";
+  const run = makeFakeRun({
+    "lsof -nP": `COMMAND   PID  USER   FD   TYPE DEVICE SIZE/OFF NODE NAME\npython3 12345 tester 23u  IPv6 0x1234      0t0  TCP *:3456 (LISTEN)`,
+    "launchctl print": hijackedBlob,
+  });
+  await assert.rejects(async () => {
+    await runUpgrade({
+      rollback: true, yes: true, mockExec: true,
+      mockPlatform: "darwin", run,
+      mockSnapshots: [{ name: "upgrade-snapshot-2026-05-11T08:30:00Z", path: "/tmp/snap-x" }],
+      mockSnapshotMeta: { fromCommit: "abc1234", fromVersion: "v3.10.0", toVersion: "v3.14.0", path: "/tmp/snap-x" },
+    });
+  }, /not OCP's server\.mjs.*main\.py/s);
+});
+
+test("#239 MED-6: injected runner — launchctl print is only invoked once a listener is actually confirmed (not shelled out to for nothing)", async () => {
+  // Mirrors the Linux gather layer's own "don't shell out for nothing" posture (cgroup/cmdline
+  // are only read once ss confirms a listener). Uses an explicit call COUNTER rather than only
+  // asserting on the final error text — a "launchctl print" call whose result is discarded (the
+  // gather layer's own catch swallows any thrown error into `null` silently) would otherwise
+  // never surface in the final message at all, letting an accidental "always probe" regression
+  // pass this test vacuously even though it shells out unnecessarily on every darwin restart
+  // resolution, listening or not.
+  let launchctlPrintCalls = 0;
+  const run = makeFakeRun({
+    "launchctl print": () => { launchctlPrintCalls++; return LAUNCHCTL_PRINT_RUNNING_OCP_12345; },
+    "lsof -nP": "",
+  });
+  let caught = null;
+  try {
+    await runUpgrade({
+      yes: true, dryRun: false, mockExec: true,
+      mockDoctor: { ready_to_upgrade: true, next_action: { kind: "upgrade" }, current_version: "v3.10.0", latest_version: "v3.14.0" },
+      mockPlatform: "darwin", run,
+    });
+  } catch (e) { caught = e; }
+  assert.ok(caught, "upgrade must refuse when nothing is listening");
+  assert.ok(/nothing is currently listening/.test(caught.message), `expected the not-listening refusal; got: ${caught.message}`);
+  assert.equal(launchctlPrintCalls, 0, "launchctl print must never be invoked when nothing is listening");
 });
 
 test("MED-6: injected runner — ss tool missing (throws) maps to 'unknown', aborts loudly, never silently proceeds", async () => {
@@ -9905,6 +10253,8 @@ test("issue #233 defect 1: lsof is invoked at its absolute path (/usr/sbin/lsof)
   // test would fail with a refusal instead of a successful restart plan.
   const run = makeFakeRun({
     "/usr/sbin/lsof -nP -iTCP:": `COMMAND   PID  USER   FD   TYPE DEVICE SIZE/OFF NODE NAME\nnode    12345 opc   23u  IPv6 0x1234      0t0  TCP *:3456 (LISTEN)`,
+    // issue #239: see the "macOS path calls lsof" test above for why this handler is required now.
+    "launchctl print": LAUNCHCTL_PRINT_RUNNING_OCP_12345,
   });
   const result = await runUpgrade({
     yes: true, dryRun: false, mockExec: true,

@@ -17,7 +17,7 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 import { existsSync, copyFileSync } from "node:fs";
 import { writeSnapshot, listSnapshots, readSnapshot, gcSnapshots } from "./lib/snapshot.mjs";
-import { resolveOwningUnit, planRestart, classifySsListener } from "./lib/restart-unit.mjs";
+import { resolveOwningUnit, planRestart, classifySsListener, classifyLsofListener } from "./lib/restart-unit.mjs";
 import { DEFAULT_PORT } from "../lib/constants.mjs";
 
 // Default command runner for restart-unit gathering/probing: real execSync, string in,
@@ -104,6 +104,26 @@ function mapLsofFailureToProbeValue(err, run, port) {
   if (listening === true) return { lsofOutput: null, netstatConfirmsListener: true };
   if (listening === false) return { lsofOutput: "" };
   return { lsofOutput: null, netstatProbeFailed: true };
+}
+
+// issue #239: `launchctl print gui/<uid>/<label>` signals "label not registered" via a NONZERO
+// exit (113 observed on this host; Apple does not document launchctl's exit codes, so this is NOT
+// asserted on — matching this file's existing lsof-failure posture above, see
+// mapLsofFailureToProbeValue) with EMPTY stdout and a stderr message:
+//   Bad request.
+//   Could not find service "<label>" in domain for user gui: <uid>
+// — verified live against a deliberately nonexistent label on this host. That specific, expected
+// failure maps to `""` (classifyLaunchdJob's own "not-registered" sentinel — same convention
+// mapLsofFailureToProbeValue uses for lsof's own "nothing matched" signature above); anything else
+// (permission failure, launchctl itself missing, a differently-worded failure) maps to `null`
+// ("unknown" — genuinely couldn't tell), never silently treated the same as "not registered".
+function mapLaunchctlPrintFailureToProbeValue(err) {
+  const stdout = err && err.stdout != null ? String(err.stdout) : "";
+  const stderr = err && err.stderr != null ? String(err.stderr) : "";
+  if (stdout.trim() === "" && /Could not find service/i.test(stderr)) {
+    return { launchdPrintOutput: "" };
+  }
+  return { launchdPrintOutput: null };
 }
 
 // Resolve which unit actually owns the OCP port and build a restart plan for it, instead
@@ -193,6 +213,24 @@ function resolveRestartPlan({ opts, port, isRollback = false, fromCommit = null 
           if (mapped.netstatConfirmsListener) probe.netstatConfirmsListener = true;
           if (mapped.netstatProbeFailed) probe.netstatProbeFailed = true;
         }
+      }
+
+      // issue #239: a confirmed listener alone is not proof it's dev.ocp.proxy — gather launchd's
+      // own bookkeeping for the ONE label this repo manages, keyed off nothing but the label
+      // itself (unlike Linux, launchd has no pid -> label reverse lookup, so this doesn't need
+      // listener.pid the way the cgroup/cmdline reads below do). resolveOwningUnit
+      // (scripts/lib/restart-unit.mjs) uses this to verify the port's actual holder before ever
+      // treating a confirmed listener as a restart candidate — see classifyLaunchdJob /
+      // classifyLaunchdArgv for the pure classification half. Only probed once a listener is
+      // actually confirmed (same "don't shell out for nothing" posture the Linux branch below
+      // already takes for its own cgroup/cmdline reads).
+      const macListener = classifyLsofListener(probe.lsofOutput, {
+        netstatConfirmsListener: !!probe.netstatConfirmsListener,
+        netstatProbeFailed: !!probe.netstatProbeFailed,
+      });
+      if (macListener.state === "listening") {
+        try { probe.launchdPrintOutput = run(`launchctl print gui/$(id -u)/${expectedUnit}`); }
+        catch (err) { probe.launchdPrintOutput = mapLaunchctlPrintFailureToProbeValue(err).launchdPrintOutput; }
       }
     } else {
       try { probe.ssOutput = run(`ss -lptn "sport = :${port}"`); } catch { probe.ssOutput = null; }
