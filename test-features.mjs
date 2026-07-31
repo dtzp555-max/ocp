@@ -1762,7 +1762,7 @@ test("resolveServicePlan tolerates other unrelated argv alongside the bare flag"
 // the same seam scripts/upgrade.mjs already uses (opts.mockExec) and doctor.mjs uses
 // (opts.mockHealth). These tests call the REAL function with fake run/fs primitives and
 // assert on which commands/files were actually touched, not on source shape.
-import { installAutoStart } from "./scripts/lib/install-autostart.mjs";
+import { installAutoStart, xmlEscape } from "./scripts/lib/install-autostart.mjs";
 
 function baseInstallOpts(overrides = {}) {
   return {
@@ -1923,6 +1923,160 @@ test("installAutoStart(unsupported platform): no run/write/unlink calls at all, 
   assert.equal(calls.length, 0);
   assert.equal(unlinked.length, 0);
   assert.equal(written.length, 0);
+});
+
+// ── #231: content/order guards on the generated template (not run()-call membership) ──
+// Everything above this point asserts which run()/unlink calls happened, or that a path was
+// touched — never the CONTENT of what installAutoStart actually writes, nor the ORDER commands
+// run in. Issue #231 (found in review of #229) demonstrated six template properties that are
+// load-bearing on a real host but pass this whole file's suite unchanged when mutated: a
+// WantedBy= target swap, RunAtLoad flipped to false, a dropped chmod 0600, daemon-reload moved
+// after enable/start, Restart=always flipped to Restart=no, and the env-merge branch bypassed —
+// all six survived at 510 passed/0 failed in the issue's own mutation table, because
+// baseInstallOpts()'s `existsPath: () => false` default means the env-merge branch is never even
+// exercised, and no prior test reads a captured writeFile/chmodPath argument. These tests do.
+console.log("\ninstallAutoStart template guards (#231 — assert on generated content/order):");
+
+test("G1: linux systemd unit's [Install] section targets default.target, not graphical-session.target", () => {
+  let unitContent = null;
+  installAutoStart(baseInstallOpts({
+    platform: "linux",
+    writeFile: (path, content) => { if (path.endsWith("ocp-proxy.service")) unitContent = content; },
+  }));
+  assert.ok(unitContent, "expected the systemd unit file to be written");
+  assert.match(unitContent, /^WantedBy=default\.target$/m,
+    `expected an exact "WantedBy=default.target" line; got:\n${unitContent}`);
+});
+
+test("G2: darwin plist's RunAtLoad is literally <true/> (job must actually start at login)", () => {
+  let plistContent = null;
+  installAutoStart(baseInstallOpts({
+    platform: "darwin",
+    servicePlan: resolveServicePlan([], "darwin"),
+    writeFile: (path, content) => { if (path.endsWith("dev.ocp.proxy.plist")) plistContent = content; },
+  }));
+  assert.ok(plistContent, "expected the plist to be written");
+  const m = plistContent.match(/<key>RunAtLoad<\/key>\s*<(true|false)\/>/);
+  assert.ok(m, `expected a RunAtLoad key/value pair; got:\n${plistContent}`);
+  assert.equal(m[1], "true", `RunAtLoad must be <true/>; got <${m[1]}/>`);
+});
+
+test("G3a: darwin plist file is chmod'd 0600 (carries OCP_ADMIN_KEY/PROXY_ANONYMOUS_KEY — CHANGELOG:457)", () => {
+  const chmods = [];
+  installAutoStart(baseInstallOpts({
+    platform: "darwin",
+    servicePlan: resolveServicePlan([], "darwin"),
+    chmodPath: (path, mode) => { chmods.push({ path, mode }); },
+  }));
+  const plistChmod = chmods.find(c => c.path.endsWith("dev.ocp.proxy.plist"));
+  assert.ok(plistChmod, `expected a chmodPath call on the plist; got=${JSON.stringify(chmods)}`);
+  assert.equal(plistChmod.mode, 0o600, `plist must be chmod 0600; got ${String(plistChmod.mode)}`);
+});
+
+test("G3b: linux systemd unit file is chmod'd 0600 (carries OCP_ADMIN_KEY/PROXY_ANONYMOUS_KEY — CHANGELOG:457)", () => {
+  const chmods = [];
+  installAutoStart(baseInstallOpts({
+    platform: "linux",
+    chmodPath: (path, mode) => { chmods.push({ path, mode }); },
+  }));
+  const unitChmod = chmods.find(c => c.path.endsWith("ocp-proxy.service"));
+  assert.ok(unitChmod, `expected a chmodPath call on the unit file; got=${JSON.stringify(chmods)}`);
+  assert.equal(unitChmod.mode, 0o600, `unit file must be chmod 0600; got ${String(unitChmod.mode)}`);
+});
+
+test("G4: linux first-install run() order is daemon-reload BEFORE enable BEFORE start (#221 MED-8: stale-cache restart)", () => {
+  const calls = [];
+  installAutoStart(baseInstallOpts({
+    platform: "linux",
+    servicePlan: resolveServicePlan([], "linux"),
+    run: (cmd) => { calls.push(cmd); return ""; },
+  }));
+  const relevant = calls.filter(c => /daemon-reload|enable ocp-proxy|start ocp-proxy/.test(c));
+  assert.deepEqual(relevant, [
+    "systemctl --user daemon-reload",
+    "systemctl --user enable ocp-proxy",
+    "systemctl --user start ocp-proxy",
+  ], `expected exactly this order (membership alone does not prove ordering); got ${JSON.stringify(relevant)}`);
+});
+
+test("G5: linux systemd unit has Restart=always, not Restart=no", () => {
+  let unitContent = null;
+  installAutoStart(baseInstallOpts({
+    platform: "linux",
+    writeFile: (path, content) => { if (path.endsWith("ocp-proxy.service")) unitContent = content; },
+  }));
+  assert.ok(unitContent, "expected the systemd unit file to be written");
+  assert.match(unitContent, /^Restart=always$/m, `expected "Restart=always"; got:\n${unitContent}`);
+});
+
+test("G6: linux mergeSystemdEnv actually runs — a pre-existing operator env var survives the rewrite", () => {
+  // baseInstallOpts()'s existsPath: () => false means this branch (existsPath(path) ?
+  // readFile(...) : null) is never exercised by any test above — closing G6 means exercising
+  // it, not just asserting on mergeSystemdEnv in isolation (already covered at the unit level
+  // around test-features.mjs:649-653; this is the WIRING, which was never proven).
+  const servicePath = "/fake/home/.config/systemd/user/ocp-proxy.service";
+  const existingUnit = `[Unit]
+Description=OCP — Open Claude Proxy
+After=network.target
+
+[Service]
+ExecStart=/usr/bin/node /fake/repo/server.mjs
+Environment=CLAUDE_PROXY_PORT=3456
+Environment=CLAUDE_BIND=127.0.0.1
+Environment=CLAUDE_AUTH_MODE=none
+Environment=CUSTOM_OPERATOR_VAR=keep-me
+Restart=always
+RestartSec=5
+`;
+  let finalContent = null;
+  installAutoStart(baseInstallOpts({
+    platform: "linux",
+    existsPath: (p) => p === servicePath,
+    readFile: (p) => (p === servicePath ? existingUnit : ""),
+    writeFile: (path, content) => { if (path === servicePath) finalContent = content; },
+  }));
+  assert.ok(finalContent, "expected the systemd unit file to be (re)written");
+  assert.match(finalContent, /Environment=CUSTOM_OPERATOR_VAR=keep-me/,
+    `expected the pre-existing operator env var to survive the rewrite; got:\n${finalContent}`);
+});
+
+// ── G7 (added — not in the issue's list; same defect class as G6, other platform) ──
+// The exact same existsPath: () => false blind spot leaves darwin's mergePlistEnv branch
+// (installAutoStart's plist counterpart to G6's mergeSystemdEnv) equally unexercised. It's the
+// identical wiring gap on the platform this dev host actually runs under, so it's covered here
+// too rather than left as a known gap.
+test("G7: darwin mergePlistEnv actually runs — a pre-existing operator env var survives the rewrite", () => {
+  const plistPath = "/fake/home/Library/LaunchAgents/dev.ocp.proxy.plist";
+  const existingPlist = `<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>dev.ocp.proxy</string>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>CLAUDE_PROXY_PORT</key>
+    <string>3456</string>
+    <key>CLAUDE_BIND</key>
+    <string>127.0.0.1</string>
+    <key>CLAUDE_AUTH_MODE</key>
+    <string>none</string>
+    <key>CUSTOM_OPERATOR_VAR</key>
+    <string>keep-me</string>
+  </dict>
+</dict>
+</plist>`;
+  let finalContent = null;
+  installAutoStart(baseInstallOpts({
+    platform: "darwin",
+    servicePlan: resolveServicePlan([], "darwin"),
+    existsPath: (p) => p === plistPath,
+    readFile: (p) => (p === plistPath ? existingPlist : ""),
+    writeFile: (path, content) => { if (path === plistPath) finalContent = content; },
+  }));
+  assert.ok(finalContent, "expected the plist to be (re)written");
+  assert.match(finalContent, /<key>CUSTOM_OPERATOR_VAR<\/key>\s*<string>keep-me<\/string>/,
+    `expected the pre-existing operator env var to survive the rewrite; got:\n${finalContent}`);
 });
 
 test("upgrade full path's reconfigure phase invokes setup.mjs with --reconfigure-only", async () => {
@@ -2138,14 +2292,17 @@ test("gcSnapshots keeps last N regardless of age", () => {
   rmSync(root, { recursive: true, force: true });
 });
 
-// ── setup.mjs helpers: xmlEscape + assertSafeInjectValue ──
-// setup.mjs cannot be imported (top-level side effects run the installer).
-// Replicated verbatim from setup.mjs for unit-testing — keep in sync with source.
+// ── setup.mjs inject helpers: xmlEscape (real import) + assertSafeInjectValue (replica) ──
+// xmlEscape used to be a verbatim replica here too, on the same "setup.mjs cannot be imported"
+// premise — but #229 moved xmlEscape OUT of setup.mjs's unimportable top level and into
+// scripts/lib/install-autostart.mjs, which exports it (see the import above). The premise the
+// replica relied on is gone, so it's imported for real now (issue #231's stale-replica finding:
+// the old comment's three justifying clauses — "setup.mjs helper", "cannot be imported",
+// "keep in sync with source" — were all false once #229 landed). assertSafeInjectValue has NOT
+// moved (still setup.mjs-local, still unexported, still genuinely unimportable), so its replica
+// below remains legitimate.
 console.log("\nsetup.mjs inject helpers:");
 
-function xmlEscape(v) {
-  return String(v).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;").replace(/'/g, "&apos;");
-}
 function assertSafeInjectValueTest(name, v) {
   if (v == null) return v;
   // eslint-disable-next-line no-control-regex
