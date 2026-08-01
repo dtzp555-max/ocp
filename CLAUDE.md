@@ -11,9 +11,30 @@
 
 ## Before starting any task
 
-1. Read `./ALIGNMENT.md`. Internalize the five Rules and the 2026-04-11 drift lesson.
+1. Read `./ALIGNMENT.md`. Internalize the five Rules, the scope they are declared under (`ALIGNMENT.md:17` — Class A only), and the 2026-04-11 drift lesson.
 2. Run `/dev-start <task description>` to get a pre-flight plan that incorporates the iron rules, `SKILL_ROUTING.md`, this file, and `ALIGNMENT.md`.
-3. If the task touches `server.mjs`, locate the corresponding `cli.js` reference **before** drafting any code. No code is written ahead of the `grep cli.js` evidence.
+3. If the task touches `server.mjs`, classify the change (next section) and locate **that class's** reference — `cli.js` for Class A, the OpenAI specification section for B.1, the authorizing ADR for B.2 — **before** drafting any code. No code is written ahead of the evidence.
+
+---
+
+## Classify the change first: Class A or Class B
+
+`ALIGNMENT.md`'s five Rules are **not** universal. `ALIGNMENT.md:17` scopes Rules 1–5 to **Class A operations** — the `cli.js`-mirror surface. `server.mjs` also serves a **Class B** surface that OCP owns outright, where `cli.js` is not the wire authority and the governing document is an ADR. Which class the change falls in is therefore the *first* decision, and it determines which evidence the next section demands.
+
+**Classification is a table lookup, not an argument.** Class B is a closed, enumerated inventory in `ALIGNMENT.md` § "Current Class B inventory", plus the Hybrid note immediately after it (`ALIGNMENT.md:135`, which is where `/usage` lives — it is not in the table). If the handler you are touching is listed there, it is Class B. You do not get to reclassify an endpoint by arguing for it, and you do not get to declare new surface Class B to avoid a `cli.js` citation — new Class B surface needs its own ADR (below).
+
+| Class | Surface | Authority | Citation |
+|---|---|---|---|
+| **A** | `cli.js`-mirror: inbound and outbound `/v1/messages`, the OAuth bearer machinery, the Anthropic wire call inside `/usage`. OCP forwards, observes, or multiplexes something `cli.js` already does. | `cli.js` at the `ALIGNMENT.md` audit pin. Rules 1–5 apply verbatim. | `cli.js:NNNN` or `cli.js vE4 <functionName>` |
+| **B.1** | OpenAI-compatibility: `/v1/chat/completions`, `/v1/models`. `cli.js` cannot speak OpenAI's wire format, by construction. | OpenAI's published `/v1/chat/completions` specification, plus ADR 0006. | Spec section URL + ADR 0006 |
+| **B.2** | OCP-administrative: `/health`, `/dashboard`, `/sessions`, `/logs`, `/status`, `/settings`, `/api/keys*`, `/api/usage`, `/cache*`. Exists to operate the proxy itself. | The ADR that authorized the endpoint. The endpoints listed here are grandfathered by ADR 0006 at their v3.16.4 behaviour. | Authorizing ADR number |
+| **Hybrid** | `/usage` — Class A wire call under a Class B synthesis layer. | Both, per layer touched. | Both, per layer touched |
+
+Adding a **Class B** endpoint, or a new method on an existing Class B one, is not covered by any row: it requires its own ADR merged with or before the PR, per `ALIGNMENT.md` § "New Class B endpoint procedure" (`ALIGNMENT.md:157`). That procedure is Class B only. A new **Class A** forwarding route — `ALIGNMENT.md:17` contemplates "any future operations OCP forwards from `cli.js` to Anthropic" — is governed by Rules 1–5 and needs a `cli.js` citation, not an ADR. An ADR is never a substitute for a `cli.js` citation on Class A surface.
+
+A `server.mjs` change that touches no request handler at all (an internal refactor, a comment, a constant) has no row and needs no class evidence — declare "not endpoint-touching" and say so in the PR summary, as the PR template's fourth option already allows. Requirements 2 and 3 below still apply.
+
+This table is a navigation aid so the first decision can be made without leaving this file. `ALIGNMENT.md` § "Scope Clarification: OCP-Owned Compatibility Endpoints (Class B)" and ADR 0006 are the full text, and `ALIGNMENT.md` governs on any conflict (`ALIGNMENT.md:3`).
 
 ---
 
@@ -21,9 +42,29 @@
 
 Every PR that modifies `server.mjs` must satisfy all three of the following. A PR missing any one of them is blocked from merge.
 
-1. **`cli.js` citation.** The commit message and PR body declare the corresponding `cli.js` function name and line number range, using the format `cli.js:NNNN` or `cli.js vE4 <functionName>`. If `cli.js` does not perform the operation, the PR must state this explicitly and justify scope under `ALIGNMENT.md` Rule 2 (in practice, this almost always means the PR should be closed).
-2. **CI blacklist pass.** The `alignment.yml` workflow must pass. The workflow greps `server.mjs` for known-hallucinated tokens (currently blocking `api.anthropic.com/api/oauth/usage`) and fails the build on any hit. New tokens are added via PR amendment to `alignment.yml`; removing entries requires an `ALIGNMENT.md` amendment PR. Do not suppress the workflow.
-3. **Independent reviewer (Iron Rule 10).** The implementation author may not self-approve. A separate reviewer — human or a subagent spawned with a fresh context — must read the diff, verify the `cli.js` citation by opening `cli.js` at the cited lines, and explicitly approve. A review comment that does not confirm the `cli.js` citation was checked is not a valid approval.
+1. **Evidence for the declared class.** Declare the class from the table above, then supply that class's evidence in both the commit message and the PR body.
+
+   - **Class A** — the corresponding `cli.js` function name and line range, as `cli.js:NNNN` or `cli.js vE4 <functionName>`.
+
+     If the grep does not hit, declare that: Rule 1 makes an absent hit a finding in its own right. But do **not** offer "scope justified under Rule 2." **Rule 2 is a prohibition, not an authorization**, and citing it as permission is a category error — recorded in the #193 thread as an independent-review finding the author accepted, which held that PR until the citation was corrected. On a genuine Class A operation an absent hit means Rule 2 puts the feature out of scope and Rule 4 deletes it: the PR should be closed. The one other legitimate outcome is that the classification was wrong, so check the Class B inventory before concluding anything.
+
+   - **Class B.1** — the OpenAI specification section covering the field or behaviour, plus ADR 0006. A `cli.js` citation is neither required nor meaningful here. The anti-invention discipline still binds with OpenAI's spec substituted for `cli.js`: a field OpenAI's spec does not define is as out of scope as a fabricated endpoint is in Class A.
+
+   - **Class B.2** — the authorizing ADR. Which one, and how much work it is, follows from what the change does. The dividing question is **not** "is the current value wrong?" — it is **"does the field's documented meaning change?"**
+     - **Behaviour-preserving** — request shape, response shape and semantics all unchanged. This includes a fix that makes a field's *value* truthful **while the rule that determines it stays the same**: the field already promised this, and the code was not delivering it. Worked example: the #193 `stats.activeRequests` leak — the field always meant "requests in flight" and was simply over-reporting, so the field set was unchanged, the values were made truthful, and no new ADR was needed. Cite `Authorized by ADR 0006 (grandfathered as of v3.16.4)`, state that the contract is unchanged, and say which of the two routes you are taking. One line, and it covers most B.2 work.
+     - **Contract change** — request shape, response shape, or semantics change, *including* a change to the rule that determines a field's value even when the field name and type are untouched. `ALIGNMENT.md:114` and ADR 0006:39 / :109 make this a new authorization request: it needs its own ADR, merged with or before the PR, cited alongside ADR 0006. Worked example: ADR 0010 redefined *when* `/health` and `/status` report `degraded` — same field, same type, new rule — and needed its own ADR. If you are tempted to file that under "making the value truthful", it is this bullet, not the one above.
+     - **New Class B endpoint, or a new method on a grandfathered one** — its own ADR, always.
+
+   - **Hybrid** — satisfy the Class A requirement for the wire-call layer and the Class B requirement for the synthesis layer, for whichever layers the PR actually touches.
+
+2. **CI blacklist pass.** The `alignment.yml` workflow must pass. The workflow greps `server.mjs` for known-hallucinated tokens (currently blocking `api.anthropic.com/api/oauth/usage`) and fails the build on any hit. New tokens are added via PR amendment to `alignment.yml`; removing entries requires an `ALIGNMENT.md` amendment PR. Do not suppress the workflow. Note its limit: the blacklist is a fixed-string grep and cannot tell a correctly-cited PR from a plausibly-worded one. It catches the 2026-04-11 drift tokens, not a wrong authority. Requirement 3 is the only gate that does that.
+
+3. **Independent reviewer (Iron Rule 10).** The implementation author may not self-approve. A separate reviewer — human or a subagent spawned with a fresh context — must read the diff, **independently confirm the declared class against the `ALIGNMENT.md` inventory table** rather than taking the author's word for it, open the reference that class demands, and explicitly approve:
+   - Class A → open `cli.js` at the cited lines.
+   - Class B.1 → open the cited OpenAI specification section.
+   - Class B.2 → open the authorizing ADR; if the citation is the ADR 0006 grandfather clause, confirm the change really is behaviour-preserving.
+
+   A review comment that does not name the reference it opened is not a valid approval. Neither is one that accepts a Rule 2 argument in place of a citation.
 
 ---
 
@@ -33,7 +74,7 @@ This repo operates under the CC Development Iron Rules (CC 开发铁律) v1.3. T
 
 - **Iron Rule 10 (Code Review).** Every implementation phase has an independent reviewer. Self-review does not count. See `server.mjs` hard requirement #3 above.
 - **Iron Rule 11 (Incremental Diff Review).** Non-trivial work is split into the minimum reviewable unit — one PR per layer per severity. `ALIGNMENT.md`, `CLAUDE.md`, the PR template, and the CI workflow are therefore shipped as the same constitutional PR (they are one layer: governance), but any subsequent `server.mjs` remediation lands as its own PR.
-- **Iron Rule 12 (Pre-Brainstorm Prior-Art Search).** Before proposing any new endpoint or header, search GitHub, Anthropic docs, and the `cli.js` bundle. For OCP specifically, the `cli.js` grep is the decisive search: if it does not hit, Rule 2 of the constitution applies.
+- **Iron Rule 12 (Pre-Brainstorm Prior-Art Search).** Before proposing any new endpoint or header, search GitHub, Anthropic docs, and the `cli.js` bundle. For OCP specifically, which search is decisive depends on the class: `grep cli.js` for Class A (an absent hit means Rules 2 and 4 apply and the feature is out of scope), OpenAI's published specification for B.1, and `docs/adr/` for B.2. Searching only `cli.js` for a Class B change answers a question nobody asked.
 
 The full iron rules are at `~/.claude/CC_DEV_IRON_RULES.md` (symlinked from the cc-rules repo on the maintainer's workstations). Load them into session context with `/cc-rules` when needed.
 
@@ -58,7 +99,7 @@ The full iron rules are at `~/.claude/CC_DEV_IRON_RULES.md` (symlinked from the 
 
 ## Project-level escalation
 
-If a design decision cannot be resolved by reference to `cli.js` and `ALIGNMENT.md`, escalate to the project maintainer via `/cc-chat` rather than guessing. Silent guessing is what produced the 2026-04-11 drift.
+If a design decision cannot be resolved by reference to `ALIGNMENT.md` and the change's class authority — `cli.js` (A), OpenAI's specification (B.1), or the authorizing ADR (B.2) — escalate to the project maintainer via `/cc-chat` rather than guessing. Silent guessing is what produced the 2026-04-11 drift. Citing an authority that does not govern the surface you are touching is a quieter version of the same failure.
 
 ---
 
