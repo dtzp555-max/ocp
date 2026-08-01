@@ -3058,14 +3058,22 @@ function _sleepStartShPollMs(ms) {
 // bare-name command the generated script itself calls; `node` was already stubbed here).
 // `spawnSync` is pointed at bash's own absolute path so launching bash ITSELF never
 // depends on this deliberately-gutted $PATH either.
-function _runStartShScenario({ lsofScript, netstatScript, buildScript, port }) {
+function _runStartShScenario({ lsofScript, netstatScript, buildScript, port, lsofMissing = false }) {
   const root = mkdtempSync(testJoin(tmpdir(), "start-sh-test-"));
   try {
     const stubDir = testJoin(root, "stubs"); // deliberately NOT on PATH below
     tMkdirSync(stubDir, { recursive: true });
+    // lsofMissing (review round 2, finding 2): the absolute lsofAbsPath is never written a
+    // stub file at all -- combined with the fully-isolated $PATH below (no bare `lsof`
+    // reachable either), this reproduces lsof being GENUINELY ABSENT from the host, not
+    // just returning a nonzero exit -- `[ -x "$LSOF" ]` fails, falls back to the bare name,
+    // which ALSO fails to resolve, so the invocation itself is bash's own "command not
+    // found" (exit 127), never reaching the fake stub's own exit code at all.
     const lsofAbsPath = testJoin(stubDir, "fake-lsof");
-    testWriteFile(lsofAbsPath, `#!/bin/bash\n${lsofScript}\n`);
-    _ltChmod(lsofAbsPath, 0o755);
+    if (!lsofMissing) {
+      testWriteFile(lsofAbsPath, `#!/bin/bash\n${lsofScript}\n`);
+      _ltChmod(lsofAbsPath, 0o755);
+    }
     const netstatAbsPath = testJoin(stubDir, "fake-netstat");
     testWriteFile(netstatAbsPath, `#!/bin/bash\n${netstatScript}\n`);
     _ltChmod(netstatAbsPath, 0o755);
@@ -3204,6 +3212,79 @@ test("buildStartSh darwin: netstat itself fails to run -- fails closed, does not
     buildScript: _fixedDarwinBuild,
   });
   assert.equal(r.started, false, `netstat failure must fail closed; stdout=${JSON.stringify(r.stdout)}`);
+});
+
+// Independent review of PR #269 (round 2) found the fail-closed DEFAULT itself (start-sh.mjs's
+// `listening=1` before either explicit branch runs) had ZERO test coverage: mutating that
+// literal from 1 to 0 left the suite fully green, because every existing scenario above drove
+// lsof into one of the two EXPLICIT branches (status===0 with output, or status===1 with empty
+// output) -- none exercised the THIRD, unenumerated case the default exists for: lsof failing
+// in some way that is neither of those two shapes. That is exactly what a genuinely missing
+// binary, a permission error, or a malformed invocation looks like on a real restricted-PATH
+// host -- the precise condition this whole fix exists to handle safely. Three shapes below,
+// each asserting the SAME safe outcome (does not start) via a DIFFERENT route into the default.
+console.log("\nbuildStartSh darwin: fail-closed DEFAULT coverage (review round 2, finding 2):");
+
+test("buildStartSh darwin: lsof genuinely missing (not just failing) -- command-not-found falls to the fail-closed default, does not start", () => {
+  const r = _runStartShScenario({
+    port: _startShTestPort,
+    lsofMissing: true, // no stub file at all; bare fallback ALSO unreachable on this PATH
+    netstatScript: `exit 1`, // never reached -- lsof_status won't be 1 (bash's own 127, not lsof's own exit code)
+    buildScript: _fixedDarwinBuild,
+  });
+  assert.equal(r.started, false, `stdout=${JSON.stringify(r.stdout)} stderr=${JSON.stringify(r.stderr)}`);
+});
+
+test("buildStartSh darwin: lsof exits 0 (success) but with EMPTY stdout -- matches neither explicit branch, falls to the fail-closed default", () => {
+  const r = _runStartShScenario({
+    port: _startShTestPort,
+    lsofScript: `exit 0`, // status===0 but stdout is empty -- fails "status===0 && -n lsof_out"
+    netstatScript: `exit 1`, // never reached -- lsof_status isn't 1 either
+    buildScript: _fixedDarwinBuild,
+  });
+  assert.equal(r.started, false, `stdout=${JSON.stringify(r.stdout)} stderr=${JSON.stringify(r.stderr)}`);
+});
+
+test("buildStartSh darwin: lsof hard error (neither 0 nor 1, e.g. a malformed invocation) -- falls to the fail-closed default", () => {
+  const r = _runStartShScenario({
+    port: _startShTestPort,
+    lsofScript: `echo "lsof: illegal option -- z" >&2; exit 2`, // status===2 -- matches neither explicit branch
+    netstatScript: `exit 1`, // never reached
+    buildScript: _fixedDarwinBuild,
+  });
+  assert.equal(r.started, false, `stdout=${JSON.stringify(r.stdout)} stderr=${JSON.stringify(r.stderr)}`);
+});
+
+// Independent review finding 6 (LOW): the netstat LISTEN-row match's suffix anchoring
+// (`*".$PORT"`, requiring the literal dot immediately before the port digits) was never
+// actually driven by a decoy that WOULD collide under a naive unanchored substring match --
+// mirrors scripts/upgrade.mjs's own established "FOLD-IN 1" test class for its JS netstat
+// parser (netstatHasListenerOnPort), applied here to this file's bash-native equivalent.
+console.log("\nbuildStartSh darwin: netstat suffix-anchoring guards (review round 2, finding 6):");
+
+test("buildStartSh darwin: netstat parser rejects an adjacent port that merely CONTAINS the target port's digits as a substring", () => {
+  const decoyPort = `9${_startShTestPort}`; // e.g. our port 54321 -> decoy "954321": contains
+                                             // "54321" as a raw substring, but does NOT end in
+                                             // ".54321" (the character before it is "9", not ".")
+  const r = _runStartShScenario({
+    port: _startShTestPort,
+    lsofScript: `exit 1`,
+    netstatScript: `echo "tcp4 0 0 *.${decoyPort} *.* LISTEN"; exit 0`,
+    buildScript: _fixedDarwinBuild,
+  });
+  assert.equal(r.started, true,
+    `an adjacent port containing our port's digits must NOT be read as a match; stdout=${JSON.stringify(r.stdout)}`);
+});
+
+test("buildStartSh darwin: netstat parser rejects a non-LISTEN row on the exact target port", () => {
+  const r = _runStartShScenario({
+    port: _startShTestPort,
+    lsofScript: `exit 1`,
+    netstatScript: `echo "tcp4 0 0 *.${_startShTestPort} *.* TIME_WAIT"; exit 0`,
+    buildScript: _fixedDarwinBuild,
+  });
+  assert.equal(r.started, true,
+    `a TIME_WAIT (non-LISTEN) row on our own port must not block the not-listening conclusion; stdout=${JSON.stringify(r.stdout)}`);
 });
 
 test("MONEY TEST (money A): restricted PATH + genuinely free port -- FIXED code starts the server via the absolute lsof/netstat paths", () => {
