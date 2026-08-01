@@ -75,11 +75,15 @@ export function resolveBinaryPath(absolutePath, fallbackName, existsSyncFn = rea
 
 // The darwin-only lsof+netstat listener check (issue #246). Returns a bash snippet that
 // sets `listening` to 1 (something is there, or we cannot safely tell) or 0 (confirmed
-// nothing is there) -- never shells out to a nested awk regex (avoids a multi-layer
-// backslash-escaping trap across JS-template -> bash-single-quote -> awk-string-literal
-// boundaries); the netstat LISTEN-row suffix match is done with a plain bash `case` glob
-// instead, matching scripts/upgrade.mjs's own column-4 "ends with .PORT" comparison
-// (netstatHasListenerOnPort) one-for-one but in bash form.
+// nothing is there). Column-4 extraction and the netstat LISTEN-row suffix match both use
+// bash BUILTINS ONLY (`read`'s own word-splitting + a `case` glob) -- no `awk`, no other
+// external command, no PATH lookup at all -- matching scripts/upgrade.mjs's own column-4
+// "ends with .PORT" comparison (netstatHasListenerOnPort) one-for-one but in bash form.
+// (An earlier revision used `awk '{print $4}'` here; independent review of PR #269 found
+// that `awk` call was itself a bare external command inside this fail-closed cross-check,
+// so a host missing `awk` made the WHOLE cross-check fail OPEN under exactly the
+// restricted-PATH condition this fix exists to handle -- see the `read` line below for the
+// full writeup.)
 function darwinListeningCheck({ lsofPath, netstatPath }) {
   return `LSOF=${JSON.stringify(lsofPath)}
 [ -x "$LSOF" ] || LSOF=lsof
@@ -106,7 +110,17 @@ elif [ "$lsof_status" -eq 1 ] && [ -z "$lsof_out" ]; then
     while IFS= read -r netstat_line; do
       case "$netstat_line" in
         *LISTEN*)
-          netstat_col4=$(printf '%s\\n' "$netstat_line" | awk '{print $4}')
+          # Column 4 (Local-Address) via bash's OWN word-splitting, not 'awk' (independent
+          # review, PR #269): an 'awk' call here was itself a BARE external command inside
+          # this fail-closed cross-check -- under the exact restricted-PATH condition this
+          # whole fix exists to handle, 'awk' failing silently left netstat_col4 empty,
+          # which never matches "*.$PORT" and made netstat_confirms stay 0 -- i.e. the
+          # cross-check failed OPEN (concluded "not listening"), not closed, on a host
+          # missing 'awk'. 'read' is a bash BUILTIN: no external binary, no PATH lookup, so
+          # this cross-check now has zero remaining dependencies on anything resolvable
+          # via $PATH at all. Extra fields beyond the 4th collect into the trailing
+          # variable and are unused.
+          read -r _netstat_proto _netstat_recvq _netstat_sendq netstat_col4 _netstat_rest <<<"$netstat_line"
           case "$netstat_col4" in
             *".$PORT") netstat_confirms=1 ;;
           esac
