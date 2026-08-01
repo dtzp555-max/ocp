@@ -681,15 +681,37 @@ cmd_restart() {
     # failing, which produced the identical unframed-death shape. OpenClaw is an OPTIONAL
     # sibling tool (AGENTS.md "What this project is"): its absence is a normal configuration,
     # not a fault, so it gets its own branch here rather than folding into the generic
-    # `_curl_or_die`-style "could not run" message #261 uses for curl -- "not installed" is
+    # `_curl_or_die`-style "could not run" message #261 uses for curl -- "not found on $PATH" is
     # reported once, calmly, and this function returns SUCCESS (0); "installed and failed" is
     # the opposite: openclaw's own combined output is preserved (2>&1 here is safe -- it feeds a
     # visible failure message, not a misdiagnosis, unlike the #261 pattern) and surfaced loudly
-    # on stderr with a nonzero return, because that IS the operator's gateway breaking.
+    # on stderr with a nonzero return, because that IS the operator's gateway breaking. This
+    # branch is reached only via an explicit `ocp restart gateway`: the no-argument
+    # `( cmd_restart )` call sites on the update/recovery path take the PROXY branch below,
+    # never this one (independent review corrected this issue's original scope claim).
+    #
+    # Independent review round 1 (blocking): the classifier here used to also check
+    # `[[ "$gw_out" == *"command not found"* ]]` -- a text-substring match against COMBINED
+    # (2>&1) output -- alongside the exit-127 check. Removing it left the suite green; it
+    # carried zero tested behavior. What it did carry was false-positive surface worse than
+    # #261's analogous curl-side check (which only ever inspects curl's own stderr, never a
+    # response body): openclaw is a subcommand dispatcher that shells out, so a genuinely
+    # FAILING, INSTALLED openclaw can print "command not found" as part of its OWN diagnostic
+    # output (e.g. a plugin/dependency lookup message) -- reintroducing this issue's own defect
+    # through the very marker meant to fix it: a real gateway failure silently reported as a
+    # successful no-op. Bash guarantees exit 127 for "command not found" unconditionally, so the
+    # numeric check alone already carries the full signal. Removed.
     local gw_out gw_status=0
     gw_out=$(openclaw gateway restart 2>&1) || gw_status=$?
-    if [[ $gw_status -eq 127 ]] || [[ "$gw_out" == *"command not found"* ]]; then
-      echo "  OpenClaw is not installed — skipping gateway restart (it is an optional sibling tool, not a proxy dependency)."
+    if [[ $gw_status -eq 127 ]]; then
+      # Independent review round 1: this message reports what PATH-lookup semantics actually
+      # established -- NOT "OpenClaw is not installed". A non-interactive shell's $PATH (e.g. a
+      # bare `ssh host 'ocp restart gateway'`) can omit directories an interactive login
+      # shell's $PATH includes, so this exact branch can fire on a host where OpenClaw is
+      # installed, configured, and running. Overclaiming "not installed" here would be a
+      # second wrong diagnosis stacked on top of the one #263 exists to fix -- say only what
+      # was actually observed.
+      echo "  OpenClaw was not found on \$PATH — skipping gateway restart (it is an optional sibling tool, not a proxy dependency; this reports what this shell's \$PATH resolved, not whether OpenClaw is actually installed — a non-interactive \$PATH can differ from an interactive one's)."
       return 0
     fi
     if [[ $gw_status -ne 0 ]]; then

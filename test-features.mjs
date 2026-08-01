@@ -9908,9 +9908,18 @@ function _bwHarnessRun({
   // work here today, but the shadow-stub technique is used anyway for the same reason #261
   // adopted it for curl: it does not depend on what happens to be missing from a given host's
   // /usr/bin:/bin, which is real system directory this harness's $PATH always includes for
-  // python3/cat/sed/mktemp. Independent of serviceStubsSucceed: "not installed" is a third
+  // python3/cat/sed/mktemp. Independent of serviceStubsSucceed: "not found on $PATH" is a third
   // state, not a variant of "installed and succeeds/fails".
   openclawAbsent = false,
+  // Independent review round 1 (case 6, blocking): lets the "installed and fails" branch of the
+  // openclaw stub report an ARBITRARY exit code and output, instead of always the fixed
+  // exit-95/refusal-text default. Needed to reproduce a genuinely-installed, genuinely-failing
+  // openclaw whose own diagnostic output happens to contain the substring "command not found"
+  // (a real subcommand-dispatcher failure mode, e.g. a plugin/dependency lookup message) without
+  // that text ever implying "not found on $PATH". `undefined` (the default) leaves the existing
+  // fixed refusal behavior byte-identical to before this option existed.
+  openclawFailExit = undefined,
+  openclawFailOutput = undefined,
   // Issue #242: generic curl response fixtures for the nine read-only display commands
   // (usage/logs/models/sessions/clear/keys/settings), none of which existed as a harness
   // capability before this issue (every prior call site here only ever needed the `/health`
@@ -10068,12 +10077,16 @@ function _bwHarnessRun({
     }
 
     // Issue #263: `openclaw` gets its own three-state stub (not the shared loop above) because
-    // `cmd_restart gateway`'s fix needs to distinguish THREE situations, not two: not installed
-    // (openclawAbsent — a normal, silent-or-informational configuration, see #263's own scope
-    // discussion), installed and succeeds (serviceStubsSucceed), and installed and fails (the
-    // default — same "refuse loudly, AGENTS.md 'unreachable by construction'" posture the
+    // `cmd_restart gateway`'s fix needs to distinguish THREE situations, not two: not found on
+    // $PATH (openclawAbsent — a normal, silent-or-informational configuration, see #263's own
+    // scope discussion), installed and succeeds (serviceStubsSucceed), and installed and fails
+    // (the default — same "refuse loudly, AGENTS.md 'unreachable by construction'" posture the
     // shared loop already uses for launchctl/systemctl/pkill/nohup, preserved byte-identically
-    // when openclawAbsent is false, its default).
+    // when openclawAbsent is false and openclawFailExit/openclawFailOutput are both undefined,
+    // all three defaults). openclawFailExit/openclawFailOutput (independent review round 1,
+    // case 6) let the installed-and-fails branch report an arbitrary exit code and combined
+    // output, so a failure whose OWN text happens to contain "command not found" can be
+    // reproduced without that ever meaning "not found on $PATH".
     mkStub("openclaw", openclawAbsent ? [
       `echo "FAKE-OPENCLAW-ABSENT-CALL $*" >> "${logPath}"`,
       `exit 127`,
@@ -10083,9 +10096,11 @@ function _bwHarnessRun({
       `exit 0`,
     ].join("\n") : [
       `echo "FAKE-OPENCLAW-CALL $*" >> "${logPath}"`,
-      `echo "FAKE-OPENCLAW: refusing -- this harness must never reach a real ` +
-        `service-mutating command (AGENTS.md 'unreachable by construction')" >&2`,
-      `exit 95`,
+      ...(openclawFailOutput !== undefined
+        ? [`echo ${JSON.stringify(openclawFailOutput)} >&2`]
+        : [`echo "FAKE-OPENCLAW: refusing -- this harness must never reach a real ` +
+             `service-mutating command (AGENTS.md 'unreachable by construction')" >&2`]),
+      `exit ${openclawFailExit ?? 95}`,
     ].join("\n"));
 
     // Issue #224: `sleep` is a no-op stub purely for test speed (the real `cmd_restart` calls
@@ -11109,16 +11124,25 @@ test("#224: _cmd_update_light no longer swallows cmd_restart's refusal (operator
 // #261's "loud local-fault" treatment, while "installed and failed" stays loud and non-zero.
 // `overrideCmdRestart: false` drives these through the REAL cmd_restart body via ocp's real
 // top-level dispatch (`args: ["restart", "gateway"]`), the only way to reach this branch.
-console.log("\ncmd_restart gateway: 'not installed' vs 'installed and failed' (#263):");
+//
+// Independent review round 1: the message says "not found on $PATH", not "not installed" — a
+// non-interactive shell's $PATH (a bare `ssh host 'ocp restart gateway'`, in particular) can
+// omit directories an interactive login shell's $PATH includes, so exit 127 here does not prove
+// absence, only that this invocation's $PATH did not resolve openclaw. Test names/assertions
+// below were updated to match; this is a wording correction, not a behavior change (still exit
+// 0, still calm, still on stdout).
+console.log("\ncmd_restart gateway: 'not found on $PATH' vs 'installed and failed' (#263):");
 
-test("#263 cmd_restart gateway: openclaw NOT installed is reported once, calmly, on stdout, and reports SUCCESS", () => {
+test("#263 cmd_restart gateway: openclaw not found on $PATH is reported once, calmly, on stdout, and reports SUCCESS", () => {
   const r = _bwHarnessRun({ args: ["restart", "gateway"], overrideCmdRestart: false, openclawAbsent: true });
   assert.equal(r.status, 0,
     `absence of an OPTIONAL sibling tool must not fail 'ocp restart gateway'; status=${r.status} ` +
     `stdout=${JSON.stringify(r.stdout)} stderr=${JSON.stringify(r.stderr)}`);
-  assert.ok(r.stdout.toLowerCase().includes("not installed"),
-    `expected an informational 'not installed' message on stdout, got stdout=${JSON.stringify(r.stdout)}`);
-  assert.equal(r.stderr, "", `not-installed is not an error — stderr must stay clean; got: ${JSON.stringify(r.stderr)}`);
+  assert.ok(r.stdout.includes("not found on"),
+    `expected the corrected 'not found on $PATH' wording (NOT 'not installed' -- that overclaims), got stdout=${JSON.stringify(r.stdout)}`);
+  assert.ok(!r.stdout.toLowerCase().includes("not installed"),
+    `must NOT claim "not installed" -- a non-interactive $PATH lookup cannot establish that; stdout=${JSON.stringify(r.stdout)}`);
+  assert.equal(r.stderr, "", `absence-from-$PATH is not an error — stderr must stay clean; got: ${JSON.stringify(r.stderr)}`);
   assert.ok(_bwCalled(r.log, "FAKE-OPENCLAW-ABSENT-CALL"), `sanity check the absent stub was actually reached; log=${JSON.stringify(r.log)}`);
 });
 
@@ -11139,13 +11163,39 @@ test("#263 control: cmd_restart gateway with openclaw installed and succeeding r
   assert.ok(r.stdout.includes("✓ Gateway restarted."), `expected the success line, got stdout=${JSON.stringify(r.stdout)}`);
 });
 
-test("#263 the money contrast: 'not installed' (exit 0) and 'installed and failed' (nonzero) are genuinely distinguishable exit codes -- the bug's own complaint was that they were not", () => {
+test("#263 the money contrast: 'not found on $PATH' (exit 0) and 'installed and failed' (nonzero) are genuinely distinguishable exit codes -- the bug's own complaint was that they were not", () => {
   const absent = _bwHarnessRun({ args: ["restart", "gateway"], overrideCmdRestart: false, openclawAbsent: true });
   const failed = _bwHarnessRun({ args: ["restart", "gateway"], overrideCmdRestart: false });
-  assert.equal(absent.status, 0, `not-installed must be status 0; got ${absent.status}`);
+  assert.equal(absent.status, 0, `not-found-on-$PATH must be status 0; got ${absent.status}`);
   assert.notEqual(failed.status, 0, `installed-and-failed must be nonzero; got ${failed.status}`);
   assert.notEqual(absent.status, failed.status,
     `the two situations #263 describes as "today indistinguishable" must now genuinely differ`);
+});
+
+// ── Independent review round 1 (BLOCKING, case 6): the classifier used to also match a
+// "command not found" TEXT substring against openclaw's COMBINED (2>&1) output, alongside the
+// exit-127 check -- removed above because it carried zero tested behavior AND a real
+// false-positive risk: openclaw is a subcommand dispatcher that shells out, so a genuinely
+// FAILING, INSTALLED openclaw can print "command not found" as part of its own diagnostic
+// output for an unrelated reason (a plugin/dependency lookup message, reproduced below). Before
+// removal this reintroduced #263's own defect through the very marker meant to fix it: a real
+// gateway failure silently reported as a successful no-op. This is the regression test for that
+// specific text-arm, using the harness's new openclawFailExit/openclawFailOutput fixtures.
+test("#263 case 6 (independent review round 1, blocking): openclaw installed and genuinely failing, whose own output happens to contain the phrase 'command not found', must still be reported LOUDLY and non-zero", () => {
+  const r = _bwHarnessRun({
+    args: ["restart", "gateway"], overrideCmdRestart: false,
+    openclawFailExit: 2,
+    openclawFailOutput: "gateway plugin error: dependency lookup failed (command not found in registry)",
+  });
+  assert.notEqual(r.status, 0,
+    `a REAL failure must not be swallowed just because its own text happens to contain ` +
+    `'command not found' -- that is #263's own defect, reintroduced through the marker meant ` +
+    `to fix it; status=${r.status} stdout=${JSON.stringify(r.stdout)} stderr=${JSON.stringify(r.stderr)}`);
+  assert.ok(r.stderr.includes("✗ openclaw gateway restart failed"),
+    `expected the loud, labeled failure message, got stderr=${JSON.stringify(r.stderr)}`);
+  assert.ok(!r.stdout.includes("not found on"),
+    `must NOT be misreported as absent-from-$PATH; stdout=${JSON.stringify(r.stdout)}`);
+  assert.ok(_bwCalled(r.log, "FAKE-OPENCLAW-CALL"), `sanity check the (installed, failing) stub was actually reached; log=${JSON.stringify(r.log)}`);
 });
 
 // ── #241: _cmd_update_light gets --post-flight-only verification + explicit --target no-op ───
