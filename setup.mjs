@@ -422,12 +422,22 @@ if (!DRY_RUN) {
         // regardless of this block's outcome -- the HTTP health check above already
         // confirmed the server is up. See classifyBindCheck()'s own header for the full
         // trace of why this stays a diagnostic line, not a gate.
-        const bindCheck = classifyBindCheck({ port: PORT, platform: process.platform });
-        if (bindCheck.kind === "found") {
-          console.log(`    bind:     ${bindCheck.line}`);
-        } else if (bindCheck.kind === "could-not-run") {
-          warn(`bind check could not run (${bindCheck.detail}) — cosmetic only, the health check above already confirmed the server is up`);
-        }
+        //
+        // Independent review round 1 (LOW-1): classifyBindCheck() itself funnels every
+        // expected failure into a returned `kind` rather than throwing, so this inner
+        // try/catch is provably unreachable under normal use today -- but it costs nothing to
+        // keep, and it means an unforeseen future exception here can never silently skip
+        // `verified = true` below, which would misreport a genuinely healthy server as
+        // "did not respond" and exit 1. Insurance against this cosmetic diagnostic ever
+        // becoming load-bearing by accident, not a response to a live defect.
+        try {
+          const bindCheck = classifyBindCheck({ port: PORT, platform: process.platform });
+          if (bindCheck.kind === "found") {
+            console.log(`    bind:     ${bindCheck.line}`);
+          } else if (bindCheck.kind === "could-not-run") {
+            warn(`bind check could not run (${bindCheck.detail}) — cosmetic only, the health check above already confirmed the server is up`);
+          }
+        } catch { /* insurance only -- see comment above; classifyBindCheck() should never reach here */ }
 
         verified = true;
       } else {
