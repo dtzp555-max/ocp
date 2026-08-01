@@ -591,6 +591,44 @@ export async function runUpgrade(opts = {}) {
   const kind = doctor.next_action.kind;
   plan.push(`[doctor] from=${doctor.current_version} to=${doctor.latest_version} kind=${kind}`);
 
+  // Issue #260: --target is a PIN ("do not put me on anything else"), not a preference. noop,
+  // restart, and fresh_install have no mechanism to redirect what they do onto a specific
+  // version: noop does nothing, restart re-serves the CURRENT tree exactly as-is, and
+  // fresh_install replays doctor's own ai_executable[] -- a fixed, unparameterized script, not
+  // a tag checkout. Refuse (throw -- matching resolveUpgradeTarget's own refusal shape below,
+  // and mirroring bash's identical noop/restart refusal in `ocp`'s cmd_update) rather than
+  // silently proceeding -- including proceeding to do NOTHING -- when the caller asserted a
+  // pin. Checked here, before both the noop early-return and the --dry-run early-exit below,
+  // so previewing an impossible pin also refuses rather than previewing a plan that quietly
+  // drops it.
+  //
+  // "restart" is reachable here only when something calls runUpgrade() programmatically with a
+  // mockDoctor/live doctor reporting kind="restart" -- the real CLI path (`ocp`'s cmd_update)
+  // handles "restart" entirely in bash (_cmd_update_restart, which never execs into this file
+  // at all) and refuses it there directly, for the identical reason -- see that refusal's own
+  // comment in `ocp`. Included here anyway as defense in depth for any other caller of this
+  // exported function.
+  //
+  // "fresh_install" IS reached for real through the CLI: `ocp`'s cmd_update dispatches BOTH
+  // "upgrade" and "fresh_install" through the same `exec node scripts/upgrade.mjs "$@"` arm
+  // (only "upgrade" honors --target, per #259), so this is the only layer that can refuse it.
+  //
+  // Consistency with the light/patch-bump path ("update" kind, #241/#255): that path stays a
+  // WARNING, not a refusal, here and in `ocp` -- out of this issue's own stated scope (its own
+  // table lists only noop/restart/fresh_install as "no signal at all"; the light path already
+  // gives an observable, if non-blocking, stderr signal). See this PR's description for the
+  // full reasoning either way.
+  if (opts.target && (kind === "noop" || kind === "restart" || kind === "fresh_install")) {
+    const why = kind === "noop"
+      ? "the tree is already at the latest release -- there is nothing to check out"
+      : kind === "restart"
+        ? "the tree already matches the latest release and only the running service is stale -- this path restarts the current tree as-is and never runs git"
+        : "fresh_install replays doctor's own fixed install steps, not a checkout of a specific tag";
+    throw new Error(
+      `--target ${opts.target} was requested, but doctor selected the "${kind}" path, which cannot honor a version pin (${why}). Re-run \`ocp update\` without --target, or once a checkout-capable path (light or full upgrade) is available.`
+    );
+  }
+
   // --- noop ---
   if (kind === "noop") {
     plan.push(`[noop] already at latest (${doctor.latest_version})`);

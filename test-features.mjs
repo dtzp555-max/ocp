@@ -1911,6 +1911,104 @@ test("upgrade full path executes 5 phases", async () => {
   }
 });
 
+// ── --target REFUSAL on noop/restart/fresh_install (issue #260) ──────────────────────────────
+// Before #260: --target was accepted and silently dropped with NO signal at all on these three
+// kinds — the doctor-selected kind (not the caller) decides whether the pin gets honored (kind
+// "upgrade", #259), WARNED about but ignored (kind "update"/light path, #241/#255), or dropped
+// outright with zero signal (these three). Refuse (throw) instead: a pin is a constraint, not a
+// preference, and exiting 0 having ignored it is how a caller ends up believing a version is
+// pinned when it isn't. "noop"/"restart" are only reachable here via a direct/mocked call —
+// `ocp`'s real cmd_update refuses them identically in bash BEFORE ever exec'ing into this file
+// (see that refusal's own comment) — but "fresh_install" IS the real CLI-reachable case: bash's
+// cmd_update dispatches both "upgrade" and "fresh_install" through the same
+// `exec node scripts/upgrade.mjs "$@"` arm, so this file is the only layer that can refuse it.
+console.log("\n--target REFUSAL on noop/restart/fresh_install (issue #260):");
+
+test("#260: runUpgrade refuses --target on kind=noop", async () => {
+  await assert.rejects(async () => {
+    await runUpgrade({
+      target: "v3.99.0",
+      mockDoctor: { ready_to_upgrade: true, next_action: { kind: "noop" },
+                    current_version: "v3.26.0", latest_version: "v3.26.0" }
+    });
+  }, /--target v3\.99\.0 was requested.*"noop"/s);
+});
+
+test("#260 control: runUpgrade WITHOUT --target still returns noop cleanly (proves the refusal above is target-specific, not a general noop breakage)", async () => {
+  const result = await runUpgrade({
+    mockDoctor: { ready_to_upgrade: true, next_action: { kind: "noop" },
+                  current_version: "v3.26.0", latest_version: "v3.26.0" }
+  });
+  assert.equal(result.path, "noop");
+  assert.equal(result.executed, true);
+});
+
+test("#260: runUpgrade refuses --target on kind=restart", async () => {
+  await assert.rejects(async () => {
+    await runUpgrade({
+      target: "v3.99.0",
+      mockDoctor: { ready_to_upgrade: true, next_action: { kind: "restart" },
+                    current_version: "v3.26.0", latest_version: "v3.26.0" }
+    });
+  }, /--target v3\.99\.0 was requested.*"restart"/s);
+});
+
+test("#260 control: runUpgrade WITHOUT --target still returns restart cleanly", async () => {
+  const result = await runUpgrade({
+    mockDoctor: { ready_to_upgrade: true, next_action: { kind: "restart" },
+                  current_version: "v3.26.0", latest_version: "v3.26.0" }
+  });
+  assert.equal(result.path, "restart");
+  assert.equal(result.executed, true);
+});
+
+test("#260 (the money test): runUpgrade refuses --target on kind=fresh_install -- the actual CLI-reachable case", async () => {
+  await assert.rejects(async () => {
+    await runUpgrade({
+      target: "v3.14.0",
+      yes: true,
+      mockExec: true,
+      mockDoctor: { ready_to_upgrade: false, from_version_supported: false,
+                    next_action: { kind: "fresh_install", ai_executable: ["echo step-1"] },
+                    current_version: "v3.2.0", latest_version: "v3.14.0" }
+    });
+  }, /--target v3\.14\.0 was requested.*"fresh_install"/s);
+});
+
+test("#260 control: runUpgrade fresh_install WITHOUT --target still runs ai_executable (proves the money test above can fail)", async () => {
+  const result = await runUpgrade({
+    yes: true,
+    mockExec: true,
+    mockDoctor: { ready_to_upgrade: false, from_version_supported: false,
+                  next_action: { kind: "fresh_install", ai_executable: ["echo step-1", "echo step-2"] },
+                  current_version: "v3.2.0", latest_version: "v3.14.0" }
+  });
+  assert.equal(result.path, "fresh_install");
+  assert.equal(result.steps.length, 2);
+});
+
+test("#260: the refusal fires BEFORE --dry-run's own early exit -- previewing an impossible pin also refuses rather than quietly previewing a plan that drops it", () => {
+  return assert.rejects(async () => {
+    await runUpgrade({
+      dryRun: true,
+      target: "v3.99.0",
+      mockDoctor: { ready_to_upgrade: true, next_action: { kind: "noop" },
+                    current_version: "v3.26.0", latest_version: "v3.26.0" }
+    });
+  }, /--target v3\.99\.0 was requested/);
+});
+
+test("#260 non-regression: --target on kind=upgrade (the cross-minor full path) is UNAFFECTED -- still honored per #259", async () => {
+  const result = await runUpgrade({
+    yes: true, mockExec: true,
+    target: "v3.12.0",
+    mockDoctor: { ready_to_upgrade: true, next_action: { kind: "upgrade" },
+                  current_version: "v3.10.0", latest_version: "v3.14.0" }
+  });
+  assert.equal(result.path, "upgrade");
+  assert.equal(result.target, "v3.12.0");
+});
+
 // ── --target on the FULL (cross-minor) upgrade path (issue #257) ───────────────────────────────
 // `--target` was parsed from argv and threaded into runUpgrade(opts), but opts.target was never
 // actually READ anywhere in runUpgrade / runFullUpgrade / runFreshInstall / runRollback — the
@@ -10759,6 +10857,57 @@ test("non-regression control: cmd_update kind=restart with NO --dry-run DOES res
   assert.ok(_bwCalled(r.log, "FAKE-CMD-RESTART-CALLED"), `cmd_restart must run; log=${JSON.stringify(r.log)}`);
   assert.ok(_bwCalled(r.log, "FAKE-NODE-CALL") && r.log.some((l) => l.includes("post-flight-only")),
     `post-flight verification must run; log=${JSON.stringify(r.log)}`);
+});
+
+// ── #260: --target REFUSES (not silent-drop) on noop/restart, driven through ocp's REAL outer
+// dispatch (not a direct function call) — same rigor as #235's own acceptance test above.
+test("#260 (the money test): cmd_update kind=noop --target vX.Y.Z REFUSES -- non-zero exit, no mutation, names what was asked", () => {
+  const r = _bwHarnessRun({ kind: "noop", args: ["update", "--target", "v9.9.9"] });
+  assert.notEqual(r.status, 0, `expected a non-zero exit; stdout=${JSON.stringify(r.stdout)} stderr=${JSON.stringify(r.stderr)}`);
+  assert.match(r.stderr, /--target v9\.9\.9/, `refusal must name what was asked; stderr=${JSON.stringify(r.stderr)}`);
+  assert.match(r.stderr, /noop/, `refusal must name the path that cannot honor it; stderr=${JSON.stringify(r.stderr)}`);
+  assert.ok(!r.stdout.includes("Already at latest. Nothing to do."),
+    `must NOT print the silent-success noop message; stdout=${JSON.stringify(r.stdout)}`);
+});
+
+test("#260: cmd_update kind=noop --target=vX.Y.Z (equals form, LOW-6 shape) ALSO refuses", () => {
+  const r = _bwHarnessRun({ kind: "noop", args: ["update", "--target=v9.9.9"] });
+  assert.notEqual(r.status, 0, `expected a non-zero exit; stdout=${JSON.stringify(r.stdout)}`);
+  assert.match(r.stderr, /--target v9\.9\.9/, `stderr=${JSON.stringify(r.stderr)}`);
+});
+
+test("#260 control: cmd_update kind=noop WITHOUT --target still succeeds cleanly (proves the money test above can fail)", () => {
+  const r = _bwHarnessRun({ kind: "noop", args: ["update"] });
+  assert.equal(r.status, 0, `expected a clean exit; stdout=${JSON.stringify(r.stdout)} stderr=${JSON.stringify(r.stderr)}`);
+  assert.ok(r.stdout.includes("Already at latest. Nothing to do."), `stdout=${JSON.stringify(r.stdout)}`);
+});
+
+test("#260 (the money test): cmd_update kind=restart --target vX.Y.Z REFUSES BEFORE cmd_restart ever runs -- no partial mutation", () => {
+  const r = _bwHarnessRun({ kind: "restart", args: ["update", "--target", "v9.9.9"] });
+  assert.notEqual(r.status, 0, `expected a non-zero exit; stdout=${JSON.stringify(r.stdout)} stderr=${JSON.stringify(r.stderr)}`);
+  assert.match(r.stderr, /--target v9\.9\.9/, `stderr=${JSON.stringify(r.stderr)}`);
+  assert.match(r.stderr, /restart/, `stderr=${JSON.stringify(r.stderr)}`);
+  assert.ok(!_bwCalled(r.log, "FAKE-CMD-RESTART-CALLED"),
+    `cmd_restart must NEVER run once refused -- a partial restart is worse than the pre-#260 silent no-op; log=${JSON.stringify(r.log)}`);
+  assert.ok(!r.log.some((l) => l.includes("post-flight-only")),
+    `post-flight must never run either; log=${JSON.stringify(r.log)}`);
+});
+
+test("#260 control: cmd_update kind=restart WITHOUT --target still restarts + post-flight verifies (proves the money test above can fail)", () => {
+  const r = _bwHarnessRun({ kind: "restart", args: ["update"] });
+  assert.equal(r.status, 0, `expected a clean exit; stdout=${JSON.stringify(r.stdout)} stderr=${JSON.stringify(r.stderr)}`);
+  assert.ok(_bwCalled(r.log, "FAKE-CMD-RESTART-CALLED"), `log=${JSON.stringify(r.log)}`);
+});
+
+test("#260 acceptance: the refusal survives ocp's REAL outer dispatch (not a direct cmd_update call) -- same rigor #235's own acceptance test applies", () => {
+  const r = _bwHarnessRun({ kind: "noop", args: ["update", "--target", "v9.9.9"] });
+  assert.notEqual(r.status, 0, `--target must survive the real outer dispatch and still refuse; stdout=${JSON.stringify(r.stdout)}`);
+});
+
+test("#260 non-regression: the light path's OWN --target WARNING (issue #241/#255) is UNCHANGED -- still a warning, still exit 0, not a refusal", () => {
+  const r = _bwHarnessRun({ kind: "update", args: ["update", "--target", "v9.9.9"] });
+  assert.equal(r.status, 0, `light path must remain a WARN, not a refusal -- deliberately out of #260's own scope; stdout=${JSON.stringify(r.stdout)} stderr=${JSON.stringify(r.stderr)}`);
+  assert.match(r.stderr, /is not honored on the light\/patch-bump path/, `stderr=${JSON.stringify(r.stderr)}`);
 });
 
 // ── #236: the WARN/INFO block must not kill cmd_update when python3 is absent ────────────────

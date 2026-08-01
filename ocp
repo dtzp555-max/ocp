@@ -1003,7 +1003,47 @@ Notes:
   answers). Passing --target on the light path prints a runtime warning
   (accepts both `--target vX.Y.Z` and `--target=vX.Y.Z`) rather than
   silently doing nothing unexpected.
+
+  --target REFUSES (non-zero exit, no changes made) on the noop, restart,
+  and fresh_install paths (issue #260): none of these three has ANY
+  mechanism to redirect what it does onto a specific version -- noop does
+  nothing, restart re-serves the current tree exactly as-is, and
+  fresh_install replays doctor's own fixed install steps rather than
+  checking out a tag. Which of these three paths runs is doctor's own
+  current-vs-latest decision, not something the caller chooses -- so the
+  SAME `ocp update --target vX.Y.Z` command would otherwise pin or silently
+  not, depending only on where the host happens to sit in the release
+  cycle. Re-run without --target, or once a checkout-capable path (light or
+  full upgrade) is available.
 EOF
+}
+
+# Issue #260: shared by cmd_update's kind dispatch (noop/restart refusal) AND
+# _cmd_update_light (the light path's own pre-existing --target WARNING, issue #241/#255) —
+# detects whether --target/--target=X was passed anywhere in "$@", regardless of which kind
+# ends up handling the request. Extracted out of _cmd_update_light's own inline loop (which
+# used to be the only caller) so noop/restart can reuse the identical two-token/one-token
+# detection instead of a second, potentially-drifting copy. Sets the CALLER's own
+# _TARGET_SEEN (0/1) and _TARGET_VAL globals — not a subshell/command-substitution return,
+# so the caller doesn't need to fork a process just to read a flag.
+_detect_target_flag() {
+  _TARGET_SEEN=0
+  _TARGET_VAL=""
+  local _args=("$@") _i
+  for ((_i = 0; _i < ${#_args[@]}; _i++)); do
+    case "${_args[_i]}" in
+      --target)
+        _TARGET_SEEN=1
+        _TARGET_VAL="${_args[_i+1]:-<no value given>}"
+        break
+        ;;
+      --target=*)
+        _TARGET_SEEN=1
+        _TARGET_VAL="${_args[_i]#--target=}"
+        break
+        ;;
+    esac
+  done
 }
 
 cmd_update() {
@@ -1112,6 +1152,44 @@ for c in d.get('checks', []):
 " 2>/dev/null || true
   fi
 
+  # Issue #260: --target is a PIN ("do not put me on anything else"), not a preference. Before
+  # #260, noop/restart accepted --target and dropped it with NO signal at all -- exit 0 having
+  # done something other than what was asked, the exact "reported success while the wrong thing
+  # happened" shape #214/#241 both record. `doctor` -- not the caller -- picks which kind runs
+  # (a current-vs-latest comparison), so the SAME `ocp update --target vX.Y.Z` command pins or
+  # silently doesn't depending on where the host happens to sit in the release cycle. Refuse
+  # (non-zero, naming what was asked and what the path can actually do) rather than warn: a
+  # refusal costs one re-run without the flag and changes no state; silently proceeding --
+  # including proceeding to do NOTHING -- costs a version state the caller believes is pinned.
+  # Deliberately checked BEFORE the kind-specific bodies below, not inside them: neither noop's
+  # early return nor _cmd_update_restart has any mechanism that could honor a pin regardless.
+  #
+  # fresh_install is NOT handled here even though it also cannot honor a pin (its own
+  # ai_executable[] steps are a fixed, unparameterized script) -- unlike noop/restart, that kind
+  # already unconditionally `exec`s to `scripts/upgrade.mjs "$@"` below (same arm as "upgrade",
+  # which DOES honor --target per #259), so its own doctor re-resolution and opts.target handling
+  # happen at that Node layer instead; see runUpgrade()'s own target-vs-kind guard.
+  #
+  # The light/patch-bump path ("update" kind, issue #241/#255) is UNCHANGED here -- it already
+  # prints a --target warning to stderr rather than staying silent, and reopening warn-vs-refuse
+  # for that specific, already-reviewed, already-shipped decision is out of this issue's own
+  # stated scope (see this PR's own description for the full reasoning either way).
+  if [[ "$kind" == "noop" || "$kind" == "restart" ]]; then
+    _detect_target_flag "$@"
+    if [[ $_TARGET_SEEN -eq 1 ]]; then
+      case "$kind" in
+        noop)
+          echo "✗ --target $_TARGET_VAL was requested, but doctor reports the tree is already at the latest release -- there is nothing to check out, and the noop path makes no git or service changes at all. The pin cannot be honored because this path has no mechanism to honor ANY version request, pinned or not." >&2
+          ;;
+        restart)
+          echo "✗ --target $_TARGET_VAL was requested, but doctor reports the tree already matches the latest release and only the RUNNING SERVICE is stale -- this path restarts the current tree as-is and never runs git, so it cannot check out a different tag." >&2
+          ;;
+      esac
+      echo "  Run \`ocp update\` again once a newer release makes a checkout-capable path (light or full upgrade) available, or omit --target to accept this path's own outcome." >&2
+      return 1
+    fi
+  fi
+
   case "$kind" in
     noop)
       echo "Already at latest. Nothing to do."
@@ -1165,23 +1243,14 @@ _cmd_update_light() {
   # both without a second pass. The warning itself now goes to stderr, not stdout: in piped fleet
   # automation (`ocp update --target vX | some-log-parser`), a stdout warning would be silently
   # read as data by whatever consumes the pipe; stderr is where a human-facing advisory belongs.
-  local _args=("$@") _i _target_seen=0 _target_val=""
-  for ((_i = 0; _i < ${#_args[@]}; _i++)); do
-    case "${_args[_i]}" in
-      --target)
-        _target_seen=1
-        _target_val="${_args[_i+1]:-<no value given>}"
-        break
-        ;;
-      --target=*)
-        _target_seen=1
-        _target_val="${_args[_i]#--target=}"
-        break
-        ;;
-    esac
-  done
-  if [[ $_target_seen -eq 1 ]]; then
-    echo "  ⚠ --target $_target_val is not honored on the light/patch-bump path — it always pulls the latest origin/main regardless. Run \`ocp update --help\` for details." >&2
+  #
+  # Issue #260: this detection loop is now `_detect_target_flag` (shared with cmd_update's own
+  # noop/restart refusal, which needed the identical two-token/one-token detection) rather than
+  # a second, potentially-drifting copy. Behavior here is UNCHANGED from #255 -- still a WARNING,
+  # not a refusal; see this PR's own description for why that decision was left as-is.
+  _detect_target_flag "$@"
+  if [[ $_TARGET_SEEN -eq 1 ]]; then
+    echo "  ⚠ --target $_TARGET_VAL is not honored on the light/patch-bump path — it always pulls the latest origin/main regardless. Run \`ocp update --help\` for details." >&2
   fi
 
   # Honor --dry-run BEFORE any mutation (issue #235). This arm used to be called with NO
