@@ -24,8 +24,8 @@ PRs with the relevant evidence section blank or unchecked will receive a `reques
 - [ ] **Corresponding `cli.js` reference.** I have identified the `cli.js` function and line range that performs the operation this PR forwards. Citation (format `cli.js:NNNN` or `cli.js vE4 <functionName>`):
   <!-- e.g. cli.js:18423-18467 (function: sendUserMessage)  -->
 
-- [ ] **If `cli.js` does not perform this operation**, I have stated this explicitly below and justified the scope under `ALIGNMENT.md` Rule 2. (Note: in almost all cases this means the PR should be closed, not merged. Proxy layers do not invent endpoints. If the endpoint is in fact Class B, switch the class above and use the Class B section instead.)
-  <!-- Justification, if applicable. Empty is fine when cli.js does perform the operation. -->
+- [ ] **If `cli.js` does not perform this operation**, I have stated that explicitly below, because Rule 1 requires an absent grep hit to be declared. I have **not** offered `ALIGNMENT.md` Rule 2 as a justification: Rule 2 is a prohibition, not an authorization, and citing it as permission is a category error. On a genuine Class A operation an absent hit means Rule 2 puts the change out of scope and Rule 4 deletes it — this PR should be closed, not merged. Proxy layers do not invent endpoints. If the endpoint is in fact listed in `ALIGNMENT.md` § "Current Class B inventory", switch the class above and use the Class B section instead.
+  <!-- Declaration of the absent hit, if applicable. Empty is fine when cli.js does perform the operation. -->
 
 - [ ] **Commit message citations.** Every "Claude Code uses X" or "cli.js uses X" assertion in every commit of this PR is immediately followed by a `cli.js:NNNN` or `cli.js vE4 <functionName>` citation. I have verified this by rereading each commit message.
 
@@ -34,11 +34,11 @@ PRs with the relevant evidence section blank or unchecked will receive a `reques
 - [ ] **Authorizing ADR.** Cite the ADR number that authorizes the endpoint this PR modifies (e.g., "ADR 0006 — OpenAI shim scope"). For B.1 endpoints (`/v1/chat/completions`, `/v1/models`), this is ADR 0006. For grandfathered B.2 endpoints, this is "ADR 0006 (grandfathered as of v3.16.4)." For new B.2 endpoints, cite the endpoint's own authorizing ADR; if none exists, the PR cannot proceed — the authorizing ADR must be drafted and merged first.
   <!-- e.g., ADR 0006 -->
 
-- [ ] **Specification citation.** For B.1 endpoints, link to the relevant section of OpenAI's `/v1/chat/completions` specification (https://platform.openai.com/docs/api-reference/chat/create), including the specific field or behaviour being implemented. For B.2 endpoints with their own ADR, cite the ADR section that specifies the behaviour. For grandfathered B.2 endpoints, the PR must be a behaviour-preserving refactor — link the existing handler code being modified.
+- [ ] **Specification citation.** For B.1 endpoints, link to the relevant section of OpenAI's `/v1/chat/completions` specification (https://platform.openai.com/docs/api-reference/chat/create), including the specific field or behaviour being implemented. For B.2 endpoints with their own ADR, cite the ADR section that specifies the behaviour. For grandfathered B.2 endpoints, `ALIGNMENT.md:114` and ADR 0006:39 give exactly two routes — say which one this PR takes: either **(a)** it is a behaviour-preserving refactor (request shape, response shape and semantics all unchanged; link the existing handler code being modified), or **(b)** it is a contract change authorized by **its own ADR**, merged with or before this PR. Note the dividing question is whether the field's documented *meaning* changes, not whether its current value is wrong: making a value truthful under an unchanged rule is route (a); changing the rule that determines it is route (b), even if the field name and type are untouched (ADR 0010 is the worked example of (b)).
   <!-- B.1 example: OpenAI chat/completions, `response_format` parameter, https://platform.openai.com/docs/api-reference/chat/create#chat-create-response_format -->
   <!-- B.2 example: ADR 00NN § "Behaviour" -->
 
-- [ ] **No invention beyond the specification.** I confirm this PR does not introduce any field or behaviour not present in OpenAI's spec for the endpoint (B.1) or beyond the scope of the authorizing ADR (B.2). For grandfathered B.2 endpoints, I confirm the change is behaviour-preserving (no contract drift). If something the user actually wants is not in the spec, the right answer is to close this PR and propose an upstream spec change or a new ADR.
+- [ ] **No invention beyond the specification.** I confirm this PR does not introduce any field or behaviour not present in OpenAI's spec for the endpoint (B.1) or beyond the scope of the authorizing ADR (B.2). For grandfathered B.2 endpoints, I confirm the change is either behaviour-preserving (no contract drift) or authorized by its own ADR, per the route declared above. If something the user actually wants is not in the spec, the right answer is to close this PR and propose an upstream spec change or a new ADR.
 
 ## Type of change
 
@@ -55,7 +55,9 @@ Reviewers: this section is for you, not the author. Do not approve until every b
 - [ ] If Class A, I opened `cli.js` at the cited line range and confirmed the operation matches. If Class B, I opened the OpenAI spec at the cited section (B.1) or the authorizing ADR (B.2) and confirmed the behaviour described in this PR matches the cited reference.
 - [ ] I ran (or confirmed CI ran) `.github/workflows/alignment.yml` and it passed.
 - [ ] I am not the commit author of any commit in this PR (Iron Rule 10).
-- [ ] If the PR asserts scope without a `cli.js` citation (Class A) or without an ADR (Class B), I confirmed the justification is sound per `ALIGNMENT.md` Rule 2 and ADR 0006.
+- [ ] I confirmed the declared class myself against `ALIGNMENT.md` § "Current Class B inventory" rather than taking the author's word for it. A misdeclared class means the wrong evidence section was filled and the PR is not reviewable as submitted.
+- [ ] If the PR is Class A with no `cli.js` citation, I did **not** accept `ALIGNMENT.md` Rule 2 as the justification. Rule 2 is a prohibition, not an authorization; an absent hit on a genuine Class A operation closes the PR (Rules 2 and 4). If the endpoint is in the Class B inventory, I asked the author to reclassify instead.
+- [ ] If the PR is Class B, I confirmed an authorizing ADR exists and is cited. For a grandfathered B.2 citation, I confirmed the change really is behaviour-preserving — specifically that the field's documented meaning is unchanged, not merely that its value is now correct. A change to the rule that determines a value is a contract change and needs its own ADR (`ALIGNMENT.md:114`, ADR 0006:39), however small the diff.
 - [ ] If the PR is Class B and adds a new endpoint or new method, I confirmed the authorizing ADR lands in the same merge or before this PR.
 
 ## Related
