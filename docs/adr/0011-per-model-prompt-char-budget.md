@@ -132,13 +132,18 @@ citing it as permission is the category error recorded in the #193 thread.
   such prompts — the same one-time trade ADR 0009 made at the 150k→600k step, one order of
   magnitude up. Operators who do not want it set `CLAUDE_MAX_PROMPT_CHARS` or
   `ocp settings maxPromptChars <n>`, which is precisely what those knobs are for.
-- **The new ceiling is not reachable at the default body cap for multi-byte text**, which is
-  worth knowing because CJK is the audience `charsPerToken = 3` was chosen for.
-  `MAX_BODY_SIZE` defaults to 5 MB (`CLAUDE_MAX_BODY_SIZE`), so a 3,000,000-char request is
-  rejected with a 413 before truncation is ever considered once the encoding exceeds ~1.7
-  bytes/char — 3,000,000 CJK chars is ~9 MB. Nothing regressed here (the 413 is loud, and the
-  cap is unchanged), but an operator who actually wants to feed a 1M-token CJK prompt must
-  raise `CLAUDE_MAX_BODY_SIZE` as well as rely on this ADR.
+- **The default body cap does not block the new ceiling, and an earlier draft of this ADR said
+  it did.** That claim came from a round-1 review finding which the same reviewer retracted in
+  round 2, and it is recorded here rather than silently deleted because it was wrong in the
+  direction that would have sent operators to raise a knob they do not need to touch.
+  `MAX_BODY_SIZE` is not a byte cap: `server.mjs` accumulates the request into a JS **string**
+  (`body += chunk`) and compares `body.length` — UTF-16 code units, i.e. characters. Measured
+  by replicating that loop: 3,000,000 CJK characters is 9,000,000 bytes on the wire but
+  `body.length` = 3,000,000 against a cap of 5,242,880, so no 413 occurs, for any encoding.
+  What the cap does bound, encoding-independently, is the whole serialized conversation: a
+  request body exceeding ~5,242,880 characters is rejected before per-model truncation can
+  trim it. Note `MAX_BODY_SIZE_LABEL` renders that character count as `"5MB"`, which is what
+  misled the review; that mislabel is pre-existing and tracked separately.
 - `claude-haiku-4-5-20251001`, `claude-opus-4-6` and `claude-sonnet-4-6` keep the 600,000-char
   ceiling they have today. This is the property the regression test pins, and it is what
   distinguishes this change from simply raising the ceiling.
