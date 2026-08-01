@@ -3991,14 +3991,176 @@ test("buildStartSh non-darwin: bare lsof resolves fine via PATH (unchanged pre-#
 
 // Wiring/premise check (AGENTS.md's carve-out: legitimate for a harness's own boundary, not
 // for the decision logic itself -- the decision logic above is tested behaviorally). Confirms
-// setup.mjs actually calls the real buildStartSh()/resolveBinaryPath() rather than an inline
+// setup.mjs actually calls the real buildStartSh()/classifyBindCheck() rather than an inline
 // reimplementation drifting back in unnoticed.
-test("setup.mjs wiring: imports buildStartSh/resolveBinaryPath from scripts/lib/start-sh.mjs and no longer inlines a bare lsof call", () => {
+test("setup.mjs wiring: imports buildStartSh/classifyBindCheck from scripts/lib/start-sh.mjs and no longer inlines a bare lsof call", () => {
   const src = _ltRead(testJoin(import.meta.dirname, "setup.mjs"), "utf8");
   assert.match(src, /from ["']\.\/scripts\/lib\/start-sh\.mjs["']/, "setup.mjs must import from scripts/lib/start-sh.mjs");
   assert.match(src, /buildStartSh\(/, "setup.mjs must call buildStartSh()");
-  assert.match(src, /resolveBinaryPath\(/, "setup.mjs must call resolveBinaryPath()");
+  // issue #246 (second half): resolveBinaryPath's absolute-path preference is no longer
+  // called directly from setup.mjs -- it now lives entirely inside classifyBindCheck()
+  // (scripts/lib/start-sh.mjs), which setup.mjs's Step 8 calls instead. The old assertion
+  // here (`resolveBinaryPath(` must appear in setup.mjs) is stale as of this change and is
+  // replaced by classifyBindCheck() below plus the dedicated wiring test further down.
+  assert.match(src, /classifyBindCheck\(/, "setup.mjs must call classifyBindCheck()");
   assert.ok(!/\n\s*lsof -i :/.test(src), "setup.mjs must not re-inline the old bare `lsof -i :` check");
+});
+
+// ── scripts/lib/start-sh.mjs: buildBindCheckCommand / classifyBindCheck (issue #246, second
+// half -- setup.mjs's Step 8 post-install bind-check) ──────────────────────────────────────
+// setup.mjs itself still can never be executed by this suite (see the section header above
+// and AGENTS.md's "NEVER run setup.mjs" constraint) -- same rationale, same extraction
+// pattern, applied to the SECOND of setup.mjs's two lsof call sites (the first, :293's
+// port-liveness gate, was fixed by the section above; PR #269). This one is a pure
+// diagnostic-line builder (see classifyBindCheck()'s own header in start-sh.mjs for the full
+// trace of why `verified` never depends on its outcome), so its money test only needs to
+// prove real-subprocess stderr-preservation, not the full listening-decision state machine
+// the section above exercises.
+import { buildBindCheckCommand, classifyBindCheck } from "./scripts/lib/start-sh.mjs";
+import { execSync as _bindCheckExecSync } from "node:child_process";
+
+console.log("\nscripts/lib/start-sh.mjs -- buildBindCheckCommand (issue #246, second half):");
+
+test("buildBindCheckCommand: darwin prefers the resolveBinaryPath-preferred absolute lsof path", () => {
+  const cmd = buildBindCheckCommand({ port: _startShTestPort, platform: "darwin", lsofPath: "/usr/sbin/lsof", existsSyncFn: () => true });
+  assert.equal(cmd, `/usr/sbin/lsof -nP -iTCP:${_startShTestPort} -sTCP:LISTEN`);
+});
+
+test("buildBindCheckCommand: darwin falls back to the bare name when the absolute path does not exist", () => {
+  const cmd = buildBindCheckCommand({ port: _startShTestPort, platform: "darwin", lsofPath: "/usr/sbin/lsof", existsSyncFn: () => false });
+  assert.equal(cmd, `lsof -nP -iTCP:${_startShTestPort} -sTCP:LISTEN`);
+});
+
+test("buildBindCheckCommand: linux uses ss -tlnp | grep", () => {
+  const cmd = buildBindCheckCommand({ port: _startShTestPort, platform: "linux" });
+  assert.equal(cmd, `ss -tlnp | grep ':${_startShTestPort}'`);
+});
+
+test("buildBindCheckCommand: darwin branch never redirects stderr to /dev/null (issue #246 second half's actual defect)", () => {
+  const cmd = buildBindCheckCommand({ port: _startShTestPort, platform: "darwin", existsSyncFn: () => true });
+  assert.ok(!cmd.includes("2>/dev/null"), `must not redirect stderr: ${cmd}`);
+});
+
+test("buildBindCheckCommand: linux branch never redirects stderr to /dev/null", () => {
+  const cmd = buildBindCheckCommand({ port: _startShTestPort, platform: "linux" });
+  assert.ok(!cmd.includes("2>/dev/null"), `must not redirect stderr: ${cmd}`);
+});
+
+console.log("\nscripts/lib/start-sh.mjs -- classifyBindCheck (issue #246, second half):");
+
+test("classifyBindCheck: execFn returns a line -> kind 'found', line captured verbatim (first line only)", () => {
+  const result = classifyBindCheck({
+    port: _startShTestPort, platform: "darwin",
+    execFn: () => "node    1 u   4u  IPv4 0x0      0t0  TCP *:12345 (LISTEN)\nextra ignored line\n",
+  });
+  assert.equal(result.kind, "found");
+  assert.equal(result.line, "node    1 u   4u  IPv4 0x0      0t0  TCP *:12345 (LISTEN)");
+});
+
+test("classifyBindCheck: execFn returns empty string -> kind 'empty'", () => {
+  const result = classifyBindCheck({ port: _startShTestPort, platform: "darwin", execFn: () => "" });
+  assert.deepEqual(result, { kind: "empty" });
+});
+
+test("classifyBindCheck: execFn throws lsof/grep's own plain 'no match' (status 1, empty stderr) -> kind 'empty' (unchanged, stays silent)", () => {
+  const err = Object.assign(new Error("Command failed"), { status: 1, stderr: "" });
+  const result = classifyBindCheck({ port: _startShTestPort, platform: "darwin", execFn: () => { throw err; } });
+  assert.equal(result.kind, "empty");
+});
+
+test("classifyBindCheck: execFn throws exit 127 'command not found' -> kind 'could-not-run', detail carries the diagnostic text", () => {
+  const err = Object.assign(new Error("Command failed"), { status: 127, stderr: "sh: lsof: command not found" });
+  const result = classifyBindCheck({ port: _startShTestPort, platform: "darwin", execFn: () => { throw err; } });
+  assert.equal(result.kind, "could-not-run");
+  assert.match(result.detail, /command not found/);
+});
+
+test("classifyBindCheck: execFn throws exit 126 'permission denied' -> kind 'could-not-run'", () => {
+  const err = Object.assign(new Error("Command failed"), { status: 126, stderr: "Permission denied" });
+  const result = classifyBindCheck({ port: _startShTestPort, platform: "darwin", execFn: () => { throw err; } });
+  assert.equal(result.kind, "could-not-run");
+  assert.match(result.detail, /Permission denied/);
+});
+
+test("classifyBindCheck: execFn throws with only .message (no .stderr) containing ENOENT -> the .message fallback still classifies it could-not-run", () => {
+  const err = new Error("spawnSync sh ENOENT");
+  const result = classifyBindCheck({ port: _startShTestPort, platform: "darwin", execFn: () => { throw err; } });
+  assert.equal(result.kind, "could-not-run");
+  assert.match(result.detail, /ENOENT/);
+});
+
+// The pre-#246(second-half) setup.mjs:423 body, copied verbatim (before this PR's fix) so the
+// exact regression this half fixes stays provable even after setup.mjs's own source moves on
+// -- same idea as _preFix246StartSh above, applied to this call site.
+function _preFix246BindCheck({ port, lsofPath }) {
+  return `${lsofPath} -nP -iTCP:${port} -sTCP:LISTEN 2>/dev/null`;
+}
+
+console.log("\nclassifyBindCheck MONEY TEST -- real subprocess stderr preservation (issue #246, second half):");
+
+test("MONEY TEST: pre-fix command string swallows a real broken binary's stderr; buildBindCheckCommand's fixed command preserves it", () => {
+  const root = mkdtempSync(testJoin(tmpdir(), "bind-check-money-"));
+  try {
+    // A real, executable fake `lsof` that fails loudly on its OWN stderr -- proves this test
+    // exercises real command execution, not an injected error object.
+    const fakeLsofPath = testJoin(root, "fake-lsof");
+    testWriteFile(fakeLsofPath, `#!/bin/bash\necho "fake-lsof: distinctive-marker-text" >&2\nexit 2\n`);
+    _ltChmod(fakeLsofPath, 0o755);
+
+    let preFixThrew = false;
+    let preFixStderr = "UNSET";
+    try {
+      _bindCheckExecSync(_preFix246BindCheck({ port: _startShTestPort, lsofPath: fakeLsofPath }), { encoding: "utf-8" });
+    } catch (e) {
+      preFixThrew = true;
+      preFixStderr = String(e.stderr || "");
+    }
+    assert.ok(preFixThrew, "the fake lsof stub exits 2 -- pre-fix command must throw");
+    assert.equal(preFixStderr.trim(), "",
+      `pre-fix command's own 2>/dev/null must swallow stderr (defect reproduction); got ${JSON.stringify(preFixStderr)}`);
+
+    const fixedCmd = buildBindCheckCommand({ port: _startShTestPort, platform: "darwin", lsofPath: fakeLsofPath });
+    let fixedThrew = false;
+    let fixedStderr = "UNSET";
+    try {
+      _bindCheckExecSync(fixedCmd, { encoding: "utf-8" });
+    } catch (e) {
+      fixedThrew = true;
+      fixedStderr = String(e.stderr || "");
+    }
+    assert.ok(fixedThrew, "the fake lsof stub exits 2 -- fixed command must also throw");
+    assert.match(fixedStderr, /distinctive-marker-text/,
+      `fixed command must preserve the real stub's stderr; got ${JSON.stringify(fixedStderr)}`);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("setup.mjs wiring: no longer contains the raw '-sTCP:LISTEN'/'ss -tlnp' inline command construction or the empty best-effort catch (issue #246, second half)", () => {
+  const src = _ltRead(testJoin(import.meta.dirname, "setup.mjs"), "utf8");
+  assert.ok(!src.includes("-sTCP:LISTEN"), "setup.mjs must not inline the old lsof command construction (now inside classifyBindCheck())");
+  assert.ok(!src.includes("ss -tlnp"), "setup.mjs must not inline the old ss command construction (now inside classifyBindCheck())");
+  assert.ok(!src.includes("bind check is best-effort"), "setup.mjs must not keep the old empty best-effort catch comment");
+});
+
+// A stricter, PROXIMITY-anchored wiring check (not just "both strings exist somewhere in the
+// 447-line file" -- install-autostart.mjs's own header describes exactly that weaker shape
+// failing to catch a review mutation that emptied a gate while leaving the guarded code
+// unguarded, "co-location, not containment"). setup.mjs's own Step 8 body can never be
+// executed by this suite (AGENTS.md), so this can only be a textual check -- but anchoring the
+// match to "'could-not-run' followed shortly by a warn( call" at least proves the warn() call
+// sits INSIDE the could-not-run branch, not merely somewhere else in the file. Still strictly
+// weaker evidence than a behavioral test: it cannot prove the warn() call fires at runtime,
+// only that the source is shaped as if it does. classifyBindCheck() itself (the actual
+// could-not-run/empty/found classification logic) is covered behaviorally above; this test's
+// only job is the wiring from that classification to the one line of setup.mjs that prints it.
+test("setup.mjs wiring: the could-not-run branch actually calls warn() (proximity-anchored, not just co-located in the file)", () => {
+  const src = _ltRead(testJoin(import.meta.dirname, "setup.mjs"), "utf8");
+  assert.match(
+    src,
+    /bindCheck\.kind === ["']could-not-run["'][\s\S]{0,200}?warn\(/,
+    "setup.mjs must call warn() within the could-not-run branch, not merely elsewhere in the file",
+  );
 });
 
 // ── Doctor --check oauth fast path tests ──

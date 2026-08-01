@@ -61,8 +61,23 @@
 // scenario -- the same scenario :293 fixes), but does NOT get the netstat cross-check:
 // that would add real complexity for a text-only line whose failure mode is already
 // non-functional, and the issue's own text agrees ("its own blast radius is smaller").
+//
+// Second half of issue #246 (this fix): the ABSOLUTE-PATH half of :426 was fixed alongside
+// :293 above, but two things stayed broken there, matching the issue's own text verbatim:
+// (1) BOTH branches of the bind-check command redirected the underlying tool's own stderr to
+// /dev/null, and (2) the surrounding `catch {}` was completely empty, discarding a genuinely-
+// nothing-there empty match and "lsof/ss itself could not run at all" identically. Verified
+// independently (not just taken on the issue's word) by tracing every assignment to `verified`
+// in setup.mjs's Step 8 block: it is set `true` unconditionally immediately after the bind-
+// check's try/catch, regardless of what happened inside it -- nothing downstream ever branches
+// on this block's outcome, confirming it stays a purely cosmetic diagnostic. Sized accordingly:
+// buildBindCheckCommand()/classifyBindCheck() below turn "any failure -> total silence" into "a
+// real tool-execution fault gets ONE honest diagnostic line, a genuine empty match stays exactly
+// as silent as before" -- no netstat cross-check, no privilege-gap classifier, nothing that
+// would only earn its complexity if something downstream actually acted on the distinction.
 
 import { existsSync as realExistsSync } from "node:fs";
+import { execSync as realExecSync } from "node:child_process";
 
 // Prefers `absolutePath` when it exists on this host, falling back to the bare
 // `fallbackName` (relying on $PATH, exactly the pre-#246 behavior) otherwise -- so a host
@@ -184,4 +199,60 @@ else
   echo "claude-proxy already running on port $PORT"
 fi
 `;
+}
+
+// Pure command-string builder for setup.mjs's Step 8 post-install bind-check (issue #246,
+// second half). No execution happens here -- classifyBindCheck() below is the only caller
+// that actually runs the returned string -- so this is testable with a plain return-value
+// assertion, no subprocess needed. Never appends `2>/dev/null` (or any other stderr redirect)
+// on EITHER platform branch: that redirect is the literal remaining defect the issue
+// describes for the old setup.mjs:426 body -- it threw the underlying tool's own stderr away,
+// which is exactly what made "lsof/ss itself is broken" indistinguishable from "ran fine,
+// found nothing" at the call site. `existsSyncFn` threads through to resolveBinaryPath() so
+// tests can pick either branch deterministically regardless of what is actually installed on
+// the host running the suite.
+export function buildBindCheckCommand({ port, platform = process.platform, lsofPath = "/usr/sbin/lsof", existsSyncFn = realExistsSync }) {
+  return platform === "linux"
+    ? `ss -tlnp | grep ':${port}'`
+    : `${resolveBinaryPath(lsofPath, "lsof", existsSyncFn)} -nP -iTCP:${port} -sTCP:LISTEN`;
+}
+
+// Runs buildBindCheckCommand()'s command via an injectable execFn (defaulting to the real
+// execSync) and classifies the outcome into exactly three kinds (issue #246, second half).
+// setup.mjs's Step 8 bind-check used to collapse every failure -- a genuine empty match AND
+// lsof/ss itself failing to execute -- into the same silent blank line, via a bare `catch {}`
+// sitting on top of a command that had already thrown its own stderr away with
+// `2>/dev/null`. This restores the distinction the operator needs WITHOUT changing anything
+// downstream: see this function's call site in setup.mjs, where `verified` is set true
+// unconditionally right after this block runs regardless of its outcome (traced end-to-end
+// for this fix -- nothing reads this function's return value except the one console.log/
+// warn() line at that call site), which is why this intentionally does NOT get
+// darwinListeningCheck()'s netstat privilege-gap cross-check above: that earns its complexity
+// only when something downstream actually acts on the distinction, and here nothing does.
+//
+//   - "found":         the tool ran and matched something -- print `line`.
+//   - "empty":         the tool ran fine and found nothing -- unchanged from today's silence.
+//   - "could-not-run": the tool itself never produced a real "no match" -- surface `detail`.
+//
+// The empty/could-not-run boundary is inherently heuristic: Node's execSync collapses "tool
+// ran, exited nonzero with nothing to say" (lsof/grep's own plain "no match" exit) and "the
+// shell could not even start the tool" into the same thrown-error shape. Classified here by
+// exit status 127/126 (POSIX "command not found" / "found but not executable") or a small set
+// of shell-level phrases in the surfaced text -- the same style scripts/upgrade.mjs's
+// mapLsofFailureToProbeValue already uses for this repo's other lsof-failure classifiers.
+// Anything else (including no status at all, e.g. lsof/grep's own plain "no match" exit)
+// stays "empty" -- the unchanged, pre-#246(second-half) silent case.
+export function classifyBindCheck({ port, platform = process.platform, lsofPath = "/usr/sbin/lsof", existsSyncFn = realExistsSync, execFn = realExecSync }) {
+  const cmd = buildBindCheckCommand({ port, platform, lsofPath, existsSyncFn });
+  try {
+    const out = execFn(cmd, { encoding: "utf-8" }).trim();
+    return out ? { kind: "found", line: out.split("\n")[0] } : { kind: "empty" };
+  } catch (e) {
+    const text = String(e.stderr || e.message || "").trim();
+    const couldNotRun = e.status === 127 || e.status === 126
+      || /command not found|no such file or directory|permission denied|enoent/i.test(text);
+    return couldNotRun
+      ? { kind: "could-not-run", detail: text.split("\n")[0] || (e.status != null ? `exit ${e.status}` : "unknown error") }
+      : { kind: "empty" };
+  }
 }
