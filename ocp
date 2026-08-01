@@ -673,7 +673,32 @@ EOF
 cmd_restart() {
   if [[ "${1:-}" == "gateway" ]]; then
     echo "Restarting gateway..."
-    openclaw gateway restart 2>&1
+    # Issue #263 (the #261 pattern's instance inside cmd_restart, itself the follow-up to
+    # #242's `_pyfail`): a bare `openclaw gateway restart 2>&1` with no `||` handling meant
+    # `set -e` (ocp:7) killed the ENTIRE `ocp` process the instant `openclaw` was missing from
+    # $PATH (bash's own "command not found", exit 127) -- with no OCP-level framing at all, and
+    # no way to tell that apart from openclaw being installed but its OWN restart genuinely
+    # failing, which produced the identical unframed-death shape. OpenClaw is an OPTIONAL
+    # sibling tool (AGENTS.md "What this project is"): its absence is a normal configuration,
+    # not a fault, so it gets its own branch here rather than folding into the generic
+    # `_curl_or_die`-style "could not run" message #261 uses for curl -- "not installed" is
+    # reported once, calmly, and this function returns SUCCESS (0); "installed and failed" is
+    # the opposite: openclaw's own combined output is preserved (2>&1 here is safe -- it feeds a
+    # visible failure message, not a misdiagnosis, unlike the #261 pattern) and surfaced loudly
+    # on stderr with a nonzero return, because that IS the operator's gateway breaking.
+    local gw_out gw_status=0
+    gw_out=$(openclaw gateway restart 2>&1) || gw_status=$?
+    if [[ $gw_status -eq 127 ]] || [[ "$gw_out" == *"command not found"* ]]; then
+      echo "  OpenClaw is not installed — skipping gateway restart (it is an optional sibling tool, not a proxy dependency)."
+      return 0
+    fi
+    if [[ $gw_status -ne 0 ]]; then
+      echo "✗ openclaw gateway restart failed (exit $gw_status):" >&2
+      echo "$gw_out" >&2
+      return 1
+    fi
+    [[ -n "$gw_out" ]] && echo "$gw_out"
+    echo "✓ Gateway restarted."
   else
     echo "Restarting proxy..."
     local self_r script_dir
