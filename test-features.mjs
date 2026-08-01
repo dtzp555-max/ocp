@@ -2009,6 +2009,37 @@ test("#260 non-regression: --target on kind=upgrade (the cross-minor full path) 
   assert.equal(result.target, "v3.12.0");
 });
 
+// Independent review of this PR (#272) found a real MEDIUM: the refusal's own retry guidance
+// told the user to "wait for a checkout-capable path (light or full upgrade)" -- but the light
+// path is NEITHER checkout-capable NOR pin-honoring (it warns and still silently proceeds to
+// `latest`, per #241/#255, a few tests above this one). Following the original wording would
+// have landed the user on an un-pinned version while believing they'd waited for a path that
+// COULD honor the pin -- the exact #260 failure shape, deferred one release instead of
+// prevented. Fixed to name only the full (cross-minor) path, and to point at --rollback for a
+// downgrade instead (mirroring resolveUpgradeTarget's own existing --rollback pointer for the
+// sibling "not newer than current" refusal).
+test("#260 review fix: the fresh_install refusal's retry guidance names ONLY the full upgrade path -- never implies the light path can honor a pin", async () => {
+  await assert.rejects(
+    async () => {
+      await runUpgrade({
+        target: "v3.14.0",
+        yes: true,
+        mockExec: true,
+        mockDoctor: { ready_to_upgrade: false, from_version_supported: false,
+                      next_action: { kind: "fresh_install", ai_executable: ["echo step-1"] },
+                      current_version: "v3.2.0", latest_version: "v3.14.0" }
+      });
+    },
+    (err) => {
+      assert.match(err.message, /full upgrade path/, `message=${JSON.stringify(err.message)}`);
+      assert.match(err.message, /--rollback/, `message=${JSON.stringify(err.message)}`);
+      assert.ok(!/light or full/.test(err.message), `must not claim the light path can honor a pin; message=${JSON.stringify(err.message)}`);
+      assert.ok(!/checkout-capable path \(light/.test(err.message), `message=${JSON.stringify(err.message)}`);
+      return true;
+    }
+  );
+});
+
 // ── --target on the FULL (cross-minor) upgrade path (issue #257) ───────────────────────────────
 // `--target` was parsed from argv and threaded into runUpgrade(opts), but opts.target was never
 // actually READ anywhere in runUpgrade / runFullUpgrade / runFreshInstall / runRollback — the
@@ -10908,6 +10939,21 @@ test("#260 non-regression: the light path's OWN --target WARNING (issue #241/#25
   const r = _bwHarnessRun({ kind: "update", args: ["update", "--target", "v9.9.9"] });
   assert.equal(r.status, 0, `light path must remain a WARN, not a refusal -- deliberately out of #260's own scope; stdout=${JSON.stringify(r.stdout)} stderr=${JSON.stringify(r.stderr)}`);
   assert.match(r.stderr, /is not honored on the light\/patch-bump path/, `stderr=${JSON.stringify(r.stderr)}`);
+});
+
+// Independent review of this PR (#272) found a real MEDIUM: cmd_update's own noop/restart
+// refusal told the user to retry "once a checkout-capable path (light or full upgrade) is
+// available" -- but the test immediately above proves the light path is neither
+// checkout-capable NOR pin-honoring. Following the original wording would have sent the user
+// to the ONE path guaranteed to silently ignore the pin they were just refused for asking.
+// Fixed to name only the full (cross-minor) path and to point at --rollback for a downgrade.
+test("#260 review fix: cmd_update's noop refusal names ONLY the full upgrade path -- never implies the light path can honor a pin", () => {
+  const r = _bwHarnessRun({ kind: "noop", args: ["update", "--target", "v9.9.9"] });
+  assert.notEqual(r.status, 0, `stdout=${JSON.stringify(r.stdout)}`);
+  assert.match(r.stderr, /full upgrade path/, `stderr=${JSON.stringify(r.stderr)}`);
+  assert.match(r.stderr, /--rollback/, `stderr=${JSON.stringify(r.stderr)}`);
+  assert.ok(!/light or full/.test(r.stderr), `must not claim the light path can honor a pin; stderr=${JSON.stringify(r.stderr)}`);
+  assert.ok(!/checkout-capable path \(light/.test(r.stderr), `stderr=${JSON.stringify(r.stderr)}`);
 });
 
 // ── #236: the WARN/INFO block must not kill cmd_update when python3 is absent ────────────────

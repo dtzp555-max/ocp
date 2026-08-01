@@ -625,7 +625,7 @@ export async function runUpgrade(opts = {}) {
         ? "the tree already matches the latest release and only the running service is stale -- this path restarts the current tree as-is and never runs git"
         : "fresh_install replays doctor's own fixed install steps, not a checkout of a specific tag";
     throw new Error(
-      `--target ${opts.target} was requested, but doctor selected the "${kind}" path, which cannot honor a version pin (${why}). Re-run \`ocp update\` without --target, or once a checkout-capable path (light or full upgrade) is available.`
+      `--target ${opts.target} was requested, but doctor selected the "${kind}" path, which cannot honor a version pin (${why}). Re-run \`ocp update\` without --target, or once a cross-minor release makes the full upgrade path available -- that is currently the ONLY path that honors --target (the light/patch-bump path warns and ignores it, per #241/#255). To move to an OLDER version instead, use \`ocp update --rollback\`.`
     );
   }
 

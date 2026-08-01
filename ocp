@@ -1013,8 +1013,10 @@ Notes:
   current-vs-latest decision, not something the caller chooses -- so the
   SAME `ocp update --target vX.Y.Z` command would otherwise pin or silently
   not, depending only on where the host happens to sit in the release
-  cycle. Re-run without --target, or once a checkout-capable path (light or
-  full upgrade) is available.
+  cycle. Re-run without --target, or once a cross-minor release makes the
+  full upgrade path available -- that is currently the ONLY path that
+  honors --target (the light/patch-bump path warns and ignores it, see
+  above). To move to an OLDER version instead, use `ocp update --rollback`.
 EOF
 }
 
@@ -1185,7 +1187,7 @@ for c in d.get('checks', []):
           echo "✗ --target $_TARGET_VAL was requested, but doctor reports the tree already matches the latest release and only the RUNNING SERVICE is stale -- this path restarts the current tree as-is and never runs git, so it cannot check out a different tag." >&2
           ;;
       esac
-      echo "  Run \`ocp update\` again once a newer release makes a checkout-capable path (light or full upgrade) available, or omit --target to accept this path's own outcome." >&2
+      echo "  Run \`ocp update\` again once a cross-minor release makes the full upgrade path available -- that is currently the ONLY path that honors --target (the light/patch-bump path warns and ignores it). To move to an OLDER version instead, use \`ocp update --rollback\`. Or omit --target to accept this path's own outcome." >&2
       return 1
     fi
   fi
