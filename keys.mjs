@@ -139,11 +139,8 @@ export function createKey(name) {
 export function listKeys() {
   const d = getDb();
   return d.prepare(
-    "SELECT id, key, name, created_at, revoked, quota_daily, quota_weekly, quota_monthly FROM api_keys ORDER BY created_at DESC"
-  ).all().map(({ key, ...rest }) => ({
-    ...rest,
-    keyPreview: key.slice(0, 8) + "..." + key.slice(-4),
-  }));
+    "SELECT id, substr(key,1,8)||'...'||substr(key,-4) as keyPreview, name, created_at, revoked, quota_daily, quota_weekly, quota_monthly FROM api_keys ORDER BY created_at DESC"
+  ).all();
 }
 
 export function revokeKey(idOrName) {
@@ -166,10 +163,10 @@ export function validateKey(key) {
 
 export function recordUsage({ keyId, keyName, model, promptChars, responseChars, elapsedMs, success }) {
   const d = getDb();
-  d.prepare(`
-    INSERT INTO usage_log (key_id, key_name, model, prompt_chars, response_chars, elapsed_ms, success)
-    VALUES (?, ?, ?, ?, ?, ?, ?)
-  `).run(keyId ?? null, keyName || "anonymous", model, promptChars, responseChars, elapsedMs, success ? 1 : 0);
+  d.prepare(
+    "INSERT INTO usage_log (key_id, key_name, model, prompt_chars, response_chars, elapsed_ms, success)" +
+    " VALUES (?, ?, ?, ?, ?, ?, ?)"
+  ).run(keyId ?? null, keyName || "anonymous", model, promptChars, responseChars, elapsedMs, success ? 1 : 0);
 }
 
 // ── Usage queries ──
@@ -181,23 +178,16 @@ export function getUsageByKey({ since, until } = {}) {
   if (since) { where += " AND created_at >= ?"; params.push(since); }
   if (until) { where += " AND created_at <= ?"; params.push(until); }
 
-  return d.prepare(`
-    SELECT
-      key_name,
-      COUNT(*) as requests,
-      SUM(CASE WHEN success = 1 THEN 1 ELSE 0 END) as successes,
-      SUM(CASE WHEN success = 0 THEN 1 ELSE 0 END) as errors,
-      SUM(prompt_chars) as total_prompt_chars,
-      SUM(response_chars) as total_response_chars,
-      SUM(elapsed_ms) as total_elapsed_ms,
-      AVG(elapsed_ms) as avg_elapsed_ms,
-      MIN(created_at) as first_request,
-      MAX(created_at) as last_request
-    FROM usage_log
-    ${where}
-    GROUP BY key_name
-    ORDER BY requests DESC
-  `).all(...params);
+  return d.prepare(
+    "SELECT key_name, COUNT(*) as requests," +
+    " SUM(CASE WHEN success = 1 THEN 1 ELSE 0 END) as successes," +
+    " SUM(CASE WHEN success = 0 THEN 1 ELSE 0 END) as errors," +
+    " SUM(prompt_chars) as total_prompt_chars, SUM(response_chars) as total_response_chars," +
+    " SUM(elapsed_ms) as total_elapsed_ms, AVG(elapsed_ms) as avg_elapsed_ms," +
+    " MIN(created_at) as first_request, MAX(created_at) as last_request" +
+    " FROM usage_log " + where +
+    " GROUP BY key_name ORDER BY requests DESC"
+  ).all(...params);
 }
 
 export function getUsageTimeline({ keyName, hours = 24 } = {}) {
@@ -207,28 +197,21 @@ export function getUsageTimeline({ keyName, hours = 24 } = {}) {
   const params = [since];
   if (keyName) { where += " AND key_name = ?"; params.push(keyName); }
 
-  return d.prepare(`
-    SELECT
-      strftime('%Y-%m-%dT%H:00:00', created_at) as hour,
-      COUNT(*) as requests,
-      SUM(prompt_chars) as prompt_chars,
-      SUM(response_chars) as response_chars,
-      AVG(elapsed_ms) as avg_elapsed_ms
-    FROM usage_log
-    ${where}
-    GROUP BY hour
-    ORDER BY hour
-  `).all(...params);
+  return d.prepare(
+    "SELECT strftime('%Y-%m-%dT%H:00:00', created_at) as hour, COUNT(*) as requests," +
+    " SUM(prompt_chars) as prompt_chars, SUM(response_chars) as response_chars," +
+    " AVG(elapsed_ms) as avg_elapsed_ms" +
+    " FROM usage_log " + where +
+    " GROUP BY hour ORDER BY hour"
+  ).all(...params);
 }
 
 export function getRecentUsage(limit = 50) {
   const d = getDb();
-  return d.prepare(`
-    SELECT key_name, model, prompt_chars, response_chars, elapsed_ms, success, created_at
-    FROM usage_log
-    ORDER BY created_at DESC
-    LIMIT ?
-  `).all(limit);
+  return d.prepare(
+    "SELECT key_name, model, prompt_chars, response_chars, elapsed_ms, success, created_at" +
+    " FROM usage_log ORDER BY created_at DESC LIMIT ?"
+  ).all(limit);
 }
 
 // ── SQLite datetime helper ──
@@ -271,14 +254,12 @@ export function checkQuota(keyId, _keyName) {
   }
 
   // Single query for all periods (widest window = monthly)
-  const row = d.prepare(`
-    SELECT
-      SUM(CASE WHEN created_at >= ? THEN 1 ELSE 0 END) as daily_cnt,
-      SUM(CASE WHEN created_at >= ? THEN 1 ELSE 0 END) as weekly_cnt,
-      COUNT(*) as monthly_cnt
-    FROM usage_log
-    WHERE key_id = ? AND success = 1 AND created_at >= ?
-  `).get(startOfToday, sevenDaysAgo, keyId, thirtyDaysAgo);
+  const row = d.prepare(
+    "SELECT SUM(CASE WHEN created_at >= ? THEN 1 ELSE 0 END) as daily_cnt," +
+    " SUM(CASE WHEN created_at >= ? THEN 1 ELSE 0 END) as weekly_cnt," +
+    " COUNT(*) as monthly_cnt" +
+    " FROM usage_log WHERE key_id = ? AND success = 1 AND created_at >= ?"
+  ).get(startOfToday, sevenDaysAgo, keyId, thirtyDaysAgo);
 
   const checks = [
     { period: "daily",   limit: keyRow.quota_daily,   used: row?.daily_cnt ?? 0,   resetsIn: msToHuman(tomorrowUTC - now) },
@@ -308,7 +289,7 @@ export function updateKeyQuota(idOrName, updates = {}) {
   if (setClauses.length === 0) return false;
   params.push(idOrName, idOrName);
   const result = d.prepare(
-    `UPDATE api_keys SET ${setClauses.join(", ")} WHERE id = ? OR name = ?`
+    "UPDATE api_keys SET " + setClauses.join(", ") + " WHERE id = ? OR name = ?"
   ).run(...params);
   return result.changes > 0;
 }
@@ -326,14 +307,12 @@ export function getKeyQuota(keyId) {
   const sevenDaysAgo  = sqliteDatetime(new Date(Date.now() - 7 * 86400000));
   const thirtyDaysAgo = sqliteDatetime(new Date(Date.now() - 30 * 86400000));
 
-  const row = d.prepare(`
-    SELECT
-      SUM(CASE WHEN created_at >= ? THEN 1 ELSE 0 END) as daily_cnt,
-      SUM(CASE WHEN created_at >= ? THEN 1 ELSE 0 END) as weekly_cnt,
-      COUNT(*) as monthly_cnt
-    FROM usage_log
-    WHERE key_id = ? AND success = 1 AND created_at >= ?
-  `).get(startOfToday, sevenDaysAgo, keyId, thirtyDaysAgo);
+  const row = d.prepare(
+    "SELECT SUM(CASE WHEN created_at >= ? THEN 1 ELSE 0 END) as daily_cnt," +
+    " SUM(CASE WHEN created_at >= ? THEN 1 ELSE 0 END) as weekly_cnt," +
+    " COUNT(*) as monthly_cnt" +
+    " FROM usage_log WHERE key_id = ? AND success = 1 AND created_at >= ?"
+  ).get(startOfToday, sevenDaysAgo, keyId, thirtyDaysAgo);
 
   return {
     daily:   { limit: keyRow.quota_daily   ?? null, used: row?.daily_cnt ?? 0 },
@@ -350,21 +329,21 @@ export function getKeyQuota(keyId) {
 export function cacheHash(model, messages, opts = {}) {
   const keyId = opts.keyId || "anon";
   const h = createHash("sha256");
-  h.update(`v2|k:${keyId}|`);
+  h.update("v2|k:" + keyId + "|");
   h.update(model);
-  if (opts.temperature != null) h.update(`t:${opts.temperature}`);
-  if (opts.max_tokens != null) h.update(`mt:${opts.max_tokens}`);
-  if (opts.top_p != null) h.update(`tp:${opts.top_p}`);
+  if (opts.temperature != null) h.update("t:" + opts.temperature);
+  if (opts.max_tokens != null) h.update("mt:" + opts.max_tokens);
+  if (opts.top_p != null) h.update("tp:" + opts.top_p);
   // #176: fold the server's boot-config epoch into the key, so a config change that shapes
   // answers (operator system prompt, wrapper text, allowed tools, NO_CONTEXT) invalidates
   // the persistent cache instead of serving answers composed under the old config. Callers
   // that omit it (older paths, tests) hash byte-identically to before.
-  if (opts.configEpoch != null) h.update(`ce:${opts.configEpoch}|`);
+  if (opts.configEpoch != null) h.update("ce:" + opts.configEpoch + "|");
   // Structured-output (OpenAI response_format / json_mode) requests must never share a cache slot
   // with the conversational answer to the same prompt, nor with a different schema — the steering
   // instruction and validated JSON payload differ. Keying on the detected descriptor isolates them.
   // Absent for normal requests → hashes are byte-identical to pre-change.
-  if (opts.structured != null) h.update(`s:${JSON.stringify(opts.structured)}`);
+  if (opts.structured != null) h.update("s:" + JSON.stringify(opts.structured));
   for (const m of messages) {
     h.update(m.role || "");
     h.update(typeof m.content === "string" ? m.content : JSON.stringify(m.content));
@@ -406,10 +385,10 @@ export function getCachedResponse(hash, ttlMs) {
 export function setCachedResponse(hash, model, response) {
   const d = getDb();
   // Upsert: if hash already exists (race condition), just update
-  d.prepare(`
-    INSERT INTO response_cache (hash, model, response) VALUES (?, ?, ?)
-    ON CONFLICT(hash) DO UPDATE SET response = excluded.response, created_at = datetime('now'), hits = 0
-  `).run(hash, model, response);
+  d.prepare(
+    "INSERT INTO response_cache (hash, model, response) VALUES (?, ?, ?)" +
+    " ON CONFLICT(hash) DO UPDATE SET response = excluded.response, created_at = datetime('now'), hits = 0"
+  ).run(hash, model, response);
 }
 
 // Clear all cached responses, or expired ones only
