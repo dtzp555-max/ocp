@@ -2068,6 +2068,31 @@ test("postFlightOk: a degraded server rejects regardless of version", () => {
   assert.equal(postFlightOk(null, "v3.22.1"), false);
 });
 
+// The DISCLOSED WEAKER DIRECTION, pinned (independent review MEDIUM-2 on #289). #289 accepts,
+// deliberately, that ONE conclusive rejection no longer blocks post-flight: ADR 0010 degrades
+// only after AUTH_DEGRADE_AFTER = 2 because one rejection is a token-rotation race, and
+// post-flight sees exactly that first probe on a fresh process. Before this test, that trade was
+// argued in a comment and asserted nowhere — so `if (body?.status !== "ok" || body?.auth?.ok ===
+// false) return false;` silently PARTIALLY REVERTED the fix and the whole suite still passed.
+// A deliberate relaxation that no test can see is indistinguishable from an accidental one.
+test("postFlightOk: #289 — ONE conclusive rejection does NOT block a good restart (the accepted weaker direction)", () => {
+  const body = { status: "ok", version: "3.27.0",
+                 auth: { ok: false, message: "Invalid refresh token",
+                         lastOutcome: "rejected", consecutiveFailures: 1 } };
+  assert.equal(body.auth.consecutiveFailures, 1,
+    "premise: exactly ONE rejection — two would legitimately make status degraded");
+  assert.equal(postFlightOk(body, "v3.27.0"), true,
+    "post-flight verifies a RESTART, not credentials; ADR 0010 holds one rejection is a " +
+    "token-rotation race, and a real outage is caught by doctor's fix_oauth pre-flight gate");
+});
+
+test("postFlightOk: #289 — TWO conclusive rejections DO block (status has gone degraded)", () => {
+  const body = { status: "degraded", version: "3.27.0",
+                 auth: { ok: false, lastOutcome: "rejected", consecutiveFailures: 2 } };
+  assert.equal(postFlightOk(body, "v3.27.0"), false,
+    "the weaker direction stops exactly where ADR 0010 says a rejection becomes a condition");
+});
+
 test("postFlightOk: unknown/empty target degrades to the serving check alone (never blocks)", () => {
   assert.equal(postFlightOk({ status: "ok", auth: { ok: true }, version: "3.22.1" }, ""), true);
   assert.equal(postFlightOk({ status: "ok", auth: { ok: true }, version: "3.22.1" }, undefined), true);
@@ -14220,6 +14245,44 @@ function rpStatus(shape) {
   };
 }
 
+// LIVE-SERVER PREMISE GUARD (independent review LOW-1 on #289). The self-check below asserts the
+// fixture against itself, which cannot catch the fixture being wrong about what server.mjs really
+// emits. The ESTABLISHED shape is already pinned against a real boot by the #232 integration test
+// ("an INCONCLUSIVE auth probe ... preserves ok and the verdict"), but the FRESH shape — the only
+// one post-flight ever sees, and the entire basis of this fix — was pinned by nothing. Reasoning
+// about a payload in prose while asserting only a hand-written copy of it is precisely the gap
+// #289 exists to close, so it is closed here too rather than only argued about.
+//
+// AUTH_PROBE_MODE=signal WITHOUT AUTH_PROBE_FIRST_OK is a fresh boot whose very first probe dies
+// on a signal — the same branch a real AUTH_CHECK_TIMEOUT_MS expiry takes, in milliseconds
+// instead of 10s, and with no prior conclusive verdict to preserve.
+ltTest("replay premise (LIVE): a real server.mjs whose FIRST probe dies on a signal emits exactly rpHealth('fresh')", async () => {
+  if (!LT_POSIX) return;
+  const dir = ltMkdir(); const fake = ltAuthFake(dir);
+  const probeLog = join(dir, "probes.txt");
+  const { child, buf, port } = await ltBootFresh({
+    CLAUDE_BIN: fake, AUTH_PROBE_LOG: probeLog, AUTH_PROBE_MODE: "signal",
+    CLAUDE_AUTH_CHECK_INTERVAL_MS: "300",
+  }, dir);
+  try {
+    const h = await ltWaitHealth(port, b => b.auth && b.auth.lastOutcome === "timeout", 15000);
+    assert.ok(h, `the signal-killed first probe never landed — ${ltDiag(buf)}`);
+    const f = rpHealth("fresh");
+    assert.equal(h.auth.ok, null,
+      `a fresh boot with no conclusive probe must report auth.ok=null; got ${JSON.stringify(h.auth)}`);
+    assert.equal(h.auth.ok, f.auth.ok, "fixture must match the live shape");
+    assert.equal(h.auth.lastOutcome, f.auth.lastOutcome, "fixture must match the live lastOutcome");
+    assert.equal(h.auth.consecutiveFailures, f.auth.consecutiveFailures,
+      "fixture must match the live tally");
+    assert.equal(h.status, f.status,
+      `the serving verdict postFlightOk now reads must be "ok" on a real inconclusive boot; got ${h.status}`);
+    // The decision, driven by the REAL payload rather than the fixture — this is the end-to-end
+    // statement of the fix: main's predicate returns false here, and that was the whole defect.
+    assert.equal(postFlightOk(h, h.version), true,
+      "postFlightOk must accept a real, live, freshly-booted proxy whose first auth probe timed out");
+  } finally { child.kill("SIGKILL"); _ltRmRetry(dir); }
+});
+
 // Premise guard. Everything below is worthless if the fixture is not actually the ADR 0010
 // inconclusive state, so assert the fixture's own shape before trusting any decision read off it.
 test("replay premise: the fixture IS ADR 0010's inconclusive state (status ok, tally untouched)", () => {
@@ -14304,6 +14367,12 @@ test("replay → doctor DECIDES kind!=fix_oauth and does not block the next upda
   assert.notEqual(r.next_action.kind, "fix_oauth",
     "must not route the operator to debug credentials that were never rejected (#289)");
   assert.equal(r.ready_to_upgrade, true, "and must not refuse the next `ocp update`");
+  // Independent review MEDIUM-3: warn_count was asserted only for key-presence and for ==0, so
+  // NO test could observe a non-zero value and `const warn_count = 0` survived as a mutation.
+  // doctor.mjs:996 prints "Summary: N FAIL, M WARN" from these two numbers, so an uncounted WARN
+  // is a WARN the operator is told does not exist.
+  assert.equal(r.warn_count, 1, "the oauth_ok WARN must be COUNTED, not just pushed");
+  assert.equal(r.fail_count, 0);
 });
 
 test("replay → doctor's message states the OBSERVED value, never a hard-coded auth.ok=false", async () => {
@@ -14342,6 +14411,11 @@ test("replay → doctor --check oauth DECIDES kind!=fix_oauth and exits 0 (FRESH
   assert.equal(oauth.level, "WARN");
   assert.notEqual(r.next_action.kind, "fix_oauth");
   assert.equal(r.fail_count, 0, "`ocp doctor --check oauth` exits on fail_count; 0 keeps exit 0");
+  // Independent review MEDIUM-1: this path hard-coded `warn_count: 0`, which was true while only
+  // PASS/FAIL were reachable and became a lie the moment #289 made WARN reachable — printing
+  // "Summary: 0 FAIL, 0 WARN" directly beneath the [WARN] line it had just emitted.
+  assert.equal(r.warn_count, 1,
+    "the oauth_ok WARN must be counted on the --check oauth path too, not hard-coded to 0");
   assert.ok(!/auth\.ok=false/.test(oauth.message), `got: ${oauth.message}`);
   // The next_action must not claim health it never established, on the very path doctor's own
   // fix_oauth remediation tells the operator to re-run.

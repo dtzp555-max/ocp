@@ -848,7 +848,11 @@ export async function runDoctor(opts = {}) {
         `launchctl bootstrap gui/$(id -u) ${join(homedir(), "Library", "LaunchAgents", "dev.ocp.proxy.plist")}`,
         `${ocpDir}/ocp doctor`
       ],
-      verify: "ocp doctor expects oauth_ok=PASS",
+      // Independent review LOW-2 on #289: this remediation RESTARTS the service, and by ADR
+      // 0010 a freshly restarted proxy reports auth.ok=null — oauth_ok WARN, not PASS — until
+      // its first probe concludes. Demanding PASS immediately afterwards sets an expectation the
+      // fix itself makes temporarily unreachable, and would read as "the fix did not work".
+      verify: "ocp doctor expects oauth_ok=PASS (WARN immediately after the restart is expected — the first auth probe has not concluded yet; re-run once it has)",
       reference: "~/.cc-rules/memory/learnings/ocp_claude_native_binary_postinstall.md"
     };
   } else if (kind === "fix_service") {
@@ -939,7 +943,8 @@ function runOauthOnly(opts, checks, push) {
         `launchctl bootstrap gui/$(id -u) ${join(homedir(), "Library", "LaunchAgents", "dev.ocp.proxy.plist")}`,
         `${ocpDir}/ocp doctor --check oauth`
       ],
-      verify: "ocp doctor --check oauth expects PASS",
+      // Same as the full path's fix_oauth verify above (independent review LOW-2 on #289).
+      verify: "ocp doctor --check oauth expects PASS (WARN immediately after the restart is expected — the first auth probe has not concluded yet; re-run once it has)",
       reference: "~/.cc-rules/memory/learnings/ocp_claude_native_binary_postinstall.md"
     };
   } else {
@@ -967,7 +972,13 @@ function runOauthOnly(opts, checks, push) {
     latest_version: opts.mockLatest || "skipped",
     from_version_supported: true,
     fail_count,
-    warn_count: 0,
+    // Computed, not the literal 0 it used to be (independent review MEDIUM-1 on #289). The
+    // literal was correct while this path could only ever push PASS or FAIL; #289 made WARN
+    // reachable here, and a hard-coded 0 then printed "Summary: 0 FAIL, 0 WARN" directly under
+    // a [WARN] oauth_ok line and under-reported to any agent reading --json. That is the same
+    // hard-coded-literal-asserting-an-unobserved-state defect this issue exists to remove, so
+    // it is derived from `checks` exactly as the full run does it.
+    warn_count: checks.filter(c => c.level === "WARN").length,
     checks,
     next_action
   };
