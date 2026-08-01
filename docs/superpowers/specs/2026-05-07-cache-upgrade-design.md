@@ -28,6 +28,12 @@ This PR pair extends the existing cache (introduced in earlier commits) without 
 
 Per Rule 1 / Rule 5: every commit body in this PR pair will state the absence of `cli.js` reference explicitly and justify scope under Rule 2's value-add carve-out for non-wire-affecting proxy operations.
 
+> **Correction (2026-08-01, per issue #282).** The sentence above justifies scope under "Rule 2's value-add carve-out." No such carve-out exists: `ALIGNMENT.md` Rule 2 (`ALIGNMENT.md:21`, "No Invention") is a prohibition with no value-add exception — verified directly against the constitution (`grep -ci 'carve.out\|value-add' ALIGNMENT.md` → 0) — and `ALIGNMENT.md:17` additionally scopes Rules 1–5 to Class A (`cli.js`-mirror) surface regardless. A prohibition cannot authorize anything, in Class A or Class B.
+>
+> This document was drafted before ADR 0006 (dated 2026-05-20, less than two weeks later), which is the taxonomy that actually governs this surface. Under it: the internal cache mechanics behind `/v1/chat/completions` (D1–D3 — per-key isolation, `cache_control` bypass, chunked replay) are Class B.1, covered by ADR 0006's authorization of that endpoint's existing surface; the additive `/cache/stats` fields that shipped with D4 (`inflight`, `requesters` — CHANGELOG v3.13.0, "Existing fields `entries`, `totalHits`, `sizeBytes` are preserved unchanged") are Class B.2, grandfathered by ADR 0006 subject to the behaviour-preserving bar at `ALIGNMENT.md:114`.
+>
+> D1–D4 stand as shipped in v3.13.0. Only the cited authority was wrong.
+
 ---
 
 ## Key decisions (with rationale)

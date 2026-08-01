@@ -180,6 +180,12 @@ Historical reference: PR #43 / postmortem #44 (2026-04-22) scrubbed a prior leak
 
 `cli.js` does not itself emit SSE heartbeat frames — claude CLI speaks newline-delimited JSON to stdout, not SSE. SSE is an OCP-owned translation layer. Per `ALIGNMENT.md` Rule 2 / `AGENTS.md` ("OCP forwards, observes, and multiplexes traffic that cli.js already emits"): heartbeats are a translation-layer response-shaping concern, not a new endpoint and not a behavior mimicry. The PR body will state this explicitly in the `cli.js` citation checkbox and reference this design doc.
 
+> **Correction (2026-08-01, per issue #282).** The paragraph above cites `ALIGNMENT.md` Rule 2 as the reason heartbeat frames are in scope. Rule 2 ("No Invention") is a prohibition — it does not authorize anything — and `ALIGNMENT.md:17` additionally scopes Rules 1–5 to Class A (`cli.js`-mirror) surface only. This design was never Class A surface, so Rule 2 was never the applicable rule in either direction.
+>
+> This document was drafted before ADR 0006 (dated 2026-05-20). The `/v1/chat/completions` streaming path this design extends is Class B.1 (`ALIGNMENT.md` § "Current Class B inventory"); its protocol authority is OpenAI's published `/v1/chat/completions` specification (https://platform.openai.com/docs/api-reference/chat/create) plus ADR 0006 — not `cli.js`, and not Rule 2. Under that authority the reasoning in this section still holds: OpenAI's spec does not forbid an SSE comment frame, which conforming SSE parsers are specified to ignore, so the feature remains in scope as an additive, opt-in response-shaping behavior.
+>
+> The decision stands as shipped in v3.12.0 ("Streaming heartbeat" — see CHANGELOG). Only the cited authority was wrong.
+
 ## IDR (Iron Rule 11) disposition
 
 Single PR. Scope is one feature (SSE heartbeat) × one layer (streaming response formatting) × one severity (minor opt-in addition). Release-kit companion files (version bump, CHANGELOG, README) are bundled with the code change per the explicit Iron Rule 11 example ("版本 bump 相关的小改动 + README + CHANGELOG 可以同 PR"). The separate filings for the dangling-client bug (`server.mjs:480-489`) and any follow-up heartbeat format variants are IDR-compliant — each lands as its own PR.
