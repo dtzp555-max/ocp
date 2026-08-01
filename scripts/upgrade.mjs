@@ -1085,6 +1085,62 @@ async function runRollback(opts) {
   }
   for (const c of restartPlan.plan.cmds) exec(c.cmd, c.label);
 
+  // Issue #274 (split from #253's own item 2): unlike runFullUpgrade's phase 6, this used to
+  // return success unconditionally once the restart phase's shell commands exited 0 -- a
+  // rollback that "succeeded" while the restored tree was not what actually came back up had
+  // nothing left to catch it. That is the same failure shape this file has hit three times
+  // already: #214 (retry short-circuited into a no-op while the tree was new and the process
+  // old -- only /health told the truth), #241 (the light path had no post-flight), and #232 (a
+  // health verdict that did not track serving). Reuses runPostFlightCheck()/postFlightOk() --
+  // the SAME acceptance predicate every other path in this file already uses -- rather than a
+  // fourth hand-rolled check.
+  //
+  // Target is meta.fromVersion, deliberately NOT doctor.latest_version or any upgrade target:
+  // rollback's entire point is restoring the OLDER version recorded in the snapshot's own
+  // from-version.txt (writeSnapshot, scripts/lib/snapshot.mjs, writes fromVersion as
+  // doctor.current_version at the time the snapshot was taken -- the version the just-restored
+  // fromCommit actually served). Comparing against toVersion/doctor.latest_version would check
+  // the rollback against the version it is trying to LEAVE, not the one it is restoring --
+  // exactly backwards. See PR body for the fuller design-question writeup #274 asked for.
+  //
+  // opts.mockProbe: the SAME test hook runPostFlightCheck already exposes for its own callers
+  // (not a new name) -- reused verbatim so this phase is independently testable without a live
+  // server, the same way opts.run already lets resolveRestartPlan's own gathering be driven
+  // end-to-end regardless of opts.mockExec. Under plain opts.mockExec with no mockProbe, this
+  // phase is skipped like every other mutating phase above, so every existing all-mock rollback
+  // test is unaffected. A real (non-mockExec) rollback always runs the real check.
+  let postFlight = { ok: true, lastSeen: null, target: String(meta.fromVersion || "").replace(/^v/, "") };
+  if (opts.mockProbe || !opts.mockExec) {
+    postFlight = await runPostFlightCheck(meta.fromVersion, {
+      mockProbe: opts.mockProbe,
+      attempts: opts.postFlightAttempts,
+      intervalMs: opts.postFlightIntervalMs,
+    });
+    phases.push({
+      name: "post-flight",
+      status: postFlight.ok ? "ok" : "fail",
+      ...(postFlight.ok ? {} : {
+        message: `health did not return auth.ok=true AND version=${postFlight.target} within the post-flight budget`
+          + (postFlight.lastSeen
+            ? ` (last saw version=${postFlight.lastSeen} — the restored tree may not be what's running; check \`ss -ltnp\` / \`lsof -i\`)`
+            : " (unreachable)"),
+      }),
+    });
+  } else {
+    phases.push({ name: "post-flight", status: "skipped-mock" });
+  }
+
+  if (!postFlight.ok) {
+    // No further fallback to retry (#221's HIGH-A finding about permanent-refusal traps does
+    // not apply here: the restart phase already ran, this only decides whether to REPORT
+    // success truthfully) -- throw, matching runFullUpgrade's own post-flight-failure shape,
+    // so operators get the same failure contract regardless of which path failed.
+    throw Object.assign(
+      new Error(`rollback post-flight failed: restored tree may not be what's running — run \`ocp doctor\` before assuming the rollback succeeded`),
+      { phases, target: target.path }
+    );
+  }
+
   return { path: "rollback", executed: true, changed: true, target: target.path, phases };
 }
 

@@ -3354,6 +3354,72 @@ test("rollback latest snapshot restores files (mockExec)", async () => {
   assert.ok(result.phases.some(p => p.name === "git-checkout"));
 });
 
+console.log("\nRollback post-flight verification (issue #274) — a 'successful' rollback must confirm what's actually serving:");
+
+// Before this fix, runRollback reported success unconditionally once the restart phase's shell
+// commands exited 0 — it never checked that the restored tree is what actually came back up.
+// opts.mockProbe is the SAME test hook runPostFlightCheck already exposes to its other callers
+// (the bash "restart"/"light" paths via --post-flight-only); reused here, not a new name, so
+// this phase is testable end-to-end without a live server, independent of opts.mockExec.
+
+test("#274 (the money test): rollback reports FAILURE when post-flight does not confirm the snapshot's fromVersion, even though every restart phase exited 0", async () => {
+  await assert.rejects(async () => {
+    await runUpgrade({
+      rollback: true, yes: true, mockExec: true,
+      mockSnapshots: [{ name: "upgrade-snapshot-2026-05-11T08:30:00Z", path: "/tmp/snap-x" }],
+      mockSnapshotMeta: { fromCommit: "abc1234", fromVersion: "v3.10.0", toVersion: "v3.14.0", path: "/tmp/snap-x" },
+      // A stale/orphan process still answers auth.ok=true but serves the version rollback was
+      // trying to LEAVE, not the one it restored — exactly the "reports success while serving
+      // the wrong tree" shape #274 describes.
+      mockProbe: () => ({ auth: { ok: true }, version: "3.14.0" }),
+      postFlightAttempts: 1, postFlightIntervalMs: 0,
+    });
+  }, /rollback post-flight failed/);
+});
+
+test("#274 control: rollback reports SUCCESS when post-flight confirms the snapshot's fromVersion (proves the money test's failure is real, not rollback just always failing now)", async () => {
+  const result = await runUpgrade({
+    rollback: true, yes: true, mockExec: true,
+    mockSnapshots: [{ name: "upgrade-snapshot-2026-05-11T08:30:00Z", path: "/tmp/snap-x" }],
+    mockSnapshotMeta: { fromCommit: "abc1234", fromVersion: "v3.10.0", toVersion: "v3.14.0", path: "/tmp/snap-x" },
+    mockProbe: () => ({ auth: { ok: true }, version: "3.10.0" }),
+    postFlightAttempts: 1, postFlightIntervalMs: 0,
+  });
+  assert.equal(result.path, "rollback");
+  assert.equal(result.executed, true);
+  const pf = result.phases.find(p => p.name === "post-flight");
+  assert.ok(pf, "post-flight phase must be recorded");
+  assert.equal(pf.status, "ok");
+});
+
+test("#274: rollback post-flight targets meta.fromVersion, NOT toVersion — a probe still serving toVersion must fail even though that version IS a real, known version", async () => {
+  // Guards the specific design decision #274 asked for: rollback restores fromCommit (which
+  // served fromVersion), so a probe confirming toVersion (the version being rolled BACK FROM)
+  // must still fail — checking toVersion here would be checking the rollback against the
+  // version it is trying to leave, not the one it is restoring.
+  await assert.rejects(async () => {
+    await runUpgrade({
+      rollback: true, yes: true, mockExec: true,
+      mockSnapshots: [{ name: "upgrade-snapshot-2026-05-11T08:30:00Z", path: "/tmp/snap-x" }],
+      mockSnapshotMeta: { fromCommit: "abc1234", fromVersion: "v3.10.0", toVersion: "v3.14.0", path: "/tmp/snap-x" },
+      mockProbe: () => ({ auth: { ok: true }, version: "3.14.0" }), // toVersion, not fromVersion
+      postFlightAttempts: 1, postFlightIntervalMs: 0,
+    });
+  }, /rollback post-flight failed/);
+});
+
+test("#274: rollback post-flight is skipped-mock under plain mockExec with no injected probe (existing all-mock rollback tests stay inert)", async () => {
+  const result = await runUpgrade({
+    rollback: true, yes: true, mockExec: true,
+    mockSnapshots: [{ name: "upgrade-snapshot-2026-05-11T08:30:00Z", path: "/tmp/snap-x" }],
+    mockSnapshotMeta: { fromCommit: "abc1234", fromVersion: "v3.10.0", toVersion: "v3.14.0", path: "/tmp/snap-x" },
+  });
+  assert.equal(result.path, "rollback");
+  const pf = result.phases.find(p => p.name === "post-flight");
+  assert.ok(pf, "post-flight phase must still be recorded, even when skipped");
+  assert.equal(pf.status, "skipped-mock");
+});
+
 test("gcSnapshots keeps last N regardless of age", () => {
   const root = mkdtempSync(testJoin(tmpdir(), "ocp-gc-test-"));
   const dotOcp = testJoin(root, ".ocp");
