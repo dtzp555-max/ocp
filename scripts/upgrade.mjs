@@ -477,9 +477,21 @@ function resolveRestartPlan({ opts, port, isRollback = false, fromCommit = null 
 //   - WEAKER: a single conclusive rejection leaves `status` at "ok" (ADR 0010 degrades after
 //     AUTH_DEGRADE_AFTER = 2). That is intended. ADR 0010 § "Why the threshold is 2" holds that
 //     one rejection is a token-rotation race, not a condition — and post-flight, running against
-//     a fresh process, sees exactly that first probe. A genuine credential outage is caught
-//     BEFORE this point anyway: `ocp doctor` selects kind=fix_oauth and `ocp update` refuses to
-//     run. Post-flight is not the layer that adjudicates credentials; it verifies a restart.
+//     a fresh process, sees exactly that first probe. On the UPDATE paths a genuine credential
+//     outage is also caught before this point twice over: `runDoctor`'s FAIL on a conclusive
+//     `auth.ok === false` clears `ready_to_upgrade` (the pre-flight guard below at "doctor
+//     pre-flight"), and bash refuses `kind=fix_oauth` ahead of dispatch (`ocp` cmd_update).
+//     Both key off `auth.ok`, which this change deliberately leaves FAILing, so neither gate
+//     depends on the field being relaxed here.
+//
+//     ROLLBACK IS THE EXCEPTION, and it is deliberate rather than an oversight: `--rollback`
+//     `exec`s straight past the doctor dispatch in `ocp` and returns from `runUpgrade`'s rollback
+//     branch before the pre-flight guard ("no doctor needed; snapshot is authoritative"), because
+//     rollback exists to restore a service that is already down — gating it on a health check it
+//     is trying to repair would deadlock it. So on rollback, post-flight is the only check, and
+//     what it must establish is that the RESTORED TREE is the one now serving: the version arm,
+//     which this change does not touch. Credentials are out of scope there by construction.
+//     Post-flight is not the layer that adjudicates credentials; it verifies a restart.
 //
 // Fail-closed by construction: a body with no `status` yields `undefined !== "ok"` → false, and
 // an unreachable server never produces a body at all (the caller's try/catch retries). Verified
