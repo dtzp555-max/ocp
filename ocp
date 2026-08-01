@@ -118,7 +118,8 @@ _pyfail() {
 # `<cmd> ... 2>&1) || { echo "Error: <label>"; exit 1; }` shape at each site, byte-identical on
 # the success path and on a genuine network failure (same label text), and message text goes to
 # stderr (matching the sibling display commands' own stderr convention, PR #252 round 1 fix 3 —
-# these three call sites were the ones that review explicitly left untouched).
+# those three call sites, cmd_usage's two arms plus cmd_keys add, were the ones that review
+# explicitly left untouched at the time).
 _curl_or_die() {
   local network_label="$1"; shift
   local errfile out status err
