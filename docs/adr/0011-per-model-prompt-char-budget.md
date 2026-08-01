@@ -132,6 +132,13 @@ citing it as permission is the category error recorded in the #193 thread.
   such prompts — the same one-time trade ADR 0009 made at the 150k→600k step, one order of
   magnitude up. Operators who do not want it set `CLAUDE_MAX_PROMPT_CHARS` or
   `ocp settings maxPromptChars <n>`, which is precisely what those knobs are for.
+- **The new ceiling is not reachable at the default body cap for multi-byte text**, which is
+  worth knowing because CJK is the audience `charsPerToken = 3` was chosen for.
+  `MAX_BODY_SIZE` defaults to 5 MB (`CLAUDE_MAX_BODY_SIZE`), so a 3,000,000-char request is
+  rejected with a 413 before truncation is ever considered once the encoding exceeds ~1.7
+  bytes/char — 3,000,000 CJK chars is ~9 MB. Nothing regressed here (the 413 is loud, and the
+  cap is unchanged), but an operator who actually wants to feed a 1M-token CJK prompt must
+  raise `CLAUDE_MAX_BODY_SIZE` as well as rely on this ADR.
 - `claude-haiku-4-5-20251001`, `claude-opus-4-6` and `claude-sonnet-4-6` keep the 600,000-char
   ceiling they have today. This is the property the regression test pins, and it is what
   distinguishes this change from simply raising the ceiling.
@@ -165,10 +172,13 @@ would itself require an ADR under `ALIGNMENT.md` § "New Class B endpoint proced
 `ocp settings` client also formats a single scalar per key. If a real need appears, it is a
 separate ADR.
 
-**(d) Report a per-model map, or `null`, from `GET /settings`.** Rejected: `ocp` renders
-`maxPromptChars` into a fixed-width column via `v.get('value','?')`, so a map renders as a dict
-and `null` renders as `None`; and a response-shape change is a strictly larger contract change
-than the semantic one this ADR already takes.
+**(d) Report a per-model map, or `null`, from `GET /settings`.** Rejected, and the reason is
+harder than "it would look wrong": `ocp` renders `maxPromptChars` through
+`print(f'  {k:<20} {val:>8} {unit:<6}  {desc}')`, and `format(None, '>8')` raises
+`TypeError: unsupported format string passed to NoneType.__format__` — so `null` does not
+render as `None`, it takes the whole `ocp settings` listing down into `_pyfail`. A dict fails
+the same way. Beyond that, a response-shape change is a strictly larger contract change than
+the semantic one this ADR already takes.
 
 **(e) Widen the `maxPromptChars` PATCH range to 3,000,000** so an operator can express a global
 override matching what a 1M model now derives. Rejected as out of scope here: it is an

@@ -1048,6 +1048,28 @@ test("resolveGlobalPromptCharOverride: set-but-garbage → null (derivation), no
   assert.equal(resolveGlobalPromptCharOverride("0"), null);
 });
 
+// Independent-review finding on this PR: a UNIT-SUFFIXED value is the dangerous case, and a
+// bare parseInt accepts it silently. parseInt consumes a valid PREFIX and drops the rest, so
+// "1M" → 1 and "600k" → 600: a near-zero ceiling on EVERY model, truncating every prompt to
+// almost nothing, with NO warning (server.mjs only warns when this returns null). "1M" is a
+// plausible thing to type now that the README quotes budgets in the millions. This is the same
+// class as CLAUDE_MAX_BODY_SIZE=5MB (PR #154 review F3), which is why the resolver must go
+// through parsePositiveInt's `String(n) !== trimmed` check rather than parseInt.
+// Mutation-proof: replace the parsePositiveInt call with `parseInt(rawEnv, 10)` and every
+// assertion below fails with the partially-consumed number.
+test("resolveGlobalPromptCharOverride: a unit-suffixed value is REJECTED, never silently truncated to its prefix", () => {
+  assert.equal(resolveGlobalPromptCharOverride("1M"), null, "parseInt('1M') is 1 — a 1-char global ceiling on every model");
+  assert.equal(resolveGlobalPromptCharOverride("600k"), null, "parseInt('600k') is 600");
+  assert.equal(resolveGlobalPromptCharOverride("1e6"), null, "parseInt('1e6') is 1");
+  assert.equal(resolveGlobalPromptCharOverride("3MB"), null);
+  assert.equal(resolveGlobalPromptCharOverride("600000abc"), null, "a valid prefix followed by junk is still junk");
+  assert.equal(resolveGlobalPromptCharOverride("20.5"), null, "fractional is ambiguous — rejected, not floored");
+  // Control: the well-formed value on either side of those must still be accepted, or the
+  // guard would be "reject everything" and the tests above would pass vacuously.
+  assert.equal(resolveGlobalPromptCharOverride("1000000"), 1000000);
+  assert.equal(resolveGlobalPromptCharOverride(" 600000 "), 600000, "surrounding whitespace is trimmed, not rejected");
+});
+
 console.log("\nSystem-prompt operator append:");
 
 test("appendOperatorPrompt: appends the operator prompt LAST, blank-line separated", () => {

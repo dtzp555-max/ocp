@@ -947,7 +947,8 @@ Tunable keys:
   firstByteTimeout   Base first-byte timeout (ms)         [15000 - 300000]
   maxConcurrent      Max concurrent claude processes      [1 - 32]
   sessionTTL         Session idle expiry (ms)             [60000 - 86400000]
-  maxPromptChars     Prompt truncation limit (chars)      [10000 - 1000000]
+  maxPromptChars     GLOBAL truncation override (chars)   [10000 - 1000000]
+                     (unset = per-model, models.json contextWindow x 3)
   tiers.opus.base    Opus first-byte timeout base (ms)    [30000 - 600000]
   tiers.opus.perChar    Opus per-char timeout (ms/char)   [0 - 0.01]
   tiers.sonnet.base  Sonnet first-byte timeout base (ms)  [30000 - 600000]
