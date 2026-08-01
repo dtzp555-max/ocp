@@ -1032,7 +1032,8 @@ Runs `ocp doctor` internally to choose the right path:
   • Tree at latest, service stale:  restart-only (no git/npm changes) + post-flight verify
   • Patch bump (same minor):     light path (git pull + npm install + restart)
   • Cross-minor (e.g. v3.10→v3.14): full path with snapshot + post-flight
-  • Old version (< v3.4.0):       fresh-install (asks first; AI passes --yes)
+  • Old version (< v3.4.0):       fresh-install (execution-unverified, issue #227 --
+                                   requires --fresh-install --yes, both explicit)
 
 Usage:
   ocp update                          Smart auto-pick path
@@ -1040,6 +1041,7 @@ Usage:
   ocp update --dry-run                Preview the plan, don't mutate
   ocp update --target v3.13.0         Pin a specific version
   ocp update --yes                    Skip y/N prompts (AI agents pass this)
+  ocp update --fresh-install --yes    Run the fresh-install path (see Notes -- issue #227)
   ocp update --rollback               Restore the most recent upgrade snapshot
   ocp update --rollback --list        List available snapshots
   ocp update --rollback <path>        Restore a specific snapshot
@@ -1079,6 +1081,14 @@ Notes:
   `ocp update --rollback --list` to pick a snapshot, then
   `ocp update --rollback <path>` to restore it -- --target is NOT accepted
   on --rollback (it restores a stored snapshot, not a requested version).
+
+  fresh_install (< v3.4.0 hosts) requires --fresh-install IN ADDITION TO
+  --yes (issue #227): this path has never been execution-verified, in CI
+  or by hand, so a routine `ocp update --yes` -- the same flag every other
+  non-interactive path already accepts -- no longer runs it. Doctor still
+  reports kind="fresh_install" and its ai_executable[] steps either way;
+  only automatic execution through `ocp update` is gated. See
+  docs/upgrading.md's "Old version (< v3.4.0)" section.
 EOF
 }
 

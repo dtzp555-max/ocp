@@ -56,6 +56,29 @@ What `ocp update` does:
   preserved; you do not need to re-OAuth unless your token expired
   separately.
 
+  **Known limitation, dated 2026-08-01 (issue #227): this path has never been
+  execution-verified.** It was dead on `main` for an unknown length of time
+  (a `doctor.mjs`/bash pipeline bug swallowed its own `kind` value) until
+  #217 fixed that bug and, as a side effect, reconnected it. What IS
+  covered: `doctor.mjs`'s decision that a host qualifies for this kind
+  (unit-tested against real version strings), and `runFreshInstall`'s own
+  `--yes`/`--fresh-install` gate and step-sequencing logic (unit-tested with
+  `execSync` mocked out). What is NOT covered, in CI or by hand, since the
+  arm was reconnected: the real commands the path runs when it executes —
+  `mv ~/.ocp ~/.ocp.backup-<epoch>`, `rm -rf ~/ocp` (a path `doctor.mjs`
+  hardcodes, not derived from where the running `ocp` was invoked from), a
+  fresh `git clone`, and `node setup.mjs` — and the real `ocp` → `scripts/
+  upgrade.mjs` dispatch that reaches them (this repo's own bash-CLI test
+  harness deliberately stubs that exec arm out; see its own comment for
+  why). This is not a claim that the path is broken, only that nobody has
+  run it long enough to know either way. Because of this, `ocp update` no
+  longer runs it off a bare `--yes` — the same flag every other
+  non-interactive `ocp update` invocation already passes. Proceeding
+  requires the separate, explicit `--fresh-install` flag (see Manual
+  upgrade below); a routine `ocp update --yes` on a qualifying host now
+  refuses instead, naming what doctor concluded and the explicit command
+  to opt in.
+
 Snapshots are saved to `~/.ocp/upgrade-snapshot-<ISO-ts>/` and never
 auto-deleted. Clean old ones with `rm -rf ~/.ocp/upgrade-snapshot-*` once
 you're confident the upgrade is stable.
@@ -67,6 +90,7 @@ ocp update                  # smart-pick path
 ocp update --check          # show available updates, don't apply
 ocp update --dry-run        # preview plan
 ocp update --target v3.13.0 # pin a specific version
+ocp update --fresh-install --yes # opt into the execution-unverified fresh-install path (#227)
 ocp update --rollback --yes # restore most recent snapshot (--yes confirms)
 ocp update --rollback --list      # list snapshots, no mutation
 ocp update --rollback --dry-run   # preview rollback plan

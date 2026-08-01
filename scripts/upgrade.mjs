@@ -8,7 +8,9 @@
  *                 changes — cmd_restart + post-flight only; delegated to bash cmd_update
  *   light         same major.minor, patch bump only (existing fast path; delegated to bash)
  *   full          cross-minor (snapshot + setup.mjs + post-flight)
- *   fresh_install from-version < v3.4.0 (--yes required for non-interactive)
+ *   fresh_install from-version < v3.4.0 (both --fresh-install AND --yes required, explicit --
+ *                 issue #227: this path has never been execution-verified, so it is no longer
+ *                 reachable off a bare --yes -- see runFreshInstall() below)
  *   rollback      restore from snapshot
  */
 import { runDoctor, detectMultiUnitBootRace } from "./doctor.mjs";
@@ -920,8 +922,29 @@ async function runFullUpgrade({ doctor, opts }) {
 }
 
 async function runFreshInstall({ doctor, opts }) {
-  if (!opts.yes) {
-    throw new Error("fresh_install requires --yes for non-interactive execution (or run interactively and answer y)");
+  // Issue #227: doctor selecting kind="fresh_install" used to be enough, combined with the
+  // SAME --yes flag every other non-interactive `ocp update` invocation already passes (see
+  // `ocp update --yes` in `ocp`'s own help text, "AI agents pass this", and doctor.mjs's own
+  // ai_executable suggestion for update/upgrade/restart -- `${ocpDir}/ocp update --yes`), to
+  // run this arm's ai_executable[] for real: `mv ~/.ocp ...`, `rm -rf ${ocpDir}`, a fresh
+  // `git clone`, and `node setup.mjs`. That chain has never been execution-verified -- not in
+  // CI (this suite only ever reaches this function with opts.mockExec: true; see this file's
+  // own test-features.mjs coverage) and not by hand -- since the arm was reconnected by #217.
+  // A routine `ocp update --yes` run for an ordinary, well-tested upgrade must not silently
+  // walk into this path just because doctor happened to classify the host as pre-v3.4.0; the
+  // operator who wants THIS path has to say so, separately from the generic non-interactive
+  // flag. `--fresh-install` is that separate, explicit opt-in -- both it and --yes are
+  // required; --yes alone (the routine case) now refuses here instead of executing.
+  if (!opts.yes || !opts.freshInstall) {
+    throw new Error(
+      `doctor concluded kind="fresh_install" for this host (from-version is unsupported or ` +
+      `unparseable -- run \`ocp doctor\` for the specific check). This path has never been ` +
+      `execution-verified (issue #227): its ai_executable steps run \`rm -rf ~/ocp\` and ` +
+      `reinstall from scratch, and it is no longer reachable off a bare --yes. To proceed ` +
+      `anyway, re-run with both flags: \`ocp update --fresh-install --yes\`. This is not a ` +
+      `claim that the path is broken -- only that nobody has run it long enough to know either ` +
+      `way; see docs/upgrading.md's "Old version (< v3.4.0)" section for what that means.`
+    );
   }
   const steps = [];
   for (const cmd of doctor.next_action.ai_executable) {
@@ -1204,6 +1227,9 @@ if (_isMain()) {
   const args = process.argv.slice(2);
   const dryRun = args.includes("--dry-run");
   const yes = args.includes("--yes");
+  // Issue #227: explicit, separate opt-in required to execute the fresh_install path -- see
+  // runFreshInstall()'s own comment. Has no effect on any other kind.
+  const freshInstall = args.includes("--fresh-install");
   const rollback = args.includes("--rollback");
   const list = args.includes("--list");
   const gc = args.includes("--gc");
@@ -1276,7 +1302,7 @@ if (_isMain()) {
   }
 
   try {
-    const result = await runUpgrade({ dryRun, yes, rollback, list, gc, snapshotPath, target });
+    const result = await runUpgrade({ dryRun, yes, freshInstall, rollback, list, gc, snapshotPath, target });
     if (result.plan) for (const line of result.plan) console.log(line);
     if (result.phases) for (const p of result.phases) console.log(`[${p.name}] ${p.status}${p.cmd ? `: ${p.cmd}` : ""}`);
     if (result.steps) for (const s of result.steps) console.log(`  ${s.status === "ok" ? "✓" : s.status === "skipped-mock" ? "·" : "✗"} ${s.cmd}`);

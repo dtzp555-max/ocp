@@ -2265,8 +2265,12 @@ test("#260 (the money test): runUpgrade refuses --target on kind=fresh_install -
 });
 
 test("#260 control: runUpgrade fresh_install WITHOUT --target still runs ai_executable (proves the money test above can fail)", async () => {
+  // Issue #227 (landed after #260): fresh_install now ALSO requires --fresh-install, separate
+  // from --yes -- this test is about --target handling, not that gate, so opt in explicitly
+  // (freshInstall: true) to keep exercising the --target-specific behavior it was written for.
   const result = await runUpgrade({
     yes: true,
+    freshInstall: true,
     mockExec: true,
     mockDoctor: { ready_to_upgrade: false, from_version_supported: false,
                   next_action: { kind: "fresh_install", ai_executable: ["echo step-1", "echo step-2"] },
@@ -3218,7 +3222,7 @@ test("upgrade error after snapshot carries snapshotPath + hint", async () => {
   assert.equal(result.executed, true);
 });
 
-test("upgrade fresh_install requires --yes for non-interactive", async () => {
+test("upgrade fresh_install with neither flag refuses", async () => {
   await assert.rejects(async () => {
     await runUpgrade({
       yes: false,
@@ -3227,12 +3231,55 @@ test("upgrade fresh_install requires --yes for non-interactive", async () => {
                     next_action: { kind: "fresh_install", ai_executable: ["echo would-rm-rf"] },
                     current_version: "v3.2.0", latest_version: "v3.14.0" }
     });
-  }, /requires --yes/);
+  }, /execution-verified/);
 });
 
-test("upgrade fresh_install with --yes runs ai_executable", async () => {
+// Issue #227: doctor selecting kind="fresh_install" used to run for real off the SAME --yes
+// flag every other non-interactive `ocp update` invocation already passes (see `ocp`'s own
+// help text -- "AI agents pass this" -- and doctor.mjs's own ai_executable suggestion for
+// update/upgrade/restart: `${ocpDir}/ocp update --yes`). This path has never been execution-
+// verified (not in CI -- this suite only ever reaches runFreshInstall with opts.mockExec:
+// true -- and not by hand, since the arm was reconnected by #217): its real ai_executable
+// steps run `mv ~/.ocp ...` and `rm -rf ${ocpDir}` against a live host. The money test: a
+// bare --yes, with no separate opt-in, must now refuse instead of executing -- the exact
+// shape an AI agent following doctor's own generic remediation would otherwise hit by
+// accident on a host that happens to classify as pre-v3.4.0.
+console.log("\nfresh_install requires an explicit, separate opt-in (issue #227):");
+
+test("#227 (the money test): fresh_install refuses on a BARE --yes -- the routine ocp-update shape doctor itself suggests for every other kind", async () => {
+  await assert.rejects(async () => {
+    await runUpgrade({
+      yes: true,
+      mockExec: true,
+      mockDoctor: { ready_to_upgrade: false, from_version_supported: false,
+                    next_action: { kind: "fresh_install", ai_executable: ["echo would-rm-rf"] },
+                    current_version: "v3.2.0", latest_version: "v3.14.0" }
+    });
+  }, (err) => {
+    assert.match(err.message, /fresh_install/, `message=${JSON.stringify(err.message)}`);
+    assert.match(err.message, /227/, `message=${JSON.stringify(err.message)}`);
+    assert.match(err.message, /--fresh-install --yes/, `message=${JSON.stringify(err.message)}`);
+    return true;
+  });
+});
+
+test("#227 control: --fresh-install alone (no --yes) still refuses -- both flags are independently required", async () => {
+  await assert.rejects(async () => {
+    await runUpgrade({
+      yes: false,
+      freshInstall: true,
+      mockExec: true,
+      mockDoctor: { ready_to_upgrade: false, from_version_supported: false,
+                    next_action: { kind: "fresh_install", ai_executable: ["echo would-rm-rf"] },
+                    current_version: "v3.2.0", latest_version: "v3.14.0" }
+    });
+  }, /execution-verified/);
+});
+
+test("#227: fresh_install with BOTH --fresh-install and --yes runs ai_executable (the explicit, accepted-risk path)", async () => {
   const result = await runUpgrade({
     yes: true,
+    freshInstall: true,
     mockExec: true,
     mockDoctor: { ready_to_upgrade: false, from_version_supported: false,
                   next_action: { kind: "fresh_install",
@@ -3241,6 +3288,18 @@ test("upgrade fresh_install with --yes runs ai_executable", async () => {
   });
   assert.equal(result.path, "fresh_install");
   assert.equal(result.steps.length, 3);
+});
+
+test("#227 non-regression: kind=upgrade with a BARE --yes (no --fresh-install) is UNAFFECTED -- the new gate is scoped to fresh_install only", async () => {
+  const result = await runUpgrade({
+    yes: true,
+    mockExec: true,
+    mockDoctor: { ready_to_upgrade: true, from_version_supported: true,
+                  next_action: { kind: "upgrade" },
+                  current_version: "v3.10.0", latest_version: "v3.14.0" }
+  });
+  assert.equal(result.path, "upgrade");
+  assert.equal(result.executed, true);
 });
 
 test("rollback --list returns snapshots", async () => {
