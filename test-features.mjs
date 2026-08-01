@@ -2020,6 +2020,55 @@ ltTest("integration: a non-executable claude binary still yields degraded (#232 
   } finally { _ltChmod(fake, 0o755); child.kill("SIGKILL"); _ltRmRetry(dir); }
 });
 
+// NOTE ON PLACEMENT: this lives here, with the other auth-probe integration tests and AHEAD of
+// the #248 serialization sentinel below, not down in the ADR 0010 CONSUMER REPLAY section it
+// logically belongs to. The sentinel's claim is 'registered last in the ltTest chain, so no NEW
+// ltBoot call will happen after this point'; registering an ltTest after it would silently
+// falsify that comment and leave this boot outside the peak-concurrency invariant it asserts.
+// `rpHealth` is a hoisted function declaration defined in that later section, and its body is
+// only evaluated when this async test runs (well after module evaluation), so the forward
+// reference is safe.
+// LIVE-SERVER PREMISE GUARD (independent review LOW-1 on #289). The self-check below asserts the
+// fixture against itself, which cannot catch the fixture being wrong about what server.mjs really
+// emits. The ESTABLISHED shape is already pinned against a real boot by the #232 integration test
+// ("an INCONCLUSIVE auth probe ... preserves ok and the verdict"), but the FRESH shape — the only
+// one post-flight ever sees, and the entire basis of this fix — was pinned by nothing. Reasoning
+// about a payload in prose while asserting only a hand-written copy of it is precisely the gap
+// #289 exists to close, so it is closed here too rather than only argued about.
+//
+// AUTH_PROBE_MODE=signal WITHOUT AUTH_PROBE_FIRST_OK is a fresh boot whose very first probe dies
+// on a signal — the same branch a real AUTH_CHECK_TIMEOUT_MS expiry takes, in milliseconds
+// instead of 10s, and with no prior conclusive verdict to preserve.
+ltTest("replay premise (LIVE): a real server.mjs whose FIRST probe dies on a signal emits exactly rpHealth('fresh')", async () => {
+  if (!LT_POSIX) return;
+  const dir = ltMkdir(); const fake = ltAuthFake(dir);
+  const probeLog = join(dir, "probes.txt");
+  const { child, buf, port } = await ltBootFresh({
+    CLAUDE_BIN: fake, AUTH_PROBE_LOG: probeLog, AUTH_PROBE_MODE: "signal",
+    CLAUDE_AUTH_CHECK_INTERVAL_MS: "300",
+  }, dir);
+  try {
+    const h = await ltWaitHealth(port, b => b.auth && b.auth.lastOutcome === "timeout", 15000);
+    assert.ok(h, `the signal-killed first probe never landed — ${ltDiag(buf)}`);
+    const f = rpHealth("fresh");
+    assert.equal(h.auth.ok, null,
+      `a fresh boot with no conclusive probe must report auth.ok=null; got ${JSON.stringify(h.auth)}`);
+    assert.equal(h.auth.ok, f.auth.ok, "fixture must match the live shape");
+    assert.equal(h.auth.lastOutcome, f.auth.lastOutcome, "fixture must match the live lastOutcome");
+    assert.equal(h.auth.consecutiveFailures, f.auth.consecutiveFailures,
+      "fixture must match the live tally");
+    assert.equal(h.status, f.status,
+      `the serving verdict postFlightOk now reads must be "ok" on a real inconclusive boot; got ${h.status}`);
+    // The decision, driven by the REAL payload rather than the fixture — this is the end-to-end
+    // statement of the fix: main's predicate returns false here, and that was the whole defect.
+    // Passing the body's OWN version as the target satisfies the version arm tautologically, so
+    // this line exercises the STATUS arm only. That is exactly what it is for — the version arm
+    // is covered by the unit tests above — but do not credit this test with version-arm coverage.
+    assert.equal(postFlightOk(h, h.version), true,
+      "postFlightOk must accept a real, live, freshly-booted proxy whose first auth probe timed out");
+  } finally { child.kill("SIGKILL"); _ltRmRetry(dir); }
+});
+
 // Deterministic close for the ltTest serialization claim: a fact about how many server.mjs
 // children were EVER alive at once during this block, not a race against wall-clock luck (see
 // the comment on _ltPeakBoots above ltBoot's definition). Registered last in the ltTest chain —
@@ -2086,6 +2135,10 @@ test("postFlightOk: #289 — ONE conclusive rejection does NOT block a good rest
     "token-rotation race, and a real outage is caught by doctor's fix_oauth pre-flight gate");
 });
 
+// DOCUMENTATION, NOT INDEPENDENT COVERAGE. Its input is the same shape the "a degraded server
+// rejects regardless of version" test above already drives (status:"degraded"), so no mutation
+// dies here that does not also die there. It exists to state, next to the relaxation it bounds,
+// exactly where that relaxation stops — do not count it in a mutation table.
 test("postFlightOk: #289 — TWO conclusive rejections DO block (status has gone degraded)", () => {
   const body = { status: "degraded", version: "3.27.0",
                  auth: { ok: false, lastOutcome: "rejected", consecutiveFailures: 2 } };
@@ -14245,44 +14298,6 @@ function rpStatus(shape) {
   };
 }
 
-// LIVE-SERVER PREMISE GUARD (independent review LOW-1 on #289). The self-check below asserts the
-// fixture against itself, which cannot catch the fixture being wrong about what server.mjs really
-// emits. The ESTABLISHED shape is already pinned against a real boot by the #232 integration test
-// ("an INCONCLUSIVE auth probe ... preserves ok and the verdict"), but the FRESH shape — the only
-// one post-flight ever sees, and the entire basis of this fix — was pinned by nothing. Reasoning
-// about a payload in prose while asserting only a hand-written copy of it is precisely the gap
-// #289 exists to close, so it is closed here too rather than only argued about.
-//
-// AUTH_PROBE_MODE=signal WITHOUT AUTH_PROBE_FIRST_OK is a fresh boot whose very first probe dies
-// on a signal — the same branch a real AUTH_CHECK_TIMEOUT_MS expiry takes, in milliseconds
-// instead of 10s, and with no prior conclusive verdict to preserve.
-ltTest("replay premise (LIVE): a real server.mjs whose FIRST probe dies on a signal emits exactly rpHealth('fresh')", async () => {
-  if (!LT_POSIX) return;
-  const dir = ltMkdir(); const fake = ltAuthFake(dir);
-  const probeLog = join(dir, "probes.txt");
-  const { child, buf, port } = await ltBootFresh({
-    CLAUDE_BIN: fake, AUTH_PROBE_LOG: probeLog, AUTH_PROBE_MODE: "signal",
-    CLAUDE_AUTH_CHECK_INTERVAL_MS: "300",
-  }, dir);
-  try {
-    const h = await ltWaitHealth(port, b => b.auth && b.auth.lastOutcome === "timeout", 15000);
-    assert.ok(h, `the signal-killed first probe never landed — ${ltDiag(buf)}`);
-    const f = rpHealth("fresh");
-    assert.equal(h.auth.ok, null,
-      `a fresh boot with no conclusive probe must report auth.ok=null; got ${JSON.stringify(h.auth)}`);
-    assert.equal(h.auth.ok, f.auth.ok, "fixture must match the live shape");
-    assert.equal(h.auth.lastOutcome, f.auth.lastOutcome, "fixture must match the live lastOutcome");
-    assert.equal(h.auth.consecutiveFailures, f.auth.consecutiveFailures,
-      "fixture must match the live tally");
-    assert.equal(h.status, f.status,
-      `the serving verdict postFlightOk now reads must be "ok" on a real inconclusive boot; got ${h.status}`);
-    // The decision, driven by the REAL payload rather than the fixture — this is the end-to-end
-    // statement of the fix: main's predicate returns false here, and that was the whole defect.
-    assert.equal(postFlightOk(h, h.version), true,
-      "postFlightOk must accept a real, live, freshly-booted proxy whose first auth probe timed out");
-  } finally { child.kill("SIGKILL"); _ltRmRetry(dir); }
-});
-
 // Premise guard. Everything below is worthless if the fixture is not actually the ADR 0010
 // inconclusive state, so assert the fixture's own shape before trusting any decision read off it.
 test("replay premise: the fixture IS ADR 0010's inconclusive state (status ok, tally untouched)", () => {
@@ -14438,6 +14453,29 @@ test("replay → doctor --check oauth DECIDES kind!=fix_oauth and exits 0 (FRESH
   assert.ok(!/OAuth healthy/.test(r.next_action.verify),
     `--check oauth must not report "OAuth healthy" for a state it never established; got: ${r.next_action.verify}`);
   assert.match(r.next_action.verify, /not yet established/, `got: ${r.next_action.verify}`);
+});
+
+// Independent review LOW-2 on #289: neither fix_oauth `verify` string was pinned by any test, so
+// reverting that wording survived the suite — asymmetric with its sibling on the noop path, which
+// IS pinned. Both remediations RESTART the service, and by ADR 0010 a freshly restarted proxy
+// reports oauth_ok WARN until its first probe concludes, so telling the operator to expect PASS
+// immediately afterwards describes a state the remediation itself makes temporarily unreachable.
+test("replay → both fix_oauth remediations warn that PASS is not immediate after the restart", async () => {
+  const rejected = { status: "ok", version: RP_VERSION,
+    auth: { ok: false, message: "Invalid refresh token", lastOutcome: "rejected", consecutiveFailures: 1 } };
+  const full = await runDoctor({
+    mockVersion: `v${RP_VERSION}`, mockLatest: `v${RP_VERSION}`, skipNetwork: false,
+    mockHealth: { status: 200, body: rejected },
+  });
+  const fast = await runDoctor({ checkOnly: "oauth", mockHealth: { status: 200, body: rejected } });
+  for (const [label, r] of [["full run", full], ["--check oauth", fast]]) {
+    assert.equal(r.next_action.kind, "fix_oauth", `${label}: premise — this must be the fix_oauth path`);
+    assert.match(r.next_action.verify, /WARN/,
+      `${label}: the remediation restarts the service, so its verify string must say a WARN ` +
+      `immediately afterwards is expected; got: ${r.next_action.verify}`);
+    assert.match(r.next_action.verify, /PASS/,
+      `${label}: it must still name PASS as the eventual success condition; got: ${r.next_action.verify}`);
+  }
 });
 
 test("replay control → doctor --check oauth still reports 'OAuth healthy' on a real PASS", async () => {
