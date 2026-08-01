@@ -1016,7 +1016,10 @@ Notes:
   cycle. Re-run without --target, or once a cross-minor release makes the
   full upgrade path available -- that is currently the ONLY path that
   honors --target (the light/patch-bump path warns and ignores it, see
-  above). To move to an OLDER version instead, use `ocp update --rollback`.
+  above). To move to an OLDER version instead, use
+  `ocp update --rollback --list` to pick a snapshot, then
+  `ocp update --rollback <path>` to restore it -- --target is NOT accepted
+  on --rollback (it restores a stored snapshot, not a requested version).
 EOF
 }
 
@@ -1056,6 +1059,15 @@ cmd_update() {
 
   # Pass through --check fast path (existing behaviour)
   if [[ "${1:-}" == "--check" ]]; then
+    # Issue #260/#272 review round 2 (LOW, optional): --check is read-only (no mutation, no
+    # wrong end state -- it only fetches + prints status), but --target was still silently
+    # accepted and ignored here with zero signal, the last fully-silent hole in this whole
+    # chain. Reuses the same shared detector the noop/restart refusal and the light-path
+    # warning both already use.
+    _detect_target_flag "$@"
+    if [[ $_TARGET_SEEN -eq 1 ]]; then
+      echo "  ⚠ --target $_TARGET_VAL has no effect on --check -- --check is read-only (fetch + report only) and never pins anything. Run \`ocp update --target $_TARGET_VAL\` (without --check) to actually apply it." >&2
+    fi
     cd "$script_dir"
     git fetch origin main --quiet 2>/dev/null || true
     local local_ver remote_ver
@@ -1187,7 +1199,7 @@ for c in d.get('checks', []):
           echo "✗ --target $_TARGET_VAL was requested, but doctor reports the tree already matches the latest release and only the RUNNING SERVICE is stale -- this path restarts the current tree as-is and never runs git, so it cannot check out a different tag." >&2
           ;;
       esac
-      echo "  Run \`ocp update\` again once a cross-minor release makes the full upgrade path available -- that is currently the ONLY path that honors --target (the light/patch-bump path warns and ignores it). To move to an OLDER version instead, use \`ocp update --rollback\`. Or omit --target to accept this path's own outcome." >&2
+      echo "  Run \`ocp update\` again once a cross-minor release makes the full upgrade path available -- that is currently the ONLY path that honors --target (the light/patch-bump path warns and ignores it). To move to an OLDER version instead, run \`ocp update --rollback --list\` to pick a snapshot, then \`ocp update --rollback <path>\` to restore it -- --target is NOT accepted on --rollback. Or omit --target to accept this path's own outcome." >&2
       return 1
     fi
   fi

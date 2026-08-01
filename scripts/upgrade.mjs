@@ -579,6 +579,23 @@ export async function runUpgrade(opts = {}) {
 
   // --- rollback path (no doctor needed; snapshot is authoritative) ---
   if (opts.rollback) {
+    // Independent review of #260/#272 (round 2): --target has NO meaning on --rollback --
+    // rollback restores a STORED SNAPSHOT (selected by path, or the most recent one), never
+    // an arbitrary requested version, and runRollback() below never reads opts.target at
+    // all -- it silently ignores it, the same "accepted and dropped with no signal" shape
+    // #260 exists to close everywhere else. This combination became genuinely reachable in
+    // practice only after this same file's own noop/restart/fresh_install refusal messages
+    // (below) started pointing refused users at `ocp update --rollback` for downgrade
+    // intent -- following that advice with --target still attached would otherwise restore
+    // the newest snapshot while reporting success, believing the requested version was
+    // honored, on the one path that actually mutates disk (git checkout, npm install,
+    // restore plist/db, restart). Refuse rather than silently drop it, matching every other
+    // guard this issue added.
+    if (opts.target) {
+      throw new Error(
+        `--target ${opts.target} has no effect on --rollback -- rollback restores a stored snapshot (selected by path, or the most recent one), not a requested version. Use \`ocp update --rollback --list\` to see available snapshots, then \`ocp update --rollback <path>\` to restore a specific one.`
+      );
+    }
     return await runRollback(opts);
   }
 
@@ -625,7 +642,7 @@ export async function runUpgrade(opts = {}) {
         ? "the tree already matches the latest release and only the running service is stale -- this path restarts the current tree as-is and never runs git"
         : "fresh_install replays doctor's own fixed install steps, not a checkout of a specific tag";
     throw new Error(
-      `--target ${opts.target} was requested, but doctor selected the "${kind}" path, which cannot honor a version pin (${why}). Re-run \`ocp update\` without --target, or once a cross-minor release makes the full upgrade path available -- that is currently the ONLY path that honors --target (the light/patch-bump path warns and ignores it, per #241/#255). To move to an OLDER version instead, use \`ocp update --rollback\`.`
+      `--target ${opts.target} was requested, but doctor selected the "${kind}" path, which cannot honor a version pin (${why}). Re-run \`ocp update\` without --target, or once a cross-minor release makes the full upgrade path available -- that is currently the ONLY path that honors --target (the light/patch-bump path warns and ignores it, per #241/#255). To move to an OLDER version instead, run \`ocp update --rollback --list\` to pick a snapshot, then \`ocp update --rollback <path>\` to restore it -- --target is NOT accepted on --rollback.`
     );
   }
 
