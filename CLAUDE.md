@@ -62,7 +62,8 @@ Every PR that modifies `server.mjs` must satisfy all three of the following. A P
 3. **Independent reviewer (Iron Rule 10).** The implementation author may not self-approve. A separate reviewer — human or a subagent spawned with a fresh context — must read the diff, **independently confirm the declared class against the `ALIGNMENT.md` inventory table** rather than taking the author's word for it, open the reference that class demands, and explicitly approve:
    - Class A → open `cli.js` at the cited lines.
    - Class B.1 → open the cited OpenAI specification section.
-   - Class B.2 → open the authorizing ADR; if the citation is the ADR 0006 grandfather clause, confirm the change really is behaviour-preserving.
+   - Class B.2 → open the authorizing ADR; if the citation is the ADR 0006 grandfather clause, confirm the change really is behaviour-preserving — specifically that the field's documented *meaning* is unchanged, not merely that its value is now correct.
+   - Not endpoint-touching → confirm the diff genuinely touches no request handler. This is the cheapest class to declare, so it is the one most worth checking.
 
    A review comment that does not name the reference it opened is not a valid approval. Neither is one that accepts a Rule 2 argument in place of a citation.
 
