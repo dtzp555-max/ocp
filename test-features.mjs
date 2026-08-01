@@ -12440,6 +12440,184 @@ test("#273 stream parity: cmd_health 'proxy unreachable' guard writes to stderr,
   assert.equal(r.stdout, "", `cmd_health: stdout must stay clean of the error text; got: ${JSON.stringify(r.stdout)}`);
 });
 
+// ═════════════════════════════════════════════════════════════════════════════
+// Issue #278: the seven sites #273 itself named as its own deferred follow-up ("Seven further
+// sites ... print 'proxy unreachable' for a local fault but do not swallow bash's own message ...
+// Lower priority" — #273's own text), plus an eighth, higher-severity site found during #273's
+// own site survey (cmd_connect's health probe). All eight route through the existing
+// `_curl_or_die` helper (#261/#267/#273) — no new mechanism, same drop-in shape, `|| return 1`
+// preserved everywhere (never `exit 1` — `_curl_or_die`'s own doc comment shows `|| exit 1` only
+// as cmd_usage's own documented top-level-exit special case, not a template for functions reached
+// from ocp's outer dispatch and expected to `return`).
+//
+// Independent confirmation of the issue's own severity ranking (cmd_connect ranked ABOVE the
+// other seven), checked directly against the unmodified `ocp` source before writing these tests
+// rather than trusting the issue text: sites 1-7 below already write "Error: proxy
+// unreachable..." with `>&2` (real stderr) — a curl-exec failure at any of them still prints TWO
+// lines: bash's own "command not found"/"Permission denied" diagnostic (curl's stderr was never
+// redirected away) alongside the wrong "proxy unreachable" headline. Wrong and confusing, but the
+// true signal is visible somewhere on a real terminal. `cmd_connect`'s health probe was different
+// in KIND, not degree: `curl ... 2>/dev/null` discarded curl's own stderr outright, so a curl-exec
+// failure there produced exactly ONE line — "✗ Cannot reach $base_url/health" — with zero trace
+// of the real cause on either stream. That is total information loss vs. a confusing-but-visible
+// mislabel, which independently confirms the issue's ranking rather than merely asserting it.
+// Also found while confirming this (not previously called out anywhere): that same "✗ Cannot
+// reach ..." / "Make sure OCP is running ..." pair used plain `echo` with no `>&2` at all — the
+// diagnostic landed on STDOUT, unlike every one of the other seven sites and unlike
+// `_curl_or_die`'s own stderr convention. Routing this site through `_curl_or_die` fixes that too,
+// as a side effect of the fix rather than a separate change.
+console.log("\nocp: eight more silent-failure sites route through _curl_or_die (#278, generalizes #261's repro):");
+
+test("#278 cmd_logs: curl missing from $PATH must be reported as a local fault, not 'proxy unreachable'", () => {
+  const r = _bwHarnessRun({ args: ["logs"], curlAbsent: true });
+  assert.notEqual(r.status, 0, `expected a nonzero exit; status=${r.status}`);
+  assert.ok(!r.stderr.includes("proxy unreachable") && !r.stdout.includes("proxy unreachable"),
+    `must NOT misattribute a missing curl binary to the proxy; stderr=${JSON.stringify(r.stderr)} stdout=${JSON.stringify(r.stdout)}`);
+  assert.ok(/curl/i.test(r.stderr), `expected the message to name curl/the local command failure, got stderr=${JSON.stringify(r.stderr)}`);
+});
+
+test("#278 control: cmd_logs with curl present but the proxy genuinely unreachable still says 'proxy unreachable'", () => {
+  const r = _bwHarnessRun({ args: ["logs"] });
+  assert.notEqual(r.status, 0, `expected a nonzero exit; status=${r.status}`);
+  assert.ok(r.stderr.includes("Error: proxy unreachable"),
+    `a GENUINE network failure must still be reported as such (proves the fix does not just delete the diagnosis), got stderr=${JSON.stringify(r.stderr)}`);
+});
+
+test("#278 cmd_models: curl missing from $PATH must be reported as a local fault, not 'proxy unreachable'", () => {
+  const r = _bwHarnessRun({ args: ["models"], curlAbsent: true });
+  assert.notEqual(r.status, 0, `expected a nonzero exit; status=${r.status}`);
+  assert.ok(!r.stderr.includes("proxy unreachable") && !r.stdout.includes("proxy unreachable"),
+    `must NOT misattribute a missing curl binary to the proxy; stderr=${JSON.stringify(r.stderr)} stdout=${JSON.stringify(r.stdout)}`);
+  assert.ok(/curl/i.test(r.stderr), `expected the message to name curl/the local command failure, got stderr=${JSON.stringify(r.stderr)}`);
+});
+
+test("#278 fold-in (exit 126 coverage): cmd_models with curl present but NOT EXECUTABLE must also be reported as a local fault, not 'proxy unreachable'", () => {
+  // Mirrors #261 fold-in B: the reviewer's own repro (`chmod 000` a real curl -> exit 126 +
+  // "Permission denied") for at least one of this issue's eight sites, so exit 126 is proven
+  // covered here too, not just exit 127 (curlAbsent).
+  const r = _bwHarnessRun({ args: ["models"], curlNotExecutable: true });
+  assert.notEqual(r.status, 0, `expected a nonzero exit; status=${r.status}`);
+  assert.ok(!r.stderr.includes("proxy unreachable") && !r.stdout.includes("proxy unreachable"),
+    `must NOT misattribute a non-executable curl binary to the proxy; stderr=${JSON.stringify(r.stderr)} stdout=${JSON.stringify(r.stdout)}`);
+  assert.ok(/curl/i.test(r.stderr), `expected the message to name curl/the local command failure, got stderr=${JSON.stringify(r.stderr)}`);
+});
+
+test("#278 control: cmd_models with curl present but the proxy genuinely unreachable still says 'proxy unreachable'", () => {
+  const r = _bwHarnessRun({ args: ["models"] });
+  assert.notEqual(r.status, 0, `expected a nonzero exit; status=${r.status}`);
+  assert.ok(r.stderr.includes("Error: proxy unreachable"),
+    `a GENUINE network failure must still be reported as such, got stderr=${JSON.stringify(r.stderr)}`);
+});
+
+test("#278 cmd_sessions: curl missing from $PATH must be reported as a local fault, not 'proxy unreachable'", () => {
+  const r = _bwHarnessRun({ args: ["sessions"], curlAbsent: true });
+  assert.notEqual(r.status, 0, `expected a nonzero exit; status=${r.status}`);
+  assert.ok(!r.stderr.includes("proxy unreachable") && !r.stdout.includes("proxy unreachable"),
+    `must NOT misattribute a missing curl binary to the proxy; stderr=${JSON.stringify(r.stderr)} stdout=${JSON.stringify(r.stdout)}`);
+  assert.ok(/curl/i.test(r.stderr), `expected the message to name curl/the local command failure, got stderr=${JSON.stringify(r.stderr)}`);
+});
+
+test("#278 control: cmd_sessions with curl present but the proxy genuinely unreachable still says 'proxy unreachable'", () => {
+  const r = _bwHarnessRun({ args: ["sessions"] });
+  assert.notEqual(r.status, 0, `expected a nonzero exit; status=${r.status}`);
+  assert.ok(r.stderr.includes("Error: proxy unreachable"),
+    `a GENUINE network failure must still be reported as such, got stderr=${JSON.stringify(r.stderr)}`);
+});
+
+test("#278 cmd_clear: curl missing from $PATH must be reported as a local fault, not 'proxy unreachable'", () => {
+  const r = _bwHarnessRun({ args: ["clear"], curlAbsent: true });
+  assert.notEqual(r.status, 0, `expected a nonzero exit; status=${r.status}`);
+  assert.ok(!r.stderr.includes("proxy unreachable") && !r.stdout.includes("proxy unreachable"),
+    `must NOT misattribute a missing curl binary to the proxy; stderr=${JSON.stringify(r.stderr)} stdout=${JSON.stringify(r.stdout)}`);
+  assert.ok(/curl/i.test(r.stderr), `expected the message to name curl/the local command failure, got stderr=${JSON.stringify(r.stderr)}`);
+});
+
+test("#278 control: cmd_clear with curl present but the proxy genuinely unreachable still says 'proxy unreachable'", () => {
+  const r = _bwHarnessRun({ args: ["clear"] });
+  assert.notEqual(r.status, 0, `expected a nonzero exit; status=${r.status}`);
+  assert.ok(r.stderr.includes("Error: proxy unreachable"),
+    `a GENUINE network failure must still be reported as such, got stderr=${JSON.stringify(r.stderr)}`);
+});
+
+test("#278 cmd_keys revoke: curl missing from $PATH must be reported as a local fault, not 'proxy unreachable or unauthorized'", () => {
+  const r = _bwHarnessRun({ args: ["keys", "revoke", "laptop-marker"], adminKey: "test-admin-key-marker", curlAbsent: true });
+  assert.notEqual(r.status, 0, `expected a nonzero exit; status=${r.status}`);
+  assert.ok(!r.stderr.includes("proxy unreachable") && !r.stdout.includes("proxy unreachable"),
+    `must NOT misattribute a missing curl binary to the proxy/auth layer; stderr=${JSON.stringify(r.stderr)} stdout=${JSON.stringify(r.stdout)}`);
+  assert.ok(/curl/i.test(r.stderr), `expected the message to name curl/the local command failure, got stderr=${JSON.stringify(r.stderr)}`);
+});
+
+test("#278 control: cmd_keys revoke with curl present but the proxy genuinely unreachable still says 'proxy unreachable or unauthorized'", () => {
+  const r = _bwHarnessRun({ args: ["keys", "revoke", "laptop-marker"], adminKey: "test-admin-key-marker" });
+  assert.notEqual(r.status, 0, `expected a nonzero exit; status=${r.status}`);
+  assert.ok(r.stderr.includes("proxy unreachable or unauthorized"),
+    `a GENUINE network failure must still be reported as such, got stderr=${JSON.stringify(r.stderr)}`);
+});
+
+test("#278 cmd_keys list: curl missing from $PATH must be reported as a local fault, not 'proxy unreachable or key management not available'", () => {
+  const r = _bwHarnessRun({ args: ["keys"], adminKey: "test-admin-key-marker", curlAbsent: true });
+  assert.notEqual(r.status, 0, `expected a nonzero exit; status=${r.status}`);
+  assert.ok(!r.stderr.includes("proxy unreachable") && !r.stdout.includes("proxy unreachable"),
+    `must NOT misattribute a missing curl binary to the proxy/auth layer; stderr=${JSON.stringify(r.stderr)} stdout=${JSON.stringify(r.stdout)}`);
+  assert.ok(/curl/i.test(r.stderr), `expected the message to name curl/the local command failure, got stderr=${JSON.stringify(r.stderr)}`);
+});
+
+test("#278 control: cmd_keys list with curl present but the proxy genuinely unreachable still says 'proxy unreachable or key management not available'", () => {
+  const r = _bwHarnessRun({ args: ["keys"], adminKey: "test-admin-key-marker" });
+  assert.notEqual(r.status, 0, `expected a nonzero exit; status=${r.status}`);
+  assert.ok(r.stderr.includes("proxy unreachable or key management not available"),
+    `a GENUINE network failure must still be reported as such, got stderr=${JSON.stringify(r.stderr)}`);
+});
+
+test("#278 cmd_settings (GET): curl missing from $PATH must be reported as a local fault, not 'proxy unreachable'", () => {
+  const r = _bwHarnessRun({ args: ["settings"], curlAbsent: true });
+  assert.notEqual(r.status, 0, `expected a nonzero exit; status=${r.status}`);
+  assert.ok(!r.stderr.includes("proxy unreachable") && !r.stdout.includes("proxy unreachable"),
+    `must NOT misattribute a missing curl binary to the proxy; stderr=${JSON.stringify(r.stderr)} stdout=${JSON.stringify(r.stdout)}`);
+  assert.ok(/curl/i.test(r.stderr), `expected the message to name curl/the local command failure, got stderr=${JSON.stringify(r.stderr)}`);
+});
+
+test("#278 control: cmd_settings (GET) with curl present but the proxy genuinely unreachable still says 'proxy unreachable'", () => {
+  const r = _bwHarnessRun({ args: ["settings"] });
+  assert.notEqual(r.status, 0, `expected a nonzero exit; status=${r.status}`);
+  assert.ok(r.stderr.includes("Error: proxy unreachable"),
+    `a GENUINE network failure must still be reported as such, got stderr=${JSON.stringify(r.stderr)}`);
+});
+
+// ── cmd_connect: the eighth, higher-severity site. Unlike the seven above, the pre-fix code
+// actively discarded curl's own stderr via `2>/dev/null` (a true silence, not just a
+// mislabeling), AND targets a REMOTE host ($base_url, built from the user's own `ocp connect
+// <host-ip>` argument) rather than $PROXY. 192.0.2.1 is a TEST-NET-1 documentation address (RFC
+// 5737) — never a real host — and no --port is passed, so cmd_connect's own pre-existing default
+// (3456) applies unmodified; this test file introduces no new port literal.
+console.log("\nocp cmd_connect: the eighth, higher-severity site — was a TRUE silence via 2>/dev/null (#278):");
+
+test("#278 cmd_connect: curl missing from $PATH must be reported as a local fault, not 'Cannot reach ...' — and must NOT carry the 'make sure OCP is running' hint (wrong advice for a local fault)", () => {
+  const r = _bwHarnessRun({ args: ["connect", "192.0.2.1"], curlAbsent: true });
+  assert.notEqual(r.status, 0, `expected a nonzero exit; status=${r.status}`);
+  assert.ok(!r.stderr.includes("Cannot reach") && !r.stdout.includes("Cannot reach"),
+    `must NOT misattribute a missing curl binary to the remote host; stderr=${JSON.stringify(r.stderr)} stdout=${JSON.stringify(r.stdout)}`);
+  assert.ok(/curl/i.test(r.stderr), `expected the message to name curl/the local command failure, got stderr=${JSON.stringify(r.stderr)}`);
+  assert.ok(!r.stderr.includes("make sure OCP is running") && !r.stdout.includes("make sure OCP is running"),
+    `a local curl fault must NOT carry the 'make sure OCP is running on <host>' hint — that advice ` +
+    `is wrong when the real cause is a missing local curl binary, not a down remote peer; ` +
+    `stderr=${JSON.stringify(r.stderr)} stdout=${JSON.stringify(r.stdout)}`);
+});
+
+test("#278 control: cmd_connect with curl present but the remote genuinely unreachable still surfaces 'Cannot reach ... make sure OCP is running ...'", () => {
+  const r = _bwHarnessRun({ args: ["connect", "192.0.2.1"] });
+  assert.notEqual(r.status, 0, `expected a nonzero exit; status=${r.status}`);
+  assert.ok(r.stderr.includes("Cannot reach") && r.stderr.includes("make sure OCP is running"),
+    `a GENUINE network failure must still surface the original diagnosis + hint (proves the fix ` +
+    `does not just delete it), got stderr=${JSON.stringify(r.stderr)}`);
+});
+
+test("#278 cmd_connect: the diagnostic now goes to stderr, not stdout (previously neither echo had '>&2' — a positive side effect of routing through _curl_or_die)", () => {
+  const r = _bwHarnessRun({ args: ["connect", "192.0.2.1"] });
+  assert.notEqual(r.status, 0, `expected a nonzero exit; status=${r.status}`);
+  assert.equal(r.stdout.includes("Cannot reach"), false, `the diagnostic must not land on stdout; got stdout=${JSON.stringify(r.stdout)}`);
+});
+
 console.log("\nRestart-unit resolution (issue #233 defect 1) — macOS lsof exit-code handling:");
 
 // Background: `lsof -nP -iTCP:<port> -sTCP:LISTEN` EXITS 1 with EMPTY stdout when nothing

@@ -316,7 +316,12 @@ cmd_logs() {
   local n=${1:-20}
   local level=${2:-error}
   local data
-  data=$(curl -sf --max-time 10 "$PROXY/logs?n=$n&level=$level") || { echo "Error: proxy unreachable" >&2; return 1; }
+  # Issue #278 (#273's own deferred follow-up): routed through `_curl_or_die` (#261/#267/#273)
+  # like the other captured-assignment sites, so a curl-exec failure (curl missing from $PATH,
+  # permission denied, corrupted binary) is no longer misreported as "proxy unreachable" — same
+  # drop-in shape, `|| return 1` preserved (this function is reached via ocp's outer dispatch, not
+  # a top-level exit-on-failure path).
+  data=$(_curl_or_die "proxy unreachable" curl -sf --max-time 10 "$PROXY/logs?n=$n&level=$level") || return 1
   echo "$data" | python3 -c "
 import sys, json
 d = json.loads(sys.stdin.read())
@@ -351,7 +356,8 @@ EOF
 
 cmd_models() {
   local data
-  data=$(curl -sf --max-time 5 "$PROXY/v1/models") || { echo "Error: proxy unreachable" >&2; return 1; }
+  # Issue #278 (same shape as cmd_logs above, see its comment).
+  data=$(_curl_or_die "proxy unreachable" curl -sf --max-time 5 "$PROXY/v1/models") || return 1
   echo "$data" | python3 -c "
 import sys, json
 d = json.loads(sys.stdin.read())
@@ -371,7 +377,8 @@ EOF
 
 cmd_sessions() {
   local data
-  data=$(curl -sf --max-time 5 "$PROXY/sessions") || { echo "Error: proxy unreachable" >&2; return 1; }
+  # Issue #278 (same shape as cmd_logs above, see its comment).
+  data=$(_curl_or_die "proxy unreachable" curl -sf --max-time 5 "$PROXY/sessions") || return 1
   echo "$data" | python3 -c "
 import sys, json
 d = json.loads(sys.stdin.read())
@@ -395,7 +402,8 @@ EOF
 
 cmd_clear() {
   local result
-  result=$(curl -sf --max-time 5 -X DELETE "$PROXY/sessions") || { echo "Error: proxy unreachable" >&2; return 1; }
+  # Issue #278 (same shape as cmd_logs above, see its comment).
+  result=$(_curl_or_die "proxy unreachable" curl -sf --max-time 5 -X DELETE "$PROXY/sessions") || return 1
   # The DELETE above already ran (the clear itself, if the proxy answered, already happened) —
   # only the count formatting can still fail python3-absent/malformed, so the fallback below
   # says so explicitly rather than implying the clear itself didn't happen (issue #242).
@@ -459,7 +467,10 @@ else:
     revoke)
       if [[ -z "${2:-}" ]]; then echo "Usage: ocp keys revoke <name|id>"; return 1; fi
       local result
-      result=$(_curl -sf --max-time 5 -X DELETE "$PROXY/api/keys/$2") || { echo "Error: proxy unreachable or unauthorized" >&2; return 1; }
+      # Issue #278 (same shape as cmd_logs above, see its comment) — kept on `_curl` (not bare
+      # curl): `_curl` adds the admin-key auth header via `_AUTH_ARGS`, dropping it here would
+      # silently break authenticated revoke requests.
+      result=$(_curl_or_die "proxy unreachable or unauthorized" _curl -sf --max-time 5 -X DELETE "$PROXY/api/keys/$2") || return 1
       echo "$result" | python3 -c "
 import sys, json
 d = json.loads(sys.stdin.read())
@@ -483,7 +494,9 @@ else:
       # unreachable proxy still gets its own accurate message), then let python3's failure route
       # through the shared `_pyfail` helper (raw JSON preserved, not swallowed by `2>/dev/null`).
       local data
-      data=$(_curl -sf --max-time 5 "$PROXY/api/keys") || { echo "Error: proxy unreachable or key management not available" >&2; return 1; }
+      # Issue #278 (same shape as cmd_logs above, see its comment) — kept on `_curl` (not bare
+      # curl): dropping it here would silently break authenticated list requests.
+      data=$(_curl_or_die "proxy unreachable or key management not available" _curl -sf --max-time 5 "$PROXY/api/keys") || return 1
       echo "$data" | python3 -c "
 import sys, json
 d = json.loads(sys.stdin.read())
@@ -561,13 +574,22 @@ cmd_connect() {
   echo ""
 
   # Step 1: Test connectivity via /health
+  #
+  # Issue #278: this used to be `curl ... 2>/dev/null`, a TRUE silence (unlike the seven other
+  # sites this issue fixes, which at least let bash's own diagnostic through unredirected) — a
+  # curl-exec failure here (curl missing from $PATH on the machine running `ocp connect`) reported
+  # "Cannot reach $base_url/health" with zero evidence the LOCAL curl binary, not the REMOTE peer,
+  # was the actual fault. Routed through `_curl_or_die` (#261/#267/#273) like the other seven, with
+  # one difference: `_curl_or_die`'s plain "Error: <label>" doesn't carry this function's own
+  # "Make sure OCP is running..." hint, and that hint would be WRONG advice on the local-fault
+  # branch (a missing local curl has nothing to do with whether the remote OCP is running) — so
+  # the hint is folded into the label itself, which only ever surfaces on the genuine-network-
+  # failure branch. Also fixes an independent, previously-uncalled-out defect found while doing
+  # this: neither original `echo` had `>&2`, so the diagnostic landed on STDOUT — unlike every one
+  # of this issue's other seven sites and unlike `_curl_or_die`'s own stderr convention.
   echo "  Checking connectivity..."
   local health_json
-  health_json=$(curl -sf --max-time 10 "$base_url/health" 2>/dev/null) || {
-    echo "  ✗ Cannot reach $base_url/health"
-    echo "    Make sure OCP is running on $host and bound to 0.0.0.0 (LAN mode)."
-    return 1
-  }
+  health_json=$(_curl_or_die "Cannot reach $base_url/health — make sure OCP is running on $host and bound to 0.0.0.0 (LAN mode)" curl -sf --max-time 10 "$base_url/health") || return 1
   echo "  ✓ Connected"
   echo ""
 
@@ -943,7 +965,8 @@ cmd_settings() {
   if [[ -z "${1:-}" ]]; then
     # GET — show all settings
     local data
-    data=$(curl -sf --max-time 5 "$PROXY/settings") || { echo "Error: proxy unreachable" >&2; return 1; }
+    # Issue #278 (same shape as cmd_logs above, see its comment).
+    data=$(_curl_or_die "proxy unreachable" curl -sf --max-time 5 "$PROXY/settings") || return 1
     echo "$data" | python3 -c "
 import sys, json
 d = json.loads(sys.stdin.read())
