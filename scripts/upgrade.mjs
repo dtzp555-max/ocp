@@ -15,7 +15,7 @@ import { runDoctor } from "./doctor.mjs";
 import { execSync, execFileSync } from "node:child_process";
 import { homedir } from "node:os";
 import { join } from "node:path";
-import { existsSync, copyFileSync } from "node:fs";
+import { existsSync, copyFileSync, realpathSync } from "node:fs";
 import { writeSnapshot, listSnapshots, readSnapshot, gcSnapshots } from "./lib/snapshot.mjs";
 import { resolveOwningUnit, planRestart, classifySsListener, classifyLsofListener } from "./lib/restart-unit.mjs";
 import { DEFAULT_PORT } from "../lib/constants.mjs";
@@ -26,6 +26,17 @@ import { DEFAULT_PORT } from "../lib/constants.mjs";
 // refer to the exact same implementation.
 function execRun(cmd) {
   return execSync(cmd, { stdio: ["pipe", "pipe", "pipe"] }).toString();
+}
+
+// issue #254: the working tree THIS installation (the one this process is actually running from)
+// is rooted in — same opts.ocpDir-or-default fallback every other ocpDir use in this file already
+// takes (runFullUpgrade, runRollback). realpath'd where possible so a symlinked install dir
+// (~/ocp -> /data/ocp, say) compares correctly against /proc/<pid>/cwd's already-kernel-canonical
+// target; falls back to the raw path when realpath fails (doesn't exist yet, permission gap) —
+// this function must never throw, only degrade to the best answer it has.
+function resolveExpectedWorkingTree(opts) {
+  const ocpDir = opts.ocpDir || join(homedir(), "ocp");
+  try { return realpathSync(ocpDir); } catch { return ocpDir; }
 }
 
 // issue #233 defect 1: `lsof -nP -iTCP:<port> -sTCP:LISTEN` signals "nothing matched" via
@@ -242,6 +253,14 @@ function resolveRestartPlan({ opts, port, isRollback = false, fromCommit = null 
         // confirm the owning process is actually OCP's server.mjs before ever treating a resolved
         // unit as a restart candidate, instead of acting on a real-but-foreign unit name.
         try { probe.cmdlineContent = run(`cat /proc/${listener.pid}/cmdline`); } catch { probe.cmdlineContent = null; }
+        // issue #254: same gather step, same pid — read the process's actual working directory via
+        // the /proc/<pid>/cwd symlink (readlink resolves it to a kernel-canonical absolute path,
+        // regardless of whether argv itself spelled out a relative or absolute server.mjs). Paired
+        // with expectedWorkingTree (this installation's own tree) so resolveOwningUnit can tell a
+        // same-name, same-argv process apart from a DIFFERENT OCP checkout — see
+        // classifyWorkingTree's own comment in restart-unit.mjs for what this can and cannot decide.
+        try { probe.cwdTarget = run(`readlink /proc/${listener.pid}/cwd`); } catch { probe.cwdTarget = null; }
+        probe.expectedWorkingTree = resolveExpectedWorkingTree(opts);
       }
     }
     owner = resolveOwningUnit(probe);
@@ -938,7 +957,6 @@ async function runRollback(opts) {
 
 // CLI entrypoint — use fileURLToPath + realpath to handle symlinked install paths.
 import { fileURLToPath } from "node:url";
-import { realpathSync } from "node:fs";
 function _isMain() {
   if (!process.argv[1]) return false;
   try {

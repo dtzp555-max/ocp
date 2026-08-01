@@ -150,6 +150,33 @@
  * before this field existed. `planRestart`'s `no-unit` and `foreign-process` refusal messages are
  * platform-branched (`owner.platform === "darwin"`) since the Linux wording names `systemd`,
  * `/proc/<pid>/cgroup`, and `/proc/<pid>/cmdline` — none of which exist on macOS.
+ *
+ * A FIFTH independent review (issue #254, split from #237 by review of PR #251) found that #237's
+ * own fix, while it fully closes the reported "wholly foreign service" vulnerability, leaves one
+ * narrower case open: classifyCmdlineOwner confirms a process invokes A server.mjs, never that it
+ * invokes THIS installation's server.mjs. A second, unrelated Node application whose entrypoint
+ * happens to be named (or symlinked to) server.mjs — or, more realistically on this fleet, a
+ * second OCP checkout (a dev tree sitting next to a production install) — still passes
+ * classifyCmdlineOwner's "ocp" verdict and gets treated as a legitimate restart candidate.
+ *
+ * Fix: classifyWorkingTree compares the resolved process's ACTUAL working directory
+ * (`readlink /proc/<pid>/cwd`, gathered in the same probe pass as cmdline/cgroup — no separate
+ * resolution round-trip) against the working tree scripts/upgrade.mjs is itself running from
+ * (opts.ocpDir or its script-relative default). Unlike doctor.mjs's own #230 workingTree (derived
+ * from static argv TEXT, since it inspects unit definitions that may not even be running — and
+ * unreliable for a bare relative "server.mjs" argv, a real production unit shape on this fleet
+ * today), `/proc/<pid>/cwd` reflects the kernel's own canonical resolution of a LIVE pid's cwd,
+ * independent of whatever argv happened to spell out.
+ *
+ * Deliberately a WARNING, not a refusal (see classifyWorkingTree's own comment for the full
+ * rationale): unlike #237's argv check, whose false-positive rate is close to zero (real argv
+ * genuinely lacking "server.mjs" is unambiguous), a working-tree mismatch is comparatively weaker
+ * evidence — `/proc/<pid>/cwd` requires ptrace-level visibility (stricter than cmdlineContent's),
+ * so "unknown" is a routine outcome, not an edge case, on a non-root updater against a root-owned
+ * unit. A false "different install" verdict here would refuse a healthy production restart, which
+ * this fleet cannot afford — a stricter posture than #237 took for the CONFIRMED-foreign case.
+ * Scope: Linux only, mirroring #237/#239's own platform split — macOS has no direct pid-to-cwd
+ * read this module can lean on without its own separate design pass, and is left for a follow-up.
  */
 
 // Anything accepted as a restart target must look like a real systemd unit name.
@@ -487,6 +514,83 @@ export function classifyCmdlineOwner(cmdlineContent) {
   return { state: "ocp", reason: null };
 }
 
+// --- Linux: compare the port-holding process's ACTUAL working directory against the working
+// tree the specific installation running `ocp update`/`ocp restart` is itself rooted in --- (issue
+// #254 — the residual gap independent review of PR #251 flagged and asked to be filed rather than
+// silently dropped)
+//
+// classifyCmdlineOwner (#237, above) answers "does this process invoke A server.mjs at all" — it
+// does not, and was never meant to, answer "is it THIS installation's server.mjs". A second,
+// unrelated Node application whose own entrypoint happens to be named (or symlinked to)
+// server.mjs — or, far more realistically on this fleet, a second OCP checkout (a dev tree sitting
+// next to a production install) — passes classifyCmdlineOwner's "ocp" verdict exactly the same way
+// the real production process does; nothing about that check can tell them apart.
+//
+// doctor.mjs's own #230 fingerprintSystemdUnit/parsePlistCandidates derive a "workingTree" by
+// slicing argv's own server.mjs path apart (`serverArg === "server.mjs" ? "" : serverArg.slice(0,
+// -"/server.mjs".length)`). That is a STATIC-TEXT signal computed over a unit DEFINITION that may
+// not even be running, and it is unreliable by construction for a bare relative "server.mjs" argv
+// — workingTree resolves to "", not to a real, comparable directory. This fleet runs production
+// units of EXACTLY that shape today (WorkingDirectory=<tree>, ExecStart=node server.mjs); keying a
+// comparison off argv text would read every one of them as an unresolvable mismatch regardless of
+// whether the tree is actually the same — wrong by construction, not a corner case.
+//
+// This module's context is different and stronger: resolveOwningUnit only ever reaches this check
+// once `ss` has already confirmed a LIVE pid. A live pid's actual working directory is legible
+// straight from the kernel: `/proc/<pid>/cwd` is a symlink whose target the kernel resolves and
+// stores as a real (canonical, no "..", no unresolved intermediate symlink) absolute path,
+// entirely independent of whatever argv happened to spell out (relative or absolute) — so this
+// does NOT inherit doctor.mjs's bare-relative-argv blind spot.
+//
+// What this honestly CANNOT decide:
+//   - `/proc/<pid>/cwd` requires ptrace-level visibility (same uid, or CAP_SYS_PTRACE) — a
+//     STRICTER requirement than /proc/<pid>/cmdline, which is world-readable on a default
+//     hidepid=0/1 host. A non-root `ocp update` against a root-owned SYSTEM unit — a supported,
+//     already-documented shape elsewhere in this file — will routinely have cmdlineContent succeed
+//     while THIS read is denied. Denied means "unknown", never "confirmed different tree" — same
+//     "unknown must never be treated as safe-to-guess" posture as every other classifier here.
+//   - it reflects the process's CURRENT cwd, not provably "the directory server.mjs was loaded
+//     from" — a process that calls `process.chdir()` after startup would defeat this. OCP's own
+//     server.mjs does not (verified: no `process.chdir` call anywhere in server.mjs); an adversary
+//     willing to both fork a lookalike server.mjs-named entrypoint AND chdir it to match is the
+//     same out-of-scope threat model #237's own review already named ("spoofing argv is a
+//     non-issue for the threat model this addresses — misconfiguration, not an adversary
+//     controlling process identity").
+//   - unlike classifyCmdlineOwner (near-zero false-positive rate: real argv genuinely not
+//     containing "server.mjs" is unambiguous), a working-tree MISMATCH is comparatively weaker
+//     evidence on its own. A false "different install" verdict here would block a healthy
+//     production restart — unlike #237's classifyCmdlineOwner, this is NOT safe to treat as an
+//     unconditional refusal. See planRestart: a confirmed mismatch WARNS (matching doctor.mjs's
+//     own #230 MED-7 posture — "two legitimate, separate installs ... must NOT have one nominated
+//     over the other", extended here from "which unit to disable" to "whether to trust a
+//     restart"), it does not refuse.
+//
+// Returns one of three states:
+//   "match"     the observed cwd equals the expected working tree
+//   "mismatch"  both sides are known and they differ — a confident, positive "this may not be THIS
+//               installation" signal, not proof (see the honest limits above)
+//   "unknown"   either side could not be determined — never conflated with "mismatch"
+export function classifyWorkingTree(cwdTarget, expectedWorkingTree) {
+  const expected = expectedWorkingTree == null ? "" : String(expectedWorkingTree).trim();
+  if (!expected) {
+    return { state: "unknown", reason: "no expected working tree was provided to compare against" };
+  }
+  if (cwdTarget == null) {
+    return { state: "unknown", reason: "could not read /proc/<pid>/cwd (permission denied, or the process exited between probes)" };
+  }
+  const observed = String(cwdTarget).trim();
+  if (!observed) {
+    return { state: "unknown", reason: "empty /proc/<pid>/cwd read" };
+  }
+  if (observed === expected) {
+    return { state: "match", reason: null };
+  }
+  return {
+    state: "mismatch",
+    reason: `owning process's working directory (${observed}) does not match this installation's own working tree (${expected}) — this may be a different OCP checkout (or an unrelated process) rather than this installation`,
+  };
+}
+
 // --- macOS: classify a launchd job's argv as OCP's own server.mjs, or a foreign process ---
 // (issue #239, mirroring classifyCmdlineOwner's #237 check)
 //
@@ -546,6 +650,21 @@ export function classifyLaunchdArgv(argv) {
  *                                  undefined — "undefined" only arises from a caller (or test)
  *                                  that hasn't been wired to this check, and must not newly
  *                                  refuse restarts that were safe before this field existed.
+ *   cwdTarget      raw `readlink /proc/<pid>/cwd` output for the resolved PID (Linux only; issue
+ *                   #254). Only consulted once cmdlineContent has already classified as "ocp" —
+ *                   comparing working trees is meaningless for an already-unknown/foreign process.
+ *                   Same three-state convention as cmdlineContent:
+ *                     a string     classified via classifyWorkingTree against expectedWorkingTree
+ *                     null         the probe was ATTEMPTED and failed to read (commonly a
+ *                                  permission gap — /proc/<pid>/cwd needs ptrace-level visibility,
+ *                                  stricter than cmdlineContent's) — treated as "unknown"
+ *                     undefined    the caller never attempted this probe at all — the check is
+ *                                  SKIPPED entirely, preserving pre-#254 behavior. Legacy/back-
+ *                                  compat lane, same convention as cmdlineContent's.
+ *   expectedWorkingTree  the working tree THIS installation (the one running `ocp update`/
+ *                   `ocp restart`) is itself rooted in — scripts/upgrade.mjs derives this from
+ *                   opts.ocpDir (realpath'd where possible), the same default every other ocpDir
+ *                   use in that file already falls back to.
  *   launchdPrintOutput  raw `launchctl print gui/<uid>/<expectedUnit>` stdout for the ONE label
  *                   this repo manages (macOS only; issue #239). Same three-state convention as
  *                   cmdlineContent above:
@@ -654,6 +773,7 @@ export function resolveOwningUnit(probe = {}) {
   // all (skip the check, preserve pre-#237 behavior for callers not yet wired to it); a string or
   // null means it WAS attempted, and gets classified/treated-as-unknown respectively. See
   // classifyCmdlineOwner's own comment for the full three-state rationale.
+  let workingTreeResult = null;
   if (probe.cmdlineContent !== undefined) {
     const cmdlineResult = classifyCmdlineOwner(probe.cmdlineContent);
     if (cmdlineResult.state === "unknown") {
@@ -668,6 +788,14 @@ export function resolveOwningUnit(probe = {}) {
         reason: `"${cgroupResult.unit}" (${cgroupResult.scope}-scope) owns the OCP port, but its process is not OCP's server.mjs — ${cmdlineResult.reason}`,
       };
     }
+    // cmdlineResult.state === "ocp": confirmed to invoke A server.mjs. issue #254: that is not
+    // proof it's THIS installation's server.mjs — compare working trees, but only when the caller
+    // actually attempted this probe (probe.cwdTarget === undefined preserves pre-#254 behavior for
+    // callers/tests not yet wired to it, same legacy lane every other probe field in this file
+    // already uses).
+    if (probe.cwdTarget !== undefined) {
+      workingTreeResult = classifyWorkingTree(probe.cwdTarget, probe.expectedWorkingTree);
+    }
   }
 
   const mismatched = !!expectedUnit && cgroupResult.unit !== expectedUnit;
@@ -678,6 +806,13 @@ export function resolveOwningUnit(probe = {}) {
     unit: cgroupResult.unit,
     scope: cgroupResult.scope,
     mismatched,
+    // issue #254: a POSITIVE confirmation the resolved process's cwd differs from this
+    // installation's own working tree. Deliberately NOT folded into `mismatched` (a unit-NAME
+    // comparison) or `kind` (this never becomes "foreign-process" — see classifyWorkingTree's own
+    // comment for why an unconditional refusal is not safe here). "unknown"/no-probe both leave
+    // this false, same as every other classifier's "never treat unknown as confirmed" posture.
+    workingTreeMismatch: workingTreeResult?.state === "mismatch",
+    workingTreeReason: workingTreeResult?.state === "mismatch" ? workingTreeResult.reason : undefined,
   };
 }
 
@@ -730,6 +865,24 @@ export function planRestart(owner, opts = {}) {
       `[restart] WARNING: the OCP port is actually served by "${owner.unit}" (${owner.kind}), ` +
       `not the expected "${opts.expectedUnit}". Restarting "${owner.unit}" instead of the expected ` +
       `unit — see issue #215 (a hard-coded restart target left an orphan when the real owner differed).`
+    );
+  }
+
+  // issue #254: a confirmed "invokes server.mjs" verdict (classifyCmdlineOwner) is not proof it's
+  // THIS installation's server.mjs — see classifyWorkingTree's own comment for what the
+  // /proc/<pid>/cwd comparison can and cannot decide. Deliberately a WARNING, not a refusal: unlike
+  // the foreign-process check below (near-zero false-positive rate), a working-tree mismatch is
+  // weaker evidence — a false "different install" verdict here would refuse a healthy production
+  // restart, which this fleet cannot afford (matches doctor.mjs's own #230 MED-7 posture: two
+  // differing working trees are two legitimate, separate installs, and this codebase does not
+  // nominate one over the other without a human deciding).
+  if (owner.workingTreeMismatch) {
+    warnings.push(
+      `[restart] WARNING: ${owner.workingTreeReason} (issue #254). Proceeding anyway — a working-` +
+      `tree mismatch is not treated as confirmed-foreign the way issue #237's argv check is, ` +
+      `because refusing outright risks blocking a healthy production restart (this fleet runs a ` +
+      `relative "server.mjs" argv shape today, where only /proc/<pid>/cwd — not argv text — can ` +
+      `tell installs apart at all). Verify manually before trusting this restart if that matters here.`
     );
   }
 

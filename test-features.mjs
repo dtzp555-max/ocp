@@ -8433,7 +8433,7 @@ test("LOW-2 (real shell, verified mechanism): ocp's doctor-check-surfacing block
 // and asserts on return values or thrown messages — never on scripts/
 // upgrade.mjs's or scripts/lib/restart-unit.mjs's source text.
 // ═══════════════════════════════════════════════════════════════════════════
-import { resolveOwningUnit, planRestart, classifySsListener, classifyLsofListener, parseCgroupUnit, classifyCmdlineOwner, classifyLaunchdJob, classifyLaunchdArgv } from "./scripts/lib/restart-unit.mjs";
+import { resolveOwningUnit, planRestart, classifySsListener, classifyLsofListener, parseCgroupUnit, classifyCmdlineOwner, classifyLaunchdJob, classifyLaunchdArgv, classifyWorkingTree } from "./scripts/lib/restart-unit.mjs";
 
 console.log("\nRestart-unit resolution (issue #215) — classifiers:");
 
@@ -8618,6 +8618,51 @@ test("classifyCmdlineOwner: empty-string cmdline read is also 'unknown', not 'fo
   assert.equal(classifyCmdlineOwner("").state, "unknown");
 });
 
+console.log("\nRestart-unit resolution (issue #254) — classifyWorkingTree:");
+
+// issue #254: split from #237 per independent review of PR #251 — classifyCmdlineOwner confirms
+// "this process invokes A server.mjs", never "THIS installation's server.mjs". classifyWorkingTree
+// closes that gap by comparing /proc/<pid>/cwd (kernel-canonical, independent of whatever argv
+// spelled out) against the working tree the caller itself is running from.
+
+test("classifyWorkingTree: observed cwd equals the expected tree → match", () => {
+  assert.deepEqual(classifyWorkingTree("/home/opc/ocp", "/home/opc/ocp"), { state: "match", reason: null });
+});
+
+test("classifyWorkingTree: observed cwd is a DIFFERENT tree → mismatch, names BOTH paths in the reason", () => {
+  const result = classifyWorkingTree("/home/other-user/ocp-dev", "/home/opc/ocp");
+  assert.equal(result.state, "mismatch");
+  assert.ok(result.reason.includes("/home/other-user/ocp-dev"));
+  assert.ok(result.reason.includes("/home/opc/ocp"));
+});
+
+test("classifyWorkingTree: readlink's real output carries a trailing newline — trimmed before comparing", () => {
+  // execSync's .toString() includes the shell command's trailing newline verbatim; a naive
+  // string compare would read a real match as a mismatch on every single call.
+  assert.equal(classifyWorkingTree("/home/opc/ocp\n", "/home/opc/ocp").state, "match");
+});
+
+test("classifyWorkingTree: cwdTarget null (probe attempted, failed to read) → unknown, never the false-confident 'mismatch'", () => {
+  // /proc/<pid>/cwd requires ptrace-level visibility — a STRICTER permission bar than
+  // /proc/<pid>/cmdline. A non-root updater against a root-owned system unit routinely has
+  // cmdlineContent succeed while this read is denied; that must never be read as "confirmed
+  // different tree", the same "unknown must never be treated as safe-to-guess" posture every other
+  // classifier in this file already takes.
+  const result = classifyWorkingTree(null, "/home/opc/ocp");
+  assert.equal(result.state, "unknown");
+  assert.notEqual(result.state, "mismatch");
+});
+
+test("classifyWorkingTree: empty-string cwdTarget read is also 'unknown', not 'mismatch'", () => {
+  assert.equal(classifyWorkingTree("", "/home/opc/ocp").state, "unknown");
+});
+
+test("classifyWorkingTree: no expected working tree provided → unknown (never guesses a comparison with nothing to compare against)", () => {
+  assert.equal(classifyWorkingTree("/home/opc/ocp", "").state, "unknown");
+  assert.equal(classifyWorkingTree("/home/opc/ocp", null).state, "unknown");
+  assert.equal(classifyWorkingTree("/home/opc/ocp", undefined).state, "unknown");
+});
+
 console.log("\nRestart-unit resolution (issue #239) — classifyLaunchdJob:");
 
 // issue #239: macOS has no /proc/<pid>/cgroup reverse lookup, so ownership resolution runs the
@@ -8765,6 +8810,122 @@ test("resolveOwningUnit: cmdlineContent ABSENT (undefined, not null) preserves p
   });
   assert.equal(owner.kind, "system-unit");
   assert.equal(owner.mismatched, true);
+});
+
+console.log("\nRestart-unit resolution (issue #254) — resolveOwningUnit + planRestart: working-tree comparison:");
+
+test("resolveOwningUnit: confirmed server.mjs process, MATCHING working tree → workingTreeMismatch false, no warning from planRestart", () => {
+  const owner = resolveOwningUnit({
+    platform: "linux",
+    expectedUnit: "ocp-proxy.service",
+    ssOutput: `LISTEN 0 511 127.0.0.1:3456 0.0.0.0:* users:(("node",pid=900010,fd=19))`,
+    cgroupContent: "0::/user.slice/user-1000.slice/user@1000.service/app.slice/ocp-proxy.service\n",
+    cmdlineContent: "/usr/bin/node\0/home/opc/ocp/server.mjs\0",
+    cwdTarget: "/home/opc/ocp\n",
+    expectedWorkingTree: "/home/opc/ocp",
+  });
+  assert.equal(owner.kind, "user-unit");
+  assert.equal(owner.workingTreeMismatch, false);
+  const plan = planRestart(owner, { expectedUnit: "ocp-proxy.service" });
+  assert.ok(!plan.warnings.some(w => w.includes("#254")), "a matching working tree must not produce a #254 warning");
+});
+
+test("resolveOwningUnit: confirmed server.mjs process, DIFFERENT working tree (a second OCP checkout) → workingTreeMismatch true, named in owner.reason-adjacent field", () => {
+  const owner = resolveOwningUnit({
+    platform: "linux",
+    expectedUnit: "ocp-proxy.service",
+    ssOutput: `LISTEN 0 511 127.0.0.1:3456 0.0.0.0:* users:(("node",pid=900011,fd=19))`,
+    cgroupContent: "0::/user.slice/user-1000.slice/user@1000.service/app.slice/ocp-proxy.service\n",
+    cmdlineContent: "/usr/bin/node\0/home/other-user/ocp-dev/server.mjs\0",
+    cwdTarget: "/home/other-user/ocp-dev\n",
+    expectedWorkingTree: "/home/opc/ocp",
+  });
+  assert.equal(owner.kind, "user-unit", "still a real, name-matching unit — this is NOT the foreign-process case");
+  assert.equal(owner.workingTreeMismatch, true);
+  assert.ok(owner.workingTreeReason.includes("/home/other-user/ocp-dev"));
+  assert.ok(owner.workingTreeReason.includes("/home/opc/ocp"));
+});
+
+test("resolveOwningUnit: BARE RELATIVE server.mjs argv (the real production unit shape) with the SAME cwd as expected → match, no false positive", () => {
+  // The central fleet risk this fix must not introduce: WorkingDirectory=<tree>,
+  // ExecStart=node server.mjs is a real production unit today. argv alone carries no path at all
+  // (doctor.mjs's own #230 workingTree derivation would resolve to "" here — unusable). Only
+  // /proc/<pid>/cwd tells this apart from a genuinely different install, and it must correctly
+  // recognize the common, legitimate case as a match.
+  const owner = resolveOwningUnit({
+    platform: "linux",
+    expectedUnit: "ocp-proxy.service",
+    ssOutput: `LISTEN 0 511 127.0.0.1:3456 0.0.0.0:* users:(("node",pid=900012,fd=19))`,
+    cgroupContent: "0::/user.slice/user-1000.slice/user@1000.service/app.slice/ocp-proxy.service\n",
+    cmdlineContent: "/usr/bin/node\0server.mjs\0",
+    cwdTarget: "/home/opc/ocp\n",
+    expectedWorkingTree: "/home/opc/ocp",
+  });
+  assert.equal(owner.workingTreeMismatch, false, "a relative argv resolving to the SAME cwd must never be flagged as a mismatch");
+});
+
+test("resolveOwningUnit: BARE RELATIVE server.mjs argv with a DIFFERENT cwd → mismatch IS caught (proves cwd succeeds where argv-text would be blind)", () => {
+  const owner = resolveOwningUnit({
+    platform: "linux",
+    expectedUnit: "ocp-proxy.service",
+    ssOutput: `LISTEN 0 511 127.0.0.1:3456 0.0.0.0:* users:(("node",pid=900013,fd=19))`,
+    cgroupContent: "0::/user.slice/user-1000.slice/user@1000.service/app.slice/ocp-proxy.service\n",
+    cmdlineContent: "/usr/bin/node\0server.mjs\0",
+    cwdTarget: "/opt/second-ocp-install\n",
+    expectedWorkingTree: "/home/opc/ocp",
+  });
+  assert.equal(owner.workingTreeMismatch, true);
+  assert.ok(owner.workingTreeReason.includes("/opt/second-ocp-install"));
+});
+
+test("resolveOwningUnit: cwdTarget null (probe attempted, permission denied) → workingTreeMismatch stays false — never a false-confident mismatch", () => {
+  const owner = resolveOwningUnit({
+    platform: "linux",
+    expectedUnit: "ocp-proxy.service",
+    ssOutput: `LISTEN 0 511 0.0.0.0:3456 0.0.0.0:* users:(("node",pid=900014,fd=19))`,
+    cgroupContent: "0::/system.slice/ocp.service\n",
+    cmdlineContent: "/usr/bin/node\0/opt/ocp/server.mjs\0",
+    cwdTarget: null,
+    expectedWorkingTree: "/opt/ocp",
+  });
+  assert.equal(owner.workingTreeMismatch, false);
+  const plan = planRestart(owner, { expectedUnit: "ocp-proxy.service", isRoot: true });
+  assert.ok(!plan.warnings.some(w => w.includes("#254")));
+});
+
+test("resolveOwningUnit: cwdTarget ABSENT (undefined, not null) preserves pre-#254 behavior — backward compatible for callers not wired to the new check", () => {
+  const owner = resolveOwningUnit({
+    platform: "linux",
+    expectedUnit: "ocp-proxy.service",
+    ssOutput: `LISTEN 0 511 0.0.0.0:3456 0.0.0.0:* users:(("node",pid=900015,fd=19))`,
+    cgroupContent: "0::/system.slice/ocp.service\n",
+    cmdlineContent: "/usr/bin/node\0/opt/ocp/server.mjs\0",
+    // cwdTarget/expectedWorkingTree deliberately omitted — mirrors every legacy caller that
+    // predates this check.
+  });
+  assert.equal(owner.workingTreeMismatch, false);
+});
+
+test("planRestart: a working-tree mismatch WARNS but still proceeds — never escalated to a refusal (a false mismatch must not block a healthy restart)", () => {
+  const owner = {
+    kind: "user-unit", platform: "linux", pid: "900011", unit: "ocp-proxy.service", scope: "user", mismatched: false,
+    workingTreeMismatch: true,
+    workingTreeReason: `owning process's working directory (/home/other-user/ocp-dev) does not match this installation's own working tree (/home/opc/ocp) — this may be a different OCP checkout (or an unrelated process) rather than this installation`,
+  };
+  const plan = planRestart(owner, { expectedUnit: "ocp-proxy.service" });
+  assert.equal(plan.cmds.length, 1, "must still construct a restart command — this is a warning, not a refusal");
+  assert.ok(plan.warnings.some(w => w.includes("#254") && w.includes("/home/other-user/ocp-dev") && w.includes("/home/opc/ocp")));
+});
+
+test("planRestart: a working-tree mismatch on a SYSTEM unit, root-authorized, still proceeds with a warning (not silently dropped, not refused)", () => {
+  const owner = {
+    kind: "system-unit", platform: "linux", pid: "900016", unit: "ocp.service", scope: "system", mismatched: false,
+    workingTreeMismatch: true,
+    workingTreeReason: `owning process's working directory (/opt/second-ocp-install) does not match this installation's own working tree (/home/opc/ocp) — this may be a different OCP checkout (or an unrelated process) rather than this installation`,
+  };
+  const plan = planRestart(owner, { expectedUnit: "ocp-proxy.service", isRoot: true });
+  assert.equal(plan.cmds[0].cmd, "systemctl restart -- ocp.service");
+  assert.ok(plan.warnings.some(w => w.includes("#254")));
 });
 
 console.log("\nRestart-unit resolution (issue #215) — resolveOwningUnit composition:");
@@ -9460,6 +9621,76 @@ test("#237: injected runner — REAL gather layer reads /proc/<pid>/cmdline and 
       mockPlatform: "linux", mockIsRoot: true, run,
     });
   }, /nginx\.service.*not OCP's server\.mjs/s);
+});
+
+console.log("\nRestart-unit resolution (issue #254) — working-tree comparison (residual gap left open by #237's own review):");
+
+// issue #254: split from #237 per independent review of PR #251. classifyCmdlineOwner (#237)
+// answers "does this process invoke A server.mjs at all" — it does NOT answer "is it THIS
+// installation's server.mjs". A second, unrelated Node app whose entrypoint happens to be named
+// server.mjs, or — far more realistically on this fleet — a second OCP checkout (a dev tree next
+// to a production install) passes classifyCmdlineOwner's "ocp" verdict exactly like the real
+// production process does. These two tests drive the fix end to end through the SAME runUpgrade()
+// path #237's own wiring tests use — one via mockOwnerProbe (bypasses scripts/upgrade.mjs's own
+// gather layer), one via a fake injected run() (drives the REAL `readlink /proc/<pid>/cwd`
+// invocation) — mirroring the two-test shape #237 itself used for exactly the same reason (review
+// finding MED-6: the impure gather layer is where real defects hide, so it needs its own coverage,
+// not just the pure functions in isolation).
+
+test("#254: upgrade full path — a process confirmed to invoke server.mjs but from a DIFFERENT working tree gets a loud warning, not silent trust", async () => {
+  const result = await runUpgrade({
+    yes: true, dryRun: false, mockExec: true,
+    mockDoctor: { ready_to_upgrade: true, next_action: { kind: "upgrade" }, current_version: "v3.10.0", latest_version: "v3.14.0" },
+    mockPlatform: "linux",
+    mockOwnerProbe: {
+      ssOutput: `LISTEN 0 511 0.0.0.0:3456 0.0.0.0:* users:(("node",pid=900001,fd=19))`,
+      cgroupContent: "0::/user.slice/user-1000.slice/user@1000.service/app.slice/ocp-proxy.service\n",
+      // A REAL server.mjs — classifyCmdlineOwner alone confirms "ocp" — but rooted in a completely
+      // different checkout than this installation (opts.ocpDir below) is running from.
+      cmdlineContent: "/usr/bin/node\0/home/other-user/ocp-dev/server.mjs\0",
+      cwdTarget: "/home/other-user/ocp-dev\n", // readlink's real output carries a trailing newline
+      expectedWorkingTree: "/home/opc/ocp",
+    },
+    mockIsRoot: true,
+  });
+  const restartCmds = result.phases.filter(p => p.name === "restart").map(p => p.cmd);
+  // A working-tree mismatch WARNS — it does not refuse. See the fix's own design note: unlike
+  // #237's argv check (near-zero false-positive rate), a false "different install" verdict here
+  // would block a healthy production restart, which this fleet cannot afford (see the relative-argv
+  // production shape covered by the second test below).
+  assert.ok(restartCmds.length > 0, "a working-tree mismatch must not silently refuse the whole restart");
+  assert.ok(
+    result.phases.some(p => p.name === "restart-resolve" && p.note &&
+      p.note.includes("/home/other-user/ocp-dev") && p.note.includes("/home/opc/ocp")),
+    `expected a loud warning naming BOTH the observed and expected working tree; got phases=${JSON.stringify(result.phases)}`
+  );
+});
+
+test("#254: injected runner — REAL gather layer reads /proc/<pid>/cwd and warns on a working-tree mismatch end to end (not just the pure functions), even for a BARE RELATIVE server.mjs argv", async () => {
+  // The relative-argv shape (WorkingDirectory=<tree>, ExecStart=node server.mjs — argv carries no
+  // path at all) is a real production unit today. Any check keyed off argv TEXT for the tree
+  // (mirroring doctor.mjs's own #230 workingTree derivation) is blind here — the fix must use
+  // /proc/<pid>/cwd instead, which resolves the real cwd regardless of what argv spelled out.
+  const run = makeFakeRun({
+    "ss -lptn": `LISTEN 0 511 0.0.0.0:3456 0.0.0.0:* users:(("node",pid=900002,fd=19))`,
+    "cat /proc/900002/cgroup": "0::/system.slice/ocp.service\n",
+    "cat /proc/900002/cmdline": "/usr/bin/node\0server.mjs\0",
+    "readlink /proc/900002/cwd": "/opt/other-ocp-install\n",
+    "sudo -n -l systemctl restart -- ocp.service": "systemctl restart -- ocp.service",
+  });
+  const result = await runUpgrade({
+    yes: true, dryRun: false, mockExec: true,
+    mockDoctor: { ready_to_upgrade: true, next_action: { kind: "upgrade" }, current_version: "v3.10.0", latest_version: "v3.14.0" },
+    mockPlatform: "linux", mockIsRoot: true, run,
+    ocpDir: "/opt/ocp",
+  });
+  const restartCmds = result.phases.filter(p => p.name === "restart").map(p => p.cmd);
+  assert.ok(restartCmds.length > 0, "must still restart — a working-tree mismatch warns, it does not refuse");
+  assert.ok(
+    result.phases.some(p => p.name === "restart-resolve" && p.note &&
+      p.note.includes("/opt/other-ocp-install") && p.note.includes("/opt/ocp")),
+    `expected the warning to name BOTH the observed and expected working tree; got ${JSON.stringify(result.phases)}`
+  );
 });
 
 test("MED-4 wiring: injected runner — sudo -n -l denies THIS specific command → refuses (not a generic sudo -n true probe)", async () => {
