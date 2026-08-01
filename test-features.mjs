@@ -2997,6 +2997,210 @@ test("gcSnapshots --dry-run reports plan without deleting", () => {
   rmSync(root, { recursive: true, force: true });
 });
 
+// ── scripts/lib/start-sh.mjs: issue #246 (setup.mjs's bare lsof call sites) ──────────────────
+// setup.mjs itself can never be executed by this suite (it is the real installer -- see
+// AGENTS.md's "NEVER run setup.mjs" constraint and scripts/lib/install-autostart.mjs's own
+// header for the identical rationale), so this drives the extracted buildStartSh()/
+// resolveBinaryPath() behaviorally: build the real bash text, write REAL fake lsof/netstat
+// stubs to disk, and execute the generated script as a real `bash` subprocess with a
+// deliberately RESTRICTED $PATH (never includes the stub directory) -- proving resolution
+// happens via the injected absolute path, not via PATH lookup, exactly matching this
+// session's own live-verified defect (`which lsof` / `which netstat` both fail under this
+// agent's own PATH; `/usr/sbin/lsof` succeeds).
+import { buildStartSh, resolveBinaryPath } from "./scripts/lib/start-sh.mjs";
+
+console.log("\nscripts/lib/start-sh.mjs (issue #246):");
+
+// The pre-#246 setup.mjs:293 body, copied verbatim from this repo's history so the exact
+// regression this issue fixes stays provable even after setup.mjs's own source moved on.
+// Bare `lsof`, both stdout+stderr to /dev/null, no netstat cross-check at all.
+function _preFix246StartSh({ port, serverPath, logDir }) {
+  return `#!/bin/bash
+# Start OCP (Open Claude Proxy) if not already running
+PORT=\${CLAUDE_PROXY_PORT:-${port}}
+if ! lsof -i :\$PORT -sTCP:LISTEN &>/dev/null; then
+  unset CLAUDECODE
+  nohup node "${serverPath}" \\
+    >> "${logDir}/claude-proxy.log" \\
+    2>> "${logDir}/claude-proxy.err.log" &
+  echo "claude-proxy started on port \$PORT (pid $!)"
+else
+  echo "claude-proxy already running on port \$PORT"
+fi
+`;
+}
+
+// Writes real fake lsof/netstat stubs at freshly-allocated absolute paths (inside a
+// directory NEVER added to the child's $PATH below), lets `buildScript` construct the
+// actual script text using those exact paths, then runs it as a real subprocess and
+// reports whether the fake `node` (also stubbed, ON $PATH under its bare name -- matching
+// how a real install would resolve `node`) was ever invoked.
+function _runStartShScenario({ lsofScript, netstatScript, buildScript, port = 9999 }) {
+  const root = mkdtempSync(testJoin(tmpdir(), "start-sh-test-"));
+  try {
+    const stubDir = testJoin(root, "stubs"); // deliberately NOT on PATH below
+    tMkdirSync(stubDir, { recursive: true });
+    const lsofAbsPath = testJoin(stubDir, "fake-lsof");
+    testWriteFile(lsofAbsPath, `#!/bin/bash\n${lsofScript}\n`);
+    _ltChmod(lsofAbsPath, 0o755);
+    const netstatAbsPath = testJoin(stubDir, "fake-netstat");
+    testWriteFile(netstatAbsPath, `#!/bin/bash\n${netstatScript}\n`);
+    _ltChmod(netstatAbsPath, 0o755);
+
+    const logDir = testJoin(root, "logs");
+    tMkdirSync(logDir, { recursive: true });
+    const serverPath = testJoin(root, "server.mjs");
+    testWriteFile(serverPath, "");
+
+    const binDir = testJoin(root, "bin"); // ON PATH below -- only the fake `node` lives here
+    tMkdirSync(binDir, { recursive: true });
+    const nodeLogPath = testJoin(root, "node-called.log");
+    const fakeNode = testJoin(binDir, "node");
+    testWriteFile(fakeNode, `#!/bin/bash\necho "NODE-CALLED $*" >> ${JSON.stringify(nodeLogPath)}\n`);
+    _ltChmod(fakeNode, 0o755);
+
+    const scriptText = buildScript({ port, serverPath, logDir, lsofAbsPath, netstatAbsPath });
+    const scriptPath = testJoin(root, "start.sh");
+    testWriteFile(scriptPath, scriptText);
+    _ltChmod(scriptPath, 0o755);
+
+    // Restricted PATH: excludes stubDir entirely (proves absolute-path invocation, not a
+    // PATH-based lookup) -- mirrors this session's own live-verified restricted shell.
+    const env = { PATH: `${binDir}:/bin:/usr/bin`, HOME: root };
+    const res = spawnSync("bash", [scriptPath], { cwd: root, env, encoding: "utf8" });
+
+    // `nohup node ... &` backgrounds the fake-node call -- the script returns before it
+    // necessarily finishes writing its log line, so poll briefly rather than checking once
+    // (AGENTS.md: "wait for the thing you are about to assert, not a proxy for it").
+    const deadline = Date.now() + 2000;
+    let started = testExistsSync(nodeLogPath);
+    while (!started && Date.now() < deadline) started = testExistsSync(nodeLogPath);
+
+    return { stdout: res.stdout, stderr: res.stderr, status: res.status, started };
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+}
+
+const _fixedDarwinBuild = ({ port, serverPath, logDir, lsofAbsPath, netstatAbsPath }) =>
+  buildStartSh({ port, serverPath, logDir, platform: "darwin", lsofPath: lsofAbsPath, netstatPath: netstatAbsPath });
+
+test("resolveBinaryPath: prefers the absolute path when it exists on this host", () => {
+  const result = resolveBinaryPath("/usr/sbin/lsof", "lsof", () => true);
+  assert.equal(result, "/usr/sbin/lsof");
+});
+
+test("resolveBinaryPath: falls back to the bare name when the absolute path does not exist", () => {
+  const result = resolveBinaryPath("/usr/sbin/lsof", "lsof", () => false);
+  assert.equal(result, "lsof");
+});
+
+test("resolveBinaryPath: existsSyncFn is called with the absolute path being checked", () => {
+  let seen = null;
+  resolveBinaryPath("/usr/sbin/lsof", "lsof", (p) => { seen = p; return true; });
+  assert.equal(seen, "/usr/sbin/lsof");
+});
+
+test("buildStartSh darwin: lsof cleanly matches -- already running, does not start a duplicate", () => {
+  const r = _runStartShScenario({
+    lsofScript: `echo "node 1 u 4u IPv4 0x0 0t0 TCP *:9999 (LISTEN)"; exit 0`,
+    netstatScript: `exit 1`,
+    buildScript: _fixedDarwinBuild,
+  });
+  assert.equal(r.started, false, `expected NOT to start; stdout=${JSON.stringify(r.stdout)}`);
+  assert.match(r.stdout, /already running/);
+});
+
+test("buildStartSh darwin: lsof + netstat both cleanly report nothing -- starts the server", () => {
+  const r = _runStartShScenario({
+    lsofScript: `exit 1`,
+    netstatScript: `echo "tcp4 0 0 *.1234 *.* LISTEN"; exit 0`, // a LISTEN row, but NOT on our port
+    buildScript: _fixedDarwinBuild,
+  });
+  assert.equal(r.started, true, `expected to start; stdout=${JSON.stringify(r.stdout)} stderr=${JSON.stringify(r.stderr)}`);
+  assert.match(r.stdout, /claude-proxy started/);
+});
+
+test("buildStartSh darwin (headline fix): lsof ambiguous + netstat CONFIRMS a privilege-gap listener -- refuses to start a duplicate", () => {
+  const r = _runStartShScenario({
+    lsofScript: `exit 1`, // exit 1, empty stdout -- lsof's own "nothing matched" signature,
+                           // indistinguishable from "can't see a root-owned listener"
+    netstatScript: `echo "tcp4 0 0 *.9999 *.* LISTEN"; exit 0`, // netstat CAN see it
+    buildScript: _fixedDarwinBuild,
+  });
+  assert.equal(r.started, false, `must NOT start a duplicate; stdout=${JSON.stringify(r.stdout)}`);
+  assert.match(r.stdout, /already running/);
+});
+
+test("buildStartSh darwin: netstat itself fails to run -- fails closed, does not start", () => {
+  const r = _runStartShScenario({
+    lsofScript: `exit 1`,
+    netstatScript: `exit 127`,
+    buildScript: _fixedDarwinBuild,
+  });
+  assert.equal(r.started, false, `netstat failure must fail closed; stdout=${JSON.stringify(r.stdout)}`);
+});
+
+test("MONEY TEST (money A): restricted PATH + genuinely free port -- FIXED code starts the server via the absolute lsof/netstat paths", () => {
+  const r = _runStartShScenario({
+    lsofScript: `exit 1`,
+    netstatScript: `echo "tcp4 0 0 *.5555 *.* CLOSED"; exit 0`, // no LISTEN row at all
+    buildScript: _fixedDarwinBuild,
+  });
+  assert.equal(r.started, true, `expected the FIXED script to start; stdout=${JSON.stringify(r.stdout)} stderr=${JSON.stringify(r.stderr)}`);
+});
+
+test("MONEY TEST (money B, the actual #246 regression): restricted PATH + a REAL listener -- pre-fix bare lsof cannot see it and starts a DUPLICATE; fixed absolute-path code correctly refuses", () => {
+  // Both runs use the IDENTICAL restricted $PATH (stubDir never on PATH) and the IDENTICAL
+  // fake lsof/netstat behavior (both would report "something is listening" -- lsof exit 0
+  // with output -- if only they could be reached). The only variable is which script body
+  // runs: the pre-#246 bare-lsof body, or buildStartSh()'s fixed absolute-path body.
+  const lsofScript = `echo "node 1 u 4u IPv4 0x0 0t0 TCP *:9999 (LISTEN)"; exit 0`;
+  const netstatScript = `exit 1`; // never reached by either body in this scenario
+
+  const preFix = _runStartShScenario({
+    lsofScript, netstatScript,
+    buildScript: ({ port, serverPath, logDir }) => _preFix246StartSh({ port, serverPath, logDir }),
+  });
+  // THE DEFECT: bare `lsof` under a restricted PATH is "command not found" (bash exit 127),
+  // which the pre-#246 `if ! lsof ...` treats identically to "nothing is listening" --
+  // starts a SECOND server.mjs on top of a real listener.
+  assert.equal(preFix.started, true,
+    `control must reproduce the #246 defect (bare lsof unreachable -> false "not listening" -> duplicate spawn); stdout=${JSON.stringify(preFix.stdout)}`);
+
+  const fixed = _runStartShScenario({
+    lsofScript, netstatScript,
+    buildScript: _fixedDarwinBuild,
+  });
+  assert.equal(fixed.started, false,
+    `fixed script must find the SAME listener via the absolute path and refuse to start a duplicate; stdout=${JSON.stringify(fixed.stdout)}`);
+});
+
+test("buildStartSh non-darwin: bare lsof resolves fine via PATH (unchanged pre-#246 behavior) -- lsof match means already running", () => {
+  const r = _runStartShScenario({
+    lsofScript: `echo "irrelevant -- never called on non-darwin"; exit 1`,
+    netstatScript: `exit 1`,
+    buildScript: ({ port, serverPath, logDir }) => buildStartSh({ port, serverPath, logDir, platform: "linux" }),
+  });
+  // non-darwin's bare `lsof` isn't stubbed at all here (buildStartSh's non-darwin branch
+  // never references lsofAbsPath/netstatAbsPath) -- with no real `lsof` on this restricted
+  // PATH either, resolution fails as "command not found", which the (unchanged, matching
+  // the original pre-#246 semantics) non-darwin branch treats as "not listening" -> starts.
+  assert.equal(r.started, true, `stdout=${JSON.stringify(r.stdout)}`);
+});
+
+// Wiring/premise check (AGENTS.md's carve-out: legitimate for a harness's own boundary, not
+// for the decision logic itself -- the decision logic above is tested behaviorally). Confirms
+// setup.mjs actually calls the real buildStartSh()/resolveBinaryPath() rather than an inline
+// reimplementation drifting back in unnoticed.
+test("setup.mjs wiring: imports buildStartSh/resolveBinaryPath from scripts/lib/start-sh.mjs and no longer inlines a bare lsof call", () => {
+  const src = _ltRead(testJoin(import.meta.dirname, "setup.mjs"), "utf8");
+  assert.match(src, /from ["']\.\/scripts\/lib\/start-sh\.mjs["']/, "setup.mjs must import from scripts/lib/start-sh.mjs");
+  assert.match(src, /buildStartSh\(/, "setup.mjs must call buildStartSh()");
+  assert.match(src, /resolveBinaryPath\(/, "setup.mjs must call resolveBinaryPath()");
+  assert.ok(!/\n\s*lsof -i :/.test(src), "setup.mjs must not re-inline the old bare `lsof -i :` check");
+});
+
 // ── Doctor --check oauth fast path tests ──
 console.log("\nDoctor --check oauth:");
 

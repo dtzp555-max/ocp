@@ -18,6 +18,7 @@
 import { readFileSync, writeFileSync, existsSync, mkdirSync, readdirSync } from "node:fs";
 import { resolveServicePlan } from "./scripts/lib/service-mode.mjs";
 import { installAutoStart } from "./scripts/lib/install-autostart.mjs";
+import { buildStartSh, resolveBinaryPath } from "./scripts/lib/start-sh.mjs";
 import { execSync } from "node:child_process";
 import { join, dirname } from "node:path";
 import { homedir } from "node:os";
@@ -287,19 +288,11 @@ const serverPath = join(__dirname, "server.mjs");
 const logDir = join(OPENCLAW_DIR, "logs");
 if (!existsSync(logDir)) mkdirSync(logDir, { recursive: true });
 
-const startSh = `#!/bin/bash
-# Start OCP (Open Claude Proxy) if not already running
-PORT=\${CLAUDE_PROXY_PORT:-${PORT}}
-if ! lsof -i :\$PORT -sTCP:LISTEN &>/dev/null; then
-  unset CLAUDECODE
-  nohup node "${serverPath}" \\
-    >> "${logDir}/claude-proxy.log" \\
-    2>> "${logDir}/claude-proxy.err.log" &
-  echo "claude-proxy started on port \$PORT (pid $!)"
-else
-  echo "claude-proxy already running on port \$PORT"
-fi
-`;
+// issue #246: the port-liveness check (bare `lsof`, gates whether a second server.mjs gets
+// nohup'd) is extracted into scripts/lib/start-sh.mjs's buildStartSh() so it can be driven
+// by injected fake lsof/netstat binaries in tests -- see that file's header for the full
+// defect writeup and the darwin/non-darwin scope decision.
+const startSh = buildStartSh({ port: PORT, serverPath, logDir });
 
 const startPath = join(__dirname, "start.sh");
 if (!DRY_RUN) {
@@ -421,9 +414,13 @@ if (!DRY_RUN) {
 
         // Verify bind socket
         try {
+          // issue #246: absolute path (falls back to bare `lsof` only if /usr/sbin/lsof
+          // genuinely does not exist on this host) -- see scripts/lib/start-sh.mjs's header
+          // for why this call site gets absolute-path-only rather than the full netstat
+          // cross-check buildStartSh()'s darwin branch uses.
           const bindCheck = process.platform === "linux"
             ? execSync(`ss -tlnp 2>/dev/null | grep ':${PORT}'`, { encoding: "utf-8" }).trim()
-            : execSync(`lsof -nP -iTCP:${PORT} -sTCP:LISTEN 2>/dev/null`, { encoding: "utf-8" }).trim();
+            : execSync(`${resolveBinaryPath("/usr/sbin/lsof", "lsof")} -nP -iTCP:${PORT} -sTCP:LISTEN 2>/dev/null`, { encoding: "utf-8" }).trim();
           if (bindCheck) {
             console.log(`    bind:     ${bindCheck.split("\n")[0]}`);
           }
