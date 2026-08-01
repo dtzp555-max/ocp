@@ -12236,6 +12236,49 @@ test("#273 stream parity: cmd_status / cmd_settings PATCH 'proxy unreachable' gu
   assert.equal(settings.stdout, "", `cmd_settings PATCH: stdout must stay clean; got: ${JSON.stringify(settings.stdout)}`);
 });
 
+// ── cmd_health: found during this PR's own independent review (Iron Rule 10), not in #273's own
+// text — the reviewer noticed `cmd_health` (ocp:284-286 at the time) is BYTE-FOR-BYTE the same
+// bare-pipeline shape `cmd_status` had pre-fix (`curl -sf ... | _json`, zero failure handling),
+// 14 lines below the function this PR already fixes. It is the SAME severity as #273's own two
+// sites (total silence on both streams, in both fault modes — verified with the harness itself,
+// using the exact fixtures the cmd_status tests above already established), not the lower
+// severity of the seven sites deferred to #278 (those still let bash's own message through
+// unredirected). Fixed here rather than deferred, per the reviewer's own Iron Rule 11 reasoning:
+// deferring same-severity work to a lower-severity follow-up is the one split that rule does not
+// license. Tests mirror the cmd_status set exactly (same helper, same fixtures, same shape).
+console.log("\nocp cmd_health: the same silent-failure shape as cmd_status, found during PR #279's own independent review (#273):");
+
+test("#273 cmd_health: the money test — curl present but the proxy genuinely unreachable must not be COMPLETELY SILENT (reproduces the exact status=7/stdout=[]/stderr=[] signature)", () => {
+  const r = _bwHarnessRun({ args: ["health"], curlResponses: [{ match: "/health", body: "", exit: 7 }] });
+  assert.notEqual(r.status, 0, `expected a nonzero exit; status=${r.status}`);
+  assert.ok(!(r.stdout === "" && r.stderr === ""),
+    `must not reproduce the silent status=7/stdout=[]/stderr=[] signature this issue exists to kill; stdout=${JSON.stringify(r.stdout)} stderr=${JSON.stringify(r.stderr)}`);
+  assert.ok(r.stderr.includes("proxy unreachable"), `expected a diagnostic naming the proxy, got stderr=${JSON.stringify(r.stderr)}`);
+  assert.equal(r.stdout, "", `the diagnostic belongs on stderr, not stdout; got stdout=${JSON.stringify(r.stdout)}`);
+});
+
+test("#273 cmd_health: curl missing from $PATH must be reported as a local fault, not 'proxy unreachable' or silence", () => {
+  const r = _bwHarnessRun({ args: ["health"], curlAbsent: true });
+  assert.notEqual(r.status, 0, `expected a nonzero exit; status=${r.status}`);
+  assert.ok(!(r.stdout === "" && r.stderr === ""), `must not be silent; stdout=${JSON.stringify(r.stdout)} stderr=${JSON.stringify(r.stderr)}`);
+  assert.ok(!r.stderr.includes("proxy unreachable") && !r.stdout.includes("proxy unreachable"),
+    `must NOT misattribute a missing curl binary to the proxy; stderr=${JSON.stringify(r.stderr)} stdout=${JSON.stringify(r.stdout)}`);
+  assert.ok(/curl/i.test(r.stderr), `expected the message to name curl/the local command failure, got stderr=${JSON.stringify(r.stderr)}`);
+});
+
+test("#273 control: cmd_health with curl present and the proxy genuinely reachable still prints the (pretty-printed) health body", () => {
+  const r = _bwHarnessRun({ args: ["health"], curlResponses: [{ match: "/health", body: JSON.stringify({ status: "ok", version: "3.26.0" }) }] });
+  assert.equal(r.status, 0, `expected a clean exit, got status=${r.status} stderr=${r.stderr}`);
+  assert.ok(r.stdout.includes('"status"') && r.stdout.includes("ok"), `expected the health JSON on stdout, got: ${JSON.stringify(r.stdout)}`);
+  assert.equal(r.stderr, "", `a successful run must not print anything to stderr; got: ${JSON.stringify(r.stderr)}`);
+});
+
+test("#273 stream parity: cmd_health 'proxy unreachable' guard writes to stderr, stdout stays empty", () => {
+  const r = _bwHarnessRun({ args: ["health"] });
+  assert.notEqual(r.status, 0, `expected a nonzero exit; status=${r.status}`);
+  assert.equal(r.stdout, "", `cmd_health: stdout must stay clean of the error text; got: ${JSON.stringify(r.stdout)}`);
+});
+
 console.log("\nRestart-unit resolution (issue #233 defect 1) — macOS lsof exit-code handling:");
 
 // Background: `lsof -nP -iTCP:<port> -sTCP:LISTEN` EXITS 1 with EMPTY stdout when nothing

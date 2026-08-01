@@ -113,7 +113,8 @@ _pyfail() {
 #
 # Usage: `data=$(_curl_or_die "<network-failure label>" _curl -sf ... "$url") || exit 1` — the
 # first argument after the label is the command to run (`_curl` for authenticated call sites,
-# plain `curl` for the one unauthenticated one), so this stays a drop-in replacement for the old
+# plain `curl` for the unauthenticated ones — cmd_usage's main call, cmd_status, cmd_settings
+# PATCH, and cmd_health, per #273), so this stays a drop-in replacement for the old
 # `<cmd> ... 2>&1) || { echo "Error: <label>"; exit 1; }` shape at each site, byte-identical on
 # the success path and on a genuine network failure (same label text), and message text goes to
 # stderr (matching the sibling display commands' own stderr convention, PR #252 round 1 fix 3 —
@@ -282,7 +283,14 @@ EOF
 }
 
 cmd_health() {
-  curl -sf --max-time 10 "$PROXY/health" | _json
+  # Issue #273 (found during this PR's own independent review, Iron Rule 10 — not in #273's own
+  # text): byte-for-byte the same bare-pipeline shape `cmd_status` had pre-fix, and just as
+  # silent for the identical reason -- see that function's own comment block above for the full
+  # verified repro (curl exits 7 silently on a real connection failure under -sf; a shadow-
+  # stubbed curl exiting 127 is exactly as silent). Same fix, same shape.
+  local data
+  data=$(_curl_or_die "proxy unreachable" curl -sf --max-time 10 "$PROXY/health") || exit 1
+  echo "$data" | _json
 }
 
 # ── logs ─────────────────────────────────────────────────────────────────
