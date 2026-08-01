@@ -19,7 +19,9 @@
  *   CLAUDE_SYSTEM_PROMPT         — system prompt appended to all requests
  *   CLAUDE_MCP_CONFIG            — path to MCP server config JSON file
  *   CLAUDE_SESSION_TTL           — session TTL in ms (default: 3600000 = 1h)
- *   CLAUDE_MAX_CONCURRENT        — max concurrent claude processes, -p/stream-json path (default: 8)
+ *   CLAUDE_AUTH_CHECK_INTERVAL_MS — how often the background `claude auth status` probe runs (default: 600000 = 10min)
+ *   CLAUDE_AUTH_CHECK_TIMEOUT_MS  — per-probe timeout in ms (default: 10000)
+ *   CLAUDE_MAX_CONCURRENT       — max concurrent claude processes, -p/stream-json path (default: 8)
  *   CLAUDE_MAX_QUEUE             — max requests waiting for a -p slot before HTTP 429 (default: 16)
  *   OCP_TUI_MAX_CONCURRENT       — max concurrent interactive TUI turns, TUI-mode path (default: 2)
  *   OCP_TUI_POOL_SIZE            — pre-booted warm `claude` panes held for TUI-mode (default: 0 = off;
@@ -34,7 +36,7 @@
  *   CLAUDE_HEARTBEAT_INTERVAL    — SSE heartbeat interval in ms on streaming path (default: 0 = disabled)
  */
 import { createServer } from "node:http";
-import { spawn, execFileSync, spawnSync } from "node:child_process";
+import { spawn, execFile, execFileSync, spawnSync } from "node:child_process";
 import { randomUUID, timingSafeEqual, createHash as cryptoCreateHash } from "node:crypto";
 import { readFileSync, readdirSync, accessSync, existsSync, constants, chmodSync, statSync, mkdirSync, writeFileSync, rmSync } from "node:fs";
 import { fileURLToPath } from "node:url";
@@ -1114,27 +1116,99 @@ function trackError(msg) {
 }
 
 // ── Auth health check ───────────────────────────────────────────────────
-let authStatus = { ok: null, lastCheck: 0, message: "" };
+// Both tunables go through parseIntEnv (hoisted below), so an empty / NaN / non-positive value
+// falls back to the default rather than silently disabling or bricking the probe — the same
+// fail-closed discipline CLAUDE_MAX_PROMPT_CHARS uses.
+const AUTH_CHECK_INTERVAL_MS = parseIntEnv("CLAUDE_AUTH_CHECK_INTERVAL_MS", 600000);
+// The 10s bound is DELIBERATELY unchanged by #232 and is still correct now that the probe no
+// longer blocks: it bounds a stuck child, and lengthening it would only widen the window in
+// which authStatus is stale. A longer timeout was explicitly NOT the fix — the defect was that
+// a SYNCHRONOUS execFileSync held the whole event loop for the duration.
+const AUTH_CHECK_TIMEOUT_MS = parseIntEnv("CLAUDE_AUTH_CHECK_TIMEOUT_MS", 10000);
+
+// How many CONSECUTIVE conclusive rejections before the proxy calls itself degraded (ADR 0010).
+// One rejection can be a token mid-refresh race; two consecutive is a real condition.
+const AUTH_DEGRADE_AFTER = 2;
+
+let authStatus = {
+  ok: null,                  // last CONCLUSIVE verdict: true | false | null (never established)
+  lastCheck: 0,              // when the last probe COMPLETED, any outcome
+  message: "",               // human-readable detail of the last probe
+  lastOutcome: "none",       // "none" | "authenticated" | "rejected" | "timeout" | "unavailable"
+  consecutiveFailures: 0,    // consecutive CONCLUSIVE rejections only
+};
+
+// The single definition of "can this proxy serve?", used by BOTH /status and /health (#232).
+// Those two carried byte-identical copies of the old expression; a shared function is what keeps
+// them from drifting. Value domain is exactly {"ok","degraded"} — dashboard.html and
+// ocp-plugin/index.js compare against those two strings, so do not invent a third. See ADR 0010.
+function proxyHealthStatus(binaryOk) {
+  if (!binaryOk) return "degraded";
+  if (authStatus.consecutiveFailures >= AUTH_DEGRADE_AFTER) return "degraded";
+  return "ok";
+}
+
+// One probe at a time. The probe is an idempotent diagnostic, so stacking spawns when the host
+// is already slow is exactly the pathology being fixed — a loaded host makes probes run long,
+// and overlapping probes would then add spawn pressure to the very host that is struggling.
+let authProbeInFlight = false;
 
 async function checkAuth() {
+  if (authProbeInFlight) return;
+  authProbeInFlight = true;
   try {
     const env = { ...process.env };
     delete env.CLAUDECODE;
     delete env.ANTHROPIC_API_KEY;
     delete env.ANTHROPIC_BASE_URL;
     delete env.ANTHROPIC_AUTH_TOKEN;
-    execFileSync(CLAUDE, ["auth", "status"], { encoding: "utf8", timeout: 10000, env });
-    authStatus = { ok: true, lastCheck: Date.now(), message: "authenticated" };
+    // ASYNC execFile, not execFileSync (#232). Marking the function `async` never made the old
+    // synchronous call non-blocking: it froze the event loop for up to AUTH_CHECK_TIMEOUT_MS at
+    // boot (before server.listen()) and again on every interval tick.
+    await new Promise((resolve, reject) => {
+      const child = execFile(CLAUDE, ["auth", "status"],
+        { encoding: "utf8", timeout: AUTH_CHECK_TIMEOUT_MS, env },
+        // execFile does NOT attach stdout/stderr to the error object the way execFileSync does,
+        // so carry stderr across explicitly — the message below depends on it.
+        (err, _stdout, stderr) => (err ? reject(Object.assign(err, { stderr })) : resolve()));
+      // A background diagnostic must never be the reason the process stays up. gracefulShutdown
+      // (which clears authCheckInterval) always process.exit()s, so this is belt-and-braces.
+      child.unref();
+    });
+    authStatus = { ok: true, lastCheck: Date.now(), message: "authenticated",
+                   lastOutcome: "authenticated", consecutiveFailures: 0 };
   } catch (e) {
     const msg = (e.stderr || e.message || "").slice(0, 200);
-    authStatus = { ok: false, lastCheck: Date.now(), message: msg };
-    console.error(`[auth] check failed: ${msg}`);
+    const now = Date.now();
+    if (e.signal) {
+      // INCONCLUSIVE. Our own timeout lands here (Node reports killed:true, signal:"SIGTERM"),
+      // as does any other signal death. A probe timeout measures HOST LOAD, not credential
+      // validity — proven in production, where /health reported auth.ok=false with
+      // "spawnSync ... ETIMEDOUT" in the same minute that POST /v1/chat/completions returned 200
+      // on the same credentials. So preserve the last conclusive `ok` and leave the tally alone.
+      authStatus = { ...authStatus, lastCheck: now, message: msg, lastOutcome: "timeout" };
+    } else if (typeof e.code !== "number") {
+      // INCONCLUSIVE. A spawn failure (ENOENT / EACCES / …) means the probe never ran, so it
+      // says nothing about the credentials either. Same treatment. (A missing/non-executable
+      // binary is still caught — by binaryOk in proxyHealthStatus, which is a real precondition.)
+      authStatus = { ...authStatus, lastCheck: now, message: msg, lastOutcome: "unavailable" };
+    } else {
+      // CONCLUSIVE REJECTION. claude ran to completion and exited non-zero. checkAuth and
+      // spawnClaudeProcess scrub the environment identically, so the probe resolves the SAME
+      // credentials the request path uses — a non-zero exit genuinely predicts serving failure.
+      authStatus = { ok: false, lastCheck: now, message: msg, lastOutcome: "rejected",
+                     consecutiveFailures: authStatus.consecutiveFailures + 1 };
+    }
+    // Carries the outcome class so an operator can tell a timeout from a real rejection.
+    console.error(`[auth] check ${authStatus.lastOutcome}: ${msg}`);
+  } finally {
+    authProbeInFlight = false;
   }
 }
 
-// Check auth on start and every 10 minutes
+// Check auth on start and on every interval tick (default 10 minutes)
 checkAuth();
-const authCheckInterval = setInterval(checkAuth, 600000);
+const authCheckInterval = setInterval(checkAuth, AUTH_CHECK_INTERVAL_MS);
 
 // ── Build CLI arguments ─────────────────────────────────────────────────
 // Phase 6c port (2026-05-30): removed `-p` / `--output-format text`.
@@ -2639,7 +2713,7 @@ async function handleStatus(_req, res) {
 
   return jsonResponse(res, 200, {
     proxy: {
-      status: binaryOk && authStatus.ok !== false ? "ok" : "degraded",
+      status: proxyHealthStatus(binaryOk),
       version: VERSION,
       uptime: `${Math.floor(uptimeMs / 3600000)}h ${Math.floor((uptimeMs % 3600000) / 60000)}m`,
       auth: authStatus.ok ? "ok" : authStatus.message,
@@ -3264,7 +3338,7 @@ const server = createServer(async (req, res) => {
     }
 
     return jsonResponse(res, 200, {
-      status: binaryOk && authStatus.ok !== false ? "ok" : "degraded",
+      status: proxyHealthStatus(binaryOk),
       version: VERSION,
       architecture: "on-demand (v2)",
       uptime: uptimeMs,

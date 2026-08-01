@@ -1094,7 +1094,16 @@ const LT_NEG_MARK = "You do NOT have access to any local filesystem";
 const LT_POS_MARK = "you may use your available local tools";
 // Fake claude: record the --system-prompt it was spawned with, bump an optional spawn counter,
 // then emit a minimal valid stream-json response so the request completes (and caches).
+//
+// The `auth status` early exit is load-bearing, not tidiness (#232). server.mjs's boot-time
+// `checkAuth()` invokes CLAUDE with exactly those two args, and it used to be SYNCHRONOUS — so
+// its SP_COUNTER bump always landed before `listening on`, i.e. before the `_ltWrite(counter,
+// "0")` that every spawn-counting test below does after the banner. Now that the probe is
+// async, that ordering is no longer guaranteed and the probe's bump could be counted as a
+// REQUEST spawn. Exiting early keeps SP_COUNTER meaning "request spawns", which is what those
+// tests assert on. Exit 0 preserves the previous outcome for the probe itself (authenticated).
 const LT_FAKE = `#!/bin/sh
+if [ "$1" = "auth" ] && [ "$2" = "status" ]; then exit 0; fi
 prev=""
 for a in "$@"; do
   if [ "$prev" = "--system-prompt" ]; then printf '%s' "$a" > "$SP_CAPTURE"; fi
@@ -1636,6 +1645,7 @@ ltTest("integration: a synchronous pre-spawn throw must not leak stats.activeReq
 // Fake that emits schema-valid JSON, so the structured path caches a VALIDATED result
 // (the stock LT_FAKE returns "OK", which fails validation → refusal → never cached).
 const LT_FAKE_JSON = `#!/bin/sh
+if [ "$1" = "auth" ] && [ "$2" = "status" ]; then exit 0; fi
 if [ -n "$SP_COUNTER" ]; then c=$(cat "$SP_COUNTER" 2>/dev/null || echo 0); echo $((c+1)) > "$SP_COUNTER"; fi
 printf '%s\\n' '{"type":"assistant","message":{"content":[{"type":"text","text":"{\\"ok\\":true}"}]}}'
 printf '%s\\n' '{"type":"result"}'
@@ -1729,6 +1739,285 @@ ltTest("integration: a config change invalidates the STRUCTURED cache too (close
     assert.equal(off, 1, "first structured request (cache empty) must spawn claude");
     assert.equal(on, 1, "structured cache must honor CONFIG_EPOCH — before #194 it omitted the epoch entirely and served the stale answer");
   } finally { _ltRmRetry(dir); }
+});
+
+// ── Auth probe: non-blocking + verdict semantics (#232, ADR 0010) ───────────────
+// Two defects lived in the same eight lines. (A) `execFileSync` inside an `async function` is
+// still synchronous — it froze the event loop for up to 10s at boot (before `server.listen()`)
+// and again on every interval tick. (B) a SINGLE failed probe set `ok:false`, and nothing
+// re-evaluated for 10 minutes, so one transient timeout reported `degraded` for ten minutes
+// while the proxy served normally — captured in production as `/health` saying
+// `status=degraded, auth.ok=false, "spawnSync ... ETIMEDOUT"` in the same minute a
+// `POST /v1/chat/completions` returned 200.
+//
+// These are behavioral: every assertion below comes from a real `server.mjs` child's live
+// `/health` body or from wall-clock ordering between two real processes. Nothing greps source.
+//
+// The probe reaches the fake because `checkAuth()` spawns CLAUDE with a copy of the server's own
+// environment (minus the ANTHROPIC_*/CLAUDECODE scrub), so `AUTH_PROBE_*` set on `ltBoot` arrives
+// intact. `OCP_SKIP_AUTH_TEST` is set by `ltBoot` but is never read by `server.mjs` — the probe
+// genuinely runs in these children, which is why they can observe it at all.
+//
+// One fake, two roles, selected by argv — the stock LT_FAKE ignores its args and so cannot make
+// the probe behave differently from a request spawn.
+const LT_AUTH_FAKE = `#!/bin/sh
+if [ "$1" = "auth" ] && [ "$2" = "status" ]; then
+  n=0
+  if [ -n "$AUTH_PROBE_LOG" ]; then
+    # Append-then-count rather than read-modify-write: O_APPEND writes are atomic, so the tally
+    # stays truthful even when probes DO overlap — which is the exact condition A2 measures.
+    echo probe >> "$AUTH_PROBE_LOG"
+    n=$(wc -l < "$AUTH_PROBE_LOG" | tr -d ' ')
+  fi
+  [ -n "$AUTH_PROBE_SLEEP" ] && sleep "$AUTH_PROBE_SLEEP"
+  mode="$AUTH_PROBE_MODE"
+  # The first N probes take the success branch whatever the mode: lets a test establish a
+  # CONCLUSIVE ok:true first, then drive the branch it actually wants to observe.
+  if [ -n "$AUTH_PROBE_FIRST_OK" ] && [ "$n" -le "$AUTH_PROBE_FIRST_OK" ]; then mode=ok; fi
+  # Written AFTER the sleep: its existence means "this probe could have completed by now".
+  if [ -n "$AUTH_PROBE_DONE" ]; then echo done > "$AUTH_PROBE_DONE"; fi
+  case "$mode" in
+    signal) kill -TERM $$; sleep 5; exit 0 ;;
+    reject) echo "fake claude: not authenticated" >&2; exit 1 ;;
+    *)      echo "fake claude: logged in"; exit 0 ;;
+  esac
+fi
+prev=""
+for a in "$@"; do
+  if [ "$prev" = "--system-prompt" ] && [ -n "$SP_CAPTURE" ]; then printf '%s' "$a" > "$SP_CAPTURE"; fi
+  prev="$a"
+done
+if [ -n "$SP_COUNTER" ]; then c=$(cat "$SP_COUNTER" 2>/dev/null || echo 0); echo $((c+1)) > "$SP_COUNTER"; fi
+printf '%s\\n' '{"type":"assistant","message":{"content":[{"type":"text","text":"OK"}]}}'
+printf '%s\\n' '{"type":"result"}'
+exit 0
+`;
+function ltAuthFake(dir) { const p = join(dir, "claude-auth"); _ltWrite(p, LT_AUTH_FAKE); _ltChmod(p, 0o755); return p; }
+function ltProbeCount(logPath) {
+  if (!_ltExists(logPath)) return 0;
+  return _ltRead(logPath, "utf8").split("\n").filter(Boolean).length;
+}
+async function ltHealth(port) {
+  try {
+    const r = await fetch(`http://127.0.0.1:${port}/health`);
+    if (!r.ok) return null;
+    return await r.json();
+  } catch { return null; }
+}
+// Async sibling of ltWait. Same adaptive deadline (a contended host stalls THIS process's timers
+// too, so feed the measured overshoot back into the deadline — see ltWait's comment for the
+// measurements behind the 10x cap), but the predicate needs a real HTTP GET /health per poll,
+// which ltWait's synchronous cond() cannot express. Returns the matching body, or null.
+async function ltWaitHealth(port, pred, ms = 9000) {
+  const start = Date.now();
+  let deadline = start + ms;
+  const hardCap = start + ms * 10;
+  let body = null;
+  for (;;) {
+    body = await ltHealth(port);
+    if (body && pred(body)) return body;
+    if (Date.now() >= deadline) return null;
+    const before = Date.now();
+    await new Promise(r => setTimeout(r, 40));
+    const overshoot = (Date.now() - before) - 40;
+    if (overshoot > 0) deadline = Math.min(deadline + overshoot, hardCap);
+  }
+}
+
+console.log("\nAuth probe: non-blocking + verdict semantics (#232 / ADR 0010):");
+
+// A1 — the load-bearing evidence for defect (A). Deliberately NOT a wall-clock ceiling: the
+// discriminator is the ORDERING of two real processes, which is immune to host contention.
+// `checkAuth()` runs at module top level, BEFORE `server.listen()`. The fake sleeps 3s on
+// `auth status` and only then writes AUTH_PROBE_DONE. So:
+//   - synchronous probe (the bug): the 3s sleep finishes -> DONE exists -> module evaluation
+//     resumes -> listen. DONE is therefore present before the first byte is ever served.
+//   - async probe (the fix): listen happens while the probe is still sleeping, so the first
+//     successful request lands with DONE still absent.
+// "Serving" is a real 200 from GET /health, not the banner — waiting on a proxy signal and
+// asserting a different one is the race #199 was filed for.
+ltTest("integration: the auth probe must NOT block boot — the server serves before the probe can finish (#232 defect A)", async () => {
+  if (!LT_POSIX) return;
+  const dir = ltMkdir(); const fake = ltAuthFake(dir);
+  const probeLog = join(dir, "probes.txt"); const probeDone = join(dir, "probe-done.txt");
+  const PROBE_SLEEP_S = 3;
+  const { child, buf, port } = await ltBootFresh({
+    CLAUDE_BIN: fake, AUTH_PROBE_LOG: probeLog, AUTH_PROBE_DONE: probeDone,
+    AUTH_PROBE_SLEEP: String(PROBE_SLEEP_S), CLAUDE_AUTH_CHECK_INTERVAL_MS: "600000",
+  }, dir);
+  try {
+    // Poll for genuine service. The deadline is generous (a slow boot is not the failure this
+    // test is about); the assertion is on what was true AT the moment of the first 200.
+    let servedMs = null, doneWhenServed = null;
+    const deadline = Date.now() + 40000;
+    while (Date.now() < deadline) {
+      if (await ltHealth(port)) {
+        servedMs = Date.now() - buf.t0;
+        doneWhenServed = _ltExists(probeDone);
+        break;
+      }
+      if (buf.closed || buf.spawnErr) break;
+      await new Promise(r => setTimeout(r, 25));
+    }
+    assert.ok(servedMs !== null, `server never served GET /health — ${ltDiag(buf)}`);
+    // Non-vacuity: the probe must have ACTUALLY run. Without this the test would pass trivially
+    // on any build where checkAuth() was simply skipped or never reached the binary.
+    assert.ok(await ltWait(() => ltProbeCount(probeLog) >= 1, 9000),
+      `the auth probe never ran, so this test proved nothing about it — ${ltDiag(buf)}`);
+    assert.equal(doneWhenServed, false,
+      `the server served its first request only AFTER the ${PROBE_SLEEP_S}s auth probe had ` +
+      `completed (served at +${servedMs}ms) — that is the blocking execFileSync of #232`);
+    // ...and the result of that probe must still be recorded once it finishes, so the fix cannot
+    // be satisfied by simply dropping the probe (which would also pass every assertion above).
+    const settled = await ltWaitHealth(port, b => b.auth && b.auth.ok === true, 15000);
+    assert.ok(settled, `the async probe's verdict never landed — ${ltDiag(buf)}`);
+    assert.equal(settled.auth.lastOutcome, "authenticated",
+      `a clean exit must be recorded as a conclusive success; got ${JSON.stringify(settled.auth)}`);
+  } finally { child.kill("SIGKILL"); _ltRmRetry(dir); }
+});
+
+// A2 — the overlap guard. With a 2s probe and a 200ms interval, an unguarded build starts a new
+// child every tick; the guard holds it to one at a time. Both bounds are derived from the
+// MEASURED window rather than assumed, so a contended host (which only ever produces FEWER
+// probes) cannot turn this into a false failure.
+ltTest("integration: an in-flight auth probe suppresses the next tick instead of stacking spawns (#232)", async () => {
+  if (!LT_POSIX) return;
+  const dir = ltMkdir(); const fake = ltAuthFake(dir);
+  const probeLog = join(dir, "probes.txt");
+  const INTERVAL_MS = 200, PROBE_SLEEP_S = 2;
+  const { child, buf, port } = await ltBootFresh({
+    CLAUDE_BIN: fake, AUTH_PROBE_LOG: probeLog, AUTH_PROBE_SLEEP: String(PROBE_SLEEP_S),
+    CLAUDE_AUTH_CHECK_INTERVAL_MS: String(INTERVAL_MS),
+  }, dir);
+  try {
+    assert.ok(await ltWait(() => buf.out.includes("listening on") || buf.closed || buf.spawnErr),
+      `server did not start — ${ltDiag(buf)}`);
+    assert.ok(await ltWait(() => ltProbeCount(probeLog) >= 1, 9000),
+      `the boot probe never ran — ${ltDiag(buf)}`);
+    const t0 = Date.now();
+    await new Promise(r => setTimeout(r, 3000));
+    const elapsed = Date.now() - t0;
+    const count = ltProbeCount(probeLog);
+    // A guarded build can only start a probe once the previous one has finished, and each takes
+    // PROBE_SLEEP_S; +1 covers the boot probe already counted before the window opened.
+    const guardedMax = Math.ceil(elapsed / (PROBE_SLEEP_S * 1000)) + 1;
+    const unguardedMin = Math.floor(elapsed / INTERVAL_MS);
+    // Discrimination check, in the spirit of "a control mutation must prove the test CAN fail":
+    // if the window were too short for the two regimes to separate, the assertion below would be
+    // satisfiable by an unguarded build and would prove nothing.
+    assert.ok(unguardedMin >= guardedMax * 3,
+      `window too short to distinguish guarded from unguarded (elapsed ${elapsed}ms → ` +
+      `guardedMax ${guardedMax}, unguardedMin ${unguardedMin})`);
+    assert.ok(count <= guardedMax,
+      `${count} probes started in ${elapsed}ms; the in-flight guard bounds it at ${guardedMax}. ` +
+      `An unguarded build ticking every ${INTERVAL_MS}ms would start ~${unguardedMin} — that is ` +
+      `spawn pressure piled onto the very host the probe is timing out on`);
+  } finally { child.kill("SIGKILL"); _ltRmRetry(dir); }
+});
+
+// B1 — one conclusive rejection is not a verdict. On the pre-fix build this reports "degraded".
+ltTest("integration: ONE conclusive auth rejection must not flip /health status to degraded (#232 defect B)", async () => {
+  if (!LT_POSIX) return;
+  const dir = ltMkdir(); const fake = ltAuthFake(dir);
+  const probeLog = join(dir, "probes.txt");
+  const { child, buf, port } = await ltBootFresh({
+    CLAUDE_BIN: fake, AUTH_PROBE_LOG: probeLog, AUTH_PROBE_MODE: "reject",
+    // Long enough that only the BOOT probe runs for the life of this test — the point is what a
+    // single rejection does, so a second one must not sneak in.
+    CLAUDE_AUTH_CHECK_INTERVAL_MS: "600000",
+  }, dir);
+  try {
+    // Wait for the probe to have COMPLETED (lastCheck moves on any outcome, on both builds), not
+    // for a field only the fixed build has — otherwise the pre-fix failure is a timeout with an
+    // unhelpful message instead of the real finding.
+    const h = await ltWaitHealth(port, b => b.auth && b.auth.lastCheck > 0, 15000);
+    assert.ok(h, `no /health body with a completed auth probe — ${ltDiag(buf)}`);
+    assert.equal(ltProbeCount(probeLog), 1, "exactly one probe must have run in this window");
+    assert.equal(h.status, "ok",
+      `a single conclusive rejection must not change the serving verdict (AUTH_DEGRADE_AFTER=2); ` +
+      `got status=${h.status} with auth=${JSON.stringify(h.auth)}`);
+    assert.equal(h.auth.lastOutcome, "rejected", "a non-zero exit is a CONCLUSIVE rejection");
+    assert.equal(h.auth.consecutiveFailures, 1, "and it must be counted");
+    assert.equal(h.auth.ok, false, "ok reflects the last conclusive verdict, which was a rejection");
+  } finally { child.kill("SIGKILL"); _ltRmRetry(dir); }
+});
+
+// B2 — the signal is not merely disabled: two consecutive rejections DO degrade.
+ltTest("integration: TWO consecutive conclusive auth rejections DO flip /health status to degraded (#232)", async () => {
+  if (!LT_POSIX) return;
+  const dir = ltMkdir(); const fake = ltAuthFake(dir);
+  const probeLog = join(dir, "probes.txt");
+  const { child, buf, port } = await ltBootFresh({
+    CLAUDE_BIN: fake, AUTH_PROBE_LOG: probeLog, AUTH_PROBE_MODE: "reject",
+    CLAUDE_AUTH_CHECK_INTERVAL_MS: "300",
+  }, dir);
+  try {
+    const h = await ltWaitHealth(port, b => b.auth && b.auth.consecutiveFailures >= 2, 15000);
+    assert.ok(h, `never reached 2 consecutive rejections — ${ltDiag(buf)}`);
+    assert.ok(ltProbeCount(probeLog) >= 2, "at least two probes must have run");
+    assert.equal(h.status, "degraded",
+      `two consecutive conclusive rejections is a real credential condition and must degrade; ` +
+      `got status=${h.status} with auth=${JSON.stringify(h.auth)}`);
+    assert.equal(h.auth.ok, false);
+  } finally { child.kill("SIGKILL"); _ltRmRetry(dir); }
+});
+
+// B3 — an INCONCLUSIVE probe changes nothing. The fake succeeds once (establishing a conclusive
+// ok:true), then kills itself with SIGTERM, so the error arrives with `err.signal` set — the
+// SAME branch a real AUTH_CHECK_TIMEOUT_MS expiry takes (Node reports killed:true,
+// signal:"SIGTERM" there). Exercising the branch this way costs milliseconds instead of 10s.
+// On the pre-fix build the second probe sets ok:false and status goes degraded.
+ltTest("integration: an INCONCLUSIVE auth probe (signal death, as a timeout arrives) preserves ok and the verdict (#232 defect B)", async () => {
+  if (!LT_POSIX) return;
+  const dir = ltMkdir(); const fake = ltAuthFake(dir);
+  const probeLog = join(dir, "probes.txt");
+  const { child, buf, port } = await ltBootFresh({
+    CLAUDE_BIN: fake, AUTH_PROBE_LOG: probeLog, AUTH_PROBE_MODE: "signal",
+    AUTH_PROBE_FIRST_OK: "1", CLAUDE_AUTH_CHECK_INTERVAL_MS: "300",
+  }, dir);
+  try {
+    const first = await ltWaitHealth(port, b => b.auth && b.auth.ok === true, 15000);
+    assert.ok(first, `the first probe never established a conclusive ok:true — ${ltDiag(buf)}`);
+    // Wait for the SECOND probe to have landed, on either build: the fixed one records a
+    // "timeout" outcome, the pre-fix one flips ok to false.
+    const after = await ltWaitHealth(port,
+      b => b.auth && (b.auth.lastOutcome === "timeout" || b.auth.ok === false), 15000);
+    assert.ok(after, `the signal-killed probe never landed — ${ltDiag(buf)}`);
+    assert.ok(ltProbeCount(probeLog) >= 2, "at least two probes must have run");
+    assert.equal(after.auth.ok, true,
+      `a probe killed by a signal measures HOST LOAD, not credential validity — the last ` +
+      `conclusive verdict must survive it; got auth=${JSON.stringify(after.auth)}`);
+    assert.equal(after.auth.lastOutcome, "timeout", "signal death classifies as INCONCLUSIVE");
+    assert.equal(after.auth.consecutiveFailures, 0, "an inconclusive probe must not touch the tally");
+    assert.equal(after.status, "ok",
+      `status must stay ok across an inconclusive probe; got ${after.status}`);
+  } finally { child.kill("SIGKILL"); _ltRmRetry(dir); }
+});
+
+// B4 — the genuine serving precondition still degrades. binaryOk is recomputed per request
+// (accessSync(CLAUDE, X_OK) inside the handler), so dropping the execute bit on this test's OWN
+// fake — it lives in this test's private ltMkdir() temp dir, so no other test can see it — flips
+// the verdict without restarting anything. Asserting "ok" first makes the transition, not the
+// end state, the thing under test.
+ltTest("integration: a non-executable claude binary still yields degraded (#232 — the real precondition survives)", async () => {
+  if (!LT_POSIX) return;
+  const dir = ltMkdir(); const fake = ltAuthFake(dir);
+  const probeLog = join(dir, "probes.txt");
+  const { child, buf, port } = await ltBootFresh({
+    CLAUDE_BIN: fake, AUTH_PROBE_LOG: probeLog, CLAUDE_AUTH_CHECK_INTERVAL_MS: "600000",
+  }, dir);
+  try {
+    const before = await ltWaitHealth(port, b => b.auth && b.auth.lastCheck > 0, 15000);
+    assert.ok(before, `no /health body with a completed auth probe — ${ltDiag(buf)}`);
+    assert.equal(before.status, "ok", "control: an authenticated probe + executable binary is ok");
+    assert.equal(before.claudeBinaryOk, true);
+    _ltChmod(fake, 0o644); // still present, no longer executable
+    const after = await ltWaitHealth(port, b => b.claudeBinaryOk === false, 9000);
+    assert.ok(after, `/health never observed the binary as non-executable — ${ltDiag(buf)}`);
+    assert.equal(after.status, "degraded",
+      `an unusable claude binary is a genuine serving precondition and must still degrade; ` +
+      `got status=${after.status}`);
+  } finally { _ltChmod(fake, 0o755); child.kill("SIGKILL"); _ltRmRetry(dir); }
 });
 
 // Deterministic close for the ltTest serialization claim: a fact about how many server.mjs
