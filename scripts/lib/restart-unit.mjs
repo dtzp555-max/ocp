@@ -151,6 +151,18 @@
  * platform-branched (`owner.platform === "darwin"`) since the Linux wording names `systemd`,
  * `/proc/<pid>/cgroup`, and `/proc/<pid>/cmdline` — none of which exist on macOS.
  *
+ * issue #253 (split from #234 by independent review of PR #250): the `allowNotListeningFallback`
+ * warning above (HIGH-A) used to assert "there is no other candidate unit to weigh this against"
+ * unconditionally. Untrue on the exact host that motivated #215: a SYSTEM unit and a USER unit
+ * both enabled for the same port. With the system unit down, this fallback starts the default USER
+ * unit, which binds loopback only — silently placing the host into the boot race
+ * scripts/doctor.mjs's #230 `multi_unit_boot_race` check already knows how to detect, while
+ * post-flight (127.0.0.1-only) reports success regardless. `opts.secondUnitNote`
+ * (scripts/upgrade.mjs computes it by REUSING that same #230 detection — see
+ * `detectMultiUnitBootRace`/`describeSecondUnit` there — not re-implementing unit enumeration a
+ * second time) names the other enabled unit when one is known to exist, so the warning states what
+ * it actually knows instead of what was merely true on the host this fallback was designed for.
+ *
  * A FIFTH independent review (issue #254, split from #237 by review of PR #251) found that #237's
  * own fix, while it fully closes the reported "wholly foreign service" vulnerability, leaves one
  * narrower case open: classifyCmdlineOwner confirms a process invokes A server.mjs, never that it
@@ -846,6 +858,12 @@ function launchdCmds(opts) {
  *     path: restarting the user-level unit instead would again leave the real
  *     (system) listener untouched.
  *
+ * opts.secondUnitNote (issue #253): a short, pre-formatted description of another enabled unit
+ * sharing the OCP port with `opts.expectedUnit` (e.g. `system-scope "ocp.service" (bind 0.0.0.0)`),
+ * or falsy when none is known — computed in scripts/upgrade.mjs by reusing
+ * scripts/doctor.mjs's #230 detectMultiUnitBootRace, never shelled out to from this pure function.
+ * Only consulted by the "not-listening" + allowNotListeningFallback warning below.
+ *
  * opts.isRoot / opts.sudoAuthorized (review finding MED-4): NOPASSWD sudoers
  * entries are per-command ("deploy ALL=(root) NOPASSWD: /bin/systemctl restart
  * ocp.service"), so a generic `sudo -n true` probe is the wrong question and
@@ -911,14 +929,31 @@ export function planRestart(owner, opts = {}) {
     // default unit with a loud warning instead of a permanent refusal; the upgrade path's
     // refusal is untouched.
     if (opts.allowNotListeningFallback) {
+      // issue #253: this used to assert "there is no other candidate unit to weigh this against"
+      // unconditionally — true on the host this fallback was originally designed for, but not in
+      // general. The exact host that motivated #215 has a SYSTEM unit and a USER unit BOTH
+      // enabled for the same port: with the system unit down (the not-listening state reached
+      // here) this fallback starts the default USER unit, which binds loopback only — silently
+      // landing the host in the boot race scripts/doctor.mjs's #230 multi_unit_boot_race check
+      // already warns about, while post-flight (127.0.0.1-only) reports success regardless.
+      // opts.secondUnitNote (computed in scripts/upgrade.mjs by reusing that SAME #230 detection,
+      // not re-implementing it) names the other unit when one is known to exist, instead of
+      // asserting none does.
+      const secondUnitClause = opts.secondUnitNote
+        ? `This host ALSO has ${opts.secondUnitNote} enabled and targeting this same port (see ` +
+          `scripts/doctor.mjs's #230 multi_unit_boot_race check) — if THAT unit is the one meant ` +
+          `to serve this port, starting "${opts.expectedUnit}" here will NOT restore it, and ` +
+          `post-flight (which only checks 127.0.0.1) cannot tell the difference. Run \`ocp doctor\` ` +
+          `for the full boot-race diagnosis before trusting this restart, or start the intended ` +
+          `unit manually instead (issue #253).`
+        : `There is no other candidate unit to weigh this against — refusing here would leave the ` +
+          `rollback stuck (re-running hits this identical state). If a different unit is meant to ` +
+          `own this port long-term, start it manually instead and ignore this one.`;
       warnings.push(
         `[restart] WARNING: nothing was listening on the OCP port before this rollback restart. ` +
         `Starting the default unit ("${opts.expectedUnit}") anyway: unlike the upgrade path, ` +
         `rollback has no doctor health gate and its own snapshot only ever restores ` +
-        `"${opts.expectedUnit}"'s config in the first place (scripts/lib/snapshot.mjs), so there ` +
-        `is no other candidate unit to weigh this against — refusing here would leave the ` +
-        `rollback stuck (re-running hits this identical state). If a different unit is meant to ` +
-        `own this port long-term, start it manually instead and ignore this one.`
+        `"${opts.expectedUnit}"'s config in the first place (scripts/lib/snapshot.mjs). ${secondUnitClause}`
       );
       if (owner.platform === "darwin") {
         return { action: "launchd", warnings, cmds: launchdCmds(opts) };

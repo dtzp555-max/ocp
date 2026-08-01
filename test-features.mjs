@@ -9919,6 +9919,83 @@ test("HIGH-A wiring: rollback with nothing listening on the port PROCEEDS instea
     "the fallback must surface loudly in phases, not silently");
 });
 
+console.log("\nRestart-unit resolution (issue #253) — rollback fallback names the second enabled unit:");
+
+// issue #253: split from #234 per independent review of PR #250. HIGH-A's own allowNotListeningFallback
+// warning (just above) asserted "there is no other candidate unit to weigh this against" — true on
+// the host that motivated the fallback itself, but not on the host that motivated #215: a SYSTEM
+// unit and a USER unit both enabled for the same port. With the system unit down, this fallback
+// starts the default USER unit (loopback only), silently landing the host in the boot race
+// scripts/doctor.mjs's #230 multi_unit_boot_race check already knows how to detect — while
+// post-flight (127.0.0.1-only) reports success regardless. These tests drive the fix's three
+// layers: planRestart's own warning text (pure), scripts/upgrade.mjs's wiring via the
+// opts.mockSecondUnitNote test hook, and the REAL scripts/doctor.mjs#230 detection reused end to
+// end (not re-implemented) via a fake command router.
+
+test("planRestart: rollback fallback names the second enabled unit when opts.secondUnitNote is known, instead of asserting none exists", () => {
+  const owner = { kind: "not-listening", platform: "linux", pid: null, unit: null, mismatched: false };
+  const plan = planRestart(owner, {
+    expectedUnit: "ocp-proxy.service",
+    allowNotListeningFallback: true,
+    secondUnitNote: 'system-scope "ocp.service" (bind 0.0.0.0)',
+  });
+  assert.ok(
+    plan.warnings.some(w => w.includes('system-scope "ocp.service" (bind 0.0.0.0)')),
+    `expected the fallback warning to name the second unit; got: ${JSON.stringify(plan.warnings)}`
+  );
+});
+
+test("planRestart: rollback fallback WITHOUT a known second unit keeps the honest 'no other candidate' wording (regression guard)", () => {
+  const owner = { kind: "not-listening", platform: "linux", pid: null, unit: null, mismatched: false };
+  const plan = planRestart(owner, { expectedUnit: "ocp-proxy.service", allowNotListeningFallback: true });
+  assert.ok(plan.warnings.some(w => w.includes("no other candidate unit")));
+});
+
+test("#253: rollback wiring — allowNotListeningFallback names the second enabled unit via opts.mockSecondUnitNote", async () => {
+  const result = await runUpgrade({
+    rollback: true, yes: true, mockExec: true,
+    mockPlatform: "linux",
+    mockSnapshots: [{ name: "upgrade-snapshot-2026-05-11T08:30:00Z", path: "/tmp/snap-x" }],
+    mockSnapshotMeta: { fromCommit: "abc1234", fromVersion: "v3.10.0", toVersion: "v3.14.0", path: "/tmp/snap-x" },
+    mockOwnerProbe: { ssOutput: "" }, // ran cleanly, confirmed nothing listening — the down-service rollback case
+    mockSecondUnitNote: 'system-scope "ocp.service" (bind 0.0.0.0)',
+  });
+  const restartCmds = result.phases.filter(p => p.name === "restart").map(p => p.cmd);
+  assert.deepEqual(restartCmds, ["systemctl --user restart -- ocp-proxy.service"], "still proceeds — this is a diagnosis addition, not a new refusal");
+  assert.ok(
+    result.phases.some(p => p.name === "restart-resolve" && p.note && p.note.includes('system-scope "ocp.service" (bind 0.0.0.0)')),
+    `expected the fallback warning phase to name the second unit; got phases=${JSON.stringify(result.phases)}`
+  );
+});
+
+test("#253: injected runner — REAL gather layer reuses scripts/doctor.mjs's #230 detectMultiUnitBootRace and names the second enabled unit end to end (not just the mocked hook)", async () => {
+  // The exact issue #215 field-incident fixture shape (FIELD_INCIDENT_USER_SHOW/SYSTEM_SHOW,
+  // defined earlier in this file for the #220/#230 doctor.mjs tests): system unit ocp.service
+  // (bind 0.0.0.0), user unit ocp-proxy.service (bind 127.0.0.1), same working tree, same port —
+  // reused here rather than inventing a parallel fixture, since it's the scenario #253 itself cites.
+  const run = makeFakeRun({
+    "ss -lptn": "", // nothing listening — the not-listening/fallback path
+    "--user list-unit-files": "ocp-proxy.service enabled\n",
+    "list-unit-files": "ocp.service enabled\n",
+    "--user show": FIELD_INCIDENT_USER_SHOW,
+    "systemctl show": FIELD_INCIDENT_SYSTEM_SHOW,
+    "daemon-reload": "", // MED-8's own best-effort daemon-reload — unrelated to what this test covers
+  });
+  const result = await runUpgrade({
+    rollback: true, yes: true, mockExec: true,
+    mockPlatform: "linux",
+    mockSnapshots: [{ name: "upgrade-snapshot-2026-05-11T08:30:00Z", path: "/tmp/snap-x" }],
+    mockSnapshotMeta: { fromCommit: "abc1234", fromVersion: "v3.10.0", toVersion: "v3.14.0", path: "/tmp/snap-x" },
+    run,
+  });
+  const restartCmds = result.phases.filter(p => p.name === "restart").map(p => p.cmd);
+  assert.deepEqual(restartCmds, ["systemctl --user restart -- ocp-proxy.service"]);
+  assert.ok(
+    result.phases.some(p => p.name === "restart-resolve" && p.note && p.note.includes("ocp.service") && p.note.includes("0.0.0.0")),
+    `expected the REAL gather layer to detect and name the second enabled unit; got phases=${JSON.stringify(result.phases)}`
+  );
+});
+
 // ── MED-C: UNIT_NAME_RE must reject a leading "-" (argv injection, not just shell metacharacters) ──
 
 test("MED-C: parseCgroupUnit rejects a leading-dash unit segment — never resolves it as a restart target", () => {

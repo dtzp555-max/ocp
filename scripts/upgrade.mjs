@@ -11,7 +11,7 @@
  *   fresh_install from-version < v3.4.0 (--yes required for non-interactive)
  *   rollback      restore from snapshot
  */
-import { runDoctor } from "./doctor.mjs";
+import { runDoctor, detectMultiUnitBootRace } from "./doctor.mjs";
 import { execSync, execFileSync } from "node:child_process";
 import { homedir } from "node:os";
 import { join, dirname } from "node:path";
@@ -164,6 +164,25 @@ function mapLaunchctlPrintFailureToProbeValue(err) {
     return { launchdPrintOutput: "" };
   }
   return { launchdPrintOutput: null };
+}
+
+// issue #253: does a SECOND enabled unit — besides expectedUnit — also target the same port this
+// rollback is about to fall back onto? Reuses scripts/doctor.mjs's own #230 detectMultiUnitBootRace
+// (its `multi_unit_boot_race` check) rather than re-implementing unit enumeration a second time —
+// the exact reuse issue #253 itself asks for. multiUnit is the already-classified result (never
+// shells out itself — this function is pure); returns a short human-readable descriptor of every
+// OTHER enabled unit sharing this port, or null if there is none / detection was inconclusive.
+// Best-effort by design: this is a diagnostic addition to a warning message, not a new refusal —
+// a `null` here must never be read as "confirmed no second unit", only as "nothing more specific
+// to say", so the caller's existing fallback wording (which already covers the "don't know"
+// case honestly) is untouched when this returns null.
+function describeSecondUnit(multiUnit, port, expectedUnit) {
+  if (!multiUnit || multiUnit.state !== "warn") return null;
+  const group = multiUnit.groups.find(g => g.length > 0 && String(g[0].port) === String(port));
+  if (!group) return null;
+  const others = group.filter(u => u.name !== expectedUnit);
+  if (others.length === 0) return null;
+  return others.map(u => `${u.scope}-scope "${u.name}" (bind ${u.bind})`).join(" and ");
 }
 
 // Resolve which unit actually owns the OCP port and build a restart plan for it, instead
@@ -378,6 +397,33 @@ function resolveRestartPlan({ opts, port, isRollback = false, fromCommit = null 
     );
   }
 
+  // issue #253: the allowNotListeningFallback warning below (planRestart) used to assert "there is
+  // no other candidate unit to weigh this against" unconditionally — true on the #221 host this
+  // fallback was designed for, but not in general: the exact host that motivated #215 has a SYSTEM
+  // unit and a USER unit both enabled for the same port, and #230's own multi_unit_boot_race check
+  // already knows how to detect that shape. Only probed when it's actually about to matter
+  // (rollback, and the port genuinely isn't listening — the one state where the fallback fires) so
+  // a healthy rollback never pays for an extra `systemctl`/plist scan. opts.mockSecondUnitNote is
+  // the test seam, mirroring sudoAuthorized's own opts.mockSudoAuthorized pattern just above: an
+  // explicit answer always wins; otherwise, in a mocked/test context with no injected runner, this
+  // skips rather than shells out for real (never silently probes a live host from inside a test).
+  let secondUnitNote = opts.mockSecondUnitNote;
+  if (secondUnitNote === undefined && isRollback && owner.kind === "not-listening") {
+    const isBareProduction = !opts.run && !opts.mockExec && !opts.mockOwnerProbe;
+    if (opts.run || isBareProduction) {
+      try {
+        const multiUnit = detectMultiUnitBootRace({ mockPlatform: platform, run });
+        secondUnitNote = describeSecondUnit(multiUnit, port, expectedUnit);
+      } catch {
+        // Best-effort: this is a diagnostic addition to a warning, not a new refusal — a failed
+        // probe here must never abort an otherwise-recoverable rollback.
+        secondUnitNote = null;
+      }
+    } else {
+      secondUnitNote = null;
+    }
+  }
+
   const plan = planRestart(owner, {
     expectedUnit,
     isRoot,
@@ -389,6 +435,9 @@ function resolveRestartPlan({ opts, port, isRollback = false, fromCommit = null 
     // left rollback permanently stuck — re-running hits this identical state forever. See
     // scripts/lib/restart-unit.mjs's planRestart for the fallback itself.
     allowNotListeningFallback: isRollback,
+    // issue #253: name the second enabled unit (if any) in the fallback warning, instead of
+    // asserting none exists.
+    secondUnitNote,
   });
   return { owner, plan };
 }
