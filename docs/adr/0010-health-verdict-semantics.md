@@ -1,8 +1,15 @@
 # ADR 0010 — `/health` and `/status` verdict semantics (what `degraded` means)
 
 **Date:** 2026-08-01
-**Status:** Accepted
-**Deciders:** project maintainer
+**Status:** Proposed — implemented, awaiting maintainer sign-off
+
+> Per `AGENTS.md` § "ADR writing protocol (Category A)", an ADR is drafted, shown to the
+> maintainer, and only then accepted. This one was authored by an agent alongside the
+> implementation and has **not** been reviewed by the maintainer yet, so it must not claim
+> otherwise. The code it describes is independently reviewed and verified; what is pending is
+> sign-off on the *semantics* — specifically what `degraded` is allowed to mean, since
+> `ocp update`'s post-flight check and human operators both read it.
+**Deciders:** pending — proposed by an implementing agent, not yet ratified
 **Related:** issue #232; ADR 0006 (Class A/B taxonomy + the B.2 grandfather provision); ADR 0007 (precedent for amending a grandfathered B.2 endpoint's response); `ALIGNMENT.md` § "Current Class B inventory"
 
 ---
