@@ -251,7 +251,23 @@ EOF
 }
 
 cmd_status() {
-  curl -sf --max-time 15 "$PROXY/status" | _json
+  # Issue #273 (found during independent review of #261/#267): this was a BARE pipeline with no
+  # failure handling -- `curl -sf ... | _json` -- and under `-sf` (silent + fail-on-HTTP-error)
+  # curl suppresses its OWN diagnostic text on a genuine connection failure too, not just HTTP
+  # error bodies, so a real "the proxy is down" case produced status=7 with stdout AND stderr
+  # both completely empty (verified directly, not assumed: a real curl against a closed port
+  # exits 7 silently on both streams; a shadow-stubbed curl exiting 127, simulating "not on
+  # $PATH", is exactly as silent). This is the command an operator runs FIRST when something
+  # looks wrong, and it used to answer by saying nothing at all.
+  #
+  # Routed through `_curl_or_die` (#261/#267) like the other captured-assignment sites, but this
+  # one needs a second stage afterward that none of the three #261 sites needed: `_json`'s own
+  # `python3 -m json.tool 2>/dev/null || cat` pretty-printer. Capture the verified-successful body
+  # first, THEN pipe it into `_json` -- a formatter failure still degrades to the raw JSON via
+  # `_json`'s own `cat` fallback rather than losing the response a second time.
+  local data
+  data=$(_curl_or_die "proxy unreachable" curl -sf --max-time 15 "$PROXY/status") || exit 1
+  echo "$data" | _json
 }
 
 # ── health ───────────────────────────────────────────────────────────────
@@ -948,9 +964,20 @@ for tier in ('opus','sonnet','haiku'):
     local key="$1"
     local value="$2"
     local result
-    result=$(curl -s --max-time 5 -X PATCH "$PROXY/settings" \
+    # Issue #273 (found during independent review of #261/#267): a fourth `2>&1`-into-capture
+    # site, literally the shape `_curl_or_die`'s own comment describes: `result=$(curl ... 2>&1)`.
+    # Unlike a `local result=$(...)` (which masks the exit status from `set -e` -- see this file's
+    # own #261-era `_pyfail`/`cmd_restart` exit-vs-return lesson), this is a PLAIN assignment, so a
+    # curl-exec failure (127, curl missing from $PATH) used to trip `errexit` immediately -- the
+    # whole `ocp settings <key> <value>` invocation died right there, before the
+    # `if echo "$result" | python3 ...` line below was ever reached, taking the `2>&1`-captured
+    # diagnostic down with it: status=127, stdout=[], stderr=[]. Deliberately still WITHOUT `-f`
+    # here (unlike most `_curl_or_die` call sites): the server can answer with a 2xx-or-not body
+    # carrying an `errors` array for a validation failure, which the code below must still be able
+    # to read -- `-f` would make curl swallow that body on a non-2xx response.
+    result=$(_curl_or_die "proxy unreachable" curl -s --max-time 5 -X PATCH "$PROXY/settings" \
       -H "Content-Type: application/json" \
-      -d "{\"$key\": $value}" 2>&1)
+      -d "{\"$key\": $value}") || return 1
     if echo "$result" | python3 -c "import sys,json; d=json.loads(sys.stdin.read()); errs=d.get('errors',[]); exit(1 if errs else 0)" 2>/dev/null; then
       echo "✓ $key = $value"
     else
