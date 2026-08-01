@@ -14,8 +14,9 @@
 import { runDoctor } from "./doctor.mjs";
 import { execSync, execFileSync } from "node:child_process";
 import { homedir } from "node:os";
-import { join } from "node:path";
+import { join, dirname } from "node:path";
 import { existsSync, copyFileSync, realpathSync } from "node:fs";
+import { fileURLToPath } from "node:url";
 import { writeSnapshot, listSnapshots, readSnapshot, gcSnapshots } from "./lib/snapshot.mjs";
 import { resolveOwningUnit, planRestart, classifySsListener, classifyLsofListener } from "./lib/restart-unit.mjs";
 import { DEFAULT_PORT } from "../lib/constants.mjs";
@@ -29,13 +30,41 @@ function execRun(cmd) {
 }
 
 // issue #254: the working tree THIS installation (the one this process is actually running from)
-// is rooted in — same opts.ocpDir-or-default fallback every other ocpDir use in this file already
-// takes (runFullUpgrade, runRollback). realpath'd where possible so a symlinked install dir
+// is rooted in.
+//
+// Post-review correction: the first cut of this function defaulted to `opts.ocpDir ||
+// join(homedir(), "ocp")` — the SAME pattern runFullUpgrade/runRollback already use for their own
+// git-checkout/npm-install target. That default is silently wrong for THIS comparison specifically.
+// `opts.ocpDir` is dead in every real invocation: the `ocp` bash wrapper calls `node
+// "$script_dir/scripts/upgrade.mjs" ...` positionally (verified: grep the `ocp` script — no
+// `--ocp-dir` flag anywhere), and this file's own `_isMain()` argv parser never reads one either.
+// So in production the old default ALWAYS resolved to `~/ocp`, regardless of which tree is
+// actually running — which reproduces, in this new check, the exact class of bug it exists to
+// catch: it silently reports "match" when a DIFFERENT tree (say `~/ocp-dev`) manages production's
+// real `~/ocp` install (nothing about that scenario ever gets compared against the tree that's
+// actually acting), and it spuriously reports "mismatch" on every single restart on the
+// `/opt/ocp`-shaped hosts this fix was explicitly written to support (this file's own module
+// comment and the PR that introduced it both cite `/opt/ocp` as a real production shape) — because
+// the default never resolves to anything BUT `~/ocp`.
+//
+// Fix: default to the directory of THIS RUNNING FILE — the one fact this process can actually be
+// certain of — via `fileURLToPath(import.meta.url)`, exactly the same "trust the module's own URL
+// over any assumption about where it's installed" precedent `_isMain()` below already establishes
+// for symlinked install paths. `scripts/upgrade.mjs` always lives at `<ocpDir>/scripts/upgrade.mjs`
+// (setup.mjs never installs it anywhere else), so the OCP root is two `dirname()` calls up.
+// `opts.ocpDir` remains a valid EXPLICIT override (tests use it, and any future CLI flag could) —
+// only the no-override default changed. realpath'd where possible so a symlinked install dir
 // (~/ocp -> /data/ocp, say) compares correctly against /proc/<pid>/cwd's already-kernel-canonical
-// target; falls back to the raw path when realpath fails (doesn't exist yet, permission gap) —
-// this function must never throw, only degrade to the best answer it has.
+// target; this function must never throw, only degrade to the best answer it has.
 function resolveExpectedWorkingTree(opts) {
-  const ocpDir = opts.ocpDir || join(homedir(), "ocp");
+  let ocpDir = opts.ocpDir;
+  if (!ocpDir) {
+    try {
+      ocpDir = dirname(dirname(fileURLToPath(import.meta.url)));
+    } catch {
+      ocpDir = join(homedir(), "ocp"); // last-resort fallback if import.meta.url is ever unavailable
+    }
+  }
   try { return realpathSync(ocpDir); } catch { return ocpDir; }
 }
 
@@ -956,7 +985,6 @@ async function runRollback(opts) {
 }
 
 // CLI entrypoint — use fileURLToPath + realpath to handle symlinked install paths.
-import { fileURLToPath } from "node:url";
 function _isMain() {
   if (!process.argv[1]) return false;
   try {

@@ -8618,6 +8618,8 @@ test("classifyCmdlineOwner: empty-string cmdline read is also 'unknown', not 'fo
   assert.equal(classifyCmdlineOwner("").state, "unknown");
 });
 
+import { realpathSync } from "node:fs";
+
 console.log("\nRestart-unit resolution (issue #254) — classifyWorkingTree:");
 
 // issue #254: split from #237 per independent review of PR #251 — classifyCmdlineOwner confirms
@@ -9690,6 +9692,45 @@ test("#254: injected runner — REAL gather layer reads /proc/<pid>/cwd and warn
     result.phases.some(p => p.name === "restart-resolve" && p.note &&
       p.note.includes("/opt/other-ocp-install") && p.note.includes("/opt/ocp")),
     `expected the warning to name BOTH the observed and expected working tree; got ${JSON.stringify(result.phases)}`
+  );
+});
+
+test("#254: injected runner — default expectedWorkingTree derives from THIS RUNNING FILE's own location, not homedir() (post-review regression guard)", async () => {
+  // Independent review of an earlier revision of this fix found resolveExpectedWorkingTree's
+  // no-override default was opts.ocpDir || join(homedir(), "ocp") — the same pattern
+  // runFullUpgrade/runRollback use for their OWN git-checkout/npm-install target. That default is
+  // dead-wrong for THIS comparison specifically: opts.ocpDir is never populated by any real
+  // invocation (the `ocp` bash wrapper calls `node "$script_dir/scripts/upgrade.mjs" ...`
+  // positionally — no --ocp-dir flag exists anywhere, verified by reading the `ocp` script and this
+  // file's own _isMain() argv parser), so in production the old default ALWAYS resolved to ~/ocp
+  // regardless of which tree was actually running — reproducing, inside the new check itself, the
+  // exact "silently assumes the wrong tree" failure mode #254 exists to catch. Fixed to default to
+  // scripts/upgrade.mjs's own file location (fileURLToPath(import.meta.url), two dirnames up) —
+  // the one fact this process can be certain of, the same precedent this file's own _isMain()
+  // already establishes for symlinked install paths. This test drives the REAL default (no
+  // opts.ocpDir override at all) and confirms a cwd matching THIS repo's own root produces a
+  // match — not a spurious mismatch warning, which is what the old homedir()-based default would
+  // produce in this sandboxed test environment (whose real $HOME is essentially never this repo's
+  // checkout path).
+  const thisRepoRoot = realpathSync(_ltF2P(new URL(".", import.meta.url)).replace(/\/$/, ""));
+  const run = makeFakeRun({
+    "ss -lptn": `LISTEN 0 511 0.0.0.0:3456 0.0.0.0:* users:(("node",pid=900003,fd=19))`,
+    "cat /proc/900003/cgroup": "0::/system.slice/ocp.service\n",
+    "cat /proc/900003/cmdline": "/usr/bin/node\0server.mjs\0",
+    "readlink /proc/900003/cwd": `${thisRepoRoot}\n`, // SAME tree upgrade.mjs is actually running from
+    "sudo -n -l systemctl restart -- ocp.service": "systemctl restart -- ocp.service",
+  });
+  const result = await runUpgrade({
+    yes: true, dryRun: false, mockExec: true,
+    mockDoctor: { ready_to_upgrade: true, next_action: { kind: "upgrade" }, current_version: "v3.10.0", latest_version: "v3.14.0" },
+    mockPlatform: "linux", mockIsRoot: true, run,
+    // Deliberately NO ocpDir override — that absence is the entire point of this test.
+  });
+  const restartCmds = result.phases.filter(p => p.name === "restart").map(p => p.cmd);
+  assert.ok(restartCmds.length > 0);
+  assert.ok(
+    !result.phases.some(p => p.name === "restart-resolve" && p.note && p.note.includes("does not match this installation's own working tree")),
+    `default expectedWorkingTree must resolve to THIS repo's own root, not homedir()/ocp; got phases=${JSON.stringify(result.phases)}`
   );
 });
 
