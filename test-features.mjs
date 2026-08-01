@@ -9913,6 +9913,15 @@ function _bwHarnessRun({
   // latter is a substring of the former). Purely additive: an empty array (the default)
   // leaves every existing call site's curl stub byte-identical to before this issue.
   curlResponses = [],
+  // Issue #261: simulates "curl is not on $PATH at all" the same way pythonAbsent (below)
+  // simulates a missing python3 — a stub that always exits 127 (bash's own reserved "command
+  // not found" code, never one curl itself produces), placed first on $PATH so it shadows any
+  // real curl the harness's own /usr/bin:/bin fallback would otherwise resolve to. The
+  // realistic, environment-only-controlled stand-in for "the command could not run", as
+  // distinct from "the command ran and the request failed" (the existing curlResponses/
+  // curlHealthExit/default-refusal arms, all of which still require curl to have started).
+  // Default false leaves the curl stub's behavior byte-identical to before this issue.
+  curlAbsent = false,
   // Issue #242 test-setup note (NOT a fix for a #242/#241 defect — a separate, pre-existing,
   // previously-undiscovered one, found incidentally while adding these tests, out of scope for
   // both PRs and left for its own issue): `_curl()`'s `curl "${_AUTH_ARGS[@]}" "$@"` references
@@ -10077,12 +10086,30 @@ function _bwHarnessRun({
     // Issue #242: curlResponses (see its own doc comment above) adds arbitrary fixture arms,
     // checked BEFORE "/health" and the default refusal, for the nine display commands' own
     // curl calls (/api/usage, /usage, /logs, /v1/models, /sessions, /api/keys, /settings).
+    //
+    // Issue #261: curlAbsent simulates "curl is not on $PATH" the SAME way pythonAbsent already
+    // simulates "python3 is not on $PATH" a few lines below (see that stub's own comment: "a
+    // real executable file that always reports command-not-found's own exit code ... rather
+    // than trying to strip PATH of every directory that might contain a real" copy). Simply
+    // omitting the bin/curl file does NOT achieve this: this harness's $PATH is
+    // `${bin}:/usr/bin:/bin` (needed so python3/cat/sed/mktemp resolve to the real system
+    // copies), and /usr/bin/curl is a real, present binary on this repo's own macOS dev hosts
+    // (and on plenty of Linux bases) — omitting only the harness's own stub would silently fall
+    // through to that REAL curl, which would then make a REAL (if pointless, PROXY is
+    // "http://127.0.0.1:1") network attempt and fail for a genuinely-different reason than the
+    // one this option exists to simulate. The stub below always wins the PATH lookup (bin/ is
+    // first) and, when curlAbsent is true, unconditionally exits 127 — bash's own reserved
+    // "command not found" code, which curl itself never produces — without attempting any
+    // network I/O, before curlResponseFiles/curlHealthExit are even consulted.
     const curlResponseFiles = curlResponses.map((r, i) => {
       const p = join(root, `curl-resp-${i}.json`);
       testWriteFile(p, r.body ?? "");
       return { match: r.match, exit: r.exit ?? 0, path: p };
     });
-    mkStub("curl", [
+    mkStub("curl", curlAbsent ? [
+      `echo "FAKE-CURL-ABSENT-CALL $*" >> "${logPath}"`,
+      `exit 127`,
+    ].join("\n") : [
       `echo "FAKE-CURL-CALL $*" >> "${logPath}"`,
       `case "$*" in`,
       ...curlResponseFiles.flatMap((r) => [
@@ -10618,6 +10645,78 @@ test("#242 fix-3 cmd_keys revoke: 'Error: proxy unreachable or unauthorized' goe
   assert.notEqual(r.status, 0);
   assert.ok(r.stderr.includes("Error: proxy unreachable or unauthorized"), `expected the message on stderr, got: ${JSON.stringify(r.stderr)}`);
   assert.equal(r.stdout, "", `stdout must stay clean; got: ${JSON.stringify(r.stdout)}`);
+});
+
+// ═════════════════════════════════════════════════════════════════════════════
+// Issue #261 (the pattern #256/#258 partially addressed, and #242's own review left the three
+// sites below untouched — see the "fix 3" note above): `cmd_usage --by-key`, `cmd_usage`
+// (main), and `cmd_keys add` are the three remaining call sites that fold curl's own stderr
+// into the captured response body via `2>&1` and then attribute ANY nonzero exit — a genuine
+// network failure OR a hard shell-level failure before curl ever ran (the exact #256 shape) —
+// to the identical "proxy unreachable" text. `curl` missing from $PATH (bash's own reserved
+// exit 127, "command not found" — a code and message curl itself never produces) is the
+// realistic, environment-only-controlled stand-in used here for "the command could not run",
+// generalizing #256's own repro (an `unbound variable` inside `_curl` itself, now fixed by
+// #258) to the CLASS of bug rather than that one instance. Each site gets a money test (curl
+// absent — must NOT say "proxy unreachable", must name curl) and a control test (curl present,
+// proxy genuinely unreachable — must still say "proxy unreachable", proving the fix does not
+// just delete the diagnosis). A fourth test checks the stream: these three sites previously
+// printed to stdout, unlike every sibling site #242's own "fix 3" already moved to stderr —
+// fixing that parity gap is in scope here because this PR rewrites these exact lines anyway.
+console.log("\nocp _curl call sites distinguish 'the command could not run' from 'the request failed' (#261):");
+
+test("#261 cmd_usage --by-key: curl missing from $PATH must be reported as a local fault, not 'proxy unreachable' (generalizes #256's exact repro)", () => {
+  const r = _bwHarnessRun({ args: ["usage", "--by-key"], adminKey: "test-admin-key-marker", curlAbsent: true });
+  assert.notEqual(r.status, 0, `expected a nonzero exit; status=${r.status}`);
+  assert.ok(!r.stderr.includes("proxy unreachable") && !r.stdout.includes("proxy unreachable"),
+    `must NOT misattribute a missing curl binary to the proxy — this is exactly how #256 hid the real cause; stderr=${JSON.stringify(r.stderr)} stdout=${JSON.stringify(r.stdout)}`);
+  assert.ok(/curl/i.test(r.stderr), `expected the message to name curl/the local command failure, got stderr=${JSON.stringify(r.stderr)}`);
+});
+
+test("#261 control: cmd_usage --by-key with curl present but the proxy genuinely unreachable still says so", () => {
+  const r = _bwHarnessRun({ args: ["usage", "--by-key"], adminKey: "test-admin-key-marker" });
+  assert.notEqual(r.status, 0, `expected a nonzero exit; status=${r.status}`);
+  assert.ok(r.stderr.includes("proxy unreachable or usage API not available"),
+    `a GENUINE network failure must still be reported as such (proves the fix does not just delete the diagnosis), got stderr=${JSON.stringify(r.stderr)}`);
+});
+
+test("#261 cmd_usage (main): curl missing from $PATH must be reported as a local fault, not 'proxy unreachable'", () => {
+  const r = _bwHarnessRun({ args: ["usage"], curlAbsent: true });
+  assert.notEqual(r.status, 0, `expected a nonzero exit; status=${r.status}`);
+  assert.ok(!r.stderr.includes("proxy unreachable") && !r.stdout.includes("proxy unreachable"),
+    `must NOT misattribute a missing curl binary to the proxy; stderr=${JSON.stringify(r.stderr)} stdout=${JSON.stringify(r.stdout)}`);
+  assert.ok(/curl/i.test(r.stderr), `expected the message to name curl/the local command failure, got stderr=${JSON.stringify(r.stderr)}`);
+});
+
+test("#261 control: cmd_usage (main) with curl present but the proxy genuinely unreachable still says so", () => {
+  const r = _bwHarnessRun({ args: ["usage"] });
+  assert.notEqual(r.status, 0, `expected a nonzero exit; status=${r.status}`);
+  assert.ok(r.stderr.includes("Error: proxy unreachable"),
+    `a GENUINE network failure must still be reported as such, got stderr=${JSON.stringify(r.stderr)}`);
+});
+
+test("#261 cmd_keys add: curl missing from $PATH must be reported as a local fault, not 'proxy unreachable or unauthorized'", () => {
+  const r = _bwHarnessRun({ args: ["keys", "add", "laptop-marker"], adminKey: "test-admin-key-marker", curlAbsent: true });
+  assert.notEqual(r.status, 0, `expected a nonzero exit; status=${r.status}`);
+  assert.ok(!r.stderr.includes("proxy unreachable") && !r.stdout.includes("proxy unreachable"),
+    `must NOT misattribute a missing curl binary to the proxy/auth layer; stderr=${JSON.stringify(r.stderr)} stdout=${JSON.stringify(r.stdout)}`);
+  assert.ok(/curl/i.test(r.stderr), `expected the message to name curl/the local command failure, got stderr=${JSON.stringify(r.stderr)}`);
+});
+
+test("#261 control: cmd_keys add with curl present but the proxy genuinely unreachable still says so", () => {
+  const r = _bwHarnessRun({ args: ["keys", "add", "laptop-marker"], adminKey: "test-admin-key-marker" });
+  assert.notEqual(r.status, 0, `expected a nonzero exit; status=${r.status}`);
+  assert.ok(r.stderr.includes("proxy unreachable or unauthorized"),
+    `a GENUINE network failure must still be reported as such, got stderr=${JSON.stringify(r.stderr)}`);
+});
+
+test("#261 stream parity: cmd_usage/cmd_keys-add 'proxy unreachable' guards now write to stderr, stdout stays empty (matches the #242 fix-3 sibling sites)", () => {
+  const byKey = _bwHarnessRun({ args: ["usage", "--by-key"], adminKey: "test-admin-key-marker" });
+  assert.equal(byKey.stdout, "", `cmd_usage --by-key: stdout must stay clean of the error text; got: ${JSON.stringify(byKey.stdout)}`);
+  const main = _bwHarnessRun({ args: ["usage"] });
+  assert.equal(main.stdout, "", `cmd_usage (main): stdout must stay clean; got: ${JSON.stringify(main.stdout)}`);
+  const keysAdd = _bwHarnessRun({ args: ["keys", "add", "laptop-marker"], adminKey: "test-admin-key-marker" });
+  assert.equal(keysAdd.stdout, "", `cmd_keys add: stdout must stay clean; got: ${JSON.stringify(keysAdd.stdout)}`);
 });
 
 console.log("\nRestart-unit resolution (issue #233 defect 1) — macOS lsof exit-code handling:");

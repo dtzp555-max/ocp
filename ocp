@@ -71,6 +71,51 @@ _pyfail() {
   return 1
 }
 
+# Issue #261 (the pattern #256/#258 partially addressed): a call site that folds curl's own
+# stderr into the captured response body via `2>&1` — `data=$(_curl ... 2>&1) || { echo "proxy
+# unreachable"; exit 1; }` — cannot tell "curl itself never ran" (a local shell/exec fault —
+# curl missing from $PATH, or a bash builtin error firing before curl was ever invoked, e.g. the
+# `set -u` "unbound variable" that used to fire inside `_curl` itself, per #256) apart from
+# "curl ran and the request genuinely failed" (network down, proxy not listening, non-2xx).
+# Both produce a nonzero exit from the `$(...)`, so both got the SAME "proxy unreachable" text —
+# exactly how #256 hid: the shell died three lines before curl would have run, and the reader
+# was pointed at a healthy service instead of the actual fault.
+#
+# `_curl_or_die` never merges the two streams: the wrapped command's own stderr is captured to a
+# private temp file (never /dev/null — discarding it would just trade one misdiagnosis for a
+# silent one), and the exit status plus that captured text decide which message fires. Exit 127
+# is bash's own reserved "command not found" code (curl itself never produces it); the text
+# "command not found" in the captured stderr is bash's own diagnostic vocabulary, never curl's —
+# either signal means the shell failed to even start the command, not that it ran and failed.
+#
+# Usage: `data=$(_curl_or_die "<network-failure label>" _curl -sf ... "$url") || exit 1` — the
+# first argument after the label is the command to run (`_curl` for authenticated call sites,
+# plain `curl` for the one unauthenticated one), so this stays a drop-in replacement for the old
+# `<cmd> ... 2>&1) || { echo "Error: <label>"; exit 1; }` shape at each site, byte-identical on
+# the success path and on a genuine network failure (same label text), and message text goes to
+# stderr (matching the sibling display commands' own stderr convention, PR #252 round 1 fix 3 —
+# these three call sites were the ones that review explicitly left untouched).
+_curl_or_die() {
+  local network_label="$1"; shift
+  local errfile out status err
+  errfile=$(mktemp "${TMPDIR:-/tmp}/ocp-curlerr.XXXXXX" 2>/dev/null) || errfile="${TMPDIR:-/tmp}/.ocp-curlerr.$$"
+  out=$("$@" 2>"$errfile")
+  status=$?
+  err=$(cat "$errfile" 2>/dev/null)
+  rm -f "$errfile"
+  if [[ $status -ne 0 ]]; then
+    if [[ $status -eq 127 ]] || [[ "$err" == *"command not found"* ]]; then
+      echo "Error: could not run curl (${err:-exit status $status}) — this is a local shell/environment fault, not a proxy problem" >&2
+    else
+      echo "Error: $network_label" >&2
+      [[ -n "$err" ]] && echo "$err" >&2
+    fi
+    return 1
+  fi
+  printf '%s' "$out"
+  return 0
+}
+
 _bar() {
   local pct=$1 width=20
   local filled=$(( pct * width / 100 ))
@@ -100,7 +145,7 @@ EOF
 cmd_usage() {
   if [[ "${1:-}" == "--by-key" ]]; then
     local data
-    data=$(_curl -sf --max-time 15 "$PROXY/api/usage" 2>&1) || { echo "Error: proxy unreachable or usage API not available"; exit 1; }
+    data=$(_curl_or_die "proxy unreachable or usage API not available" _curl -sf --max-time 15 "$PROXY/api/usage") || exit 1
     echo "$data" | python3 -c "
 import sys, json
 d = json.loads(sys.stdin.read())
@@ -121,7 +166,7 @@ else:
   fi
 
   local data
-  data=$(curl -sf --max-time 15 "$PROXY/usage" 2>&1) || { echo "Error: proxy unreachable"; exit 1; }
+  data=$(_curl_or_die "proxy unreachable" curl -sf --max-time 15 "$PROXY/usage") || exit 1
 
   echo "$data" | python3 -c "
 import sys, json
@@ -337,9 +382,9 @@ cmd_keys() {
     add)
       if [[ -z "${2:-}" ]]; then echo "Usage: ocp keys add <name>"; return 1; fi
       local result
-      result=$(_curl -sf --max-time 5 -X POST "$PROXY/api/keys" \
+      result=$(_curl_or_die "proxy unreachable or unauthorized" _curl -sf --max-time 5 -X POST "$PROXY/api/keys" \
         -H "Content-Type: application/json" \
-        -d "{\"name\": \"$2\"}" 2>&1) || { echo "Error: proxy unreachable or unauthorized"; exit 1; }
+        -d "{\"name\": \"$2\"}") || exit 1
       # Issue #242: this is the highest-stakes of the nine `_pyfail` sites — the formatted view
       # below is the ONLY place the newly created key is ever shown ("you won't see it again").
       # A silent death here (python3 missing/broken) would mean the key was created (the POST
