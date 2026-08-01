@@ -965,6 +965,23 @@ async function runRollback(opts) {
   const meta = opts.mockSnapshotMeta ?? readSnapshot(target.path);
   if (!meta.fromCommit) throw new Error(`snapshot ${target.path} has no from-commit.txt`);
 
+  // SECURITY (issue #262): meta.fromCommit is read back from from-commit.txt, written by
+  // writeSnapshot() (scripts/lib/snapshot.mjs) from `git rev-parse HEAD`'s own output
+  // (runFullUpgrade phase 2, below) -- never from a CLI flag or any other user-supplied string.
+  // That is what makes interpolating it into a shell command safe TODAY, but the invariant was
+  // written down nowhere and enforced by nothing: a hand-edited snapshot directory, a future
+  // feature that lets an operator name/import a snapshot, or metadata restored from a backup
+  // could all produce a value that is no longer a bare SHA. `git rev-parse HEAD` always prints
+  // lowercase hex, 7 (short) to 40 (full) characters; anchored at both ends (matching the #257
+  // precedent in `_targetSemverParts` for the same "validate before using in a command" shape)
+  // so any value carrying anything else -- including shell metacharacters -- is refused before
+  // it ever reaches a command, belt-and-braces alongside the execArgv conversion below.
+  if (!/^[0-9a-f]{7,40}$/.test(meta.fromCommit)) {
+    throw new Error(
+      `snapshot ${target.path} has a malformed from-commit.txt (expected a git SHA, got: ${JSON.stringify(meta.fromCommit)})`
+    );
+  }
+
   const phases = [];
   if (opts.dryRun) {
     return {
@@ -1000,9 +1017,41 @@ async function runRollback(opts) {
       );
     }
   };
+  // SECURITY (issue #262, matching the #259 pattern already used by runFullUpgrade's own
+  // `execArgv` above): argv-form sibling of `exec`, for the one command in this function whose
+  // argument is read back from disk rather than being a fixed string -- `meta.fromCommit`.
+  // `execFileSync(file, args)` never invokes `/bin/sh`, so an argv element can never be
+  // reinterpreted as shell syntax, regardless of its content. `cmd` (the human-readable display
+  // string recorded into `phases`, matching every existing test's `.cmd.includes(...)`-style
+  // assertions) is built via `.join(" ")` purely for bookkeeping/display -- it is NEVER itself
+  // executed. Error/phase shape matches this function's own `exec` above (`{phases, target:
+  // target.path}`), not runFullUpgrade's `execArgv` (`{phases, cmd}`) -- the two functions
+  // already use different error shapes for their existing failure sites and this stays
+  // consistent with runRollback's own convention rather than importing the sibling's.
+  const execArgv = (file, args, label) => {
+    const cmd = [file, ...args].join(" ");
+    if (opts.mockExec) {
+      phases.push({ name: label, cmd, status: "skipped-mock" });
+      return "";
+    }
+    try {
+      execFileSync(file, args, { stdio: ["pipe", "pipe", "pipe"] });
+      phases.push({ name: label, cmd, status: "ok" });
+    } catch (err) {
+      const detail = err.stderr?.toString().trim();
+      phases.push({ name: label, cmd, status: "fail", stderr: detail });
+      throw Object.assign(
+        new Error(`rollback phase ${label} failed: ${detail || err.message}`),
+        { phases, target: target.path }
+      );
+    }
+  };
 
   const ocpDir = opts.ocpDir || join(homedir(), "ocp");
-  exec(`git -C ${ocpDir} checkout ${meta.fromCommit}`, "git-checkout");
+  // Issue #262: was `exec(\`git -C ${ocpDir} checkout ${meta.fromCommit}\`, "git-checkout")` --
+  // a shell template string carrying a disk-read value. Now argv form; see execArgv above and
+  // the SHA-shape validation above meta.fromCommit is first read.
+  execArgv("git", ["-C", ocpDir, "checkout", meta.fromCommit], "git-checkout");
 
   if (!opts.mockExec) {
     const tryCopy = (src, dst) => {

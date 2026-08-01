@@ -3420,6 +3420,101 @@ test("#274: rollback post-flight is skipped-mock under plain mockExec with no in
   assert.equal(pf.status, "skipped-mock");
 });
 
+// ── #262 SECURITY (same shape as #257's injection, on the rollback path) ───────────────────────
+// meta.fromCommit is read back from from-commit.txt inside the snapshot directory and was
+// interpolated into an `exec()` shell template string for `git -C ${ocpDir} checkout
+// ${meta.fromCommit}`. Today that value always originates from OCP's own `git rev-parse HEAD`
+// (writeSnapshot, scripts/lib/snapshot.mjs) — there is no path from a CLI flag to it — but
+// nothing enforced that invariant on the read side. Fix has two independent layers, mirroring
+// #259's precedent for the sibling upgrade-path sites: (1) an anchored git-SHA-shape check
+// before meta.fromCommit is used for anything, and (2) execArgv (execFileSync argv form, never
+// /bin/sh) for the checkout call itself.
+//
+// mockExec:false is deliberate and required for the money test below: mockExec:true would skip
+// the real git call entirely, so the vulnerable shell-interpolation line (or its fixed
+// execArgv replacement) would never actually run — the injection could only ever be
+// demonstrated, or ruled out, with real execution. Safe to run for real: with layer (1) intact,
+// validation throws before ANY phase (including the dry-run preview branch) is ever reached —
+// no snapshot listing beyond the injected mocks, no exec/execArgv call, nothing mutates.
+console.log("\nRollback checkout argv-form + fromCommit validation (issue #262):");
+
+test("#262 SECURITY: a snapshot fromCommit carrying shell metacharacters is refused AND never reaches a shell (marker file must not exist)", async () => {
+  const scratchDir = _ltMkdtemp(join(_ltTmp(), "ocp-262-injection-"));
+  try {
+    const markerPath = join(scratchDir, "PWNED");
+    const payload = `abc1234 ; touch ${markerPath} ; false`;
+    let caught = null;
+    try {
+      await runUpgrade({
+        rollback: true, yes: true, mockExec: false, ocpDir: scratchDir,
+        mockSnapshots: [{ name: "upgrade-snapshot-2026-05-11T08:30:00Z", path: scratchDir }],
+        mockSnapshotMeta: { fromCommit: payload, fromVersion: "v3.10.0", toVersion: "v3.14.0", path: scratchDir },
+      });
+    } catch (e) { caught = e; }
+    // Deliberately does NOT assert on caught.message / which layer refused it (that is covered
+    // separately, and precisely, by the two non-metacharacter tests below). This test asserts
+    // exactly one property, checked FIRST so it is never short-circuited by an unrelated
+    // message-format change: the payload's injected command must never execute, regardless of
+    // which of the two independent layers (SHA-shape validation, or execArgv's argv form) is
+    // the one that happened to stop it.
+    assert.ok(!_ltExists(markerPath),
+      `SECURITY: the payload's injected command must NEVER execute -- a marker file at ` +
+      `${markerPath} would prove fromCommit reached a real shell.`);
+    assert.ok(caught, "a shell-metacharacter fromCommit must be refused, not silently accepted");
+  } finally {
+    _ltRm(scratchDir, { recursive: true, force: true });
+  }
+});
+
+// Isolates the ANCHORED-REGEX layer specifically from the metacharacter-payload test above: this
+// payload carries no shell metacharacters at all, so it cannot be caught by execArgv's "never
+// invokes /bin/sh" property — only the SHA-shape validation can refuse it. Distinguishes "the
+// guard actually validates shape" from "the guard only happens to catch strings with `;` in
+// them".
+test("#262: a from-commit.txt value that is not a git SHA (no shell metacharacters at all) is refused, not silently accepted", async () => {
+  await assert.rejects(async () => {
+    await runUpgrade({
+      rollback: true, yes: true, mockExec: true,
+      mockSnapshots: [{ name: "upgrade-snapshot-2026-05-11T08:30:00Z", path: "/tmp/snap-x" }],
+      mockSnapshotMeta: { fromCommit: "not-a-real-sha-at-all", fromVersion: "v3.10.0", toVersion: "v3.14.0", path: "/tmp/snap-x" },
+    });
+  }, /malformed from-commit\.txt/);
+});
+
+test("#262: an uppercase-hex fromCommit is refused — git rev-parse HEAD only ever emits lowercase, so uppercase means the value did not come from that call", async () => {
+  await assert.rejects(async () => {
+    await runUpgrade({
+      rollback: true, yes: true, mockExec: true,
+      mockSnapshots: [{ name: "upgrade-snapshot-2026-05-11T08:30:00Z", path: "/tmp/snap-x" }],
+      mockSnapshotMeta: { fromCommit: "ABC1234", fromVersion: "v3.10.0", toVersion: "v3.14.0", path: "/tmp/snap-x" },
+    });
+  }, /malformed from-commit\.txt/);
+});
+
+test("#262: a too-short fromCommit (6 hex chars, one short of git's minimum abbreviation) is refused", async () => {
+  await assert.rejects(async () => {
+    await runUpgrade({
+      rollback: true, yes: true, mockExec: true,
+      mockSnapshots: [{ name: "upgrade-snapshot-2026-05-11T08:30:00Z", path: "/tmp/snap-x" }],
+      mockSnapshotMeta: { fromCommit: "abc123", fromVersion: "v3.10.0", toVersion: "v3.14.0", path: "/tmp/snap-x" },
+    });
+  }, /malformed from-commit\.txt/);
+});
+
+test("#262 control: a full 40-char lowercase-hex fromCommit (a real, non-abbreviated git SHA) is accepted, proving the guard is not accidentally 7-chars-only", async () => {
+  const result = await runUpgrade({
+    rollback: true, yes: true, mockExec: true,
+    mockSnapshots: [{ name: "upgrade-snapshot-2026-05-11T08:30:00Z", path: "/tmp/snap-x" }],
+    mockSnapshotMeta: {
+      fromCommit: "0123456789abcdef0123456789abcdef01234567",
+      fromVersion: "v3.10.0", toVersion: "v3.14.0", path: "/tmp/snap-x",
+    },
+  });
+  assert.equal(result.path, "rollback");
+  assert.equal(result.executed, true);
+  assert.ok(result.phases.some(p => p.name === "git-checkout"));
+});
+
 test("gcSnapshots keeps last N regardless of age", () => {
   const root = mkdtempSync(testJoin(tmpdir(), "ocp-gc-test-"));
   const dotOcp = testJoin(root, ".ocp");
