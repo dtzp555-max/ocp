@@ -7,7 +7,7 @@
       "displayName": "Claude Opus 5",
       "openclawName": "Claude Opus 5 (via CLI)",
       "reasoning": true,
-      "contextWindow": 200000,
+      "contextWindow": 1000000,
       "maxTokens": 64000
     },
     {
@@ -15,7 +15,7 @@
       "displayName": "Claude Opus 4.8",
       "openclawName": "Claude Opus 4.8 (via CLI)",
       "reasoning": true,
-      "contextWindow": 200000,
+      "contextWindow": 1000000,
       "maxTokens": 64000
     },
     {
@@ -23,7 +23,7 @@
       "displayName": "Claude Opus 4.7",
       "openclawName": "Claude Opus 4.7 (via CLI)",
       "reasoning": true,
-      "contextWindow": 200000,
+      "contextWindow": 1000000,
       "maxTokens": 64000
     },
     {
@@ -39,7 +39,7 @@
       "displayName": "Claude Sonnet 5",
       "openclawName": "Claude Sonnet 5 (via CLI)",
       "reasoning": true,
-      "contextWindow": 200000,
+      "contextWindow": 1000000,
       "maxTokens": 64000
     },
     {

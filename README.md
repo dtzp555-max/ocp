@@ -167,15 +167,19 @@ Any tool use happens server-side, under the `--allowedTools` set configured on t
 
 ## Available Models
 
-| Model ID | Notes |
-|----------|-------|
-| `claude-opus-5` | Most capable (default for `opus` alias) |
-| `claude-opus-4-8` | Previous Opus, retained for pinning |
-| `claude-opus-4-7` | Older Opus, retained for pinning |
-| `claude-opus-4-6` | Older Opus, retained for pinning |
-| `claude-sonnet-5` | Latest Sonnet (default for `sonnet` alias) |
-| `claude-sonnet-4-6` | Previous Sonnet, retained for pinning |
-| `claude-haiku-4-5-20251001` | Fastest, lightweight (default for `haiku` alias) |
+| Model ID | Context window | Notes |
+|----------|---------------:|-------|
+| `claude-opus-5` | 1M | Most capable (default for `opus` alias) |
+| `claude-opus-4-8` | 1M | Previous Opus, retained for pinning |
+| `claude-opus-4-7` | 1M | Older Opus, retained for pinning |
+| `claude-opus-4-6` | 200k | Older Opus, retained for pinning |
+| `claude-sonnet-5` | 1M | Latest Sonnet (default for `sonnet` alias) |
+| `claude-sonnet-4-6` | 200k | Previous Sonnet, retained for pinning |
+| `claude-haiku-4-5-20251001` | 200k | Fastest, lightweight (default for `haiku` alias) |
+
+Context windows match the Claude Code CLI registry. Each model's prompt truncation ceiling is
+derived from its own window (`contextWindow × 3` chars) — see [ADR 0011](docs/adr/0011-per-model-prompt-char-budget.md)
+and `CLAUDE_MAX_PROMPT_CHARS` in [Environment Variables](#environment-variables).
 
 The canonical list lives in [`models.json`](./models.json) — the single source of truth as of v3.11.0, validated in CI against [`models.schema.json`](./models.schema.json). Both `server.mjs` (the `/v1/models` endpoint) and `setup.mjs` (the OpenClaw registration) derive from it. Adding a new model is now a one-file edit:
 
@@ -223,7 +227,7 @@ The canonical list lives in [`models.json`](./models.json) — the single source
 | `CLAUDE_MAX_CONCURRENT` | `8` | Max concurrent claude processes (`-p`/stream-json path) |
 | `CLAUDE_MAX_QUEUE` | `16` | Max requests **waiting** for a `-p` concurrency slot. Beyond `CLAUDE_MAX_CONCURRENT`, requests queue (up to this cap) instead of being rejected; when the queue is **also** full, the request gets `HTTP 429` + `Retry-After` (not an opaque 500). Surfaced on `/health.concurrency` + `/health.stats.queueRejections`. |
 | `CLAUDE_QUEUE_RETRY_AFTER` | `5` | Seconds advertised in the `Retry-After` header on a `-p` concurrency-overflow `429`. |
-| `CLAUDE_MAX_PROMPT_CHARS` | *(derived)* | Prompt truncation limit in chars. Default derives from the models.json SPOT: `max(contextWindow) × 3` — currently **600,000** (≈150–200k tokens). Setting this env var (or the runtime settings API) overrides the derivation absolutely. See [ADR 0009](docs/adr/0009-spot-derived-prompt-budget.md). Note: very large prompts burn subscription-window quota quickly and slow TTFT; the TUI-mode paste path is untested beyond ~hundreds of KB. Applies to **text only** — image bytes bypass this budget (see [Images / Multimodal](#images--multimodal-vision)). |
+| `CLAUDE_MAX_PROMPT_CHARS` | *(derived per model)* | Prompt truncation limit in chars. By default there is **no single limit**: each request is bounded by the named model's own `contextWindow × 3` from the models.json SPOT — **3,000,000** for the native-1M models (`claude-opus-5`, `-4-8`, `-4-7`, `claude-sonnet-5`) and **600,000** for the 200k models (`claude-opus-4-6`, `claude-sonnet-4-6`, `claude-haiku-4-5`). Setting this env var (or `ocp settings maxPromptChars`) overrides the derivation absolutely, applying that one number to **every** model. See [ADR 0011](docs/adr/0011-per-model-prompt-char-budget.md) (supersedes [ADR 0009](docs/adr/0009-spot-derived-prompt-budget.md)'s single global ceiling). Note: very large prompts burn subscription-window quota quickly and slow TTFT; the TUI-mode paste path is untested beyond ~hundreds of KB. Applies to **text only** — image bytes bypass this budget (see [Images / Multimodal](#images--multimodal-vision)). |
 | `OCP_STRUCTURED_MAX_ATTEMPTS` | `3` | Max attempts (initial + retries) to coerce a schema-valid JSON reply when a request uses OpenAI `response_format`. Fail-closed: a non-numeric value keeps the default. See [Structured Outputs](#structured-outputs-openai-response_format). |
 | `CLAUDE_SESSION_TTL` | `3600000` | Session expiry (ms, default: 1 hour) |
 | `CLAUDE_AUTH_CHECK_INTERVAL_MS` | `600000` | How often the background `claude auth status` probe runs (ms, default: 10 min). Lower it for faster detection of a real credential outage — the verdict needs **2 consecutive** conclusive rejections, so onset is reported within roughly one interval. Fail-closed parsing: an empty/garbage value keeps the default. Probe outcome is surfaced on `/health.auth.lastOutcome` (`authenticated`/`rejected`/`timeout`/`unavailable`) and the running tally on `/health.auth.consecutiveFailures`, so an operator can tell a host-load timeout from a real credential rejection. See [ADR 0010](docs/adr/0010-health-verdict-semantics.md). |
@@ -281,6 +285,12 @@ $ ocp settings maxPromptChars 200000
 $ ocp settings maxConcurrent 4
 ✓ maxConcurrent = 4
 ```
+
+`maxPromptChars` is a **global** override: setting it pins the truncation ceiling to that one
+number for every model, replacing the per-model derivation. Left unset, `ocp settings` reports
+the fallback (600,000) and each model uses its own `contextWindow × 3`. There is no way to
+clear the override back to per-model derivation over `PATCH` — restart without
+`CLAUDE_MAX_PROMPT_CHARS` to do that. See [ADR 0011](docs/adr/0011-per-model-prompt-char-budget.md).
 
 ## LAN & multi-user
 

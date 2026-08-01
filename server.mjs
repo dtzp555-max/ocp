@@ -54,7 +54,7 @@ import { TuiDeltaAssembler, DEFAULT_HOLDBACK_CHARS, resolveStreamHoldback } from
 import { createSerialMutex, createTtlCache, isTokenExpiring, orderLabelsLastGoodFirst } from "./lib/spawn-auth.mjs";
 import { hasImageContent, buildImageBlocks, buildStreamJsonInput, MultimodalError } from "./lib/multimodal.mjs";
 import { parsePositiveInt } from "./lib/env.mjs";
-import { appendOperatorPrompt, derivePromptCharBudget, selectPromptWrapper, localToolsSafetyError } from "./lib/prompt.mjs";
+import { appendOperatorPrompt, promptCharBudgetFor, fallbackPromptCharBudget, resolveGlobalPromptCharOverride, selectPromptWrapper, localToolsSafetyError } from "./lib/prompt.mjs";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const _pkg = JSON.parse(readFileSync(join(__dirname, "package.json"), "utf8"));
@@ -1292,22 +1292,41 @@ function parseIntEnv(name, def) {
 }
 
 // ── Format messages to prompt text ──────────────────────────────────────
-// Truncation guard: if total chars exceed MAX_PROMPT_CHARS, keep the system
+// Truncation guard: if total chars exceed the request's per-model budget, keep the system
 // message(s) + first user message + last N messages, dropping the middle.
 // This prevents runaway context from gateway-side conversation accumulation.
-// Routed through parseIntEnv so a misconfigured cap fails CLOSED to the default rather than
-// NaN — CLAUDE_MAX_PROMPT_CHARS=unlimited previously → NaN → enforceTextBudget's `!(NaN > 0)`
-// early-return → 500k chars passed unbounded, silently defeating F2's text-budget guarantee
-// (PR #154 round 2, gap (a)). The default itself is SPOT-DERIVED (ADR 0009, PR #179):
-// max(models.json contextWindow) × 3 chars/token — currently 600,000 — so the two fixes
-// compose: parseIntEnv guards a SET-but-garbage value, the derivation supplies the honest
-// default when unset/empty. `let` is kept for the settings API.
-let MAX_PROMPT_CHARS = parseIntEnv("CLAUDE_MAX_PROMPT_CHARS", derivePromptCharBudget(modelsConfig.models));
+// The budget is PER-MODEL (ADR 0011, #213), superseding ADR 0009's single global number.
+// ADR 0009 derived one ceiling as max(models.json contextWindow) × 3, which forced models.json
+// to under-declare every native-1M model at 200000: one 1e6 entry would have raised the ceiling
+// from 600k to 3M for EVERY model, including the genuinely-200k claude-haiku-4-5, converting
+// graceful OCP-side truncation into upstream API rejections. Now models.json states each true
+// window and the ceiling is looked up for the model the request actually named.
+//
+// CLAUDE_MAX_PROMPT_CHARS and PATCH /settings {maxPromptChars} remain ABSOLUTE GLOBAL overrides,
+// exactly as ADR 0009 specified them: when either is set, that one number is the ceiling for
+// every model and no derivation happens. null means "no override — derive per model".
+// resolveGlobalPromptCharOverride fails CLOSED on a set-but-garbage value (→ null → derivation)
+// rather than NaN, preserving PR #154 round 2 gap (a): CLAUDE_MAX_PROMPT_CHARS=unlimited used to
+// yield NaN → enforceTextBudget's `!(NaN > 0)` early-return → text passed unbounded.
+// `let` is kept for the settings API.
+let MAX_PROMPT_CHARS_OVERRIDE = resolveGlobalPromptCharOverride(process.env.CLAUDE_MAX_PROMPT_CHARS);
+if (process.env.CLAUDE_MAX_PROMPT_CHARS && MAX_PROMPT_CHARS_OVERRIDE === null) {
+  console.warn(`⚠ CLAUDE_MAX_PROMPT_CHARS="${process.env.CLAUDE_MAX_PROMPT_CHARS}" is not a valid positive integer (chars, no unit suffix); ignoring and deriving the budget per model from models.json.`);
+}
+// Reported by GET /settings when no override is in force, and applied to any model id with no
+// models.json entry. See lib/prompt.mjs for why this is the SMALLEST known window, not the largest.
+const FALLBACK_PROMPT_CHARS = fallbackPromptCharBudget(modelsConfig.models);
+
+// The truncation ceiling for one request. `cliModel` must be the RESOLVED canonical id
+// (MODEL_MAP[model] || model), never the raw client string.
+function promptCharBudget(cliModel) {
+  return MAX_PROMPT_CHARS_OVERRIDE ?? promptCharBudgetFor(modelsConfig.models, cliModel);
+}
 
 // ── Multimodal image caps (issue #110) ──────────────────────────────────
 // OpenAI `image_url` parts are forwarded to claude as Anthropic image blocks via
 // `--input-format stream-json`. Images deliberately BYPASS the text char budget
-// (MAX_PROMPT_CHARS) — they are bounded by these byte/count caps instead, and by
+// (the per-model prompt budget) — they are bounded by these byte/count caps instead, and by
 // MAX_BODY_SIZE at the HTTP layer. Data URIs are supported by default; remote
 // http(s) image URLs are OFF unless CLAUDE_IMAGE_ALLOW_URL is set (v1: data URIs
 // only). See docs/adr/0006-openai-shim-scope.md (Class B.1) and README § "Images".
@@ -1335,7 +1354,11 @@ function contentToText(content) {
   return content == null ? "" : JSON.stringify(content);
 }
 
-function messagesToPrompt(messages) {
+// `maxChars` is the caller's per-model budget (promptCharBudget(cliModel)). It is a required
+// argument in practice — the default only exists so a future internal caller that has no model
+// in hand still gets the conservative fallback rather than an undefined (NaN) ceiling, which
+// would disable the guard entirely.
+function messagesToPrompt(messages, maxChars = FALLBACK_PROMPT_CHARS) {
   const full = messages.map((m) => {
     const text = contentToText(m.content);
     if (m.role === "system") return `[System] ${text}`;
@@ -1344,12 +1367,12 @@ function messagesToPrompt(messages) {
   });
 
   const joined = full.join("\n\n");
-  if (joined.length <= MAX_PROMPT_CHARS) return joined;
+  if (joined.length <= maxChars) return joined;
 
   // Truncation: keep system messages, first user msg, and trim from the tail
   logEvent("warn", "prompt_truncated", {
     originalChars: joined.length,
-    maxChars: MAX_PROMPT_CHARS,
+    maxChars,
     originalMessages: messages.length,
   });
 
@@ -1362,7 +1385,7 @@ function messagesToPrompt(messages) {
 
   // Keep system + as many recent messages as fit
   const systemText = system.join("\n\n");
-  const budget = MAX_PROMPT_CHARS - systemText.length - 200; // 200 for separator
+  const budget = maxChars - systemText.length - 200; // 200 for separator
   const kept = [];
   let used = 0;
   for (let i = rest.length - 1; i >= 0; i--) {
@@ -1429,23 +1452,25 @@ function spawnClaudeProcess(model, messages, conversationId, keyName, releaseSlo
   // mutation so a validation failure never leaks counters or the concurrency slot
   // (handleChatCompletions validates first, so in practice it will not throw here).
   const useStreamJson = hasImageContent(nonSystemMessages);
+  // Per-model ceiling (ADR 0011): resolved from cliModel, not a global max across the registry.
+  const maxPromptChars = promptCharBudget(cliModel);
   let stdinPayload, promptChars;
   if (useStreamJson) {
-    // Pass MAX_PROMPT_CHARS so the multimodal text is bounded by the same
+    // Pass the budget so the multimodal text is bounded by the same
     // runaway-context guard as the text path (PR #154 review F2). Images bypass it.
-    const built = buildStreamJsonInput(nonSystemMessages, { ...MULTIMODAL_OPTS, maxTextChars: MAX_PROMPT_CHARS });
+    const built = buildStreamJsonInput(nonSystemMessages, { ...MULTIMODAL_OPTS, maxTextChars: maxPromptChars });
     stdinPayload = built.payload;
     promptChars = built.stats.textChars;
     if (built.stats.truncated) {
       logEvent("warn", "prompt_truncated", {
         originalChars: built.stats.originalTextChars,
-        maxChars: MAX_PROMPT_CHARS,
+        maxChars: maxPromptChars,
         keptChars: built.stats.textChars,
         path: "multimodal",
       });
     }
   } else {
-    stdinPayload = messagesToPrompt(nonSystemMessages);
+    stdinPayload = messagesToPrompt(nonSystemMessages, maxPromptChars);
     promptChars = stdinPayload.length;
   }
 
@@ -1709,7 +1734,7 @@ async function callClaude(model, messages, conversationId, keyName, res) {
 // mid-turn instead of holding the semaphore slot for a dead socket.
 async function callClaudeTui(model, messages, _conversationId, _keyName, res, streamCtx = null) {
   const cliModel = MODEL_MAP[model] || model;
-  const prompt = messagesToPrompt(messages); // includes system as [System] inline
+  const prompt = messagesToPrompt(messages, promptCharBudget(cliModel)); // includes system as [System] inline
   recordModelRequest(cliModel, prompt.length);
   // C-4: gate the heavy interactive boot behind the TUI semaphore (queuing if all slots are
   // busy, up to maxQueue). F2: `signal` (tied to `res` "close") cancels a QUEUED wait the
@@ -2743,7 +2768,12 @@ const SETTINGS_SCHEMA = {
   timeout:          { type: "number", min: 30000, max: 1800000, unit: "ms", desc: "Request timeout (default: 600s)" },
   maxConcurrent:    { type: "number", min: 1, max: 32, unit: "", desc: "Max concurrent claude processes" },
   sessionTTL:       { type: "number", min: 60000, max: 86400000, unit: "ms", desc: "Session idle expiry" },
-  maxPromptChars:   { type: "number", min: 10000, max: 1000000, unit: "chars", desc: "Prompt truncation limit" },
+  // ADR 0011: a GLOBAL override of the per-model budget. Setting it pins the truncation ceiling
+  // to this one number for EVERY model; unset, each model gets contextWindow × 3 from models.json
+  // and this reports the fallback (smallest known window × 3). Range unchanged — deliberately not
+  // widened to the 3,000,000 a native-1M model now derives, because that would be a separate
+  // request-validation contract change with no requester; see ADR 0011 § Rejected alternatives.
+  maxPromptChars:   { type: "number", min: 10000, max: 1000000, unit: "chars", desc: "Global prompt truncation override (unset = per-model from models.json)" },
   cacheTTL:         { type: "number", min: 0, max: 86400000, unit: "ms", desc: "Response cache TTL (0 = disabled)" },
 };
 
@@ -2752,7 +2782,11 @@ function getSettings() {
     timeout:          { value: TIMEOUT, ...SETTINGS_SCHEMA.timeout },
     maxConcurrent:    { value: MAX_CONCURRENT, ...SETTINGS_SCHEMA.maxConcurrent },
     sessionTTL:       { value: SESSION_TTL, ...SETTINGS_SCHEMA.sessionTTL },
-    maxPromptChars:   { value: MAX_PROMPT_CHARS, ...SETTINGS_SCHEMA.maxPromptChars },
+    // Stays a plain number: `ocp settings` formats this into a fixed-width column and PATCH
+    // takes a single scalar, so a null or a per-model map would break both consumers. When no
+    // override is set this is FALLBACK_PROMPT_CHARS (600,000 today) — the same number this
+    // field reported before ADR 0011, because every non-1M entry is still 200000.
+    maxPromptChars:   { value: MAX_PROMPT_CHARS_OVERRIDE ?? FALLBACK_PROMPT_CHARS, ...SETTINGS_SCHEMA.maxPromptChars },
     cacheTTL:         { value: CACHE_TTL, ...SETTINGS_SCHEMA.cacheTTL },
   };
 }
@@ -2772,7 +2806,11 @@ function applySettingUpdate(key, value) {
     // needs queued waiters woken immediately to use the new headroom. See lib/tui/semaphore.mjs.
     case "maxConcurrent":    MAX_CONCURRENT = value; claudeSemaphore.setLimit(value); break;
     case "sessionTTL":       SESSION_TTL = value; break;
-    case "maxPromptChars":   MAX_PROMPT_CHARS = value; break;
+    // ADR 0011: installs the GLOBAL override. There is deliberately no way to clear it back to
+    // per-model derivation over PATCH — the schema's min is 10000, so no in-range value means
+    // "unset", and accepting null would be a request-shape change. Restart without
+    // CLAUDE_MAX_PROMPT_CHARS to return to derivation.
+    case "maxPromptChars":   MAX_PROMPT_CHARS_OVERRIDE = value; break;
     case "cacheTTL":         CACHE_TTL = value; break;
     default: return `${key}: not implemented`;
   }
@@ -2962,7 +3000,9 @@ async function handleChatCompletions(req, res) {
       });
     }
     try {
-      buildImageBlocks(nonSystem, { ...MULTIMODAL_OPTS, maxTextChars: MAX_PROMPT_CHARS });
+      // cacheModel is the RESOLVED canonical id, so this early validation pass uses the same
+      // per-model ceiling spawnClaudeProcess will apply (ADR 0011).
+      buildImageBlocks(nonSystem, { ...MULTIMODAL_OPTS, maxTextChars: promptCharBudget(cacheModel) });
     } catch (e) {
       if (e instanceof MultimodalError) {
         return jsonResponse(res, e.status, { error: { message: e.message, type: e.type, code: e.code } });

@@ -967,48 +967,85 @@ test("#214: tree==latest, /health version field unparseable → degrades gracefu
 // contract lives in lib/prompt.mjs. Mutation-proof: make appendOperatorPrompt
 // return `base` unconditionally and the first test fails; make it stop trimming
 // and the whitespace test fails.
-import { appendOperatorPrompt, derivePromptCharBudget, resolvePromptCharBudget, selectPromptWrapper, localToolsSafetyError } from "./lib/prompt.mjs";
+import { appendOperatorPrompt, promptCharBudgetFor, fallbackPromptCharBudget, resolveGlobalPromptCharOverride, selectPromptWrapper, localToolsSafetyError } from "./lib/prompt.mjs";
 
-console.log("\nPrompt-char budget (ADR 0009 — SPOT-derived):");
+console.log("\nPrompt-char budget (ADR 0011 — per-model, superseding ADR 0009's global max):");
 
-// Mutation-proof: drop the ×charsPerToken and the first test fails; drop the
-// Math.max floor guard and the floor tests fail; use min() instead of max() over
-// windows and the largest-window test fails.
-test("derivePromptCharBudget: LARGEST contextWindow × 3 chars/token", () => {
-  const models = [{ contextWindow: 200000 }, { contextWindow: 100000 }];
-  assert.equal(derivePromptCharBudget(models), 600000);
+// Mutation-proof: drop the ×charsPerToken and the first test fails; drop the Math.max
+// floor guard and the floor tests fail; make promptCharBudgetFor ignore modelId and
+// take max() across the registry (i.e. revert to ADR 0009) and the DISCRIMINATING test
+// below fails on its haiku arm.
+test("promptCharBudgetFor: the named model's OWN contextWindow × 3 chars/token", () => {
+  const models = [{ id: "big", contextWindow: 1000000 }, { id: "small", contextWindow: 200000 }];
+  assert.equal(promptCharBudgetFor(models, "big"), 3000000);
+  assert.equal(promptCharBudgetFor(models, "small"), 600000);
 });
 
-test("derivePromptCharBudget: matches the live models.json SPOT (200k → 600k today)", () => {
+// THE test this whole change exists for (#213). One registry, two models, two different
+// budgets, asserted together — a fix that raised the ceiling globally passes the first
+// assertion and fails the second, and ADR 0009's shipped behaviour fails the first.
+test("promptCharBudgetFor: a 1M model gets 3M chars while a 200k model in the SAME registry still gets 600k (#213)", () => {
   const spot = JSON.parse(tuiReadFileSync(new URL("./models.json", import.meta.url), "utf8"));
-  assert.equal(derivePromptCharBudget(spot.models), 600000);
+  assert.equal(promptCharBudgetFor(spot.models, "claude-opus-5"), 3000000,
+    "claude-opus-5 is native 1M in the CLI registry — it must get the large budget");
+  assert.equal(promptCharBudgetFor(spot.models, "claude-sonnet-5"), 3000000,
+    "claude-sonnet-5 is native 1M in the CLI registry — it must get the large budget");
+  assert.equal(promptCharBudgetFor(spot.models, "claude-haiku-4-5-20251001"), 600000,
+    "claude-haiku-4-5 is genuinely 200k — raising ITS ceiling turns OCP-side truncation into an upstream rejection");
+  assert.equal(promptCharBudgetFor(spot.models, "claude-sonnet-4-6"), 600000,
+    "claude-sonnet-4-6 is genuinely 200k");
 });
 
-test("derivePromptCharBudget: floor wins over a tiny/absent window; empty input → floor", () => {
-  assert.equal(derivePromptCharBudget([{ contextWindow: 1000 }]), 150000, "3k chars would truncate everything — floor guards it");
-  assert.equal(derivePromptCharBudget([]), 150000);
-  assert.equal(derivePromptCharBudget(undefined), 150000);
-  assert.equal(derivePromptCharBudget([{ id: "x" }, { contextWindow: "junk" }, { contextWindow: -5 }]), 150000);
+test("promptCharBudgetFor: floor wins over a tiny window; unknown/garbage entries fall back", () => {
+  assert.equal(promptCharBudgetFor([{ id: "t", contextWindow: 1000 }], "t"), 150000, "3k chars would truncate everything — floor guards it");
+  assert.equal(promptCharBudgetFor([], "anything"), 150000);
+  assert.equal(promptCharBudgetFor(undefined, "anything"), 150000);
+  assert.equal(promptCharBudgetFor([{ id: "a", contextWindow: "junk" }, { id: "b", contextWindow: -5 }], "a"), 150000);
 });
 
-test("derivePromptCharBudget: charsPerToken and floor are tunable parameters", () => {
-  assert.equal(derivePromptCharBudget([{ contextWindow: 1000000 }], { charsPerToken: 3 }), 3000000);
-  assert.equal(derivePromptCharBudget([], { floor: 42 }), 42);
+test("promptCharBudgetFor: charsPerToken and floor are tunable parameters", () => {
+  assert.equal(promptCharBudgetFor([{ id: "m", contextWindow: 1000000 }], "m", { charsPerToken: 3 }), 3000000);
+  assert.equal(promptCharBudgetFor([], "m", { floor: 42 }), 42);
 });
 
-// PR #179 review regression: EMPTY env value must mean "use the default" (the old
-// `parseInt(env || "150000")` contract). Mutation-proof: switch the resolver's
-// truthiness check to `!= null` and the empty-string test fails (NaN ≠ 600000).
-test("resolvePromptCharBudget: empty/unset env → SPOT-derived default, never NaN", () => {
-  const models = [{ contextWindow: 200000 }];
-  assert.equal(resolvePromptCharBudget("", models), 600000, "CLAUDE_MAX_PROMPT_CHARS= (empty) must fall back to derived");
-  assert.equal(resolvePromptCharBudget(undefined, models), 600000);
+// The unknown-model fallback is the SMALLEST known window, not the largest — reusing ADR
+// 0009's max() here would reintroduce the exact hazard for any id not in the SPOT.
+// Mutation-proof: swap Math.min for Math.max and the first assertion fails (3000000).
+test("fallbackPromptCharBudget: SMALLEST known window × 3, so an unknown model can never outrank a real one", () => {
+  const models = [{ id: "big", contextWindow: 1000000 }, { id: "small", contextWindow: 200000 }];
+  assert.equal(fallbackPromptCharBudget(models), 600000);
+  assert.equal(promptCharBudgetFor(models, "model-not-in-the-spot"), 600000);
+  assert.equal(fallbackPromptCharBudget([]), 150000);
+  assert.equal(fallbackPromptCharBudget(undefined), 150000);
 });
 
-test("resolvePromptCharBudget: a set env value overrides the derivation absolutely", () => {
-  const models = [{ contextWindow: 200000 }];
-  assert.equal(resolvePromptCharBudget("300000", models), 300000);
-  assert.equal(resolvePromptCharBudget("150000", models), 150000, "explicit legacy value wins over the bigger derived default");
+// The number GET /settings reports on the default path must not move: every non-1M entry
+// is still 200000, so the fallback is the same 600000 ADR 0009's max() produced before
+// the 1M windows were declared.
+test("fallbackPromptCharBudget: the live SPOT still yields 600000, so /settings' default-path value is unchanged", () => {
+  const spot = JSON.parse(tuiReadFileSync(new URL("./models.json", import.meta.url), "utf8"));
+  assert.equal(fallbackPromptCharBudget(spot.models), 600000);
+});
+
+// PR #179 review regression, carried forward: EMPTY env value must mean "use the default"
+// (the old `parseInt(env || "150000")` contract). Mutation-proof: switch the resolver's
+// truthiness check to `!= null` and the empty-string test fails (NaN is not null).
+test("resolveGlobalPromptCharOverride: empty/unset env → null (derive per model), never NaN", () => {
+  assert.equal(resolveGlobalPromptCharOverride(""), null, "CLAUDE_MAX_PROMPT_CHARS= (empty) must mean 'no override'");
+  assert.equal(resolveGlobalPromptCharOverride(undefined), null);
+});
+
+test("resolveGlobalPromptCharOverride: a set env value becomes the absolute global override", () => {
+  assert.equal(resolveGlobalPromptCharOverride("300000"), 300000);
+  assert.equal(resolveGlobalPromptCharOverride("150000"), 150000, "explicit legacy value wins over the bigger derived default");
+});
+
+// Fail CLOSED, not to NaN: a NaN ceiling silently DISABLES the runaway-context guard
+// (enforceTextBudget's `!(NaN > 0)` early-return) — PR #154 round 2, gap (a).
+test("resolveGlobalPromptCharOverride: set-but-garbage → null (derivation), not NaN", () => {
+  assert.equal(resolveGlobalPromptCharOverride("unlimited"), null);
+  assert.equal(resolveGlobalPromptCharOverride("-5"), null);
+  assert.equal(resolveGlobalPromptCharOverride("0"), null);
 });
 
 console.log("\nSystem-prompt operator append:");
@@ -1670,6 +1707,146 @@ ltTest("integration: an alias and its canonical target share ONE cache slot (nor
     await new Promise(r => setTimeout(r, 600));
     assert.equal(Number(_ltRead(counter, "utf8")) || 0, 1,
       "the canonical id must hit the slot the alias populated — a 2nd spawn means the key still hashes the raw alias");
+  } finally { child.kill("SIGKILL"); _ltRmRetry(dir); }
+});
+
+// #213 / ADR 0011 — the acceptance case, end-to-end against a real server.mjs child.
+//
+// This is the test the whole change exists to pass, and it is deliberately a PAIR on the same
+// boot: raising the ceiling globally (the naive fix) satisfies the 1M arm and fails the 200k
+// arm, while shipped ADR 0009 behaviour fails the 1M arm. Only a per-model budget passes both.
+//
+// Observable: server.mjs logs `prompt_truncated` at level warn, which logEvent sends to
+// console.error, i.e. the child's stderr — and the entry carries `maxChars`, which IS the
+// budget that was in force. So the assertions read the actual number, not a proxy for it.
+//
+// The spawn counter is what makes the negative arm honest. Asserting "no new truncation line
+// appeared" right after a POST would also pass if the request simply had not been processed
+// yet; `prompt_truncated` is emitted inside messagesToPrompt, which runs BEFORE the CLI spawn,
+// so waiting for the counter to bump proves the request got past the point that would have
+// logged. Wait for the thing you are about to assert.
+ltTest("integration (#213): the SAME oversized prompt is truncated for a 200k model and NOT for a 1M model", async () => {
+  if (!LT_POSIX) return;
+  const dir = ltMkdir(); const fake = ltFake(dir); const counter = join(dir, "spawns.txt");
+  const { child, buf, port } = await ltBootFresh({ CLAUDE_BIN: fake, SP_COUNTER: counter }, dir);
+  const nTrunc = () => buf.err.split('"prompt_truncated"').length - 1;
+  try {
+    assert.ok(await ltWait(() => buf.out.includes("listening on")), `did not start: ${buf.err.slice(0, 200)}`);
+    _ltWrite(counter, "0");
+
+    // Over the 200k model's 600,000-char ceiling, well under the 1M model's 3,000,000.
+    const big = "x".repeat(700000);
+
+    // Arm 1 — genuinely-200k model: MUST truncate, at exactly 600000.
+    await ltPost(port, { model: "claude-haiku-4-5-20251001", messages: [{ role: "user", content: big }] });
+    assert.ok(await ltWait(() => nTrunc() >= 1, 15000),
+      `claude-haiku-4-5 is 200k native: a 700k-char prompt must be truncated OCP-side. ${ltDiag(buf)}`);
+    const hit = buf.err.split("\n").find(l => l.includes('"prompt_truncated"'));
+    assert.match(hit, /"maxChars":600000/,
+      `the 200k model's ceiling must still be 600000 (contextWindow 200000 x 3) — a global raise would ` +
+      `show 3000000 here and hand this model prompts the upstream will reject. Got: ${hit}`);
+    assert.ok(await ltWait(() => (Number(_ltRead(counter, "utf8")) || 0) >= 1, 9000), "arm 1 reached the spawn");
+
+    // Arm 2 — native-1M model, IDENTICAL prompt: must NOT truncate.
+    await ltPost(port, { model: "claude-opus-5", messages: [{ role: "user", content: big }] });
+    assert.ok(await ltWait(() => (Number(_ltRead(counter, "utf8")) || 0) >= 2, 15000),
+      `arm 2 must reach the spawn, otherwise the no-truncation assertion below is vacuous. ${ltDiag(buf)}`);
+    assert.equal(nTrunc(), 1,
+      `claude-opus-5 is native 1M: the same 700k-char prompt must pass through WHOLE. A second ` +
+      `prompt_truncated line means the ceiling is still the old global 600000. stderr: ${buf.err.slice(-400)}`);
+
+    // Arm 3 — the 1M model's budget is a real 3,000,000, not "no ceiling". Proves arm 2 passed
+    // because the budget is larger, not because the guard was disabled.
+    await ltPost(port, { model: "claude-opus-5", messages: [{ role: "user", content: "y".repeat(3100000) }] });
+    assert.ok(await ltWait(() => nTrunc() >= 2, 20000),
+      `claude-opus-5 must still truncate ABOVE its own 3,000,000-char budget — otherwise the guard is ` +
+      `off for this model rather than merely wider. ${ltDiag(buf)}`);
+    const hit3 = buf.err.split("\n").filter(l => l.includes('"prompt_truncated"'))[1];
+    assert.match(hit3, /"maxChars":3000000/,
+      `the 1M model's ceiling must be exactly 3000000 (contextWindow 1000000 x 3). Got: ${hit3}`);
+  } finally { child.kill("SIGKILL"); _ltRmRetry(dir); }
+});
+
+// ADR 0011's settings decision, pinned end-to-end: `maxPromptChars` is an ABSOLUTE GLOBAL
+// override, so setting it must beat the per-model derivation — including DOWNWARD on a model
+// whose own window would derive a far larger budget. This is the arm that distinguishes the
+// chosen semantics from a clamp/ceiling reading (which would be a no-op in the raising
+// direction) and from "the override only applies to models without a SPOT entry".
+//
+// It also pins the GET contract that ADR 0011 deliberately did not move: a plain number, and
+// 600000 on the default path — the same value the field reported before the change, because
+// the fallback is the smallest known window x 3.
+ltTest("integration (ADR 0011): /settings maxPromptChars is a GLOBAL override that beats a 1M model's per-model budget", async () => {
+  if (!LT_POSIX) return;
+  const dir = ltMkdir(); const fake = ltFake(dir); const counter = join(dir, "spawns.txt");
+  const { child, buf, port } = await ltBootFresh({ CLAUDE_BIN: fake, SP_COUNTER: counter }, dir);
+  const nTrunc = () => buf.err.split('"prompt_truncated"').length - 1;
+  const getSettings = async () => (await (await fetch(`http://127.0.0.1:${port}/settings`)).json());
+  try {
+    assert.ok(await ltWait(() => buf.out.includes("listening on")), `did not start: ${buf.err.slice(0, 200)}`);
+    _ltWrite(counter, "0");
+
+    // Default path: a plain number, and the pre-ADR-0011 value.
+    const before = await getSettings();
+    assert.equal(typeof before.maxPromptChars.value, "number",
+      "`ocp settings` formats this into a fixed-width column — it must stay a scalar, never null or a per-model map");
+    assert.equal(before.maxPromptChars.value, 600000,
+      "with no override set, GET /settings must report the fallback (smallest known window x 3) — unchanged by ADR 0011");
+
+    // Install a global override well BELOW what claude-opus-5 derives on its own (3,000,000).
+    const patch = await fetch(`http://127.0.0.1:${port}/settings`, {
+      method: "PATCH", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ maxPromptChars: 200000 }),
+    });
+    assert.equal(patch.status, 200, `PATCH /settings must succeed, got ${patch.status}`);
+    assert.equal((await getSettings()).maxPromptChars.value, 200000, "GET must report the override that was just installed");
+
+    // The 1M model must now truncate at the OVERRIDE, not at its own 3,000,000 budget.
+    await ltPost(port, { model: "claude-opus-5", messages: [{ role: "user", content: "z".repeat(700000) }] });
+    assert.ok(await ltWait(() => nTrunc() >= 1, 15000),
+      `the global override must apply to claude-opus-5 too — without it a 700k prompt would pass whole. ${ltDiag(buf)}`);
+    const hit = buf.err.split("\n").find(l => l.includes('"prompt_truncated"'));
+    assert.match(hit, /"maxChars":200000/,
+      `the override is ABSOLUTE: claude-opus-5's ceiling must be the 200000 that was set, not its derived ` +
+      `3000000 and not a min/max blend with it. Got: ${hit}`);
+  } finally { child.kill("SIGKILL"); _ltRmRetry(dir); }
+});
+
+// The TUI path takes its budget from a DIFFERENT call site than the -p path
+// (callClaudeTui -> messagesToPrompt, vs spawnClaudeProcess), so covering one does not cover
+// the other: a mutation reverting only callClaudeTui to the global fallback survived the whole
+// suite until this test existed.
+//
+// It needs no tmux and no real claude. messagesToPrompt is the FIRST statement in
+// callClaudeTui, ahead of the semaphore and every tmux/pane operation, so the truncation
+// decision is made and logged before anything that would need a real interactive CLI — the
+// turn failing afterwards is expected and irrelevant (ltPost already tolerates it).
+//
+// BOTH arms assert positively (each waits for a truncation line and then reads its maxChars),
+// so neither can pass vacuously by the request simply not having been processed. Arm 2 is the
+// discriminating one: with a single global budget it would report 600000, not 3000000.
+ltTest("integration (#213): the TUI path bounds the prompt per model too, not by the global fallback", async () => {
+  if (!LT_POSIX) return;
+  const dir = ltMkdir(); const fake = ltFake(dir);
+  const { child, buf, port } = await ltBootFresh({ CLAUDE_TUI_MODE: "true", CLAUDE_BIN: fake }, dir);
+  const truncLines = () => buf.err.split("\n").filter(l => l.includes('"prompt_truncated"'));
+  try {
+    assert.ok(await ltWait(() => buf.out.includes("listening on")), `did not start: ${buf.err.slice(0, 200)}`);
+
+    // Arm 1 — 200k model, over its 600,000 ceiling.
+    await ltPost(port, { model: "claude-haiku-4-5-20251001", messages: [{ role: "user", content: "x".repeat(700000) }] });
+    assert.ok(await ltWait(() => truncLines().length >= 1, 20000),
+      `the TUI path must still truncate a 700k prompt for a 200k model. ${ltDiag(buf)}`);
+    assert.match(truncLines()[0], /"maxChars":600000/,
+      `TUI ceiling for claude-haiku-4-5 must be 600000. Got: ${truncLines()[0]}`);
+
+    // Arm 2 — 1M model, over its own 3,000,000 ceiling. Under a global budget this reads 600000.
+    await ltPost(port, { model: "claude-opus-5", messages: [{ role: "user", content: "y".repeat(3100000) }] });
+    assert.ok(await ltWait(() => truncLines().length >= 2, 25000),
+      `the TUI path must truncate a 3.1M prompt even for a 1M model. ${ltDiag(buf)}`);
+    assert.match(truncLines()[1], /"maxChars":3000000/,
+      `TUI ceiling for claude-opus-5 must be its own 3000000, not the global fallback — this is the ` +
+      `assertion that catches callClaudeTui being wired to the wrong budget. Got: ${truncLines()[1]}`);
   } finally { child.kill("SIGKILL"); _ltRmRetry(dir); }
 });
 
@@ -7151,89 +7328,79 @@ test("models.json: claude-opus-5 is present in models[] (the entry this PR adds)
   assert.ok(_spotModelIds.has("claude-opus-5"), "claude-opus-5 must exist as a models[].id");
 });
 
-// The prompt-char budget is GLOBAL (max across every entry × 3 chars/token), not
-// per-model — see lib/prompt.mjs derivePromptCharBudget. An entry declaring a native 1M
-// window would therefore raise the truncation ceiling for claude-haiku-4-5 too (genuinely
-// 200k), turning OCP-side truncation into an upstream API rejection.
+// ADR 0011 removed the coupling this slot used to guard. Until #213 the budget was GLOBAL
+// (max across every entry × 3), so a single 1M entry raised the truncation ceiling for
+// claude-haiku-4-5 too and the test here pinned `max(contextWindow) === 200000` to stop that.
+// The budget is now looked up per model (lib/prompt.mjs promptCharBudgetFor), so a large
+// entry no longer perturbs anything else and pinning the max would only forbid the truth.
 //
-// Asserts the MAX, deliberately, not every entry: ADR 0009 states the budget "scales
-// automatically — no code change", so a future entry with a SMALLER window (say a 128k
-// model) must stay legal and must not fail this suite. Only raising the ceiling is the
-// hazard, and that is an ADR-level decision requiring per-model budgets first.
-test("models.json: max contextWindow is 200000 (global prompt-budget ceiling)", () => {
-  const windows = _spotModels.models.map(m => m.contextWindow);
-  assert.equal(Math.max(...windows), 200000,
-    `max contextWindow re-scales MAX_PROMPT_CHARS for ALL models incl. the 200k-native haiku (see lib/prompt.mjs + ADR 0009)`);
+// What replaces it is NOT weaker: the per-entry registry check below pins every row to its
+// own CLI-registry value, and the isolation property the old max() test was really protecting
+// — haiku keeping its 600k ceiling while opus-5 gets 3M — is asserted behaviourally, twice:
+// on the pure function ("promptCharBudgetFor: a 1M model gets 3M chars while a 200k model in
+// the SAME registry still gets 600k") and end-to-end against a live server ("integration
+// (#213): the SAME oversized prompt is truncated for a 200k model and NOT for a 1M model").
+test("models.json: every contextWindow is a positive integer (shape guard; the ceiling is per-model since ADR 0011)", () => {
+  for (const m of _spotModels.models) {
+    assert.ok(Number.isInteger(m.contextWindow) && m.contextWindow > 0,
+      `${m.id}: contextWindow must be a positive integer, got ${JSON.stringify(m.contextWindow)} — ` +
+      `a non-numeric or zero window sends promptCharBudgetFor to the fallback and silently gives ` +
+      `this model the smallest budget in the registry`);
+  }
 });
 
-// contextWindow vs the CLI registry (#213). Be honest about what this buys, because it is less than
-// it looks: TODAY every one of the seven rows resolves to a required value of exactly 200000, so this
-// test is currently EQUIVALENT to `assert.equal(m.contextWindow, 200000)`. The table earns its place
-// for two other reasons — symmetry with the reviewed _spotRegistryMaxTokens pattern below, and
-// failure messages that tell the next maintainer what to do — NOT for extra detection power.
-// Branch 1 only starts discriminating if a model with a registry window BELOW 200000 is ever added.
+// contextWindow vs the CLI registry (#213, resolved). This USED to allow two legal values per row —
+// the registry's, or a deliberate 200000 cap — because ADR 0009's global max() meant one 1e6 entry
+// re-scaled the ceiling for every model. ADR 0011 made the budget per-model, so the cap is gone and
+// there is now exactly ONE legal value per row: the registry's. That makes the table discriminating
+// for the first time — before, all seven rows resolved to 200000 and it was equivalent to
+// `assert.equal(m.contextWindow, 200000)`; now four rows require 1000000 and three require 200000,
+// so a copy-paste that flattens them fails.
 //
-// It is also a FROZEN SNAPSHOT, not a live check. If Anthropic promotes claude-opus-4-6 from 200k to
-// 1M in a CLI update, this table still says 200000, models.json still says 200000, branch 1 compares
-// equal, and the suite stays GREEN while every message here asserts something the registry no longer
-// says. This detects models.json drift only. Re-extract the table when bumping the pinned CLI.
+// It remains a FROZEN SNAPSHOT, not a live check. If Anthropic promotes claude-opus-4-6 from 200k to
+// 1M in a CLI update, this table still says 200000, models.json still says 200000, they compare
+// equal, and the suite stays GREEN while asserting something the registry no longer says. This
+// detects models.json drift only. Re-extract the table when bumping the pinned CLI.
 //
-// models.json UNDER-declares contextWindow for every native-1M model, and that is a DECISION, not
-// drift. #195/#208 established that SPOT values should be the truth about the model, so without
-// this test the four capped rows read as unfixed bugs. Why they are capped: derivePromptCharBudget
-// (lib/prompt.mjs, ADR 0009) takes max(contextWindow) × 3 across ALL entries, so ONE 1e6 row would
-// raise MAX_PROMPT_CHARS from 600k to 3M for EVERY model — including claude-haiku-4-5-20251001,
-// which is genuinely 200k native — turning clean OCP-side truncation into upstream API rejections.
-// Declaring the true 1M needs per-model budgets instead of a single global max(); tracked in #213.
-//
-// Values extracted id-anchored from the compiled CLI 2.1.220 registry (`grep -ao 'id:"<id>"…'` plus
-// the following bytes) — never by bare-string search, which matches cross-references inside OTHER
-// records. NOTE the haiku key is the models.json id; the registry record is id:"claude-haiku-4-5",
-// and the dated string appears only as a provider alias — measured, under FOUR keys (first_party,
-// anthropic_aws, anthropic_google_cloud, gateway) and never as an `id:` — so
-// `grep 'id:"claude-haiku-4-5-20251001"'` returns 0 hits.
+// Values extracted id-anchored from the compiled CLI 2.1.220 registry
+// (sha256 8addc857f3fe64d5a0368af9ee50321b50afb4a6918ba3ef018ab84f5dbbe081) — never by bare-string
+// search, which matches cross-references inside OTHER records. Two extraction hazards, both hit
+// while producing this table:
+//   1. The haiku key is the models.json id; the registry record is id:"claude-haiku-4-5", and the
+//      dated string appears only as a provider alias (first_party, anthropic_aws,
+//      anthropic_google_cloud, gateway) and never as an `id:` — so an `id:"claude-haiku-4-5-20251001"`
+//      anchor returns 0 hits.
+//   2. A FIXED-WIDTH window after the anchor bleeds into the NEXT record. Reading 2000 bytes past
+//      claude-opus-4-6 picks up the neighbouring 1M record's `context:{...}` and reports opus-4-6 as
+//      native_1m, which it is not. Bound each slice at the next `{id:"` separator. Cross-validated
+//      binary-wide and independently of the per-id slices: `native_1m:!0` occurs 6x and
+//      `context:{window:1e6` occurs 6x, over the same six records — the four below plus
+//      claude-fable-5 and claude-mythos-5, which OCP does not expose.
 const _spotRegistryContextWindow = {
   "claude-opus-5": 1000000, "claude-opus-4-8": 1000000, "claude-opus-4-7": 1000000,
   "claude-opus-4-6": 200000, "claude-sonnet-5": 1000000, "claude-sonnet-4-6": 200000,
   "claude-haiku-4-5-20251001": 200000,      // registry id: claude-haiku-4-5
 };
-const _SPOT_CTX_CAP = 200000;
 
-test("models.json: contextWindow equals the registry, or is the deliberate 200000 cap (#213)", () => {
+test("models.json: contextWindow equals the CLI registry exactly, for every model (#213)", () => {
   for (const m of _spotModels.models) {
     const reg = _spotRegistryContextWindow[m.id];
     assert.ok(reg !== undefined,
       `${m.id} has no recorded registry contextWindow — extract it id-anchored from the CLI binary ` +
-      `(see the comment above; the haiku row shows how a models.json id can differ from the registry id) ` +
-      `and add a row. Do NOT guess, and do NOT delete this assertion.`);
-    if (reg <= _SPOT_CTX_CAP) {
-      // PRESUMED a typo, not proven one. The model's real window fits under the cap, so there is no
-      // prompt-budget reason to differ — but this PR's own schema edit records that contextWindow also
-      // drives OpenClaw's compaction budget, and that budget is LINEAR in it (contextWindowTokens x
-      // maxHistoryShare x SAFETY_MARGIN), which OpenClaw documents as a tuning axis. So declaring
-      // BELOW the registry to compact earlier and leave more generation headroom is a coherent
-      // decision. If that is what you are doing, change this row and record why — do not delete the
-      // assertion. This deliberately tightens the latitude the aggregate test's comment above leaves
-      // for "a future entry with a SMALLER window".
-      assert.equal(m.contextWindow, reg,
-        `${m.id}: registry says ${reg}, which is at or below the ${_SPOT_CTX_CAP} cap, so models.json ` +
-        // JSON.stringify, not bare interpolation: a STRING "200000" would otherwise render as
-        // `must match it exactly — it says 200000`, reading as a self-contradiction. assert.equal is
-        // strict here (the file imports `strict as assert`), so the type is the whole defect.
-        `must match it exactly — it says ${JSON.stringify(m.contextWindow)}`);
-    } else {
-      // Registry window exceeds the cap: the ONLY legitimate value is the cap itself. Declaring the
-      // true window re-scales the global prompt budget for every other model (see above).
-      // The label is DERIVED, not hardcoded: for a future 500k model a literal "(native 1M)" would be
-      // a lie, and the message would then lecture about a 1M window that does not exist.
-      const _regLabel = reg === 1000000 ? "native 1M" : `above the ${_SPOT_CTX_CAP} cap`;
-      assert.equal(m.contextWindow, _SPOT_CTX_CAP,
-        `${m.id}: registry says ${reg} (${_regLabel}), so models.json must declare exactly ` +
-        `${_SPOT_CTX_CAP} — it says ${JSON.stringify(m.contextWindow)}. If you RAISED it: ` +
-        `derivePromptCharBudget takes max() across ALL entries, so that re-scales the budget for the ` +
-        `genuinely-200k models too, and is not a one-line change. If you LOWERED it: that may be ` +
-        `deliberate OpenClaw compaction tuning — change this row and record why. See #213, ADR 0009.`);
-    }
+      `(see the comment above; the haiku row shows how a models.json id can differ from the registry id, ` +
+      `and the window-bleed hazard shows how to get native_1m wrong) and add a row. Do NOT guess, and ` +
+      `do NOT delete this assertion.`);
+    // JSON.stringify, not bare interpolation: a STRING "200000" would otherwise render as
+    // `must match it exactly — it says 200000`, reading as a self-contradiction. assert.equal is
+    // strict here (the file imports `strict as assert`), so the type is the whole defect.
+    assert.equal(m.contextWindow, reg,
+      `${m.id}: the CLI registry says ${reg}, so models.json must say exactly that — it says ` +
+      `${JSON.stringify(m.contextWindow)}. Since ADR 0011 the budget is per-model, so this value ` +
+      `affects ONLY this model's truncation ceiling (contextWindow x 3) and no longer re-scales any ` +
+      `other model. If you LOWERED it deliberately — contextWindow also drives OpenClaw's compaction ` +
+      `budget, which is LINEAR in it (contextWindowTokens x maxHistoryShare x SAFETY_MARGIN), so ` +
+      `declaring below the registry to compact earlier is coherent — change this row and record why. ` +
+      `Do not delete the assertion. See #213, ADR 0011.`);
   }
   // Reverse direction. Both loops above walk models.json, so the mapping is ONE-WAY and a deleted
   // entry is simply never visited: removing claude-sonnet-4-6 leaves the suite at 463 passed, 0
