@@ -14369,9 +14369,19 @@ test("replay → doctor DECIDES kind!=fix_oauth and does not block the next upda
   assert.equal(r.ready_to_upgrade, true, "and must not refuse the next `ocp update`");
   // Independent review MEDIUM-3: warn_count was asserted only for key-presence and for ==0, so
   // NO test could observe a non-zero value and `const warn_count = 0` survived as a mutation.
-  // doctor.mjs:996 prints "Summary: N FAIL, M WARN" from these two numbers, so an uncounted WARN
-  // is a WARN the operator is told does not exist.
-  assert.equal(r.warn_count, 1, "the oauth_ok WARN must be COUNTED, not just pushed");
+  // doctor.mjs prints "Summary: N FAIL, M WARN" from these two numbers, so an uncounted WARN is
+  // a WARN the operator is told does not exist.
+  //
+  // Asserted as the INVARIANT (warn_count === the number of WARN checks) rather than as the
+  // literal 1. This test runs with skipNetwork unset, so detectMultiUnitBootRace probes the real
+  // host: a machine with two enabled OCP units legitimately pushes a second WARN, and pinning the
+  // literal would fail there for a reason having nothing to do with #289. The invariant still
+  // kills `const warn_count = 0` (1 !== 0) and is host-independent.
+  const warns = r.checks.filter(c => c.level === "WARN");
+  assert.ok(warns.some(c => c.id === "oauth_ok"), "oauth_ok must be among the WARN checks");
+  assert.equal(r.warn_count, warns.length,
+    `warn_count must equal the number of WARN checks; got ${r.warn_count} vs ${warns.length}`);
+  assert.ok(r.warn_count >= 1, "and the oauth_ok WARN alone makes it non-zero");
   assert.equal(r.fail_count, 0);
 });
 
@@ -14414,6 +14424,12 @@ test("replay → doctor --check oauth DECIDES kind!=fix_oauth and exits 0 (FRESH
   // Independent review MEDIUM-1: this path hard-coded `warn_count: 0`, which was true while only
   // PASS/FAIL were reachable and became a lie the moment #289 made WARN reachable — printing
   // "Summary: 0 FAIL, 0 WARN" directly beneath the [WARN] line it had just emitted.
+  //
+  // The literal IS deterministic here, unlike the full run above: runOauthOnly pushes exactly one
+  // check and never runs the multi-unit probe (an existing test pins `ids === ["oauth_ok"]`). The
+  // invariant is asserted alongside it so this cannot rot into a coincidence.
+  assert.equal(r.warn_count, r.checks.filter(c => c.level === "WARN").length,
+    "warn_count must equal the number of WARN checks, not a hard-coded constant");
   assert.equal(r.warn_count, 1,
     "the oauth_ok WARN must be counted on the --check oauth path too, not hard-coded to 0");
   assert.ok(!/auth\.ok=false/.test(oauth.message), `got: ${oauth.message}`);
