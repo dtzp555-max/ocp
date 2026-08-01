@@ -82,23 +82,45 @@ The obvious way to make the verdict fresh is to run the probe when someone asks.
 
 ## Consequences
 
-### Downstream: `ocp update`'s post-flight check changes behaviour
+### Downstream: `ocp update`'s post-flight check
 
-**This is the change most likely to surprise someone, so it is stated first.** `auth.ok` is now **preserved** across an inconclusive probe instead of being clobbered to `false`. `postFlightOk` (`scripts/upgrade.mjs:453`) requires `body?.auth?.ok !== true` to fail:
+An earlier draft of this ADR claimed that `auth.ok` preservation makes `ocp update`'s post-flight
+check **pass** on a busy host where it previously failed spuriously. **That claim was wrong, and
+it is withdrawn.** An independent reviewer falsified it experimentally, and the correction is
+recorded here rather than quietly deleted, because a wrong "consequences" section is exactly the
+kind of confident-but-unverified claim this repo's governance exists to catch.
 
-```js
-export function postFlightOk(body, target) {
-  if (body?.auth?.ok !== true) return false;
-  const want = String(target || "").replace(/^v/, "");
-  return !want || body?.version === want;
-}
+Why it was wrong: `runPostFlightCheck` only ever runs **after a restart** (`scripts/upgrade.mjs`
+phase 6, and the restart-only path at `:619`/`:638` — both are `cmd_restart` followed by
+post-flight). The process it probes is therefore always **fresh**, so `authStatus.ok` is `null`
+and there is no earlier conclusive verdict to preserve. Preservation semantics cannot help a
+process that has never had a conclusive result. Measured against a boot whose probe exceeds its
+timeout, after the real 10×1s retry budget:
+
+```
+status           = "ok"
+auth.ok          = null
+auth.lastOutcome = "timeout"
+postFlightOk()   = false     <- same as before this change
 ```
 
-So on a busy host, `ocp update`'s post-flight verification will now **pass** where it previously **failed spuriously** — a timed-out probe used to leave `auth.ok=false` for up to ten minutes, and an upgrade that landed inside that window was reported as failed even though the new version was serving correctly.
+`postFlightOk` (`scripts/upgrade.mjs:453`) requires `auth.ok === true`, and `null !== true`. So
+post-flight behaviour on a slow-probe host is **unchanged**.
 
-This is an intended improvement, and it does not weaken the check that actually guards against the failure mode `postFlightOk` was written for: per that function's own comment, `auth.ok` alone was never sufficient — the **version match** is the real orphan guard ("a stale process holding the port answers `auth.ok=true` while still running the OLD code"). That comparison is untouched.
+There *is* a real improvement to `ocp update` from this change, but it comes from defect (A), not
+from (B): `/health` is now reachable within milliseconds of boot instead of being unreachable
+until a blocking probe returns (measured: first answer at +82ms against a probe that stalls for
+30s). Previously the post-flight retry budget could be spent entirely on connection-refused
+against a server that had not reached `listen()` yet.
 
-But it **is** a behaviour change to `ocp update` and must not be discovered by accident.
+### Downstream: `scripts/doctor.mjs` — where the preservation change actually lands
+
+`scripts/doctor.mjs:668` / `:869` read `auth.ok` with a falsy check (`if (!authOk)`), so doctor
+**is** affected by the preservation change — and unlike post-flight it runs against a
+long-established process. If doctor probes an instance that has a prior conclusive success and
+whose most recent probe was inconclusive, `oauth_ok` now PASSes where it previously FAILed. That
+is the intended improvement, and it is the correct outcome: the credentials were last known good
+and nothing since has said otherwise.
 
 ### Consumers of `status`
 
@@ -110,7 +132,7 @@ There are exactly three readers in the repo:
 | `ocp-plugin/index.js:113` (`cmdStatus`) | `d.proxy?.status`, the repo's only literal `"degraded"` comparison, three-way 🟢/🟡/🔴 | Unchanged code path; the value domain is still exactly `{"ok","degraded"}`, so the 🟡 branch still fires on `degraded` and 🔴 still fires only when the field is missing/unreachable. |
 | `ocp-plugin/index.js:95` (`cmdHealth`) | `d.status`, echoed verbatim | Prints the new verdict. No parsing, no comparison. |
 
-`postFlightOk` (`scripts/upgrade.mjs:453`), `scripts/doctor.mjs:668` / `:869`, the `ocp` CLI, `ocp-connect` and `setup.mjs` all read `auth.ok` / `version` **directly** and never read `status`, so they are affected only via the `auth.ok` preservation described above.
+`postFlightOk` (`scripts/upgrade.mjs:453`), `scripts/doctor.mjs:668` / `:869`, the `ocp` CLI, `ocp-connect` and `setup.mjs` all read `auth.ok` / `version` **directly** and never read `status`. Of those, only `doctor.mjs` changes behaviour — see the two subsections above for why post-flight does not.
 
 ### Field additions
 
@@ -122,4 +144,6 @@ There are exactly three readers in the repo:
 
 - A genuine credential outage is reported up to one probe interval later. See "Why the threshold is 2".
 - `authStatus.ok` can now be *stale* rather than merely wrong — it holds the last **conclusive** verdict, which may be older than `lastCheck`. `lastOutcome` exists so an operator can tell the difference, and `lastCheck` still moves on every completed probe whatever its outcome.
+- **"2 consecutive" has no time bound.** Because an inconclusive probe leaves the tally untouched, the sequence `reject → timeout → reject` does reach 2 and does degrade. So "consecutive" precisely means "two conclusive rejections with no intervening *success*", which can span an arbitrary interval — a rejection may sit at `consecutiveFailures = 1` indefinitely and pair with an unrelated one much later. Accepted rather than fixed: the alternative (ageing the tally) adds a second time constant to reason about, and the failure mode is benign and self-healing — one successful probe resets it, so a false `degraded` from this path clears within one interval. Called out because "consecutive" reads as "adjacent in time" and here it is not.
+- **A new boot state exists.** With the probe now asynchronous, a boot whose first probe is inconclusive leaves `auth.ok: null` with `status: "ok"` for a full interval, where the old synchronous code would have had `ok: false` and `degraded` by the time anything could connect. This is the intended direction (an unknown credential state is not evidence of a broken one, and the proxy genuinely is serving), but it means `auth.ok` can read `null` on a freshly restarted instance for up to `CLAUDE_AUTH_CHECK_INTERVAL_MS`, with no faster retry. Any consumer requiring a positive `auth.ok` right after a restart — `postFlightOk` is the one in-tree — must keep its own retry budget.
 - `AUTH_DEGRADE_AFTER` is a constant, not an env var. Two is a judgement about what a credential rotation race looks like, not a per-deployment tuning knob; making it configurable would invite operators to set it to 1 and re-create the bug.

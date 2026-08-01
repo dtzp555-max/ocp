@@ -21,7 +21,7 @@
  *   CLAUDE_SESSION_TTL           — session TTL in ms (default: 3600000 = 1h)
  *   CLAUDE_AUTH_CHECK_INTERVAL_MS — how often the background `claude auth status` probe runs (default: 600000 = 10min)
  *   CLAUDE_AUTH_CHECK_TIMEOUT_MS  — per-probe timeout in ms (default: 10000)
- *   CLAUDE_MAX_CONCURRENT       — max concurrent claude processes, -p/stream-json path (default: 8)
+ *   CLAUDE_MAX_CONCURRENT        — max concurrent claude processes, -p/stream-json path (default: 8)
  *   CLAUDE_MAX_QUEUE             — max requests waiting for a -p slot before HTTP 429 (default: 16)
  *   OCP_TUI_MAX_CONCURRENT       — max concurrent interactive TUI turns, TUI-mode path (default: 2)
  *   OCP_TUI_POOL_SIZE            — pre-booted warm `claude` panes held for TUI-mode (default: 0 = off;
@@ -1165,15 +1165,19 @@ async function checkAuth() {
     // ASYNC execFile, not execFileSync (#232). Marking the function `async` never made the old
     // synchronous call non-blocking: it froze the event loop for up to AUTH_CHECK_TIMEOUT_MS at
     // boot (before server.listen()) and again on every interval tick.
+    // NOT unref()'d, deliberately. An unref'd execFile child silently drops its callback if
+    // nothing else is holding the event loop open — measured: with a keepalive the callback
+    // fired at +505ms; without one the process exited at +803ms and it never fired at all.
+    // It would be safe here only by accident (the authCheckInterval below is registered
+    // synchronously right after), and it buys nothing, because gracefulShutdown always
+    // process.exit()s. So: no unref, no trap for whoever moves this code next.
     await new Promise((resolve, reject) => {
-      const child = execFile(CLAUDE, ["auth", "status"],
+      execFile(CLAUDE, ["auth", "status"],
         { encoding: "utf8", timeout: AUTH_CHECK_TIMEOUT_MS, env },
-        // execFile does NOT attach stdout/stderr to the error object the way execFileSync does,
-        // so carry stderr across explicitly — the message below depends on it.
+        // execFile does NOT attach stdout/stderr to the error object the way execFileSync does
+        // (verified: err.stderr is undefined in the callback), so carry stderr across
+        // explicitly — the message below depends on it.
         (err, _stdout, stderr) => (err ? reject(Object.assign(err, { stderr })) : resolve()));
-      // A background diagnostic must never be the reason the process stays up. gracefulShutdown
-      // (which clears authCheckInterval) always process.exit()s, so this is belt-and-braces.
-      child.unref();
     });
     authStatus = { ok: true, lastCheck: Date.now(), message: "authenticated",
                    lastOutcome: "authenticated", consecutiveFailures: 0 };
