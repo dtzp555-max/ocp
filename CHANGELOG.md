@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+## v3.27.0 — 2026-08-02
+
+Minor release. Two new tunables (`CLAUDE_AUTH_CHECK_INTERVAL_MS`, `CLAUDE_AUTH_CHECK_TIMEOUT_MS`) and two new `/health` fields (`auth.lastOutcome`, `auth.consecutiveFailures`) land — see Added — alongside the large CLI/doctor reliability batch below and one `server.mjs` correctness fix (#232) to the async auth-probe verdict.
+
 37 PRs landed on `main` after v3.26.0 before this entry was written; only one of them (issue #232, merged as PR #275) got an `Unreleased` line at merge time, written by that PR's own author. The other 36 shipped silently — a coordination gap, not a quality gap: every one of these PRs carried an independent fresh-context reviewer (Iron Rule 10) and mutation-proven tests, and several went through two or three review rounds that caught real defects the first pass missed. This entry reconstructs them after the fact, grouped by story rather than by PR number.
 
 Read together, most of this batch is one shape of bug, hit independently at a dozen call sites: **a check's own failure to run got treated as the answer it would have given if it had run and found nothing.** A hard-coded restart target got "restarted" whether or not it was the process actually holding the port. `cmd_restart` had no failure exit code at all. `lsof`/`curl`/`python3` simply being absent from `$PATH` looked identical, downstream, to each of them running cleanly and reporting an empty or negative result. The fix, repeated a dozen times across this batch, is always the same: distinguish "the command could not run" from "the command ran and told you something." First fixed at the request-diagnostics layer by #232 below, the same pattern turned out to also describe most of the control-plane tooling (`ocp update`, `ocp restart`, rollback, and the bash CLI's own status commands).

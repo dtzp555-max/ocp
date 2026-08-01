@@ -96,6 +96,8 @@ ocp update --rollback --list      # list snapshots, no mutation
 ocp update --rollback --dry-run   # preview rollback plan
 ```
 
+**`--target` is only honored on the cross-minor (full) upgrade path** — it is a no-op-with-warning on the light/patch-bump path and a hard refusal (non-zero exit, no changes made) on the `noop`, `restart`, and `fresh_install` paths, since none of those three has any mechanism to redirect what it does onto a specific version. Which path a given `ocp update --target` invocation hits depends on `doctor`'s current-vs-latest classification, not on the caller — automation that pins unconditionally should read `ocp update --help`'s Notes section for the full per-path matrix before relying on it.
+
 ## When upgrade fails
 
 `ocp update` prints a recovery line on failure. To restore from the snapshot:
