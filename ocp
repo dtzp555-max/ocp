@@ -1405,7 +1405,7 @@ _cmd_update_light() {
   # latest. Nothing to do.", exit 0) without ever restarting — only `curl $PROXY/health` told the
   # truth. `_cmd_update_restart` (#217) already closed this exact gap for the sibling "restart"
   # kind via `node scripts/upgrade.mjs --post-flight-only`, which reuses postFlightOk() (compares
-  # /health's reported version against the target, not just auth.ok) instead of a second
+  # /health's reported version against the target, not just its serving verdict) instead of a second
   # hand-rolled check — wiring the light path up the same way is what this block does. `new_ver`
   # (re-read from package.json AFTER the git pull above, whether or not it changed) is the
   # correct verification target: it reflects whatever version the tree actually landed on.

@@ -2045,28 +2045,69 @@ import { runUpgrade, postFlightOk, runPostFlightCheck } from "./scripts/upgrade.
 
 console.log("\nUpgrade:");
 
-// ── postFlightOk (issue #173) — the acceptance predicate for phase 6 ─────────
-// Mutation-proof: revert the version comparison to auth-only and the "stale process
-// still holds the port" test below goes green-to-red (that case is the 2026-07-17
-// Oracle incident: orphan answered auth.ok=true while serving the OLD version).
+// ── postFlightOk (issue #173, re-anchored by #289) — phase 6's acceptance predicate ──
+// Mutation-proof: revert the version comparison to the serving check alone and the "stale
+// process still holds the port" test below goes green-to-red (that case is the 2026-07-17
+// Oracle incident: an orphan answered healthy while serving the OLD version).
+//
+// The fixtures below carry `status`, because a real /health always does — continuously from
+// v3.4.0, doctor's from_version_supported floor. The pre-#289 fixtures omitted it, which is why
+// they could not express the state that broke production.
 test("postFlightOk: rejects a healthy-looking probe that serves the WRONG version (orphan case)", () => {
-  assert.equal(postFlightOk({ auth: { ok: true }, version: "3.21.1" }, "v3.22.1"), false);
+  assert.equal(postFlightOk({ status: "ok", auth: { ok: true }, version: "3.21.1" }, "v3.22.1"), false);
 });
 
-test("postFlightOk: accepts auth.ok + exact target version, tolerating the leading v", () => {
-  assert.equal(postFlightOk({ auth: { ok: true }, version: "3.22.1" }, "v3.22.1"), true);
-  assert.equal(postFlightOk({ auth: { ok: true }, version: "3.22.1" }, "3.22.1"), true);
+test("postFlightOk: accepts status=ok + exact target version, tolerating the leading v", () => {
+  assert.equal(postFlightOk({ status: "ok", auth: { ok: true }, version: "3.22.1" }, "v3.22.1"), true);
+  assert.equal(postFlightOk({ status: "ok", auth: { ok: true }, version: "3.22.1" }, "3.22.1"), true);
 });
 
-test("postFlightOk: auth failure rejects regardless of version", () => {
-  assert.equal(postFlightOk({ auth: { ok: false }, version: "3.22.1" }, "v3.22.1"), false);
-  assert.equal(postFlightOk({ version: "3.22.1" }, "v3.22.1"), false);
+test("postFlightOk: a degraded server rejects regardless of version", () => {
+  assert.equal(postFlightOk({ status: "degraded", auth: { ok: false }, version: "3.22.1" }, "v3.22.1"), false);
+  assert.equal(postFlightOk({ version: "3.22.1" }, "v3.22.1"), false, "no status field must fail CLOSED");
   assert.equal(postFlightOk(null, "v3.22.1"), false);
 });
 
-test("postFlightOk: unknown/empty target degrades to the auth-only check (never blocks)", () => {
-  assert.equal(postFlightOk({ auth: { ok: true }, version: "3.22.1" }, ""), true);
-  assert.equal(postFlightOk({ auth: { ok: true }, version: "3.22.1" }, undefined), true);
+test("postFlightOk: unknown/empty target degrades to the serving check alone (never blocks)", () => {
+  assert.equal(postFlightOk({ status: "ok", auth: { ok: true }, version: "3.22.1" }, ""), true);
+  assert.equal(postFlightOk({ status: "ok", auth: { ok: true }, version: "3.22.1" }, undefined), true);
+});
+
+// ── #289 regression: the ADR 0010 inconclusive-probe state ──────────────────
+// This is the defect. ADR 0010 made an inconclusive probe (its own 10s timeout firing on a
+// loaded host) leave auth.ok at the last CONCLUSIVE verdict. Post-flight always runs against a
+// process that was just restarted, so there is no earlier conclusive verdict and auth.ok is
+// `null` — for up to CLAUDE_AUTH_CHECK_INTERVAL_MS (600000ms) with no accelerated re-probe,
+// against a 10 x 1s retry budget. The old predicate required `auth.ok === true`, so a
+// SUCCESSFUL restart/update/rollback reported failure on exactly the host shape ADR 0010 was
+// written about. `status` is "ok" throughout, because ADR 0010 deliberately does not let an
+// inconclusive probe move the verdict.
+test("postFlightOk: #289 — a fresh boot whose auth probe TIMED OUT (auth.ok=null) is still a pass", () => {
+  const body = {
+    status: "ok",
+    version: "3.27.0",
+    auth: { ok: null, lastCheck: Date.now(), message: "spawnSync /usr/local/bin/claude ETIMEDOUT",
+            lastOutcome: "timeout", consecutiveFailures: 0 },
+  };
+  assert.equal(body.auth.ok, null, "premise: the ADR 0010 inconclusive state really is auth.ok=null");
+  assert.equal(postFlightOk(body, "v3.27.0"), true,
+    "a successful restart must not be reported as a failure because one probe timed out (#289)");
+});
+
+test("postFlightOk: #289 — auth.ok=null still rejects when the version is WRONG (orphan is still caught)", () => {
+  const body = { status: "ok", version: "3.21.1", auth: { ok: null, lastOutcome: "timeout" } };
+  assert.equal(postFlightOk(body, "v3.27.0"), false,
+    "relaxing the auth arm must not relax the version arm — #173's orphan case still fails");
+});
+
+test("postFlightOk: #289 — status=degraded rejects even with a stale auth.ok=true (unusable binary)", () => {
+  // A non-executable claude binary makes the probe fail to SPAWN, which ADR 0010 classifies as
+  // INCONCLUSIVE, so a stale conclusive `ok: true` survives it. proxyHealthStatus catches it via
+  // binaryOk. The old auth.ok-only predicate missed this case entirely; reading `status` gains it.
+  const body = { status: "degraded", version: "3.27.0",
+                 auth: { ok: true, lastOutcome: "unavailable", consecutiveFailures: 0 } };
+  assert.equal(postFlightOk(body, "v3.27.0"), false,
+    "a proxy that cannot execute its claude binary must not pass post-flight");
 });
 
 // ── runPostFlightCheck (issue #214, MED-1 on PR #217 review) ────────────────
@@ -2083,7 +2124,7 @@ test("runPostFlightCheck: succeeds immediately when the first probe already matc
   let calls = 0;
   const result = await runPostFlightCheck("v3.26.0", {
     attempts: 5, intervalMs: 0,
-    mockProbe: () => { calls++; return { auth: { ok: true }, version: "3.26.0" }; }
+    mockProbe: () => { calls++; return { status: "ok", auth: { ok: true }, version: "3.26.0" }; }
   });
   assert.equal(result.ok, true);
   assert.equal(calls, 1, "must not keep polling once the target is already reached");
@@ -2096,8 +2137,8 @@ test("runPostFlightCheck: retries past a stale/unreachable probe and succeeds on
     mockProbe: () => {
       calls++;
       if (calls === 1) throw new Error("ECONNREFUSED"); // service mid-restart
-      if (calls === 2) return { auth: { ok: true }, version: "3.25.0" }; // old process still holding the port
-      return { auth: { ok: true }, version: "3.26.0" }; // new process finally serving
+      if (calls === 2) return { status: "ok", auth: { ok: true }, version: "3.25.0" }; // old process still holding the port
+      return { status: "ok", auth: { ok: true }, version: "3.26.0" }; // new process finally serving
     }
   });
   assert.equal(result.ok, true);
@@ -2108,7 +2149,7 @@ test("runPostFlightCheck: exhausts attempts and reports ok:false + lastSeen when
   let calls = 0;
   const result = await runPostFlightCheck("v3.26.0", {
     attempts: 3, intervalMs: 0,
-    mockProbe: () => { calls++; return { auth: { ok: true }, version: "3.25.0" }; }
+    mockProbe: () => { calls++; return { status: "ok", auth: { ok: true }, version: "3.25.0" }; }
   });
   assert.equal(result.ok, false);
   assert.equal(result.lastSeen, "3.25.0");
@@ -3430,7 +3471,7 @@ test("#274 (the money test): rollback reports FAILURE when post-flight does not 
       // A stale/orphan process still answers auth.ok=true but serves the version rollback was
       // trying to LEAVE, not the one it restored — exactly the "reports success while serving
       // the wrong tree" shape #274 describes.
-      mockProbe: () => ({ auth: { ok: true }, version: "3.14.0" }),
+      mockProbe: () => ({ status: "ok", auth: { ok: true }, version: "3.14.0" }),
       postFlightAttempts: 1, postFlightIntervalMs: 0,
     });
   }, /rollback post-flight failed/);
@@ -3441,7 +3482,7 @@ test("#274 control: rollback reports SUCCESS when post-flight confirms the snaps
     rollback: true, yes: true, mockExec: true,
     mockSnapshots: [{ name: "upgrade-snapshot-2026-05-11T08:30:00Z", path: "/tmp/snap-x" }],
     mockSnapshotMeta: { fromCommit: "abc1234", fromVersion: "v3.10.0", toVersion: "v3.14.0", path: "/tmp/snap-x" },
-    mockProbe: () => ({ auth: { ok: true }, version: "3.10.0" }),
+    mockProbe: () => ({ status: "ok", auth: { ok: true }, version: "3.10.0" }),
     postFlightAttempts: 1, postFlightIntervalMs: 0,
   });
   assert.equal(result.path, "rollback");
@@ -3461,7 +3502,7 @@ test("#274: rollback post-flight targets meta.fromVersion, NOT toVersion — a p
       rollback: true, yes: true, mockExec: true,
       mockSnapshots: [{ name: "upgrade-snapshot-2026-05-11T08:30:00Z", path: "/tmp/snap-x" }],
       mockSnapshotMeta: { fromCommit: "abc1234", fromVersion: "v3.10.0", toVersion: "v3.14.0", path: "/tmp/snap-x" },
-      mockProbe: () => ({ auth: { ok: true }, version: "3.14.0" }), // toVersion, not fromVersion
+      mockProbe: () => ({ status: "ok", auth: { ok: true }, version: "3.14.0" }), // toVersion, not fromVersion
       postFlightAttempts: 1, postFlightIntervalMs: 0,
     });
   }, /rollback post-flight failed/);
@@ -13706,11 +13747,11 @@ test("#241 MEDIUM-1 control: with python3 fully healthy, the SAME scenario still
 test("#241 MEDIUM-1: postFlightOk() itself, driven directly, confirms WHY 'v?' is unverifiable -- the predicate this fix routes around", () => {
   // Direct, unmocked exercise of the real predicate (imported at the top of this file's upgrade
   // full-path section) -- this is the evidence for the fix above, not a duplicate of it.
-  assert.equal(postFlightOk({ auth: { ok: true }, version: "3.27.0" }, "v3.27.0"), true,
+  assert.equal(postFlightOk({ status: "ok", auth: { ok: true }, version: "3.27.0" }, "v3.27.0"), true,
     "a matching version must pass");
-  assert.equal(postFlightOk({ auth: { ok: true }, version: "3.27.0" }, "v?"), false,
+  assert.equal(postFlightOk({ status: "ok", auth: { ok: true }, version: "3.27.0" }, "v?"), false,
     "target 'v?' must NOT pass against any real version -- this is the MEDIUM-1 defect made concrete");
-  assert.equal(postFlightOk({ auth: { ok: true }, version: "3.27.0" }, ""), true,
+  assert.equal(postFlightOk({ status: "ok", auth: { ok: true }, version: "3.27.0" }, ""), true,
     "an EMPTY target degrades to the auth-only check and passes -- 'v?' is categorically different from empty, which is why substituting an empty string was considered and rejected (the CLI's own --post-flight-only entrypoint fails closed on a falsy/empty target argument by design)");
 });
 
@@ -14114,6 +14155,340 @@ test("ocp-connect: every user-defined array expansion is guarded (no bare \"${na
   assert.deepEqual(findings, [],
     `unguarded array expansion(s) in ocp-connect: ${JSON.stringify(findings)} -- wrap with ` +
     `\${name[@]+"\${name[@]}"} (see rc_files for the pattern)`);
+});
+
+// ════════════════════════════════════════════════════════════════════════════
+// ADR 0010 CONSUMER REPLAY (issue #289)
+// ════════════════════════════════════════════════════════════════════════════
+// ADR 0010 changed what `/health` reports during an inconclusive auth probe, then reasoned
+// about the downstream effect in prose (§ "Consumers of `status`"). Prose is what got it
+// wrong: the ADR concluded post-flight was "unchanged", which is true of the return VALUE and
+// false of the OPERATOR OUTCOME — the value it is unchanged at is `false`, on a restart that
+// succeeded. An outside review's finding was that this repo asserts on the endpoint payload
+// and never on what the consumers DECIDE from it. This section is that missing artifact:
+// it replays ADR 0010's own motivating incident and asserts the DECISION of every consumer.
+//
+// The incident (ADR 0010 § Context, and the production capture it quotes): a loaded host makes
+// `claude auth status` exceed AUTH_CHECK_TIMEOUT_MS; Node kills it (killed:true,
+// signal:"SIGTERM"); server.mjs classifies signal death as INCONCLUSIVE, so the probe records
+// lastOutcome "timeout" and does NOT move `ok` or the failure tally. Credentials are fine —
+// POST /v1/chat/completions returned 200 in the same minute on the same credentials.
+//
+// Two shapes of the same incident matter, and they differ only in what came BEFORE the timeout:
+//   FRESH        — the process was just restarted, so there is no prior conclusive verdict to
+//                  preserve and `ok` is still its initial `null`. This is what post-flight ALWAYS
+//                  sees: runPostFlightCheck only ever runs after a restart.
+//   ESTABLISHED  — a long-running process with a prior conclusive success; preservation keeps
+//                  `ok: true`. This is what `ocp doctor` usually sees, and it is the case ADR
+//                  0010 § "Downstream: scripts/doctor.mjs" claims now PASSes.
+// `status` is "ok" in BOTH: ADR 0010 deliberately does not let an inconclusive probe degrade
+// the verdict, and the binary is executable in this incident.
+import { createServer as _rpHttpServer } from "node:http";
+
+console.log("\nADR 0010 consumer replay (#289):");
+
+const RP_VERSION = "3.27.0";
+
+// The /health body, byte-faithful to what server.mjs emits for this incident.
+function rpHealth(shape) {
+  const auth = shape === "fresh"
+    ? { ok: null, lastCheck: Date.now(), message: "spawnSync /usr/local/bin/claude ETIMEDOUT",
+        lastOutcome: "timeout", consecutiveFailures: 0 }
+    : { ok: true, lastCheck: Date.now(), message: "spawnSync /usr/local/bin/claude ETIMEDOUT",
+        lastOutcome: "timeout", consecutiveFailures: 0 };
+  return {
+    status: "ok",                 // proxyHealthStatus(binaryOk=true): inconclusive never degrades
+    version: RP_VERSION,
+    uptimeHuman: "36h 12m",
+    claudeBinaryOk: true,
+    authMode: "none",
+    auth,
+  };
+}
+
+// The /status projection of the SAME authStatus (server.mjs handleStatus):
+//   proxy.status = proxyHealthStatus(binaryOk); proxy.auth = authStatus.ok ? "ok" : authStatus.message
+function rpStatus(shape) {
+  const h = rpHealth(shape);
+  return {
+    proxy: {
+      status: h.status, version: h.version, uptime: h.uptimeHuman,
+      auth: h.auth.ok ? "ok" : h.auth.message,
+      activeSessions: 0,
+    },
+    requests: { total: 12, active: 0, errors: 0, timeouts: 0 },
+  };
+}
+
+// Premise guard. Everything below is worthless if the fixture is not actually the ADR 0010
+// inconclusive state, so assert the fixture's own shape before trusting any decision read off it.
+test("replay premise: the fixture IS ADR 0010's inconclusive state (status ok, tally untouched)", () => {
+  const fresh = rpHealth("fresh"), est = rpHealth("established");
+  assert.equal(fresh.auth.ok, null, "FRESH: no conclusive verdict has ever been recorded");
+  assert.equal(est.auth.ok, true, "ESTABLISHED: the prior conclusive success is PRESERVED");
+  for (const h of [fresh, est]) {
+    assert.equal(h.auth.lastOutcome, "timeout", "the probe died on a signal → INCONCLUSIVE");
+    assert.equal(h.auth.consecutiveFailures, 0, "an inconclusive probe must not touch the tally");
+    assert.equal(h.status, "ok", "and must not move the serving verdict");
+  }
+});
+
+// ── Consumer 1: postFlightOk (scripts/upgrade.mjs) ──────────────────────────
+test("replay → postFlightOk DECIDES accept on the FRESH incident (was: reject a good restart)", () => {
+  assert.equal(postFlightOk(rpHealth("fresh"), `v${RP_VERSION}`), true);
+});
+
+test("replay → postFlightOk DECIDES accept on the ESTABLISHED incident", () => {
+  assert.equal(postFlightOk(rpHealth("established"), `v${RP_VERSION}`), true);
+});
+
+// ── Consumer 2: runPostFlightCheck (the real retry loop, real budget) ───────
+// Driven at the SHIPPED budget (attempts=10) rather than a shortened one, because the budget
+// is half the defect: 10 x 1s cannot outlast a 600000ms probe interval. intervalMs=0 keeps the
+// test fast without changing the attempt count that matters.
+test("replay → runPostFlightCheck DECIDES ok on a restart whose every probe stays inconclusive", async () => {
+  let calls = 0;
+  const r = await runPostFlightCheck(`v${RP_VERSION}`, {
+    attempts: 10, intervalMs: 0,
+    mockProbe: () => { calls++; return rpHealth("fresh"); },
+  });
+  assert.equal(r.ok, true, "a successful restart must not be reported as a failed one (#289)");
+  assert.equal(calls, 1, "and it must settle on the FIRST probe, not burn the whole budget");
+});
+
+// ── Consumer 3: runRollback's post-flight (scripts/upgrade.mjs) ─────────────
+// The user-visible symptom this closes: "rollback post-flight failed: restored tree may not be
+// what's running" thrown about a rollback that worked.
+test("replay → runRollback DECIDES success (no 'restored tree may not be what's running' throw)", async () => {
+  const restored = { ...rpHealth("fresh"), version: "3.10.0" }; // the snapshot's fromVersion
+  const result = await runUpgrade({
+    rollback: true, yes: true, mockExec: true,
+    mockSnapshots: [{ name: "upgrade-snapshot-2026-05-11T08:30:00Z", path: "/tmp/snap-x" }],
+    mockSnapshotMeta: { fromCommit: "abc1234", fromVersion: "v3.10.0", toVersion: "v3.14.0", path: "/tmp/snap-x" },
+    mockProbe: () => restored,
+    postFlightAttempts: 10, postFlightIntervalMs: 0,
+  });
+  assert.equal(result.path, "rollback");
+  const pf = result.phases.find(p => p.name === "post-flight");
+  assert.ok(pf, "post-flight phase must be recorded");
+  assert.equal(pf.status, "ok",
+    "a rollback that restored a SERVING proxy must not throw 'restored tree may not be what's running' (#289)");
+});
+
+test("replay control → runRollback still THROWS when the restored proxy serves the wrong version", async () => {
+  await assert.rejects(async () => {
+    await runUpgrade({
+      rollback: true, yes: true, mockExec: true,
+      mockSnapshots: [{ name: "upgrade-snapshot-2026-05-11T08:30:00Z", path: "/tmp/snap-x" }],
+      mockSnapshotMeta: { fromCommit: "abc1234", fromVersion: "v3.10.0", toVersion: "v3.14.0", path: "/tmp/snap-x" },
+      mockProbe: () => ({ ...rpHealth("fresh"), version: "3.14.0" }), // toVersion, not fromVersion
+      postFlightAttempts: 1, postFlightIntervalMs: 0,
+    });
+  }, /rollback post-flight failed/);
+});
+
+// ── Consumer 4: scripts/doctor.mjs, full run ────────────────────────────────
+// Three decisions, not one: the check LEVEL, the next_action.kind (which gates the next
+// `ocp update`), and ready_to_upgrade. The message is asserted too — doctor previously printed
+// a hard-coded "auth.ok=false" for a value that was null, which is the confident-wrong-answer
+// class this repo's recent work exists to remove.
+test("replay → doctor DECIDES kind!=fix_oauth and does not block the next update (FRESH)", async () => {
+  const r = await runDoctor({
+    mockVersion: `v${RP_VERSION}`, mockLatest: `v${RP_VERSION}`, skipNetwork: false,
+    mockHealth: { status: 200, body: rpHealth("fresh") },
+  });
+  const oauth = r.checks.find(c => c.id === "oauth_ok");
+  assert.ok(oauth, "doctor must still report an oauth_ok check");
+  assert.notEqual(oauth.level, "FAIL", "an inconclusive probe is not a credential rejection");
+  assert.equal(oauth.level, "WARN", "but it IS worth surfacing — it is 'not known', not 'fine'");
+  assert.notEqual(r.next_action.kind, "fix_oauth",
+    "must not route the operator to debug credentials that were never rejected (#289)");
+  assert.equal(r.ready_to_upgrade, true, "and must not refuse the next `ocp update`");
+});
+
+test("replay → doctor's message states the OBSERVED value, never a hard-coded auth.ok=false", async () => {
+  const r = await runDoctor({
+    mockVersion: `v${RP_VERSION}`, mockLatest: `v${RP_VERSION}`,
+    mockHealth: { status: 200, body: rpHealth("fresh") },
+  });
+  const msg = r.checks.find(c => c.id === "oauth_ok").message;
+  assert.ok(!/auth\.ok=false/.test(msg),
+    `doctor must not assert a state that did not occur; got: ${msg}`);
+  assert.ok(/auth\.ok=null/.test(msg), `must report what it actually saw; got: ${msg}`);
+  assert.ok(/lastOutcome=timeout/.test(msg),
+    `and must carry the reason an operator needs to act on; got: ${msg}`);
+});
+
+test("replay → doctor DECIDES PASS on the ESTABLISHED incident (ADR 0010's own claim)", async () => {
+  const r = await runDoctor({
+    mockVersion: `v${RP_VERSION}`, mockLatest: `v${RP_VERSION}`,
+    mockHealth: { status: 200, body: rpHealth("established") },
+  });
+  const oauth = r.checks.find(c => c.id === "oauth_ok");
+  assert.equal(oauth.level, "PASS", "a preserved conclusive success is still a success");
+  assert.notEqual(r.next_action.kind, "fix_oauth");
+});
+
+// ── Consumer 5: scripts/doctor.mjs, the `--check oauth` fast path ───────────
+// A SEPARATE code path from the full run (runOauthOnly), with its own copy of the same read.
+// It is also the path doctor's own fix_oauth remediation tells the operator to re-run, so a
+// wrong answer here is self-confirming.
+test("replay → doctor --check oauth DECIDES kind!=fix_oauth and exits 0 (FRESH)", async () => {
+  const r = await runDoctor({
+    checkOnly: "oauth",
+    mockHealth: { status: 200, body: rpHealth("fresh") },
+  });
+  const oauth = r.checks.find(c => c.id === "oauth_ok");
+  assert.equal(oauth.level, "WARN");
+  assert.notEqual(r.next_action.kind, "fix_oauth");
+  assert.equal(r.fail_count, 0, "`ocp doctor --check oauth` exits on fail_count; 0 keeps exit 0");
+  assert.ok(!/auth\.ok=false/.test(oauth.message), `got: ${oauth.message}`);
+  // The next_action must not claim health it never established, on the very path doctor's own
+  // fix_oauth remediation tells the operator to re-run.
+  assert.ok(!/OAuth healthy/.test(r.next_action.verify),
+    `--check oauth must not report "OAuth healthy" for a state it never established; got: ${r.next_action.verify}`);
+  assert.match(r.next_action.verify, /not yet established/, `got: ${r.next_action.verify}`);
+});
+
+test("replay control → doctor --check oauth still reports 'OAuth healthy' on a real PASS", async () => {
+  const r = await runDoctor({
+    checkOnly: "oauth",
+    mockHealth: { status: 200, body: rpHealth("established") },
+  });
+  assert.equal(r.checks.find(c => c.id === "oauth_ok").level, "PASS");
+  assert.equal(r.next_action.kind, "noop");
+  assert.equal(r.next_action.verify, "OAuth healthy",
+    "the PASS wording must be untouched — only the WARN case changes");
+});
+
+// A conclusive rejection must still FAIL, on both doctor paths. Without this, the fix above
+// could have been "make oauth_ok never fail", which would be a worse bug than the one closed.
+test("replay control → a CONCLUSIVE rejection still DECIDES FAIL + fix_oauth on both doctor paths", async () => {
+  const rejected = { ...rpHealth("fresh"),
+    auth: { ok: false, lastCheck: Date.now(), message: "Invalid refresh token",
+            lastOutcome: "rejected", consecutiveFailures: 1 } };
+  const full = await runDoctor({
+    mockVersion: `v${RP_VERSION}`, mockLatest: `v${RP_VERSION}`,
+    mockHealth: { status: 200, body: rejected },
+  });
+  assert.equal(full.checks.find(c => c.id === "oauth_ok").level, "FAIL");
+  assert.equal(full.next_action.kind, "fix_oauth");
+  assert.equal(full.ready_to_upgrade, false);
+
+  const fast = await runDoctor({ checkOnly: "oauth", mockHealth: { status: 200, body: rejected } });
+  assert.equal(fast.checks.find(c => c.id === "oauth_ok").level, "FAIL");
+  assert.equal(fast.next_action.kind, "fix_oauth");
+});
+
+// classifyAuthOk is imported LAZILY, not at module scope. A static `import { classifyAuthOk }`
+// makes the whole suite fail to LOAD against a tree that lacks the export (SyntaxError before a
+// single test runs), which reports as "everything failed" and destroys the ability to name the
+// tests that actually invert. Dynamic import keeps this one test's failure local and named.
+test("replay control → classifyAuthOk maps the three-valued domain to three distinct decisions", async () => {
+  const { classifyAuthOk: _rpClassifyAuthOk } = await import("./scripts/doctor.mjs");
+  assert.equal(typeof _rpClassifyAuthOk, "function",
+    "doctor.mjs must export the three-valued classifier that replaced the falsy check (#289)");
+  const mk = ok => ({ auth: { ok, message: "m", lastOutcome: "timeout" } });
+  assert.equal(_rpClassifyAuthOk(mk(true)).level, "PASS");
+  assert.equal(_rpClassifyAuthOk(mk(false)).level, "FAIL");
+  assert.equal(_rpClassifyAuthOk(mk(null)).level, "WARN");
+  assert.equal(_rpClassifyAuthOk({}).level, "WARN", "an absent field is 'not known', not 'rejected'");
+  assert.equal(_rpClassifyAuthOk(mk(false)).oauthOk, false, "only a rejection may select fix_oauth");
+  assert.equal(_rpClassifyAuthOk(mk(null)).oauthOk, true);
+  assert.match(_rpClassifyAuthOk({}).message, /auth\.ok=missing/,
+    "an absent field must be reported as absent, not as null and not as false");
+});
+
+// ── Consumer 6+7: ocp-plugin/index.js (cmdHealth :97 / :95, cmdStatus :113) ──
+// ADR 0010 § "Consumers of `status`" lists cmdHealth as reading only `d.status`; it also reads
+// `d.auth?.ok` two lines below (index.js:97), which the ADR's auth.ok enumeration omits. Driven
+// through the REAL plugin: its default export, its real command handler, its real fetchJSON,
+// over real HTTP against a real listener. Nothing is stubbed or sliced.
+//
+// PROXY is a module-level const resolved at IMPORT time from OCP_PROXY_URL, so the listener has
+// to exist and the env has to be set before the dynamic import — hence the lazy shared harness.
+// The harness is shared, so its mutable payload is serialized through _rpChain: these tests
+// would otherwise race each other through pendingAsync.
+let _rpHarness = null;
+let _rpServed = { "/health": null, "/status": null };
+let _rpChain = Promise.resolve();
+const _rpSerial = (fn) => { const p = _rpChain.then(fn); _rpChain = p.then(() => {}, () => {}); return p; };
+
+async function rpPluginHandler() {
+  if (_rpHarness) return _rpHarness;
+  const port = await ltFreePort();
+  const srv = _rpHttpServer((req, res) => {
+    const path = req.url.split("?")[0];
+    const body = _rpServed[path];
+    if (!body) { res.writeHead(404).end("{}"); return; }
+    res.writeHead(200, { "content-type": "application/json" });
+    res.end(JSON.stringify(body));
+  });
+  await new Promise(r => srv.listen(port, "127.0.0.1", r));
+  srv.unref();
+  process.env.OCP_PROXY_URL = `http://127.0.0.1:${port}`;
+  const mod = await import("./ocp-plugin/index.js");
+  let handler = null;
+  mod.default({ registerCommand: (c) => { handler = c.handler; } });
+  assert.ok(typeof handler === "function",
+    "harness premise: the plugin must have registered a command handler");
+  _rpHarness = { handler, srv };
+  return _rpHarness;
+}
+
+test("replay → ocp-plugin `/ocp health` DECIDES what to print for an inconclusive auth.ok", () => _rpSerial(async () => {
+  const { handler } = await rpPluginHandler();
+  _rpServed["/health"] = rpHealth("fresh");
+  const out = (await handler({ args: "health" })).text;
+  // index.js:95 — `Status: ${d.status}` echoed verbatim. The serving verdict is the truthful one.
+  assert.match(out, /Status: ok \| v3\.27\.0/, `cmdHealth must echo the serving verdict; got:\n${out}`);
+  // index.js:97 — `d.auth?.ok ? "ok" : d.auth?.message || "unknown"`. A falsy check again, so
+  // `null` prints the raw ETIMEDOUT string. That is DISPLAY only: it drives no branch, blocks
+  // nothing, and is honest about what happened rather than asserting a rejection. Asserted so
+  // the behaviour is pinned and a future change to it is a deliberate one.
+  assert.match(out, /Auth: spawnSync .*ETIMEDOUT/,
+    `cmdHealth surfaces the probe message when no conclusive verdict exists; got:\n${out}`);
+  assert.ok(!/Auth: (ok|unknown)\b/.test(out),
+    `must not claim a verdict it does not have; got:\n${out}`);
+}));
+
+test("replay → ocp-plugin `/ocp status` DECIDES the GREEN icon (not 🟡 degraded)", () => _rpSerial(async () => {
+  const { handler } = await rpPluginHandler();
+  _rpServed["/status"] = rpStatus("fresh");
+  const out = (await handler({ args: "status" })).text;
+  assert.ok(out.includes("🟢"), `the repo's only literal "degraded" comparison must stay green; got:\n${out}`);
+  assert.ok(!out.includes("🟡") && !out.includes("🔴"), `got:\n${out}`);
+}));
+
+test("replay control → ocp-plugin `/ocp status` still DECIDES 🟡 on a real degraded verdict", () => _rpSerial(async () => {
+  const { handler } = await rpPluginHandler();
+  const degraded = rpStatus("fresh");
+  degraded.proxy.status = "degraded";
+  _rpServed["/status"] = degraded;
+  const out = (await handler({ args: "status" })).text;
+  assert.ok(out.includes("🟡"), `got:\n${out}`);
+}));
+
+// ── Consumer 8: dashboard.html:151 — the Status card ────────────────────────
+// A browser file, so the real ternary is sliced out and evaluated. Per AGENTS.md § "Testing
+// discipline", a textual assertion is acceptable for a SLICE BOUNDARY but never for the
+// behaviour under test — so the slice is asserted non-empty (anchor-drift guard) and then the
+// extracted expression is EXECUTED. A slice that silently missed would otherwise pass vacuously.
+test("replay → dashboard.html Status card DECIDES tag-ok (the green card) on the incident", () => {
+  const src = _ltRead(_ltF2P(new URL("./dashboard.html", import.meta.url)), "utf8");
+  const m = src.match(/p\.status === 'ok' \? '([\w-]+)' : '([\w-]+)'/);
+  assert.ok(m, "anchor drift: dashboard.html's Status-card ternary was not found — fix the slice");
+  assert.ok(m[1] && m[2] && m[1] !== m[2], `slice produced a degenerate ternary: ${m[0]}`);
+  const decide = new Function("p", `return (${m[0]});`);
+  // Asserted against the LITERAL class names, not against m[1]/m[2]. Comparing the result to the
+  // arm it was extracted from is self-referential: swapping the ternary's two arms would leave
+  // such an assertion green while the card rendered red on a healthy proxy. Found by mutating
+  // this very test (M12) after M10 killed it only via the anchor guard above — the guard proves
+  // the slice was found, which is not the same as proving the decision was checked.
+  assert.equal(decide(rpStatus("fresh").proxy), "tag-ok",
+    "the operator's Status card must not flip red because one probe timed out");
+  assert.equal(decide({ status: "degraded" }), "tag-err",
+    "control: a real degraded verdict must still render the error tag");
 });
 
 runAsyncTests().then(() => Promise.all(pendingAsync)).then(() => {

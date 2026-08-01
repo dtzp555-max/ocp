@@ -579,6 +579,52 @@ function describeMultiUnitConflict(groups) {
   }).join(" | ");
 }
 
+// Issue #289. ADR 0010 split the auth probe's outcomes into CONCLUSIVE (clean exit / non-zero
+// exit) and INCONCLUSIVE (killed by a signal — including the probe's own timeout — or failed to
+// spawn), and made `/health`'s `auth.ok` carry only the last CONCLUSIVE verdict: `true`, `false`,
+// or `null` when no probe has ever concluded. That three-valued domain IS the content of ADR
+// 0010; collapsing it back to two throws the decision away.
+//
+// Both doctor call sites used a falsy check (`if (!authOk)`), which maps `null` onto the same
+// branch as `false` and then reported it with a hard-coded string — so doctor printed
+// `auth.ok=false` for a value that was `null`, asserting a state that never occurred, and then
+// selected next_action.kind = "fix_oauth" over credentials that had never been rejected. That
+// routed the operator to debug working credentials AND made the next `ocp update` refuse to run
+// ("Pre-upgrade check failed: fix_oauth"). This helper is the single place that split now lives,
+// so the two sites cannot drift apart again — the same structural argument ADR 0010 made for
+// `proxyHealthStatus`.
+//
+// Why `null`/absent is WARN rather than FAIL: a FAIL here is not a label, it is a decision with
+// two consequences — `kind = "fix_oauth"`, whose remediation is "reinstall the claude native
+// binary and restart the service", and `fail_count > 0`, which blocks the next `ocp update`.
+// Neither is a correct response to "no probe has concluded yet". On a freshly restarted proxy
+// that is the EXPECTED state for up to CLAUDE_AUTH_CHECK_INTERVAL_MS (ADR 0010 § "Costs
+// accepted" — "A new boot state exists"). WARN keeps it visible in the check list and in
+// warn_count without inverting a decision on evidence that does not exist.
+//
+// The rendered value is derived from what was actually observed (`auth.ok=null`,
+// `auth.ok=false`, `auth.ok=missing`) rather than written as a literal, so no branch can assert
+// a state the server did not report.
+export function classifyAuthOk(body) {
+  const auth = body?.auth;
+  const ok = auth?.ok;
+  const detail = auth?.message || "unknown";
+  if (ok === true) return { level: "PASS", oauthOk: true, message: "OAuth token valid" };
+
+  const seen = ok === null ? "null" : ok === undefined ? "missing" : String(ok);
+  if (ok === false) {
+    return { level: "FAIL", oauthOk: false, message: `auth.ok=${seen}: ${detail}` };
+  }
+  // `null` (ADR 0010's "no conclusive probe yet") and an absent field are both "not known",
+  // which is not "rejected". lastOutcome, when present, is what tells an operator WHY.
+  const because = auth?.lastOutcome ? `, lastOutcome=${auth.lastOutcome}` : "";
+  return {
+    level: "WARN",
+    oauthOk: true,
+    message: `auth.ok=${seen} — no conclusive auth probe yet${because}; not a credential rejection (ADR 0010): ${detail}`,
+  };
+}
+
 export async function runDoctor(opts = {}) {
   const checks = [];
   const push = (id, level, message, extra = {}) =>
@@ -665,13 +711,9 @@ export async function runDoctor(opts = {}) {
       push("service_running", "FAIL", "service /health returned 200 but empty/non-JSON body");
     } else {
       push("service_running", "PASS", "service responding on /health");
-      const authOk = health.body?.auth?.ok;
-      if (!authOk) {
-        oauthOk = false;
-        push("oauth_ok", "FAIL", `auth.ok=false: ${health.body?.auth?.message || "unknown"}`);
-      } else {
-        push("oauth_ok", "PASS", "OAuth token valid");
-      }
+      const auth = classifyAuthOk(health.body);
+      if (!auth.oauthOk) oauthOk = false;
+      push("oauth_ok", auth.level, auth.message);
       // /health reports a bare semver (server.mjs `version: VERSION`, no leading "v"); only
       // trust it when it actually parses as a version, so a missing/garbled field degrades to
       // "unknown" (serviceVersion stays null) instead of being mistaken for a real mismatch.
@@ -846,7 +888,7 @@ export async function runDoctor(opts = {}) {
 }
 
 function runOauthOnly(opts, checks, push) {
-  let healthOk = true, oauthOk = true;
+  let healthOk = true, oauthOk = true, oauthLevel = null;
   let health;
   if (opts.mockHealth !== undefined) {
     health = opts.mockHealth;
@@ -866,11 +908,11 @@ function runOauthOnly(opts, checks, push) {
   } else if (!health.body || typeof health.body !== "object") {
     healthOk = false;
     push("oauth_ok", "FAIL", "service /health returned 200 but empty/non-JSON body");
-  } else if (!health.body?.auth?.ok) {
-    oauthOk = false;
-    push("oauth_ok", "FAIL", `auth.ok=false: ${health.body?.auth?.message || "unknown"}`);
   } else {
-    push("oauth_ok", "PASS", "OAuth token valid");
+    const auth = classifyAuthOk(health.body);
+    if (!auth.oauthOk) oauthOk = false;
+    oauthLevel = auth.level;
+    push("oauth_ok", auth.level, auth.message);
   }
 
   const kind = !healthOk ? "fix_service" : !oauthOk ? "fix_oauth" : "noop";
@@ -878,7 +920,15 @@ function runOauthOnly(opts, checks, push) {
   let next_action;
   const ocpDir = opts.ocpDir || join(homedir(), "ocp");
   if (kind === "noop") {
-    next_action = { kind, human_required: [], ai_executable: [], verify: "OAuth healthy" };
+    // `ocp doctor --check oauth` exists to answer "is OAuth OK?", so reporting "OAuth healthy"
+    // when the honest answer is "no probe has concluded yet" is the same overclaim #289 is about,
+    // on the very path doctor's own fix_oauth remediation tells the operator to re-run. `kind`
+    // deliberately stays "noop" — a WARN must not gate anything (see classifyAuthOk) — only the
+    // verify string stops asserting a state that was never established.
+    next_action = { kind, human_required: [], ai_executable: [],
+      verify: oauthLevel === "WARN"
+        ? "auth state not yet established — re-run `ocp doctor --check oauth` after the next probe"
+        : "OAuth healthy" };
   } else if (kind === "fix_oauth") {
     next_action = {
       kind,

@@ -141,6 +141,42 @@ There are exactly three readers in the repo:
 
 `postFlightOk` (`scripts/upgrade.mjs:453`), `scripts/doctor.mjs:668` / `:869`, the `ocp` CLI, `ocp-connect` and `setup.mjs` all read `auth.ok` / `version` **directly** and never read `status`. Of those, only `doctor.mjs` changes behaviour — see the two subsections above for why post-flight does not.
 
+> **Correction (issue #289).** Both enumerations above were audited against the tree and are
+> partly wrong. Recorded in place rather than rewritten, on the same principle this ADR already
+> applied to its own withdrawn post-flight claim: a wrong enumeration is exactly the kind of
+> confident-but-unverified statement this repo's governance exists to catch, and silently
+> deleting it would hide that the error was made.
+>
+> 1. **The `auth.ok` list names three files that do not read it.** `ocp`, `ocp-connect` and
+>    `setup.mjs` read `/health`'s `version` and `authMode`; none of them reads `auth.ok`. The
+>    `auth` keys near them (`setup.mjs:206-208`, `ocp-connect:198-199`) are `config.auth.profiles`
+>    in **OpenClaw's** config JSON — an unrelated `auth`. The clause "and never read `status`" is
+>    correct for all three.
+> 2. **The `auth.ok` list omits a real reader.** `ocp-plugin/index.js:97`
+>    (`d.auth?.ok ? "ok" : d.auth?.message || "unknown"`) reads it, two lines below the `d.status`
+>    read the table above *does* cite. `ocp-plugin/index.js:114` also reads `proxy.auth`, the
+>    `/status` projection of the same value. Both are display-only — neither drives a branch —
+>    which is why #289 leaves their behaviour as it is, but "exactly three readers" understated
+>    the surface.
+> 3. **`postFlightOk` no longer reads `auth.ok`; it reads `status`** (#289). The subsection above
+>    is right that ADR 0010 did not *change* post-flight's return value — and that is precisely
+>    the defect it failed to draw. The value it left unchanged is `false`, on a restart that
+>    succeeded: `auth.ok` is `null` on the fresh process post-flight always probes, the predicate
+>    required a strict `true`, and the retry budget (10 × 1s) is two orders of magnitude smaller
+>    than the wait for the next probe (600s, not shortened by an inconclusive result). "Unchanged
+>    return value" and "unchanged operator outcome" are different claims; only the first was
+>    checked.
+> 4. **Doctor's falsy check is gone.** `:668` / `:869` collapsed `null` into `false` and then
+>    printed a hard-coded `auth.ok=false` for a state that never occurred. Both sites now route
+>    through one `classifyAuthOk()` helper that keeps the three-valued domain three-valued. The
+>    subsection above ("Downstream: `scripts/doctor.mjs`") remains correct on its own case: a
+>    preserved conclusive success still PASSes.
+>
+> The general lesson, and the reason #289's regression tests are shaped the way they are: this
+> section reasoned about consumers **in prose** while the test suite asserted only on the endpoint
+> payload. `test-features.mjs` § "ADR 0010 CONSUMER REPLAY" now replays this ADR's own motivating
+> incident through every consumer and asserts each one's **decision**.
+
 ### Field additions
 
 `/health`'s `auth` object gains two fields, `lastOutcome` and `consecutiveFailures`. This is **additive**: no existing field is renamed, removed, or re-typed, and every existing `/health` consumer reads what it already read. That is the same standard ADR 0007 applied when it added the `tui` block to `/health` — "the change is additive … no existing `/health` field is changed, renamed, removed, or re-typed" — and it is the bar ADR 0006's grandfather provision sets for a non-ADR contract change. The `status` **semantics** change is what needs this ADR; the new fields ride along under the ADR 0007 precedent.
