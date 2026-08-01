@@ -9922,6 +9922,23 @@ function _bwHarnessRun({
   // curlHealthExit/default-refusal arms, all of which still require curl to have started).
   // Default false leaves the curl stub's behavior byte-identical to before this issue.
   curlAbsent = false,
+  // Independent review round 1 (fold-in B): reproduces "curl is present on $PATH but not
+  // executable" (the reviewer's own repro: `chmod 000` a real curl -> exit 126 + "Permission
+  // denied"). Uses the same echo-and-exit shadow-stub technique as curlAbsent, not a literal
+  // chmod-644 file -- verified directly that bash's own PATH search does not stop at a
+  // non-executable candidate and report 126, it SKIPS it and keeps searching later PATH
+  // entries, so a chmod-based stub here would silently fall through to the real, executable
+  // /usr/bin/curl this harness's own fallback provides for python3/cat/sed/mktemp (caught by
+  // running a first attempt built that way, not assumed). See the stub's own comment below for
+  // the exact repro that surfaced this.
+  curlNotExecutable = false,
+  // Independent review round 1 (fold-in A): shadows the real `mktemp` on $PATH with a stub that
+  // always fails, to prove `_curl_or_die` now treats a `mktemp` failure as FATAL (an honest
+  // error) rather than falling back to the predictable, world-readable, symlink-following path
+  // the review flagged as a security issue. Same shadow-stub technique as
+  // curlAbsent/openclawAbsent/pythonAbsent. Default false leaves the real system `mktemp`
+  // (resolved via the harness's own /usr/bin:/bin fallback) untouched.
+  mktempFails = false,
   // Issue #242 test-setup note (NOT a fix for a #242/#241 defect — a separate, pre-existing,
   // previously-undiscovered one, found incidentally while adding these tests, out of scope for
   // both PRs and left for its own issue): `_curl()`'s `curl "${_AUTH_ARGS[@]}" "$@"` references
@@ -10101,32 +10118,66 @@ function _bwHarnessRun({
     // first) and, when curlAbsent is true, unconditionally exits 127 — bash's own reserved
     // "command not found" code, which curl itself never produces — without attempting any
     // network I/O, before curlResponseFiles/curlHealthExit are even consulted.
-    const curlResponseFiles = curlResponses.map((r, i) => {
-      const p = join(root, `curl-resp-${i}.json`);
-      testWriteFile(p, r.body ?? "");
-      return { match: r.match, exit: r.exit ?? 0, path: p };
-    });
-    mkStub("curl", curlAbsent ? [
-      `echo "FAKE-CURL-ABSENT-CALL $*" >> "${logPath}"`,
-      `exit 127`,
-    ].join("\n") : [
-      `echo "FAKE-CURL-CALL $*" >> "${logPath}"`,
-      `case "$*" in`,
-      ...curlResponseFiles.flatMap((r) => [
-        `  *${JSON.stringify(r.match)}*)`,
-        `    cat ${JSON.stringify(r.path)}`,
-        `    exit ${r.exit}`,
+    // Independent review round 1 (fold-in B): curlNotExecutable simulates "curl found on $PATH
+    // but not executable" (the reviewer's own repro: `chmod 000` a real curl -> exit 126 +
+    // "Permission denied"). A literal chmod-644 stub does NOT reliably reproduce this inside
+    // this harness: verified directly (env -i PATH="<stub-dir>:/usr/bin:/bin" bash -c 'curl
+    // --version') that bash's PATH search does not stop at a non-executable candidate and
+    // report 126 -- it SKIPS it and keeps searching later PATH entries, silently falling
+    // through to the real, executable /usr/bin/curl this harness's own fallback provides for
+    // python3/cat/sed/mktemp. (A first attempt at this option used chmod 0644 and the "money"
+    // test failed with the REAL curl's own network error instead of the intended 126 -- caught
+    // by running it, not assumed.) Using the same echo-and-exit shadow-stub technique as
+    // curlAbsent/openclawFailExit instead: portable, and does not depend on what a given host's
+    // /usr/bin:/bin happens to contain.
+    if (curlNotExecutable) {
+      mkStub("curl", [
+        `echo "FAKE-CURL-NOT-EXECUTABLE-CALL $*" >> "${logPath}"`,
+        `echo "bash: $0: Permission denied" >&2`,
+        `exit 126`,
+      ].join("\n"));
+    } else {
+      const curlResponseFiles = curlResponses.map((r, i) => {
+        const p = join(root, `curl-resp-${i}.json`);
+        testWriteFile(p, r.body ?? "");
+        return { match: r.match, exit: r.exit ?? 0, path: p };
+      });
+      mkStub("curl", curlAbsent ? [
+        `echo "FAKE-CURL-ABSENT-CALL $*" >> "${logPath}"`,
+        `exit 127`,
+      ].join("\n") : [
+        `echo "FAKE-CURL-CALL $*" >> "${logPath}"`,
+        `case "$*" in`,
+        ...curlResponseFiles.flatMap((r) => [
+          `  *${JSON.stringify(r.match)}*)`,
+          `    cat ${JSON.stringify(r.path)}`,
+          `    exit ${r.exit}`,
+          `    ;;`,
+        ]),
+        `  *"/health"*)`,
+        `    exit ${curlHealthExit}`,
         `    ;;`,
-      ]),
-      `  *"/health"*)`,
-      `    exit ${curlHealthExit}`,
-      `    ;;`,
-      `  *)`,
-      `    echo "FAKE-CURL: refusing unhandled invocation: $*" >&2`,
-      `    exit 94`,
-      `    ;;`,
-      `esac`,
-    ].join("\n"));
+        `  *)`,
+        `    echo "FAKE-CURL: refusing unhandled invocation: $*" >&2`,
+        `    exit 94`,
+        `    ;;`,
+        `esac`,
+      ].join("\n"));
+    }
+
+    // Independent review round 1 (fold-in A): mktempFails shadows the real `mktemp` (normally
+    // resolved via this harness's own /usr/bin:/bin fallback) with a stub that always fails, so
+    // `_curl_or_die`'s mktemp call fails too -- proving the fix treats that as FATAL rather than
+    // falling back to the predictable, world-readable, symlink-following path the review
+    // flagged. Prints its own stderr line (like a real `mktemp` failure would) rather than
+    // silently exiting, since #261's own lesson is "never discard stderr".
+    if (mktempFails) {
+      mkStub("mktemp", [
+        `echo "FAKE-MKTEMP-FAIL-CALL $*" >> "${logPath}"`,
+        `echo "mktemp: FAKE failure injected by test harness (mktempFails)" >&2`,
+        `exit 1`,
+      ].join("\n"));
+    }
 
     // Simulates issue #236's exact repro ("stubbed absent": a real executable file that always
     // reports command-not-found's own exit code) rather than trying to strip PATH of every
@@ -10717,6 +10768,37 @@ test("#261 stream parity: cmd_usage/cmd_keys-add 'proxy unreachable' guards now 
   assert.equal(main.stdout, "", `cmd_usage (main): stdout must stay clean; got: ${JSON.stringify(main.stdout)}`);
   const keysAdd = _bwHarnessRun({ args: ["keys", "add", "laptop-marker"], adminKey: "test-admin-key-marker" });
   assert.equal(keysAdd.stdout, "", `cmd_keys add: stdout must stay clean; got: ${JSON.stringify(keysAdd.stdout)}`);
+});
+
+// ── Independent review round 1: two fold-ins ──────────────────────────────────────────────────
+console.log("\nocp _curl_or_die: independent review round 1 fold-ins (exit 126, mktemp security):");
+
+test("#261 fold-in B (independent review round 1): curl present but NOT EXECUTABLE (exit 126) is reported as a local fault, not 'proxy unreachable'", () => {
+  // Reviewer's own repro: `chmod 000` a real curl -> exit 126 -> "Error: proxy unreachable...",
+  // the exact headline this issue exists to kill, and this repo's own ENOEXEC footgun history
+  // (a corrupted `claude` native binary) makes this a real, not merely theoretical, scenario.
+  const r = _bwHarnessRun({ args: ["usage", "--by-key"], adminKey: "test-admin-key-marker", curlNotExecutable: true });
+  assert.notEqual(r.status, 0, `expected a nonzero exit; status=${r.status}`);
+  assert.ok(!r.stderr.includes("proxy unreachable") && !r.stdout.includes("proxy unreachable"),
+    `must NOT misattribute a non-executable curl binary to the proxy; stderr=${JSON.stringify(r.stderr)} stdout=${JSON.stringify(r.stdout)}`);
+  assert.ok(/curl/i.test(r.stderr), `expected the message to name curl/the local command failure, got stderr=${JSON.stringify(r.stderr)}`);
+});
+
+test("#261 fold-in A (independent review round 1, security): a mktemp failure is FATAL, not a silent fallback to a predictable/world-readable/symlink-following temp path", () => {
+  // The original fallback (`errfile="$TMPDIR/.ocp-curlerr.$$"`, used only when mktemp itself
+  // failed) was 0644 at a PID-predictable path, and a plain `>` redirect follows a pre-existing
+  // symlink there instead of refusing -- the review demonstrated a symlink-planted-in-advance
+  // attack truncating a victim file. This test proves the fallback is gone entirely: a mktemp
+  // failure must now produce an honest error, and curl must never even be invoked (nothing safe
+  // exists yet to redirect its stderr into).
+  const r = _bwHarnessRun({ args: ["usage", "--by-key"], adminKey: "test-admin-key-marker", mktempFails: true });
+  assert.notEqual(r.status, 0, `expected a nonzero exit; status=${r.status}`);
+  assert.ok(r.stderr.includes("could not create a secure temp file"),
+    `expected the explicit mktemp-failure message, got stderr=${JSON.stringify(r.stderr)}`);
+  assert.ok(_bwCalled(r.log, "FAKE-MKTEMP-FAIL-CALL"), `sanity check the mktemp-fails stub was actually reached; log=${JSON.stringify(r.log)}`);
+  assert.ok(!_bwCalled(r.log, "FAKE-CURL-CALL"),
+    `curl must never be invoked once mktemp has already failed -- there is nothing safe to ` +
+    `redirect its stderr into; log=${JSON.stringify(r.log)}`);
 });
 
 console.log("\nRestart-unit resolution (issue #233 defect 1) — macOS lsof exit-code handling:");

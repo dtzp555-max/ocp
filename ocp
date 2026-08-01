@@ -84,9 +84,32 @@ _pyfail() {
 # `_curl_or_die` never merges the two streams: the wrapped command's own stderr is captured to a
 # private temp file (never /dev/null — discarding it would just trade one misdiagnosis for a
 # silent one), and the exit status plus that captured text decide which message fires. Exit 127
-# is bash's own reserved "command not found" code (curl itself never produces it); the text
-# "command not found" in the captured stderr is bash's own diagnostic vocabulary, never curl's —
-# either signal means the shell failed to even start the command, not that it ran and failed.
+# is bash's own reserved "command not found" code (curl itself never produces it); exit 126 is
+# bash's own "found, but not executable" code (permission denied, ENOEXEC, a broken interpreter
+# line — this repo has its own history of exactly that shape, a corrupted `claude` native
+# binary). Independent review round 1: curl present but `chmod 000` reproduced exit 126 landing
+# in the "proxy unreachable" branch — the exact headline this issue exists to kill. Both codes,
+# plus "Permission denied"/"bad interpreter" in the captured stderr, now route to the could-not-
+# run branch. (The original text match for "command not found" alongside the 127 check was
+# dropped per the same review: bash's exit 127 already carries the full signal unconditionally,
+# and unlike this issue's own #263 sibling — which inspects a subcommand DISPATCHER's combined
+# stdout+stderr and genuinely needed the text arm removed to avoid a false positive — curl's own
+# stderr can't organically contain that phrase, so the arm was redundant, not merely benign.)
+#
+# Independent review round 1 (security, LOW-MEDIUM): the original mktemp fallback
+# (`errfile="${TMPDIR:-/tmp}/.ocp-curlerr.$$"`, used only if `mktemp` itself failed) created its
+# file via plain shell redirection, not `mktemp` — world-readable (0644 under a standard 022
+# umask, vs. `mktemp`'s 0600) at a PID-predictable path under a typically-shared `/tmp`, and a
+# plain `>` redirect FOLLOWS a pre-existing symlink at that path rather than refusing, so a
+# symlink planted in advance at the predictable name gets its target truncated. The content
+# curl's own stderr carries is normally harmless ("command not found" never echoes the request's
+# own arguments), but under `bash -x` tracing an expanded `Authorization: Bearer <admin key>`
+# would reach stderr and could land in that 0644 file. Fixed by making a `mktemp` failure fatal
+# instead of falling back to a predictable path at all: `mktemp` is a POSIX utility present on
+# every host this repo targets, so losing the ability to run `_curl_or_die` on a hypothetical
+# host without it is an acceptable trade for removing the vulnerable fallback outright. mktemp's
+# own stderr is left unredirected (never `2>/dev/null` — see this file's own #261 lesson) so a
+# genuine `mktemp` failure (e.g. a full or unwritable $TMPDIR) is visible, not swallowed.
 #
 # Usage: `data=$(_curl_or_die "<network-failure label>" _curl -sf ... "$url") || exit 1` — the
 # first argument after the label is the command to run (`_curl` for authenticated call sites,
@@ -98,13 +121,16 @@ _pyfail() {
 _curl_or_die() {
   local network_label="$1"; shift
   local errfile out status err
-  errfile=$(mktemp "${TMPDIR:-/tmp}/ocp-curlerr.XXXXXX" 2>/dev/null) || errfile="${TMPDIR:-/tmp}/.ocp-curlerr.$$"
+  errfile=$(mktemp "${TMPDIR:-/tmp}/ocp-curlerr.XXXXXX") || {
+    echo "Error: could not create a secure temp file to capture curl's diagnostic output (mktemp failed, see error above) — cannot safely determine why the request failed" >&2
+    return 1
+  }
   out=$("$@" 2>"$errfile")
   status=$?
   err=$(cat "$errfile" 2>/dev/null)
   rm -f "$errfile"
   if [[ $status -ne 0 ]]; then
-    if [[ $status -eq 127 ]] || [[ "$err" == *"command not found"* ]]; then
+    if [[ $status -eq 127 ]] || [[ $status -eq 126 ]] || [[ "$err" == *"Permission denied"* ]] || [[ "$err" == *"bad interpreter"* ]]; then
       echo "Error: could not run curl (${err:-exit status $status}) — this is a local shell/environment fault, not a proxy problem" >&2
     else
       echo "Error: $network_label" >&2
