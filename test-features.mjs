@@ -13346,6 +13346,95 @@ test("#278 cmd_connect: the diagnostic now goes to stderr, not stdout (previousl
   assert.equal(r.stdout.includes("Cannot reach"), false, `the diagnostic must not land on stdout; got stdout=${JSON.stringify(r.stdout)}`);
 });
 
+// Issues #296, #299, #300: the probes the #261 → #267 → #273 → #278 → #286 arc left behind.
+// Each collapsed "curl could not be run" into an `else` branch that asserts a SPECIFIC cause —
+// "bound to localhost only", "Proxy not responding after restart", "key may be invalid or
+// revoked", "proxy is reachable but chat completion did not succeed" — so a local environment
+// fault was narrated as a fact about the proxy, with remediation pointing the wrong way.
+//
+// These are behavioral, not textual. A source-grep for `curl` would have been the cheap guard
+// (#300 suggested one), but it passes the moment a bare curl reappears in a shape the pattern
+// did not anticipate — which is exactly how three separate enumeration passes each believed
+// they had the full list and each was wrong. Every case below removes curl (or makes it exit
+// 127) and asserts on what the command SAYS, and every one is paired with a control proving the
+// genuine-remote-failure diagnosis is still produced — otherwise "we deleted the wrong message"
+// would pass just as well as "we fixed it".
+console.log("\nocp: the remaining bare-curl probes distinguish a local fault from a remote condition (#296, #299, #300):");
+
+test("#296 ocp lan: curl missing from $PATH must NOT be narrated as 'bound to localhost only'", () => {
+  const r = _bwHarnessRun({ args: ["lan"], curlAbsent: true });
+  assert.ok(!r.stdout.includes("bound to localhost only") && !r.stderr.includes("bound to localhost only"),
+    `a missing local curl must not be reported as a proxy bind-address fact — the remediation printed ` +
+    `directly under that line sends the operator to set CLAUDE_BIND and restart a service that was ` +
+    `never the problem; stdout=${JSON.stringify(r.stdout)} stderr=${JSON.stringify(r.stderr)}`);
+  assert.ok(/curl/i.test(r.stderr), `expected the message to name curl, got stderr=${JSON.stringify(r.stderr)}`);
+  assert.ok(r.stdout.includes("Undetermined"),
+    `the status line must decline to characterise LAN reachability at all, got stdout=${JSON.stringify(r.stdout)}`);
+});
+
+test("#296 control: ocp lan with curl present but the port genuinely unreachable still says 'Not LAN-accessible'", () => {
+  const r = _bwHarnessRun({ args: ["lan"] });
+  assert.ok(r.stdout.includes("Not LAN-accessible"),
+    `a GENUINE unreachable port must still produce the original diagnosis — proves the fix does not ` +
+    `simply delete the message, got stdout=${JSON.stringify(r.stdout)}`);
+  assert.ok(!r.stdout.includes("Undetermined"),
+    `and must NOT take the undetermined arm, got stdout=${JSON.stringify(r.stdout)}`);
+});
+
+test("#299 cmd_restart: curl missing from $PATH must NOT report a successful restart as 'Proxy not responding after restart'", () => {
+  const r = _bwHarnessRun({ args: ["restart"], overrideCmdRestart: false, serviceStubsSucceed: true, curlAbsent: true });
+  assert.ok(!r.stdout.includes("Proxy not responding after restart") && !r.stderr.includes("Proxy not responding after restart"),
+    `this probe is the restart's OWN verdict and it reaches _cmd_update_light's restart_status (#255) — ` +
+    `a local curl fault must not be reported as the proxy being down; ` +
+    `stdout=${JSON.stringify(r.stdout)} stderr=${JSON.stringify(r.stderr)}`);
+  assert.ok(r.stdout.includes("UNKNOWN"),
+    `the verdict must say the proxy's state is unknown rather than asserting either outcome, got stdout=${JSON.stringify(r.stdout)}`);
+  assert.ok(/curl/i.test(r.stderr), `expected the message to name curl, got stderr=${JSON.stringify(r.stderr)}`);
+});
+
+test("#299 control: cmd_restart with curl present but the proxy genuinely not answering still says 'Proxy not responding after restart'", () => {
+  const r = _bwHarnessRun({ args: ["restart"], overrideCmdRestart: false, serviceStubsSucceed: true, curlHealthExit: 1 });
+  assert.ok(r.stdout.includes("Proxy not responding after restart"),
+    `a GENUINE post-restart failure must still be reported as such — proves the fix does not just ` +
+    `delete the failure branch, got stdout=${JSON.stringify(r.stdout)}`);
+  assert.ok(!r.stdout.includes("UNKNOWN"),
+    `and must NOT take the undetermined arm, got stdout=${JSON.stringify(r.stdout)}`);
+});
+
+// For the two `cmd_connect` sites the local fault has to be injected at the /v1/models step
+// SPECIFICALLY: `curlAbsent` would kill the flow at cmd_connect's first probe (already covered
+// by the #278 tests above) and never reach these. A `curlResponses` arm that exits 127 does it —
+// the stub runs and returns 127, which is indistinguishable from bash's own "command not found"
+// to `_curl_or_die`, since all it ever sees is the exit status and the captured stderr.
+test("#300 cmd_connect /v1/models: a local curl fault must NOT be narrated as 'key may be invalid or revoked'", () => {
+  const r = _bwHarnessRun({
+    args: ["connect", "192.0.2.1"],
+    curlHealthExit: 0,
+    curlResponses: [{ match: "/v1/models", body: "", exit: 127 }],
+  });
+  assert.ok(!r.stdout.includes("key may be invalid or revoked") && !r.stderr.includes("key may be invalid or revoked"),
+    `'ocp connect' is what a new user runs against an unverified machine — a local curl fault must not ` +
+    `send them to regenerate a perfectly good key; stdout=${JSON.stringify(r.stdout)} stderr=${JSON.stringify(r.stderr)}`);
+  assert.ok(/curl/i.test(r.stderr),
+    `expected _curl_or_die's local-fault message to name curl, got stderr=${JSON.stringify(r.stderr)}`);
+});
+
+test("#300 control: cmd_connect /v1/models with curl running and the remote genuinely refusing still names the key as a possible cause", () => {
+  const r = _bwHarnessRun({
+    args: ["connect", "192.0.2.1"],
+    curlHealthExit: 0,
+    curlResponses: [{ match: "/v1/models", body: "", exit: 22 }],
+  });
+  // The keyless arm carries the label without the "(the key may be invalid or revoked)"
+  // parenthetical — that clause belongs only to the arm that actually sent a key, which is the
+  // point of having two labels. Assert the part both arms share.
+  assert.ok(r.stderr.includes("the remote refused or did not serve /v1/models"),
+    `a GENUINE remote refusal must still be diagnosed as a remote refusal — proves the fix does not ` +
+    `just delete the diagnosis, got stderr=${JSON.stringify(r.stderr)}`);
+  assert.ok(!/could not run curl/.test(r.stderr),
+    `and must NOT be misreported as a local fault, got stderr=${JSON.stringify(r.stderr)}`);
+});
+
 console.log("\nRestart-unit resolution (issue #233 defect 1) — macOS lsof exit-code handling:");
 
 // Background: `lsof -nP -iTCP:<port> -sTCP:LISTEN` EXITS 1 with EMPTY stdout when nothing
