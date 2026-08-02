@@ -4414,10 +4414,50 @@ test("buildBindCheckCommand: darwin falls back to the bare name when the absolut
 // `grep` exits 1, never 127). No pipe, no grep -- port matching now happens in JS
 // (ssLineMatchesPort) against the unfiltered `ss -tlnp` output, so `ss`'s own real exit status
 // survives to classifyBindCheck()'s catch block.
-test("buildBindCheckCommand: linux uses bare 'ss -tlnp', no pipe/grep (issue #246 second half, MED-2 fix)", () => {
-  const cmd = buildBindCheckCommand({ port: _startShTestPort, platform: "linux" });
-  assert.equal(cmd, "ss -tlnp");
-  assert.ok(!cmd.includes("|"), `must not pipe through grep (masks ss's own exit status): ${cmd}`);
+// Issue #298: this test used to assert `cmd === "ss -tlnp"` with no `existsSyncFn` injected,
+// which made it host-dependent the moment the linux branch gained absolute-path resolution:
+// it passes on macOS (where /usr/sbin/ss does not exist, so the fallback fires) and fails on a
+// Debian CI runner (where it does). Both branches are now driven explicitly, mirroring the
+// darwin pair directly above — that is what makes them discriminating rather than incidentally
+// green on whatever host happens to run them.
+test("buildBindCheckCommand: linux prefers the resolveBinaryPath-preferred absolute ss path (#298)", () => {
+  const cmd = buildBindCheckCommand({ port: _startShTestPort, platform: "linux", ssPath: "/usr/sbin/ss", existsSyncFn: () => true });
+  assert.equal(cmd, "/usr/sbin/ss -tlnp",
+    `a restricted PATH without /usr/sbin loses bare 'ss' on Debian/Raspberry Pi OS — the same ` +
+    `exposure #246 fixed for lsof on the darwin branch; got ${cmd}`);
+});
+
+test("buildBindCheckCommand: linux falls back to the bare name when the absolute ss path does not exist (#298)", () => {
+  const cmd = buildBindCheckCommand({ port: _startShTestPort, platform: "linux", ssPath: "/usr/sbin/ss", existsSyncFn: () => false });
+  assert.equal(cmd, "ss -tlnp",
+    `a host whose ss is elsewhere must be no worse off than before the fix — same fallback ` +
+    `direction as the darwin branch; got ${cmd}`);
+});
+
+test("buildBindCheckCommand: linux checks the absolute ss path, not some other path (#298)", () => {
+  let seen = null;
+  buildBindCheckCommand({ port: _startShTestPort, platform: "linux", ssPath: "/usr/sbin/ss", existsSyncFn: (p) => { seen = p; return true; } });
+  assert.equal(seen, "/usr/sbin/ss", `expected the ss absolute path to be the one probed, got ${JSON.stringify(seen)}`);
+});
+
+test("buildBindCheckCommand: linux still uses no pipe/grep (issue #246 second half, MED-2 fix — preserved by #298)", () => {
+  for (const exists of [true, false]) {
+    const cmd = buildBindCheckCommand({ port: _startShTestPort, platform: "linux", existsSyncFn: () => exists });
+    assert.ok(!cmd.includes("|"), `must not pipe through grep (masks ss's own exit status): ${cmd}`);
+    assert.ok(cmd.endsWith(" -tlnp"), `flags must be unchanged by the path resolution: ${cmd}`);
+  }
+});
+
+test("classifyBindCheck: threads ssPath through to the command it runs (#298 — otherwise the fix is unreachable from the caller)", () => {
+  let ran = null;
+  classifyBindCheck({
+    port: _startShTestPort, platform: "linux", ssPath: "/opt/custom/ss",
+    existsSyncFn: () => true,
+    execFn: (cmd) => { ran = cmd; return ""; },
+  });
+  assert.equal(ran, "/opt/custom/ss -tlnp",
+    `classifyBindCheck is the only caller setup.mjs reaches; if it drops ssPath the resolution ` +
+    `never happens in production. got ${JSON.stringify(ran)}`);
 });
 
 test("buildBindCheckCommand: darwin branch never redirects stderr to /dev/null (issue #246 second half's actual defect)", () => {
