@@ -14906,6 +14906,80 @@ test("replay → doctor DECIDES kind!=fix_oauth and does not block the next upda
   assert.equal(r.fail_count, 0);
 });
 
+// ── Issue #304: warn_count's WARN-multiplicity gap ──────────────────────────
+// `warn_count` has two computation sites, and the issue reports that mutating EITHER to
+// `Math.min(1, checks.filter(c => c.level === "WARN").length)` survives the whole suite. Both
+// survive, but for DIFFERENT reasons, and the categories are the point — conflating them would
+// produce one useless test and leave the real gap open:
+//
+//   - doctor.mjs:879 (the full run) — genuinely (a) NO COVERAGE. A 2-WARN shape is perfectly
+//     reachable there; nothing in the suite produced one, so every exercised shape had at most
+//     one WARN and a cap at 1 was indistinguishable from the truth. The first test below closes it.
+//
+//   - doctor.mjs:981 (`runOauthOnly`, the `--check oauth` path) — (c) UNREACHABLE BY
+//     CONSTRUCTION. That function has exactly three push sites and all three push the same id,
+//     `oauth_ok`, on mutually exclusive branches, so its `checks` array can never hold more than
+//     one entry and warn_count there is 0 or 1 by construction. A cap at 1 is not wrong on that
+//     path; it is simply unobservable, and a test claiming to "cover" it would be asserting
+//     something the code cannot violate.
+//
+// What the second test pins is therefore the PREMISE, not the cap: if a future change adds a
+// second check to that path, the gap becomes real, and this test fails at that moment rather than
+// leaving a silent cap behind. That is the only guard that has any content there.
+console.log("\nwarn_count counts every WARN, not just the first (#304):");
+
+test("#304 (the money test): a doctor shape with TWO WARNs reports warn_count === 2", async () => {
+  // Both WARN sources are already in this file, from different issues; the gap was that no test
+  // ever combined them. oauth_ok WARN comes from #289's FRESH (inconclusive) auth body;
+  // multi_unit_boot_race WARN comes from #220's two-enabled-units mock. Fully mocked host, so
+  // this is deterministic rather than depending on how many units the runner happens to have.
+  const r = await runDoctor({
+    skipNetwork: false,
+    mockVersion: "v3.26.0",
+    mockLatest: "v3.26.0",
+    mockHealth: { status: 200, body: { ...rpHealth("fresh"), version: "3.26.0" } },
+    mockPlatform: "linux",
+    run: (cmd) => {
+      if (cmd.includes("--user list-unit-files")) return "ocp-proxy.service enabled\n";
+      if (cmd.includes("list-unit-files")) return "ocp.service enabled\n";
+      if (cmd.includes("--user show")) return FIELD_INCIDENT_USER_SHOW;
+      if (cmd.includes("systemctl show")) return FIELD_INCIDENT_SYSTEM_SHOW;
+      throw new Error("unexpected: " + cmd);
+    },
+  });
+  const warnIds = r.checks.filter(c => c.level === "WARN").map(c => c.id).sort();
+  // Non-vacuous on the input side first: if the mock ever stops producing two distinct WARNs,
+  // this test would "pass" a cap-at-1 mutation for the wrong reason.
+  assert.deepEqual(warnIds, ["multi_unit_boot_race", "oauth_ok"],
+    `precondition: this shape must carry exactly these two WARNs, got ${JSON.stringify(warnIds)}`);
+  assert.equal(r.warn_count, 2,
+    `doctor.mjs prints "Summary: N FAIL, M WARN" from this number, so a cap at 1 tells the ` +
+    `operator one of two real warnings does not exist; got ${r.warn_count}`);
+  assert.equal(r.fail_count, 0, "neither WARN may be counted as a failure");
+});
+
+test("#304 premise: the --check oauth path pushes exactly one check, which is why a cap at 1 is unobservable THERE", async () => {
+  // Three health shapes covering runOauthOnly's three mutually exclusive push branches
+  // (unreachable / 200-but-unparseable / parsed-and-classified). Each must yield exactly one
+  // check. When that stops being true, the warn_count cap on that path becomes observable and
+  // this test is the thing that says so.
+  const shapes = [
+    { label: "service unreachable", health: { status: 0, error: "connect ECONNREFUSED" } },
+    { label: "200 with an empty body", health: { status: 200, body: null } },
+    { label: "parsed + classified (FRESH → WARN)", health: { status: 200, body: rpHealth("fresh") } },
+  ];
+  for (const { label, health } of shapes) {
+    const r = await runDoctor({ checkOnly: "oauth", skipNetwork: true, mockHealth: health });
+    assert.equal(r.checks.length, 1,
+      `${label}: runOauthOnly must push exactly one check — if this ever exceeds 1, a 2-WARN ` +
+      `shape becomes reachable on that path and doctor.mjs:981 needs the same coverage as :879; ` +
+      `got ${JSON.stringify(r.checks.map(c => c.id))}`);
+    assert.equal(r.checks[0].id, "oauth_ok", `${label}: and it must be oauth_ok`);
+    assert.ok(r.warn_count === 0 || r.warn_count === 1,
+      `${label}: with one check, warn_count is 0 or 1 by construction; got ${r.warn_count}`);
+  }
+});
+
 test("replay → doctor's message states the OBSERVED value, never a hard-coded auth.ok=false", async () => {
   const r = await runDoctor({
     mockVersion: `v${RP_VERSION}`, mockLatest: `v${RP_VERSION}`,
