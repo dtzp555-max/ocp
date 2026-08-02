@@ -2864,13 +2864,27 @@ async function handleSettings(req, res) {
 }
 
 // ── Handle chat completions ─────────────────────────────────────────────
-// Default 5 MB, byte-for-byte unchanged unless CLAUDE_MAX_BODY_SIZE is set. Base64
-// image payloads inflate ~33%; operators enabling large images (issue #110) can
-// raise this to admit bigger requests. Parsed fail-closed (PR #154 review F3): a
-// bad value (`unlimited` → NaN, `5MB` → 5) must not disable the body cap or brick
-// the proxy — parseIntEnv keeps the 5 MB default and warns instead.
+// This cap is compared against `body.length` — UTF-16 code units, i.e. CHARACTERS — because the
+// accumulator below is a JS string (`body += chunk` decodes each Buffer as UTF-8). Issue #310: it
+// was labelled "5MB", which reads as bytes to every reader, including two review rounds that
+// concluded a 3,000,000-character CJK prompt would be rejected here. It would not: 3,000,000 is
+// well under the 5,242,880-character cap, though it is 9,000,000 bytes on the wire. That label
+// cost two review rounds and nearly shipped operator guidance to raise a knob nobody needed to
+// touch.
+//
+// The comparison is deliberately LEFT counting characters. A byte cap of the same number is never
+// more permissive — UTF-8 byte length >= UTF-16 unit length for every character class (ASCII 1:1,
+// Latin-1 accents 2:1, CJK 3:1, astral 4:2) — so switching to bytes would reject bodies accepted
+// today. That is a contract change on a Class B.1 surface under CLAUDE.md's dividing test, not a
+// label fix, and it is not what #310 is for. What changes here is that the label and the 413 body
+// now state which quantity they measured, so nobody reasons in the wrong unit again.
+//
+// Parsed fail-closed (PR #154 review F3): a bad value (`unlimited` → NaN, `5MB` → 5) must not
+// disable the body cap or brick the proxy — parseIntEnv keeps the default and warns instead.
 const MAX_BODY_SIZE = parseIntEnv("CLAUDE_MAX_BODY_SIZE", 5 * 1024 * 1024);
-const MAX_BODY_SIZE_LABEL = `${Math.round(MAX_BODY_SIZE / (1024 * 1024))}MB`;
+// No "MB": the number is a character count and any byte-flavoured unit on it is a lie. Deliberately
+// not `toLocaleString()` — that is locale-sensitive and would make the 413 body vary by host.
+const MAX_BODY_SIZE_LABEL = `${MAX_BODY_SIZE} characters`;
 
 // Set of all valid model identifiers (canonical IDs + aliases)
 const VALID_MODELS = new Set(Object.keys(MODEL_MAP));
@@ -2915,7 +2929,10 @@ async function handleChatCompletions(req, res) {
     for await (const chunk of req) {
       body += chunk;
       if (body.length > MAX_BODY_SIZE) {
-        return jsonResponse(res, 413, { error: { message: `Request body too large (max ${MAX_BODY_SIZE_LABEL})`, type: "invalid_request_error" } });
+        // #310: the message names the unit. A client that reads "5MB" and shrinks its payload by
+        // byte count is optimising against the wrong quantity — a multi-byte body is several times
+        // this limit on the wire and still admitted.
+        return jsonResponse(res, 413, { error: { message: `Request body too large (max ${MAX_BODY_SIZE_LABEL}; this limit counts characters, not bytes)`, type: "invalid_request_error" } });
       }
     }
   } catch (e) {

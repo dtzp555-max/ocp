@@ -236,7 +236,7 @@ The canonical list lives in [`models.json`](./models.json) — the single source
 | `CLAUDE_ALLOWED_TOOLS` | `Bash,Read,...,Agent` | Comma-separated tools to pre-approve |
 | `CLAUDE_SKIP_PERMISSIONS` | `false` | Bypass all permission checks |
 | `CLAUDE_MCP_CONFIG` | *(unset)* | Path to an MCP server config JSON, passed to the spawned `claude` as `--mcp-config` (both the `-p` path and TUI `OCP_TUI_FULL_TOOLS` panes) |
-| `CLAUDE_MAX_BODY_SIZE` | `5242880` | Max request body size (bytes, default 5 MB). Base64 image payloads inflate ~33%; raise this to admit larger multimodal requests. Fail-closed parsing: a garbage value keeps the default. |
+| `CLAUDE_MAX_BODY_SIZE` | `5242880` | Max request body size, counted in **characters** (UTF-16 code units), not bytes — the body is accumulated as a JS string, so a multi-byte payload can be several times this size on the wire and still be admitted (5,242,880 CJK characters is ~15 MB). Base64 image payloads are ASCII, so for those the two counts coincide and the ~33% base64 inflation applies as written; raise this to admit larger multimodal requests. Fail-closed parsing: a garbage value keeps the default. |
 | `CLAUDE_IMAGE_ALLOW_URL` | `false` | Allow remote `http(s)` image URLs in `image_url` parts. **Off by default** (v1 supports base64 `data:` URIs only). When on, the URL is passed through to Anthropic as a `url` image source — **OCP does not fetch it** (no OCP-side SSRF surface); unreachable/blocked URLs surface as an API error. |
 | `CLAUDE_MAX_IMAGE_BYTES` | `5242880` | Per-image decoded-byte cap (default 5 MB). Over-cap images get `HTTP 413`. |
 | `CLAUDE_MAX_IMAGES` | `20` | Max image parts per request. Over-cap gets `HTTP 413`. |
@@ -497,7 +497,7 @@ silent drop):
 
 | Cap | Env var | Default | Error |
 |-----|---------|---------|-------|
-| Request body | `CLAUDE_MAX_BODY_SIZE` | 5 MB | `413` request body too large |
+| Request body | `CLAUDE_MAX_BODY_SIZE` | 5,242,880 characters | `413` request body too large |
 | Per-image bytes | `CLAUDE_MAX_IMAGE_BYTES` | 5 MB | `413` `image_too_large` |
 | Total image bytes | `CLAUDE_MAX_IMAGE_TOTAL_BYTES` | 20 MB | `413` `images_too_large` |
 | Image count | `CLAUDE_MAX_IMAGES` | 20 | `413` `too_many_images` |

@@ -1692,6 +1692,61 @@ ltTest("integration: a synchronous pre-spawn throw must not leak stats.activeReq
   } finally { child.kill("SIGKILL"); _ltRmRetry(dir); }
 });
 
+// ── The request-body cap counts CHARACTERS, and now says so (#310) ───────────
+// `MAX_BODY_SIZE` is compared against `body.length` — UTF-16 code units — because the accumulator
+// is a JS string. It was labelled "5MB". That label is what made two review rounds of #307
+// conclude a 3,000,000-character CJK prompt would be rejected here, write that conclusion into
+// ADR 0011 with an arithmetic threshold computed against the wrong quantity, and nearly ship
+// operator guidance to raise a knob nobody needed to touch.
+//
+// Both tests drive a real server child with the cap lowered to 1000 via CLAUDE_MAX_BODY_SIZE, so
+// the discriminating case costs milliseconds instead of a 9 MB request. The cap is left counting
+// characters (switching to bytes would reject bodies accepted today — a Class B.1 contract
+// change, not a label fix); what these pin is that the unit is stated and that the behaviour is
+// the one the unit describes.
+console.log("\nRequest body cap counts characters, not bytes, and the 413 says which (#310):");
+
+ltTest("integration (#310, the money test): a body far OVER the cap in BYTES but under it in CHARACTERS is admitted", async () => {
+  const dir = ltMkdir(); const fake = ltFake(dir);
+  const { child, buf, port } = await ltBootFresh({ CLAUDE_BIN: fake, CLAUDE_MAX_BODY_SIZE: "1000" }, dir);
+  try {
+    const up = await ltWait(() => buf.out.includes("listening on") || buf.spawnErr, 20000);
+    assert.ok(up && !buf.spawnErr, `did not start: ${buf.spawnErr ? buf.spawnErr.message : buf.err.slice(0, 300)}`);
+    // 600 CJK characters: 600 UTF-16 units, 1800 UTF-8 bytes. Both preconditions are asserted
+    // rather than assumed — if JSON escaping or the wrapper ever changed the arithmetic, this
+    // test would otherwise pass while exercising nothing.
+    const body = { model: "haiku", messages: [{ role: "user", content: "中".repeat(600) }] };
+    const serialized = JSON.stringify(body);
+    const chars = serialized.length;
+    const bytes = Buffer.byteLength(serialized, "utf8");
+    assert.ok(chars < 1000, `precondition: body must be UNDER the cap in characters, got ${chars}`);
+    assert.ok(bytes > 1000, `precondition: body must be OVER the cap in bytes, got ${bytes}`);
+    const r = await ltPostStatus(port, body);
+    assert.notEqual(r.status, 413,
+      `${chars} characters / ${bytes} bytes was rejected. The cap counts characters, so this body ` +
+      `must be admitted — a 413 here would mean the comparison changed to bytes, which is a ` +
+      `contract change on a Class B.1 surface, not a label fix. body=${r.text.slice(0, 200)}`);
+  } finally { child.kill("SIGKILL"); _ltRmRetry(dir); }
+});
+
+ltTest("integration (#310): a body over the cap in characters is still rejected, and the 413 names the unit it measured", async () => {
+  const dir = ltMkdir(); const fake = ltFake(dir);
+  const { child, buf, port } = await ltBootFresh({ CLAUDE_BIN: fake, CLAUDE_MAX_BODY_SIZE: "1000" }, dir);
+  try {
+    const up = await ltWait(() => buf.out.includes("listening on") || buf.spawnErr, 20000);
+    assert.ok(up && !buf.spawnErr, `did not start: ${buf.spawnErr ? buf.spawnErr.message : buf.err.slice(0, 300)}`);
+    const body = { model: "haiku", messages: [{ role: "user", content: "x".repeat(2000) }] };
+    assert.ok(JSON.stringify(body).length > 1000, "precondition: body must exceed the cap in characters");
+    const r = await ltPostStatus(port, body);
+    assert.equal(r.status, 413, `expected the cap to still reject an oversized body; got ${r.status}: ${r.text.slice(0, 200)}`);
+    assert.match(r.text, /characters/,
+      `the 413 must name the quantity it measured — a client that reads "5MB" and shrinks its ` +
+      `payload by byte count is optimising against the wrong number; got ${r.text.slice(0, 200)}`);
+    assert.ok(!/\dMB\b/.test(r.text),
+      `the 413 must not carry a byte-flavoured unit on a character count; got ${r.text.slice(0, 200)}`);
+  } finally { child.kill("SIGKILL"); _ltRmRetry(dir); }
+});
+
 // ── Cache keys hash the RESOLVED model, not the alias string (#194) ──────────
 // models.json is read once at boot, so repointing an alias only takes effect on restart —
 // while the SQLite response_cache outlives it. Hashing the raw string would keep serving the
