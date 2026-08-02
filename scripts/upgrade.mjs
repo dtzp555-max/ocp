@@ -536,24 +536,100 @@ export function postFlightOk(body, target) {
 // opts.mockExec convention): a zero-arg function called instead of the real curl, returning a
 // /health body object or throwing (to simulate unreachable) — makes the retry loop testable
 // without a live server or real sleeps.
+// Issue #291. The probe lane used to swallow every failure into one bare `catch { /* retry */ }`,
+// so a missing curl (exit 127), a refused connection (curl 7), an HTTP error (curl 22 under -f), a
+// timeout (curl 28) and a non-JSON body all produced the identical outcome — and the caller then
+// reported "(unreachable)", a statement about the SERVICE, for a fault that may be entirely local.
+// That is the exact conflation the #261 → #267 → #273 → #278 → #286 arc removed from sixteen bash
+// sites, still present in the function those bash sites now DELEGATE their final verdict to
+// (`_cmd_update_light` and `_cmd_update_restart` both report whatever `--post-flight-only` says).
+//
+// Severity is diagnosis-quality, not outcome-inverting: post-flight has already failed by the time
+// this text is composed. What it changes is whether the operator is sent to debug a healthy
+// service or their own environment.
+//
+// `SyntaxError` is checked FIRST and on its own: JSON.parse is the only thing here that throws it,
+// and it carries no `.status`, so the exit-code arms below would otherwise misfile it as a network
+// condition.
+export function classifyPostFlightProbeFailure(e) {
+  if (e instanceof SyntaxError) {
+    return { kind: "unparseable", detail: "/health responded but the body is not JSON" };
+  }
+  const status = e?.status;
+  const text = String(e?.stderr || e?.message || "").trim();
+  const first = text.split("\n")[0];
+  // Same predicate as `ocp`'s `_curl_is_local_fault` and classifyBindCheck's could-not-run arm:
+  // 127/126 are bash's own reserved codes (curl never produces them), and dash phrases a missing
+  // command as "not found" without the word "command" at all.
+  if (status === 127 || status === 126
+      || /\bnot found\b|no such file or directory|permission denied|enoent/i.test(text)) {
+    return { kind: "probe-could-not-run", detail: first || `exit ${status ?? "unknown"}` };
+  }
+  if (status === 22) return { kind: "http-error", detail: first || "curl exit 22 (server returned a non-2xx status)" };
+  if (status === 28) return { kind: "timeout", detail: first || "curl exit 28 (operation timed out)" };
+  if (status === 7) return { kind: "unreachable", detail: first || "curl exit 7 (failed to connect)" };
+  return { kind: "unreachable", detail: first || (status != null ? `curl exit ${status}` : "unknown probe failure") };
+}
+
+// The operator-facing rendering of a post-flight failure. Exported and kept separate from the
+// classifier so the text a real `ocp update` prints is assertable without a subprocess — #291's
+// coverage note applies to the message every bit as much as to the classification, since the
+// message is the entire deliverable of this fix.
+//
+// The `lastSeen` branch is deliberately byte-identical to the pre-#291 text: when a body WAS read,
+// the old message was already correct and specific, and changing it would be churn.
+export function postFlightFailureSuffix(result) {
+  if (result?.lastSeen) {
+    return ` (last saw version=${result.lastSeen} — a stale process may still hold the port; check \`ss -ltnp\` / \`lsof -i\`)`;
+  }
+  const f = result?.lastFailure;
+  if (!f) return " (unreachable)";
+  switch (f.kind) {
+    case "probe-could-not-run":
+      return ` — the post-flight probe could not run on THIS machine (${f.detail}).`
+        + ` That is a local environment fault and says nothing about the service:`
+        + ` the upgrade may well have succeeded. Fix the local curl, then re-check with`
+        + ` \`ocp update --post-flight-only v${result.target}\`.`;
+    case "unparseable":
+      return ` — ${f.detail}. Something is answering on the port, but it is not this proxy.`;
+    case "http-error":
+      return ` — the service answered with a non-2xx status (${f.detail}).`;
+    case "timeout":
+      return ` — the probe timed out (${f.detail}); the service may be starting but not yet responsive.`;
+    default:
+      return ` (unreachable — ${f.detail})`;
+  }
+}
+
 export async function runPostFlightCheck(target, opts = {}) {
   const port = process.env.CLAUDE_PROXY_PORT || String(DEFAULT_PORT);
   const attempts = opts.attempts ?? 10;
   const intervalMs = opts.intervalMs ?? 1000;
+  // #291 coverage note, from the issue: every existing test drives `opts.mockProbe`, and the lane
+  // that actually ships is the execSync one — so a fix verified only through mockProbe would be
+  // verified on the lane that was never broken. `opts.execFn` makes the REAL lane drivable,
+  // mirroring classifyBindCheck's own injection convention in scripts/lib/start-sh.mjs.
+  const execFn = opts.execFn || execSync;
   const probe = opts.mockProbe || (() => {
-    const out = execSync(`curl -sf --max-time 2 http://127.0.0.1:${port}/health`).toString();
+    const out = execFn(`curl -sf --max-time 2 http://127.0.0.1:${port}/health`,
+      { stdio: ["ignore", "pipe", "pipe"] }).toString();
     return JSON.parse(out);
   });
-  let ok = false, lastSeen = null;
+  let ok = false, lastSeen = null, lastFailure = null;
   for (let i = 0; i < attempts; i++) {
     try {
       const body = probe();
       lastSeen = body.version;
-      if (postFlightOk(body, target)) { ok = true; break; }
-    } catch { /* retry */ }
+      if (postFlightOk(body, target)) { ok = true; lastFailure = null; break; }
+      // Reached the service and read a version, it is just not the one we are waiting for. That
+      // is a different thing from not reaching it, and the caller can now say which.
+      lastFailure = { kind: "version-mismatch", detail: `serving ${body?.version ?? "unknown"}` };
+    } catch (e) {
+      lastFailure = classifyPostFlightProbeFailure(e);
+    }
     if (i < attempts - 1) await new Promise(r => setTimeout(r, intervalMs));
   }
-  return { ok, lastSeen, target: String(target || "").replace(/^v/, "") };
+  return { ok, lastSeen, target: String(target || "").replace(/^v/, ""), lastFailure };
 }
 
 // Issue #257: `--target` was parsed from argv (see `_isMain()` below) and threaded into
@@ -1354,8 +1430,12 @@ if (_isMain()) {
       console.log(`✓ service now serving v${result.target}`);
       process.exit(0);
     } else {
+      // #291: this used to print a bare "(unreachable)" for every non-lastSeen failure — a claim
+      // about the SERVICE, printed just as readily when the fault was that curl could not run on
+      // this machine. The probe now reports which of the five it was, and only the genuinely
+      // remote ones are narrated as remote.
       console.error(`✗ service did not reach v${result.target} within the post-flight budget`
-        + (result.lastSeen ? ` (last saw version=${result.lastSeen} — a stale process may still hold the port; check \`ss -ltnp\` / \`lsof -i\`)` : " (unreachable)"));
+        + postFlightFailureSuffix(result));
       process.exit(1);
     }
   }

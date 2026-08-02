@@ -2344,7 +2344,7 @@ ltTest("integration: ltTest serialization keeps peak concurrent server.mjs child
 });
 
 // ── Upgrade Tests ──
-import { runUpgrade, postFlightOk, runPostFlightCheck, parseFlagValue } from "./scripts/upgrade.mjs";
+import { runUpgrade, postFlightOk, runPostFlightCheck, parseFlagValue, classifyPostFlightProbeFailure, postFlightFailureSuffix } from "./scripts/upgrade.mjs";
 
 console.log("\nUpgrade:");
 
@@ -2450,6 +2450,79 @@ test("postFlightOk: #289 — status=degraded rejects even with a stale auth.ok=t
 // is the fix: it polls /health and reuses postFlightOk() (tested above) rather than a second
 // hand-rolled predicate. opts.mockProbe/attempts/intervalMs make the retry loop itself
 // testable without a live server or real sleeps.
+// ── Issue #291: the REAL probe lane, and what it tells the operator ──────────
+// Every pre-existing test in the section below drives `opts.mockProbe`. The lane that SHIPS is the
+// execSync one, and that is the lane whose bare `catch { /* retry */ }` collapsed five distinct
+// failures into one "(unreachable)" — a claim about the SERVICE, printed just as readily when curl
+// could not run on this machine at all. Verifying the fix through mockProbe would have verified it
+// on the lane that was never broken, which is why `opts.execFn` exists and why every test here
+// uses it. The message is the deliverable of this fix, so it is asserted too.
+const _pf291 = (props) => { const e = new Error(props.message || "probe failed"); Object.assign(e, props); return e; };
+const _pf291Run = (execFn) => runPostFlightCheck("v3.27.0", { execFn, attempts: 1, intervalMs: 0 });
+
+console.log("\nrunPostFlightCheck's real probe lane distinguishes a local fault from a remote condition (#291):");
+
+test("#291 (the money test): a probe that COULD NOT RUN must not be reported as the service being unreachable", async () => {
+  const r = await _pf291Run(() => { throw _pf291({ status: 127, stderr: "sh: 1: curl: not found" }); });
+  assert.equal(r.ok, false);
+  assert.equal(r.lastFailure.kind, "probe-could-not-run",
+    `exit 127 is bash's own "command not found" — a LOCAL fault; got ${JSON.stringify(r.lastFailure)}`);
+  const msg = postFlightFailureSuffix(r);
+  assert.match(msg, /could not run on THIS machine/,
+    `the operator must be told the fault is local; got ${JSON.stringify(msg)}`);
+  assert.ok(!/\(unreachable\)/.test(msg),
+    `and must NOT get the bare "(unreachable)" verdict about a service this probe never reached — ` +
+    `that is the #261-family conflation, in the function the bash layer now delegates its final ` +
+    `truth-telling to; got ${JSON.stringify(msg)}`);
+});
+
+test("#291 control: a genuinely refused connection IS still reported as unreachable", async () => {
+  const r = await _pf291Run(() => { throw _pf291({ status: 7, stderr: "curl: (7) Failed to connect" }); });
+  assert.equal(r.lastFailure.kind, "unreachable",
+    `curl exit 7 is a real remote condition and must keep saying so — proves the fix does not just ` +
+    `relabel every failure as local; got ${JSON.stringify(r.lastFailure)}`);
+  assert.match(postFlightFailureSuffix(r), /unreachable/);
+});
+
+test("#291: exit 126 (found but not executable) is also a local fault", async () => {
+  const r = await _pf291Run(() => { throw _pf291({ status: 126, stderr: "bash: curl: Permission denied" }); });
+  assert.equal(r.lastFailure.kind, "probe-could-not-run", JSON.stringify(r.lastFailure));
+});
+
+test("#291: a non-JSON body is 'unparseable', not 'unreachable' — something answered", async () => {
+  const r = await _pf291Run(() => ({ toString: () => "<html>not json</html>" }));
+  assert.equal(r.lastFailure.kind, "unparseable",
+    `JSON.parse throws SyntaxError, which carries no .status — without its own arm it falls through ` +
+    `to the network default and gets narrated as a connection problem; got ${JSON.stringify(r.lastFailure)}`);
+  assert.match(postFlightFailureSuffix(r), /not this proxy/);
+});
+
+test("#291: an HTTP error and a timeout are each named, not merged into 'unreachable'", async () => {
+  const http = await _pf291Run(() => { throw _pf291({ status: 22, stderr: "curl: (22) The requested URL returned error: 503" }); });
+  assert.equal(http.lastFailure.kind, "http-error", JSON.stringify(http.lastFailure));
+  const to = await _pf291Run(() => { throw _pf291({ status: 28, stderr: "curl: (28) Operation timed out" }); });
+  assert.equal(to.lastFailure.kind, "timeout", JSON.stringify(to.lastFailure));
+  assert.notEqual(postFlightFailureSuffix(http), postFlightFailureSuffix(to),
+    "two different faults must not render the same sentence");
+});
+
+test("#291: a reachable service on the WRONG version keeps the pre-existing message byte-for-byte", async () => {
+  const r = await _pf291Run(() => ({ toString: () => JSON.stringify({ status: "ok", version: "3.26.0" }) }));
+  assert.equal(r.lastSeen, "3.26.0");
+  assert.equal(r.lastFailure.kind, "version-mismatch", JSON.stringify(r.lastFailure));
+  assert.equal(postFlightFailureSuffix(r),
+    " (last saw version=3.26.0 — a stale process may still hold the port; check `ss -ltnp` / `lsof -i`)",
+    "this branch was already correct and specific; rewording it would be churn");
+});
+
+test("#291: the real lane still SUCCEEDS when the service is serving the target", async () => {
+  // Non-vacuity for the whole group: if execFn injection had broken the happy path, every test
+  // above would still pass while the shipped lane was dead.
+  const r = await _pf291Run(() => ({ toString: () => JSON.stringify({ status: "ok", version: "3.27.0" }) }));
+  assert.equal(r.ok, true, "the injected lane must exercise the same success path as production");
+  assert.equal(r.lastFailure, null, "and must not leave a stale failure behind on success");
+});
+
 console.log("\nrunPostFlightCheck (#214):");
 
 test("runPostFlightCheck: succeeds immediately when the first probe already matches target", async () => {
