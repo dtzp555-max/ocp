@@ -113,6 +113,8 @@ OCP has two classes of endpoint. Rules 1–5 above were drafted in the aftermath
 
 ADR 0006 retroactively authorizes the B.2 endpoints listed in the inventory table below, **frozen at their current behaviour as of v3.16.4**. This is a one-time provision; it does not extend to new B.2 endpoints or to B.1 endpoints. Any change to the contract (request shape, response shape, semantics) of a grandfathered B.2 endpoint is treated as a new authorization request and requires either a behaviour-preserving refactor PR or its own ADR. Any new B.2 endpoint, or any new method on a grandfathered B.2 endpoint, requires its own ADR before merge.
 
+**Additive read-only fields (ADR 0012).** Adding a field to a grandfathered B.2 response *is* a response-shape change, so the paragraph above requires an ADR for it. ADR 0012 supplies that authorization **once, as a standing authorization**, for additive read-only fields that satisfy all six of its conditions — additive only, read-only, no new endpoint or method, same endpoint purpose, named in the PR body and CHANGELOG, B.2 only. Such a PR cites `additive under ADR 0012` and lists the field names; it does not need its own ADR. A change failing any condition is a contract change and the paragraph above applies unmodified. This narrows nothing about new endpoints, new methods, or changed semantics — see ADR 0012 § "Decision" for the conditions and § "Consequences" for the cost this deliberately accepts.
+
 ### Current Class B inventory
 
 | Endpoint | Method | Sub-bucket | Authorizing ADR |
@@ -129,10 +131,12 @@ ADR 0006 retroactively authorizes the B.2 endpoints listed in the inventory tabl
 | `/api/keys/:id` | DELETE | B.2 (administrative) | ADR 0006 (grandfathered as of v3.16.4) |
 | `/api/keys/:id/quota` | GET, PATCH | B.2 (administrative) | ADR 0006 (grandfathered as of v3.16.4) |
 | `/api/usage` | GET | B.2 (administrative) | ADR 0006 (grandfathered as of v3.16.4) |
-| `/cache/stats` | GET | B.2 (administrative) | ADR 0006 (grandfathered as of v3.16.4) |
+| `/cache/stats` | GET | B.2 (administrative) | ADR 0006 (grandfathered as of v3.16.4); additive `inflight` / `requesters` per ADR 0012 |
 | `/cache` | DELETE | B.2 (administrative) | ADR 0006 (grandfathered as of v3.16.4) |
 
-**Hybrid note.** `/usage` is a hybrid endpoint: the underlying call to `api.anthropic.com/v1/messages` (used to extract `anthropic-ratelimit-unified-*` headers, per the in-file comment block at `server.mjs` line 845–849) is Class A and requires the standard `cli.js` citation; the local synthesis layer that adds `proxy:` stats and `models:` snapshot is Class B and is authorized by ADR 0006. A PR touching only the wire-call layer is Class A; a PR touching only the synthesis layer is Class B; a PR touching both must satisfy both citation requirements.
+**Hybrid note.** `/usage` is a hybrid endpoint: the underlying call to `api.anthropic.com/v1/messages` (used to extract `anthropic-ratelimit-unified-*` headers, per the comment block introduced by `server.mjs`'s sole `// ALIGNMENT:` marker — `grep -n '^// ALIGNMENT:' server.mjs`, line 2373 as of v3.27.0) is Class A and requires the standard `cli.js` citation; the local synthesis layer that adds `proxy:` stats and `models:` snapshot is Class B and is authorized by ADR 0006. A PR touching only the wire-call layer is Class A; a PR touching only the synthesis layer is Class B; a PR touching both must satisfy both citation requirements.
+
+> The citation above is anchored on a **grep-able marker**, not on a bare line number, because the bare line number is what rotted: this note cited `server.mjs` line 845–849 from before v3.16.4 until #292, and by then those lines were the `OCP_LOCAL_TOOLS` boot gate — a reviewer following the citation as instructed landed on unrelated code. The block had moved to 2374–2379, and even #292's own corrected range (2349–2354) was stale again by the time the fix was written. `// ALIGNMENT:` appears exactly once in `server.mjs` and marks this block deliberately, so it survives the drift a line number cannot. Line numbers in this document are always secondary to a named anchor, and are pinned to a stated version so that staleness is visible rather than silent.
 
 ### Class B citation requirement
 
