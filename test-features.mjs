@@ -8976,10 +8976,17 @@ finally:
 // ~/.openclaw/openclaw.json model picker); or maxTokens silently becoming a STRING (JS's `<=`
 // operator coerces `"32000" <= 32000` to `true`). This is the one assertion that catches all
 // four (#218 review HIGH-2 / MED-4).
+// #309 added `contextWindow` to every row and four SPECIFIC-id rows. contextWindow is not a
+// family property — claude-opus-5 is 1M and claude-opus-4-6 is 200k, same prefix — so the
+// specific rows are what express it, winning via get_model_meta's existing longest-prefix sort.
 const _OC_EXPECTED_MODEL_META_TABLE = {
-  "claude-opus": { name: "Claude Opus (OCP)", reasoning: true, maxTokens: 64000 },
-  "claude-sonnet": { name: "Claude Sonnet (OCP)", reasoning: true, maxTokens: 32000 },
-  "claude-haiku": { name: "Claude Haiku (OCP)", reasoning: false, maxTokens: 32000 },
+  "claude-opus": { name: "Claude Opus (OCP)", reasoning: true, maxTokens: 64000, contextWindow: 200000 },
+  "claude-sonnet": { name: "Claude Sonnet (OCP)", reasoning: true, maxTokens: 32000, contextWindow: 200000 },
+  "claude-haiku": { name: "Claude Haiku (OCP)", reasoning: false, maxTokens: 32000, contextWindow: 200000 },
+  "claude-opus-5": { name: "Claude Opus (OCP)", reasoning: true, maxTokens: 64000, contextWindow: 1000000 },
+  "claude-opus-4-8": { name: "Claude Opus (OCP)", reasoning: true, maxTokens: 64000, contextWindow: 1000000 },
+  "claude-opus-4-7": { name: "Claude Opus (OCP)", reasoning: true, maxTokens: 64000, contextWindow: 1000000 },
+  "claude-sonnet-5": { name: "Claude Sonnet (OCP)", reasoning: true, maxTokens: 64000, contextWindow: 1000000 },
 };
 
 test("ocp-connect: model_meta table matches a pinned snapshot EXACTLY (name + reasoning + maxTokens, not just an upper bound)", () => {
@@ -8988,6 +8995,43 @@ test("ocp-connect: model_meta table matches a pinned snapshot EXACTLY (name + re
     "ocp-connect's model_meta table drifted from the pinned snapshot above — a deleted row, an " +
     "under-advertising drift, a changed `name`, or a stringified maxTokens would all pass the " +
     "<=-based tests below silently; this is the test that catches them");
+});
+
+// Issue #309. The test immediately below asserts `<=` — "never OVER-advertises". #309 was an
+// UNDER-advertisement, which `<=` passes by definition, so the suite was structurally blind to
+// it: `contextWindow` was a hardcoded 200000 in the write loop and four of the seven models are
+// natively 1M, and separately `claude-sonnet-5` inherited the family's 32000 maxTokens when its
+// real value is 64000. Neither could ever fail a `<=` check.
+//
+// This asserts EQUALITY against models.json for both numeric columns, for every id the SPOT
+// declares. It is what makes a future model added to models.json — or a window changed there —
+// fail here until ocp-connect is updated too, instead of silently shipping a client capped low.
+test("#309: every models.json id classifies to EXACTLY the SPOT's contextWindow and maxTokens (equality — the <= test below cannot see an under-advertisement)", () => {
+  const ids = _spotModels.models.map((m) => m.id);
+  const classified = _ocClassify(ids);
+  const mismatches = [];
+  for (const m of _spotModels.models) {
+    const got = classified[m.id];
+    assert.ok(got, `ocp-connect get_model_meta returned nothing for ${m.id}`);
+    const wantCtx = m.contextWindow;
+    const wantMax = m.maxOutputTokens ?? m.maxTokens;
+    assert.equal(typeof got.contextWindow, "number", `${m.id}: contextWindow must be a number, got ${typeof got.contextWindow}`);
+    assert.equal(typeof got.maxTokens, "number", `${m.id}: maxTokens must be a number, got ${typeof got.maxTokens}`);
+    if (got.contextWindow !== wantCtx) mismatches.push(`${m.id}: contextWindow=${got.contextWindow}, models.json says ${wantCtx}`);
+    if (got.maxTokens !== wantMax) mismatches.push(`${m.id}: maxTokens=${got.maxTokens}, models.json says ${wantMax}`);
+  }
+  assert.deepEqual(mismatches, [],
+    `ocp-connect writes these numbers straight into a user's ~/.openclaw/openclaw.json, so a ` +
+    `divergence from the SPOT caps (or over-promises) every client it onboards:\n  ` + mismatches.join("\n  "));
+});
+
+test("#309 control: an id absent from the table still falls back to the conservative floor, not to a 1M row", () => {
+  // The specific 1M rows must not become a default for unknown ids: get_model_meta's fallback is
+  // the smallest window any known model declares, so an unrecognised id is capped at a value
+  // every model can honour rather than handed a promise the server would have to truncate.
+  const got = _ocClassify(["claude-3-5-haiku-20241022"])["claude-3-5-haiku-20241022"];
+  assert.equal(got.contextWindow, 200000, `unknown ids must inherit the floor; got ${got.contextWindow}`);
+  assert.equal(got.maxTokens, 8192, `unknown-id maxTokens fallback must be unchanged by #309; got ${got.maxTokens}`);
 });
 
 test("ocp-connect: every models.json id classifies at or below its CLI-registry maxTokens (never over-advertises)", () => {
@@ -9025,10 +9069,14 @@ test("ocp-connect: reasoning classification matches models.json ground truth for
 // same way HIGH-2 pins the model_meta table — this is what closes that gap and is what makes the
 // "covers ... the loop" scope claim above actually true (previously only 4 of the 7 fields the
 // loop writes were checked).
+// #309 moved `contextWindow` OUT of this snapshot. It was pinned here precisely BECAUSE
+// get_model_meta() did not return it, so the meta-diff below structurally could not see it. That
+// is no longer true — it is a classifier output now, asserted against the classifier below and
+// against models.json itself in the #309 test above. Leaving a literal 200000 pinned here would
+// have re-frozen the exact number the issue was about, in the exact place that made it invisible.
 const _OC_EXPECTED_PROVIDER_MODEL_LITERALS = {
   input: ["text"],
   cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-  contextWindow: 200000,
 };
 
 test("ocp-connect: the provider.models write loop produces the exact entry — meta-derived fields verbatim, plus the pinned literal constants", () => {
@@ -9059,13 +9107,18 @@ test("ocp-connect: the provider.models write loop produces the exact entry — m
       `get_model_meta's classification (${JSON.stringify(meta.reasoning)})`);
     assert.equal(entry.name, meta.name,
       `${entry.id}: provider.models.name=${JSON.stringify(entry.name)} does not match get_model_meta's classification`);
-    // MED-2: the three literal-constant fields — invisible to the meta-diff above by construction.
+    // #309: contextWindow is meta-derived now, not a literal. This is what proves the write loop
+    // actually reads meta["contextWindow"] rather than re-hardcoding a number — exactly the
+    // mapping-level mutation MED-3 added this test for, applied to the field #309 was about.
+    assert.equal(entry.contextWindow, meta.contextWindow,
+      `${entry.id}: provider.models contextWindow=${JSON.stringify(entry.contextWindow)} does not match ` +
+      `get_model_meta's contextWindow=${JSON.stringify(meta.contextWindow)} — the write loop is not ` +
+      `copying the classifier's output verbatim`);
+    // MED-2: the remaining literal-constant fields — invisible to the meta-diff above by construction.
     assert.deepEqual(entry.input, _OC_EXPECTED_PROVIDER_MODEL_LITERALS.input,
       `${entry.id}: provider.models.input=${JSON.stringify(entry.input)}, want ${JSON.stringify(_OC_EXPECTED_PROVIDER_MODEL_LITERALS.input)}`);
     assert.deepEqual(entry.cost, _OC_EXPECTED_PROVIDER_MODEL_LITERALS.cost,
       `${entry.id}: provider.models.cost=${JSON.stringify(entry.cost)}, want ${JSON.stringify(_OC_EXPECTED_PROVIDER_MODEL_LITERALS.cost)}`);
-    assert.equal(entry.contextWindow, _OC_EXPECTED_PROVIDER_MODEL_LITERALS.contextWindow,
-      `${entry.id}: provider.models.contextWindow=${JSON.stringify(entry.contextWindow)}, want ${JSON.stringify(_OC_EXPECTED_PROVIDER_MODEL_LITERALS.contextWindow)}`);
   }
 });
 

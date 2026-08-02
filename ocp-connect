@@ -144,10 +144,43 @@ provider = {
 # over-advertising would promise capacity a member of the family does not have.
 # models.json is authoritative per ADR 0003; this table only exists because /v1/models does
 # not expose maxTokens.
+# Issue #309. Two columns here are per-MODEL, not per-family, and the table used to assume both
+# were per-family:
+#
+#   - contextWindow was not in this table at all; the write loop below hardcoded 200000. After
+#     #213/#307, models.json declares claude-opus-5 / -4-8 / -4-7 and claude-sonnet-5 at a native
+#     1M, so that literal under-declared four of the seven by 5x.
+#   - maxTokens WAS here, keyed on family. "claude-sonnet" -> 32000 was correct while
+#     claude-sonnet-4-6 was the only sonnet; claude-sonnet-5 is 64000, so the family key silently
+#     halved it. Not named in #309 — found by diffing this classifier's output against models.json
+#     model by model, which is what the regression test below now does on every run.
+#
+# A family-prefix table cannot express this on its own: claude-opus-5 (1M) and claude-opus-4-6
+# (200k) share the "claude-opus" prefix. What makes it work is the longest-prefix-wins ordering
+# get_model_meta() already had — specific ids are simply longer keys, so they win over their own
+# family without any new matching logic. #309 suggested "extend get_model_meta with a
+# context-window column"; that is right only together with this ordering, which is why the
+# specific rows exist rather than a fourth family row.
+#
+# The family rows keep contextWindow 200000 deliberately, as the conservative floor: this file's
+# own established rule (see get_model_meta's fallback comment) is that under-advertising caps a
+# client lower than the model allows, which is safe, while over-advertising promises capacity
+# that does not exist. So a window is raised only for an id verified against models.json, and a
+# future model that lands here unlisted inherits the floor rather than a guess.
+#
+# `name` is deliberately unchanged: each specific row repeats its family's display name, so the
+# only thing this change alters in what OpenClaw receives is the two numeric columns.
 model_meta = {
-    "claude-opus": {"name": "Claude Opus (OCP)", "reasoning": True, "maxTokens": 64000},
-    "claude-sonnet": {"name": "Claude Sonnet (OCP)", "reasoning": True, "maxTokens": 32000},
-    "claude-haiku": {"name": "Claude Haiku (OCP)", "reasoning": False, "maxTokens": 32000},
+    # Family defaults — the floor for anything not listed specifically below.
+    "claude-opus": {"name": "Claude Opus (OCP)", "reasoning": True, "maxTokens": 64000, "contextWindow": 200000},
+    "claude-sonnet": {"name": "Claude Sonnet (OCP)", "reasoning": True, "maxTokens": 32000, "contextWindow": 200000},
+    "claude-haiku": {"name": "Claude Haiku (OCP)", "reasoning": False, "maxTokens": 32000, "contextWindow": 200000},
+    # Specific ids whose window and/or output exceed their family default. Values are those in
+    # models.json, which is the SPOT (ADR 0003) and is asserted against on every test run.
+    "claude-opus-5": {"name": "Claude Opus (OCP)", "reasoning": True, "maxTokens": 64000, "contextWindow": 1000000},
+    "claude-opus-4-8": {"name": "Claude Opus (OCP)", "reasoning": True, "maxTokens": 64000, "contextWindow": 1000000},
+    "claude-opus-4-7": {"name": "Claude Opus (OCP)", "reasoning": True, "maxTokens": 64000, "contextWindow": 1000000},
+    "claude-sonnet-5": {"name": "Claude Sonnet (OCP)", "reasoning": True, "maxTokens": 64000, "contextWindow": 1000000},
 }
 
 def get_model_meta(mid):
@@ -162,7 +195,11 @@ def get_model_meta(mid):
     # above. Raising this to a family-table value would over-advertise those two by 4x. Keep 8192:
     # under-advertising caps a client lower than a model allows, which is safe; over-advertising
     # promises capacity that does not exist.
-    return {"name": mid + " (OCP)", "reasoning": False, "maxTokens": 8192}
+    #
+    # #309: contextWindow 200000 here for the same reason. It is the smallest window any model in
+    # models.json declares, so an unknown id is capped at a value every known model can honour
+    # rather than being handed a 1M promise the server would then have to truncate.
+    return {"name": mid + " (OCP)", "reasoning": False, "maxTokens": 8192, "contextWindow": 200000}
 
 for mid in model_ids:
     meta = get_model_meta(mid)
@@ -172,7 +209,7 @@ for mid in model_ids:
         "reasoning": meta["reasoning"],
         "input": ["text"],
         "cost": {"input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0},
-        "contextWindow": 200000,
+        "contextWindow": meta["contextWindow"],
         "maxTokens": meta["maxTokens"]
     })
 
