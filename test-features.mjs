@@ -2289,7 +2289,7 @@ ltTest("integration: ltTest serialization keeps peak concurrent server.mjs child
 });
 
 // ── Upgrade Tests ──
-import { runUpgrade, postFlightOk, runPostFlightCheck } from "./scripts/upgrade.mjs";
+import { runUpgrade, postFlightOk, runPostFlightCheck, parseFlagValue } from "./scripts/upgrade.mjs";
 
 console.log("\nUpgrade:");
 
@@ -3643,6 +3643,86 @@ test("rollback --list returns snapshots", async () => {
 // advice with --target still attached would land on the WRONG restored state while reporting
 // success, the exact #260 shape this whole guard chain exists to close, on the one path that
 // actually mutates disk.
+// ── Issue #297: the Node argv parser dropped `--target=vX.Y.Z` ──────────────────────────────
+// `ocp`'s bash layer has understood both `--target vX.Y.Z` and `--target=vX.Y.Z` since #272
+// (_detect_target_flag), and ocp:1289 forwards the user's argv to this script VERBATIM
+// (`exec node .../upgrade.mjs "$@"`). The Node side only did `args.indexOf("--target")`, so the
+// equals form arrived as `target: undefined`: #272's refusal never fired on fresh_install, and
+// on the full/cross-minor path #259's pin was silently not applied — the upgrade went to
+// doctor.latest_version. That is the "believes they pinned and did not" failure #260 exists to
+// prevent, reintroduced across a layer boundary.
+//
+// Why it slipped is the useful part: #272's tests exercised the equals form at the BASH layer,
+// where the fix was, and every #272 Node-side test calls runUpgrade({target}) directly. Nothing
+// ever drove argv -> parse -> runUpgrade, so the boundary itself was untested. These tests test
+// the parser as a unit AND feed its output into runUpgrade, which is the seam that was missing.
+console.log("\n--target=vX.Y.Z equals form is parsed at the Node layer too (issue #297):");
+
+test("#297 parseFlagValue: the equals form yields the same value as the separate form", () => {
+  assert.deepEqual(parseFlagValue(["--target=v3.27.0"], "--target"), { seen: true, value: "v3.27.0" });
+  assert.deepEqual(parseFlagValue(["--target", "v3.27.0"], "--target"), { seen: true, value: "v3.27.0" });
+});
+
+test("#297 parseFlagValue: the equals form is found mid-argv, not only in first position", () => {
+  assert.deepEqual(parseFlagValue(["--yes", "--target=v3.27.0", "--dry-run"], "--target"), { seen: true, value: "v3.27.0" });
+});
+
+test("#297 parseFlagValue: absent flag reports seen=false (not merely an undefined value)", () => {
+  assert.deepEqual(parseFlagValue(["--yes", "--dry-run"], "--target"), { seen: false, value: undefined });
+});
+
+test("#297 parseFlagValue: a typed-but-empty flag is seen=true — the distinction a bare `undefined` destroys", () => {
+  // `--target=` and a trailing `--target` are the shapes that used to collapse into "not passed",
+  // silently dropping a pin the user typed. `seen` is what lets the caller refuse instead.
+  assert.deepEqual(parseFlagValue(["--target="], "--target"), { seen: true, value: "" });
+  assert.deepEqual(parseFlagValue(["--target"], "--target"), { seen: true, value: undefined });
+});
+
+test("#297 parseFlagValue: `--targetv3.27.0` (no separator) is NOT this flag", () => {
+  assert.deepEqual(parseFlagValue(["--targetv3.27.0"], "--target"), { seen: false, value: undefined },
+    "silently honouring a typo'd flag would be a new way to pin a version the user never asked for");
+});
+
+test("#297 parseFlagValue: the first occurrence wins, matching bash's own `break`", () => {
+  assert.deepEqual(parseFlagValue(["--target=a", "--target=b"], "--target"), { seen: true, value: "a" });
+});
+
+test("#297 (the money test): a value parsed from the EQUALS form reaches runUpgrade and triggers the same refusal the separate form does", async () => {
+  // The seam #297 was about: parse argv the way the CLI entry point now does, hand the result to
+  // runUpgrade, and require the pin to be refused on a path that cannot honour it. Before the
+  // fix this call would have received target=undefined and returned a plan instead of throwing.
+  const parsed = parseFlagValue(["--target=v9.9.9"], "--target");
+  const mockDoctor = { ready_to_upgrade: true, current_version: "v3.27.0", latest_version: "v3.27.0", next_action: { kind: "noop" } };
+  await assert.rejects(
+    () => runUpgrade({ target: parsed.value, mockDoctor }),
+    (e) => /--target v9\.9\.9 was requested/.test(e.message),
+    "the equals form's value must reach the #272 refusal — its absence there is the whole defect",
+  );
+});
+
+// Wiring test. Everything above proves parseFlagValue is CORRECT; nothing above proves the CLI
+// entry point actually calls it — and "the fix exists but the caller never reaches it" is a real
+// shape (see #298's classifyBindCheck threading test for the sibling case). This drives the real
+// argv boundary in a child process, using the typed-but-empty refusal because it is the one CLI
+// outcome here that needs neither the network nor a doctor run: `--target=` is unreachable from
+// the old indexOf-only parser (it would see no `--target` token at all and stay silent), so this
+// test is discriminating for the wiring specifically.
+test("#297 wiring: the real CLI entry point parses the equals form — `--target=` refuses instead of being silently dropped", () => {
+  const r = spawnSync(process.execPath, ["scripts/upgrade.mjs", "--target="], { encoding: "utf-8", cwd: process.cwd() });
+  assert.equal(r.status, 1, `expected a refusal exit; status=${r.status} stdout=${JSON.stringify(r.stdout)} stderr=${JSON.stringify(r.stderr)}`);
+  assert.match(r.stderr, /--target requires a version argument/,
+    `a typed-but-empty pin must be refused at the CLI boundary, not dropped to undefined; stderr=${JSON.stringify(r.stderr)}`);
+});
+
+test("#297 control: the separate form still refuses identically (proves the money test is not asserting something new)", async () => {
+  const parsed = parseFlagValue(["--target", "v9.9.9"], "--target");
+  const mockDoctor = { ready_to_upgrade: true, current_version: "v3.27.0", latest_version: "v3.27.0", next_action: { kind: "noop" } };
+  await assert.rejects(
+    () => runUpgrade({ target: parsed.value, mockDoctor }),
+    (e) => /--target v9\.9\.9 was requested/.test(e.message),
+  );
+});
+
 console.log("\n--rollback + --target guard (issue #260/#272 review round 2):");
 
 test("#272 (the money test): runUpgrade refuses --rollback + --target together -- never reaches runRollback at all", async () => {

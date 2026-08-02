@@ -497,6 +497,26 @@ function resolveRestartPlan({ opts, port, isRollback = false, fromCommit = null 
 // an unreachable server never produces a body at all (the caller's try/catch retries). Verified
 // present on /health continuously from v3.4.0 — doctor's `from_version_supported` floor — so
 // rollback targets across the whole supported range still answer it.
+// Parses `--flag value` and `--flag=value` into the same result, mirroring `ocp`'s own
+// `_detect_target_flag` (which has handled both shapes since #272). Returns `seen` separately
+// from `value` on purpose: "the flag was not typed" and "the flag was typed with nothing after
+// it" are different situations, and collapsing them to `undefined` is what let a typed-but-empty
+// pin be dropped in silence — the exact failure #260 exists to prevent. The first occurrence
+// wins, matching the bash side's `break`.
+//
+// Only the two forms `ocp` itself documents are recognised. `--flagvalue` (no separator) is not
+// a form of this flag and must not be treated as one: `--targetv3.27.0` is a typo, and silently
+// honouring it would be a new way to pin something the user did not ask for.
+export function parseFlagValue(args, flag) {
+  const eq = `${flag}=`;
+  for (let i = 0; i < args.length; i++) {
+    const a = args[i];
+    if (a === flag) return { seen: true, value: args[i + 1] };
+    if (a.startsWith(eq)) return { seen: true, value: a.slice(eq.length) };
+  }
+  return { seen: false, value: undefined };
+}
+
 export function postFlightOk(body, target) {
   if (body?.status !== "ok") return false;
   const want = String(target || "").replace(/^v/, "");
@@ -1278,8 +1298,27 @@ if (_isMain()) {
   const rollback = args.includes("--rollback");
   const list = args.includes("--list");
   const gc = args.includes("--gc");
-  const targetIdx = args.indexOf("--target");
-  const target = targetIdx !== -1 ? args[targetIdx + 1] : undefined;
+  // Issue #297: this was `args.indexOf("--target")` — the SEPARATE-token form only. `ocp`'s bash
+  // layer forwards the user's argv verbatim (`exec node .../upgrade.mjs "$@"`, ocp:1289), and its
+  // own `_detect_target_flag` has handled BOTH `--target vX.Y.Z` and `--target=vX.Y.Z` since #272,
+  // so `ocp update --target=v9.9.9` arrived here with `target` undefined: the #272 refusal never
+  // fired on fresh_install, and on the full/cross-minor path the #259 pin was silently not
+  // applied — the upgrade went to doctor.latest_version instead. That is precisely the "user
+  // believes they pinned a version and did not" failure #260 exists to prevent, reintroduced
+  // through a layer boundary because #272's tests exercised the equals form only at the bash
+  // layer, where its fix was.
+  const targetFlag = parseFlagValue(args, "--target");
+  const target = targetFlag.value;
+  // Fail CLOSED when the flag is present but carries no value (`--target` as the last token,
+  // `--target=`, `--target --dry-run`, `--target ""`). Both forms used to drop these silently to
+  // `undefined`, which is the same silent-no-pin outcome #260 was filed about — the flag was
+  // typed, so staying quiet is the one thing this must not do. Mirrors the identical guard
+  // `--post-flight-only` already carries a few lines below, and the bash side's own
+  // `_TARGET_SEEN`/`_TARGET_VAL` split, which exists for exactly this distinction.
+  if (targetFlag.seen && (!target || target.startsWith("--"))) {
+    console.error(`✗ --target requires a version argument, e.g. --target v3.27.0 (or --target=v3.27.0)`);
+    process.exit(1);
+  }
   // First non-flag positional after --rollback is the snapshot path
   let snapshotPath;
   if (rollback) {
@@ -1292,9 +1331,14 @@ if (_isMain()) {
   // (richer fallback logic than belongs here) and then shells out to THIS one-shot mode to
   // verify the restart actually took, reusing postFlightOk() instead of a second predicate.
   // Distinct from the runUpgrade() flow below — no doctor call, no plan, just poll + exit code.
-  const postFlightOnlyIdx = args.indexOf("--post-flight-only");
-  if (postFlightOnlyIdx !== -1) {
-    const postFlightTarget = args[postFlightOnlyIdx + 1];
+  // #297: routed through the same parser as `--target`. `ocp` only ever invokes this internally
+  // with the separate-token form (ocp:1434, ocp:1489), so the equals form is not reachable from
+  // the product and this is not a second instance of #297's defect — but keeping two different
+  // parsers for the same flag shape in one file is how they drift, and the guard below already
+  // says this exists to catch hand-invoked misuse, which is exactly where someone types `=`.
+  const postFlightFlag = parseFlagValue(args, "--post-flight-only");
+  if (postFlightFlag.seen) {
+    const postFlightTarget = postFlightFlag.value;
     // Fail CLOSED on a missing/malformed target (PR #217 review, LOW): postFlightOk() treats
     // an empty/unknown target as "degrade to the auth-only check" by design (so a genuinely
     // unknown release target never blocks a good upgrade elsewhere) — but that same degrade
