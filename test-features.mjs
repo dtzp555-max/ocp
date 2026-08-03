@@ -1788,6 +1788,44 @@ test("#311: \"auto\" and \"none\" are both satisfiable by a text answer, so neit
   assert.equal(classifyToolRequest({}).supported, true);
 });
 
+// Cross-vendor review (codex) reading the INSTALLED OpenAI SDK types found the first draft
+// refused only two of the four doors. `ChatCompletionToolChoiceOption` is
+// `'none' | 'auto' | 'required' | AllowedToolChoice | NamedToolChoice | NamedToolChoiceCustom`,
+// and `function_call?: 'none' | 'auto' | FunctionCallOption` is a separate, still-accepted field
+// whose object form the SDK documents as "forces the model to call that function". Missing any of
+// them leaves that request on the original silently-wrong success path — the same defect, a
+// different door, which is the failure mode this repo has hit repeatedly.
+test("#311: tool_choice {type:'custom'} forces a named custom tool → refused", () => {
+  const r = classifyToolRequest({ tool_choice: { type: "custom", custom: { name: "my_tool" } } });
+  assert.equal(r.supported, false);
+  assert.equal(r.parameter, "tool_choice");
+  assert.match(r.message, /my_tool/, `the client must see which call was refused; got ${r.message}`);
+});
+
+test("#311: allowed_tools mode 'required' forces a call → refused; mode 'auto' only narrows the set → allowed", () => {
+  const req = classifyToolRequest({ tool_choice: { type: "allowed_tools", allowed_tools: { mode: "required", tools: [] } } });
+  assert.equal(req.supported, false, "mode 'required' requires a call to one of the allowed tools");
+  const auto = classifyToolRequest({ tool_choice: { type: "allowed_tools", allowed_tools: { mode: "auto", tools: [] } } });
+  assert.equal(auto.supported, true,
+    "mode 'auto' merely CONSTRAINS the set the model may pick from and still permits a text answer — " +
+    "refusing it would break a client that is only narrowing its tool list");
+});
+
+test("#311: the legacy function_call:{name} forcing form is refused, and blames function_call — not tool_choice", () => {
+  const r = classifyToolRequest({ functions: [{ name: "legacy" }], function_call: { name: "legacy" } });
+  assert.equal(r.supported, false);
+  assert.equal(r.parameter, "function_call",
+    `error.param must name the field the client actually sent, or the 400 sends them to fix the wrong one; got ${r.parameter}`);
+  assert.match(r.message, /legacy/);
+});
+
+test("#311: legacy function_call 'auto' and 'none' are permissive and must NOT be refused", () => {
+  assert.equal(classifyToolRequest({ functions: [{ name: "f" }], function_call: "auto" }).supported, true);
+  assert.equal(classifyToolRequest({ function_call: "none" }).supported, true);
+  assert.equal(classifyToolRequest({ functions: [{ name: "f" }] }).supported, true,
+    "a legacy `functions` list without a forcing function_call is the same permissive shape as `tools`");
+});
+
 test("#311: a malformed tool_choice is left alone rather than newly rejected", () => {
   // Policing malformed input is not this classifier's job, and inventing a rejection would change
   // behaviour for requests that work today.
