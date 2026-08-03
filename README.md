@@ -583,10 +583,10 @@ Top-level files a contributor or operator may need to know:
 | `models.json` | Single source of truth for model IDs, aliases, context windows. See ADR 0003. |
 | `ocp` / `ocp-connect` | User-facing CLI wrappers (server-side / client-side respectively). |
 | `dashboard.html` | Static dashboard served from `/dashboard`. |
-| `lib/constants.mjs` | Shared constants (default port, loopback host, local proxy URL) — one definition for `server.mjs`, the CLIs and the tests. |
+| `lib/constants.mjs` | Shared constants (default port, loopback host, local proxy URL) — one definition for `server.mjs`, `setup.mjs`, the `scripts/` helpers and `lib/tui/`. The bash CLIs cannot import it and carry a keep-in-sync note instead. |
 | `lib/env.mjs` | Fail-closed positive-integer parsing for the numeric env caps (body size, image bytes, …). |
 | `lib/multimodal.mjs` | OpenAI `image_url` content parts → Anthropic image blocks for `claude -p --input-format stream-json`. See § "Images / Multimodal (Vision)". |
-| `lib/net.mjs` | `isLoopbackBind()` — whether a bind address is reachable from another host. Gates TUI mode (`OCP_TUI_ALLOW_LAN`) and the `OCP_LOCAL_TOOLS` boot check, both of which fail closed on a non-loopback bind. |
+| `lib/net.mjs` | `isLoopbackBind()` — true only for addresses that **cannot** be reached from another host; anything else (`0.0.0.0`, `::`, a concrete LAN/Tailscale IP) counts as network-exposed. Gates TUI mode (`OCP_TUI_ALLOW_LAN`) and the `OCP_LOCAL_TOOLS` boot check, both of which fail closed on a non-loopback bind. |
 | `lib/prompt.mjs` | Pure system-prompt assembly: operator append, per-model truncation budget, wrapper selection. See ADR 0011. |
 | `lib/spawn-auth.mjs` | Pure primitives for `-p` spawn-token resolution and HOME isolation (serial mutex, TTL cache, expiry, label ordering). |
 | `lib/structured-output.mjs` | OpenAI `response_format` helpers — detection, JSON-Schema validation, payload extraction. Class B.1, ADR 0006. |
