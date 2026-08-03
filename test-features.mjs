@@ -2344,7 +2344,7 @@ ltTest("integration: ltTest serialization keeps peak concurrent server.mjs child
 });
 
 // ── Upgrade Tests ──
-import { runUpgrade, postFlightOk, runPostFlightCheck, parseFlagValue, classifyPostFlightProbeFailure, postFlightFailureSuffix } from "./scripts/upgrade.mjs";
+import { runUpgrade, postFlightOk, runPostFlightCheck, parseFlagValue, classifyPostFlightProbeFailure, postFlightFailureSuffix, probeLaunchdDomains } from "./scripts/upgrade.mjs";
 
 console.log("\nUpgrade:");
 
@@ -10696,6 +10696,125 @@ test("classifyWorkingTree: no expected working tree provided → unknown (never 
   assert.equal(classifyWorkingTree("/home/opc/ocp", "").state, "unknown");
   assert.equal(classifyWorkingTree("/home/opc/ocp", null).state, "unknown");
   assert.equal(classifyWorkingTree("/home/opc/ocp", undefined).state, "unknown");
+});
+
+// ── Issue #290: launchd has TWO domains, and only one was ever probed ────────
+// The gather step ran `launchctl print gui/$(id -u)/dev.ocp.proxy` and nothing else. A root
+// LaunchDaemon — a supported deployment; scripts/doctor.mjs's own multi-unit-risk check looks for
+// /Library/LaunchDaemons — is genuinely not registered in `gui`, so the probe returned the
+// "not-registered" sentinel, resolution reported no-unit, and the operator was told to bring up a
+// service that was already running. Fail-closed and loud, but on a false premise, and permanent.
+//
+// This module's own comments were why nobody looked: both said there is "no multi-label ambiguity
+// to resolve the way Linux has system-vs-user scope". That conflates two things and denies the
+// real one — there is no multi-LABEL ambiguity, but launchd has exactly the system-vs-user DOMAIN
+// split those words dismissed. Corrected in place.
+//
+// Scope: this DETECTS the system domain and refuses accurately. It does not restart a root
+// LaunchDaemon — that needs `sudo launchctl`, and running sudo from the upgrade path is a
+// different operation with its own hazard surface. The deliverable is that a confusing dead end
+// becomes an actionable one.
+console.log("\nRestart-unit resolution (issue #290) — launchd's gui vs system domain:");
+
+const _d290_running =
+  "dev.ocp.proxy = {\n\tpid = 4242\n\tstate = running\n\targuments = {\n" +
+  "\t\t/opt/homebrew/bin/node\n\t\t/Users/tester/ocp/server.mjs\n\t}\n}";
+const _d290_lsof = "node 4242 tester 22u IPv4 0x1 0t0 TCP 127.0.0.1:3456 (LISTEN)";
+const _d290_probe = (extra) => ({ platform: "darwin", lsofOutput: _d290_lsof, ...extra });
+
+// The escalation RULE itself. Everything above proves what happens once a domain is known; these
+// prove how it becomes known — and specifically that "" (gui says not registered here) escalates
+// while `null` (gui could not tell) does NOT. Getting that backwards would trade a permanent
+// refusal for a confident claim about a domain with no evidence behind it, which is the failure
+// mode mapLaunchctlPrintFailureToProbeValue exists to prevent.
+const _d290_notFound = (dom) => { const e = new Error("Bad request."); e.stdout = ""; e.stderr = `Could not find service "dev.ocp.proxy" in domain for ${dom}`; return e; };
+
+test("#290: gui says NOT REGISTERED → the system domain is probed, and a daemon found there wins", () => {
+  const calls = [];
+  const r = probeLaunchdDomains((cmd) => {
+    calls.push(cmd);
+    if (cmd.includes("gui/")) throw _d290_notFound("user gui: 501");
+    return _d290_running;
+  }, "dev.ocp.proxy");
+  assert.equal(r.launchdDomain, "system", `expected escalation; calls=${JSON.stringify(calls)}`);
+  assert.equal(r.launchdPrintOutput, _d290_running);
+  assert.equal(calls.length, 2, `both domains must be probed; got ${JSON.stringify(calls)}`);
+  assert.match(calls[1], /launchctl print system\/dev\.ocp\.proxy/);
+});
+
+test("#290 (the gate): gui COULD NOT TELL (null) → the system domain must NOT be probed", () => {
+  // A permission failure, a missing launchctl, or an unrecognised error. Escalating here would
+  // turn an honest "unknown" into a claim about a domain we have no evidence for — and "unknown"
+  // is the verdict that makes resolveOwningUnit refuse rather than guess.
+  const calls = [];
+  const r = probeLaunchdDomains((cmd) => {
+    calls.push(cmd);
+    const e = new Error("Operation not permitted"); e.stdout = ""; e.stderr = "launchctl: Operation not permitted"; throw e;
+  }, "dev.ocp.proxy");
+  assert.equal(r.launchdPrintOutput, null, "an unrecognised failure stays 'unknown'");
+  assert.equal(calls.length, 1, `only gui may be probed; got ${JSON.stringify(calls)}`);
+  assert.equal(r.launchdDomain, "gui");
+});
+
+test("#290: registered in NEITHER domain stays 'not-registered' in the gui domain (the install-it remediation target)", () => {
+  const calls = [];
+  const r = probeLaunchdDomains((cmd) => {
+    calls.push(cmd);
+    throw _d290_notFound(cmd.includes("gui/") ? "user gui: 501" : "system");
+  }, "dev.ocp.proxy");
+  assert.equal(r.launchdPrintOutput, "", "both said not-registered, so the answer is still not-registered");
+  assert.equal(r.launchdDomain, "gui", "and the remediation target stays gui, where `ocp` installs it");
+  assert.equal(calls.length, 2, "but both were asked");
+});
+
+test("#290: the common case (registered in gui) never probes the system domain at all", () => {
+  const calls = [];
+  const r = probeLaunchdDomains((cmd) => { calls.push(cmd); return _d290_running; }, "dev.ocp.proxy");
+  assert.equal(r.launchdDomain, "gui");
+  assert.equal(calls.length, 1, `no extra shell-out on the common path; got ${JSON.stringify(calls)}`);
+});
+
+test("#290 (the money test): a job found in the SYSTEM domain gets its own outcome, not 'no-unit'", () => {
+  const owner = resolveOwningUnit(_d290_probe({ launchdPrintOutput: _d290_running, launchdDomain: "system" }),
+    { expectedUnit: "dev.ocp.proxy", port: 3456 });
+  assert.equal(owner.kind, "launchd-system-domain",
+    `a root LaunchDaemon that is running, owns the port, and runs server.mjs is not "unmanaged" — ` +
+    `reporting no-unit here is what made this a permanent dead end; got ${JSON.stringify(owner)}`);
+  assert.equal(owner.pid, "4242");
+});
+
+test("#290: planRestart REFUSES a system-domain job, and hands over the sudo commands instead of blaming the service", () => {
+  const owner = resolveOwningUnit(_d290_probe({ launchdPrintOutput: _d290_running, launchdDomain: "system" }),
+    { expectedUnit: "dev.ocp.proxy", port: 3456 });
+  assert.throws(
+    () => planRestart(owner, { expectedUnit: "dev.ocp.proxy", plistPath: "/x.plist" }),
+    (e) => {
+      assert.match(e.message, /is running correctly/, "must not imply the service is broken");
+      assert.match(e.message, /sudo launchctl bootout system\/dev\.ocp\.proxy/, "must give the exact bootout");
+      assert.match(e.message, /sudo launchctl bootstrap system \/Library\/LaunchDaemons\//, "must give the exact bootstrap");
+      assert.ok(!/bring it under launchd/.test(e.message),
+        "must NOT repeat the pre-#290 advice to bring up a service that is already running");
+      return true;
+    },
+  );
+});
+
+test("#290 control: a gui-domain job still produces the normal restart plan (the fix refuses only the domain it must)", () => {
+  const owner = resolveOwningUnit(_d290_probe({ launchdPrintOutput: _d290_running, launchdDomain: "gui" }),
+    { expectedUnit: "dev.ocp.proxy", port: 3456 });
+  assert.equal(owner.kind, "launchd");
+  const plan = planRestart(owner, { expectedUnit: "dev.ocp.proxy", plistPath: "/x.plist" });
+  assert.ok(plan.cmds.some(c => /bootstrap gui\/\$\(id -u\)/.test(c.cmd)),
+    `the common case must be untouched; got ${JSON.stringify(plan.cmds.map(c => c.cmd))}`);
+});
+
+test("#290 back-compat: a probe with NO launchdDomain field behaves exactly as before (pre-#290 callers)", () => {
+  // Mirrors the `probe.launchdPrintOutput === undefined` convention a few lines away in the module:
+  // a field a caller never set must not newly refuse restarts that worked before it existed.
+  const owner = resolveOwningUnit(_d290_probe({ launchdPrintOutput: _d290_running }),
+    { expectedUnit: "dev.ocp.proxy", port: 3456 });
+  assert.equal(owner.kind, "launchd", `absent domain must not be treated as "system"; got ${JSON.stringify(owner)}`);
+  assert.doesNotThrow(() => planRestart(owner, { expectedUnit: "dev.ocp.proxy", plistPath: "/x.plist" }));
 });
 
 console.log("\nRestart-unit resolution (issue #239) — classifyLaunchdJob:");

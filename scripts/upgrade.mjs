@@ -159,6 +159,41 @@ function mapLsofFailureToProbeValue(err, run, port) {
 // mapLsofFailureToProbeValue uses for lsof's own "nothing matched" signature above); anything else
 // (permission failure, launchctl itself missing, a differently-worded failure) maps to `null`
 // ("unknown" — genuinely couldn't tell), never silently treated the same as "not registered".
+// Issue #290: probe BOTH launchd domains, not just `gui`. `ocp` installs a per-user LaunchAgent,
+// so `gui/<uid>` is the common case — but a root LaunchDaemon is a supported deployment
+// (scripts/doctor.mjs's own multi-unit-risk check looks for /Library/LaunchDaemons), and probing
+// only `gui` made that shape a PERMANENT dead end: the label genuinely is not registered in `gui`,
+// so the probe returned the "not-registered" sentinel, resolveOwningUnit reported no-unit, and the
+// operator was told to bring up a service that was already running. Fail-closed and loud, but on a
+// false premise.
+//
+// Extracted as a pure function over an injected `run` for the same reason classifyLaunchdJob and
+// classifyCmdlineOwner are: the escalation RULE is the whole content of this fix, and a rule that
+// can only be exercised through a full runUpgrade is a rule nobody can pin.
+//
+// The rule: escalate on the SPECIFIC "" signal — "gui says this label is not registered here" —
+// and NEVER on `null`. `null` means the gui probe could not tell (launchctl missing, permission
+// failure, an unrecognised error), and re-asking a different domain would convert an honest
+// "unknown" into a confident claim about a domain we have no evidence for. That is exactly the
+// distinction mapLaunchctlPrintFailureToProbeValue exists to preserve; spending it here would undo
+// it. Returns `{ launchdPrintOutput, launchdDomain }`.
+export function probeLaunchdDomains(run, expectedUnit) {
+  let out, domain = "gui";
+  try { out = run(`launchctl print gui/$(id -u)/${expectedUnit}`); }
+  catch (err) { out = mapLaunchctlPrintFailureToProbeValue(err).launchdPrintOutput; }
+  if (out === "") {
+    let sys;
+    try { sys = run(`launchctl print system/${expectedUnit}`); }
+    catch (err) { sys = mapLaunchctlPrintFailureToProbeValue(err).launchdPrintOutput; }
+    // "" from system too means the label is in neither domain — keep the gui answer and stay in the
+    // `gui` domain, which is the right remediation target for "it isn't installed". A `null` IS
+    // news: gui said not-here and system could not tell, so a system daemon cannot be ruled out,
+    // and "unknown" is the honest verdict rather than "no-unit".
+    if (sys !== "") { out = sys; domain = "system"; }
+  }
+  return { launchdPrintOutput: out, launchdDomain: domain };
+}
+
 function mapLaunchctlPrintFailureToProbeValue(err) {
   const stdout = err && err.stdout != null ? String(err.stdout) : "";
   const stderr = err && err.stderr != null ? String(err.stderr) : "";
@@ -290,8 +325,9 @@ function resolveRestartPlan({ opts, port, isRollback = false, fromCommit = null 
         netstatProbeFailed: !!probe.netstatProbeFailed,
       });
       if (macListener.state === "listening") {
-        try { probe.launchdPrintOutput = run(`launchctl print gui/$(id -u)/${expectedUnit}`); }
-        catch (err) { probe.launchdPrintOutput = mapLaunchctlPrintFailureToProbeValue(err).launchdPrintOutput; }
+        const probed = probeLaunchdDomains(run, expectedUnit);
+        probe.launchdPrintOutput = probed.launchdPrintOutput;
+        probe.launchdDomain = probed.launchdDomain;
       }
     } else {
       try { probe.ssOutput = run(`ss -lptn "sport = :${port}"`); } catch { probe.ssOutput = null; }

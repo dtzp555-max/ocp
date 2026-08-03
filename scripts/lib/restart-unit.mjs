@@ -127,8 +127,8 @@
  * port" to "here's what unit that is". launchd has no equivalent (there is no
  * `/proc/<pid>/launchd-label` file), so resolution has to run the OTHER direction: ask launchd
  * what pid it believes owns the ONE label this repo manages (`dev.ocp.proxy`, hardcoded — there's
- * no multi-label ambiguity to resolve the way Linux has system-vs-user scope) via `launchctl print
- * gui/<uid>/dev.ocp.proxy`, and compare that pid against the pid `lsof`/`netstat` found actually
+ * no multi-LABEL ambiguity the way Linux can have several candidate unit names) via `launchctl
+ * print <domain>/dev.ocp.proxy`, and compare that pid against the pid `lsof`/`netstat` found actually
  * holding the port. A mismatch — or the label not being registered, or registered but not
  * currently running — means the port's holder is not verified to be `dev.ocp.proxy`: the macOS
  * analogue of Linux's `no-unit`, via the same terminal `kind` (not a fourth, platform-only state).
@@ -420,10 +420,19 @@ export function parseCgroupUnit(cgroupContent) {
 // Linux has a pid -> cgroup -> unit-name REVERSE lookup (/proc/<pid>/cgroup), so parseCgroupUnit
 // above walks from "here's the pid holding the port" to "here's what unit that is". macOS/launchd
 // has no equivalent (there is no /proc/<pid>/launchd-label file), and this repo manages exactly
-// ONE label (dev.ocp.proxy, hardcoded — no multi-label ambiguity to resolve the way Linux has
-// system-vs-user scope), so this runs the OTHER direction: ask launchd what pid IT believes owns
+// ONE label (dev.ocp.proxy, hardcoded — no multi-LABEL ambiguity the way Linux can have several
+// candidate unit names), so this runs the OTHER direction: ask launchd what pid IT believes owns
 // the label, for resolveOwningUnit to compare against the pid lsof/netstat found actually holding
 // the port.
+//
+// Issue #290 corrects what these two paragraphs used to claim. Both said there is "no multi-label
+// ambiguity to resolve the way Linux has system-vs-user scope", which conflated two different
+// things and denied the one that is real: there is indeed no multi-LABEL ambiguity, but launchd
+// has exactly the system-vs-user DOMAIN split those words dismissed — `gui/<uid>` (LaunchAgent)
+// versus `system` (root LaunchDaemon). The gather step probed only `gui`, so a root LaunchDaemon
+// resolved as "not registered" and became a permanent refusal, and this comment was the reason
+// nobody went looking. It probes both domains now, and a job found in `system` gets its own
+// outcome rather than being reported as unmanaged.
 //
 // Verified live against the production host (read-only `launchctl print`, never mutated):
 //   registered + running:  exit 0, a "pid = <N>" line, and an "arguments = { ... }" block with one
@@ -760,6 +769,29 @@ export function resolveOwningUnit(probe = {}) {
       };
     }
 
+    // Issue #290: the label resolved, its pid matches the port's holder, and its argv is OCP's own
+    // server.mjs — everything checks out EXCEPT that it lives in the `system` domain, i.e. it is a
+    // root LaunchDaemon rather than the per-user LaunchAgent `ocp` installs. launchdCmds() below
+    // hardcodes `gui/$(id -u)` in both its bootout and its bootstrap, so proceeding would issue a
+    // gui-domain restart against a job that is not in the gui domain: the bootout is a no-op
+    // (`|| true` swallows it), the bootstrap either fails or — worse — brings up a SECOND,
+    // user-domain copy alongside the running daemon, which is issue #215 with extra steps.
+    //
+    // Restarting a system daemon needs `sudo launchctl` and a plist under /Library/LaunchDaemons.
+    // Running sudo from the upgrade path is a materially different operation with its own hazard
+    // surface, and is deliberately NOT what this change does. What it does is convert a confusing
+    // dead end into an accurate one: the operator gets the exact command instead of being told to
+    // bring up something that is already running.
+    //
+    // `undefined` (a caller that never set the field) keeps the pre-#290 behaviour, matching the
+    // `probe.launchdPrintOutput === undefined` back-compat convention a few lines above.
+    if (probe.launchdDomain === "system") {
+      return {
+        kind: "launchd-system-domain", platform, pid: listener.pid,
+        unit: expectedUnit || "dev.ocp.proxy", mismatched: false,
+        reason: `"${expectedUnit || "dev.ocp.proxy"}" is registered in launchd's system domain (a root LaunchDaemon), not gui/<uid>`,
+      };
+    }
     return { kind: "launchd", platform, pid: listener.pid, unit: expectedUnit || "dev.ocp.proxy", mismatched: false };
   }
 
@@ -968,6 +1000,23 @@ export function planRestart(owner, opts = {}) {
       `the default (often loopback-only) unit instead would pass post-flight — which only checks ` +
       `127.0.0.1 — while silently losing LAN reachability. Start the intended unit manually and ` +
       `re-run, or confirm "${opts.expectedUnit}" really is correct here.`
+    );
+  }
+
+  // Issue #290. Everything about this job checked out except its domain, so the refusal says so
+  // and hands over the working command rather than implying something is wrong with the service.
+  // This is a REFUSAL, not a restart: OCP does not run sudo from the upgrade path.
+  if (owner.kind === "launchd-system-domain") {
+    throw new Error(
+      `restart aborted: "${opts.expectedUnit}" (pid ${owner.pid}) is running correctly, but as a ` +
+      `root LaunchDaemon in launchd's system domain — not the per-user LaunchAgent this command ` +
+      `manages. Nothing is wrong with the service. OCP will not run sudo from the upgrade path, ` +
+      `so restart it yourself:\n` +
+      `  sudo launchctl bootout system/${opts.expectedUnit}\n` +
+      `  sudo launchctl bootstrap system /Library/LaunchDaemons/${opts.expectedUnit}.plist\n` +
+      `then re-run the upgrade. (Before #290 this reported "not managed by launchd" and told you ` +
+      `to bring up a service that was already running — the label simply is not registered in the ` +
+      `gui domain, which was the only one probed.)`
     );
   }
 
