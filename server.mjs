@@ -1162,6 +1162,41 @@ async function checkAuth() {
     delete env.ANTHROPIC_API_KEY;
     delete env.ANTHROPIC_BASE_URL;
     delete env.ANTHROPIC_AUTH_TOKEN;
+    // Issue #308. The comment on the "conclusive rejection" branch below claims "checkAuth and
+    // spawnClaudeProcess scrub the environment identically, so the probe resolves the SAME
+    // credentials the request path uses — a non-zero exit genuinely predicts serving failure."
+    // Scrubbing the ANTHROPIC_* vars identically is necessary but was not sufficient: the request
+    // path ALSO applies a per-spawn HOME decision (getSpawnHomeMode / resolveSpawnDecision), and
+    // this probe did not. With an env token present, spawns run under a credential-free scratch
+    // HOME where the token is the only credential, while this probe ran under the operator's real
+    // HOME — where `claude` PREFERS a `.credentials.json` over the env var (the same preference
+    // ADR 0007 PR-D documents for the TUI path, proven live on PI231).
+    //
+    // Two different credential sources, so the probe's verdict did not predict serving at all, in
+    // either direction:
+    //   - valid credentials.json + dead env token → probe says "authenticated", every request
+    //     fails. That is #308's exact reported shape.
+    //   - dead credentials.json + valid env token → probe says "rejected" while serving is fine,
+    //     which is the #232 false-alarm class this repo already fixed once from the other end.
+    // Verified live on a production host mid-triage: request path spawn.home
+    // `/home/opc/.ocp/spawn-home`, probe HOME `/home/opc`, and a 108-char accessToken sitting in
+    // the latter's `.credentials.json`.
+    //
+    // getSpawnHomeMode() is the right resolver here rather than resolveSpawnDecision(): it is the
+    // CONFIG-level decision, synchronous, with no fs side effects and no mutex. The probe must not
+    // take realHomeFallbackMutex — that lock serializes real-HOME spawns to protect the
+    // single-use refresh token, and a periodic health probe queueing behind request traffic would
+    // add latency for no gain.
+    //
+    // Remaining, deliberately not closed here: inside the 5-minute token-expiry window the request
+    // path falls back to the real HOME to let `claude` refresh natively, while this probe stays
+    // isolated. The probe then measures the env token during a stint when spawns do not use it.
+    // That window is bounded and self-clearing, and closing it would mean taking the mutex.
+    const spawnMode = getSpawnHomeMode();
+    if (spawnMode.isolated) {
+      ensureSpawnHome(spawnMode.home);
+      env.HOME = spawnMode.home;
+    }
     // ASYNC execFile, not execFileSync (#232). Marking the function `async` never made the old
     // synchronous call non-blocking: it froze the event loop for up to AUTH_CHECK_TIMEOUT_MS at
     // boot (before server.listen()) and again on every interval tick.
@@ -1173,7 +1208,11 @@ async function checkAuth() {
     // process.exit()s. So: no unref, no trap for whoever moves this code next.
     await new Promise((resolve, reject) => {
       execFile(CLAUDE, ["auth", "status"],
-        { encoding: "utf8", timeout: AUTH_CHECK_TIMEOUT_MS, env },
+        // #308: cwd follows HOME into the scratch dir for the same reason the spawn path sets it —
+        // a `claude` started in the operator's tree can still pick up project-local config from
+        // cwd, which would reintroduce a second credential source through the back door.
+        { encoding: "utf8", timeout: AUTH_CHECK_TIMEOUT_MS, env,
+          ...(spawnMode.isolated ? { cwd: spawnMode.home } : {}) },
         // execFile does NOT attach stdout/stderr to the error object the way execFileSync does
         // (verified: err.stderr is undefined in the callback), so carry stderr across
         // explicitly — the message below depends on it.
@@ -1198,7 +1237,9 @@ async function checkAuth() {
       authStatus = { ...authStatus, lastCheck: now, message: msg, lastOutcome: "unavailable" };
     } else {
       // CONCLUSIVE REJECTION. claude ran to completion and exited non-zero. checkAuth and
-      // spawnClaudeProcess scrub the environment identically, so the probe resolves the SAME
+      // spawnClaudeProcess scrub the environment identically AND resolve the same HOME via
+      // getSpawnHomeMode (#308 — the second half of that was missing, which is what made this
+      // sentence untrue on every host with an env token), so the probe resolves the SAME
       // credentials the request path uses — a non-zero exit genuinely predicts serving failure.
       authStatus = { ok: false, lastCheck: now, message: msg, lastOutcome: "rejected",
                      consecutiveFailures: authStatus.consecutiveFailures + 1 };

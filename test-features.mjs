@@ -1692,6 +1692,75 @@ ltTest("integration: a synchronous pre-spawn throw must not leak stats.activeReq
   } finally { child.kill("SIGKILL"); _ltRmRetry(dir); }
 });
 
+// ── Issue #308: the auth probe must read the credentials the REQUEST path uses ──
+// checkAuth's own "conclusive rejection" comment claimed the probe "resolves the SAME credentials
+// the request path uses". Scrubbing ANTHROPIC_* identically was necessary but not sufficient: the
+// request path also applies a per-spawn HOME decision (getSpawnHomeMode), and the probe did not.
+// With an env token present, spawns run under a credential-free scratch HOME where the token is
+// the only credential, while the probe ran under the operator's real HOME — where `claude` PREFERS
+// a .credentials.json over the env var. Two credential sources, so the verdict predicted nothing:
+//
+//   valid credentials.json + dead env token -> "authenticated", every request 500s   (#308's shape)
+//   dead credentials.json + valid env token -> "rejected" while serving is fine       (#232's shape)
+//
+// Verified live on a production host mid-triage: request path spawn.home
+// /home/opc/.ocp/spawn-home, probe HOME /home/opc, and a 108-char accessToken in the latter's
+// .credentials.json.
+//
+// These drive a real server child and have the fake `claude` record the $HOME it was invoked with,
+// because the divergence is invisible to anything that does not actually run the probe.
+const LT_FAKE_AUTHHOME = `#!/bin/sh
+if [ "$1" = "auth" ] && [ "$2" = "status" ]; then printf '%s' "$HOME" > "$AUTH_HOME_CAPTURE"; exit 0; fi
+printf '%s\\n' '{"type":"assistant","message":{"content":[{"type":"text","text":"OK"}]}}'
+printf '%s\\n' '{"type":"result"}'
+exit 0
+`;
+function ltFakeAuthHome(dir) {
+  const p = join(dir, "claude-authhome");
+  _ltWrite(p, LT_FAKE_AUTHHOME); _ltChmod(p, 0o755); return p;
+}
+
+ltTest("integration (#308, the money test): with an env token, the auth probe runs under the SAME scratch HOME as the request path", async () => {
+  const dir = ltMkdir();
+  const fake = ltFakeAuthHome(dir);
+  const cap = join(dir, "auth-home.txt");
+  const { child, buf } = await ltBootFresh({
+    CLAUDE_BIN: fake, HOME: dir, AUTH_HOME_CAPTURE: cap,
+    CLAUDE_CODE_OAUTH_TOKEN: "sk-ant-oat01-test-token-for-the-isolated-home-decision",
+  }, dir);
+  try {
+    const up = await ltWait(() => buf.out.includes("listening on") || buf.spawnErr, 20000);
+    assert.ok(up && !buf.spawnErr, `did not start: ${buf.spawnErr ? buf.spawnErr.message : buf.err.slice(0, 300)}`);
+    const seen = await ltWait(() => _ltExists(cap), 20000);
+    assert.ok(seen, "the auth probe never ran — this test is vacuous without it");
+    const home = _ltRead(cap, "utf8").trim();
+    assert.equal(home, join(dir, ".ocp", "spawn-home"),
+      `the probe must resolve the credential source the request path uses. Reading the operator's ` +
+      `real HOME lets a stale .credentials.json answer for a dead env token — /health then reports ` +
+      `authenticated while every request fails, which is #308. got HOME=${JSON.stringify(home)}`);
+  } finally { child.kill("SIGKILL"); _ltRmRetry(dir); }
+});
+
+ltTest("integration (#308 control): with NO env token the probe still uses the real HOME (legacy credentials.json hosts are untouched)", async () => {
+  const dir = ltMkdir();
+  const fake = ltFakeAuthHome(dir);
+  const cap = join(dir, "auth-home.txt");
+  const { child, buf } = await ltBootFresh({
+    CLAUDE_BIN: fake, HOME: dir, AUTH_HOME_CAPTURE: cap,
+    OCP_SPAWN_REAL_HOME: "1",   // the documented kill-switch — isolated:false by construction
+  }, dir);
+  try {
+    const up = await ltWait(() => buf.out.includes("listening on") || buf.spawnErr, 20000);
+    assert.ok(up && !buf.spawnErr, `did not start: ${buf.spawnErr ? buf.spawnErr.message : buf.err.slice(0, 300)}`);
+    const seen = await ltWait(() => _ltExists(cap), 20000);
+    assert.ok(seen, "the auth probe never ran — this control is vacuous without it");
+    const home = _ltRead(cap, "utf8").trim();
+    assert.equal(home, dir,
+      `a host with no isolated spawn must keep the pre-#308 behaviour exactly — the fix must not ` +
+      `redirect the probe on hosts that legitimately rely on the real HOME. got HOME=${JSON.stringify(home)}`);
+  } finally { child.kill("SIGKILL"); _ltRmRetry(dir); }
+});
+
 // ── Cache keys hash the RESOLVED model, not the alias string (#194) ──────────
 // models.json is read once at boot, so repointing an alias only takes effect on restart —
 // while the SQLite response_cache outlives it. Hashing the raw string would keep serving the
