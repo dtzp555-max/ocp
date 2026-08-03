@@ -46,6 +46,7 @@ import { validateKey, recordUsage, getUsageByKey, getUsageTimeline, getRecentUsa
 import { DEFAULT_PORT } from "./lib/constants.mjs";
 import { StructuredOutputError, detectStructuredOutput, validateJsonSchemaSafe, extractJsonPayload, structuredSystemInstruction, resolveMaxAttempts } from "./lib/structured-output.mjs";
 import { isLoopbackBind } from "./lib/net.mjs";
+import { classifyToolRequest } from "./lib/tool-support.mjs";
 import { runTuiTurn, reapStaleTuiSessions, resolveTuiHome, bootTuiPane, tuiPaneHealthy, poolPaneName, POOL_BOOT_MS } from "./lib/tui/session.mjs";
 import { detectTuiUpstreamError } from "./lib/tui/transcript.mjs";
 import { TuiSemaphore, SemaphoreAbortError, recordTuiEntrypoint, buildTuiHealthBlock } from "./lib/tui/semaphore.mjs";
@@ -2962,6 +2963,24 @@ async function handleChatCompletions(req, res) {
   // would hand cacheHash a function the day anyone widens that gate or moves this binding.
   const cacheModel = Object.hasOwn(MODEL_MAP, model) ? MODEL_MAP[model] : model;
   const stream = parsed.stream;
+
+  // Issue #311. OCP accepts `tools`/`tool_choice` and never reads them; `server.mjs` emits no
+  // tool_calls at all. Under a permissive tool_choice that is spec-conformant — the model MAY call
+  // a tool, and text is a legal outcome — so those requests are left exactly as they were. Under a
+  // FORCING tool_choice ("required", or a named function) the spec requires finish_reason
+  // "tool_calls", and answering with prose and finish_reason "stop" is not a degraded answer but a
+  // silently wrong one: no 400, no warning field, and "stop" means the turn ended normally, so the
+  // client has nothing to branch on. Refuse those, and only those. See lib/tool-support.mjs for the
+  // spec split and ADR 0013 for why OCP does not implement tool calling.
+  const toolSupport = classifyToolRequest(parsed);
+  if (!toolSupport.supported) {
+    return jsonResponse(res, 400, { error: {
+      message: toolSupport.message,
+      type: "invalid_request_error",
+      param: toolSupport.parameter,
+      code: "unsupported_parameter",
+    } });
+  }
 
   // Validate model against known models
   if (!VALID_MODELS.has(model)) {
