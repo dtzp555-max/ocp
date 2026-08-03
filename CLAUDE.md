@@ -134,4 +134,16 @@ release_kit:
     - new file / SPOT / schema → Architecture or contributor § with link
   bootstrap_quirk_policy:
     - any one-time migration quirk → README § "Troubleshooting"
+  governance_audits:
+    # ADR 0012 grants a STANDING authorization for additive read-only fields on
+    # grandfathered Class B.2 endpoints, and names its own failure mode: "surface
+    # growing one 'obviously fine' field at a time". Condition 5 already puts the
+    # field names in the PR body and the CHANGELOG — but nothing ever reads them,
+    # which is the state #288 found in the first place. This is the read.
+    - name: ADR 0012 additive-field sweep
+      when: every release, during the release_kit walk
+      how: grep the CHANGELOG section being dated for "additive under ADR 0012"
+      report: list the field names and their endpoints in the release PR body;
+        write "none this cycle" when there are none, so silence is a result
+        rather than an omission
 ```

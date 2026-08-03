@@ -1,7 +1,7 @@
 # ADR 0013 — OCP Does Not Implement OpenAI Tool Calling
 
 **Date:** 2026-08-03
-**Status:** Proposed
+**Status:** Accepted (maintainer sign-off 2026-08-03)
 **Scope:** Class B.1 — `POST /v1/chat/completions`. Authority: OpenAI's published
 `/v1/chat/completions` specification + [ADR 0006](0006-openai-shim-scope.md).
 

@@ -1,7 +1,7 @@
 # ADR 0012 — Additive Read-Only Fields on Grandfathered Class B.2 Endpoints
 
 **Date:** 2026-08-03
-**Status:** Proposed
+**Status:** Accepted (maintainer sign-off 2026-08-03)
 **Extends:** [ADR 0006](0006-openai-shim-scope.md) (Class B scope and the B.2 grandfather provision).
 This ADR does not widen ADR 0006's boundary against new Class B surface; it answers a question
 ADR 0006's text leaves determinate but expensive, and closes the compliance gap that answer exposes.

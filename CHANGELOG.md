@@ -1,5 +1,14 @@
 # Changelog
 
+## Unreleased
+
+### Changed
+
+- **ADR 0012 and ADR 0013 signed off; both move `Proposed` → `Accepted`.** Neither decision changes: no code, no endpoint, no field. What changes is that the repo stops citing unapproved authorizations as though they were settled. Both were already load-bearing in shipped artifacts while marked `Proposed` — `ALIGNMENT.md:116` states ADR 0012's standing authorization as an operative rule and `:134` cites it for `/cache/stats`'s `inflight`/`requesters`; `server.mjs:2974`, `lib/tool-support.mjs:55` and `README.md` § "Client-tools boundary" cite ADR 0013, and the 400 body that OCP returns to callers today literally reads `See ADR 0013.` A supreme document quoting a pending authorization, and a production error message naming a pending ADR, is worse than either outcome: it makes `Proposed` stop meaning anything, so the next reader cannot tell which pending records are genuinely undecided.
+  - **ADR 0013 is descriptive**, not a new decision — it records behaviour that shipped in v3.28.0 and now runs on every host in the fleet, verified against OpenAI's published specification field by field. It also keeps its own exit: § "The shape a real implementation would take" records what a genuine implementation needs, and § "Consequences" states that the refusal is "the natural thing to delete" if that is ever built.
+  - **ADR 0012 is the one that actually loosens something**, and it is accepted with the gap in it closed. Its § "Consequences" names its own failure mode — "surface growing one 'obviously fine' field at a time" — and shipped with no way to detect it. Condition 5 already requires the PR body and the CHANGELOG to name each field, so the audit trail existed; nothing read it, which is precisely the state #288 found. `CLAUDE.md`'s `release_kit:` overlay gains a `governance_audits:` block that reads it once per release and requires the answer be written down — including "none this cycle", so silence is a result rather than an omission. No new machinery: the release_kit walk already runs, and the data is already in the CHANGELOG.
+  - Recorded rather than glossed: **ADR 0006 (`Proposed — owner reviewing`) and ADR 0008 (`Proposed`) are the same defect and are deliberately NOT included here.** 0006 is the more serious instance by a wide margin — it defines the Class A/B taxonomy every PR in this repo cites, and is referenced 21× in `ALIGNMENT.md`, 7× in `CLAUDE.md` and 7× in the PR template — but its status line says "owner reviewing", which is an explicit statement of maintainer state and not something a contributor may resolve on the maintainer's behalf.
+
 ## v3.28.0 — 2026-08-03
 
 ### Fixed
