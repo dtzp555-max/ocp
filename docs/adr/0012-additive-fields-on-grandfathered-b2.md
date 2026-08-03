@@ -29,9 +29,22 @@ inventory grandfathers:
 | Change | Endpoint | Shipped | Authority actually cited |
 |---|---|---|---|
 | `inflight`, `requesters` | `/cache/stats` | v3.13.0 | the general ADR 0006 grandfather clause |
-| `tui` block (`enabled`, `entrypointMode`, `lastEntrypoint`, `entrypointMismatches`, `inflight`, `maxConcurrent`) | `/health` | v3.19.0 | ADR 0007 / ADR 0008 (the TUI feature ADRs) |
+| `tui` block (`enabled`, `entrypointMode`, `lastEntrypoint`, `entrypointMismatches`, `inflight`, `maxConcurrent`) | `/health` | v3.20.0 | ADR 0007 / ADR 0008 (the TUI feature ADRs) |
 | `auth.lastOutcome`, `auth.consecutiveFailures` | `/health` | v3.27.0 | ADR 0010 |
-| `pool` | `/health` | v3.20.0 | ADR 0008 |
+| `tui.pool` | `/health` | v3.22.1 | ADR 0008 |
+
+> **Corrected at sign-off (2026-08-03).** Two of these four rows carried the wrong shipped
+> version, and one mis-stated where its field lives. `tui` was written as v3.19.0 — the six
+> fields are listed in the **v3.20.0** section of `CHANGELOG.md`, not v3.19.0. `pool` was written
+> as a top-level `/health` field shipped in v3.20.0 — it is nested at **`tui.pool`** (ADR 0008
+> § "Observability": "`/health`'s `tui` block gains a `pool` sub-object"; confirmed
+> against a live `/health`, which has no top-level `pool` key), and it shipped with the warm pane
+> pool (#158) in **v3.22.1**. The `pool` row was independently impossible as written: ADR 0008 is
+> dated 2026-07-13 and v3.20.0 was released 2026-06-10, so a field this ADR records as authorized
+> by ADR 0008 could not have shipped a month before that ADR existed. Rows 1 (v3.13.0) and 3
+> (v3.27.0) were verified correct and are unchanged. This matters beyond tidiness because
+> § "Retroactive scope" below authorizes these four **"as of their shipped versions"** — the
+> stamps are lightly operative, so a wrong stamp authorizes the wrong thing.
 
 Three of the four are covered only incidentally: the field arrived as part of a *feature* that
 needed an ADR for its own reasons, and the field rode along. `/cache/stats` had no accompanying

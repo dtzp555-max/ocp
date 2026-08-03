@@ -140,10 +140,23 @@ release_kit:
     # growing one 'obviously fine' field at a time". Condition 5 already puts the
     # field names in the PR body and the CHANGELOG — but nothing ever reads them,
     # which is the state #288 found in the first place. This is the read.
+    #
+    # KNOWN BLIND SPOT, stated so nobody mistakes a green result for coverage:
+    # this sweep finds only additions whose author COMPLIED with condition 5 and
+    # wrote the marker. A field added with no marker — which is the exact shape of
+    # the four pre-#288 additions — produces "none this cycle", a POSITIVE-looking
+    # result for the case this is least able to see. It instruments the compliant
+    # path; it does not detect silent growth. Detecting that needs a per-release
+    # record of each B.2 endpoint's actual response key set, diffed across
+    # releases, which is real machinery and is deliberately not built here.
     - name: ADR 0012 additive-field sweep
       when: every release, during the release_kit walk
-      how: grep the CHANGELOG section being dated for "additive under ADR 0012"
-      report: list the field names and their endpoints in the release PR body;
-        write "none this cycle" when there are none, so silence is a result
-        rather than an omission
+      how: grep the CHANGELOG section being dated for "additive under ADR 0012";
+        also grep the WHOLE CHANGELOG for it and report the running total
+      report: list the field names and their endpoints in the release PR body,
+        plus the cumulative count to date; write "none this cycle" when there are
+        none, so silence is a result rather than an omission. The cumulative
+        number is the point — the failure mode ADR 0012 accepts is per-release
+        increments each of which looks fine, so a monotonically rising integer is
+        what makes the accumulation visible at all.
 ```
