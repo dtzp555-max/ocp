@@ -583,6 +583,15 @@ Top-level files a contributor or operator may need to know:
 | `models.json` | Single source of truth for model IDs, aliases, context windows. See ADR 0003. |
 | `ocp` / `ocp-connect` | User-facing CLI wrappers (server-side / client-side respectively). |
 | `dashboard.html` | Static dashboard served from `/dashboard`. |
+| `lib/constants.mjs` | Shared constants (default port, loopback host, local proxy URL) — one definition for `server.mjs`, the CLIs and the tests. |
+| `lib/env.mjs` | Fail-closed positive-integer parsing for the numeric env caps (body size, image bytes, …). |
+| `lib/multimodal.mjs` | OpenAI `image_url` content parts → Anthropic image blocks for `claude -p --input-format stream-json`. See § "Images / Multimodal (Vision)". |
+| `lib/net.mjs` | `isLoopbackBind()` — whether a bind address is reachable from another host. Gates TUI mode (`OCP_TUI_ALLOW_LAN`) and the `OCP_LOCAL_TOOLS` boot check, both of which fail closed on a non-loopback bind. |
+| `lib/prompt.mjs` | Pure system-prompt assembly: operator append, per-model truncation budget, wrapper selection. See ADR 0011. |
+| `lib/spawn-auth.mjs` | Pure primitives for `-p` spawn-token resolution and HOME isolation (serial mutex, TTL cache, expiry, label ordering). |
+| `lib/structured-output.mjs` | OpenAI `response_format` helpers — detection, JSON-Schema validation, payload extraction. Class B.1, ADR 0006. |
+| `lib/tool-support.mjs` | `classifyToolRequest()` — which `tools` / `tool_choice` / `function_call` shapes OCP must refuse. See ADR 0013. |
+| `lib/tui/` | Subscription-pool (TUI) mode internals: warm-pane pool, semaphore, session, stream, transcript. |
 | `scripts/sync-openclaw.mjs` | Idempotent OpenClaw registry sync invoked by `ocp update`. See ADR 0004. |
 | `scripts/lib/service-mode.mjs` | Pure decision layer for `setup.mjs`'s auto-start step — first install vs. `--reconfigure-only` (issue #226). |
 | `scripts/lib/install-autostart.mjs` | Injectable `installAutoStart()` — setup.mjs's auto-start install (legacy-unit migration, unit write, enable/start/bootstrap), extracted so tests can observe real run/fs calls instead of asserting on source text (issue #226). |
