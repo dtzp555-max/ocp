@@ -159,6 +159,16 @@ OCP translates OpenAI-compatible `/v1/chat/completions` requests into `claude --
 
 OCP is a **text-prompt bridge** to the official `claude` CLI. It does **not** pass through OpenAI `tools`/`functions` payloads or Anthropic `tool_use` blocks to the client. Clients (Cline, Cursor, OpenClaw, etc.) pointed at OCP receive **assistant TEXT only** — they never get `tool_calls` to execute locally.
 
+**Offering tools is fine; *forcing* a tool call gets a 400.** Because OCP never emits `tool_calls`, a request that *requires* one cannot be answered correctly, so it is refused rather than answered with prose that claims the turn ended normally:
+
+| Request | OCP |
+|---|---|
+| `tools` with no `tool_choice`, or `tool_choice` `"auto"` / `"none"` / `allowed_tools` `mode: "auto"` | **served normally** — text, `finish_reason: "stop"` |
+| `tool_choice` `"required"`, `{"type":"function"}`, `{"type":"custom"}`, or `allowed_tools` `mode: "required"` | **`400`** — `error.code: "unsupported_parameter"`, `error.param: "tool_choice"` |
+| legacy `function_call: {"name": …}` | **`400`**, same shape, `error.param: "function_call"` |
+
+Simply sending a tool list is never an error — that is the common case (every OpenClaw turn carries one) and it is unchanged. Only the instruction OCP cannot obey is refused, and it is refused loudly so a client can fall back to another provider or retry with `"auto"` instead of silently receiving a wrong answer. See [ADR 0013](docs/adr/0013-no-openai-tool-calling.md) for why this is a refusal rather than an implementation.
+
 Any tool use happens server-side, under the `--allowedTools` set configured on the OCP host. In default mode (no `CLAUDE_NO_CONTEXT`), the `claude` CLI's own built-in tools are available to the model; in TUI mode, the operator controls the tool surface via `OCP_TUI_FULL_TOOLS`. Either way, the tools run under the operator's credentials on the server, and the client sees only the final text output. Note that on the `-p` path OCP prepends a system-prompt wrapper telling the model it has **no** local access (right for a shared gateway) — a single-user loopback instance whose model *should* use its tools can flip this with `OCP_LOCAL_TOOLS=1` (see Environment Variables).
 
 **Client-local tool execution is not supported by design.** Supporting it would require bypassing the `claude` CLI to call the raw Anthropic API directly — that is a different product, and is out of scope per `ALIGNMENT.md` (every OCP endpoint must correspond to something `cli.js` actually does).

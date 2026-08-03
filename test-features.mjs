@@ -1749,7 +1749,8 @@ ltTest("integration (#310): a body over the cap in characters is still rejected,
 });
 
 // ── Issue #311: forced tool_choice is refused; permissive tool_choice is not ──
-// OCP emits no tool_calls at all (`grep -c tool_calls server.mjs` -> 0) and never reads the request
+// OCP emits no tool_calls at all (before this change `grep -c tool_calls server.mjs` -> 0; it is 2
+// now, both inside the comment this change added) and never reads the request
 // fields. Whether that is a defect depends entirely on tool_choice, and the OpenAI spec draws the
 // line: absent/"auto"/"none" all permit a text answer, so OCP is conformant there; "required" and
 // {type:"function"} require finish_reason "tool_calls", so prose with "stop" is a WRONG answer —

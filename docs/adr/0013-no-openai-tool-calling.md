@@ -93,7 +93,9 @@ Refusing on `tools` would have converted a silent wrongness into a loud outage.
   another provider or retry with `"auto"`. Before, it could not detect the failure at all.
 - A client that merely **offers** tools sees no change whatsoever. Nothing that works today breaks.
 - OCP still cannot do what a caller with `tool_choice: "auto"` might reasonably hope for. That
-  remains true and is now documented in the README rather than discovered.
+  remains true. README § "Client-tools boundary" already documented it — "they never get
+  `tool_calls` to execute locally" — and this change extends that section with the new 400
+  contract, which is the part a client author could not previously read anywhere.
 - **The cost, stated plainly:** the most common real-world case — a client that offers tools and
   genuinely wants them used — is still answered with prose and no signal. This ADR does not fix
   that. It removes the class of failure where OCP's answer contradicts an explicit instruction,
