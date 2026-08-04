@@ -1,7 +1,7 @@
 # ADR 0008 — TUI Warm Pane Pool
 
 **Date:** 2026-07-13
-**Status:** Proposed
+**Status:** Accepted (maintainer sign-off 2026-08-04)
 **Extends:** [ADR 0007](0007-tui-interactive-mode.md) (TUI interactive mode). This ADR does not
 change ADR 0007's billing-pool argument, security posture, or kill-switch — it adds a latency
 optimization *inside* the TUI spawn machinery ADR 0007 owns.

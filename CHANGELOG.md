@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+### Changed
+
+- **ADR 0006 and ADR 0008 signed off; both move `Proposed` → `Accepted`. No ADR in the repo is `Proposed` any more.** Neither decision changes — no code, no endpoint, no field, and neither ADR's body is edited beyond its status line.
+  - **ADR 0006 is the one that mattered.** It defines the Class A/B taxonomy that every PR in this repo cites as its authority, and it is referenced on **21 lines of `ALIGNMENT.md`** (the supreme document), 7 of `CLAUDE.md`, 1 of `AGENTS.md`, and by **six other ADRs** — 0007, 0008, 0010, 0011, 0012, 0013. The entire citation discipline was resting on a document marked "Proposed — owner reviewing".
+  - **This closes an inconsistency the previous sign-off created.** #326 accepted ADR 0012 and ADR 0013 while both derive their authority from 0006 — 0012 declares "Extends: ADR 0006", 0013's authority line names it — leaving two `Accepted` → `Proposed` edges in the dependency graph. That PR named the edges rather than hiding them and deferred 0006 because its status line said "owner reviewing", which is a statement of maintainer state and not a contributor's to clear. It has now been cleared by the maintainer.
+  - **ADR 0008** carries no governance weight — zero references in `ALIGNMENT.md`, `CLAUDE.md` or `AGENTS.md`, one from another ADR — and the feature it authorizes (the TUI warm-pane pool, and `/health`'s `tui.pool` sub-object) shipped in **v3.22.1**. It is signed in the same batch for the same reason: an unaccepted record of a shipped decision makes `Proposed` mean nothing.
+  - **What this buys, concretely:** `Proposed` is now an empty set. The next ADR that carries it genuinely means "undecided", which is exactly what it could not mean while four shipped-and-cited decisions sat under the same label.
+
+
 ### Fixed
 
 - **`ocp restart` no longer leaves the service DOWN when the start half fails (#325).** A restart is stop+start; when the start half failed, `cmd_restart` printed `✗ Restart command failed.` and returned 1 — with a healthy proxy already unloaded and the port dead. That wording reads like the restart was *declined*. It wasn't: the service was stopped, by this command, and stayed stopped. This happened in production during the v3.28.0 rollout — `launchctl bootout` succeeded, `launchctl bootstrap` returned `5: Input/output error`, and the proxy was down until someone noticed.
