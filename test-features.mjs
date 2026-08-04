@@ -95,6 +95,23 @@ test("listKeys includes quota fields", () => {
   assert.equal(k.quota_daily, null);
 });
 
+test("listKeys returns keyPreview without exposing raw key material", () => {
+  const keys = listKeys();
+  const k = keys.find(k => k.name === "test-user-1");
+  assert.ok(k.keyPreview, "keyPreview field must exist");
+  assert.match(k.keyPreview, /^ocp_.{4}\.\.\..{4}$/,
+    "keyPreview must be 8-char prefix + '...' + 4-char suffix");
+  for (const [prop, val] of Object.entries(k)) {
+    if (typeof val === "string") {
+      assert.ok(
+        !/^ocp_[A-Za-z0-9_-]{32}$/.test(val),
+        `property "${prop}" must not contain a full-length key`
+      );
+    }
+  }
+  assert.ok(!("key" in k), "the raw 'key' property must not exist in listKeys output");
+});
+
 test("checkQuota returns null when no quota set", () => {
   const result = checkQuota(key1.id, key1.name);
   assert.equal(result, null);
