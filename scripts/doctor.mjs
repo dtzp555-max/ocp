@@ -615,7 +615,7 @@ export function classifyAuthOk(body) {
   if (ok === false) {
     // #324. A latched `false` with nothing conclusive since is STALE EVIDENCE, not a fresh
     // rejection, and this function's verdict is a decision: FAIL sets next_action.kind =
-    // "fix_oauth", which makes `ocp update` refuse outright (ocp:1290-1293, no override).
+    // "fix_oauth", which makes `ocp update` refuse outright (the `fix_oauth|fix_service)` arm in `ocp`, which prints "Pre-upgrade check failed" and returns 1 — cited by its text, not a line number, because this repo has a documented line-rot lesson).
     //
     // The wedge is real and was hit in production. An inconclusive probe deliberately preserves
     // the last conclusive `ok` — correct on its own, since a timeout measures host load and not
@@ -629,7 +629,19 @@ export function classifyAuthOk(body) {
     // change (the ADR 0010 test). The staleness lives in a separate additive counter and only
     // this decision reads it.
     const inconclusive = Number(auth?.consecutiveInconclusive) || 0;
-    if (inconclusive >= AUTH_STALE_AFTER_INCONCLUSIVE) {
+    // The counter alone is not sufficient, and an independent review proved it by mutation: make
+    // the server PRESERVE the counter on a conclusive rejection instead of resetting it, and the
+    // state {ok:false, lastOutcome:"rejected", consecutiveInconclusive:3} reaches here — a
+    // rejection that happened SECONDS ago, read as stale, unlocking the upgrade gate. Nothing in
+    // the suite caught it.
+    //
+    // So require both: the count, AND that the most recent probe did not conclude. A correct
+    // server can never emit lastOutcome="rejected" with a non-zero counter, because the rejection
+    // branch resets it — this condition is therefore strictly tightening on correct servers and a
+    // backstop against an incorrect one. Absent lastOutcome (an older server) is not inconclusive,
+    // so it keeps FAILing, same direction as the absent-counter case.
+    const lastInconclusive = auth?.lastOutcome === "timeout" || auth?.lastOutcome === "unavailable";
+    if (inconclusive >= AUTH_STALE_AFTER_INCONCLUSIVE && lastInconclusive) {
       return {
         level: "WARN",
         oauthOk: true,
