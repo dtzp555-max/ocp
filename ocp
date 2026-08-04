@@ -174,6 +174,38 @@ _curl_or_die() {
 # stdout is discarded (these callers want the verdict, never the body); curl's own stderr is
 # captured to a private temp file and surfaced, never `2>/dev/null` — discarding it is what hid
 # all three of these sites through three separate enumeration passes.
+# Issue #325. Run one resolved restart command, retrying a bounded number of times.
+#
+# A restart is stop+start. When the start half fails, the caller has not "failed to restart" —
+# it has STOPPED a healthy service and left it stopped. That happened in production: on macOS the
+# resolver emits `launchctl bootout …` then `launchctl bootstrap …`; bootout succeeded, bootstrap
+# returned EIO ("5: Input/output error"), and `cmd_restart` printed "✗ Restart command failed."
+# and returned 1 with the proxy unloaded and the port dead.
+#
+# Retry, because the observed failure was TRANSIENT and one retry was enough: the identical
+# bootstrap succeeded by hand seconds later, unchanged plist, unchanged domain, and `ocp update`
+# ran the same two commands successfully minutes afterwards. The most plausible cause is a race
+# against the bootout that just completed, which is exactly the shape a short backoff fixes.
+#
+# `|| rc=$?` rather than a bare `eval` under `set -euo pipefail` (ocp:7): a bare failing eval
+# aborts the whole script, which would reintroduce the defect in a louder form — see the same
+# note on `_curl_probe`'s call sites, where this was a real bug caught by its own tests.
+_restart_exec_retry() {
+  local cmd="$1" attempts="${2:-3}" i rc
+  for (( i = 1; i <= attempts; i++ )); do
+    rc=0
+    eval "$cmd" || rc=$?
+    [[ $rc -eq 0 ]] && return 0
+    if (( i < attempts )); then
+      echo "    attempt $i/$attempts failed (exit $rc) — retrying in ${i}s" >&2
+      sleep "$i"
+    else
+      echo "    attempt $i/$attempts failed (exit $rc) — giving up on this command" >&2
+    fi
+  done
+  return 1
+}
+
 _curl_probe() {
   local errfile status err
   errfile=$(mktemp "${TMPDIR:-/tmp}/ocp-curlerr.XXXXXX") || {
@@ -982,12 +1014,18 @@ cmd_restart() {
     while IFS= read -r cmd_line; do
       [[ -z "$cmd_line" ]] && continue
       echo "  $cmd_line"
-      eval "$cmd_line" || restart_failed=1
+      # #325: bounded retry instead of one shot. See _restart_exec_retry.
+      _restart_exec_retry "$cmd_line" 3 || restart_failed=1
     done <<< "$resolve_out"
 
+    # #325: DO NOT return here on failure. This function's previous shape returned immediately
+    # with "✗ Restart command failed." — which is true about the command and silent about the
+    # thing that matters, namely that the stop half already ran and the service may now be DOWN.
+    # The verdict about the proxy belongs to the probe below, not to a subcommand's exit status:
+    # a failing command does not prove the proxy is down (the service manager may have started it
+    # anyway) and a succeeding one does not prove it is up. So fall through and measure.
     if [[ $restart_failed -ne 0 ]]; then
-      echo "✗ Restart command failed."
-      return 1
+      echo "! A restart command failed after retries — checking whether the proxy is up anyway." >&2
     fi
 
     sleep 3
@@ -1006,6 +1044,33 @@ cmd_restart() {
       echo "? Restart command ran, but this machine could not run curl to confirm it (see error above)."
       echo "  The proxy's state is UNKNOWN — this is a local environment fault, not evidence the restart failed."
       return 1
+    fi
+    # #325: the probe and the command outcome are two independent facts, and the message has to
+    # name the combination. The old code had two cells; the missing one is the incident: a command
+    # failed AND the proxy is not answering, i.e. the service is DOWN and this command is why.
+    if [[ $probe_rc -ne 0 && $restart_failed -ne 0 ]]; then
+      echo "✗ THE PROXY IS DOWN. A restart command failed after retries and the proxy is not answering on $PROXY." >&2
+      echo "  This command stopped it and could not start it again — it is not 'the restart was declined'," >&2
+      echo "  the service is stopped right now and will stay stopped until it is started." >&2
+      echo "" >&2
+      echo "  To bring it back, run the start command the resolver produced for this host:" >&2
+      while IFS= read -r cmd_line; do
+        [[ -z "$cmd_line" ]] && continue
+        echo "    $cmd_line" >&2
+      done <<< "$resolve_out"
+      echo "" >&2
+      echo "  If that keeps failing, \`ocp doctor\` reports which unit owns the port and why the resolver chose it." >&2
+      return 1
+    fi
+    if [[ $probe_rc -eq 0 && $restart_failed -ne 0 ]]; then
+      # Not a success message: something genuinely went wrong and the operator should know, even
+      # though the outcome is fine. Silently reporting "✓" here would train people to ignore the
+      # retry warnings that are the early signal for the DOWN case above.
+      echo "! Proxy is responding, but a restart command failed after retries (see above)."
+      echo "  The service is UP. Worth checking \`ocp doctor\` — this usually means the resolver's"
+      echo "  expected unit and the unit that actually owns the port have drifted apart."
+      ( cmd_usage ) || true
+      return 0
     fi
     if [[ $probe_rc -eq 0 ]]; then
       echo "✓ Proxy restarted successfully."

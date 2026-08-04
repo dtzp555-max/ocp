@@ -13933,6 +13933,73 @@ test("#299 control: cmd_restart with curl present but the proxy genuinely not an
     `and must NOT take the undetermined arm, got stdout=${JSON.stringify(r.stdout)}`);
 });
 
+// ── #325: a restart that cannot start must not leave the service DOWN silently ──
+// The incident: on macOS the resolver emits `launchctl bootout …` then `launchctl bootstrap …`.
+// bootout succeeded, bootstrap returned EIO, and cmd_restart printed "✗ Restart command failed."
+// and returned 1 — with a healthy proxy unloaded and the port dead. "Restart command failed"
+// reads like the restart was declined; the service was in fact stopped, by this command.
+//
+// Two behaviours are pinned here: the failing command is RETRIED (the observed failure was
+// transient — the identical bootstrap succeeded by hand seconds later), and the verdict now
+// comes from the health probe rather than a subcommand's exit status, so the four combinations
+// of (command ok?, proxy up?) get four distinct messages instead of two.
+
+test("#325 (the money test): a command that fails ONCE then succeeds is retried, and the restart succeeds", () => {
+  // A self-counting command: exits 1 on the first invocation, 0 on the second. If cmd_restart
+  // still ran each resolved command exactly once, this restart would be reported as failed.
+  // NO `$`, backticks or `$((...))` anywhere in this command. The harness emits each resolved
+  // line from a fake `node` as `echo "<line>"` (test-features.mjs, resolveRestartStdout), so any
+  // shell expansion would run inside the STUB and hand cmd_restart an already-rewritten string —
+  // a harness-premise bug that makes the test measure nothing. Counting is done by appending one
+  // byte per invocation and reading the file's LENGTH; branching by the presence of a flag file.
+  const stamp = Date.now();
+  const count = join(_ltTmp(), `ocp325-count-${stamp}`);
+  const flag = join(_ltTmp(), `ocp325-flag-${stamp}`);
+  const cmd = `sh -c 'printf x >> ${count}; if [ -f ${flag} ]; then exit 0; fi; : > ${flag}; exit 1'`;
+  const r = _bwHarnessRun({ args: ["restart"], overrideCmdRestart: false, resolveRestartStdout: [cmd], curlHealthExit: 0 });
+  assert.ok(_ltExists(count), "the resolved command ran at all — if this fails the harness never executed it");
+  assert.equal(_ltRead(count, "utf8").length, 2,
+    `expected exactly 2 attempts (one failure, one retry that succeeded) — 1 means no retry happened, ` +
+    `3+ means it retried past success; got ${JSON.stringify(_ltRead(count, "utf8"))}`);
+  assert.ok(r.stdout.includes("Proxy restarted successfully"),
+    `a transient first failure must end in a plain success, got stdout=${JSON.stringify(r.stdout)} stderr=${JSON.stringify(r.stderr)}`);
+  assert.ok(!r.stdout.includes("DOWN") && !r.stderr.includes("DOWN"),
+    "a recovered transient failure must not be reported as the proxy being down");
+});
+
+test("#325: command fails after retries AND the proxy is not answering → says the service is DOWN, and how to start it", () => {
+  // A resolved command is REQUIRED: resolveRestartStdout defaults to [], the loop reads nothing,
+  // and restart_failed stays 0 no matter what serviceStubsSucceed says.
+  const r = _bwHarnessRun({ args: ["restart"], overrideCmdRestart: false, serviceStubsSucceed: false,
+    resolveRestartStdout: ["systemctl restart -- ocp.service"], curlHealthExit: 1 });
+  assert.ok(/THE PROXY IS DOWN/.test(r.stderr),
+    `the operator must be told the service is stopped RIGHT NOW, not that a command "failed"; ` +
+    `stdout=${JSON.stringify(r.stdout)} stderr=${JSON.stringify(r.stderr)}`);
+  assert.ok(/start/i.test(r.stderr), `the message must tell them how to bring it back, got stderr=${JSON.stringify(r.stderr)}`);
+  assert.notEqual(r.status, 0, "and it must still be a failure exit");
+});
+
+test("#325: command fails after retries but the proxy IS answering → not a plain success, and not DOWN", () => {
+  const r = _bwHarnessRun({ args: ["restart"], overrideCmdRestart: false, serviceStubsSucceed: false,
+    resolveRestartStdout: ["systemctl restart -- ocp.service"], curlHealthExit: 0 });
+  assert.ok(/service is UP/i.test(r.stdout) || /responding, but a restart command failed/i.test(r.stdout),
+    `a command failed but the outcome is fine — say both, got stdout=${JSON.stringify(r.stdout)}`);
+  assert.ok(!/THE PROXY IS DOWN/.test(r.stderr), "must not claim DOWN when the probe says it is up");
+  assert.equal(r.status, 0, "the service is up, so this is not a failure for callers like _cmd_update_light");
+});
+
+test("#325 (precedence): a LOCAL curl fault must stay UNKNOWN and must never be reported as DOWN", () => {
+  // The dangerous interaction: the new DOWN branch keys on "probe non-zero", and the local-fault
+  // arm (#299) is also non-zero. If ordering were wrong, a machine that merely cannot RUN curl
+  // would be told its proxy is dead — asserting a state nobody measured, which is the exact
+  // defect class #299 exists to prevent.
+  const r = _bwHarnessRun({ args: ["restart"], overrideCmdRestart: false, serviceStubsSucceed: false,
+    resolveRestartStdout: ["systemctl restart -- ocp.service"], curlAbsent: true });
+  assert.ok(!/THE PROXY IS DOWN/.test(r.stderr) && !/THE PROXY IS DOWN/.test(r.stdout),
+    `a local fault is not evidence about the proxy; stdout=${JSON.stringify(r.stdout)} stderr=${JSON.stringify(r.stderr)}`);
+  assert.ok(r.stdout.includes("UNKNOWN"), `must still say UNKNOWN, got stdout=${JSON.stringify(r.stdout)}`);
+});
+
 // For the two `cmd_connect` sites the local fault has to be injected at the /v1/models step
 // SPECIFICALLY: `curlAbsent` would kill the flow at cmd_connect's first probe (already covered
 // by the #278 tests above) and never reach these. A `curlResponses` arm that exits 127 does it —
