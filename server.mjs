@@ -1131,12 +1131,25 @@ const AUTH_CHECK_TIMEOUT_MS = parseIntEnv("CLAUDE_AUTH_CHECK_TIMEOUT_MS", 10000)
 // One rejection can be a token mid-refresh race; two consecutive is a real condition.
 const AUTH_DEGRADE_AFTER = 2;
 
+
 let authStatus = {
   ok: null,                  // last CONCLUSIVE verdict: true | false | null (never established)
   lastCheck: 0,              // when the last probe COMPLETED, any outcome
   message: "",               // human-readable detail of the last probe
   lastOutcome: "none",       // "none" | "authenticated" | "rejected" | "timeout" | "unavailable"
   consecutiveFailures: 0,    // consecutive CONCLUSIVE rejections only
+  // #324, additive under ADR 0012. Consecutive INCONCLUSIVE probes (timeout / unavailable) since
+  // the last conclusive one. Reset to 0 by BOTH conclusive outcomes, so it means "nothing has
+  // concluded in this many probes", never "things have been bad for a while".
+  //
+  // It exists because `ok` alone cannot express staleness: an inconclusive probe deliberately
+  // preserves the last conclusive `ok` (right — a timeout measures host load, not credentials),
+  // and that composes into a latch only a conclusive success can clear, which a reliably-timing-out
+  // probe never produces. `ok` is deliberately NOT changed by this counter: the last conclusive
+  // verdict really was what it was, and rewriting it would be a contract change on a grandfathered
+  // B.2 field (the ADR 0010 test). Consumers that must DECIDE — doctor, and through it the
+  // `ocp update` gate — read this alongside `ok` instead.
+  consecutiveInconclusive: 0,
 };
 
 // The single definition of "can this proxy serve?", used by BOTH /status and /health (#232).
@@ -1185,7 +1198,7 @@ async function checkAuth() {
         (err, _stdout, stderr) => (err ? reject(Object.assign(err, { stderr })) : resolve()));
     });
     authStatus = { ok: true, lastCheck: Date.now(), message: "authenticated",
-                   lastOutcome: "authenticated", consecutiveFailures: 0 };
+                   lastOutcome: "authenticated", consecutiveFailures: 0, consecutiveInconclusive: 0 };
   } catch (e) {
     const msg = (e.stderr || e.message || "").slice(0, 200);
     const now = Date.now();
@@ -1195,18 +1208,20 @@ async function checkAuth() {
       // validity — proven in production, where /health reported auth.ok=false with
       // "spawnSync ... ETIMEDOUT" in the same minute that POST /v1/chat/completions returned 200
       // on the same credentials. So preserve the last conclusive `ok` and leave the tally alone.
-      authStatus = { ...authStatus, lastCheck: now, message: msg, lastOutcome: "timeout" };
+      authStatus = { ...authStatus, lastCheck: now, message: msg, lastOutcome: "timeout",
+                     consecutiveInconclusive: (authStatus.consecutiveInconclusive || 0) + 1 };
     } else if (typeof e.code !== "number") {
       // INCONCLUSIVE. A spawn failure (ENOENT / EACCES / …) means the probe never ran, so it
       // says nothing about the credentials either. Same treatment. (A missing/non-executable
       // binary is still caught — by binaryOk in proxyHealthStatus, which is a real precondition.)
-      authStatus = { ...authStatus, lastCheck: now, message: msg, lastOutcome: "unavailable" };
+      authStatus = { ...authStatus, lastCheck: now, message: msg, lastOutcome: "unavailable",
+                     consecutiveInconclusive: (authStatus.consecutiveInconclusive || 0) + 1 };
     } else {
       // CONCLUSIVE REJECTION. claude ran to completion and exited non-zero. checkAuth and
       // spawnClaudeProcess scrub the environment identically, so the probe resolves the SAME
       // credentials the request path uses — a non-zero exit genuinely predicts serving failure.
       authStatus = { ok: false, lastCheck: now, message: msg, lastOutcome: "rejected",
-                     consecutiveFailures: authStatus.consecutiveFailures + 1 };
+                     consecutiveFailures: authStatus.consecutiveFailures + 1, consecutiveInconclusive: 0 };
     }
     // Carries the outcome class so an operator can tell a timeout from a real rejection.
     console.error(`[auth] check ${authStatus.lastOutcome}: ${msg}`);

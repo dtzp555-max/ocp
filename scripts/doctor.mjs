@@ -15,7 +15,7 @@ import { readFileSync, existsSync } from "node:fs";
 import { join } from "node:path";
 import { homedir } from "node:os";
 import { execSync } from "node:child_process";
-import { DEFAULT_PORT } from "../lib/constants.mjs";
+import { DEFAULT_PORT, AUTH_STALE_AFTER_INCONCLUSIVE } from "../lib/constants.mjs";
 
 const SCHEMA_VERSION = "1";
 
@@ -613,6 +613,31 @@ export function classifyAuthOk(body) {
 
   const seen = ok === null ? "null" : ok === undefined ? "missing" : String(ok);
   if (ok === false) {
+    // #324. A latched `false` with nothing conclusive since is STALE EVIDENCE, not a fresh
+    // rejection, and this function's verdict is a decision: FAIL sets next_action.kind =
+    // "fix_oauth", which makes `ocp update` refuse outright (ocp:1290-1293, no override).
+    //
+    // The wedge is real and was hit in production. An inconclusive probe deliberately preserves
+    // the last conclusive `ok` — correct on its own, since a timeout measures host load and not
+    // credential validity. But once `false` is latched, only a conclusive SUCCESS clears it, and a
+    // probe that reliably times out never produces one. On that host the proxy served 51 requests
+    // with zero errors and `/health` reported `ok`, while `ocp update` refused for hours; the only
+    // symptom was the upgrade path being closed, with nothing anywhere saying "stuck".
+    //
+    // `auth.ok` itself is left alone deliberately: the last conclusive verdict really was `false`,
+    // and rewriting the rule that determines a grandfathered B.2 field's value is a contract
+    // change (the ADR 0010 test). The staleness lives in a separate additive counter and only
+    // this decision reads it.
+    const inconclusive = Number(auth?.consecutiveInconclusive) || 0;
+    if (inconclusive >= AUTH_STALE_AFTER_INCONCLUSIVE) {
+      return {
+        level: "WARN",
+        oauthOk: true,
+        message: `auth.ok=${seen} but the last ${inconclusive} probes were inconclusive ` +
+          `(lastOutcome=${auth?.lastOutcome ?? "unknown"}) — the rejection is stale evidence, not a ` +
+          `current one, so it does not block an upgrade (#324): ${detail}`,
+      };
+    }
     return { level: "FAIL", oauthOk: false, message: `auth.ok=${seen}: ${detail}` };
   }
   // `null` (ADR 0010's "no conclusive probe yet") and an absent field are both "not known",
