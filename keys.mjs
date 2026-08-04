@@ -136,11 +136,12 @@ export function createKey(name) {
   return { id: result.lastInsertRowid, key, name };
 }
 
+export const LIST_KEYS_SQL =
+  "SELECT id, substr(key,1,8)||'...'||substr(key,-4) AS keyPreview, name, created_at, revoked, quota_daily, quota_weekly, quota_monthly FROM api_keys ORDER BY created_at DESC";
+
 export function listKeys() {
   const d = getDb();
-  return d.prepare(
-    "SELECT id, substr(key,1,8)||'...'||substr(key,-4) AS keyPreview, name, created_at, revoked, quota_daily, quota_weekly, quota_monthly FROM api_keys ORDER BY created_at DESC"
-  ).all();
+  return d.prepare(LIST_KEYS_SQL).all();
 }
 
 export function revokeKey(idOrName) {

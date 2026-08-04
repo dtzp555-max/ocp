@@ -5,7 +5,7 @@
  */
 // MUST come before keys.mjs: redirects the key store to a scratch dir (see test-env.mjs).
 import { TEST_OCP_DIR } from "./test-env.mjs";
-import { getDb, getDbPath, createKey, listKeys, validateKey, recordUsage, checkQuota, updateKeyQuota, getKeyQuota, findKey, cacheHash, getCachedResponse, setCachedResponse, clearCache, getCacheStats, closeDb, hasCacheControl, singleflight, getInflightStats } from "./keys.mjs";
+import { getDb, getDbPath, createKey, listKeys, LIST_KEYS_SQL, validateKey, recordUsage, checkQuota, updateKeyQuota, getKeyQuota, findKey, cacheHash, getCachedResponse, setCachedResponse, clearCache, getCacheStats, closeDb, hasCacheControl, singleflight, getInflightStats } from "./keys.mjs";
 import { isLoopbackBind } from "./lib/net.mjs";
 import { createSerialMutex, createTtlCache, isTokenExpiring, orderLabelsLastGoodFirst } from "./lib/spawn-auth.mjs";
 import { createHash } from "node:crypto";
@@ -95,20 +95,22 @@ test("listKeys includes quota fields", () => {
   assert.equal(k.quota_daily, null);
 });
 
-test("listKeys returns keyPreview without exposing raw key material", () => {
+test("listKeys never selects the raw key column", () => {
+  const selectList = LIST_KEYS_SQL.slice(
+    LIST_KEYS_SQL.search(/SELECT/i) + 6,
+    LIST_KEYS_SQL.search(/FROM/i)
+  ).replace(/substr\([^)]*\)/gi, "");
+  assert.ok(!/\bkey\b/.test(selectList),
+    "listKeys must not SELECT the raw key column — found 'key' outside substr()");
+});
+
+test("listKeys keyPreview matches the expected redaction of a real key", () => {
+  const { key: raw } = createKey("preview-fixture");
   const keys = listKeys();
-  const k = keys.find(k => k.name === "test-user-1");
-  assert.ok(k.keyPreview, "keyPreview field must exist");
-  assert.match(k.keyPreview, /^ocp_.{4}\.\.\..{4}$/,
-    "keyPreview must be 8-char prefix + '...' + 4-char suffix");
-  for (const [prop, val] of Object.entries(k)) {
-    if (typeof val === "string") {
-      assert.ok(
-        !/^ocp_[A-Za-z0-9_-]{32}$/.test(val),
-        `property "${prop}" must not contain a full-length key`
-      );
-    }
-  }
+  const k = keys.find(k => k.name === "preview-fixture");
+  assert.ok(k, "preview-fixture must appear in listKeys output");
+  assert.equal(k.keyPreview, raw.slice(0, 8) + "..." + raw.slice(-4),
+    "keyPreview must be byte-identical to first-8 + '...' + last-4 of the raw key");
   assert.ok(!("key" in k), "the raw 'key' property must not exist in listKeys output");
 });
 
