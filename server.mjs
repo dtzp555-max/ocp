@@ -163,14 +163,14 @@ function resolveClaude() {
 
   if (isWin) {
     try {
-      const lines = _lookupLines(execFileSync("where.exe", ["claude"], { encoding: "utf8", timeout: 5000 }));
+      const lines = _lookupLines(execFileSync("where.exe", ["claude"], { encoding: "utf8", timeout: 5000, env: scrubInboundAuthEnv({ ...process.env }).env }));
       const resolved = lines.find(_isWindowsSpawnableBinary);
       if (resolved) { console.warn(`[init] CLAUDE_BIN not set, resolved via where.exe: ${resolved}`); return resolved; }
       _warnUnspawnableWindowsMatches(lines);
     } catch {}
   } else {
     try {
-      const resolved = execFileSync("which", ["claude"], { encoding: "utf8", timeout: 5000 }).trim();
+      const resolved = execFileSync("which", ["claude"], { encoding: "utf8", timeout: 5000, env: scrubInboundAuthEnv({ ...process.env }).env }).trim();
       if (resolved) { console.warn(`[init] CLAUDE_BIN not set, resolved via which: ${resolved}`); return resolved; }
     } catch {}
   }
@@ -2433,7 +2433,7 @@ function readKeychainCreds() {
       try {
         const raw = execFileSync("security", [
           "find-generic-password", "-s", label, "-w"
-        ], { encoding: "utf8", timeout: 5000 }).trim();
+        ], { env: scrubInboundAuthEnv({ ...process.env }).env, encoding: "utf8", timeout: 5000 }).trim();
         const creds = JSON.parse(raw);
         if (creds?.claudeAiOauth?.accessToken) {
           _lastGoodKeychainLabel = label; // remember the winner → try it first next time

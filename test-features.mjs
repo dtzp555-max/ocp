@@ -1510,7 +1510,10 @@ ltTest("integration: OCP_LOCAL_TOOLS=1 → the -p spawn receives the POSITIVE wr
 // wrong env var name, fake never spawned) would satisfy "no secret found" vacuously — the exact
 // anchor-drift failure this suite already guards against elsewhere.
 
-const LT_SECRETS = { PROXY_API_KEY: "lt-inbound-key", OCP_ADMIN_KEY: "lt-admin-key", PROXY_ANONYMOUS_KEY: "lt-anon-key" };
+// Values are >= MIN_ALIASED_VALUE_LEN so the by-VALUE pass is exercised, not silently skipped.
+const LT_SECRETS = { PROXY_API_KEY: "lt-inbound-key-long", OCP_ADMIN_KEY: "lt-admin-key-long", PROXY_ANONYMOUS_KEY: "lt-anon-key-long" };
+// The alias OCP itself creates via `ocp-connect`: same value, a name not on the list.
+const LT_ALIAS = { OPENAI_API_KEY: "lt-inbound-key-long" };
 
 function ltAssertNoInboundSecrets(dump, where) {
   assert.ok(dump.length > 0, `${where}: env capture is EMPTY — the assertions below would pass vacuously`);
@@ -1526,7 +1529,7 @@ ltTest("integration (#328, the money test): the -p spawn does NOT inherit OCP's 
   if (!LT_POSIX) return; // sh fake — skip on Windows CI
   const dir = ltMkdir(); const cap = join(dir, "env.txt"); const fake = ltFake(dir);
   const { child, buf, port } = await ltBootFresh(
-    { ...LT_SECRETS, CLAUDE_CODE_OAUTH_TOKEN: "lt-outbound-token", CLAUDE_BIN: fake, ENV_CAPTURE: cap }, dir);
+    { ...LT_SECRETS, ...LT_ALIAS, CLAUDE_CODE_OAUTH_TOKEN: "lt-outbound-token", CLAUDE_BIN: fake, ENV_CAPTURE: cap }, dir);
   try {
     assert.ok(await ltWait(() => buf.out.includes("listening on") || buf.exit != null), `server did not start: ${buf.err.slice(0, 200)}`);
     await ltPost(port, { model: "sonnet", messages: [{ role: "user", content: "hi" }] });
@@ -8151,6 +8154,94 @@ test("#328: an empty-string secret is still removed (falsy value, real leak)", (
   // criterion, not truthiness.
   const { removed } = scrubInboundAuthEnv({ PROXY_API_KEY: "" });
   assert.deepEqual(removed, ["PROXY_API_KEY"]);
+});
+
+// ── setup.mjs's two spawns, tested by SLICE (#328, review-3 P2-1) ───────────
+// An earlier revision of this PR declared these two sites "fixed but untestable" because running
+// the real setup.mjs writes configs and installs autostart, and AGENTS.md records an incident from
+// a harness doing exactly that. A reviewer showed that was a false dichotomy: the choice was never
+// "run it or don't test it", it is "run it or SLICE it" — the technique AGENTS.md itself endorses
+// for ocp-connect. This slices only the two `execSync(...)` statements and evaluates them with a
+// recording execSync, so nothing is spawned and nothing is written.
+function _s328Slice(marker) {
+  const src = _ltRead(spotJoin(_spotDir, "setup.mjs"), "utf8");
+  const i = src.indexOf(marker);
+  assert.notEqual(i, -1, `anchor drift: ${JSON.stringify(marker)} not found in setup.mjs`);
+  const start = src.lastIndexOf("execSync(", i + marker.length);
+  assert.notEqual(start, -1, "no execSync( before the anchor — slice boundary wrong");
+  // Balance parens from `execSync(` to its close, so the slice is the whole call and not a prefix.
+  let depth = 0, end = -1;
+  for (let k = start + "execSync".length; k < src.length; k++) {
+    if (src[k] === "(") depth++;
+    else if (src[k] === ")") { depth--; if (depth === 0) { end = k + 1; break; } }
+  }
+  assert.notEqual(end, -1, "unbalanced parens — slice boundary wrong");
+  const slice = src.slice(start, end);
+  assert.ok(slice.length > 0 && slice.includes("execSync("), "empty or malformed slice — anchor drift");
+  return slice;
+}
+
+function _s328Env(slice) {
+  let seen = null;
+  const execSync = (_cmd, opts) => { seen = opts; return ""; };
+  // Only the names the sliced expressions actually reference. Not a sandbox — a drift guard.
+  const fn = new Function("execSync", "process", "scrubInboundAuthEnv", `return (${slice});`);
+  fn(execSync, { env: { PROXY_API_KEY: "ocp_secretlongvalue1", OCP_ADMIN_KEY: "ocp_adminlongvalue1",
+                        PROXY_ANONYMOUS_KEY: "ocp_anonlongvalue11", CLAUDE_CODE_OAUTH_TOKEN: "sk-ant-outbound",
+                        PATH: "/usr/bin" } },
+     scrubInboundAuthEnv);
+  return seen;
+}
+
+for (const [label, marker] of [["claude --version", "claude --version 2>/dev/null"],
+                               ["claude -p auth probe", "--no-session-persistence"]]) {
+  test(`#328: setup.mjs's \`${label}\` spawn does not hand the child OCP's inbound credentials`, () => {
+    const opts = _s328Env(_s328Slice(marker));
+    assert.ok(opts && opts.env, `${label}: the sliced call passed no env at all — that IS the leak`);
+    // Control first: the env is populated and the outbound credential survives, so an empty
+    // object cannot satisfy the assertions below.
+    assert.equal(opts.env.CLAUDE_CODE_OAUTH_TOKEN, "sk-ant-outbound",
+      `${label}: control — the OUTBOUND credential must reach the child`);
+    for (const name of INBOUND_AUTH_ENV_VARS) {
+      assert.ok(!(name in opts.env), `${label}: ${name} reaches the child`);
+    }
+    assert.ok(!JSON.stringify(opts.env).includes("ocp_secretlongvalue1"),
+      `${label}: the VALUE reached the child under some other name`);
+  });
+}
+
+test("#328 (P1 from review 3): a secret aliased under ANOTHER name is removed by VALUE", () => {
+  // OCP itself creates this: `ocp-connect` writes the user's OCP credential into OPENAI_API_KEY —
+  // shell rc, `launchctl setenv` (user domain), `~/.config/environment.d/` — and OCP's own
+  // autostart runs in exactly those scopes. So on any host that ran `ocp connect`, deleting by
+  // name alone left the same secret reaching the child under a different variable.
+  const SECRET = "ocp_averylongsecretvalue123456";
+  const { env, removed } = scrubInboundAuthEnv({
+    PROXY_API_KEY: SECRET, OPENAI_API_KEY: SECRET, OPENAI_BASE_URL: "http://127.0.0.1:3456/v1", PATH: "/usr/bin",
+  });
+  assert.ok(!("OPENAI_API_KEY" in env), "the aliased carrier must go, even though its NAME is not on the list");
+  assert.ok(removed.includes("OPENAI_API_KEY"), "and it must be reported, so the behaviour is assertable");
+  assert.ok(!JSON.stringify(env).includes(SECRET), "the VALUE must not survive under any name");
+  assert.equal(env.OPENAI_BASE_URL, "http://127.0.0.1:3456/v1",
+    "a same-prefix variable that is NOT the secret must survive — this removes a credential, not a namespace");
+  assert.equal(env.PATH, "/usr/bin", "and unrelated variables are untouched");
+});
+
+test("#328: a legitimate OPENAI_API_KEY that is NOT OCP's credential is left alone", () => {
+  // The reason this is done by value and not by adding OPENAI_API_KEY to the name list: a child
+  // can legitimately need a real OpenAI key (an MCP server loaded via CLAUDE_MCP_CONFIG). The
+  // goal is to remove OCP's credential, not to blank that variable.
+  const { env } = scrubInboundAuthEnv({ PROXY_API_KEY: "ocp_thisisocpsownkey000000", OPENAI_API_KEY: "sk-proj-a-real-openai-key" });
+  assert.equal(env.OPENAI_API_KEY, "sk-proj-a-real-openai-key", "an unrelated key must survive");
+});
+
+test("#328: a SHORT secret does not trigger collateral deletion by value", () => {
+  // Value-matching on a short secret would strip every variable that happens to share it. Below
+  // the length floor only the name-based pass applies — stated as a deliberate limit, not a bug.
+  const { env, removed } = scrubInboundAuthEnv({ PROXY_API_KEY: "1", DEBUG: "1", VERBOSE: "1" });
+  assert.deepEqual(removed, ["PROXY_API_KEY"], "only the named one goes");
+  assert.equal(env.DEBUG, "1", "a flag that merely shares the value must not be collateral");
+  assert.equal(env.VERBOSE, "1");
 });
 
 test("#328: the var list is the single source both scrub sites read", () => {

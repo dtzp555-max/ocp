@@ -67,7 +67,8 @@ if (process.env.CLAUDE_BIN) {
   CLAUDE_BIN_INJECT = process.env.CLAUDE_BIN;
 } else {
   try {
-    const detected = execSync("which claude 2>/dev/null", { encoding: "utf-8" }).trim();
+    const detected = execSync("which claude 2>/dev/null",
+      { encoding: "utf-8", env: scrubInboundAuthEnv({ ...process.env }).env }).trim();
     if (detected && existsSync(detected)) {
       CLAUDE_BIN_INJECT = detected;
     }
