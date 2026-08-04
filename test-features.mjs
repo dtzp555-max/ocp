@@ -13998,6 +13998,24 @@ test("#325 (precedence): a LOCAL curl fault must stay UNKNOWN and must never be 
   assert.ok(!/THE PROXY IS DOWN/.test(r.stderr) && !/THE PROXY IS DOWN/.test(r.stdout),
     `a local fault is not evidence about the proxy; stdout=${JSON.stringify(r.stdout)} stderr=${JSON.stringify(r.stderr)}`);
   assert.ok(r.stdout.includes("UNKNOWN"), `must still say UNKNOWN, got stdout=${JSON.stringify(r.stdout)}`);
+  // The rc==2 arm is reachable in TWO states and must not describe them alike (review P2-2).
+  // Here a command also failed, so "Restart command ran" would be false — and would contradict
+  // the warning printed immediately above it.
+  assert.ok(!/Restart command ran/.test(r.stdout),
+    `with a failed command this must not claim the command ran; got stdout=${JSON.stringify(r.stdout)}`);
+  assert.ok(/FAILED after retries/.test(r.stdout),
+    `it must say the command failed; got stdout=${JSON.stringify(r.stdout)}`);
+  assert.ok(/may be down/i.test(r.stdout) && /systemctl restart/.test(r.stdout),
+    `and must offer the start command, since the stop half already ran; got stdout=${JSON.stringify(r.stdout)}`);
+});
+
+test("#325 control: rc==2 with all commands SUCCEEDING keeps the original wording byte-for-byte", () => {
+  // Proves the split above did not simply rewrite the pre-existing #299 message for everyone.
+  const r = _bwHarnessRun({ args: ["restart"], overrideCmdRestart: false, serviceStubsSucceed: true,
+    resolveRestartStdout: ["systemctl restart -- ocp.service"], curlAbsent: true });
+  assert.ok(r.stdout.includes("Restart command ran, but this machine could not run curl to confirm it"),
+    `the succeeded-commands wording must be unchanged; got stdout=${JSON.stringify(r.stdout)}`);
+  assert.ok(!/FAILED after retries/.test(r.stdout), "and must not borrow the failure wording");
 });
 
 // For the two `cmd_connect` sites the local fault has to be injected at the /v1/models step

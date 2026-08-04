@@ -154,26 +154,6 @@ _curl_or_die() {
   return 0
 }
 
-# The verdict-shaped sibling of `_curl_or_die` (#296, #299, #300).
-#
-# `_curl_or_die` exists for the sites that want a PAYLOAD: it returns 1 for both failure kinds
-# because the caller is going to abort either way, and the distinction lives only in the message.
-# The sites this helper serves want a VERDICT they then narrate themselves — "LAN-accessible",
-# "restarted successfully" — and for those, collapsing the two kinds into one nonzero is the
-# defect, not a presentational detail: the caller's `else` branch asserts a specific cause
-# ("bound to localhost only", "proxy not responding") that is simply false when the real fault
-# was that curl could not be run at all. So this returns three states and lets the caller say
-# only what it actually knows:
-#
-#   0 — the request succeeded.
-#   1 — curl ran and the request failed. A genuine remote/network condition; the caller MAY
-#       state a conclusion about the proxy.
-#   2 — curl could not be run, or its stderr could not be captured. A LOCAL fault; the caller
-#       MUST NOT state any conclusion about the proxy, because it has no evidence about it.
-#
-# stdout is discarded (these callers want the verdict, never the body); curl's own stderr is
-# captured to a private temp file and surfaced, never `2>/dev/null` — discarding it is what hid
-# all three of these sites through three separate enumeration passes.
 # Issue #325. Run one resolved restart command, retrying a bounded number of times.
 #
 # A restart is stop+start. When the start half fails, the caller has not "failed to restart" —
@@ -205,6 +185,27 @@ _restart_exec_retry() {
   done
   return 1
 }
+
+# The verdict-shaped sibling of `_curl_or_die` (#296, #299, #300).
+#
+# `_curl_or_die` exists for the sites that want a PAYLOAD: it returns 1 for both failure kinds
+# because the caller is going to abort either way, and the distinction lives only in the message.
+# The sites this helper serves want a VERDICT they then narrate themselves — "LAN-accessible",
+# "restarted successfully" — and for those, collapsing the two kinds into one nonzero is the
+# defect, not a presentational detail: the caller's `else` branch asserts a specific cause
+# ("bound to localhost only", "proxy not responding") that is simply false when the real fault
+# was that curl could not be run at all. So this returns three states and lets the caller say
+# only what it actually knows:
+#
+#   0 — the request succeeded.
+#   1 — curl ran and the request failed. A genuine remote/network condition; the caller MAY
+#       state a conclusion about the proxy.
+#   2 — curl could not be run, or its stderr could not be captured. A LOCAL fault; the caller
+#       MUST NOT state any conclusion about the proxy, because it has no evidence about it.
+#
+# stdout is discarded (these callers want the verdict, never the body); curl's own stderr is
+# captured to a private temp file and surfaced, never `2>/dev/null` — discarding it is what hid
+# all three of these sites through three separate enumeration passes.
 
 _curl_probe() {
   local errfile status err
@@ -893,6 +894,13 @@ Usage:
   ocp restart gateway    Restart the OpenClaw gateway
                          (briefly disconnects all Telegram/Discord bots)
 
+Exit status (changed in #325): 0 means the proxy ANSWERS /health afterwards,
+not that every restart command succeeded. A command can fail after retries and
+still exit 0 if the proxy is serving — that case prints a warning rather than a
+plain success. Exit 1 means either the proxy is not answering, or its state
+could not be determined. A script keying on exit 0 as "the restart commands
+ran cleanly" should read the output, not just the status.
+
 Note (macOS): restart does a full launchctl bootout + bootstrap, NOT
 `kickstart -k`. bootout+bootstrap re-reads the plist's EnvironmentVariables,
 so an env change you made (e.g. CLAUDE_BIND, CLAUDE_CODE_OAUTH_TOKEN) actually
@@ -1041,8 +1049,22 @@ cmd_restart() {
     local probe_rc=0
     _curl_probe curl -sf --max-time 5 "$PROXY/health" || probe_rc=$?
     if [[ $probe_rc -eq 2 ]]; then
-      echo "? Restart command ran, but this machine could not run curl to confirm it (see error above)."
-      echo "  The proxy's state is UNKNOWN — this is a local environment fault, not evidence the restart failed."
+      # #325: this cell is reachable in two different states and must not describe them alike.
+      # "Restart command ran" is FALSE when a command failed after retries, and it contradicts the
+      # `!` warning printed just above. Splitting the first line is the whole fix; the UNKNOWN
+      # verdict is unchanged, because a local curl fault is still not evidence about the proxy.
+      if [[ $restart_failed -ne 0 ]]; then
+        echo "? A restart command FAILED after retries, and this machine could not run curl to check the proxy (see errors above)."
+        echo "  The proxy's state is UNKNOWN. It may be down: the stop half of the restart already ran."
+        echo "  If it is, the start command the resolver produced for this host is:"
+        while IFS= read -r cmd_line; do
+          [[ -z "$cmd_line" ]] && continue
+          echo "    $cmd_line"
+        done <<< "$resolve_out"
+      else
+        echo "? Restart command ran, but this machine could not run curl to confirm it (see error above)."
+        echo "  The proxy's state is UNKNOWN — this is a local environment fault, not evidence the restart failed."
+      fi
       return 1
     fi
     # #325: the probe and the command outcome are two independent facts, and the message has to
@@ -1050,8 +1072,13 @@ cmd_restart() {
     # failed AND the proxy is not answering, i.e. the service is DOWN and this command is why.
     if [[ $probe_rc -ne 0 && $restart_failed -ne 0 ]]; then
       echo "✗ THE PROXY IS DOWN. A restart command failed after retries and the proxy is not answering on $PROXY." >&2
-      echo "  This command stopped it and could not start it again — it is not 'the restart was declined'," >&2
-      echo "  the service is stopped right now and will stay stopped until it is started." >&2
+      echo "  This command stopped it and could not start it again — it is not 'the restart was declined'." >&2
+      # Deliberately not "it will stay stopped": that asserts more than one probe at +3s measured.
+      # A service that binds slowly after a PARTIALLY failed plan may still be coming up. Issue
+      # #325's recommendation to poll /health to a deadline (as update's post-flight does) is NOT
+      # implemented here and is left as follow-up; re-running the start command below is harmless
+      # if it turns out to be up.
+      echo "  As of the check just now it is not answering, and nothing will start it on its own." >&2
       echo "" >&2
       echo "  To bring it back, run the start command the resolver produced for this host:" >&2
       while IFS= read -r cmd_line; do
