@@ -1521,17 +1521,40 @@ function ltAssertNoInboundSecrets(dump, where) {
 ltTest("integration (#328, the money test): the -p spawn does NOT inherit OCP's inbound credentials", async () => {
   if (!LT_POSIX) return; // sh fake — skip on Windows CI
   const dir = ltMkdir(); const cap = join(dir, "env.txt"); const fake = ltFake(dir);
-  const { child, buf, port } = await ltBootFresh({ ...LT_SECRETS, CLAUDE_BIN: fake, ENV_CAPTURE: cap }, dir);
+  const { child, buf, port } = await ltBootFresh(
+    { ...LT_SECRETS, CLAUDE_CODE_OAUTH_TOKEN: "lt-outbound-token", CLAUDE_BIN: fake, ENV_CAPTURE: cap }, dir);
   try {
     assert.ok(await ltWait(() => buf.out.includes("listening on") || buf.exit != null), `server did not start: ${buf.err.slice(0, 200)}`);
     await ltPost(port, { model: "sonnet", messages: [{ role: "user", content: "hi" }] });
-    assert.ok(await ltWait(() => _ltExists(cap)), "fake claude was spawned and dumped its env");
+    // Wait for CONTENT, not existence. `env > "$ENV_CAPTURE"` creates the file empty and then
+    // writes it, so waiting on existence returns mid-write and the assertions below read "".
+    // AGENTS.md: "wait for the thing you are about to assert, not a proxy for it" (#199/#203).
+    // This is almost certainly the intermittent failure an independent reviewer saw once and
+    // could not reproduce — same shape, either integration test, timing-dependent.
+    assert.ok(await ltWait(() => _ltExists(cap) && _ltRead(cap, "utf8").length > 0),
+      "fake claude was spawned and finished dumping its env");
     const dump = _ltRead(cap, "utf8");
     // ltBootFresh passed all three secrets in the SERVER's env, so the parent definitely holds
     // them — this cannot pass merely because the variables were never set anywhere.
     ltAssertNoInboundSecrets(dump, "request spawn");
     // The child must still get what it legitimately needs, or this "fix" would be a break.
-    assert.match(dump, /^CLAUDE_CODE_OAUTH_TOKEN=|^HOME=/m, "the child must still receive its own outbound/HOME env");
+    // Asserted on CLAUDE_CODE_OAUTH_TOKEN ALONE. An earlier revision wrote
+    // `/^CLAUDE_CODE_OAUTH_TOKEN=|^HOME=/m` — HOME always exists, so that alternation could not
+    // fail, and an independent review proved it: adding `delete env.CLAUDE_CODE_OAUTH_TOKEN` (the
+    // obvious over-correction this line exists to catch) left the suite fully green. The token is
+    // now set explicitly in the boot env below, so the assertion has something to bind to on a CI
+    // host that has no real token.
+    //
+    // WHERE TO MUTATE, because the obvious spot does not work and will look like a weak test:
+    // a `delete env.CLAUDE_CODE_OAUTH_TOKEN` placed at the scrub site (server.mjs, next to
+    // scrubInboundAuthEnv) leaves this GREEN — not because the assertion is weak, but because the
+    // isolated-spawn branch re-injects `env.CLAUDE_CODE_OAUTH_TOKEN = decision.token` a few lines
+    // LATER, so the delete is overwritten by the code itself. Mutate immediately before
+    // `spawn(CLAUDE, ...)`, after every re-injection, and this goes red (verified). The same
+    // structure is why adding the token to INBOUND_AUTH_ENV_VARS could not break requests either:
+    // the isolated path would re-establish it regardless.
+    assert.match(dump, /^CLAUDE_CODE_OAUTH_TOKEN=lt-outbound-token$/m,
+      "the OUTBOUND credential the child needs must survive — stripping it would break every request");
   } finally { child.kill("SIGKILL"); _ltRmRetry(dir); }
 });
 
@@ -1543,7 +1566,8 @@ ltTest("integration (#328): the AUTH PROBE child does not inherit them either �
     assert.ok(await ltWait(() => buf.out.includes("listening on") || buf.exit != null), `server did not start: ${buf.err.slice(0, 200)}`);
     // The probe runs at boot; no request needed. Waiting on the file is waiting on the thing
     // asserted, not on a proxy for it.
-    assert.ok(await ltWait(() => _ltExists(cap), 20000), "the boot auth probe spawned the fake and dumped its env");
+    assert.ok(await ltWait(() => _ltExists(cap) && _ltRead(cap, "utf8").length > 0, 20000),
+      "the boot auth probe spawned the fake and finished dumping its env");
     ltAssertNoInboundSecrets(_ltRead(cap, "utf8"), "auth probe spawn");
     assert.ok(port > 0, "server reached listening state");
   } finally { child.kill("SIGKILL"); _ltRmRetry(dir); }
@@ -5890,6 +5914,24 @@ test("LEGACY_SESSION_NAME_RE matches only the exact old bare-prefix shape, never
 });
 
 console.log("\nTUI command construction (proxy-purity / #4):");
+
+test("#328 (P0, found by independent review): buildTuiCmd unsets OCP's inbound credentials in the PANE", () => {
+  // The third copy of the four-name denylist lived here, and this is the ONLY request path when
+  // CLAUDE_TUI_MODE=true — server.mjs picks callClaudeTui over callClaude wholesale, so a fix
+  // applied only to spawnClaudeProcess leaves every TUI request unprotected. Behavioural: this
+  // asserts the argv `buildTuiCmd` actually returns, which is the pane's real command line.
+  const cmd = buildTuiCmd("/usr/bin/claude", "claude-haiku", "sid-328", "/home/u", "cli"); // already a string
+  for (const name of INBOUND_AUTH_ENV_VARS) {
+    assert.ok(cmd.includes(`-u ${name}`), `pane command must unset ${name}; got: ${cmd.slice(0, 200)}`);
+  }
+  // Control: the pre-existing four are still unset (this must EXTEND the list, not replace it),
+  // and the outbound credential is not among the unsets.
+  for (const name of ["CLAUDECODE", "ANTHROPIC_API_KEY", "ANTHROPIC_BASE_URL", "ANTHROPIC_AUTH_TOKEN"]) {
+    assert.ok(cmd.includes(`-u ${name}`), `pane command must still unset ${name} — the list was replaced, not extended`);
+  }
+  assert.ok(!cmd.includes("-u CLAUDE_CODE_OAUTH_TOKEN"),
+    "the OUTBOUND credential must NOT be unset — the pane's claude needs it to authenticate");
+});
 
 test("buildTuiCmd suppresses host CLAUDE.md + auto-memory (proxy purity, #4)", () => {
   const cmd = buildTuiCmd("/usr/bin/claude", "claude-haiku", "sid-1", "/home/u", "cli");
