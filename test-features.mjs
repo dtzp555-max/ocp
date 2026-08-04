@@ -105,10 +105,12 @@ test("listKeys never selects the raw key column", () => {
 });
 
 test("listKeys executes LIST_KEYS_SQL at the db layer", () => {
+  // getDb() is a singleton — the same instance listKeys() will call prepare() on.
   const d = getDb();
+  const orig = d.prepare;
   let executed;
-  d.prepare = function (sql) { executed = sql; delete d.prepare; return Object.getPrototypeOf(d).prepare.call(this, sql); };
-  listKeys();
+  d.prepare = function (sql) { executed = sql; return orig.call(this, sql); };
+  try { listKeys(); } finally { delete d.prepare; }
   assert.equal(executed, LIST_KEYS_SQL,
     "listKeys must pass LIST_KEYS_SQL to db.prepare, not an inline query");
 });
