@@ -9,7 +9,7 @@ import { getDb, getDbPath, createKey, listKeys, validateKey, recordUsage, checkQ
 import { isLoopbackBind } from "./lib/net.mjs";
 import { classifyToolRequest } from "./lib/tool-support.mjs";
 import { randomBytes } from "node:crypto";
-import { createSerialMutex, createTtlCache, isTokenExpiring, orderLabelsLastGoodFirst, scrubInboundAuthEnv, INBOUND_AUTH_ENV_VARS } from "./lib/spawn-auth.mjs";
+import { createSerialMutex, createTtlCache, isTokenExpiring, orderLabelsLastGoodFirst, scrubInboundAuthEnv, INBOUND_AUTH_ENV_VARS, applyRequestVerdictTtl } from "./lib/spawn-auth.mjs";
 import { createHash } from "node:crypto";
 import { strict as assert } from "node:assert";
 import { join } from "node:path";
@@ -2503,6 +2503,61 @@ ltTest("integration (#324, P1 from review): a conclusive rejection RESETS a coun
       "lastOutcome:'rejected', consecutiveInconclusive:>=3} — a rejection seconds old that the " +
       "decider would otherwise have to treat as stale evidence");
     assert.equal(reset.auth.ok, false, "and it is a conclusive rejection");
+  } finally { child.kill("SIGKILL"); _ltRmRetry(dir); }
+});
+
+ltTest("integration (#308, the money test): a token in the ENV must not be reported as authenticated", async () => {
+  if (!LT_POSIX) return;
+  // The exact shape #308 reported. The probe exits 0 because a token is PRESENT — measured: a
+  // fabricated token yields exit 0 and loggedIn:true — so recording "authenticated" asserts
+  // validity that was never established. On the reporting host /health said authenticated while
+  // every request 500'd on authentication.
+  const dir = ltMkdir(); const fake = ltAuthFake(dir);
+  const { child, buf, port } = await ltBootFresh({
+    CLAUDE_BIN: fake, CLAUDE_CODE_OAUTH_TOKEN: "sk-ant-oat01-present-but-unverified",
+    CLAUDE_AUTH_CHECK_INTERVAL_MS: "300",
+  }, dir);
+  try {
+    const h = await ltWaitHealth(port, b => b.auth && b.auth.lastOutcome !== "none", 15000);
+    assert.ok(h, `no probe ever landed — ${ltDiag(buf)}`);
+    assert.equal(h.auth.lastOutcome, "token-present",
+      `a probe that only saw a token must say so; got ${JSON.stringify(h.auth)}`);
+    assert.equal(h.auth.ok, null,
+      "presence is not validity — the honest verdict is 'not established', which ADR 0010 already defines");
+    assert.notEqual(h.auth.ok, true, "this is the #308 defect: asserting authenticated on presence alone");
+    assert.equal(h.status, "ok",
+      "and the health VERDICT must not move — proxyHealthStatus reads consecutiveFailures, never ok");
+  } finally { child.kill("SIGKILL"); _ltRmRetry(dir); }
+});
+
+ltTest("integration (#308 control): with NO token in the env, exit 0 still means authenticated", async () => {
+  if (!LT_POSIX) return;
+  // Proves the change is scoped to the env-token case and did not simply delete the success path.
+  const dir = ltMkdir(); const fake = ltAuthFake(dir);
+  const { child, buf, port } = await ltBootFresh({ CLAUDE_BIN: fake, CLAUDE_AUTH_CHECK_INTERVAL_MS: "300" }, dir);
+  try {
+    const h = await ltWaitHealth(port, b => b.auth && b.auth.ok === true, 15000);
+    assert.ok(h, `the no-token path must still reach a conclusive ok:true — ${ltDiag(buf)}`);
+    assert.equal(h.auth.lastOutcome, "authenticated", "unchanged for a child that resolved its own credential");
+  } finally { child.kill("SIGKILL"); _ltRmRetry(dir); }
+});
+
+ltTest("integration (#308): a completed REQUEST raises the verdict the probe could not establish", async () => {
+  if (!LT_POSIX) return;
+  // C. The request is the strongest evidence available and it is free — it was happening anyway.
+  const dir = ltMkdir(); const fake = ltAuthFake(dir);
+  const { child, buf, port } = await ltBootFresh({
+    CLAUDE_BIN: fake, CLAUDE_CODE_OAUTH_TOKEN: "sk-ant-oat01-present-but-unverified",
+    CLAUDE_AUTH_CHECK_INTERVAL_MS: "300",
+  }, dir);
+  try {
+    const before = await ltWaitHealth(port, b => b.auth && b.auth.lastOutcome === "token-present", 15000);
+    assert.ok(before, `precondition: the probe must land on token-present first — ${ltDiag(buf)}`);
+    assert.equal(before.auth.ok, null, "precondition: not established before the request");
+    await ltPost(port, { model: "sonnet", messages: [{ role: "user", content: "hi" }] });
+    const after = await ltWaitHealth(port, b => b.auth && b.auth.lastOutcome === "verified-by-request", 15000);
+    assert.ok(after, `a completed request must raise the verdict — ${ltDiag(buf)}`);
+    assert.equal(after.auth.ok, true, "a request that reached the model proves the credential works");
   } finally { child.kill("SIGKILL"); _ltRmRetry(dir); }
 });
 
@@ -8387,6 +8442,39 @@ test("#328: the var list is the single source both scrub sites read", () => {
   // call sites consume. Adding a fourth inbound-auth var without adding it here makes this fail.
   assert.deepEqual([...INBOUND_AUTH_ENV_VARS].sort(), ["OCP_ADMIN_KEY", "PROXY_ANONYMOUS_KEY", "PROXY_API_KEY"]);
   assert.throws(() => { INBOUND_AUTH_ENV_VARS.push("X"); }, "frozen, so no caller can widen it at runtime");
+});
+
+// #308 / ADR 0014 — applyRequestVerdictTtl. The LATCH guard: a verdict raised by a real request
+// must expire, because on an env-token host nothing else can ever lower it.
+test("#308: a request-verified verdict decays to null past the window", () => {
+  const st = { ok: true, lastCheck: 1000, lastOutcome: "verified-by-request", message: "verified by a completed request" };
+  const fresh = applyRequestVerdictTtl(st, 1000 + 900000, 900000);
+  assert.equal(fresh.ok, true, "exactly at the window edge is still fresh");
+  const stale = applyRequestVerdictTtl(st, 1000 + 900001, 900000);
+  assert.equal(stale.ok, null, "past the window the honest value is 'we do not know', not 'it works'");
+  assert.match(stale.message, /older than the verification window/);
+  assert.equal(stale.lastOutcome, "verified-by-request", "how it was established is history and must not be rewritten");
+});
+
+test("#308: only a request-verified verdict decays — probe verdicts are not this function's business", () => {
+  const now = 10_000_000;
+  for (const outcome of ["authenticated", "token-present", "rejected", "timeout", "unavailable", "none"]) {
+    const st = { ok: true, lastCheck: 0, lastOutcome: outcome };
+    assert.equal(applyRequestVerdictTtl(st, now, 1).ok, true,
+      `${outcome} is the probe's verdict and must be left alone, however old`);
+  }
+});
+
+test("#308: a malformed lastCheck cannot silently expire a verdict", () => {
+  // A missing/NaN timestamp must not evaluate as "infinitely old" — NaN comparisons are false,
+  // which happens to be the safe direction here, but relying on that by accident is how the
+  // NaN-passes-every-threshold class of bug happens. Asserted so it is by construction.
+  // Labels are String(), not JSON.stringify(): JSON.stringify(NaN) is "null", which made the
+  // first failure of this test point at the wrong value entirely.
+  for (const bad of [undefined, null, "1000", NaN, Infinity, {}]) {
+    const st = { ok: true, lastCheck: bad, lastOutcome: "verified-by-request" };
+    assert.equal(applyRequestVerdictTtl(st, 10_000_000, 1).ok, true, `lastCheck=${String(bad)} must not expire it`);
+  }
 });
 
 // Pure, dependency-injected primitives extracted from server.mjs so the spawn-token concurrency /

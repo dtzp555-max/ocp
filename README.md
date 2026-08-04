@@ -208,7 +208,7 @@ The canonical list lives in [`models.json`](./models.json) — the single source
 |----------|--------|-------------|
 | `/v1/models` | GET | List available models |
 | `/v1/chat/completions` | POST | Chat completion (streaming + non-streaming) |
-| `/health` | GET | Comprehensive health check (includes a `tui` block for TUI-mode drift/concurrency monitoring) |
+| `/health` | GET | Comprehensive health check (includes a `tui` block for TUI-mode drift/concurrency monitoring, and an `auth` block — see § "What `auth.ok` means") |
 | `/usage` | GET | Plan usage limits + per-model stats |
 | `/status` | GET | Combined overview (usage + health) |
 | `/settings` | GET/PATCH | View or update settings at runtime |
@@ -273,6 +273,25 @@ The canonical list lives in [`models.json`](./models.json) — the single source
 | `OCP_TUI_POOL_SIZE` | `0` (off) | (TUI-mode) Number of pre-booted warm `claude` panes (max `4`) so a request skips the cold boot — measured p50 `10.17s` → `6.00s`. Each warm pane is a live idle process; panes are single-use. See [docs/tui-mode.md § `OCP_TUI_POOL_SIZE`](docs/tui-mode.md#ocp-tui-pool-size). |
 | `OCP_SKIP_AUTH_TEST` | *(unset)* | When `=1`, skip the `claude -p` auth probe during `setup.mjs`. Under the announced (currently **paused**) 2026-06-15 billing split this probe would draw from the metered Agent SDK credit pool; set this to avoid burning a probe on re-installs or `ocp update` runs. Auth is validated at the first real request. |
 | `OCP_TUI_FULL_TOOLS` | *(unset)* | (TUI-mode, **single-user only**) `=1` grants the interactive session the same tool surface as the `-p` path (`--allowedTools` + optional `--mcp-config`) so a trusted single operator can run a tool-using / MCP agent on the subscription pool. Safe because TUI refuses to boot under `AUTH_MODE=multi`. See [docs/tui-mode.md § `OCP_TUI_FULL_TOOLS`](docs/tui-mode.md#ocp-tui-full-tools). |
+
+### What `auth.ok` means
+
+`/health`'s `auth` block answers "can this proxy authenticate", and it is deliberately conservative about saying yes.
+
+| `auth.ok` | `lastOutcome` | what was actually established |
+|---|---|---|
+| `true` | `verified-by-request` | a real completion succeeded — the strongest evidence available, and free |
+| `true` | `authenticated` | the probe ran and the child resolved its own credential from a file or the keychain |
+| `null` | `token-present` | a token was in the child's environment and the probe exited 0. **That proves presence, not validity** |
+| `null` | `verified-by-request` | it worked, but longer ago than the freshness window — "we do not know now" |
+| `false` | `rejected` | the probe ran to completion and the credential was refused |
+| unchanged | `timeout` / `unavailable` | the probe could not conclude; the previous verdict is preserved |
+
+**Why `token-present` is not `authenticated`.** `claude auth status` exits 0 whenever a token is present, without checking it: a fabricated token yields exit 0 and `loggedIn: true`. On a host that supplies `CLAUDE_CODE_OAUTH_TOKEN` through a systemd `EnvironmentFile` or an inlined unit — which is how OCP is normally deployed on Linux — the probe therefore cannot distinguish a working credential from an expired one. Reporting `authenticated` there is what issue #308 found: `/health` asserting the proxy was authenticated while every request failed on authentication. See [ADR 0014](docs/adr/0014-auth-verdict-measures-what-it-measured.md).
+
+**A `null` is not a failure.** It means no conclusive verdict, `ocp doctor` reports it as WARN rather than FAIL, and it does not block `ocp update`. On such a host the first successful request moves it to `true`.
+
+**`status` is unaffected by any of this.** The proxy's `ok` / `degraded` verdict is driven by consecutive conclusive probe *rejections* (ADR 0010), never by `auth.ok`.
 
 ### Streaming heartbeat
 
