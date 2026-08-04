@@ -1,7 +1,7 @@
 # ADR 0014 — `/health`'s auth verdict reports what was measured, and learns from real requests
 
 **Date:** 2026-08-04
-**Status:** Proposed — needs maintainer sign-off
+**Status:** Accepted (maintainer sign-off 2026-08-05)
 **Scope:** Class B.2 — `/health` and `/status`. Authority: [ADR 0006](0006-openai-shim-scope.md) (grandfathered as of v3.16.4), amending [ADR 0010](0010-health-verdict-semantics.md).
 **Supersedes for `auth.ok`:** ADR 0010's rule that the `claude auth status` probe is the sole writer of the auth verdict.
 
