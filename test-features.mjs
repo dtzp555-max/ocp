@@ -8,7 +8,7 @@ import { TEST_OCP_DIR } from "./test-env.mjs";
 import { getDb, getDbPath, createKey, listKeys, validateKey, recordUsage, checkQuota, updateKeyQuota, getKeyQuota, findKey, cacheHash, getCachedResponse, setCachedResponse, clearCache, getCacheStats, closeDb, hasCacheControl, singleflight, getInflightStats } from "./keys.mjs";
 import { isLoopbackBind } from "./lib/net.mjs";
 import { classifyToolRequest } from "./lib/tool-support.mjs";
-import { createSerialMutex, createTtlCache, isTokenExpiring, orderLabelsLastGoodFirst } from "./lib/spawn-auth.mjs";
+import { createSerialMutex, createTtlCache, isTokenExpiring, orderLabelsLastGoodFirst, scrubInboundAuthEnv, INBOUND_AUTH_ENV_VARS } from "./lib/spawn-auth.mjs";
 import { createHash } from "node:crypto";
 import { strict as assert } from "node:assert";
 import { join } from "node:path";
@@ -1163,7 +1163,15 @@ const LT_POS_MARK = "you may use your available local tools";
 // REQUEST spawn. Exiting early keeps SP_COUNTER meaning "request spawns", which is what those
 // tests assert on. Exit 0 preserves the previous outcome for the probe itself (authenticated).
 const LT_FAKE = `#!/bin/sh
-if [ "$1" = "auth" ] && [ "$2" = "status" ]; then exit 0; fi
+# #328: dump this child's own environment so a test can assert what it did NOT inherit.
+# Two separate files because the two scrub sites are different code paths: the auth probe
+# (which exits below) and the request spawn. A single file would let one path's result stand
+# in for the other's and hide a half-fix.
+if [ "$1" = "auth" ] && [ "$2" = "status" ]; then
+  if [ -n "$ENV_CAPTURE_PROBE" ]; then env > "$ENV_CAPTURE_PROBE"; fi
+  exit 0
+fi
+if [ -n "$ENV_CAPTURE" ]; then env > "$ENV_CAPTURE"; fi
 prev=""
 for a in "$@"; do
   if [ "$prev" = "--system-prompt" ]; then printf '%s' "$a" > "$SP_CAPTURE"; fi
@@ -1483,6 +1491,61 @@ ltTest("integration: OCP_LOCAL_TOOLS=1 → the -p spawn receives the POSITIVE wr
     const sp = _ltRead(cap, "utf8");
     assert.ok(sp.includes(LT_POS_MARK), `expected POSITIVE wrapper in --system-prompt, got: ${sp.slice(0,90)}`);
     assert.ok(!sp.includes(LT_NEG_MARK), "positive wrapper must REPLACE the negative one, not append");
+  } finally { child.kill("SIGKILL"); _ltRmRetry(dir); }
+});
+
+// ── OCP's own inbound credentials never reach a spawned claude (#328) ────────
+// The child reads attacker-controlled text; PROXY_API_KEY authenticates callers TO the proxy and
+// is useless to the child, so leaking it there only hands an injected child a working client
+// credential. Live-proven, not theoretical: on a two-instance host sharing one key, a child on
+// the unprivileged instance read the key from its own env, called the privileged instance, and
+// got a child under the sudo-capable account — bypassing the Unix identity boundary rather than
+// attacking it.
+//
+// Both tests assert a CONTROL variable is present. Without it, a broken capture (empty file,
+// wrong env var name, fake never spawned) would satisfy "no secret found" vacuously — the exact
+// anchor-drift failure this suite already guards against elsewhere.
+
+const LT_SECRETS = { PROXY_API_KEY: "lt-inbound-key", OCP_ADMIN_KEY: "lt-admin-key", PROXY_ANONYMOUS_KEY: "lt-anon-key" };
+
+function ltAssertNoInboundSecrets(dump, where) {
+  assert.ok(dump.length > 0, `${where}: env capture is EMPTY — the assertions below would pass vacuously`);
+  assert.match(dump, /^CLAUDE_CODE_DISABLE_AUTO_MEMORY=|^HOME=|^PATH=/m,
+    `${where}: control failed — capture does not look like an environment dump: ${dump.slice(0, 120)}`);
+  for (const [name, value] of Object.entries(LT_SECRETS)) {
+    assert.ok(!new RegExp(`^${name}=`, "m").test(dump), `${where}: ${name} reached the child`);
+    assert.ok(!dump.includes(value), `${where}: the VALUE of ${name} reached the child under some other name`);
+  }
+}
+
+ltTest("integration (#328, the money test): the -p spawn does NOT inherit OCP's inbound credentials", async () => {
+  if (!LT_POSIX) return; // sh fake — skip on Windows CI
+  const dir = ltMkdir(); const cap = join(dir, "env.txt"); const fake = ltFake(dir);
+  const { child, buf, port } = await ltBootFresh({ ...LT_SECRETS, CLAUDE_BIN: fake, ENV_CAPTURE: cap }, dir);
+  try {
+    assert.ok(await ltWait(() => buf.out.includes("listening on") || buf.exit != null), `server did not start: ${buf.err.slice(0, 200)}`);
+    await ltPost(port, { model: "sonnet", messages: [{ role: "user", content: "hi" }] });
+    assert.ok(await ltWait(() => _ltExists(cap)), "fake claude was spawned and dumped its env");
+    const dump = _ltRead(cap, "utf8");
+    // ltBootFresh passed all three secrets in the SERVER's env, so the parent definitely holds
+    // them — this cannot pass merely because the variables were never set anywhere.
+    ltAssertNoInboundSecrets(dump, "request spawn");
+    // The child must still get what it legitimately needs, or this "fix" would be a break.
+    assert.match(dump, /^CLAUDE_CODE_OAUTH_TOKEN=|^HOME=/m, "the child must still receive its own outbound/HOME env");
+  } finally { child.kill("SIGKILL"); _ltRmRetry(dir); }
+});
+
+ltTest("integration (#328): the AUTH PROBE child does not inherit them either — the second scrub site", async () => {
+  if (!LT_POSIX) return;
+  const dir = ltMkdir(); const cap = join(dir, "envprobe.txt"); const fake = ltFake(dir);
+  const { child, buf, port } = await ltBootFresh({ ...LT_SECRETS, CLAUDE_BIN: fake, ENV_CAPTURE_PROBE: cap }, dir);
+  try {
+    assert.ok(await ltWait(() => buf.out.includes("listening on") || buf.exit != null), `server did not start: ${buf.err.slice(0, 200)}`);
+    // The probe runs at boot; no request needed. Waiting on the file is waiting on the thing
+    // asserted, not on a proxy for it.
+    assert.ok(await ltWait(() => _ltExists(cap), 20000), "the boot auth probe spawned the fake and dumped its env");
+    ltAssertNoInboundSecrets(_ltRead(cap, "utf8"), "auth probe spawn");
+    assert.ok(port > 0, "server reached listening state");
   } finally { child.kill("SIGKILL"); _ltRmRetry(dir); }
 });
 
@@ -8019,6 +8082,38 @@ test("isLoopbackBind: '100.64.0.1' → false (Tailscale IP)", () => {
 });
 
 // ── Spawn-auth primitives (F3 / F5 / F6, lib/spawn-auth.mjs) ──
+
+// #328 — scrubInboundAuthEnv. The integration tests prove the wiring; these pin the contract at
+// the boundary, where the integration tests cannot reach (absent vars, unrelated vars, aliasing).
+test("#328: scrubInboundAuthEnv removes every inbound-auth var and reports which", () => {
+  const env = { PROXY_API_KEY: "a", OCP_ADMIN_KEY: "b", PROXY_ANONYMOUS_KEY: "c", PATH: "/usr/bin" };
+  const { env: out, removed } = scrubInboundAuthEnv(env);
+  assert.deepEqual(removed.sort(), ["OCP_ADMIN_KEY", "PROXY_ANONYMOUS_KEY", "PROXY_API_KEY"]);
+  assert.deepEqual(Object.keys(out), ["PATH"], "only the non-secret survives");
+  assert.equal(out, env, "mutates in place, so it composes with the existing delete-blocks");
+});
+
+test("#328: absent vars are not an error, and unrelated vars are untouched", () => {
+  const { removed, env } = scrubInboundAuthEnv({ PATH: "/usr/bin", CLAUDE_CODE_OAUTH_TOKEN: "keep-me" });
+  assert.deepEqual(removed, [], "nothing to remove reports nothing removed");
+  assert.equal(env.CLAUDE_CODE_OAUTH_TOKEN, "keep-me",
+    "the OUTBOUND credential the child genuinely needs must survive — stripping it would break every request");
+});
+
+test("#328: an empty-string secret is still removed (falsy value, real leak)", () => {
+  // `if (env[name])` would skip this and leave the name visible to the child. Presence is the
+  // criterion, not truthiness.
+  const { removed } = scrubInboundAuthEnv({ PROXY_API_KEY: "" });
+  assert.deepEqual(removed, ["PROXY_API_KEY"]);
+});
+
+test("#328: the var list is the single source both scrub sites read", () => {
+  // Not a source-grep: this asserts the exported list's CONTENT, which is what server.mjs's two
+  // call sites consume. Adding a fourth inbound-auth var without adding it here makes this fail.
+  assert.deepEqual([...INBOUND_AUTH_ENV_VARS].sort(), ["OCP_ADMIN_KEY", "PROXY_ANONYMOUS_KEY", "PROXY_API_KEY"]);
+  assert.throws(() => { INBOUND_AUTH_ENV_VARS.push("X"); }, "frozen, so no caller can widen it at runtime");
+});
+
 // Pure, dependency-injected primitives extracted from server.mjs so the spawn-token concurrency /
 // caching / expiry logic is testable without booting the server or mocking execFileSync/spawn.
 console.log("\nSpawn-auth (F3 mutex / F5 TTL cache + label memo / F6 expiry gate):");

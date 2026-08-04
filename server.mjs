@@ -52,7 +52,7 @@ import { detectTuiUpstreamError } from "./lib/tui/transcript.mjs";
 import { TuiSemaphore, SemaphoreAbortError, recordTuiEntrypoint, buildTuiHealthBlock } from "./lib/tui/semaphore.mjs";
 import { TuiPanePool, resolvePoolSize, POOL_MAX_SIZE } from "./lib/tui/pool.mjs";
 import { TuiDeltaAssembler, DEFAULT_HOLDBACK_CHARS, resolveStreamHoldback } from "./lib/tui/stream.mjs";
-import { createSerialMutex, createTtlCache, isTokenExpiring, orderLabelsLastGoodFirst } from "./lib/spawn-auth.mjs";
+import { createSerialMutex, createTtlCache, isTokenExpiring, orderLabelsLastGoodFirst, scrubInboundAuthEnv } from "./lib/spawn-auth.mjs";
 import { hasImageContent, buildImageBlocks, buildStreamJsonInput, MultimodalError } from "./lib/multimodal.mjs";
 import { parsePositiveInt } from "./lib/env.mjs";
 import { appendOperatorPrompt, promptCharBudgetFor, fallbackPromptCharBudget, resolveGlobalPromptCharOverride, selectPromptWrapper, localToolsSafetyError } from "./lib/prompt.mjs";
@@ -1163,6 +1163,10 @@ async function checkAuth() {
     delete env.ANTHROPIC_API_KEY;
     delete env.ANTHROPIC_BASE_URL;
     delete env.ANTHROPIC_AUTH_TOKEN;
+    // #328: OCP's own INBOUND credentials must not reach a child. Applied here too, not only on
+    // the request path, because this child is spawned from the same process env and a future
+    // change could give it a wider role than `auth status`.
+    scrubInboundAuthEnv(env);
     // ASYNC execFile, not execFileSync (#232). Marking the function `async` never made the old
     // synchronous call non-blocking: it froze the event loop for up to AUTH_CHECK_TIMEOUT_MS at
     // boot (before server.listen()) and again on every interval tick.
@@ -1488,6 +1492,12 @@ function spawnClaudeProcess(model, messages, conversationId, keyName, releaseSlo
   delete env.ANTHROPIC_API_KEY;
   delete env.ANTHROPIC_BASE_URL;
   delete env.ANTHROPIC_AUTH_TOKEN;
+  // #328: strip OCP's own INBOUND credentials (PROXY_API_KEY / OCP_ADMIN_KEY /
+  // PROXY_ANONYMOUS_KEY). This child reads attacker-controlled text; the proxy's key
+  // authenticates callers TO the proxy and is useless to the child, so its only effect here is
+  // to hand an injected child a working client credential. Demonstrated live, not theorised —
+  // see lib/spawn-auth.mjs for the chain and issue #328.
+  scrubInboundAuthEnv(env);
 
   // Pure API mode: suppress Claude Code context injection while preserving OAuth auth
   if (NO_CONTEXT) {
