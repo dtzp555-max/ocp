@@ -24,6 +24,7 @@ import { join, dirname } from "node:path";
 import { homedir } from "node:os";
 import { fileURLToPath } from "node:url";
 import { DEFAULT_PORT } from "./lib/constants.mjs";
+import { scrubInboundAuthEnv } from "./lib/spawn-auth.mjs";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const HOME = homedir();
@@ -144,7 +145,11 @@ log(`Node.js ${process.versions.node}`);
 
 // Check claude CLI
 try {
-  const ver = execSync("claude --version 2>/dev/null", { encoding: "utf-8" }).trim();
+  // #328: this one had no `env` option at all, so it inherited everything. `--version` reads no
+  // prompt, so it is the least exposed of the spawns — scrubbed anyway, because "which spawns are
+  // safe to leak to" is not a judgement anyone should have to re-make at each call site.
+  const ver = execSync("claude --version 2>/dev/null",
+    { encoding: "utf-8", env: scrubInboundAuthEnv({ ...process.env }).env }).trim();
   log(`Claude CLI: ${ver}`);
 } catch {
   fail("Claude CLI not found. Install: https://docs.anthropic.com/en/docs/claude-code");
@@ -162,7 +167,13 @@ if (process.env.OCP_SKIP_AUTH_TEST === "1") {
     const out = execSync('claude -p --output-format text --no-session-persistence -- "ping"', {
       encoding: "utf-8",
       timeout: 30000,
-      env: { ...process.env, CLAUDECODE: undefined, ANTHROPIC_API_KEY: undefined, ANTHROPIC_BASE_URL: undefined, ANTHROPIC_AUTH_TOKEN: undefined },
+      // #328: the FOURTH hand-rolled copy of the four-name denylist lived here, and it leaked all
+      // three inbound secrets to the child. Lower severity than the request path — this child's
+      // prompt is the literal "ping", so it never reads attacker-controlled text — but it is
+      // reachable from `ocp update` (scripts/upgrade.mjs runs `setup.mjs --reconfigure-only`, and
+      // the probe is gated only on OCP_SKIP_AUTH_TEST), and leaving it is exactly the
+      // "denylist you must remember to extend" failure this fix exists to end.
+      env: scrubInboundAuthEnv({ ...process.env, CLAUDECODE: undefined, ANTHROPIC_API_KEY: undefined, ANTHROPIC_BASE_URL: undefined, ANTHROPIC_AUTH_TOKEN: undefined }).env,
     }).trim();
     if (out.length > 0) {
       log(`Claude CLI authenticated (test response: "${out.slice(0, 40)}...")`);

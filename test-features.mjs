@@ -1168,10 +1168,14 @@ const LT_FAKE = `#!/bin/sh
 # (which exits below) and the request spawn. A single file would let one path's result stand
 # in for the other's and hide a half-fix.
 if [ "$1" = "auth" ] && [ "$2" = "status" ]; then
-  if [ -n "$ENV_CAPTURE_PROBE" ]; then env > "$ENV_CAPTURE_PROBE"; fi
+  if [ -n "$ENV_CAPTURE_PROBE" ]; then env > "$ENV_CAPTURE_PROBE.tmp" && mv "$ENV_CAPTURE_PROBE.tmp" "$ENV_CAPTURE_PROBE"; fi
   exit 0
 fi
-if [ -n "$ENV_CAPTURE" ]; then env > "$ENV_CAPTURE"; fi
+# Write-then-rename: a plain redirect writes in 4096-byte chunks, so a reader that unblocks on
+# "non-empty" can read a TRUNCATED dump — which makes the security assertions pass VACUOUSLY
+# (secrets "absent" because cut off). Measured by an independent reviewer: 4/25 partial reads at a
+# 4794-byte environment, 18/40 at 10938. rename(2) is atomic, so the reader sees all or nothing.
+if [ -n "$ENV_CAPTURE" ]; then env > "$ENV_CAPTURE.tmp" && mv "$ENV_CAPTURE.tmp" "$ENV_CAPTURE"; fi
 prev=""
 for a in "$@"; do
   if [ "$prev" = "--system-prompt" ]; then printf '%s' "$a" > "$SP_CAPTURE"; fi
@@ -8848,15 +8852,23 @@ import { tmpdir as tmpdir2 } from "node:os";
 // Fake tmux that records the spawned pane command and always looks ready + pasted.
 function makeTmuxRecorder() {
   const cmds = [];
-  const tmux = (args) => {
+  const opts = [];
+  // #328: the second argument was dropped, which is why the tmux-SERVER env scrub had no test —
+  // removing it left the suite fully green while an execution probe showed the layer is
+  // load-bearing. Capturing it makes that a unit test needing no real tmux at all.
+  const tmux = (args, o) => {
     cmds.push(args);
+    opts.push(o);
     if (args[0] === "capture-pane") {
       // input bar present AND the prompt visibly landed → both polls pass immediately
       return { status: 0, stdout: "[Pasted text #1 +2 lines]\n ? for shortcuts" };
     }
     return { status: 0, stdout: "" };
   };
-  return { tmux, cmds, paneCmd: () => (cmds.find((a) => a[0] === "new-session") || []).slice(-1)[0] || "" };
+  const newSessionIdx = () => cmds.findIndex((a) => a[0] === "new-session");
+  return { tmux, cmds, opts,
+    paneCmd: () => (cmds.find((a) => a[0] === "new-session") || []).slice(-1)[0] || "",
+    newSessionOpts: () => { const i = newSessionIdx(); return i === -1 ? undefined : opts[i]; } };
 }
 
 // A HOME with one already-terminal transcript for `sid`, so readTuiTranscript returns at once.
@@ -8869,6 +8881,36 @@ function seedTranscript(home, sid, text) {
     turn_duration: 1234, cc_entrypoint: "cli",
   }) + "\n");
 }
+
+test("#328: bootTuiPane scrubs the inbound secrets from the TMUX SERVER's environment too", async () => {
+  // A tmux server STARTED by this spawn inherits this env, and every later pane inherits from the
+  // server — so this layer leaks independently of the pane's `env -u` prefix, and it is reachable
+  // cross-platform from inside the pane via `tmux show-environment -g`, not only through Linux
+  // /proc. An independent reviewer measured both. Without this test, deleting the scrub left the
+  // whole suite green.
+  const saved = {};
+  for (const k of INBOUND_AUTH_ENV_VARS) { saved[k] = process.env[k]; process.env[k] = `lt-${k}`; }
+  const savedTok = process.env.CLAUDE_CODE_OAUTH_TOKEN;
+  process.env.CLAUDE_CODE_OAUTH_TOKEN = "lt-outbound";
+  try {
+    const home = mkdtemp2(`${tmpdir2()}/ocp-t-`);
+    const rec = makeTmuxRecorder();
+    await bootPaneUnderTest({ model: "sonnet", claudeBin: "claude", home, realHome: home,
+                              cwd: `${home}/wk`, port: 3456, tmux: rec.tmux });
+    const o = rec.newSessionOpts();
+    assert.ok(o && o.env, "new-session must have been given an env — otherwise this asserts nothing");
+    // Control first: the instrument works and the env is a real one, not an empty object.
+    assert.equal(o.env.CLAUDE_CODE_OAUTH_TOKEN, "lt-outbound",
+      "the OUTBOUND credential must reach the tmux server — control that this env is populated");
+    for (const k of INBOUND_AUTH_ENV_VARS) {
+      assert.ok(!(k in o.env), `${k} must not reach the tmux server's environment`);
+      assert.ok(!JSON.stringify(o.env).includes(`lt-${k}`), `${k}'s VALUE must not survive under another name`);
+    }
+  } finally {
+    for (const k of INBOUND_AUTH_ENV_VARS) { if (saved[k] === undefined) delete process.env[k]; else process.env[k] = saved[k]; }
+    if (savedTok === undefined) delete process.env.CLAUDE_CODE_OAUTH_TOKEN; else process.env.CLAUDE_CODE_OAUTH_TOKEN = savedTok;
+  }
+});
 
 test("bootTuiPane with a streamDir installs the hook AT BOOT and hands the sink back on the pane", async () => {
   const home = mkdtemp2(`${tmpdir2()}/ocp-t-`);
