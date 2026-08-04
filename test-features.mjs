@@ -104,6 +104,15 @@ test("listKeys never selects the raw key column", () => {
     "listKeys must not SELECT the raw key column — found 'key' outside substr()");
 });
 
+test("listKeys executes LIST_KEYS_SQL at the db layer", () => {
+  const d = getDb();
+  let executed;
+  d.prepare = function (sql) { executed = sql; delete d.prepare; return Object.getPrototypeOf(d).prepare.call(this, sql); };
+  listKeys();
+  assert.equal(executed, LIST_KEYS_SQL,
+    "listKeys must pass LIST_KEYS_SQL to db.prepare, not an inline query");
+});
+
 test("listKeys keyPreview matches the expected redaction of a real key", () => {
   const { key: raw } = createKey("preview-fixture");
   const keys = listKeys();
@@ -112,6 +121,12 @@ test("listKeys keyPreview matches the expected redaction of a real key", () => {
   assert.equal(k.keyPreview, raw.slice(0, 8) + "..." + raw.slice(-4),
     "keyPreview must be byte-identical to first-8 + '...' + last-4 of the raw key");
   assert.ok(!("key" in k), "the raw 'key' property must not exist in listKeys output");
+  for (const [prop, val] of Object.entries(k)) {
+    if (typeof val === "string") {
+      assert.ok(!/^ocp_[A-Za-z0-9_-]{32}$/.test(val),
+        `property "${prop}" must not contain a full-length key`);
+    }
+  }
 });
 
 test("checkQuota returns null when no quota set", () => {
