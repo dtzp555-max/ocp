@@ -8,6 +8,7 @@ import { TEST_OCP_DIR } from "./test-env.mjs";
 import { getDb, getDbPath, createKey, listKeys, validateKey, recordUsage, checkQuota, updateKeyQuota, getKeyQuota, findKey, cacheHash, getCachedResponse, setCachedResponse, clearCache, getCacheStats, closeDb, hasCacheControl, singleflight, getInflightStats } from "./keys.mjs";
 import { isLoopbackBind } from "./lib/net.mjs";
 import { classifyToolRequest } from "./lib/tool-support.mjs";
+import { randomBytes } from "node:crypto";
 import { createSerialMutex, createTtlCache, isTokenExpiring, orderLabelsLastGoodFirst, scrubInboundAuthEnv, INBOUND_AUTH_ENV_VARS } from "./lib/spawn-auth.mjs";
 import { createHash } from "node:crypto";
 import { strict as assert } from "node:assert";
@@ -8193,7 +8194,8 @@ function _s328Env(slice) {
   return seen;
 }
 
-for (const [label, marker] of [["claude --version", "claude --version 2>/dev/null"],
+for (const [label, marker] of [["which claude", "which claude 2>/dev/null"],
+                               ["claude --version", "claude --version 2>/dev/null"],
                                ["claude -p auth probe", "--no-session-persistence"]]) {
   test(`#328: setup.mjs's \`${label}\` spawn does not hand the child OCP's inbound credentials`, () => {
     const opts = _s328Env(_s328Slice(marker));
@@ -8225,6 +8227,34 @@ test("#328 (P1 from review 3): a secret aliased under ANOTHER name is removed by
   assert.equal(env.OPENAI_BASE_URL, "http://127.0.0.1:3456/v1",
     "a same-prefix variable that is NOT the secret must survive — this removes a credential, not a namespace");
   assert.equal(env.PATH, "/usr/bin", "and unrelated variables are untouched");
+});
+
+test("#328 (P1 from review 4): a PER-USER `ocp keys add` credential is removed by FORMAT", () => {
+  // The path both earlier passes are structurally blind to. `ocp-connect`'s documented flow when
+  // the remote requires auth is `ocp keys add <name>`; that key lives in OCP's SQLite store, not
+  // in any environment variable the scrub can observe, so it is neither one of the three names
+  // nor equal to any of their values. In multi mode PROXY_API_KEY is typically unset, which makes
+  // the by-VALUE pass entirely inert — measured: removed: [] with the key untouched.
+  const perUser = "ocp_" + "A".repeat(32);
+  const { env, removed } = scrubInboundAuthEnv({ CLAUDE_AUTH_MODE: "multi", OPENAI_API_KEY: perUser,
+                                                 OPENAI_BASE_URL: "http://host:3456/v1", PATH: "/usr/bin" });
+  assert.ok(removed.includes("OPENAI_API_KEY"), "a key this proxy issued must not reach a child, under any name");
+  assert.ok(!JSON.stringify(env).includes(perUser), "and its value must be gone entirely");
+  assert.equal(env.OPENAI_BASE_URL, "http://host:3456/v1", "the base URL is not a secret and must survive");
+});
+
+test("#328: the issued-key pattern is exact — it matches what keys.mjs mints and nothing else", () => {
+  // Matched by FORMAT rather than by name because ocp-connect puts it in OPENAI_API_KEY today but
+  // nothing constrains it to that. The shape is `ocp_` + exactly 32 base64url chars, which is
+  // `randomBytes(24).toString("base64url")` — asserted against a REAL mint, not a hand-written
+  // literal, so a change to the key format fails this instead of silently disabling the pass.
+  const real = "ocp_" + randomBytes(24).toString("base64url");
+  assert.ok(scrubInboundAuthEnv({ X: real }).removed.includes("X"), "a genuinely minted key must match");
+  for (const near of ["ocp_short", "ocp_" + "A".repeat(31), "ocp_" + "A".repeat(33),
+                      "sk-proj-a-genuine-openai-key", "ocp-" + "A".repeat(32), "prefix_ocp_" + "A".repeat(32)]) {
+    assert.ok(!scrubInboundAuthEnv({ X: near }).removed.includes("X"),
+      `${near.slice(0, 22)}… must NOT match — over-matching would delete unrelated variables`);
+  }
 });
 
 test("#328: a legitimate OPENAI_API_KEY that is NOT OCP's credential is left alone", () => {
