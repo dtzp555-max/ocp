@@ -1,7 +1,18 @@
 # ADR 0014 — `/health`'s auth verdict reports what was measured, and learns from real requests
 
 **Date:** 2026-08-04
-**Status:** Accepted (maintainer sign-off 2026-08-05)
+**Status:** Accepted (maintainer sign-off 2026-08-05), **materially amended after sign-off — see below**
+
+> **Ratification provenance.** Sign-off was recorded at `529b059`. The commit after it, `163e657`,
+> **rewrote this ADR's Decision mechanism**: an independent review proved the freshness window as
+> originally specified was unreachable under the default configuration *and* permanently
+> disarmable by a single inconclusive probe, and the fix introduced `okSource`/`okAt` — a
+> structure the maintainer did not see when signing. Two consequence bullets were added at the
+> same time. What was ratified was the *direction* (B + C, with an expiring request verdict); the
+> mechanism that implements it changed afterwards.
+>
+> Recorded rather than quietly re-dated, following ADR 0010's precedent for the same situation. A
+> re-sign is warranted; until then this note is the honest statement of what the label covers.
 **Scope:** Class B.2 — `/health` and `/status`. Authority: [ADR 0006](0006-openai-shim-scope.md) (grandfathered as of v3.16.4), amending [ADR 0010](0010-health-verdict-semantics.md).
 **Supersedes for `auth.ok`:** ADR 0010's rule that the `claude auth status` probe is the sole writer of the auth verdict.
 
@@ -116,8 +127,8 @@ This is deliberately asymmetric and the asymmetry is safe in the right direction
 ## Consequences
 
 - `/health`'s `auth.ok` starts meaning "the credential worked, or we do not know" instead of "a token is set".
-- **`/health`'s `status` is unaffected.** `proxyHealthStatus` reads `consecutiveFailures`, never `ok`, and nothing here writes that tally. ADR 0010's degraded rule is untouched.
-- Two contract changes on a grandfathered B.2 endpoint: the rule determining `auth.ok`, and a new `lastOutcome` value. Both are why this needs its own ADR rather than ADR 0012's additive-field authorization — ADR 0012 condition 1 excludes exactly this.
+- **`/health`'s `status` cannot be moved by any of this.** `proxyHealthStatus` reads `consecutiveFailures` and never `ok`, so no verdict change here can flip a host to `degraded`. It does **not** follow that the tally is untouched — an exit-0 probe resets it on both branches and a successful request clears it, which is a deliberate restoration of ADR 0010's self-heal. An earlier revision of this line said "nothing here writes that tally"; that was false, and it survived one round after the commit message that introduced the fix had already named it as concealment.
+- Two contract changes on a grandfathered B.2 endpoint: the rule determining `auth.ok`, and two new `lastOutcome` values. Both are why this needs its own ADR rather than ADR 0012's additive-field authorization — ADR 0012 condition 1 excludes exactly this.
 - The fleet's three env-token hosts will report `auth.ok: null` until their first successful request, then `true` — in practice one request — and back to `null` after 15 minutes of no successful traffic. An idle proxy therefore reports "not established" rather than a stale "works", which is the correct answer to a question nobody has evidence for.
 - **An exit-0 probe resets the rejection tally on both branches.** The first implementation preserved it on the token-present branch, which silently removed ADR 0010's self-healing on exactly the hosts that use the env-token mechanism: once the tally reached the degrade threshold nothing could lower it again, because a successful probe was the only thing that did. Restored, and a successful request clears it too.
 - **A probe never overwrites a fresher request verdict.** The token-present branch measured *less* than a recent completed request; letting it clobber that would contradict this ADR's own evidence hierarchy.

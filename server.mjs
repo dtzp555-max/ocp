@@ -1184,8 +1184,10 @@ const AUTH_REQUEST_VERDICT_TTL_MS = 900000; // 15 min
 function noteAuthVerifiedByRequest() {
   const now = Date.now();
   // Does NOT touch lastOutcome/lastCheck: those belong to the probe, and overwriting them would
-  // make /health claim a probe ran when none did. A successful request also clears the rejection
-  // tally, because it is direct evidence the credential is not being refused.
+  // make /health claim a probe ran when none did. It DOES clear consecutiveFailures — a completed
+  // request is direct evidence the credential is not being refused. An earlier revision of this
+  // header said "deliberately does NOT touch consecutiveFailures" three lines above the code that
+  // writes it; the reviewer who caught that was reading the comment, which is what comments are for.
   authStatus = { ...authStatus, ok: true, okSource: "request", okAt: now,
                  message: "verified by a completed request", consecutiveFailures: 0 };
 }
@@ -1297,6 +1299,11 @@ async function checkAuth() {
       // credentials the request path uses — a non-zero exit genuinely predicts serving failure.
       authStatus = { ok: false, lastCheck: now, message: msg, lastOutcome: "rejected",
                      consecutiveFailures: authStatus.consecutiveFailures + 1, consecutiveInconclusive: 0 };
+      // okSource/okAt on this branch too: a conclusive rejection IS a probe-established verdict.
+      // Omitting them made the fields VANISH after a rejection — a fifth state ("absent") outside
+      // the domain ADR 0014 and the README document, found by execution in review.
+      authStatus = { ok: false, okSource: "probe", okAt: now, lastCheck: now, message: msg,
+                     lastOutcome: "rejected", consecutiveFailures: authStatus.consecutiveFailures + 1 };
     }
     // Carries the outcome class so an operator can tell a timeout from a real rejection.
     console.error(`[auth] check ${authStatus.lastOutcome}: ${msg}`);

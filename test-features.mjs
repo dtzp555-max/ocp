@@ -8456,6 +8456,23 @@ test("#308: a request-verified verdict decays to null past the window", () => {
   assert.match(stale.message, /older than the verification window/);
 });
 
+test("#308 (P2 from review 2): every verdict-writing branch carries okSource and okAt", async () => {
+  // The rejected branch built a fresh object without them, so after a conclusive rejection the
+  // two fields VANISHED from /health — a fifth state ("absent") outside the domain ADR 0014 and
+  // the README document. Found by execution, not by reading.
+  const src = _ltRead(spotJoin(_spotDir, "server.mjs"), "utf8");
+  const block = src.slice(src.indexOf("async function checkAuth("), src.indexOf("// Check auth on start"));
+  assert.ok(block.length > 0, "anchor drift — checkAuth slice is empty");
+  const writes = block.match(/authStatus = \{[^;]*\};/gs) || [];
+  assert.ok(writes.length >= 4, `expected every verdict-writing branch; found ${writes.length}`);
+  for (const w of writes) {
+    // The inconclusive branches spread ...authStatus, which carries the fields forward; the
+    // others must name them. Either satisfies the contract; neither is allowed to drop them.
+    assert.ok(w.includes("...authStatus") || (w.includes("okSource") && w.includes("okAt")),
+      `a verdict write neither preserves nor sets okSource/okAt: ${w.replace(/\s+/g, " ").slice(0, 120)}`);
+  }
+});
+
 test("#308 (P1 from review): ONE inconclusive probe must not disarm the window forever", () => {
   // The reviewer's sequence, executed. Before the fix this returned ok:true at T+100h: the TTL
   // keyed on lastOutcome, and an inconclusive probe rewrites lastOutcome while preserving ok, so
@@ -8491,16 +8508,26 @@ test("#308: only a request-verified verdict decays — probe verdicts are not th
   }
 });
 
-test("#308: a malformed lastCheck cannot silently expire a verdict", () => {
+test("#308: a malformed okAt EXPIRES the verdict — the guard must fail closed", () => {
   // A missing/NaN timestamp must not evaluate as "infinitely old" — NaN comparisons are false,
   // which happens to be the safe direction here, but relying on that by accident is how the
   // NaN-passes-every-threshold class of bug happens. Asserted so it is by construction.
-  // Labels are String(), not JSON.stringify(): JSON.stringify(NaN) is "null", which made the
-  // first failure of this test point at the wrong value entirely.
+  // This test asserted the OPPOSITE for one revision, and the assertion was wrong rather than the
+  // code. A verdict whose timestamp cannot be read is a verdict whose freshness cannot be
+  // established, and this field grants trust — so the unexamined input must fall to "expired",
+  // not to "still valid". A reviewer caught that the fix for the original NaN bug had inverted
+  // the failure direction of the criterion it was written to serve.
+  //
+  // Labels are String(), not JSON.stringify(): JSON.stringify(NaN) is "null", which made an
+  // earlier failure of this test point at the wrong value entirely.
   for (const bad of [undefined, null, "1000", NaN, Infinity, {}]) {
     const st = { ok: true, okSource: "request", okAt: bad, lastOutcome: "verified-by-request" };
-    assert.equal(applyRequestVerdictTtl(st, 10_000_000, 1).ok, true, `okAt=${String(bad)} must not expire it`);
+    const r = applyRequestVerdictTtl(st, 10_000_000, 1);
+    assert.equal(r.ok, null, `okAt=${String(bad)} must expire the verdict, not preserve it`);
+    assert.equal(r.okSource, "expired", `okAt=${String(bad)} must say why`);
   }
+  // A probe verdict with a malformed okAt is NOT this function's business and stays untouched.
+  assert.equal(applyRequestVerdictTtl({ ok: true, okSource: "probe", okAt: NaN }, 10_000_000, 1).ok, true);
 });
 
 // Pure, dependency-injected primitives extracted from server.mjs so the spawn-token concurrency /
