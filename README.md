@@ -208,8 +208,7 @@ The canonical list lives in [`models.json`](./models.json) — the single source
 |----------|--------|-------------|
 | `/v1/models` | GET | List available models |
 | `/v1/chat/completions` | POST | Chat completion (streaming + non-streaming) |
-| `/health` | GET | Comprehensive health check (includes a `tui` block for TUI-mode drift/concurrency monitoring, and an `auth` block — see § "What `auth.ok` means") |
-| `/health` | GET | Comprehensive health check (includes a `tui` block for TUI-mode drift/concurrency monitoring, and `instanceName` — see § "Running more than one instance on a host") |
+| `/health` | GET | Comprehensive health check (includes a `tui` block for TUI-mode drift/concurrency monitoring, an `auth` block — see § "What `auth.ok` means" — and `instanceName` — see § "Running more than one instance on a host") |
 | `/usage` | GET | Plan usage limits + per-model stats |
 | `/status` | GET | Combined overview (usage + health) |
 | `/settings` | GET/PATCH | View or update settings at runtime |
