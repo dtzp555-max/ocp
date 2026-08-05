@@ -16,6 +16,7 @@ import { join } from "node:path";
 import { homedir } from "node:os";
 import { execSync } from "node:child_process";
 import { DEFAULT_PORT, AUTH_STALE_AFTER_INCONCLUSIVE } from "../lib/constants.mjs";
+import { resolveOcpDir } from "./lib/ocp-dir.mjs";
 
 const SCHEMA_VERSION = "1";
 
@@ -672,15 +673,30 @@ export async function runDoctor(opts = {}) {
     return runOauthOnly(opts, checks, push);
   }
 
+  // --- install directory (issue #348) ---
+  // Resolved from THIS FILE's own location, not from $HOME — see scripts/lib/ocp-dir.mjs for
+  // the full failure it fixes. Pushed as a visible check, first, because #348's real cost was
+  // not that the answer was wrong: it was that a wrong answer was invisible, and surfaced three
+  // checks downstream as "your version is too old".
+  const { dir: ocpDir, source: ocpDirSource } = resolveOcpDir(opts);
+  push("install_dir", "PASS", `${ocpDir} (resolved from ${ocpDirSource})`);
+
   // --- version detection ---
-  const ocpDir = opts.ocpDir || join(homedir(), "ocp");
+  const pkgPath = join(ocpDir, "package.json");
   let currentVersion = opts.mockVersion;
+  let versionError = null;
   if (!currentVersion) {
     try {
-      const pkg = JSON.parse(readFileSync(join(ocpDir, "package.json"), "utf8"));
+      const pkg = JSON.parse(readFileSync(pkgPath, "utf8"));
       currentVersion = `v${pkg.version}`;
-    } catch {
+    } catch (e) {
       currentVersion = "unknown";
+      // Keep WHY, not just "unknown". ENOENT (the #348 shape — right code, wrong directory) is
+      // a different operator action from a parse error or a permission denial on a file that
+      // IS there, and "unknown" alone cannot tell them apart.
+      versionError = e.code === "ENOENT"
+        ? `no package.json at ${pkgPath}`
+        : `could not read ${pkgPath}: ${e.message}`;
     }
   }
   // Resolve latest from origin/main (cheap: `git show origin/main:package.json`).
@@ -706,12 +722,39 @@ export async function runDoctor(opts = {}) {
       latestVersion = currentVersion;
     }
   }
-  push("current_version", "PASS", `current=${currentVersion}`);
+  // Issue #348: this used to push PASS unconditionally — including when its own value was the
+  // literal string "unknown". The check that HAD the information reported success, and the
+  // failure surfaced one check later as `unknown < v3.4.0`, which reads as "your version is too
+  // old" rather than "I could not find your install". FAIL here, and name the path that was
+  // tried plus how it was chosen, so the message points at the actual remedy.
+  //
+  // Deliberately narrow, and deliberately NOT a new way for a working host to be blocked: the
+  // FAIL condition (`!semverParts(currentVersion)`) is exactly the first conjunct of
+  // `fromSupported` below, so it can only fire on a host where from_version_supported ALREADY
+  // FAILs. fail_count goes 1 → 2 on those hosts; ready_to_upgrade (fail_count === 0) was
+  // already false, next_action.kind is computed from `fromSupported` and is untouched, and
+  // runUpgrade()'s pre-flight guard tolerates !ready_to_upgrade precisely for
+  // kind="fresh_install", which is what this state produces. A host on a KNOWN-but-old version
+  // (say v3.2.0) still gets current_version=PASS — it is only "I don't know" that FAILs.
+  const versionKnown = !!semverParts(currentVersion);
+  push("current_version", versionKnown ? "PASS" : "FAIL",
+       versionKnown
+         ? `current=${currentVersion}`
+         : `could not determine the installed version — ${versionError || `unparseable version ${JSON.stringify(currentVersion)}`}` +
+           `; install dir ${ocpDir} (resolved from ${ocpDirSource})` +
+           `. If OCP is installed elsewhere, set OCP_DIR=<install path>.`);
 
   // --- from-version supported? ---
-  const fromSupported = !!semverParts(currentVersion) && semverCompare(currentVersion, "v3.4.0") >= 0;
+  const fromSupported = versionKnown && semverCompare(currentVersion, "v3.4.0") >= 0;
   push("from_version_supported", fromSupported ? "PASS" : "FAIL",
-       fromSupported ? "≥ v3.4.0" : `${currentVersion} < v3.4.0; in-place upgrade not supported`);
+       fromSupported
+         ? "≥ v3.4.0"
+         : versionKnown
+           // Issue #348: the "unknown < v3.4.0" wording this branch used to emit for BOTH cases
+           // is an assertion about a version nobody established. Only claim "too old" when a
+           // version was actually read.
+           ? `${currentVersion} < v3.4.0; in-place upgrade not supported`
+           : `cannot confirm the installed version is ≥ v3.4.0 because it could not be determined at all — see the current_version check above for the path that was tried. This is NOT "your version is too old".`);
 
   // --- service health check (mockable) ---
   let healthOk = true, oauthOk = true;
@@ -918,6 +961,10 @@ export async function runDoctor(opts = {}) {
     schema_version: SCHEMA_VERSION,
     timestamp: new Date().toISOString(),
     ready_to_upgrade: fail_count === 0,
+    // Issue #348: additive, machine-readable siblings of the install_dir check, so an agent
+    // reading --json can see WHICH tree every other field in this object describes.
+    install_dir: ocpDir,
+    install_dir_source: ocpDirSource,
     current_version: currentVersion,
     latest_version: latestVersion,
     from_version_supported: fromSupported,
@@ -959,7 +1006,10 @@ function runOauthOnly(opts, checks, push) {
   const kind = !healthOk ? "fix_service" : !oauthOk ? "fix_oauth" : "noop";
 
   let next_action;
-  const ocpDir = opts.ocpDir || join(homedir(), "ocp");
+  // Issue #348: same resolution as the full path. This one only builds the ai_executable
+  // strings, but printing `~/ocp/ocp doctor --check oauth` to an operator whose install is at
+  // /opt/ocp is a remediation step that cannot work when pasted.
+  const { dir: ocpDir } = resolveOcpDir(opts);
   if (kind === "noop") {
     // `ocp doctor --check oauth` exists to answer "is OAuth OK?", so reporting "OAuth healthy"
     // when the honest answer is "no probe has concluded yet" is the same overclaim #289 is about,

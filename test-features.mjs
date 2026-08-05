@@ -791,7 +791,9 @@ console.log("\nDoctor:");
 test("doctor --json shape: required top-level keys", async () => {
   const result = await runDoctor({ skipNetwork: true, mockVersion: "v3.10.0", mockLatest: "v3.14.0" });
   for (const k of ["schema_version", "ready_to_upgrade", "current_version", "latest_version",
-                   "from_version_supported", "fail_count", "warn_count", "checks", "next_action"]) {
+                   "from_version_supported", "fail_count", "warn_count", "checks", "next_action",
+                   // #348: which tree every other field in this object describes.
+                   "install_dir", "install_dir_source"]) {
     assert.ok(k in result, `missing key: ${k}`);
   }
   assert.equal(result.schema_version, "1");
@@ -886,6 +888,175 @@ test("doctor falls back to currentVersion when origin/main unreachable (no stale
   });
   assert.equal(result.latest_version, "v3.15.0");
   assert.equal(result.next_action.kind, "noop");
+});
+
+// ── Issue #348: the install directory is where this code LIVES, not $HOME/ocp ──
+//
+// Live failure, v3.29.0 fleet rollout: on the host whose install is at /opt/ocp behind a
+// system unit, `sudo ./ocp update` refused with kind="fresh_install" — the `rm -rf ~/ocp` path
+// — on a host sitting on a perfectly parseable v3.28.0. doctor.mjs resolved the install dir as
+// `join(homedir(), "ocp")`, sudo made homedir() `/root`, `/root/ocp` does not exist,
+// readFileSync threw, current_version became "unknown", and from_version_supported FAILed with
+// "unknown < v3.4.0" — a message that reads as "your version is too old". `OCP_DIR=/opt/ocp`
+// changed nothing because nothing read it.
+//
+// These tests are behavioral: they run the real runDoctor (in a child process with a scratch
+// $HOME, for the ones whose whole point is what $HOME does or doesn't contain) and assert on
+// the values it returns. None of them look at source text.
+const _D348_DOCTOR_URL = new URL("./scripts/doctor.mjs", import.meta.url).href;
+const _D348_REPO_ROOT = _ltF2P(new URL(".", import.meta.url)).replace(/\/$/, "");
+
+// Runs the REAL runDoctor in a child process under a caller-controlled environment. A child,
+// not this process, because the fault under test is driven entirely by $HOME/$OCP_DIR and
+// mutating those in-process would leak into every later test in this file (see this file's own
+// line-20 `process.env.HOME = homedir()` normalization, which exists for that reason).
+// skipNetwork + mockLatest keep it hermetic: no curl to the live proxy, no git fetch, no
+// systemctl probe. mockVersion is deliberately NOT passed — reading package.json off the
+// resolved directory is the entire behavior under test.
+function _d348RunDoctor(env, cwd = _D348_REPO_ROOT) {
+  const script = `
+    const m = await import(${JSON.stringify(_D348_DOCTOR_URL)});
+    const r = await m.runDoctor({ skipNetwork: true, mockLatest: "v9.9.9" });
+    process.stdout.write(JSON.stringify(r));
+  `;
+  const out = execFileSync(process.execPath, ["--input-type=module", "--eval", script], {
+    encoding: "utf8",
+    cwd,
+    // Deliberately minimal env: PATH so node can still resolve anything it needs, plus exactly
+    // the variables under test. Anything inherited would weaken the premise.
+    env: { PATH: process.env.PATH || "", ...env },
+  });
+  return JSON.parse(out);
+}
+
+console.log("\nDoctor install-dir resolution (#348):");
+
+test("#348: $HOME contains no ocp/ at all and the install is elsewhere → doctor still finds the version", () => {
+  const fakeHome = mkdtempSync(testJoin(tmpdir(), "ocp-348-home-"));
+  try {
+    // Premise of the fixture, asserted rather than assumed: if $HOME/ocp existed, the old
+    // homedir()-based resolution could accidentally succeed and this test would prove nothing.
+    assert.ok(!testExistsSync(testJoin(fakeHome, "ocp")),
+      "premise: the scratch $HOME must not contain an ocp/ directory");
+    const r = _d348RunDoctor({ HOME: fakeHome });
+    const expected = "v" + JSON.parse(_ltRead(testJoin(_D348_REPO_ROOT, "package.json"), "utf8")).version;
+    assert.equal(r.current_version, expected,
+      `doctor must read package.json from its OWN tree (${_D348_REPO_ROOT}), not $HOME/ocp`);
+    assert.equal(r.install_dir, _D348_REPO_ROOT);
+    assert.equal(r.install_dir_source, "script");
+    assert.equal(r.from_version_supported, true);
+    assert.notEqual(r.next_action.kind, "fresh_install",
+      "the destructive rm -rf path must not be selected for a host that is simply installed elsewhere");
+    const cv = r.checks.find(c => c.id === "current_version");
+    assert.equal(cv.level, "PASS");
+  } finally {
+    rmSync(fakeHome, { recursive: true, force: true });
+  }
+});
+
+test("#348: doctor reports WHICH directory it used, so a wrong answer is visible", () => {
+  const fakeHome = mkdtempSync(testJoin(tmpdir(), "ocp-348-home-"));
+  try {
+    const r = _d348RunDoctor({ HOME: fakeHome });
+    const check = r.checks.find(c => c.id === "install_dir");
+    assert.ok(check, "doctor must push an install_dir check");
+    assert.ok(check.message.includes(_D348_REPO_ROOT),
+      `install_dir check must name the directory used; got: ${check.message}`);
+    assert.ok(check.message.includes("script"),
+      `install_dir check must say how the directory was chosen; got: ${check.message}`);
+  } finally {
+    rmSync(fakeHome, { recursive: true, force: true });
+  }
+});
+
+test("#348: OCP_DIR is an operator escape hatch that actually takes effect", () => {
+  const fakeHome = mkdtempSync(testJoin(tmpdir(), "ocp-348-home-"));
+  const fakeInstall = mkdtempSync(testJoin(tmpdir(), "ocp-348-install-"));
+  try {
+    // A version this repo will never legitimately be at, so a passing assertion cannot come
+    // from the script-relative default accidentally agreeing.
+    testWriteFile(testJoin(fakeInstall, "package.json"), JSON.stringify({ name: "ocp", version: "9.9.9" }));
+    const r = _d348RunDoctor({ HOME: fakeHome, OCP_DIR: fakeInstall });
+    assert.equal(r.current_version, "v9.9.9", "OCP_DIR must decide which package.json is read");
+    assert.equal(r.install_dir, fakeInstall);
+    assert.equal(r.install_dir_source, "OCP_DIR");
+    assert.notEqual(r.install_dir, _D348_REPO_ROOT,
+      "premise: OCP_DIR must point somewhere the script-relative default would never produce");
+  } finally {
+    rmSync(fakeHome, { recursive: true, force: true });
+    rmSync(fakeInstall, { recursive: true, force: true });
+  }
+});
+
+test("#348: a RELATIVE OCP_DIR is refused and SAID SO — never silently ignored", () => {
+  // Silently dropping the operator's override is the same defect class as silently assuming
+  // $HOME/ocp: the answer is wrong and nothing on screen says so. A relative path can't be
+  // honored (`git -C`/`npm --prefix` would mean different directories depending on the caller's
+  // cwd, and `ocp` cd's to script_dir on some paths and not others), so it degrades to the
+  // script-relative answer — but reports that it did.
+  const fakeHome = mkdtempSync(testJoin(tmpdir(), "ocp-348-home-"));
+  try {
+    const r = _d348RunDoctor({ HOME: fakeHome, OCP_DIR: "relative/ocp" });
+    assert.equal(r.install_dir, _D348_REPO_ROOT, "must fall back to the script-relative answer");
+    assert.ok(r.install_dir_source.includes("ignored"),
+      `source must state that OCP_DIR was ignored; got: ${r.install_dir_source}`);
+    assert.ok(r.install_dir_source.includes("relative/ocp"),
+      `source must quote back the value it refused; got: ${r.install_dir_source}`);
+    const check = r.checks.find(c => c.id === "install_dir");
+    assert.ok(check.message.includes("ignored"),
+      `the refusal must reach the printed check line, not just the JSON; got: ${check.message}`);
+  } finally {
+    rmSync(fakeHome, { recursive: true, force: true });
+  }
+});
+
+test("#348: current_version FAILs (it used to PASS) when the version cannot be determined, and names the path it tried", async () => {
+  const missing = "/nonexistent-ocp-install-for-348";
+  const result = await runDoctor({ skipNetwork: true, mockLatest: "v9.9.9", ocpDir: missing });
+  const cv = result.checks.find(c => c.id === "current_version");
+  assert.equal(cv.level, "FAIL", "a check that could not determine its own value must not report PASS");
+  assert.equal(result.current_version, "unknown");
+  assert.ok(cv.message.includes(testJoin(missing, "package.json")),
+    `the FAIL must name the path it tried; got: ${cv.message}`);
+  assert.ok(cv.message.includes("OCP_DIR"),
+    `the FAIL must point at the escape hatch; got: ${cv.message}`);
+});
+
+test("#348: from_version_supported stops claiming 'too old' about a version it never read", async () => {
+  const result = await runDoctor({ skipNetwork: true, mockLatest: "v9.9.9", ocpDir: "/nonexistent-ocp-install-for-348" });
+  const fvs = result.checks.find(c => c.id === "from_version_supported");
+  assert.equal(fvs.level, "FAIL");
+  assert.ok(!fvs.message.includes("unknown < v3.4.0"),
+    `the misleading "unknown < v3.4.0" wording must be gone; got: ${fvs.message}`);
+  assert.ok(/could not be determined/.test(fvs.message),
+    `the message must say the version is unknown, not old; got: ${fvs.message}`);
+});
+
+// The PASS→FAIL flip's safety argument, as a test rather than a claim. ready_to_upgrade is
+// `fail_count === 0`, so a check newly FAILing could in principle refuse an update that used to
+// proceed. It cannot here, because the new FAIL's condition is exactly the first conjunct of
+// from_version_supported's — every input that trips it was ALREADY failing. These two tests pin
+// both halves of that: the new FAIL never appears alone, and it never appears on a host whose
+// version is merely old.
+test("#348 safety: the new current_version FAIL can never fire alone (from_version_supported already FAILs on the same input)", async () => {
+  const result = await runDoctor({ skipNetwork: true, mockLatest: "v9.9.9", ocpDir: "/nonexistent-ocp-install-for-348" });
+  const byId = Object.fromEntries(result.checks.map(c => [c.id, c.level]));
+  assert.equal(byId.current_version, "FAIL");
+  assert.equal(byId.from_version_supported, "FAIL",
+    "if this ever PASSes while current_version FAILs, the new FAIL has started blocking hosts on its own");
+  // Unchanged from before the fix: ready_to_upgrade was already false via
+  // from_version_supported, and runUpgrade()'s pre-flight guard tolerates that for exactly
+  // this kind.
+  assert.equal(result.ready_to_upgrade, false);
+  assert.equal(result.next_action.kind, "fresh_install");
+});
+
+test("#348 safety: a KNOWN-but-unsupported version still PASSes current_version (only 'I don't know' FAILs)", async () => {
+  const result = await runDoctor({ skipNetwork: true, mockVersion: "v3.2.0", mockLatest: "v3.14.0" });
+  const byId = Object.fromEntries(result.checks.map(c => [c.id, c.level]));
+  assert.equal(byId.current_version, "PASS", "v3.2.0 was successfully determined — that check succeeded");
+  assert.equal(byId.from_version_supported, "FAIL");
+  assert.equal(result.next_action.kind, "fresh_install");
 });
 
 // ── Issue #214: doctor's noop must reflect the RUNNING SERVICE's version, not just the tree ──
@@ -12711,6 +12882,57 @@ test("#254: injected runner — default expectedWorkingTree derives from THIS RU
     !result.phases.some(p => p.name === "restart-resolve" && p.note && p.note.includes("does not match this installation's own working tree")),
     `default expectedWorkingTree must resolve to THIS repo's own root, not homedir()/ocp; got phases=${JSON.stringify(result.phases)}`
   );
+});
+
+test("#348: runFullUpgrade's git/npm/setup target is THIS installation, never $HOME/ocp", async () => {
+  // #254 (above) fixed the tree upgrade.mjs COMPARES against. This is the tree it MUTATES —
+  // `git -C <dir> checkout`, `npm --prefix <dir> install`, `node <dir>/setup.mjs` — which was
+  // still `join(homedir(), "ocp")` until #348. On a /opt/ocp host that meant applying the
+  // upgrade to whatever sat at $HOME/ocp, or (under sudo) to a /root/ocp that does not exist.
+  //
+  // The negative assertion is the load-bearing one and it is not hypothetical on a developer
+  // machine: $HOME/ocp is very often a REAL OCP checkout, so the pre-fix code emits commands
+  // naming a tree this test has no business touching. mockExec:true records every command
+  // without running any of them.
+  // Two forms of the same root, and they are not interchangeable: resolveOcpDir() does NOT
+  // realpath (it hands back exactly what it resolved, which is what lands in the command
+  // strings), while #254's expectedWorkingTree comparison does — so the /proc cwd fixture must
+  // be the realpath'd form or the restart-resolve step reports a spurious mismatch.
+  const rawRoot = _ltF2P(new URL(".", import.meta.url)).replace(/\/$/, "");
+  const thisRepoRoot = realpathSync(rawRoot);
+  const run = makeFakeRun({
+    "ss -lptn": `LISTEN 0 511 0.0.0.0:3456 0.0.0.0:* users:(("node",pid=900004,fd=19))`,
+    "cat /proc/900004/cgroup": "0::/system.slice/ocp.service\n",
+    "cat /proc/900004/cmdline": "/usr/bin/node\0server.mjs\0",
+    "readlink /proc/900004/cwd": `${thisRepoRoot}\n`,
+    "sudo -n -l systemctl restart -- ocp.service": "systemctl restart -- ocp.service",
+  });
+  const result = await runUpgrade({
+    yes: true, dryRun: false, mockExec: true,
+    mockDoctor: { ready_to_upgrade: true, next_action: { kind: "upgrade" }, current_version: "v3.10.0", latest_version: "v3.14.0" },
+    mockPlatform: "linux", mockIsRoot: true, run,
+    // Deliberately NO ocpDir override — that absence is the entire point.
+  });
+  const cmds = result.phases.map(p => p.cmd).filter(Boolean);
+  assert.ok(cmds.length > 0, "premise: mockExec must still record the commands it skipped");
+
+  for (const needle of [`git -C ${rawRoot} fetch`, `git -C ${rawRoot} checkout`,
+                        `npm --prefix ${rawRoot} install`, `${rawRoot}/setup.mjs`]) {
+    assert.ok(cmds.some(c => c.includes(needle)),
+      `expected a command containing "${needle}"; got: ${JSON.stringify(cmds)}`);
+  }
+
+  // The explicit negative. Conditional, and the condition is stated rather than hidden: this
+  // clause can only discriminate when the checkout is NOT itself $HOME/ocp — on a machine where
+  // it is, the pre-fix and post-fix answers coincide and nothing here (or in the positive
+  // assertions above) could tell them apart. The mutation proof for this test was therefore run
+  // from a worktree outside $HOME. Everywhere else — CI included — it is live.
+  const homeOcp = testJoin(homedir(), "ocp");
+  if (homeOcp !== rawRoot) {
+    const offenders = cmds.filter(c => c.includes(`${homeOcp}/`) || c.includes(` ${homeOcp} `) || c.endsWith(` ${homeOcp}`));
+    assert.equal(offenders.length, 0,
+      `no upgrade command may target $HOME/ocp when the running install is elsewhere; got: ${JSON.stringify(offenders)}`);
+  }
 });
 
 test("MED-4 wiring: injected runner — sudo -n -l denies THIS specific command → refuses (not a generic sudo -n true probe)", async () => {

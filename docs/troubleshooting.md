@@ -116,6 +116,37 @@ openclaw gateway restart   # so OpenClaw re-reads the config
 
 Future `ocp update` invocations sync automatically.
 
+<a id="update-fresh-install"></a>
+### `ocp update` wants a fresh install on a host that is plainly not fresh
+
+Symptom, from [issue #348](https://github.com/dtzp555-max/ocp/issues/348) — an install at `/opt/ocp` behind a system unit, driven with `sudo`:
+
+```
+✗ doctor concluded kind="fresh_install" for this host (from-version is unsupported
+  or unparseable). This path … runs `rm -rf ~/ocp` and reinstalls from scratch …
+```
+
+on a host sitting on a perfectly parseable version. The refusal is correct — never pass `--fresh-install --yes` to get past it on a live host — but the *conclusion* was wrong. Before the fix, `scripts/doctor.mjs` and `scripts/upgrade.mjs` assumed the install was at `$HOME/ocp`. Under `sudo` that is `/root/ocp`, which does not exist, so `package.json` could not be read, `current_version` became `unknown`, and `from_version_supported` failed with `unknown < v3.4.0` — a message that reads as "your version is too old" when the real answer is "I could not find your install". Setting `OCP_DIR` did not help, because nothing read it.
+
+**Once a host is on the fixed version this resolves itself**: the maintenance scripts locate the install from their own file location, the same way the `ocp` bash entrypoint always has, so `/opt/ocp` and `sudo` are both fine with no configuration. `ocp doctor` now prints the directory it used on its first line:
+
+```
+[PASS] install_dir: /opt/ocp (resolved from script)
+```
+
+If that line names the wrong directory, override it with an **absolute** `OCP_DIR` (a relative value is refused, and the `install_dir` line says so). If the version genuinely cannot be read, `current_version` now **FAILs** and names the path it tried, instead of reporting `PASS` with the value `unknown`.
+
+**On an older host that cannot update itself out of this**, the manual, non-destructive path is:
+
+```bash
+sudo git -C /opt/ocp fetch --tags --quiet
+sudo git -C /opt/ocp checkout --quiet <latest tag>
+sudo npm --prefix /opt/ocp install --no-audit --no-fund
+sudo systemctl restart ocp.service
+```
+
+Deliberately **without** `setup.mjs --reconfigure-only`: a hand-written unit (system-scope, unprivileged `User=`, a non-default `WorkingDirectory=`) is exactly the topology this bug punishes, and reconfiguration could overwrite it. Verify `User=`, `WorkingDirectory=` and `ExecStart=` are unchanged afterwards.
+
 <a id="restart-target-refusal"></a>
 ### `ocp update` (or `--rollback`) refuses to restart instead of restarting
 

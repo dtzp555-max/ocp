@@ -14,6 +14,7 @@
  *   rollback      restore from snapshot
  */
 import { runDoctor, detectMultiUnitBootRace } from "./doctor.mjs";
+import { resolveOcpDir } from "./lib/ocp-dir.mjs";
 import { execSync, execFileSync } from "node:child_process";
 import { homedir } from "node:os";
 import { join, dirname } from "node:path";
@@ -55,7 +56,16 @@ function execRun(cmd) {
 // for symlinked install paths. `scripts/upgrade.mjs` always lives at `<ocpDir>/scripts/upgrade.mjs`
 // (setup.mjs never installs it anywhere else), so the OCP root is two `dirname()` calls up.
 // `opts.ocpDir` remains a valid EXPLICIT override (tests use it, and any future CLI flag could) —
-// only the no-override default changed. realpath'd where possible so a symlinked install dir
+// only the no-override default changed.
+//
+// Issue #348 update: runFullUpgrade/runRollback no longer use `join(homedir(), "ocp")` either —
+// they now call scripts/lib/ocp-dir.mjs's resolveOcpDir(), for the same reason stated above. This
+// function deliberately does NOT call it: resolveOcpDir honors an operator-supplied $OCP_DIR, and
+// an override must never be able to answer "which tree is this process running from" — a wrong
+// $OCP_DIR would then silently SUPPRESS the mismatch warning this function exists to raise
+// instead of tripping it. The two questions look identical and are not.
+//
+// realpath'd where possible so a symlinked install dir
 // (~/ocp -> /data/ocp, say) compares correctly against /proc/<pid>/cwd's already-kernel-canonical
 // target; this function must never throw, only degrade to the best answer it has.
 function resolveExpectedWorkingTree(opts) {
@@ -930,7 +940,12 @@ async function runFullUpgrade({ doctor, opts }) {
       );
     }
   };
-  const ocpDir = opts.ocpDir || join(homedir(), "ocp");
+  // Issue #348: this is the git-checkout / npm-install / setup.mjs target — the directory this
+  // function MUTATES. `join(homedir(), "ocp")` here meant a /opt/ocp install would have had its
+  // upgrade applied to whatever happened to sit at $HOME/ocp (or, under sudo, /root/ocp — a
+  // path that does not exist, so every phase would have failed). Resolved from this
+  // installation's own files instead; see scripts/lib/ocp-dir.mjs.
+  const { dir: ocpDir } = resolveOcpDir(opts);
   // opts.mockPort (test hook, mirrors opts.mockPlatform): lets tests drive resolveRestartPlan's
   // port validation (HIGH-1 follow-up below) with a deliberately malformed value without
   // mutating the real process.env — a global that would otherwise leak across tests.
@@ -1247,7 +1262,9 @@ async function runRollback(opts) {
     }
   };
 
-  const ocpDir = opts.ocpDir || join(homedir(), "ocp");
+  // Issue #348: same as runFullUpgrade above — this is the directory rollback checks out into
+  // and npm-installs, not a place to guess at. See scripts/lib/ocp-dir.mjs.
+  const { dir: ocpDir } = resolveOcpDir(opts);
   // Issue #262: was `exec(\`git -C ${ocpDir} checkout ${meta.fromCommit}\`, "git-checkout")` --
   // a shell template string carrying a disk-read value. Now argv form; see execArgv above and
   // the SHA-shape validation above meta.fromCommit is first read.
