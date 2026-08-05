@@ -1,5 +1,17 @@
 # Changelog
 
+## Unreleased
+
+### Fixed
+
+- **`ocp update` took production down: #325's restart retry was in the bash path only (#347).** Fifteen minutes after #325 shipped, an `ocp update` on production ran `launchctl bootout` (succeeded) then `launchctl bootstrap` (returned `5: Input/output error`), reported `✗ phase restart failed`, exited 1, and left a healthy proxy **stopped for 2–3 minutes**. The identical bootstrap succeeded by hand on the first attempt — a transient fault racing the bootout that had just completed.
+  - **#325 fixed the leg that was caught.** `_restart_exec_retry` (`ocp:173`) is used by `cmd_restart` at `ocp:1026`, and `ocp update` never reaches `cmd_restart` — it goes through `scripts/upgrade.mjs`'s `runFullUpgrade`, whose restart phase was `for (const c of restartPlan.plan.cmds) exec(c.cmd, c.label)`. One shot, and `exec` **throws**, so the post-flight `/health` poll that follows never ran. Nothing detected the downed service and nothing put it back. `ocp update` is the *more* dangerous of the two paths: it is the fleet-rollout command, run unattended across hosts in sequence.
+  - **Bounded retry, scoped to the restart commands.** `execRestartRetry` mirrors `_restart_exec_retry`'s shape — 3 attempts (`RESTART_ATTEMPTS`, the same number `ocp:1026` passes), rising backoff. Deliberately *not* applied to `exec` generally: a failing `git checkout` or `npm install` is not transient and still fails fast on the first attempt, which is pinned by its own test.
+  - **The failure path now restores instead of only reporting.** After the retry budget is spent, the commands from the failure point onward — the ones that would have brought the service back up — are re-run once, after a settle delay, as a visible `restart-restore` phase. The tear-down half has already executed by then; running the set-up half again is exactly what fixed the incident by hand.
+  - **The verdict comes from the probe, not from an exit status.** A restart failure no longer throws, so `/health` is always polled afterwards (now via the shared `runPostFlightCheck`, which brings #291's failure classification with it). Four outcome cells, matching `ocp`'s own (`ocp:1051-1127`): command failed + not answering → **THE PROXY IS DOWN**; command failed + answering → warned success, not a silent `✓`; probe could not run → **UNKNOWN**, never DOWN — that arm is checked first, because a machine with a broken `curl` must not be told its proxy is dead.
+  - **The hint leads with service state.** It said *"Working tree may be at new version. Run `ocp update --rollback`"* — version state, which was not what mattered with the port dead. It now opens with `THE PROXY IS DOWN`, names the commands that bring it back, and demotes the tree/rollback advice to the end. A non-restart failure keeps the original tree-state hint unchanged.
+  - **Also fixed, found while writing the tests:** the post-upgrade snapshot GC was the one success-path step not gated on `mockExec`, so every all-mock test that returned successfully ran a real `rmSync` sweep over the developer's own `~/.ocp/upgrade-snapshot-*`. It had never deleted anything only because `gcSnapshots` keeps anything within `keepDays` regardless of count. Now skipped under `mockExec` like every other mutating step.
+
 ## v3.29.0 — 2026-08-05
 
 ### Changed
