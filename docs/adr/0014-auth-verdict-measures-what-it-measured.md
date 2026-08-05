@@ -25,6 +25,11 @@
 >    direction signed off was "a completed request is conclusive evidence", and `okSource:
 >    "request"` is how the code has always expressed it. See #342.
 >
+>    It **additionally** corrected § Consequences from "two new `lastOutcome` values" to one — and
+>    that sentence *was* part of the signed text. Disclosed on the standard item 2 sets. The second
+>    value it counted was the same phantom; provenance note 2 records that sentence being
+>    "corrected" from one to two, and **that earlier correction went the wrong way**.
+>
 > An earlier version of this note said "two consequence bullets" and attributed all amendment to
 > the first commit, omitting the second. In the one paragraph whose only job is exact provenance,
 > that under-enumeration is itself the defect — corrected here, and stated because it must be
@@ -34,9 +39,20 @@
 > **twice since**, and **both** amendments are material" — directly above a three-item list, and
 > directly above the paragraph you are reading, which exists to warn about exactly that. An
 > independent reviewer caught it. Recorded rather than silently corrected, because a provenance
-> note that has under-enumerated twice is evidence about how this paragraph fails: **the count is
-> written once and the list grows underneath it.** Anyone adding item 4 must change the opening
-> sentence in the same edit.
+> note that has under-enumerated twice is evidence about how this paragraph fails — on **two** axes,
+> and the same reviewer had to point out the second one after the first was written down:
+>
+> - **The count is written once and the list grows underneath it.** Anyone adding item 4 must change
+>   the opening sentence in the same edit.
+> - **An item's own description grows underneath it too.** Item 3 first described one correction and
+>   was later extended with a second, to signed text — exactly the shape item 2 discloses with its
+>   "*additionally* rewrote…". Amending an existing item counts as amending this note; re-read the
+>   item you are extending, not just the list you are appending to.
+>
+> The first axis was diagnosed here and the diagnosis was itself one axis short. That is the third
+> consecutive round of findings on this one paragraph, which is worth more as a signal than any of
+> the individual corrections: **a hand-maintained provenance list drifts in every direction it can
+> be edited from.**
 >
 > Commits are cited by subject rather than by hash: the hashes changed under a rebase and dangling
 > ones are worse than none. ADR 0010's precedent note uses descriptive anchors for the same reason.

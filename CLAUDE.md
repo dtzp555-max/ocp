@@ -194,11 +194,40 @@ release_kit:
         match CANNOT be complete over the space of ways to write a reference in
         prose. What makes it acceptable here rather than in a security control is
         that there is no adversary — the author is complying — and the variation
-        space is bounded by markdown conventions rather than open. If a THIRD
-        compliant spelling is ever found to be missed, stop widening the regex:
-        that is the signal to make the marker's canonical form part of ADR 0012's
-        condition 5, or to diff each B.2 endpoint's real response key set per
-        release instead of reading prose at all.
+        space is bounded by markdown conventions rather than open.
+
+        >> THE STOPPING RULE BELOW HAS ALREADY FIRED. Read this before touching
+        >> the pattern. <<
+
+        The rule was: if a THIRD compliant spelling is found to be missed, stop
+        widening. Within one review round of writing it, a reviewer constructed
+        twelve spellings and this pattern got 7. The third miss is bold wrapped
+        AROUND the reference:
+
+          additive under **[ADR 0012](docs/adr/0012-….md)**
+
+        `\[?` handles bold outside the whole phrase but not this, and the repo
+        already contains `authorized by **[ADR 0010](…)**` — an authorization
+        sentence about a grandfathered B.2 change, which is the exact slot an
+        ADR 0012 marker occupies. Census of reference forms in CHANGELOG+README:
+        bare link 12, bold-wrapped 1. A real minority risk, not the house style.
+
+        So: capital (round 1) -> link (round 2) -> bold-wrapped (round 3).
+        DO NOT WIDEN THE PATTERN AGAIN. Three rounds of "one spelling over" is
+        the mechanism telling you it is the wrong mechanism, and widening a
+        fourth time is how a guard becomes theatre. The pattern above is
+        deliberately left MISSING a known spelling rather than patched, so the
+        gap stays visible instead of appearing closed.
+
+        The two real fixes, both tracked in #346, both too large to land on a
+        release eve: make the marker's canonical form part of ADR 0012's
+        condition 5 (a sign-off cycle), or diff each B.2 endpoint's real response
+        key set per release and stop reading prose altogether (real machinery,
+        and the only one that also closes the original no-marker blind spot).
+
+        Until one of those lands, a releaser who finds ZERO field entries should
+        treat that as unproven rather than clean, and grep for `ADR 0012` alone
+        as a cross-check.
       report: list the field names and their endpoints in the release PR body,
         plus the cumulative count to date; write "none this cycle" when there are
         none, so silence is a result rather than an omission. If the raw grep count
