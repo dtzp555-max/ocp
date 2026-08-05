@@ -149,14 +149,53 @@ release_kit:
     # path; it does not detect silent growth. Detecting that needs a per-release
     # record of each B.2 endpoint's actual response key set, diffed across
     # releases, which is real machinery and is deliberately not built here.
+    # Both defects below were found on the sweep's FIRST real run (v3.29.0, #337)
+    # and pushed the count in OPPOSITE directions, which is why the how: below is
+    # this specific and not just "grep for the marker":
+    #
+    #   case-sensitive grep   UNDER-count   a real field vanished from the audit
+    #   counts its own prose  OVER-count    total permanently +1
+    #
+    # The under-count is the dangerous one and it fires on the COMPLIANT path: the
+    # author wrote the marker exactly as condition 5 requires, opened a sentence
+    # with it, and a literal `grep` missed the capital A. It was caught only
+    # because a reviewer happened to re-run the grep with different flags. That is
+    # not a control. See #338.
     - name: ADR 0012 additive-field sweep
       when: every release, during the release_kit walk
-      how: grep the CHANGELOG section being dated for "additive under ADR 0012";
-        also grep the WHOLE CHANGELOG for it and report the running total
+      how: |
+        Count ENTRIES carrying the marker, case-INSENSITIVELY, not raw occurrences:
+
+          grep -in 'additive under ADR 0012' CHANGELOG.md
+
+        Case-insensitive because condition 5 requires the marker, not a
+        capitalisation, and prose capitalises at a sentence start. Then subtract
+        by inspection any hit that is META-TEXT — a line describing the sweep
+        mechanism necessarily quotes the marker it greps for. A field entry names
+        an endpoint and a field; meta-text does not. Read every hit; do not report
+        the raw number.
+
+        Do the same over the section being dated (this cycle) and over the whole
+        file (cumulative).
       report: list the field names and their endpoints in the release PR body,
         plus the cumulative count to date; write "none this cycle" when there are
-        none, so silence is a result rather than an omission. The cumulative
+        none, so silence is a result rather than an omission. If the raw grep count
+        and the reported count differ, say so and say why — a corrected number
+        without its correction is indistinguishable from a miscount. The cumulative
         number is the point — the failure mode ADR 0012 accepts is per-release
         increments each of which looks fine, so a monotonically rising integer is
         what makes the accumulation visible at all.
+      baseline: |
+        As of v3.29.0 the cumulative count is 2, both on /health:
+          instanceName                  (#327)
+          auth.consecutiveInconclusive  (#324)
+        Anchored here so future releasers INCREMENT a known-good number rather
+        than recompute it with whichever grep flags they happen to use — the
+        recomputation is exactly what produced both defects above.
+
+        Not counted, correctly: /health's okSource and okAt also landed in
+        v3.29.0, but under ADR 0014 as part of a contract change rather than as
+        additive fields. They carry no marker by design. Noted because anyone
+        diffing /health's key set against this number will find two extra keys
+        and should not read that as a miss.
 ```

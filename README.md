@@ -279,14 +279,22 @@ The canonical list lives in [`models.json`](./models.json) — the single source
 
 `/health`'s `auth` block answers "can this proxy authenticate", and it is deliberately conservative about saying yes. Two pairs of fields, deliberately separate: **`okSource` / `okAt`** say how and when `auth.ok` was established, while **`lastOutcome` / `lastCheck`** describe the last probe. A probe that cannot conclude updates only the second pair.
 
-| `auth.ok` | `lastOutcome` | what was actually established |
-|---|---|---|
-| `true` | `verified-by-request` | a real completion succeeded — the strongest evidence available, and free |
-| `true` | `authenticated` | the probe ran and the child resolved its own credential from a file or the keychain |
-| `null` | `token-present` | a token was in the child's environment and the probe exited 0. **That proves presence, not validity** |
-| `null` | any | `okSource: "expired"` — it worked, but longer ago than the freshness window: "we do not know now" |
-| `false` | `rejected` | the probe ran to completion and the credential was refused |
-| unchanged | `timeout` / `unavailable` | the probe could not conclude; the previous verdict is preserved |
+**The table is keyed on `okSource`**, because that is the field the verdict's meaning turns on. `lastOutcome` describes the probe, and the probe is not always what set `auth.ok`.
+
+| `okSource` | `auth.ok` | `lastOutcome` | what was actually established |
+|---|---|---|---|
+| `none` | `null` | `none` | no probe has completed yet — the state at boot |
+| `probe` | `true` | `authenticated` | the probe ran and the child resolved its own credential from a file or the keychain |
+| `probe` | `null` | `token-present` | a token was in the child's environment and the probe exited 0. **That proves presence, not validity** |
+| `probe` | `false` | `rejected` | the probe ran to completion and the credential was refused |
+| `request` | `true` | *preserved* | a real completion succeeded — the strongest evidence available, and free |
+| `expired` | `null` | *preserved* | a request established it, but longer ago than the freshness window: "it worked; we do not know now" |
+
+**`lastOutcome` is not part of the request-verified verdict, and that is deliberate.** A completed request sets `okSource: "request"` and leaves `lastOutcome` exactly as the probe last set it — overwriting it would make `/health` claim a probe ran when none did. So on a host that supplies the token through the environment, the **steady state is `okSource: "request"` + `lastOutcome: "token-present"`**, and that pairing is normal rather than contradictory. It is also the state three of the four instances in the reference fleet spend most of their time in.
+
+> **There is no `lastOutcome: "verified-by-request"`.** Earlier revisions of this table, of ADR 0014 and of the CHANGELOG all promised one; the server has never emitted it and by design never will (see the paragraph above). A monitor written against that value could not match any real response. **Key on `okSource: "request"`.** Corrected in #342.
+
+**Inconclusive probes are not a row here**, because they change only `lastOutcome`: a `timeout` or `unavailable` leaves `ok`, `okSource` and `okAt` untouched. That is the point — a probe killed by host load measured load, not the credential.
 
 **Why `token-present` is not `authenticated`.** `claude auth status` exits 0 whenever a token is present, without checking it: a fabricated token yields exit 0 and `loggedIn: true`. On a host that supplies `CLAUDE_CODE_OAUTH_TOKEN` through a systemd `EnvironmentFile` or an inlined unit — which is how OCP is normally deployed on Linux — the probe therefore cannot distinguish a working credential from an expired one. Reporting `authenticated` there is what issue #308 found: `/health` asserting the proxy was authenticated while every request failed on authentication. See [ADR 0014](docs/adr/0014-auth-verdict-measures-what-it-measured.md).
 

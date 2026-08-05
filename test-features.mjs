@@ -8572,7 +8572,7 @@ test("#328: the var list is the single source both scrub sites read", () => {
 // #308 / ADR 0014 — applyRequestVerdictTtl. The LATCH guard: a verdict raised by a real request
 // must expire, because on an env-token host nothing else can ever lower it.
 test("#308: a request-verified verdict decays to null past the window", () => {
-  const st = { ok: true, okSource: "request", okAt: 1000, lastCheck: 1000, lastOutcome: "verified-by-request" };
+  const st = { ok: true, okSource: "request", okAt: 1000, lastCheck: 1000, lastOutcome: "token-present" };
   assert.equal(applyRequestVerdictTtl(st, 1000 + 900000, 900000).ok, true, "exactly at the window edge is still fresh");
   const stale = applyRequestVerdictTtl(st, 1000 + 900001, 900000);
   assert.equal(stale.ok, null, "past the window the honest value is 'we do not know', not 'it works'");
@@ -8623,7 +8623,7 @@ test("#308: the window is keyed on okAt, which only a REQUEST advances", () => {
   // The other half of the same defect: probes complete every ~610s by default, so a window keyed
   // on lastCheck could never elapse — dead code describing a semantic the system did not have.
   const T = 0, TTL = 900_000;
-  let st = { ok: true, okSource: "request", okAt: T, lastCheck: T, lastOutcome: "verified-by-request" };
+  let st = { ok: true, okSource: "request", okAt: T, lastCheck: T, lastOutcome: "token-present" };
   for (let tick = 1; tick <= 3; tick++) st = { ...st, lastCheck: tick * 600_000, lastOutcome: "token-present" };
   assert.equal(applyRequestVerdictTtl(st, 1_800_000, TTL).ok, null,
     "three probe ticks must not have refreshed the request verdict's clock");
@@ -8651,7 +8651,7 @@ test("#308: a malformed okAt EXPIRES the verdict — the guard must fail closed"
   // Labels are String(), not JSON.stringify(): JSON.stringify(NaN) is "null", which made an
   // earlier failure of this test point at the wrong value entirely.
   for (const bad of [undefined, null, "1000", NaN, Infinity, {}]) {
-    const st = { ok: true, okSource: "request", okAt: bad, lastOutcome: "verified-by-request" };
+    const st = { ok: true, okSource: "request", okAt: bad, lastOutcome: "token-present" };
     const r = applyRequestVerdictTtl(st, 10_000_000, 1);
     assert.equal(r.ok, null, `okAt=${String(bad)} must expire the verdict, not preserve it`);
     assert.equal(r.okSource, "expired", `okAt=${String(bad)} must say why`);
