@@ -1,7 +1,7 @@
 # 0006 — OpenAI Shim Scope: Class A vs Class B Endpoints
 
 - **Date**: 2026-05-20
-- **Status**: Proposed — owner reviewing
+- **Status**: Accepted (maintainer sign-off 2026-08-04)
 - **Authors**: project maintainer (with AI drafting assistance)
 - **Related**: `ALIGNMENT.md` (the constitution); ADR 0002 (Alignment Constitution provenance, PR #20, commit 2853088); PR #99 by external contributor (triggering incident — OpenAI `response_format` honoring on `/v1/chat/completions`)
 

@@ -39,17 +39,27 @@
 // :293 gates an ACTION (spawning a second process) -- the same stakes that justified it in
 // scripts/upgrade.mjs.
 //
-// non-darwin is left behaviorally UNCHANGED from the pre-#246 body (still a bare `lsof`
-// call): this issue's own live verification and scripts/upgrade.mjs's own established
-// precedent (#233) both scoped the absolute-path fix to macOS only -- Linux's equivalent
-// listener check in restart-unit.mjs uses `ss`, not `lsof`, and was never audited for this
-// defect. Inventing new, UNVERIFIED Linux-specific netstat-flag handling here risks a real
-// regression: GNU netstat's `-p` flag means "show PID/program name", not "protocol filter"
-// the way BSD/macOS netstat's `-p tcp` does -- reusing the darwin cross-check's command
-// shape unconditionally on Linux would misparse and could make netstat itself fail there,
-// which (fail-closed) would make the FIRST-EVER start on a fresh Linux host -- the single
-// most common invocation -- refuse to start. Left as a scope note for a follow-up issue if
-// Linux's bare `lsof`/`ss` here turns out to share this same restricted-PATH defect.
+// non-darwin was left behaviorally unchanged by #246: this issue's own live verification and
+// scripts/upgrade.mjs's established precedent (#233) both scoped the absolute-path fix to
+// macOS. That paragraph closed by naming its own follow-up -- "left as a scope note for a
+// follow-up issue if Linux's bare command here turns out to share this same restricted-PATH
+// defect" -- and #298 is that follow-up: it does. `ss` lives at /usr/sbin/ss on Debian and
+// Raspberry Pi OS, so a PATH without /usr/sbin loses it exactly as it loses lsof, and two of
+// this project's four serving hosts are Linux. buildBindCheckCommand's linux branch now takes
+// the same resolveBinaryPath treatment, with the same fallback direction.
+//
+// (Correcting this header's own earlier text while touching it: the pre-#298 note described
+// the non-darwin branch as "still a bare `lsof` call". It never was -- the branch emits `ss`.
+// The conclusion the sentence supported was right; the identifier in it was not, and #298's
+// own filing had to correct the same slip in the review that prompted it.)
+//
+// What is deliberately NOT extended to Linux, and stays scoped out: the netstat cross-check.
+// GNU netstat's `-p` means "show PID/program name", not BSD/macOS netstat's "protocol filter"
+// `-p tcp` -- reusing the darwin cross-check's command shape unconditionally on Linux would
+// misparse and could make netstat itself fail there, which (fail-closed) would make the
+// FIRST-EVER start on a fresh Linux host -- the single most common invocation -- refuse to
+// start. Absolute-path resolution carries no such risk: it is a path preference with a
+// fallback to the exact prior behavior, not a new command shape.
 //
 // setup.mjs:426's JS bind-check is a DIFFERENT call path with different stakes (per this
 // issue's own instruction to judge, not copy wholesale): it runs only AFTER the health
@@ -222,9 +232,18 @@ fi
 // `/bin/sh` on this project's own documented Linux hosts -- Debian/Ubuntu/Raspberry Pi OS --
 // rejects `-o pipefail` outright ("Illegal option"), which would break the bind-check on every
 // single run there, not just the missing-binary case.)
-export function buildBindCheckCommand({ port, platform = process.platform, lsofPath = "/usr/sbin/lsof", existsSyncFn = realExistsSync }) {
+// Issue #298: `resolveBinaryPath` -- the restricted-PATH protection #246 added -- was applied to
+// the darwin branch only; the linux branch emitted a bare `ss`. On Debian and Raspberry Pi OS
+// `ss` lives at /usr/sbin/ss, so a PATH without /usr/sbin loses it, identical in shape to the
+// `lsof` case #246 was filed for. classifyBindCheck() then reports "could-not-run" -- honest, but
+// it is a diagnosis of the environment where an absolute path would simply have worked, and this
+// is the branch that runs on the majority of this project's own serving hosts.
+//
+// The fallback direction matters and matches darwin's: prefer the absolute path when it exists,
+// otherwise the bare name, so a host with a different layout is never worse off than before.
+export function buildBindCheckCommand({ port, platform = process.platform, lsofPath = "/usr/sbin/lsof", ssPath = "/usr/sbin/ss", existsSyncFn = realExistsSync }) {
   return platform === "linux"
-    ? `ss -tlnp`
+    ? `${resolveBinaryPath(ssPath, "ss", existsSyncFn)} -tlnp`
     : `${resolveBinaryPath(lsofPath, "lsof", existsSyncFn)} -nP -iTCP:${port} -sTCP:LISTEN`;
 }
 
@@ -289,8 +308,8 @@ function ssLineMatchesPort(line, port) {
 // the single most realistic could-not-run case on Linux (`ss` not installed).
 // Anything else (including no status at all, e.g. lsof/grep's own plain "no match" exit)
 // stays "empty" -- the unchanged, pre-#246(second-half) silent case.
-export function classifyBindCheck({ port, platform = process.platform, lsofPath = "/usr/sbin/lsof", existsSyncFn = realExistsSync, execFn = realExecSync }) {
-  const cmd = buildBindCheckCommand({ port, platform, lsofPath, existsSyncFn });
+export function classifyBindCheck({ port, platform = process.platform, lsofPath = "/usr/sbin/lsof", ssPath = "/usr/sbin/ss", existsSyncFn = realExistsSync, execFn = realExecSync }) {
+  const cmd = buildBindCheckCommand({ port, platform, lsofPath, ssPath, existsSyncFn });
   try {
     const out = execFn(cmd, { encoding: "utf-8", stdio: ["ignore", "pipe", "pipe"] }).trim();
     if (platform === "linux") {

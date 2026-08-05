@@ -120,6 +120,16 @@ _pyfail() {
 # stderr (matching the sibling display commands' own stderr convention, PR #252 round 1 fix 3 —
 # those three call sites, cmd_usage's two arms plus cmd_keys add, were the ones that review
 # explicitly left untouched at the time).
+# The could-not-run test itself, extracted so `_curl_or_die` and `_curl_probe` cannot drift
+# apart. They previously would have carried two copies of this predicate, and the whole point of
+# the #261 arc is that a local execution fault must never be reported as a remote condition — a
+# second copy is a second chance to get that wrong silently. Callers pass curl's exit status and
+# its captured stderr; see the block above for why each arm is here.
+_curl_is_local_fault() {
+  local status="$1" err="$2"
+  [[ $status -eq 127 ]] || [[ $status -eq 126 ]] || [[ "$err" == *"Permission denied"* ]] || [[ "$err" == *"bad interpreter"* ]]
+}
+
 _curl_or_die() {
   local network_label="$1"; shift
   local errfile out status err
@@ -132,7 +142,7 @@ _curl_or_die() {
   err=$(cat "$errfile" 2>/dev/null)
   rm -f "$errfile"
   if [[ $status -ne 0 ]]; then
-    if [[ $status -eq 127 ]] || [[ $status -eq 126 ]] || [[ "$err" == *"Permission denied"* ]] || [[ "$err" == *"bad interpreter"* ]]; then
+    if _curl_is_local_fault "$status" "$err"; then
       echo "Error: could not run curl (${err:-exit status $status}) — this is a local shell/environment fault, not a proxy problem" >&2
     else
       echo "Error: $network_label" >&2
@@ -142,6 +152,78 @@ _curl_or_die() {
   fi
   printf '%s' "$out"
   return 0
+}
+
+# Issue #325. Run one resolved restart command, retrying a bounded number of times.
+#
+# A restart is stop+start. When the start half fails, the caller has not "failed to restart" —
+# it has STOPPED a healthy service and left it stopped. That happened in production: on macOS the
+# resolver emits `launchctl bootout …` then `launchctl bootstrap …`; bootout succeeded, bootstrap
+# returned EIO ("5: Input/output error"), and `cmd_restart` printed "✗ Restart command failed."
+# and returned 1 with the proxy unloaded and the port dead.
+#
+# Retry, because the observed failure was TRANSIENT and one retry was enough: the identical
+# bootstrap succeeded by hand seconds later, unchanged plist, unchanged domain, and `ocp update`
+# ran the same two commands successfully minutes afterwards. The most plausible cause is a race
+# against the bootout that just completed, which is exactly the shape a short backoff fixes.
+#
+# `|| rc=$?` rather than a bare `eval` under `set -euo pipefail` (ocp:7): a bare failing eval
+# aborts the whole script, which would reintroduce the defect in a louder form — see the same
+# note on `_curl_probe`'s call sites, where this was a real bug caught by its own tests.
+_restart_exec_retry() {
+  local cmd="$1" attempts="${2:-3}" i rc
+  for (( i = 1; i <= attempts; i++ )); do
+    rc=0
+    eval "$cmd" || rc=$?
+    [[ $rc -eq 0 ]] && return 0
+    if (( i < attempts )); then
+      echo "    attempt $i/$attempts failed (exit $rc) — retrying in ${i}s" >&2
+      sleep "$i"
+    else
+      echo "    attempt $i/$attempts failed (exit $rc) — giving up on this command" >&2
+    fi
+  done
+  return 1
+}
+
+# The verdict-shaped sibling of `_curl_or_die` (#296, #299, #300).
+#
+# `_curl_or_die` exists for the sites that want a PAYLOAD: it returns 1 for both failure kinds
+# because the caller is going to abort either way, and the distinction lives only in the message.
+# The sites this helper serves want a VERDICT they then narrate themselves — "LAN-accessible",
+# "restarted successfully" — and for those, collapsing the two kinds into one nonzero is the
+# defect, not a presentational detail: the caller's `else` branch asserts a specific cause
+# ("bound to localhost only", "proxy not responding") that is simply false when the real fault
+# was that curl could not be run at all. So this returns three states and lets the caller say
+# only what it actually knows:
+#
+#   0 — the request succeeded.
+#   1 — curl ran and the request failed. A genuine remote/network condition; the caller MAY
+#       state a conclusion about the proxy.
+#   2 — curl could not be run, or its stderr could not be captured. A LOCAL fault; the caller
+#       MUST NOT state any conclusion about the proxy, because it has no evidence about it.
+#
+# stdout is discarded (these callers want the verdict, never the body); curl's own stderr is
+# captured to a private temp file and surfaced, never `2>/dev/null` — discarding it is what hid
+# all three of these sites through three separate enumeration passes.
+
+_curl_probe() {
+  local errfile status err
+  errfile=$(mktemp "${TMPDIR:-/tmp}/ocp-curlerr.XXXXXX") || {
+    echo "Error: could not create a secure temp file to capture curl's diagnostic output (mktemp failed, see error above) — cannot safely determine why the probe failed" >&2
+    return 2
+  }
+  "$@" >/dev/null 2>"$errfile"
+  status=$?
+  err=$(cat "$errfile" 2>/dev/null)
+  rm -f "$errfile"
+  [[ $status -eq 0 ]] && return 0
+  if _curl_is_local_fault "$status" "$err"; then
+    echo "Error: could not run curl (${err:-exit status $status}) — this is a local shell/environment fault, not a proxy problem" >&2
+    return 2
+  fi
+  [[ -n "$err" ]] && echo "$err" >&2
+  return 1
 }
 
 _bar() {
@@ -622,17 +704,25 @@ cmd_connect() {
 
   # Step 4: Test API access via /v1/models
   echo "  Testing API access..."
+  # #300: both of these were bare curl, the second with `2>/dev/null`. `cmd_connect`'s FIRST
+  # probe was converted in #286; these later steps in the same function were not, so the command
+  # a new user runs against an unverified machine told them the truth once and then guessed
+  # twice. Routed through `_curl_or_die`, which separates "curl could not be run here" from "the
+  # remote refused" and prints whichever actually happened.
   local models_out models_ok=0
   if [[ -n "$key" ]]; then
-    models_out=$(curl -sf --max-time 10 \
-      -H "Authorization: Bearer $key" \
-      "$base_url/v1/models" 2>/dev/null) && models_ok=1
+    models_out=$(_curl_or_die "API access failed — the remote refused or did not serve /v1/models (the key may be invalid or revoked)" \
+      curl -sf --max-time 10 -H "Authorization: Bearer $key" "$base_url/v1/models") && models_ok=1
   else
-    models_out=$(curl -sf --max-time 10 "$base_url/v1/models" 2>/dev/null) && models_ok=1
+    models_out=$(_curl_or_die "API access failed — the remote refused or did not serve /v1/models" \
+      curl -sf --max-time 10 "$base_url/v1/models") && models_ok=1
   fi
 
   if [[ $models_ok -eq 0 ]]; then
-    echo "  ✗ API access failed — key may be invalid or revoked."
+    # The cause is stated above by `_curl_or_die`, and it is one of two DIFFERENT causes. This
+    # line used to assert "key may be invalid or revoked" for both, which sends someone whose
+    # own curl is missing to go regenerate a perfectly good key.
+    echo "  ✗ API access failed (see error above)."
     return 1
   fi
   local model_count
@@ -695,18 +785,24 @@ PYEOF
   # Step 8: Quick smoke test — send a minimal chat completion
   echo "  Running smoke test..."
   local chat_payload='{"model":"claude-haiku-4-5-20251001","messages":[{"role":"user","content":"Reply with OK only."}],"max_tokens":10}'
+  # #300, sites 4 and 5. The issue enumerated the two /v1/models steps; these two were found by
+  # the guard added with this change rather than by reading, which is the whole argument for
+  # having the guard — three prior enumeration passes (#261, #273, #278) each believed they had
+  # the complete list, and each was assembled by eye.
   local chat_out chat_ok=0
   if [[ -n "$key" ]]; then
-    chat_out=$(curl -sf --max-time 30 \
+    chat_out=$(_curl_or_die "smoke test failed — the remote is reachable but did not complete a chat request" \
+      curl -sf --max-time 30 \
       -H "Authorization: Bearer $key" \
       -H "Content-Type: application/json" \
       -d "$chat_payload" \
-      "$base_url/v1/chat/completions" 2>/dev/null) && chat_ok=1
+      "$base_url/v1/chat/completions") && chat_ok=1
   else
-    chat_out=$(curl -sf --max-time 30 \
+    chat_out=$(_curl_or_die "smoke test failed — the remote is reachable but did not complete a chat request" \
+      curl -sf --max-time 30 \
       -H "Content-Type: application/json" \
       -d "$chat_payload" \
-      "$base_url/v1/chat/completions" 2>/dev/null) && chat_ok=1
+      "$base_url/v1/chat/completions") && chat_ok=1
   fi
 
   if [[ $chat_ok -eq 1 ]]; then
@@ -714,8 +810,11 @@ PYEOF
     reply=$(echo "$chat_out" | python3 -c "import sys,json; d=json.loads(sys.stdin.read()); print(d['choices'][0]['message']['content'].strip())" 2>/dev/null || echo "(response received)")
     echo "  ✓ Smoke test passed: $reply"
   else
-    echo "  ⚠ Smoke test failed (proxy is reachable but chat completion did not succeed)."
-    echo "    The env vars have still been written. Check the remote OCP logs."
+    # The parenthetical used to assert "proxy is reachable" unconditionally — untrue, and
+    # misleading in the specific direction of "go read the REMOTE logs", when the fault may be
+    # entirely local. `_curl_or_die` has already said which it was.
+    echo "  ⚠ Smoke test failed (see error above)."
+    echo "    The env vars have still been written."
   fi
 
   echo ""
@@ -753,15 +852,36 @@ cmd_lan() {
   echo "  Dashboard: http://$ip:$port/dashboard"
   echo ""
 
-  if curl -sf --max-time 2 "http://$ip:$port/health" > /dev/null 2>&1; then
-    echo "  Status: ✓ LAN-accessible"
-  else
-    echo "  Status: ✗ Not LAN-accessible (bound to localhost only)"
-    echo ""
-    echo "  To enable LAN mode, set env var and restart:"
-    echo "    CLAUDE_BIND=0.0.0.0"
-    echo "    ocp restart"
-  fi
+  # #296: this was a bare `curl ... >/dev/null 2>&1` whose `else` branch asserted "bound to
+  # localhost only" — a specific claim about the PROXY — for every nonzero exit, including a curl
+  # that could not be run at all. The remediation printed underneath then sends the operator to
+  # change `CLAUDE_BIND` and restart a service that was never the problem. Three states now, and
+  # the local-fault one deliberately declines to characterise the bind address.
+  # `|| lan_rc=$?` is load-bearing, not style: this file runs under `set -e` (ocp:7), so a bare
+  # `_curl_probe ...` on its own line terminates the whole script the instant it returns nonzero —
+  # which is every failing case, i.e. exactly the cases this fix exists to narrate. Caught by this
+  # change's own tests: the first run printed cmd_lan's header and then simply stopped, with no
+  # status line at all and an empty stderr.
+  local lan_rc=0
+  _curl_probe curl -sf --max-time 2 "http://$ip:$port/health" || lan_rc=$?
+  case $lan_rc in
+    0)
+      echo "  Status: ✓ LAN-accessible"
+      ;;
+    2)
+      echo "  Status: ? Undetermined — curl could not be run on THIS machine (see error above)"
+      echo ""
+      echo "  This says nothing about the proxy's bind address. Fix the local curl first,"
+      echo "  then re-run 'ocp lan'."
+      ;;
+    *)
+      echo "  Status: ✗ Not LAN-accessible (bound to localhost only)"
+      echo ""
+      echo "  To enable LAN mode, set env var and restart:"
+      echo "    CLAUDE_BIND=0.0.0.0"
+      echo "    ocp restart"
+      ;;
+  esac
 }
 
 # ── restart ──────────────────────────────────────────────────────────────
@@ -773,6 +893,13 @@ Usage:
   ocp restart            Restart the Claude proxy service
   ocp restart gateway    Restart the OpenClaw gateway
                          (briefly disconnects all Telegram/Discord bots)
+
+Exit status (changed in #325): 0 means the proxy ANSWERS /health afterwards,
+not that every restart command succeeded. A command can fail after retries and
+still exit 0 if the proxy is serving — that case prints a warning rather than a
+plain success. Exit 1 means either the proxy is not answering, or its state
+could not be determined. A script keying on exit 0 as "the restart commands
+ran cleanly" should read the output, not just the status.
 
 Note (macOS): restart does a full launchctl bootout + bootstrap, NOT
 `kickstart -k`. bootout+bootstrap re-reads the plist's EnvironmentVariables,
@@ -895,16 +1022,84 @@ cmd_restart() {
     while IFS= read -r cmd_line; do
       [[ -z "$cmd_line" ]] && continue
       echo "  $cmd_line"
-      eval "$cmd_line" || restart_failed=1
+      # #325: bounded retry instead of one shot. See _restart_exec_retry.
+      _restart_exec_retry "$cmd_line" 3 || restart_failed=1
     done <<< "$resolve_out"
 
+    # #325: DO NOT return here on failure. This function's previous shape returned immediately
+    # with "✗ Restart command failed." — which is true about the command and silent about the
+    # thing that matters, namely that the stop half already ran and the service may now be DOWN.
+    # The verdict about the proxy belongs to the probe below, not to a subcommand's exit status:
+    # a failing command does not prove the proxy is down (the service manager may have started it
+    # anyway) and a succeeding one does not prove it is up. So fall through and measure.
     if [[ $restart_failed -ne 0 ]]; then
-      echo "✗ Restart command failed."
-      return 1
+      echo "! A restart command failed after retries — checking whether the proxy is up anyway." >&2
     fi
 
     sleep 3
-    if curl -sf --max-time 5 "$PROXY/health" > /dev/null 2>&1; then
+    # #299: this probe is the restart's OWN verdict, and it was a bare curl with both streams
+    # discarded. A curl that could not be run reported a successful restart as "✗ Proxy not
+    # responding after restart." and returned 1 — which propagates into `_cmd_update_light`'s
+    # `restart_status` (#255) and from there into the update's overall outcome, on the recovery
+    # path, at the exact moment a wrong diagnosis costs the most. The local-fault arm returns 1
+    # as well (the caller genuinely cannot confirm the restart, so claiming success would be the
+    # opposite error), but it says which of the two happened instead of asserting the proxy is
+    # down on no evidence.
+    # `|| probe_rc=$?` for the same `set -e` reason as cmd_lan's site — see the comment there.
+    local probe_rc=0
+    _curl_probe curl -sf --max-time 5 "$PROXY/health" || probe_rc=$?
+    if [[ $probe_rc -eq 2 ]]; then
+      # #325: this cell is reachable in two different states and must not describe them alike.
+      # "Restart command ran" is FALSE when a command failed after retries, and it contradicts the
+      # `!` warning printed just above. Splitting the first line is the whole fix; the UNKNOWN
+      # verdict is unchanged, because a local curl fault is still not evidence about the proxy.
+      if [[ $restart_failed -ne 0 ]]; then
+        echo "? A restart command FAILED after retries, and this machine could not run curl to check the proxy (see errors above)."
+        echo "  The proxy's state is UNKNOWN. It may be down: the stop half of the restart already ran."
+        echo "  If it is, the start command the resolver produced for this host is:"
+        while IFS= read -r cmd_line; do
+          [[ -z "$cmd_line" ]] && continue
+          echo "    $cmd_line"
+        done <<< "$resolve_out"
+      else
+        echo "? Restart command ran, but this machine could not run curl to confirm it (see error above)."
+        echo "  The proxy's state is UNKNOWN — this is a local environment fault, not evidence the restart failed."
+      fi
+      return 1
+    fi
+    # #325: the probe and the command outcome are two independent facts, and the message has to
+    # name the combination. The old code had two cells; the missing one is the incident: a command
+    # failed AND the proxy is not answering, i.e. the service is DOWN and this command is why.
+    if [[ $probe_rc -ne 0 && $restart_failed -ne 0 ]]; then
+      echo "✗ THE PROXY IS DOWN. A restart command failed after retries and the proxy is not answering on $PROXY." >&2
+      echo "  This command stopped it and could not start it again — it is not 'the restart was declined'." >&2
+      # Deliberately not "it will stay stopped": that asserts more than one probe at +3s measured.
+      # A service that binds slowly after a PARTIALLY failed plan may still be coming up. Issue
+      # #325's recommendation to poll /health to a deadline (as update's post-flight does) is NOT
+      # implemented here and is left as follow-up; re-running the start command below is harmless
+      # if it turns out to be up.
+      echo "  As of the check just now it is not answering, and nothing will start it on its own." >&2
+      echo "" >&2
+      echo "  To bring it back, run the start command the resolver produced for this host:" >&2
+      while IFS= read -r cmd_line; do
+        [[ -z "$cmd_line" ]] && continue
+        echo "    $cmd_line" >&2
+      done <<< "$resolve_out"
+      echo "" >&2
+      echo "  If that keeps failing, \`ocp doctor\` reports which unit owns the port and why the resolver chose it." >&2
+      return 1
+    fi
+    if [[ $probe_rc -eq 0 && $restart_failed -ne 0 ]]; then
+      # Not a success message: something genuinely went wrong and the operator should know, even
+      # though the outcome is fine. Silently reporting "✓" here would train people to ignore the
+      # retry warnings that are the early signal for the DOWN case above.
+      echo "! Proxy is responding, but a restart command failed after retries (see above)."
+      echo "  The service is UP. Worth checking \`ocp doctor\` — this usually means the resolver's"
+      echo "  expected unit and the unit that actually owns the port have drifted apart."
+      ( cmd_usage ) || true
+      return 0
+    fi
+    if [[ $probe_rc -eq 0 ]]; then
       echo "✓ Proxy restarted successfully."
       # MEDIUM-2 (independent review round 1 on #241/PR #255): `cmd_usage` is called here purely
       # as a nice-to-have post-restart display, but its OWN `/usage` probe does `exit 1` (not
@@ -947,7 +1142,8 @@ Tunable keys:
   firstByteTimeout   Base first-byte timeout (ms)         [15000 - 300000]
   maxConcurrent      Max concurrent claude processes      [1 - 32]
   sessionTTL         Session idle expiry (ms)             [60000 - 86400000]
-  maxPromptChars     Prompt truncation limit (chars)      [10000 - 1000000]
+  maxPromptChars     GLOBAL truncation override (chars)   [10000 - 1000000]
+                     (unset = per-model, models.json contextWindow x 3)
   tiers.opus.base    Opus first-byte timeout base (ms)    [30000 - 600000]
   tiers.opus.perChar    Opus per-char timeout (ms/char)   [0 - 0.01]
   tiers.sonnet.base  Sonnet first-byte timeout base (ms)  [30000 - 600000]
@@ -1032,7 +1228,8 @@ Runs `ocp doctor` internally to choose the right path:
   • Tree at latest, service stale:  restart-only (no git/npm changes) + post-flight verify
   • Patch bump (same minor):     light path (git pull + npm install + restart)
   • Cross-minor (e.g. v3.10→v3.14): full path with snapshot + post-flight
-  • Old version (< v3.4.0):       fresh-install (asks first; AI passes --yes)
+  • Old version (< v3.4.0):       fresh-install (execution-unverified, issue #227 --
+                                   requires --fresh-install --yes, both explicit)
 
 Usage:
   ocp update                          Smart auto-pick path
@@ -1040,6 +1237,7 @@ Usage:
   ocp update --dry-run                Preview the plan, don't mutate
   ocp update --target v3.13.0         Pin a specific version
   ocp update --yes                    Skip y/N prompts (AI agents pass this)
+  ocp update --fresh-install --yes    Run the fresh-install path (see Notes -- issue #227)
   ocp update --rollback               Restore the most recent upgrade snapshot
   ocp update --rollback --list        List available snapshots
   ocp update --rollback <path>        Restore a specific snapshot
@@ -1079,6 +1277,14 @@ Notes:
   `ocp update --rollback --list` to pick a snapshot, then
   `ocp update --rollback <path>` to restore it -- --target is NOT accepted
   on --rollback (it restores a stored snapshot, not a requested version).
+
+  fresh_install (< v3.4.0 hosts) requires --fresh-install IN ADDITION TO
+  --yes (issue #227): this path has never been execution-verified, in CI
+  or by hand, so a routine `ocp update --yes` -- the same flag every other
+  non-interactive path already accepts -- no longer runs it. Doctor still
+  reports kind="fresh_install" and its ai_executable[] steps either way;
+  only automatic execution through `ocp update` is gated. See
+  docs/upgrading.md's "Old version (< v3.4.0)" section.
 EOF
 }
 
@@ -1395,7 +1601,7 @@ _cmd_update_light() {
   # latest. Nothing to do.", exit 0) without ever restarting — only `curl $PROXY/health` told the
   # truth. `_cmd_update_restart` (#217) already closed this exact gap for the sibling "restart"
   # kind via `node scripts/upgrade.mjs --post-flight-only`, which reuses postFlightOk() (compares
-  # /health's reported version against the target, not just auth.ok) instead of a second
+  # /health's reported version against the target, not just its serving verdict) instead of a second
   # hand-rolled check — wiring the light path up the same way is what this block does. `new_ver`
   # (re-read from package.json AFTER the git pull above, whether or not it changed) is the
   # correct verification target: it reflects whatever version the tree actually landed on.

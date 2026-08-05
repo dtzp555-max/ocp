@@ -53,6 +53,7 @@ Every PR that modifies `server.mjs` must satisfy all three of the following. A P
    - **Class B.2** — the authorizing ADR. Which one, and how much work it is, follows from what the change does. The dividing question is **not** "is the current value wrong?" — it is **"does the field's documented meaning change?"**
      - **Behaviour-preserving** — request shape, response shape and semantics all unchanged. This includes a fix that makes a field's *value* truthful **while the rule that determines it stays the same**: the field already promised this, and the code was not delivering it. Worked example: the #193 `stats.activeRequests` leak — the field always meant "requests in flight" and was simply over-reporting, so the field set was unchanged, the values were made truthful, and no new ADR was needed. Cite `Authorized by ADR 0006 (grandfathered as of v3.16.4)`, state that the contract is unchanged, and say which of the two routes you are taking. One line, and it covers most B.2 work.
      - **Contract change** — request shape, response shape, or semantics change, *including* a change to the rule that determines a field's value even when the field name and type are untouched. `ALIGNMENT.md:114` and ADR 0006:39 / :109 make this a new authorization request: it needs its own ADR, merged with or before the PR, cited alongside ADR 0006. Worked example: ADR 0010 redefined *when* `/health` and `/status` report `degraded` — same field, same type, new rule — and needed its own ADR. If you are tempted to file that under "making the value truthful", it is this bullet, not the one above.
+     - **Additive read-only field on a grandfathered endpoint** — a response gaining a field *is* a response-shape change, so the bullet above would demand its own ADR. ADR 0012 supplies that authorization once, standing, for changes meeting all six of its conditions: additive only (nothing removed, renamed, retyped, or re-ruled), read-only, no new endpoint or method, reporting on what the endpoint already reports on, field names stated in the PR body **and** the CHANGELOG, B.2 only. Cite `additive under ADR 0012` and list the field names. Miss any condition and it is the bullet above — in particular, a field that reports on a *new subject* through a convenient existing endpoint is new surface wearing an additive costume, and needs its own ADR.
      - **New Class B endpoint, or a new method on a grandfathered one** — its own ADR, always.
 
    - **Hybrid** — satisfy the Class A requirement for the wire-call layer and the Class B requirement for the synthesis layer, for whichever layers the PR actually touches.
@@ -133,4 +134,119 @@ release_kit:
     - new file / SPOT / schema → Architecture or contributor § with link
   bootstrap_quirk_policy:
     - any one-time migration quirk → README § "Troubleshooting"
+  governance_audits:
+    # ADR 0012 grants a STANDING authorization for additive read-only fields on
+    # grandfathered Class B.2 endpoints, and names its own failure mode: "surface
+    # growing one 'obviously fine' field at a time". Condition 5 already puts the
+    # field names in the PR body and the CHANGELOG — but nothing ever reads them,
+    # which is the state #288 found in the first place. This is the read.
+    #
+    # KNOWN BLIND SPOT, stated so nobody mistakes a green result for coverage:
+    # this sweep finds only additions whose author COMPLIED with condition 5 and
+    # wrote the marker. A field added with no marker — which is the exact shape of
+    # the four pre-#288 additions — produces "none this cycle", a POSITIVE-looking
+    # result for the case this is least able to see. It instruments the compliant
+    # path; it does not detect silent growth. Detecting that needs a per-release
+    # record of each B.2 endpoint's actual response key set, diffed across
+    # releases, which is real machinery and is deliberately not built here.
+    # Both defects below were found on the sweep's FIRST real run (v3.29.0, #337)
+    # and pushed the count in OPPOSITE directions, which is why the how: below is
+    # this specific and not just "grep for the marker":
+    #
+    #   case-sensitive grep   UNDER-count   a real field vanished from the audit
+    #   counts its own prose  OVER-count    total permanently +1
+    #
+    # The under-count is the dangerous one and it fires on the COMPLIANT path: the
+    # author wrote the marker exactly as condition 5 requires, opened a sentence
+    # with it, and a literal `grep` missed the capital A. It was caught only
+    # because a reviewer happened to re-run the grep with different flags. That is
+    # not a control. See #338.
+    - name: ADR 0012 additive-field sweep
+      when: every release, during the release_kit walk
+      how: |
+        Count ENTRIES carrying the marker, not raw occurrences:
+
+          grep -inE 'additive under \[?ADR[^0-9]{0,10}0012' CHANGELOG.md
+
+        Then subtract by inspection any hit that is META-TEXT — a line describing
+        the sweep mechanism necessarily quotes the marker it greps for. A field
+        entry names an endpoint and a field; meta-text does not. Read every hit;
+        do not report the raw number.
+
+        Do the same over the section being dated (this cycle) and over the whole
+        file (cumulative).
+
+        Why the pattern is shaped like that, since a plain substring was tried
+        first and failed twice on the SAME axis: condition 5 requires the marker,
+        not a spelling. The literal `additive under ADR 0012` finds only 2 of the
+        5 spellings that comply with it. Missed, and not hypothetically — the
+        markdown-link form is already used 10 times elsewhere in this repo:
+
+          additive under [ADR 0012](docs/adr/0012-….md)     <- link form
+          **Additive under [ADR 0012](….md).**              <- link + bold + capital
+          additive under ADR&nbsp;0012                      <- non-breaking space
+
+        Case-insensitivity covers the sentence-initial capital; `\[?` covers the
+        link form; `[^0-9]{0,10}` covers whatever separates "ADR" from "0012".
+
+        HONEST LIMIT, because this is the second narrowing of the same grep and
+        that pattern usually means the mechanism is wrong: a substring or regex
+        match CANNOT be complete over the space of ways to write a reference in
+        prose. What makes it acceptable here rather than in a security control is
+        that there is no adversary — the author is complying — and the variation
+        space is bounded by markdown conventions rather than open.
+
+        >> THE STOPPING RULE BELOW HAS ALREADY FIRED. Read this before touching
+        >> the pattern. <<
+
+        The rule was: if a THIRD compliant spelling is found to be missed, stop
+        widening. Within one review round of writing it, a reviewer constructed
+        twelve spellings and this pattern got 7. The third miss is bold wrapped
+        AROUND the reference:
+
+          additive under **[ADR 0012](docs/adr/0012-….md)**
+
+        `\[?` handles bold outside the whole phrase but not this, and the repo
+        already contains `authorized by **[ADR 0010](…)**` — an authorization
+        sentence about a grandfathered B.2 change, which is the exact slot an
+        ADR 0012 marker occupies. Census of reference forms in CHANGELOG+README:
+        bare link 12, bold-wrapped 1. A real minority risk, not the house style.
+
+        So: capital (round 1) -> link (round 2) -> bold-wrapped (round 3).
+        DO NOT WIDEN THE PATTERN AGAIN. Three rounds of "one spelling over" is
+        the mechanism telling you it is the wrong mechanism, and widening a
+        fourth time is how a guard becomes theatre. The pattern above is
+        deliberately left MISSING a known spelling rather than patched, so the
+        gap stays visible instead of appearing closed.
+
+        The two real fixes, both tracked in #346, both too large to land on a
+        release eve: make the marker's canonical form part of ADR 0012's
+        condition 5 (a sign-off cycle), or diff each B.2 endpoint's real response
+        key set per release and stop reading prose altogether (real machinery,
+        and the only one that also closes the original no-marker blind spot).
+
+        Until one of those lands, a releaser who finds ZERO field entries should
+        treat that as unproven rather than clean, and grep for `ADR 0012` alone
+        as a cross-check.
+      report: list the field names and their endpoints in the release PR body,
+        plus the cumulative count to date; write "none this cycle" when there are
+        none, so silence is a result rather than an omission. If the raw grep count
+        and the reported count differ, say so and say why — a corrected number
+        without its correction is indistinguishable from a miscount. The cumulative
+        number is the point — the failure mode ADR 0012 accepts is per-release
+        increments each of which looks fine, so a monotonically rising integer is
+        what makes the accumulation visible at all.
+      baseline: |
+        As of v3.29.0 the cumulative count is 2, both on /health:
+          instanceName                  (#327)
+          auth.consecutiveInconclusive  (#324)
+        Anchored here so future releasers INCREMENT a known-good number rather
+        than recompute it with whichever grep flags they happen to use — the
+        recomputation is exactly what produced both defects above.
+
+        Not counted, correctly: /health's okSource and okAt also landed in
+        v3.29.0, but under ADR 0014 as part of a contract change rather than as
+        additive fields. They carry no marker by design. Noted because anyone
+        diffing /health's key set against this number will find two extra keys
+        and should not read that as a miss.
 ```

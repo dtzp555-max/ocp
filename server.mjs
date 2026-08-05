@@ -46,15 +46,16 @@ import { validateKey, recordUsage, getUsageByKey, getUsageTimeline, getRecentUsa
 import { DEFAULT_PORT } from "./lib/constants.mjs";
 import { StructuredOutputError, detectStructuredOutput, validateJsonSchemaSafe, extractJsonPayload, structuredSystemInstruction, resolveMaxAttempts } from "./lib/structured-output.mjs";
 import { isLoopbackBind } from "./lib/net.mjs";
+import { classifyToolRequest } from "./lib/tool-support.mjs";
 import { runTuiTurn, reapStaleTuiSessions, resolveTuiHome, bootTuiPane, tuiPaneHealthy, poolPaneName, POOL_BOOT_MS } from "./lib/tui/session.mjs";
 import { detectTuiUpstreamError } from "./lib/tui/transcript.mjs";
 import { TuiSemaphore, SemaphoreAbortError, recordTuiEntrypoint, buildTuiHealthBlock } from "./lib/tui/semaphore.mjs";
 import { TuiPanePool, resolvePoolSize, POOL_MAX_SIZE } from "./lib/tui/pool.mjs";
 import { TuiDeltaAssembler, DEFAULT_HOLDBACK_CHARS, resolveStreamHoldback } from "./lib/tui/stream.mjs";
-import { createSerialMutex, createTtlCache, isTokenExpiring, orderLabelsLastGoodFirst } from "./lib/spawn-auth.mjs";
+import { createSerialMutex, createTtlCache, isTokenExpiring, orderLabelsLastGoodFirst, scrubInboundAuthEnv, applyRequestVerdictTtl } from "./lib/spawn-auth.mjs";
 import { hasImageContent, buildImageBlocks, buildStreamJsonInput, MultimodalError } from "./lib/multimodal.mjs";
 import { parsePositiveInt } from "./lib/env.mjs";
-import { appendOperatorPrompt, derivePromptCharBudget, selectPromptWrapper, localToolsSafetyError } from "./lib/prompt.mjs";
+import { appendOperatorPrompt, promptCharBudgetFor, fallbackPromptCharBudget, resolveGlobalPromptCharOverride, selectPromptWrapper, localToolsSafetyError } from "./lib/prompt.mjs";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const _pkg = JSON.parse(readFileSync(join(__dirname, "package.json"), "utf8"));
@@ -162,14 +163,14 @@ function resolveClaude() {
 
   if (isWin) {
     try {
-      const lines = _lookupLines(execFileSync("where.exe", ["claude"], { encoding: "utf8", timeout: 5000 }));
+      const lines = _lookupLines(execFileSync("where.exe", ["claude"], { encoding: "utf8", timeout: 5000, env: scrubInboundAuthEnv({ ...process.env }).env }));
       const resolved = lines.find(_isWindowsSpawnableBinary);
       if (resolved) { console.warn(`[init] CLAUDE_BIN not set, resolved via where.exe: ${resolved}`); return resolved; }
       _warnUnspawnableWindowsMatches(lines);
     } catch {}
   } else {
     try {
-      const resolved = execFileSync("which", ["claude"], { encoding: "utf8", timeout: 5000 }).trim();
+      const resolved = execFileSync("which", ["claude"], { encoding: "utf8", timeout: 5000, env: scrubInboundAuthEnv({ ...process.env }).env }).trim();
       if (resolved) { console.warn(`[init] CLAUDE_BIN not set, resolved via which: ${resolved}`); return resolved; }
     } catch {}
   }
@@ -413,6 +414,19 @@ const PROXY_ANONYMOUS_KEY = process.env.PROXY_ANONYMOUS_KEY || "";
 // LAN-reachable device (issue #109 P0). Localhost callers always see it regardless,
 // since localhost is already fully trusted by the auth path.
 const ADVERTISE_ANON_KEY = process.env.PROXY_ADVERTISE_ANON_KEY === "1";
+
+// #327, additive under ADR 0012. A non-primary OCP instance names itself.
+//
+// A host can legitimately run more than one instance — the documented case is an isolated
+// backend for an agent that serves untrusted users, bound to loopback under its own Unix user so
+// the `claude` children it spawns cannot inherit the primary's identity. Nothing in OCP could
+// express that, so a second instance was indistinguishable from a leftover duplicate: `ocp
+// doctor`'s multi-unit check reported "too many candidates" on a correct configuration, every
+// run, and a version sweep that probed only the default port silently missed the other one.
+//
+// Empty is the default and means "the primary". The value is an operator label, not an
+// identifier OCP acts on — nothing branches on it.
+const INSTANCE_NAME = (process.env.OCP_INSTANCE_NAME || "").trim();
 let CACHE_TTL = parseInt(process.env.CLAUDE_CACHE_TTL || "0", 10); // 0 = disabled, value in ms
 
 // ── TUI-mode (subscription-pool bridge) — opt-in; default OFF ───────────
@@ -1130,18 +1144,73 @@ const AUTH_CHECK_TIMEOUT_MS = parseIntEnv("CLAUDE_AUTH_CHECK_TIMEOUT_MS", 10000)
 // One rejection can be a token mid-refresh race; two consecutive is a real condition.
 const AUTH_DEGRADE_AFTER = 2;
 
+
 let authStatus = {
   ok: null,                  // last CONCLUSIVE verdict: true | false | null (never established)
   lastCheck: 0,              // when the last probe COMPLETED, any outcome
   message: "",               // human-readable detail of the last probe
   lastOutcome: "none",       // "none" | "authenticated" | "rejected" | "timeout" | "unavailable"
   consecutiveFailures: 0,    // consecutive CONCLUSIVE rejections only
+  // #324, additive under ADR 0012. Consecutive INCONCLUSIVE probes (timeout / unavailable) since
+  // the last conclusive one. Reset to 0 by BOTH conclusive outcomes, so it means "nothing has
+  // concluded in this many probes", never "things have been bad for a while".
+  //
+  // It exists because `ok` alone cannot express staleness: an inconclusive probe deliberately
+  // preserves the last conclusive `ok` (right — a timeout measures host load, not credentials),
+  // and that composes into a latch only a conclusive success can clear, which a reliably-timing-out
+  // probe never produces. `ok` is deliberately NOT changed by this counter: the last conclusive
+  // verdict really was what it was, and rewriting it would be a contract change on a grandfathered
+  // B.2 field (the ADR 0010 test). Consumers that must DECIDE — doctor, and through it the
+  // `ocp update` gate — read this alongside `ok` instead.
+  consecutiveInconclusive: 0,
+  // #308 / ADR 0014. HOW and WHEN `ok` was established — distinct from lastOutcome/lastCheck,
+  // which describe the last PROBE. Conflating them made the freshness window both unreachable
+  // under the default config and permanently disarmable by a single inconclusive probe.
+  okSource: "none",          // "none" | "probe" | "request" | "expired"
+  okAt: 0,                   // when `ok` was established, by whichever source
 };
 
 // The single definition of "can this proxy serve?", used by BOTH /status and /health (#232).
 // Those two carried byte-identical copies of the old expression; a shared function is what keeps
 // them from drifting. Value domain is exactly {"ok","degraded"} — dashboard.html and
 // ocp-plugin/index.js compare against those two strings, so do not invent a third. See ADR 0010.
+// #308 / ADR 0014. How long a verdict established by a REAL REQUEST stays fresh.
+//
+// A successful completion is the strongest evidence OCP can have that the credential works —
+// stronger than any probe, and free, because the request was happening anyway. But a raised
+// verdict that never expires is a latch, and on an env-token host NOTHING can lower it: the
+// `claude auth status` probe exits 0 whenever a token is merely PRESENT (measured: a fabricated
+// token yields exit 0 / loggedIn:true), so it can never contradict a stale `true`. That is
+// #324's defect shape in the opposite direction, with no clearing path at all — the criterion
+// from that issue applies here: do not ask what the clearing condition is, ask whether it is
+// REACHABLE.
+//
+// So the raise expires. Past the window with no new success, the honest value is `null` —
+// "it worked, that was a while ago, we do not know now" — which is a state ADR 0010 already
+// defines and doctor already treats as WARN rather than FAIL. A serving proxy refreshes this on
+// every request and never decays; only one that has stopped succeeding does.
+const AUTH_REQUEST_VERDICT_TTL_MS = 900000; // 15 min
+
+// #308: a completed request proves the credential is valid. Called from both claude_ok sites.
+// Deliberately does NOT touch consecutiveFailures: that tally counts CONCLUSIVE PROBE rejections
+// and drives ADR 0010's degraded verdict, which this change does not alter.
+function noteAuthVerifiedByRequest() {
+  const now = Date.now();
+  // Does NOT touch lastOutcome/lastCheck: those belong to the probe, and overwriting them would
+  // make /health claim a probe ran when none did. It DOES clear consecutiveFailures — a completed
+  // request is direct evidence the credential is not being refused. An earlier revision of this
+  // header said "deliberately does NOT touch consecutiveFailures" three lines above the code that
+  // writes it; the reviewer who caught that was reading the comment, which is what comments are for.
+  authStatus = { ...authStatus, ok: true, okSource: "request", okAt: now,
+                 message: "verified by a completed request", consecutiveFailures: 0 };
+}
+
+// #308: apply the TTL at READ time rather than on a timer — no extra interval to keep alive, and
+// the value is correct the instant it is asked for rather than up to one tick late.
+function effectiveAuthStatus(now = Date.now()) {
+  return applyRequestVerdictTtl(authStatus, now, AUTH_REQUEST_VERDICT_TTL_MS);
+}
+
 function proxyHealthStatus(binaryOk) {
   if (!binaryOk) return "degraded";
   if (authStatus.consecutiveFailures >= AUTH_DEGRADE_AFTER) return "degraded";
@@ -1162,6 +1231,10 @@ async function checkAuth() {
     delete env.ANTHROPIC_API_KEY;
     delete env.ANTHROPIC_BASE_URL;
     delete env.ANTHROPIC_AUTH_TOKEN;
+    // #328: OCP's own INBOUND credentials must not reach a child. Applied here too, not only on
+    // the request path, because this child is spawned from the same process env and a future
+    // change could give it a wider role than `auth status`.
+    scrubInboundAuthEnv(env);
     // ASYNC execFile, not execFileSync (#232). Marking the function `async` never made the old
     // synchronous call non-blocking: it froze the event loop for up to AUTH_CHECK_TIMEOUT_MS at
     // boot (before server.listen()) and again on every interval tick.
@@ -1179,8 +1252,23 @@ async function checkAuth() {
         // explicitly — the message below depends on it.
         (err, _stdout, stderr) => (err ? reject(Object.assign(err, { stderr })) : resolve()));
     });
-    authStatus = { ok: true, lastCheck: Date.now(), message: "authenticated",
-                   lastOutcome: "authenticated", consecutiveFailures: 0 };
+    const tokenFromEnv = typeof env.CLAUDE_CODE_OAUTH_TOKEN === "string" && env.CLAUDE_CODE_OAUTH_TOKEN.length > 0;
+    const nowP = Date.now();
+
+    if (tokenFromEnv) {
+      // Presence, not validity. But do NOT clobber a FRESHER verdict that a real request
+      // established — a probe that measured less must not overwrite evidence that measured more.
+      const keepRequestVerdict = authStatus.okSource === "request" &&
+                                 nowP - authStatus.okAt <= AUTH_REQUEST_VERDICT_TTL_MS;
+      authStatus = keepRequestVerdict
+        ? { ...authStatus, lastCheck: nowP, lastOutcome: "token-present", consecutiveFailures: 0 }
+        : { ...authStatus, ok: null, okSource: "probe", okAt: nowP, lastCheck: nowP,
+            message: "a token is present; the probe cannot tell whether it is valid",
+            lastOutcome: "token-present", consecutiveFailures: 0 };
+    } else {
+      authStatus = { ok: true, okSource: "probe", okAt: nowP, lastCheck: nowP, message: "authenticated",
+                     lastOutcome: "authenticated", consecutiveFailures: 0, consecutiveInconclusive: 0 };
+    }
   } catch (e) {
     const msg = (e.stderr || e.message || "").slice(0, 200);
     const now = Date.now();
@@ -1190,18 +1278,25 @@ async function checkAuth() {
       // validity — proven in production, where /health reported auth.ok=false with
       // "spawnSync ... ETIMEDOUT" in the same minute that POST /v1/chat/completions returned 200
       // on the same credentials. So preserve the last conclusive `ok` and leave the tally alone.
-      authStatus = { ...authStatus, lastCheck: now, message: msg, lastOutcome: "timeout" };
+      authStatus = { ...authStatus, lastCheck: now, message: msg, lastOutcome: "timeout",
+                     consecutiveInconclusive: (authStatus.consecutiveInconclusive || 0) + 1 };
     } else if (typeof e.code !== "number") {
       // INCONCLUSIVE. A spawn failure (ENOENT / EACCES / …) means the probe never ran, so it
       // says nothing about the credentials either. Same treatment. (A missing/non-executable
       // binary is still caught — by binaryOk in proxyHealthStatus, which is a real precondition.)
-      authStatus = { ...authStatus, lastCheck: now, message: msg, lastOutcome: "unavailable" };
+      authStatus = { ...authStatus, lastCheck: now, message: msg, lastOutcome: "unavailable",
+                     consecutiveInconclusive: (authStatus.consecutiveInconclusive || 0) + 1 };
     } else {
       // CONCLUSIVE REJECTION. claude ran to completion and exited non-zero. checkAuth and
       // spawnClaudeProcess scrub the environment identically, so the probe resolves the SAME
       // credentials the request path uses — a non-zero exit genuinely predicts serving failure.
-      authStatus = { ok: false, lastCheck: now, message: msg, lastOutcome: "rejected",
-                     consecutiveFailures: authStatus.consecutiveFailures + 1 };
+
+      // okSource/okAt on this branch too: a conclusive rejection IS a probe-established verdict.
+      // Omitting them made the fields VANISH after a rejection — a fifth state ("absent") outside
+      // the domain ADR 0014 and the README document, found by execution in review.
+      authStatus = { ok: false, okSource: "probe", okAt: now, lastCheck: now, message: msg,
+                     lastOutcome: "rejected", consecutiveFailures: authStatus.consecutiveFailures + 1,
+                     consecutiveInconclusive: 0 };
     }
     // Carries the outcome class so an operator can tell a timeout from a real rejection.
     console.error(`[auth] check ${authStatus.lastOutcome}: ${msg}`);
@@ -1292,22 +1387,41 @@ function parseIntEnv(name, def) {
 }
 
 // ── Format messages to prompt text ──────────────────────────────────────
-// Truncation guard: if total chars exceed MAX_PROMPT_CHARS, keep the system
+// Truncation guard: if total chars exceed the request's per-model budget, keep the system
 // message(s) + first user message + last N messages, dropping the middle.
 // This prevents runaway context from gateway-side conversation accumulation.
-// Routed through parseIntEnv so a misconfigured cap fails CLOSED to the default rather than
-// NaN — CLAUDE_MAX_PROMPT_CHARS=unlimited previously → NaN → enforceTextBudget's `!(NaN > 0)`
-// early-return → 500k chars passed unbounded, silently defeating F2's text-budget guarantee
-// (PR #154 round 2, gap (a)). The default itself is SPOT-DERIVED (ADR 0009, PR #179):
-// max(models.json contextWindow) × 3 chars/token — currently 600,000 — so the two fixes
-// compose: parseIntEnv guards a SET-but-garbage value, the derivation supplies the honest
-// default when unset/empty. `let` is kept for the settings API.
-let MAX_PROMPT_CHARS = parseIntEnv("CLAUDE_MAX_PROMPT_CHARS", derivePromptCharBudget(modelsConfig.models));
+// The budget is PER-MODEL (ADR 0011, #213), superseding ADR 0009's single global number.
+// ADR 0009 derived one ceiling as max(models.json contextWindow) × 3, which forced models.json
+// to under-declare every native-1M model at 200000: one 1e6 entry would have raised the ceiling
+// from 600k to 3M for EVERY model, including the genuinely-200k claude-haiku-4-5, converting
+// graceful OCP-side truncation into upstream API rejections. Now models.json states each true
+// window and the ceiling is looked up for the model the request actually named.
+//
+// CLAUDE_MAX_PROMPT_CHARS and PATCH /settings {maxPromptChars} remain ABSOLUTE GLOBAL overrides,
+// exactly as ADR 0009 specified them: when either is set, that one number is the ceiling for
+// every model and no derivation happens. null means "no override — derive per model".
+// resolveGlobalPromptCharOverride fails CLOSED on a set-but-garbage value (→ null → derivation)
+// rather than NaN, preserving PR #154 round 2 gap (a): CLAUDE_MAX_PROMPT_CHARS=unlimited used to
+// yield NaN → enforceTextBudget's `!(NaN > 0)` early-return → text passed unbounded.
+// `let` is kept for the settings API.
+let MAX_PROMPT_CHARS_OVERRIDE = resolveGlobalPromptCharOverride(process.env.CLAUDE_MAX_PROMPT_CHARS);
+if (process.env.CLAUDE_MAX_PROMPT_CHARS && MAX_PROMPT_CHARS_OVERRIDE === null) {
+  console.warn(`⚠ CLAUDE_MAX_PROMPT_CHARS="${process.env.CLAUDE_MAX_PROMPT_CHARS}" is not a valid positive integer (chars, no unit suffix); ignoring and deriving the budget per model from models.json.`);
+}
+// Reported by GET /settings when no override is in force, and applied to any model id with no
+// models.json entry. See lib/prompt.mjs for why this is the SMALLEST known window, not the largest.
+const FALLBACK_PROMPT_CHARS = fallbackPromptCharBudget(modelsConfig.models);
+
+// The truncation ceiling for one request. `cliModel` must be the RESOLVED canonical id
+// (MODEL_MAP[model] || model), never the raw client string.
+function promptCharBudget(cliModel) {
+  return MAX_PROMPT_CHARS_OVERRIDE ?? promptCharBudgetFor(modelsConfig.models, cliModel);
+}
 
 // ── Multimodal image caps (issue #110) ──────────────────────────────────
 // OpenAI `image_url` parts are forwarded to claude as Anthropic image blocks via
 // `--input-format stream-json`. Images deliberately BYPASS the text char budget
-// (MAX_PROMPT_CHARS) — they are bounded by these byte/count caps instead, and by
+// (the per-model prompt budget) — they are bounded by these byte/count caps instead, and by
 // MAX_BODY_SIZE at the HTTP layer. Data URIs are supported by default; remote
 // http(s) image URLs are OFF unless CLAUDE_IMAGE_ALLOW_URL is set (v1: data URIs
 // only). See docs/adr/0006-openai-shim-scope.md (Class B.1) and README § "Images".
@@ -1335,7 +1449,11 @@ function contentToText(content) {
   return content == null ? "" : JSON.stringify(content);
 }
 
-function messagesToPrompt(messages) {
+// `maxChars` is the caller's per-model budget (promptCharBudget(cliModel)). It is a required
+// argument in practice — the default only exists so a future internal caller that has no model
+// in hand still gets the conservative fallback rather than an undefined (NaN) ceiling, which
+// would disable the guard entirely.
+function messagesToPrompt(messages, maxChars = FALLBACK_PROMPT_CHARS) {
   const full = messages.map((m) => {
     const text = contentToText(m.content);
     if (m.role === "system") return `[System] ${text}`;
@@ -1344,12 +1462,12 @@ function messagesToPrompt(messages) {
   });
 
   const joined = full.join("\n\n");
-  if (joined.length <= MAX_PROMPT_CHARS) return joined;
+  if (joined.length <= maxChars) return joined;
 
   // Truncation: keep system messages, first user msg, and trim from the tail
   logEvent("warn", "prompt_truncated", {
     originalChars: joined.length,
-    maxChars: MAX_PROMPT_CHARS,
+    maxChars,
     originalMessages: messages.length,
   });
 
@@ -1362,7 +1480,7 @@ function messagesToPrompt(messages) {
 
   // Keep system + as many recent messages as fit
   const systemText = system.join("\n\n");
-  const budget = MAX_PROMPT_CHARS - systemText.length - 200; // 200 for separator
+  const budget = maxChars - systemText.length - 200; // 200 for separator
   const kept = [];
   let used = 0;
   for (let i = rest.length - 1; i >= 0; i--) {
@@ -1429,23 +1547,25 @@ function spawnClaudeProcess(model, messages, conversationId, keyName, releaseSlo
   // mutation so a validation failure never leaks counters or the concurrency slot
   // (handleChatCompletions validates first, so in practice it will not throw here).
   const useStreamJson = hasImageContent(nonSystemMessages);
+  // Per-model ceiling (ADR 0011): resolved from cliModel, not a global max across the registry.
+  const maxPromptChars = promptCharBudget(cliModel);
   let stdinPayload, promptChars;
   if (useStreamJson) {
-    // Pass MAX_PROMPT_CHARS so the multimodal text is bounded by the same
+    // Pass the budget so the multimodal text is bounded by the same
     // runaway-context guard as the text path (PR #154 review F2). Images bypass it.
-    const built = buildStreamJsonInput(nonSystemMessages, { ...MULTIMODAL_OPTS, maxTextChars: MAX_PROMPT_CHARS });
+    const built = buildStreamJsonInput(nonSystemMessages, { ...MULTIMODAL_OPTS, maxTextChars: maxPromptChars });
     stdinPayload = built.payload;
     promptChars = built.stats.textChars;
     if (built.stats.truncated) {
       logEvent("warn", "prompt_truncated", {
         originalChars: built.stats.originalTextChars,
-        maxChars: MAX_PROMPT_CHARS,
+        maxChars: maxPromptChars,
         keptChars: built.stats.textChars,
         path: "multimodal",
       });
     }
   } else {
-    stdinPayload = messagesToPrompt(nonSystemMessages);
+    stdinPayload = messagesToPrompt(nonSystemMessages, maxPromptChars);
     promptChars = stdinPayload.length;
   }
 
@@ -1462,6 +1582,12 @@ function spawnClaudeProcess(model, messages, conversationId, keyName, releaseSlo
   delete env.ANTHROPIC_API_KEY;
   delete env.ANTHROPIC_BASE_URL;
   delete env.ANTHROPIC_AUTH_TOKEN;
+  // #328: strip OCP's own INBOUND credentials (PROXY_API_KEY / OCP_ADMIN_KEY /
+  // PROXY_ANONYMOUS_KEY). This child reads attacker-controlled text; the proxy's key
+  // authenticates callers TO the proxy and is useless to the child, so its only effect here is
+  // to hand an injected child a working client credential. Demonstrated live, not theorised —
+  // see lib/spawn-auth.mjs for the chain and issue #328.
+  scrubInboundAuthEnv(env);
 
   // Pure API mode: suppress Claude Code context injection while preserving OAuth auth
   if (NO_CONTEXT) {
@@ -1675,6 +1801,7 @@ async function callClaude(model, messages, conversationId, keyName, res) {
       } else {
         recordModelSuccess(cliModel, elapsed);
         breakerRecordSuccess(cliModel);
+        noteAuthVerifiedByRequest(); // #308: a completed request is conclusive evidence the credential works
         logEvent("info", "claude_ok", { model: cliModel, chars: assembledText.length, elapsed, session: convId ? convId.slice(0, 12) + "..." : "none" });
         resolve(assembledText);
       }
@@ -1709,7 +1836,7 @@ async function callClaude(model, messages, conversationId, keyName, res) {
 // mid-turn instead of holding the semaphore slot for a dead socket.
 async function callClaudeTui(model, messages, _conversationId, _keyName, res, streamCtx = null) {
   const cliModel = MODEL_MAP[model] || model;
-  const prompt = messagesToPrompt(messages); // includes system as [System] inline
+  const prompt = messagesToPrompt(messages, promptCharBudget(cliModel)); // includes system as [System] inline
   recordModelRequest(cliModel, prompt.length);
   // C-4: gate the heavy interactive boot behind the TUI semaphore (queuing if all slots are
   // busy, up to maxQueue). F2: `signal` (tied to `res` "close") cancels a QUEUED wait the
@@ -2208,6 +2335,7 @@ async function callClaudeStreaming(model, messages, conversationId, res, authInf
       recordModelSuccess(cliModel, elapsed);
       breakerRecordSuccess(cliModel);
       try { recordUsage({ keyId: authInfo.keyId, keyName: authInfo.keyName, model, promptChars: messages.reduce((a, m) => a + contentToText(m.content).length, 0), responseChars: totalChars, elapsedMs: elapsed, success: true }); } catch (e) { logEvent("error", "usage_record_failed", { error: e.message }); }
+      noteAuthVerifiedByRequest(); // #308: a completed request is conclusive evidence the credential works
       logEvent("info", "claude_ok", { model: cliModel, chars: totalChars, elapsed, session: convId ? convId.slice(0, 12) + "..." : "none" });
       // Cache write-back for streaming — only on true success (not errored)
       if (CACHE_TTL > 0 && authInfo.cacheHash) {
@@ -2397,7 +2525,7 @@ function readKeychainCreds() {
       try {
         const raw = execFileSync("security", [
           "find-generic-password", "-s", label, "-w"
-        ], { encoding: "utf8", timeout: 5000 }).trim();
+        ], { env: scrubInboundAuthEnv({ ...process.env }).env, encoding: "utf8", timeout: 5000 }).trim();
         const creds = JSON.parse(raw);
         if (creds?.claudeAiOauth?.accessToken) {
           _lastGoodKeychainLabel = label; // remember the winner → try it first next time
@@ -2720,7 +2848,7 @@ async function handleStatus(_req, res) {
       status: proxyHealthStatus(binaryOk),
       version: VERSION,
       uptime: `${Math.floor(uptimeMs / 3600000)}h ${Math.floor((uptimeMs % 3600000) / 60000)}m`,
-      auth: authStatus.ok ? "ok" : authStatus.message,
+      auth: (() => { const a = effectiveAuthStatus(); return a.ok ? "ok" : a.message; })(),
       activeSessions: sessions.size,
     },
     requests: {
@@ -2743,7 +2871,12 @@ const SETTINGS_SCHEMA = {
   timeout:          { type: "number", min: 30000, max: 1800000, unit: "ms", desc: "Request timeout (default: 600s)" },
   maxConcurrent:    { type: "number", min: 1, max: 32, unit: "", desc: "Max concurrent claude processes" },
   sessionTTL:       { type: "number", min: 60000, max: 86400000, unit: "ms", desc: "Session idle expiry" },
-  maxPromptChars:   { type: "number", min: 10000, max: 1000000, unit: "chars", desc: "Prompt truncation limit" },
+  // ADR 0011: a GLOBAL override of the per-model budget. Setting it pins the truncation ceiling
+  // to this one number for EVERY model; unset, each model gets contextWindow × 3 from models.json
+  // and this reports the fallback (smallest known window × 3). Range unchanged — deliberately not
+  // widened to the 3,000,000 a native-1M model now derives, because that would be a separate
+  // request-validation contract change with no requester; see ADR 0011 § Rejected alternatives.
+  maxPromptChars:   { type: "number", min: 10000, max: 1000000, unit: "chars", desc: "Global prompt truncation override (unset = per-model from models.json)" },
   cacheTTL:         { type: "number", min: 0, max: 86400000, unit: "ms", desc: "Response cache TTL (0 = disabled)" },
 };
 
@@ -2752,7 +2885,11 @@ function getSettings() {
     timeout:          { value: TIMEOUT, ...SETTINGS_SCHEMA.timeout },
     maxConcurrent:    { value: MAX_CONCURRENT, ...SETTINGS_SCHEMA.maxConcurrent },
     sessionTTL:       { value: SESSION_TTL, ...SETTINGS_SCHEMA.sessionTTL },
-    maxPromptChars:   { value: MAX_PROMPT_CHARS, ...SETTINGS_SCHEMA.maxPromptChars },
+    // Stays a plain number: `ocp settings` formats this into a fixed-width column and PATCH
+    // takes a single scalar, so a null or a per-model map would break both consumers. When no
+    // override is set this is FALLBACK_PROMPT_CHARS (600,000 today) — the same number this
+    // field reported before ADR 0011, because every non-1M entry is still 200000.
+    maxPromptChars:   { value: MAX_PROMPT_CHARS_OVERRIDE ?? FALLBACK_PROMPT_CHARS, ...SETTINGS_SCHEMA.maxPromptChars },
     cacheTTL:         { value: CACHE_TTL, ...SETTINGS_SCHEMA.cacheTTL },
   };
 }
@@ -2772,7 +2909,11 @@ function applySettingUpdate(key, value) {
     // needs queued waiters woken immediately to use the new headroom. See lib/tui/semaphore.mjs.
     case "maxConcurrent":    MAX_CONCURRENT = value; claudeSemaphore.setLimit(value); break;
     case "sessionTTL":       SESSION_TTL = value; break;
-    case "maxPromptChars":   MAX_PROMPT_CHARS = value; break;
+    // ADR 0011: installs the GLOBAL override. There is deliberately no way to clear it back to
+    // per-model derivation over PATCH — the schema's min is 10000, so no in-range value means
+    // "unset", and accepting null would be a request-shape change. Restart without
+    // CLAUDE_MAX_PROMPT_CHARS to return to derivation.
+    case "maxPromptChars":   MAX_PROMPT_CHARS_OVERRIDE = value; break;
     case "cacheTTL":         CACHE_TTL = value; break;
     default: return `${key}: not implemented`;
   }
@@ -2826,13 +2967,27 @@ async function handleSettings(req, res) {
 }
 
 // ── Handle chat completions ─────────────────────────────────────────────
-// Default 5 MB, byte-for-byte unchanged unless CLAUDE_MAX_BODY_SIZE is set. Base64
-// image payloads inflate ~33%; operators enabling large images (issue #110) can
-// raise this to admit bigger requests. Parsed fail-closed (PR #154 review F3): a
-// bad value (`unlimited` → NaN, `5MB` → 5) must not disable the body cap or brick
-// the proxy — parseIntEnv keeps the 5 MB default and warns instead.
+// This cap is compared against `body.length` — UTF-16 code units, i.e. CHARACTERS — because the
+// accumulator below is a JS string (`body += chunk` decodes each Buffer as UTF-8). Issue #310: it
+// was labelled "5MB", which reads as bytes to every reader, including two review rounds that
+// concluded a 3,000,000-character CJK prompt would be rejected here. It would not: 3,000,000 is
+// well under the 5,242,880-character cap, though it is 9,000,000 bytes on the wire. That label
+// cost two review rounds and nearly shipped operator guidance to raise a knob nobody needed to
+// touch.
+//
+// The comparison is deliberately LEFT counting characters. A byte cap of the same number is never
+// more permissive — UTF-8 byte length >= UTF-16 unit length for every character class (ASCII 1:1,
+// Latin-1 accents 2:1, CJK 3:1, astral 4:2) — so switching to bytes would reject bodies accepted
+// today. That is a contract change on a Class B.1 surface under CLAUDE.md's dividing test, not a
+// label fix, and it is not what #310 is for. What changes here is that the label and the 413 body
+// now state which quantity they measured, so nobody reasons in the wrong unit again.
+//
+// Parsed fail-closed (PR #154 review F3): a bad value (`unlimited` → NaN, `5MB` → 5) must not
+// disable the body cap or brick the proxy — parseIntEnv keeps the default and warns instead.
 const MAX_BODY_SIZE = parseIntEnv("CLAUDE_MAX_BODY_SIZE", 5 * 1024 * 1024);
-const MAX_BODY_SIZE_LABEL = `${Math.round(MAX_BODY_SIZE / (1024 * 1024))}MB`;
+// No "MB": the number is a character count and any byte-flavoured unit on it is a lie. Deliberately
+// not `toLocaleString()` — that is locale-sensitive and would make the 413 body vary by host.
+const MAX_BODY_SIZE_LABEL = `${MAX_BODY_SIZE} characters`;
 
 // Set of all valid model identifiers (canonical IDs + aliases)
 const VALID_MODELS = new Set(Object.keys(MODEL_MAP));
@@ -2877,7 +3032,10 @@ async function handleChatCompletions(req, res) {
     for await (const chunk of req) {
       body += chunk;
       if (body.length > MAX_BODY_SIZE) {
-        return jsonResponse(res, 413, { error: { message: `Request body too large (max ${MAX_BODY_SIZE_LABEL})`, type: "invalid_request_error" } });
+        // #310: the message names the unit. A client that reads "5MB" and shrinks its payload by
+        // byte count is optimising against the wrong quantity — a multi-byte body is several times
+        // this limit on the wire and still admitted.
+        return jsonResponse(res, 413, { error: { message: `Request body too large (max ${MAX_BODY_SIZE_LABEL}; this limit counts characters, not bytes)`, type: "invalid_request_error" } });
       }
     }
   } catch (e) {
@@ -2907,6 +3065,24 @@ async function handleChatCompletions(req, res) {
   // would hand cacheHash a function the day anyone widens that gate or moves this binding.
   const cacheModel = Object.hasOwn(MODEL_MAP, model) ? MODEL_MAP[model] : model;
   const stream = parsed.stream;
+
+  // Issue #311. OCP accepts `tools`/`tool_choice` and never reads them; `server.mjs` emits no
+  // tool_calls at all. Under a permissive tool_choice that is spec-conformant — the model MAY call
+  // a tool, and text is a legal outcome — so those requests are left exactly as they were. Under a
+  // FORCING tool_choice ("required", or a named function) the spec requires finish_reason
+  // "tool_calls", and answering with prose and finish_reason "stop" is not a degraded answer but a
+  // silently wrong one: no 400, no warning field, and "stop" means the turn ended normally, so the
+  // client has nothing to branch on. Refuse those, and only those. See lib/tool-support.mjs for the
+  // spec split and ADR 0013 for why OCP does not implement tool calling.
+  const toolSupport = classifyToolRequest(parsed);
+  if (!toolSupport.supported) {
+    return jsonResponse(res, 400, { error: {
+      message: toolSupport.message,
+      type: "invalid_request_error",
+      param: toolSupport.parameter,
+      code: "unsupported_parameter",
+    } });
+  }
 
   // Validate model against known models
   if (!VALID_MODELS.has(model)) {
@@ -2962,7 +3138,9 @@ async function handleChatCompletions(req, res) {
       });
     }
     try {
-      buildImageBlocks(nonSystem, { ...MULTIMODAL_OPTS, maxTextChars: MAX_PROMPT_CHARS });
+      // cacheModel is the RESOLVED canonical id, so this early validation pass uses the same
+      // per-model ceiling spawnClaudeProcess will apply (ADR 0011).
+      buildImageBlocks(nonSystem, { ...MULTIMODAL_OPTS, maxTextChars: promptCharBudget(cacheModel) });
     } catch (e) {
       if (e instanceof MultimodalError) {
         return jsonResponse(res, e.status, { error: { message: e.message, type: e.type, code: e.code } });
@@ -3351,7 +3529,11 @@ const server = createServer(async (req, res) => {
       claudeBinaryOk: binaryOk,
       authMode: AUTH_MODE,
       ...((isLocalhost || ADVERTISE_ANON_KEY) ? { anonymousKey: PROXY_ANONYMOUS_KEY || null } : {}),
-      auth: authStatus,
+      auth: effectiveAuthStatus(), // #308: the TTL on a request-verified verdict is applied at read time
+      // #327: empty string rather than omitted, so a consumer can tell "primary" from "an older
+      // build that does not report this at all" — the same distinction #324's backward-compat
+      // test turned on.
+      instanceName: INSTANCE_NAME,
       config: {
         timeout: TIMEOUT,
         maxConcurrent: MAX_CONCURRENT,

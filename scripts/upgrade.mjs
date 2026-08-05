@@ -8,7 +8,9 @@
  *                 changes — cmd_restart + post-flight only; delegated to bash cmd_update
  *   light         same major.minor, patch bump only (existing fast path; delegated to bash)
  *   full          cross-minor (snapshot + setup.mjs + post-flight)
- *   fresh_install from-version < v3.4.0 (--yes required for non-interactive)
+ *   fresh_install from-version < v3.4.0 (both --fresh-install AND --yes required, explicit --
+ *                 issue #227: this path has never been execution-verified, so it is no longer
+ *                 reachable off a bare --yes -- see runFreshInstall() below)
  *   rollback      restore from snapshot
  */
 import { runDoctor, detectMultiUnitBootRace } from "./doctor.mjs";
@@ -157,6 +159,41 @@ function mapLsofFailureToProbeValue(err, run, port) {
 // mapLsofFailureToProbeValue uses for lsof's own "nothing matched" signature above); anything else
 // (permission failure, launchctl itself missing, a differently-worded failure) maps to `null`
 // ("unknown" — genuinely couldn't tell), never silently treated the same as "not registered".
+// Issue #290: probe BOTH launchd domains, not just `gui`. `ocp` installs a per-user LaunchAgent,
+// so `gui/<uid>` is the common case — but a root LaunchDaemon is a supported deployment
+// (scripts/doctor.mjs's own multi-unit-risk check looks for /Library/LaunchDaemons), and probing
+// only `gui` made that shape a PERMANENT dead end: the label genuinely is not registered in `gui`,
+// so the probe returned the "not-registered" sentinel, resolveOwningUnit reported no-unit, and the
+// operator was told to bring up a service that was already running. Fail-closed and loud, but on a
+// false premise.
+//
+// Extracted as a pure function over an injected `run` for the same reason classifyLaunchdJob and
+// classifyCmdlineOwner are: the escalation RULE is the whole content of this fix, and a rule that
+// can only be exercised through a full runUpgrade is a rule nobody can pin.
+//
+// The rule: escalate on the SPECIFIC "" signal — "gui says this label is not registered here" —
+// and NEVER on `null`. `null` means the gui probe could not tell (launchctl missing, permission
+// failure, an unrecognised error), and re-asking a different domain would convert an honest
+// "unknown" into a confident claim about a domain we have no evidence for. That is exactly the
+// distinction mapLaunchctlPrintFailureToProbeValue exists to preserve; spending it here would undo
+// it. Returns `{ launchdPrintOutput, launchdDomain }`.
+export function probeLaunchdDomains(run, expectedUnit) {
+  let out, domain = "gui";
+  try { out = run(`launchctl print gui/$(id -u)/${expectedUnit}`); }
+  catch (err) { out = mapLaunchctlPrintFailureToProbeValue(err).launchdPrintOutput; }
+  if (out === "") {
+    let sys;
+    try { sys = run(`launchctl print system/${expectedUnit}`); }
+    catch (err) { sys = mapLaunchctlPrintFailureToProbeValue(err).launchdPrintOutput; }
+    // "" from system too means the label is in neither domain — keep the gui answer and stay in the
+    // `gui` domain, which is the right remediation target for "it isn't installed". A `null` IS
+    // news: gui said not-here and system could not tell, so a system daemon cannot be ruled out,
+    // and "unknown" is the honest verdict rather than "no-unit".
+    if (sys !== "") { out = sys; domain = "system"; }
+  }
+  return { launchdPrintOutput: out, launchdDomain: domain };
+}
+
 function mapLaunchctlPrintFailureToProbeValue(err) {
   const stdout = err && err.stdout != null ? String(err.stdout) : "";
   const stderr = err && err.stderr != null ? String(err.stderr) : "";
@@ -288,8 +325,9 @@ function resolveRestartPlan({ opts, port, isRollback = false, fromCommit = null 
         netstatProbeFailed: !!probe.netstatProbeFailed,
       });
       if (macListener.state === "listening") {
-        try { probe.launchdPrintOutput = run(`launchctl print gui/$(id -u)/${expectedUnit}`); }
-        catch (err) { probe.launchdPrintOutput = mapLaunchctlPrintFailureToProbeValue(err).launchdPrintOutput; }
+        const probed = probeLaunchdDomains(run, expectedUnit);
+        probe.launchdPrintOutput = probed.launchdPrintOutput;
+        probe.launchdDomain = probed.launchdDomain;
       }
     } else {
       try { probe.ssOutput = run(`ss -lptn "sport = :${port}"`); } catch { probe.ssOutput = null; }
@@ -443,15 +481,80 @@ function resolveRestartPlan({ opts, port, isRollback = false, fromCommit = null 
 }
 
 // Post-flight acceptance predicate (issue #173). A health probe passes ONLY when the server
-// is authed AND actually serving the TARGET version. auth.ok alone is not enough: a stale
-// process holding the port answers auth.ok=true while still running the OLD code — exactly
+// can serve AND is actually serving the TARGET version. The serving check alone is not enough:
+// a stale process holding the port answers healthy while still running the OLD code — exactly
 // what a nohup-fallback orphan did on 2026-07-17 (upgrade "succeeded", /health kept serving
 // 3.21.1). Comparing /health.version to the checkout target catches orphan-holds-port,
 // restart-didn't-take, and wrong-unit-restarted alike. `target` tolerates a leading "v"
 // (doctor reports "v3.22.1"; /health reports "3.22.1"); an empty/unknown target degrades to
-// the old auth-only check rather than blocking an otherwise-good upgrade.
+// the serving check alone rather than blocking an otherwise-good upgrade.
+//
+// The serving check reads `status`, NOT `auth.ok` (issue #289). ADR 0010 built `status` to
+// answer exactly one question — "can this proxy serve?" — and that is precisely the question
+// post-flight asks about the process now holding the port.
+//
+// Why `auth.ok === true` (the pre-#289 predicate) was wrong here. ADR 0010 classifies a probe
+// that dies on a signal (its own timeout) or fails to spawn as INCONCLUSIVE, and an
+// inconclusive probe preserves the last CONCLUSIVE verdict rather than recording one. But
+// post-flight only ever runs against a process that was JUST restarted (ADR 0010 § "Downstream:
+// `ocp update`'s post-flight check"), which has no last conclusive verdict — so on the loaded
+// host ADR 0010 was written about, the first probe times out and `auth.ok` sits at `null` for a
+// full CLAUDE_AUTH_CHECK_INTERVAL_MS (default 10 minutes) with no accelerated re-probe, while
+// this predicate's retry budget is 10 × 1s. `null !== true`, so a SUCCESSFUL restart, update or
+// rollback reported failure, and `runRollback` threw "restored tree may not be what's running"
+// about a rollback that had worked. `status` has no such gap: it is recomputed on every request,
+// and ADR 0010 deliberately does not let an inconclusive probe move it.
+//
+// This is not simply a weaker check. It is stronger in one direction and weaker in another,
+// both deliberately:
+//   - STRONGER: `status` is `degraded` when the `claude` binary is not executable, a real
+//     serving precondition that `auth.ok` misses entirely (an unusable binary makes the probe
+//     fail to spawn, which is INCONCLUSIVE, so a stale `auth.ok: true` survives it).
+//   - WEAKER: a single conclusive rejection leaves `status` at "ok" (ADR 0010 degrades after
+//     AUTH_DEGRADE_AFTER = 2). That is intended. ADR 0010 § "Why the threshold is 2" holds that
+//     one rejection is a token-rotation race, not a condition — and post-flight, running against
+//     a fresh process, sees exactly that first probe. On the UPDATE paths a genuine credential
+//     outage is also caught before this point twice over: `runDoctor`'s FAIL on a conclusive
+//     `auth.ok === false` clears `ready_to_upgrade` (the pre-flight guard below at "doctor
+//     pre-flight"), and bash refuses `kind=fix_oauth` ahead of dispatch (`ocp` cmd_update).
+//     Both key off `auth.ok`, which this change deliberately leaves FAILing, so neither gate
+//     depends on the field being relaxed here.
+//
+//     ROLLBACK IS THE EXCEPTION, and it is deliberate rather than an oversight: `--rollback`
+//     `exec`s straight past the doctor dispatch in `ocp` and returns from `runUpgrade`'s rollback
+//     branch before the pre-flight guard ("no doctor needed; snapshot is authoritative"), because
+//     rollback exists to restore a service that is already down — gating it on a health check it
+//     is trying to repair would deadlock it. So on rollback, post-flight is the only check, and
+//     what it must establish is that the RESTORED TREE is the one now serving: the version arm,
+//     which this change does not touch. Credentials are out of scope there by construction.
+//     Post-flight is not the layer that adjudicates credentials; it verifies a restart.
+//
+// Fail-closed by construction: a body with no `status` yields `undefined !== "ok"` → false, and
+// an unreachable server never produces a body at all (the caller's try/catch retries). Verified
+// present on /health continuously from v3.4.0 — doctor's `from_version_supported` floor — so
+// rollback targets across the whole supported range still answer it.
+// Parses `--flag value` and `--flag=value` into the same result, mirroring `ocp`'s own
+// `_detect_target_flag` (which has handled both shapes since #272). Returns `seen` separately
+// from `value` on purpose: "the flag was not typed" and "the flag was typed with nothing after
+// it" are different situations, and collapsing them to `undefined` is what let a typed-but-empty
+// pin be dropped in silence — the exact failure #260 exists to prevent. The first occurrence
+// wins, matching the bash side's `break`.
+//
+// Only the two forms `ocp` itself documents are recognised. `--flagvalue` (no separator) is not
+// a form of this flag and must not be treated as one: `--targetv3.27.0` is a typo, and silently
+// honouring it would be a new way to pin something the user did not ask for.
+export function parseFlagValue(args, flag) {
+  const eq = `${flag}=`;
+  for (let i = 0; i < args.length; i++) {
+    const a = args[i];
+    if (a === flag) return { seen: true, value: args[i + 1] };
+    if (a.startsWith(eq)) return { seen: true, value: a.slice(eq.length) };
+  }
+  return { seen: false, value: undefined };
+}
+
 export function postFlightOk(body, target) {
-  if (body?.auth?.ok !== true) return false;
+  if (body?.status !== "ok") return false;
   const want = String(target || "").replace(/^v/, "");
   return !want || body?.version === want;
 }
@@ -469,24 +572,100 @@ export function postFlightOk(body, target) {
 // opts.mockExec convention): a zero-arg function called instead of the real curl, returning a
 // /health body object or throwing (to simulate unreachable) — makes the retry loop testable
 // without a live server or real sleeps.
+// Issue #291. The probe lane used to swallow every failure into one bare `catch { /* retry */ }`,
+// so a missing curl (exit 127), a refused connection (curl 7), an HTTP error (curl 22 under -f), a
+// timeout (curl 28) and a non-JSON body all produced the identical outcome — and the caller then
+// reported "(unreachable)", a statement about the SERVICE, for a fault that may be entirely local.
+// That is the exact conflation the #261 → #267 → #273 → #278 → #286 arc removed from sixteen bash
+// sites, still present in the function those bash sites now DELEGATE their final verdict to
+// (`_cmd_update_light` and `_cmd_update_restart` both report whatever `--post-flight-only` says).
+//
+// Severity is diagnosis-quality, not outcome-inverting: post-flight has already failed by the time
+// this text is composed. What it changes is whether the operator is sent to debug a healthy
+// service or their own environment.
+//
+// `SyntaxError` is checked FIRST and on its own: JSON.parse is the only thing here that throws it,
+// and it carries no `.status`, so the exit-code arms below would otherwise misfile it as a network
+// condition.
+export function classifyPostFlightProbeFailure(e) {
+  if (e instanceof SyntaxError) {
+    return { kind: "unparseable", detail: "/health responded but the body is not JSON" };
+  }
+  const status = e?.status;
+  const text = String(e?.stderr || e?.message || "").trim();
+  const first = text.split("\n")[0];
+  // Same predicate as `ocp`'s `_curl_is_local_fault` and classifyBindCheck's could-not-run arm:
+  // 127/126 are bash's own reserved codes (curl never produces them), and dash phrases a missing
+  // command as "not found" without the word "command" at all.
+  if (status === 127 || status === 126
+      || /\bnot found\b|no such file or directory|permission denied|enoent/i.test(text)) {
+    return { kind: "probe-could-not-run", detail: first || `exit ${status ?? "unknown"}` };
+  }
+  if (status === 22) return { kind: "http-error", detail: first || "curl exit 22 (server returned a non-2xx status)" };
+  if (status === 28) return { kind: "timeout", detail: first || "curl exit 28 (operation timed out)" };
+  if (status === 7) return { kind: "unreachable", detail: first || "curl exit 7 (failed to connect)" };
+  return { kind: "unreachable", detail: first || (status != null ? `curl exit ${status}` : "unknown probe failure") };
+}
+
+// The operator-facing rendering of a post-flight failure. Exported and kept separate from the
+// classifier so the text a real `ocp update` prints is assertable without a subprocess — #291's
+// coverage note applies to the message every bit as much as to the classification, since the
+// message is the entire deliverable of this fix.
+//
+// The `lastSeen` branch is deliberately byte-identical to the pre-#291 text: when a body WAS read,
+// the old message was already correct and specific, and changing it would be churn.
+export function postFlightFailureSuffix(result) {
+  if (result?.lastSeen) {
+    return ` (last saw version=${result.lastSeen} — a stale process may still hold the port; check \`ss -ltnp\` / \`lsof -i\`)`;
+  }
+  const f = result?.lastFailure;
+  if (!f) return " (unreachable)";
+  switch (f.kind) {
+    case "probe-could-not-run":
+      return ` — the post-flight probe could not run on THIS machine (${f.detail}).`
+        + ` That is a local environment fault and says nothing about the service:`
+        + ` the upgrade may well have succeeded. Fix the local curl, then re-check with`
+        + ` \`ocp update --post-flight-only v${result.target}\`.`;
+    case "unparseable":
+      return ` — ${f.detail}. Something is answering on the port, but it is not this proxy.`;
+    case "http-error":
+      return ` — the service answered with a non-2xx status (${f.detail}).`;
+    case "timeout":
+      return ` — the probe timed out (${f.detail}); the service may be starting but not yet responsive.`;
+    default:
+      return ` (unreachable — ${f.detail})`;
+  }
+}
+
 export async function runPostFlightCheck(target, opts = {}) {
   const port = process.env.CLAUDE_PROXY_PORT || String(DEFAULT_PORT);
   const attempts = opts.attempts ?? 10;
   const intervalMs = opts.intervalMs ?? 1000;
+  // #291 coverage note, from the issue: every existing test drives `opts.mockProbe`, and the lane
+  // that actually ships is the execSync one — so a fix verified only through mockProbe would be
+  // verified on the lane that was never broken. `opts.execFn` makes the REAL lane drivable,
+  // mirroring classifyBindCheck's own injection convention in scripts/lib/start-sh.mjs.
+  const execFn = opts.execFn || execSync;
   const probe = opts.mockProbe || (() => {
-    const out = execSync(`curl -sf --max-time 2 http://127.0.0.1:${port}/health`).toString();
+    const out = execFn(`curl -sf --max-time 2 http://127.0.0.1:${port}/health`,
+      { stdio: ["ignore", "pipe", "pipe"] }).toString();
     return JSON.parse(out);
   });
-  let ok = false, lastSeen = null;
+  let ok = false, lastSeen = null, lastFailure = null;
   for (let i = 0; i < attempts; i++) {
     try {
       const body = probe();
       lastSeen = body.version;
-      if (postFlightOk(body, target)) { ok = true; break; }
-    } catch { /* retry */ }
+      if (postFlightOk(body, target)) { ok = true; lastFailure = null; break; }
+      // Reached the service and read a version, it is just not the one we are waiting for. That
+      // is a different thing from not reaching it, and the caller can now say which.
+      lastFailure = { kind: "version-mismatch", detail: `serving ${body?.version ?? "unknown"}` };
+    } catch (e) {
+      lastFailure = classifyPostFlightProbeFailure(e);
+    }
     if (i < attempts - 1) await new Promise(r => setTimeout(r, intervalMs));
   }
-  return { ok, lastSeen, target: String(target || "").replace(/^v/, "") };
+  return { ok, lastSeen, target: String(target || "").replace(/^v/, ""), lastFailure };
 }
 
 // Issue #257: `--target` was parsed from argv (see `_isMain()` below) and threaded into
@@ -881,7 +1060,7 @@ async function runFullUpgrade({ doctor, opts }) {
       if (!ok) {
         phases.push({
           name: "post-flight", status: "fail",
-          message: `health did not return auth.ok=true AND version=${upgradeTarget} within 10s`
+          message: `health did not return status=ok AND version=${upgradeTarget} within 10s`
             + (lastSeen ? ` (last saw version=${lastSeen} — a stale process may still hold the port; check \`ss -ltnp\` / \`lsof -i\`)` : ""),
         });
         throw new Error("post-flight failed");
@@ -920,8 +1099,29 @@ async function runFullUpgrade({ doctor, opts }) {
 }
 
 async function runFreshInstall({ doctor, opts }) {
-  if (!opts.yes) {
-    throw new Error("fresh_install requires --yes for non-interactive execution (or run interactively and answer y)");
+  // Issue #227: doctor selecting kind="fresh_install" used to be enough, combined with the
+  // SAME --yes flag every other non-interactive `ocp update` invocation already passes (see
+  // `ocp update --yes` in `ocp`'s own help text, "AI agents pass this", and doctor.mjs's own
+  // ai_executable suggestion for update/upgrade/restart -- `${ocpDir}/ocp update --yes`), to
+  // run this arm's ai_executable[] for real: `mv ~/.ocp ...`, `rm -rf ${ocpDir}`, a fresh
+  // `git clone`, and `node setup.mjs`. That chain has never been execution-verified -- not in
+  // CI (this suite only ever reaches this function with opts.mockExec: true; see this file's
+  // own test-features.mjs coverage) and not by hand -- since the arm was reconnected by #217.
+  // A routine `ocp update --yes` run for an ordinary, well-tested upgrade must not silently
+  // walk into this path just because doctor happened to classify the host as pre-v3.4.0; the
+  // operator who wants THIS path has to say so, separately from the generic non-interactive
+  // flag. `--fresh-install` is that separate, explicit opt-in -- both it and --yes are
+  // required; --yes alone (the routine case) now refuses here instead of executing.
+  if (!opts.yes || !opts.freshInstall) {
+    throw new Error(
+      `doctor concluded kind="fresh_install" for this host (from-version is unsupported or ` +
+      `unparseable -- run \`ocp doctor\` for the specific check). This path has never been ` +
+      `execution-verified (issue #227): its ai_executable steps run \`rm -rf ~/ocp\` and ` +
+      `reinstall from scratch, and it is no longer reachable off a bare --yes. To proceed ` +
+      `anyway, re-run with both flags: \`ocp update --fresh-install --yes\`. This is not a ` +
+      `claim that the path is broken -- only that nobody has run it long enough to know either ` +
+      `way; see docs/upgrading.md's "Old version (< v3.4.0)" section for what that means.`
+    );
   }
   const steps = [];
   for (const cmd of doctor.next_action.ai_executable) {
@@ -1169,7 +1369,7 @@ async function runRollback(opts) {
       name: "post-flight",
       status: postFlight.ok ? "ok" : "fail",
       ...(postFlight.ok ? {} : {
-        message: `health did not return auth.ok=true AND version=${postFlight.target} within the post-flight budget`
+        message: `health did not return status=ok AND version=${postFlight.target} within the post-flight budget`
           + (postFlight.lastSeen
             ? ` (last saw version=${postFlight.lastSeen} — the restored tree may not be what's running; check \`ss -ltnp\` / \`lsof -i\`)`
             : " (unreachable)"),
@@ -1204,11 +1404,33 @@ if (_isMain()) {
   const args = process.argv.slice(2);
   const dryRun = args.includes("--dry-run");
   const yes = args.includes("--yes");
+  // Issue #227: explicit, separate opt-in required to execute the fresh_install path -- see
+  // runFreshInstall()'s own comment. Has no effect on any other kind.
+  const freshInstall = args.includes("--fresh-install");
   const rollback = args.includes("--rollback");
   const list = args.includes("--list");
   const gc = args.includes("--gc");
-  const targetIdx = args.indexOf("--target");
-  const target = targetIdx !== -1 ? args[targetIdx + 1] : undefined;
+  // Issue #297: this was `args.indexOf("--target")` — the SEPARATE-token form only. `ocp`'s bash
+  // layer forwards the user's argv verbatim (`exec node .../upgrade.mjs "$@"`, ocp:1289), and its
+  // own `_detect_target_flag` has handled BOTH `--target vX.Y.Z` and `--target=vX.Y.Z` since #272,
+  // so `ocp update --target=v9.9.9` arrived here with `target` undefined: the #272 refusal never
+  // fired on fresh_install, and on the full/cross-minor path the #259 pin was silently not
+  // applied — the upgrade went to doctor.latest_version instead. That is precisely the "user
+  // believes they pinned a version and did not" failure #260 exists to prevent, reintroduced
+  // through a layer boundary because #272's tests exercised the equals form only at the bash
+  // layer, where its fix was.
+  const targetFlag = parseFlagValue(args, "--target");
+  const target = targetFlag.value;
+  // Fail CLOSED when the flag is present but carries no value (`--target` as the last token,
+  // `--target=`, `--target --dry-run`, `--target ""`). Both forms used to drop these silently to
+  // `undefined`, which is the same silent-no-pin outcome #260 was filed about — the flag was
+  // typed, so staying quiet is the one thing this must not do. Mirrors the identical guard
+  // `--post-flight-only` already carries a few lines below, and the bash side's own
+  // `_TARGET_SEEN`/`_TARGET_VAL` split, which exists for exactly this distinction.
+  if (targetFlag.seen && (!target || target.startsWith("--"))) {
+    console.error(`✗ --target requires a version argument, e.g. --target v3.27.0 (or --target=v3.27.0)`);
+    process.exit(1);
+  }
   // First non-flag positional after --rollback is the snapshot path
   let snapshotPath;
   if (rollback) {
@@ -1221,9 +1443,14 @@ if (_isMain()) {
   // (richer fallback logic than belongs here) and then shells out to THIS one-shot mode to
   // verify the restart actually took, reusing postFlightOk() instead of a second predicate.
   // Distinct from the runUpgrade() flow below — no doctor call, no plan, just poll + exit code.
-  const postFlightOnlyIdx = args.indexOf("--post-flight-only");
-  if (postFlightOnlyIdx !== -1) {
-    const postFlightTarget = args[postFlightOnlyIdx + 1];
+  // #297: routed through the same parser as `--target`. `ocp` only ever invokes this internally
+  // with the separate-token form (ocp:1434, ocp:1489), so the equals form is not reachable from
+  // the product and this is not a second instance of #297's defect — but keeping two different
+  // parsers for the same flag shape in one file is how they drift, and the guard below already
+  // says this exists to catch hand-invoked misuse, which is exactly where someone types `=`.
+  const postFlightFlag = parseFlagValue(args, "--post-flight-only");
+  if (postFlightFlag.seen) {
+    const postFlightTarget = postFlightFlag.value;
     // Fail CLOSED on a missing/malformed target (PR #217 review, LOW): postFlightOk() treats
     // an empty/unknown target as "degrade to the auth-only check" by design (so a genuinely
     // unknown release target never blocks a good upgrade elsewhere) — but that same degrade
@@ -1239,8 +1466,12 @@ if (_isMain()) {
       console.log(`✓ service now serving v${result.target}`);
       process.exit(0);
     } else {
+      // #291: this used to print a bare "(unreachable)" for every non-lastSeen failure — a claim
+      // about the SERVICE, printed just as readily when the fault was that curl could not run on
+      // this machine. The probe now reports which of the five it was, and only the genuinely
+      // remote ones are narrated as remote.
       console.error(`✗ service did not reach v${result.target} within the post-flight budget`
-        + (result.lastSeen ? ` (last saw version=${result.lastSeen} — a stale process may still hold the port; check \`ss -ltnp\` / \`lsof -i\`)` : " (unreachable)"));
+        + postFlightFailureSuffix(result));
       process.exit(1);
     }
   }
@@ -1276,7 +1507,7 @@ if (_isMain()) {
   }
 
   try {
-    const result = await runUpgrade({ dryRun, yes, rollback, list, gc, snapshotPath, target });
+    const result = await runUpgrade({ dryRun, yes, freshInstall, rollback, list, gc, snapshotPath, target });
     if (result.plan) for (const line of result.plan) console.log(line);
     if (result.phases) for (const p of result.phases) console.log(`[${p.name}] ${p.status}${p.cmd ? `: ${p.cmd}` : ""}`);
     if (result.steps) for (const s of result.steps) console.log(`  ${s.status === "ok" ? "✓" : s.status === "skipped-mock" ? "·" : "✗"} ${s.cmd}`);

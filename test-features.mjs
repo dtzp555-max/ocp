@@ -7,7 +7,9 @@
 import { TEST_OCP_DIR } from "./test-env.mjs";
 import { getDb, getDbPath, createKey, listKeys, LIST_KEYS_SQL, validateKey, recordUsage, checkQuota, updateKeyQuota, getKeyQuota, findKey, cacheHash, getCachedResponse, setCachedResponse, clearCache, getCacheStats, closeDb, hasCacheControl, singleflight, getInflightStats } from "./keys.mjs";
 import { isLoopbackBind } from "./lib/net.mjs";
-import { createSerialMutex, createTtlCache, isTokenExpiring, orderLabelsLastGoodFirst } from "./lib/spawn-auth.mjs";
+import { classifyToolRequest } from "./lib/tool-support.mjs";
+import { randomBytes } from "node:crypto";
+import { createSerialMutex, createTtlCache, isTokenExpiring, orderLabelsLastGoodFirst, scrubInboundAuthEnv, INBOUND_AUTH_ENV_VARS, applyRequestVerdictTtl } from "./lib/spawn-auth.mjs";
 import { createHash } from "node:crypto";
 import { strict as assert } from "node:assert";
 import { join } from "node:path";
@@ -1003,48 +1005,107 @@ test("#214: tree==latest, /health version field unparseable → degrades gracefu
 // contract lives in lib/prompt.mjs. Mutation-proof: make appendOperatorPrompt
 // return `base` unconditionally and the first test fails; make it stop trimming
 // and the whitespace test fails.
-import { appendOperatorPrompt, derivePromptCharBudget, resolvePromptCharBudget, selectPromptWrapper, localToolsSafetyError } from "./lib/prompt.mjs";
+import { appendOperatorPrompt, promptCharBudgetFor, fallbackPromptCharBudget, resolveGlobalPromptCharOverride, selectPromptWrapper, localToolsSafetyError } from "./lib/prompt.mjs";
 
-console.log("\nPrompt-char budget (ADR 0009 — SPOT-derived):");
+console.log("\nPrompt-char budget (ADR 0011 — per-model, superseding ADR 0009's global max):");
 
-// Mutation-proof: drop the ×charsPerToken and the first test fails; drop the
-// Math.max floor guard and the floor tests fail; use min() instead of max() over
-// windows and the largest-window test fails.
-test("derivePromptCharBudget: LARGEST contextWindow × 3 chars/token", () => {
-  const models = [{ contextWindow: 200000 }, { contextWindow: 100000 }];
-  assert.equal(derivePromptCharBudget(models), 600000);
+// Mutation-proof: drop the ×charsPerToken and the first test fails; drop the Math.max
+// floor guard and the floor tests fail; make promptCharBudgetFor ignore modelId and
+// take max() across the registry (i.e. revert to ADR 0009) and the DISCRIMINATING test
+// below fails on its haiku arm.
+test("promptCharBudgetFor: the named model's OWN contextWindow × 3 chars/token", () => {
+  const models = [{ id: "big", contextWindow: 1000000 }, { id: "small", contextWindow: 200000 }];
+  assert.equal(promptCharBudgetFor(models, "big"), 3000000);
+  assert.equal(promptCharBudgetFor(models, "small"), 600000);
 });
 
-test("derivePromptCharBudget: matches the live models.json SPOT (200k → 600k today)", () => {
+// THE test this whole change exists for (#213). One registry, two models, two different
+// budgets, asserted together — a fix that raised the ceiling globally passes the first
+// assertion and fails the second, and ADR 0009's shipped behaviour fails the first.
+test("promptCharBudgetFor: a 1M model gets 3M chars while a 200k model in the SAME registry still gets 600k (#213)", () => {
   const spot = JSON.parse(tuiReadFileSync(new URL("./models.json", import.meta.url), "utf8"));
-  assert.equal(derivePromptCharBudget(spot.models), 600000);
+  assert.equal(promptCharBudgetFor(spot.models, "claude-opus-5"), 3000000,
+    "claude-opus-5 is native 1M in the CLI registry — it must get the large budget");
+  assert.equal(promptCharBudgetFor(spot.models, "claude-sonnet-5"), 3000000,
+    "claude-sonnet-5 is native 1M in the CLI registry — it must get the large budget");
+  assert.equal(promptCharBudgetFor(spot.models, "claude-haiku-4-5-20251001"), 600000,
+    "claude-haiku-4-5 is genuinely 200k — raising ITS ceiling turns OCP-side truncation into an upstream rejection");
+  assert.equal(promptCharBudgetFor(spot.models, "claude-sonnet-4-6"), 600000,
+    "claude-sonnet-4-6 is genuinely 200k");
 });
 
-test("derivePromptCharBudget: floor wins over a tiny/absent window; empty input → floor", () => {
-  assert.equal(derivePromptCharBudget([{ contextWindow: 1000 }]), 150000, "3k chars would truncate everything — floor guards it");
-  assert.equal(derivePromptCharBudget([]), 150000);
-  assert.equal(derivePromptCharBudget(undefined), 150000);
-  assert.equal(derivePromptCharBudget([{ id: "x" }, { contextWindow: "junk" }, { contextWindow: -5 }]), 150000);
+test("promptCharBudgetFor: floor wins over a tiny window; unknown/garbage entries fall back", () => {
+  assert.equal(promptCharBudgetFor([{ id: "t", contextWindow: 1000 }], "t"), 150000, "3k chars would truncate everything — floor guards it");
+  assert.equal(promptCharBudgetFor([], "anything"), 150000);
+  assert.equal(promptCharBudgetFor(undefined, "anything"), 150000);
+  assert.equal(promptCharBudgetFor([{ id: "a", contextWindow: "junk" }, { id: "b", contextWindow: -5 }], "a"), 150000);
 });
 
-test("derivePromptCharBudget: charsPerToken and floor are tunable parameters", () => {
-  assert.equal(derivePromptCharBudget([{ contextWindow: 1000000 }], { charsPerToken: 3 }), 3000000);
-  assert.equal(derivePromptCharBudget([], { floor: 42 }), 42);
+test("promptCharBudgetFor: charsPerToken and floor are tunable parameters", () => {
+  assert.equal(promptCharBudgetFor([{ id: "m", contextWindow: 1000000 }], "m", { charsPerToken: 3 }), 3000000);
+  assert.equal(promptCharBudgetFor([], "m", { floor: 42 }), 42);
 });
 
-// PR #179 review regression: EMPTY env value must mean "use the default" (the old
-// `parseInt(env || "150000")` contract). Mutation-proof: switch the resolver's
-// truthiness check to `!= null` and the empty-string test fails (NaN ≠ 600000).
-test("resolvePromptCharBudget: empty/unset env → SPOT-derived default, never NaN", () => {
-  const models = [{ contextWindow: 200000 }];
-  assert.equal(resolvePromptCharBudget("", models), 600000, "CLAUDE_MAX_PROMPT_CHARS= (empty) must fall back to derived");
-  assert.equal(resolvePromptCharBudget(undefined, models), 600000);
+// The unknown-model fallback is the SMALLEST known window, not the largest — reusing ADR
+// 0009's max() here would reintroduce the exact hazard for any id not in the SPOT.
+// Mutation-proof: swap Math.min for Math.max and the first assertion fails (3000000).
+test("fallbackPromptCharBudget: SMALLEST known window × 3, so an unknown model can never outrank a real one", () => {
+  const models = [{ id: "big", contextWindow: 1000000 }, { id: "small", contextWindow: 200000 }];
+  assert.equal(fallbackPromptCharBudget(models), 600000);
+  assert.equal(promptCharBudgetFor(models, "model-not-in-the-spot"), 600000);
+  assert.equal(fallbackPromptCharBudget([]), 150000);
+  assert.equal(fallbackPromptCharBudget(undefined), 150000);
 });
 
-test("resolvePromptCharBudget: a set env value overrides the derivation absolutely", () => {
-  const models = [{ contextWindow: 200000 }];
-  assert.equal(resolvePromptCharBudget("300000", models), 300000);
-  assert.equal(resolvePromptCharBudget("150000", models), 150000, "explicit legacy value wins over the bigger derived default");
+// The number GET /settings reports on the default path must not move: every non-1M entry
+// is still 200000, so the fallback is the same 600000 ADR 0009's max() produced before
+// the 1M windows were declared.
+test("fallbackPromptCharBudget: the live SPOT still yields 600000, so /settings' default-path value is unchanged", () => {
+  const spot = JSON.parse(tuiReadFileSync(new URL("./models.json", import.meta.url), "utf8"));
+  assert.equal(fallbackPromptCharBudget(spot.models), 600000);
+});
+
+// PR #179 review regression, carried forward: EMPTY env value must mean "use the default"
+// (the old `parseInt(env || "150000")` contract). Mutation-proof: switch the resolver's
+// truthiness check to `!= null` and the empty-string test fails (NaN is not null).
+test("resolveGlobalPromptCharOverride: empty/unset env → null (derive per model), never NaN", () => {
+  assert.equal(resolveGlobalPromptCharOverride(""), null, "CLAUDE_MAX_PROMPT_CHARS= (empty) must mean 'no override'");
+  assert.equal(resolveGlobalPromptCharOverride(undefined), null);
+});
+
+test("resolveGlobalPromptCharOverride: a set env value becomes the absolute global override", () => {
+  assert.equal(resolveGlobalPromptCharOverride("300000"), 300000);
+  assert.equal(resolveGlobalPromptCharOverride("150000"), 150000, "explicit legacy value wins over the bigger derived default");
+});
+
+// Fail CLOSED, not to NaN: a NaN ceiling silently DISABLES the runaway-context guard
+// (enforceTextBudget's `!(NaN > 0)` early-return) — PR #154 round 2, gap (a).
+test("resolveGlobalPromptCharOverride: set-but-garbage → null (derivation), not NaN", () => {
+  assert.equal(resolveGlobalPromptCharOverride("unlimited"), null);
+  assert.equal(resolveGlobalPromptCharOverride("-5"), null);
+  assert.equal(resolveGlobalPromptCharOverride("0"), null);
+});
+
+// Independent-review finding on this PR: a UNIT-SUFFIXED value is the dangerous case, and a
+// bare parseInt accepts it silently. parseInt consumes a valid PREFIX and drops the rest, so
+// "1M" → 1 and "600k" → 600: a near-zero ceiling on EVERY model, truncating every prompt to
+// almost nothing, with NO warning (server.mjs only warns when this returns null). "1M" is a
+// plausible thing to type now that the README quotes budgets in the millions. This is the same
+// class as CLAUDE_MAX_BODY_SIZE=5MB (PR #154 review F3), which is why the resolver must go
+// through parsePositiveInt's `String(n) !== trimmed` check rather than parseInt.
+// Mutation-proof: replace the parsePositiveInt call with `parseInt(rawEnv, 10)` and every
+// assertion below fails with the partially-consumed number.
+test("resolveGlobalPromptCharOverride: a unit-suffixed value is REJECTED, never silently truncated to its prefix", () => {
+  assert.equal(resolveGlobalPromptCharOverride("1M"), null, "parseInt('1M') is 1 — a 1-char global ceiling on every model");
+  assert.equal(resolveGlobalPromptCharOverride("600k"), null, "parseInt('600k') is 600");
+  assert.equal(resolveGlobalPromptCharOverride("1e6"), null, "parseInt('1e6') is 1");
+  assert.equal(resolveGlobalPromptCharOverride("3MB"), null);
+  assert.equal(resolveGlobalPromptCharOverride("600000abc"), null, "a valid prefix followed by junk is still junk");
+  assert.equal(resolveGlobalPromptCharOverride("20.5"), null, "fractional is ambiguous — rejected, not floored");
+  // Control: the well-formed value on either side of those must still be accepted, or the
+  // guard would be "reject everything" and the tests above would pass vacuously.
+  assert.equal(resolveGlobalPromptCharOverride("1000000"), 1000000);
+  assert.equal(resolveGlobalPromptCharOverride(" 600000 "), 600000, "surrounding whitespace is trimmed, not rejected");
 });
 
 console.log("\nSystem-prompt operator append:");
@@ -1139,7 +1200,19 @@ const LT_POS_MARK = "you may use your available local tools";
 // REQUEST spawn. Exiting early keeps SP_COUNTER meaning "request spawns", which is what those
 // tests assert on. Exit 0 preserves the previous outcome for the probe itself (authenticated).
 const LT_FAKE = `#!/bin/sh
-if [ "$1" = "auth" ] && [ "$2" = "status" ]; then exit 0; fi
+# #328: dump this child's own environment so a test can assert what it did NOT inherit.
+# Two separate files because the two scrub sites are different code paths: the auth probe
+# (which exits below) and the request spawn. A single file would let one path's result stand
+# in for the other's and hide a half-fix.
+if [ "$1" = "auth" ] && [ "$2" = "status" ]; then
+  if [ -n "$ENV_CAPTURE_PROBE" ]; then env > "$ENV_CAPTURE_PROBE.tmp" && mv "$ENV_CAPTURE_PROBE.tmp" "$ENV_CAPTURE_PROBE"; fi
+  exit 0
+fi
+# Write-then-rename: a plain redirect writes in 4096-byte chunks, so a reader that unblocks on
+# "non-empty" can read a TRUNCATED dump — which makes the security assertions pass VACUOUSLY
+# (secrets "absent" because cut off). Measured by an independent reviewer: 4/25 partial reads at a
+# 4794-byte environment, 18/40 at 10938. rename(2) is atomic, so the reader sees all or nothing.
+if [ -n "$ENV_CAPTURE" ]; then env > "$ENV_CAPTURE.tmp" && mv "$ENV_CAPTURE.tmp" "$ENV_CAPTURE"; fi
 prev=""
 for a in "$@"; do
   if [ "$prev" = "--system-prompt" ]; then printf '%s' "$a" > "$SP_CAPTURE"; fi
@@ -1462,6 +1535,88 @@ ltTest("integration: OCP_LOCAL_TOOLS=1 → the -p spawn receives the POSITIVE wr
   } finally { child.kill("SIGKILL"); _ltRmRetry(dir); }
 });
 
+// ── OCP's own inbound credentials never reach a spawned claude (#328) ────────
+// The child reads attacker-controlled text; PROXY_API_KEY authenticates callers TO the proxy and
+// is useless to the child, so leaking it there only hands an injected child a working client
+// credential. Live-proven, not theoretical: on a two-instance host sharing one key, a child on
+// the unprivileged instance read the key from its own env, called the privileged instance, and
+// got a child under the sudo-capable account — bypassing the Unix identity boundary rather than
+// attacking it.
+//
+// Both tests assert a CONTROL variable is present. Without it, a broken capture (empty file,
+// wrong env var name, fake never spawned) would satisfy "no secret found" vacuously — the exact
+// anchor-drift failure this suite already guards against elsewhere.
+
+// Values are >= MIN_ALIASED_VALUE_LEN so the by-VALUE pass is exercised, not silently skipped.
+const LT_SECRETS = { PROXY_API_KEY: "lt-inbound-key-long", OCP_ADMIN_KEY: "lt-admin-key-long", PROXY_ANONYMOUS_KEY: "lt-anon-key-long" };
+// The alias OCP itself creates via `ocp-connect`: same value, a name not on the list.
+const LT_ALIAS = { OPENAI_API_KEY: "lt-inbound-key-long" };
+
+function ltAssertNoInboundSecrets(dump, where) {
+  assert.ok(dump.length > 0, `${where}: env capture is EMPTY — the assertions below would pass vacuously`);
+  assert.match(dump, /^CLAUDE_CODE_DISABLE_AUTO_MEMORY=|^HOME=|^PATH=/m,
+    `${where}: control failed — capture does not look like an environment dump: ${dump.slice(0, 120)}`);
+  for (const [name, value] of Object.entries(LT_SECRETS)) {
+    assert.ok(!new RegExp(`^${name}=`, "m").test(dump), `${where}: ${name} reached the child`);
+    assert.ok(!dump.includes(value), `${where}: the VALUE of ${name} reached the child under some other name`);
+  }
+}
+
+ltTest("integration (#328, the money test): the -p spawn does NOT inherit OCP's inbound credentials", async () => {
+  if (!LT_POSIX) return; // sh fake — skip on Windows CI
+  const dir = ltMkdir(); const cap = join(dir, "env.txt"); const fake = ltFake(dir);
+  const { child, buf, port } = await ltBootFresh(
+    { ...LT_SECRETS, ...LT_ALIAS, CLAUDE_CODE_OAUTH_TOKEN: "lt-outbound-token", CLAUDE_BIN: fake, ENV_CAPTURE: cap }, dir);
+  try {
+    assert.ok(await ltWait(() => buf.out.includes("listening on") || buf.exit != null), `server did not start: ${buf.err.slice(0, 200)}`);
+    await ltPost(port, { model: "sonnet", messages: [{ role: "user", content: "hi" }] });
+    // Wait for CONTENT, not existence. `env > "$ENV_CAPTURE"` creates the file empty and then
+    // writes it, so waiting on existence returns mid-write and the assertions below read "".
+    // AGENTS.md: "wait for the thing you are about to assert, not a proxy for it" (#199/#203).
+    // This is almost certainly the intermittent failure an independent reviewer saw once and
+    // could not reproduce — same shape, either integration test, timing-dependent.
+    assert.ok(await ltWait(() => _ltExists(cap) && _ltRead(cap, "utf8").length > 0),
+      "fake claude was spawned and finished dumping its env");
+    const dump = _ltRead(cap, "utf8");
+    // ltBootFresh passed all three secrets in the SERVER's env, so the parent definitely holds
+    // them — this cannot pass merely because the variables were never set anywhere.
+    ltAssertNoInboundSecrets(dump, "request spawn");
+    // The child must still get what it legitimately needs, or this "fix" would be a break.
+    // Asserted on CLAUDE_CODE_OAUTH_TOKEN ALONE. An earlier revision wrote
+    // `/^CLAUDE_CODE_OAUTH_TOKEN=|^HOME=/m` — HOME always exists, so that alternation could not
+    // fail, and an independent review proved it: adding `delete env.CLAUDE_CODE_OAUTH_TOKEN` (the
+    // obvious over-correction this line exists to catch) left the suite fully green. The token is
+    // now set explicitly in the boot env below, so the assertion has something to bind to on a CI
+    // host that has no real token.
+    //
+    // WHERE TO MUTATE, because the obvious spot does not work and will look like a weak test:
+    // a `delete env.CLAUDE_CODE_OAUTH_TOKEN` placed at the scrub site (server.mjs, next to
+    // scrubInboundAuthEnv) leaves this GREEN — not because the assertion is weak, but because the
+    // isolated-spawn branch re-injects `env.CLAUDE_CODE_OAUTH_TOKEN = decision.token` a few lines
+    // LATER, so the delete is overwritten by the code itself. Mutate immediately before
+    // `spawn(CLAUDE, ...)`, after every re-injection, and this goes red (verified). The same
+    // structure is why adding the token to INBOUND_AUTH_ENV_VARS could not break requests either:
+    // the isolated path would re-establish it regardless.
+    assert.match(dump, /^CLAUDE_CODE_OAUTH_TOKEN=lt-outbound-token$/m,
+      "the OUTBOUND credential the child needs must survive — stripping it would break every request");
+  } finally { child.kill("SIGKILL"); _ltRmRetry(dir); }
+});
+
+ltTest("integration (#328): the AUTH PROBE child does not inherit them either — the second scrub site", async () => {
+  if (!LT_POSIX) return;
+  const dir = ltMkdir(); const cap = join(dir, "envprobe.txt"); const fake = ltFake(dir);
+  const { child, buf, port } = await ltBootFresh({ ...LT_SECRETS, CLAUDE_BIN: fake, ENV_CAPTURE_PROBE: cap }, dir);
+  try {
+    assert.ok(await ltWait(() => buf.out.includes("listening on") || buf.exit != null), `server did not start: ${buf.err.slice(0, 200)}`);
+    // The probe runs at boot; no request needed. Waiting on the file is waiting on the thing
+    // asserted, not on a proxy for it.
+    assert.ok(await ltWait(() => _ltExists(cap) && _ltRead(cap, "utf8").length > 0, 20000),
+      "the boot auth probe spawned the fake and finished dumping its env");
+    ltAssertNoInboundSecrets(_ltRead(cap, "utf8"), "auth probe spawn");
+    assert.ok(port > 0, "server reached listening state");
+  } finally { child.kill("SIGKILL"); _ltRmRetry(dir); }
+});
+
 ltTest("integration: flag OFF → the -p spawn receives the EXACT negative wrapper (default path byte-for-byte)", async () => {
   if (!LT_POSIX) return;
   const dir = ltMkdir(); const cap = join(dir, "sp.txt"); const fake = ltFake(dir);
@@ -1669,6 +1824,172 @@ ltTest("integration: a synchronous pre-spawn throw must not leak stats.activeReq
   } finally { child.kill("SIGKILL"); _ltRmRetry(dir); }
 });
 
+// ── The request-body cap counts CHARACTERS, and now says so (#310) ───────────
+// `MAX_BODY_SIZE` is compared against `body.length` — UTF-16 code units — because the accumulator
+// is a JS string. It was labelled "5MB". That label is what made two review rounds of #307
+// conclude a 3,000,000-character CJK prompt would be rejected here, write that conclusion into
+// ADR 0011 with an arithmetic threshold computed against the wrong quantity, and nearly ship
+// operator guidance to raise a knob nobody needed to touch.
+//
+// Both tests drive a real server child with the cap lowered to 1000 via CLAUDE_MAX_BODY_SIZE, so
+// the discriminating case costs milliseconds instead of a 9 MB request. The cap is left counting
+// characters (switching to bytes would reject bodies accepted today — a Class B.1 contract
+// change, not a label fix); what these pin is that the unit is stated and that the behaviour is
+// the one the unit describes.
+console.log("\nRequest body cap counts characters, not bytes, and the 413 says which (#310):");
+
+ltTest("integration (#310, the money test): a body far OVER the cap in BYTES but under it in CHARACTERS is admitted", async () => {
+  const dir = ltMkdir(); const fake = ltFake(dir);
+  const { child, buf, port } = await ltBootFresh({ CLAUDE_BIN: fake, CLAUDE_MAX_BODY_SIZE: "1000" }, dir);
+  try {
+    const up = await ltWait(() => buf.out.includes("listening on") || buf.spawnErr, 20000);
+    assert.ok(up && !buf.spawnErr, `did not start: ${buf.spawnErr ? buf.spawnErr.message : buf.err.slice(0, 300)}`);
+    // 600 CJK characters: 600 UTF-16 units, 1800 UTF-8 bytes. Both preconditions are asserted
+    // rather than assumed — if JSON escaping or the wrapper ever changed the arithmetic, this
+    // test would otherwise pass while exercising nothing.
+    const body = { model: "haiku", messages: [{ role: "user", content: "中".repeat(600) }] };
+    const serialized = JSON.stringify(body);
+    const chars = serialized.length;
+    const bytes = Buffer.byteLength(serialized, "utf8");
+    assert.ok(chars < 1000, `precondition: body must be UNDER the cap in characters, got ${chars}`);
+    assert.ok(bytes > 1000, `precondition: body must be OVER the cap in bytes, got ${bytes}`);
+    const r = await ltPostStatus(port, body);
+    assert.notEqual(r.status, 413,
+      `${chars} characters / ${bytes} bytes was rejected. The cap counts characters, so this body ` +
+      `must be admitted — a 413 here would mean the comparison changed to bytes, which is a ` +
+      `contract change on a Class B.1 surface, not a label fix. body=${r.text.slice(0, 200)}`);
+  } finally { child.kill("SIGKILL"); _ltRmRetry(dir); }
+});
+
+ltTest("integration (#310): a body over the cap in characters is still rejected, and the 413 names the unit it measured", async () => {
+  const dir = ltMkdir(); const fake = ltFake(dir);
+  const { child, buf, port } = await ltBootFresh({ CLAUDE_BIN: fake, CLAUDE_MAX_BODY_SIZE: "1000" }, dir);
+  try {
+    const up = await ltWait(() => buf.out.includes("listening on") || buf.spawnErr, 20000);
+    assert.ok(up && !buf.spawnErr, `did not start: ${buf.spawnErr ? buf.spawnErr.message : buf.err.slice(0, 300)}`);
+    const body = { model: "haiku", messages: [{ role: "user", content: "x".repeat(2000) }] };
+    assert.ok(JSON.stringify(body).length > 1000, "precondition: body must exceed the cap in characters");
+    const r = await ltPostStatus(port, body);
+    assert.equal(r.status, 413, `expected the cap to still reject an oversized body; got ${r.status}: ${r.text.slice(0, 200)}`);
+    assert.match(r.text, /characters/,
+      `the 413 must name the quantity it measured — a client that reads "5MB" and shrinks its ` +
+      `payload by byte count is optimising against the wrong number; got ${r.text.slice(0, 200)}`);
+    assert.ok(!/\dMB\b/.test(r.text),
+      `the 413 must not carry a byte-flavoured unit on a character count; got ${r.text.slice(0, 200)}`);
+  } finally { child.kill("SIGKILL"); _ltRmRetry(dir); }
+});
+
+// ── Issue #311: forced tool_choice is refused; permissive tool_choice is not ──
+// OCP emits no tool_calls at all (before this change `grep -c tool_calls server.mjs` -> 0; it is 2
+// now, both inside the comment this change added) and never reads the request
+// fields. Whether that is a defect depends entirely on tool_choice, and the OpenAI spec draws the
+// line: absent/"auto"/"none" all permit a text answer, so OCP is conformant there; "required" and
+// {type:"function"} require finish_reason "tool_calls", so prose with "stop" is a WRONG answer —
+// and a silent one, since "stop" means the turn ended normally and the client has nothing to
+// branch on.
+//
+// The narrowness is the safety property, not a compromise: refusing on `tools` alone would have
+// broken every OpenClaw agent on this project's own fleet the day it shipped, because every
+// OpenClaw turn carries a tool list and accepts a text answer. That case is pinned below.
+console.log("\nForced tool_choice is refused, permissive tool_choice is untouched (#311, ADR 0013):");
+
+test("#311: tool_choice \"required\" is refused — the spec demands finish_reason tool_calls and OCP cannot produce one", () => {
+  const r = classifyToolRequest({ tool_choice: "required" });
+  assert.equal(r.supported, false);
+  assert.equal(r.parameter, "tool_choice");
+  assert.match(r.message, /cannot return tool_calls/);
+});
+
+test("#311: a forced named function is refused, and the message names it", () => {
+  const r = classifyToolRequest({ tool_choice: { type: "function", function: { name: "get_weather" } } });
+  assert.equal(r.supported, false);
+  assert.match(r.message, /get_weather/, `the client must be able to see which call was refused; got ${r.message}`);
+});
+
+test("#311 (the safety property): `tools` WITHOUT a forcing tool_choice must NOT be refused", () => {
+  // This is the OpenClaw shape — every turn carries a tool list and is perfectly happy with text.
+  // Refusing here would trade a silent wrongness for a loud outage across the whole fleet.
+  const r = classifyToolRequest({ tools: [{ type: "function", function: { name: "message" } }] });
+  assert.equal(r.supported, true,
+    "a permissive tool list plus a text answer is a spec-conformant exchange; refusing it breaks working clients");
+});
+
+test("#311: \"auto\" and \"none\" are both satisfiable by a text answer, so neither is refused", () => {
+  assert.equal(classifyToolRequest({ tool_choice: "auto" }).supported, true);
+  assert.equal(classifyToolRequest({ tool_choice: "none" }).supported, true);
+  assert.equal(classifyToolRequest({}).supported, true);
+});
+
+// Cross-vendor review (codex) reading the INSTALLED OpenAI SDK types found the first draft
+// refused only two of the four doors. `ChatCompletionToolChoiceOption` is
+// `'none' | 'auto' | 'required' | AllowedToolChoice | NamedToolChoice | NamedToolChoiceCustom`,
+// and `function_call?: 'none' | 'auto' | FunctionCallOption` is a separate, still-accepted field
+// whose object form the SDK documents as "forces the model to call that function". Missing any of
+// them leaves that request on the original silently-wrong success path — the same defect, a
+// different door, which is the failure mode this repo has hit repeatedly.
+test("#311: tool_choice {type:'custom'} forces a named custom tool → refused", () => {
+  const r = classifyToolRequest({ tool_choice: { type: "custom", custom: { name: "my_tool" } } });
+  assert.equal(r.supported, false);
+  assert.equal(r.parameter, "tool_choice");
+  assert.match(r.message, /my_tool/, `the client must see which call was refused; got ${r.message}`);
+});
+
+test("#311: allowed_tools mode 'required' forces a call → refused; mode 'auto' only narrows the set → allowed", () => {
+  const req = classifyToolRequest({ tool_choice: { type: "allowed_tools", allowed_tools: { mode: "required", tools: [] } } });
+  assert.equal(req.supported, false, "mode 'required' requires a call to one of the allowed tools");
+  const auto = classifyToolRequest({ tool_choice: { type: "allowed_tools", allowed_tools: { mode: "auto", tools: [] } } });
+  assert.equal(auto.supported, true,
+    "mode 'auto' merely CONSTRAINS the set the model may pick from and still permits a text answer — " +
+    "refusing it would break a client that is only narrowing its tool list");
+});
+
+test("#311: the legacy function_call:{name} forcing form is refused, and blames function_call — not tool_choice", () => {
+  const r = classifyToolRequest({ functions: [{ name: "legacy" }], function_call: { name: "legacy" } });
+  assert.equal(r.supported, false);
+  assert.equal(r.parameter, "function_call",
+    `error.param must name the field the client actually sent, or the 400 sends them to fix the wrong one; got ${r.parameter}`);
+  assert.match(r.message, /legacy/);
+});
+
+test("#311: legacy function_call 'auto' and 'none' are permissive and must NOT be refused", () => {
+  assert.equal(classifyToolRequest({ functions: [{ name: "f" }], function_call: "auto" }).supported, true);
+  assert.equal(classifyToolRequest({ function_call: "none" }).supported, true);
+  assert.equal(classifyToolRequest({ functions: [{ name: "f" }] }).supported, true,
+    "a legacy `functions` list without a forcing function_call is the same permissive shape as `tools`");
+});
+
+test("#311: a malformed tool_choice is left alone rather than newly rejected", () => {
+  // Policing malformed input is not this classifier's job, and inventing a rejection would change
+  // behaviour for requests that work today.
+  for (const bad of [42, "banana", { type: "nonsense" }, [], null]) {
+    assert.equal(classifyToolRequest({ tool_choice: bad }).supported, true, `tool_choice=${JSON.stringify(bad)}`);
+  }
+});
+
+ltTest("integration (#311): a forced tool_choice gets a 400 with the spec's error shape; a permissive one still gets a completion", async () => {
+  const dir = ltMkdir(); const fake = ltFake(dir);
+  const { child, buf, port } = await ltBootFresh({ CLAUDE_BIN: fake }, dir);
+  try {
+    const up = await ltWait(() => buf.out.includes("listening on") || buf.spawnErr, 20000);
+    assert.ok(up && !buf.spawnErr, `did not start: ${buf.spawnErr ? buf.spawnErr.message : buf.err.slice(0, 300)}`);
+    const tools = [{ type: "function", function: { name: "get_weather", parameters: { type: "object", properties: {} } } }];
+    const base = { model: "haiku", messages: [{ role: "user", content: "hi" }], max_tokens: 16 };
+
+    const forced = await ltPostStatus(port, { ...base, tools, tool_choice: "required" });
+    assert.equal(forced.status, 400, `a forced call must be refused, not answered with prose; got ${forced.status}: ${forced.text.slice(0, 200)}`);
+    const body = JSON.parse(forced.text);
+    assert.equal(body.error.type, "invalid_request_error");
+    assert.equal(body.error.param, "tool_choice", "the spec's error object carries which parameter failed");
+    assert.equal(body.error.code, "unsupported_parameter");
+
+    // The half that protects the fleet: same tools, no forcing choice, must still serve.
+    const permissive = await ltPostStatus(port, { ...base, tools });
+    assert.equal(permissive.status, 200,
+      `a permissive tool list must still get a completion — this is the OpenClaw shape, and a 400 ` +
+      `here would take down every agent on the fleet; got ${permissive.status}: ${permissive.text.slice(0, 200)}`);
+  } finally { child.kill("SIGKILL"); _ltRmRetry(dir); }
+});
+
 // ── Cache keys hash the RESOLVED model, not the alias string (#194) ──────────
 // models.json is read once at boot, so repointing an alias only takes effect on restart —
 // while the SQLite response_cache outlives it. Hashing the raw string would keep serving the
@@ -1706,6 +2027,146 @@ ltTest("integration: an alias and its canonical target share ONE cache slot (nor
     await new Promise(r => setTimeout(r, 600));
     assert.equal(Number(_ltRead(counter, "utf8")) || 0, 1,
       "the canonical id must hit the slot the alias populated — a 2nd spawn means the key still hashes the raw alias");
+  } finally { child.kill("SIGKILL"); _ltRmRetry(dir); }
+});
+
+// #213 / ADR 0011 — the acceptance case, end-to-end against a real server.mjs child.
+//
+// This is the test the whole change exists to pass, and it is deliberately a PAIR on the same
+// boot: raising the ceiling globally (the naive fix) satisfies the 1M arm and fails the 200k
+// arm, while shipped ADR 0009 behaviour fails the 1M arm. Only a per-model budget passes both.
+//
+// Observable: server.mjs logs `prompt_truncated` at level warn, which logEvent sends to
+// console.error, i.e. the child's stderr — and the entry carries `maxChars`, which IS the
+// budget that was in force. So the assertions read the actual number, not a proxy for it.
+//
+// The spawn counter is what makes the negative arm honest. Asserting "no new truncation line
+// appeared" right after a POST would also pass if the request simply had not been processed
+// yet; `prompt_truncated` is emitted inside messagesToPrompt, which runs BEFORE the CLI spawn,
+// so waiting for the counter to bump proves the request got past the point that would have
+// logged. Wait for the thing you are about to assert.
+ltTest("integration (#213): the SAME oversized prompt is truncated for a 200k model and NOT for a 1M model", async () => {
+  if (!LT_POSIX) return;
+  const dir = ltMkdir(); const fake = ltFake(dir); const counter = join(dir, "spawns.txt");
+  const { child, buf, port } = await ltBootFresh({ CLAUDE_BIN: fake, SP_COUNTER: counter }, dir);
+  const nTrunc = () => buf.err.split('"prompt_truncated"').length - 1;
+  try {
+    assert.ok(await ltWait(() => buf.out.includes("listening on")), `did not start: ${buf.err.slice(0, 200)}`);
+    _ltWrite(counter, "0");
+
+    // Over the 200k model's 600,000-char ceiling, well under the 1M model's 3,000,000.
+    const big = "x".repeat(700000);
+
+    // Arm 1 — genuinely-200k model: MUST truncate, at exactly 600000.
+    await ltPost(port, { model: "claude-haiku-4-5-20251001", messages: [{ role: "user", content: big }] });
+    assert.ok(await ltWait(() => nTrunc() >= 1, 15000),
+      `claude-haiku-4-5 is 200k native: a 700k-char prompt must be truncated OCP-side. ${ltDiag(buf)}`);
+    const hit = buf.err.split("\n").find(l => l.includes('"prompt_truncated"'));
+    assert.match(hit, /"maxChars":600000/,
+      `the 200k model's ceiling must still be 600000 (contextWindow 200000 x 3) — a global raise would ` +
+      `show 3000000 here and hand this model prompts the upstream will reject. Got: ${hit}`);
+    assert.ok(await ltWait(() => (Number(_ltRead(counter, "utf8")) || 0) >= 1, 9000), "arm 1 reached the spawn");
+
+    // Arm 2 — native-1M model, IDENTICAL prompt: must NOT truncate.
+    await ltPost(port, { model: "claude-opus-5", messages: [{ role: "user", content: big }] });
+    assert.ok(await ltWait(() => (Number(_ltRead(counter, "utf8")) || 0) >= 2, 15000),
+      `arm 2 must reach the spawn, otherwise the no-truncation assertion below is vacuous. ${ltDiag(buf)}`);
+    assert.equal(nTrunc(), 1,
+      `claude-opus-5 is native 1M: the same 700k-char prompt must pass through WHOLE. A second ` +
+      `prompt_truncated line means the ceiling is still the old global 600000. stderr: ${buf.err.slice(-400)}`);
+
+    // Arm 3 — the 1M model's budget is a real 3,000,000, not "no ceiling". Proves arm 2 passed
+    // because the budget is larger, not because the guard was disabled.
+    await ltPost(port, { model: "claude-opus-5", messages: [{ role: "user", content: "y".repeat(3100000) }] });
+    assert.ok(await ltWait(() => nTrunc() >= 2, 20000),
+      `claude-opus-5 must still truncate ABOVE its own 3,000,000-char budget — otherwise the guard is ` +
+      `off for this model rather than merely wider. ${ltDiag(buf)}`);
+    const hit3 = buf.err.split("\n").filter(l => l.includes('"prompt_truncated"'))[1];
+    assert.match(hit3, /"maxChars":3000000/,
+      `the 1M model's ceiling must be exactly 3000000 (contextWindow 1000000 x 3). Got: ${hit3}`);
+  } finally { child.kill("SIGKILL"); _ltRmRetry(dir); }
+});
+
+// ADR 0011's settings decision, pinned end-to-end: `maxPromptChars` is an ABSOLUTE GLOBAL
+// override, so setting it must beat the per-model derivation — including DOWNWARD on a model
+// whose own window would derive a far larger budget. This is the arm that distinguishes the
+// chosen semantics from a clamp/ceiling reading (which would be a no-op in the raising
+// direction) and from "the override only applies to models without a SPOT entry".
+//
+// It also pins the GET contract that ADR 0011 deliberately did not move: a plain number, and
+// 600000 on the default path — the same value the field reported before the change, because
+// the fallback is the smallest known window x 3.
+ltTest("integration (ADR 0011): /settings maxPromptChars is a GLOBAL override that beats a 1M model's per-model budget", async () => {
+  if (!LT_POSIX) return;
+  const dir = ltMkdir(); const fake = ltFake(dir); const counter = join(dir, "spawns.txt");
+  const { child, buf, port } = await ltBootFresh({ CLAUDE_BIN: fake, SP_COUNTER: counter }, dir);
+  const nTrunc = () => buf.err.split('"prompt_truncated"').length - 1;
+  const getSettings = async () => (await (await fetch(`http://127.0.0.1:${port}/settings`)).json());
+  try {
+    assert.ok(await ltWait(() => buf.out.includes("listening on")), `did not start: ${buf.err.slice(0, 200)}`);
+    _ltWrite(counter, "0");
+
+    // Default path: a plain number, and the pre-ADR-0011 value.
+    const before = await getSettings();
+    assert.equal(typeof before.maxPromptChars.value, "number",
+      "`ocp settings` formats this into a fixed-width column — it must stay a scalar, never null or a per-model map");
+    assert.equal(before.maxPromptChars.value, 600000,
+      "with no override set, GET /settings must report the fallback (smallest known window x 3) — unchanged by ADR 0011");
+
+    // Install a global override well BELOW what claude-opus-5 derives on its own (3,000,000).
+    const patch = await fetch(`http://127.0.0.1:${port}/settings`, {
+      method: "PATCH", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ maxPromptChars: 200000 }),
+    });
+    assert.equal(patch.status, 200, `PATCH /settings must succeed, got ${patch.status}`);
+    assert.equal((await getSettings()).maxPromptChars.value, 200000, "GET must report the override that was just installed");
+
+    // The 1M model must now truncate at the OVERRIDE, not at its own 3,000,000 budget.
+    await ltPost(port, { model: "claude-opus-5", messages: [{ role: "user", content: "z".repeat(700000) }] });
+    assert.ok(await ltWait(() => nTrunc() >= 1, 15000),
+      `the global override must apply to claude-opus-5 too — without it a 700k prompt would pass whole. ${ltDiag(buf)}`);
+    const hit = buf.err.split("\n").find(l => l.includes('"prompt_truncated"'));
+    assert.match(hit, /"maxChars":200000/,
+      `the override is ABSOLUTE: claude-opus-5's ceiling must be the 200000 that was set, not its derived ` +
+      `3000000 and not a min/max blend with it. Got: ${hit}`);
+  } finally { child.kill("SIGKILL"); _ltRmRetry(dir); }
+});
+
+// The TUI path takes its budget from a DIFFERENT call site than the -p path
+// (callClaudeTui -> messagesToPrompt, vs spawnClaudeProcess), so covering one does not cover
+// the other: a mutation reverting only callClaudeTui to the global fallback survived the whole
+// suite until this test existed.
+//
+// It needs no tmux and no real claude. messagesToPrompt is the FIRST statement in
+// callClaudeTui, ahead of the semaphore and every tmux/pane operation, so the truncation
+// decision is made and logged before anything that would need a real interactive CLI — the
+// turn failing afterwards is expected and irrelevant (ltPost already tolerates it).
+//
+// BOTH arms assert positively (each waits for a truncation line and then reads its maxChars),
+// so neither can pass vacuously by the request simply not having been processed. Arm 2 is the
+// discriminating one: with a single global budget it would report 600000, not 3000000.
+ltTest("integration (#213): the TUI path bounds the prompt per model too, not by the global fallback", async () => {
+  if (!LT_POSIX) return;
+  const dir = ltMkdir(); const fake = ltFake(dir);
+  const { child, buf, port } = await ltBootFresh({ CLAUDE_TUI_MODE: "true", CLAUDE_BIN: fake }, dir);
+  const truncLines = () => buf.err.split("\n").filter(l => l.includes('"prompt_truncated"'));
+  try {
+    assert.ok(await ltWait(() => buf.out.includes("listening on")), `did not start: ${buf.err.slice(0, 200)}`);
+
+    // Arm 1 — 200k model, over its 600,000 ceiling.
+    await ltPost(port, { model: "claude-haiku-4-5-20251001", messages: [{ role: "user", content: "x".repeat(700000) }] });
+    assert.ok(await ltWait(() => truncLines().length >= 1, 20000),
+      `the TUI path must still truncate a 700k prompt for a 200k model. ${ltDiag(buf)}`);
+    assert.match(truncLines()[0], /"maxChars":600000/,
+      `TUI ceiling for claude-haiku-4-5 must be 600000. Got: ${truncLines()[0]}`);
+
+    // Arm 2 — 1M model, over its own 3,000,000 ceiling. Under a global budget this reads 600000.
+    await ltPost(port, { model: "claude-opus-5", messages: [{ role: "user", content: "y".repeat(3100000) }] });
+    assert.ok(await ltWait(() => truncLines().length >= 2, 25000),
+      `the TUI path must truncate a 3.1M prompt even for a 1M model. ${ltDiag(buf)}`);
+    assert.match(truncLines()[1], /"maxChars":3000000/,
+      `TUI ceiling for claude-opus-5 must be its own 3000000, not the global fallback — this is the ` +
+      `assertion that catches callClaudeTui being wired to the wrong budget. Got: ${truncLines()[1]}`);
   } finally { child.kill("SIGKILL"); _ltRmRetry(dir); }
 });
 
@@ -1810,6 +2271,14 @@ if [ "$1" = "auth" ] && [ "$2" = "status" ]; then
   # The first N probes take the success branch whatever the mode: lets a test establish a
   # CONCLUSIVE ok:true first, then drive the branch it actually wants to observe.
   if [ -n "$AUTH_PROBE_FIRST_OK" ] && [ "$n" -le "$AUTH_PROBE_FIRST_OK" ]; then mode=ok; fi
+  # #324: the mirror knob. Lets a test establish a CONCLUSIVE ok:false first and then drive
+  # inconclusive probes — the sequence that produces the latch this issue is about. Additive:
+  # unset (every pre-#324 call site) leaves behaviour byte-identical.
+  if [ -n "$AUTH_PROBE_FIRST_REJECT" ] && [ "$n" -le "$AUTH_PROBE_FIRST_REJECT" ]; then mode=reject; fi
+  # #324: the third knob, same shape. Lets a test drive INCONCLUSIVE probes first and then a
+  # conclusive rejection — the order that pins the producer's counter RESET, which the other two
+  # orders cannot reach. Additive; unset leaves every existing call site byte-identical.
+  if [ -n "$AUTH_PROBE_FIRST_SIGNAL" ] && [ "$n" -le "$AUTH_PROBE_FIRST_SIGNAL" ]; then mode=signal; fi
   # Written AFTER the sleep: its existence means "this probe could have completed by now".
   if [ -n "$AUTH_PROBE_DONE" ]; then echo done > "$AUTH_PROBE_DONE"; fi
   case "$mode" in
@@ -2003,6 +2472,161 @@ ltTest("integration: TWO consecutive conclusive auth rejections DO flip /health 
 // SAME branch a real AUTH_CHECK_TIMEOUT_MS expiry takes (Node reports killed:true,
 // signal:"SIGTERM" there). Exercising the branch this way costs milliseconds instead of 10s.
 // On the pre-fix build the second probe sets ok:false and status goes degraded.
+ltTest("integration (#324, the money test): a latched ok:false with only inconclusive probes since becomes OBSERVABLE as stale", async () => {
+  if (!LT_POSIX) return;
+  // The wedge, reproduced end to end: probe 1 rejects conclusively (ok -> false), and every probe
+  // after it dies on a signal — inconclusive, which deliberately preserves ok. Before this change
+  // that state was indistinguishable from a fresh rejection, so `ocp update` refused forever with
+  // nothing reporting "stuck": /health said ok and the proxy served normally.
+  const dir = ltMkdir(); const fake = ltAuthFake(dir);
+  const probeLog = join(dir, "probes.txt");
+  const { child, buf, port } = await ltBootFresh({
+    CLAUDE_BIN: fake, AUTH_PROBE_LOG: probeLog, AUTH_PROBE_MODE: "signal",
+    AUTH_PROBE_FIRST_REJECT: "1", CLAUDE_AUTH_CHECK_INTERVAL_MS: "300",
+  }, dir);
+  try {
+    const rejected = await ltWaitHealth(port, b => b.auth && b.auth.ok === false, 15000);
+    assert.ok(rejected, `the first probe never produced a conclusive rejection — ${ltDiag(buf)}`);
+    // These two fields stop being true the moment probe 2 lands (~300ms at this interval), so
+    // they are only meaningful if probe 2 has NOT landed. Asserting them unconditionally is
+    // "waiting on a proxy for the thing asserted" — the rule this PR quotes elsewhere. Reset
+    // coverage does not depend on winning that race: the dedicated test below pins it directly.
+    if (ltProbeCount(probeLog) === 1) {
+      assert.equal(rejected.auth.lastOutcome, "rejected", "probe 1 must take the CONCLUSIVE arm");
+      assert.equal(rejected.auth.consecutiveInconclusive, 0, "a conclusive outcome starts the tally at 0");
+    }
+
+    // Now the inconclusive ones accumulate. Waiting on the COUNT, not on a delay: this is the
+    // thing being asserted, so waiting on anything else would be waiting on a proxy for it.
+    const stale = await ltWaitHealth(port, b => (b.auth?.consecutiveInconclusive ?? 0) >= 3, 20000);
+    assert.ok(stale, `the inconclusive tally never reached 3 — ${ltDiag(buf)}`);
+    assert.equal(stale.auth.ok, false,
+      "ok must NOT be rewritten — the last conclusive verdict really was false, and changing the " +
+      "rule that determines a grandfathered B.2 field's value would be a contract change (ADR 0010)");
+    assert.equal(stale.auth.lastOutcome, "timeout", "the recent probes are the inconclusive kind");
+    assert.equal(stale.auth.consecutiveFailures, 1,
+      "inconclusive probes must not inflate the CONCLUSIVE-rejection tally — that tally drives " +
+      "the degraded verdict (ADR 0010) and this must not move it");
+    assert.equal(stale.status, "ok",
+      "and the health verdict is unchanged by any of this — proxyHealthStatus reads " +
+      "consecutiveFailures, never ok, so this change cannot flip a host to degraded");
+  } finally { child.kill("SIGKILL"); _ltRmRetry(dir); }
+});
+
+ltTest("integration (#324, P1 from review): a conclusive rejection RESETS a counter that has already climbed", async () => {
+  if (!LT_POSIX) return;
+  // The producer half of the P1. A reviewer mutated the rejection branch to PRESERVE the counter
+  // instead of resetting it and the entire suite stayed green — the money test could not see it,
+  // because its rejection lands when the counter is already 0. This drives the other order:
+  // inconclusive probes first, counter climbs, THEN a conclusive rejection.
+  //
+  // The decider is independently hardened against the resulting state, so this is defence in
+  // depth rather than the only guard — but a producer regression should be visible AT the producer.
+  const dir = ltMkdir(); const fake = ltAuthFake(dir);
+  const probeLog = join(dir, "probes.txt");
+  const { child, buf, port } = await ltBootFresh({
+    CLAUDE_BIN: fake, AUTH_PROBE_LOG: probeLog, AUTH_PROBE_MODE: "reject",
+    AUTH_PROBE_FIRST_SIGNAL: "3", CLAUDE_AUTH_CHECK_INTERVAL_MS: "300",
+  }, dir);
+  try {
+    const climbed = await ltWaitHealth(port, b => (b.auth?.consecutiveInconclusive ?? 0) >= 3, 20000);
+    assert.ok(climbed, `the inconclusive tally never climbed — ${ltDiag(buf)}`);
+    assert.equal(climbed.auth.ok, null, "no conclusive probe has happened yet, so ok is still null");
+    const reset = await ltWaitHealth(port, b => b.auth?.lastOutcome === "rejected", 20000);
+    assert.ok(reset, `the conclusive rejection never landed — ${ltDiag(buf)}`);
+    assert.equal(reset.auth.consecutiveInconclusive, 0,
+      "a conclusive rejection must RESET the tally. Preserving it produces {ok:false, " +
+      "lastOutcome:'rejected', consecutiveInconclusive:>=3} — a rejection seconds old that the " +
+      "decider would otherwise have to treat as stale evidence");
+    assert.equal(reset.auth.ok, false, "and it is a conclusive rejection");
+  } finally { child.kill("SIGKILL"); _ltRmRetry(dir); }
+});
+
+ltTest("integration (#308, the money test): a token in the ENV must not be reported as authenticated", async () => {
+  if (!LT_POSIX) return;
+  // The exact shape #308 reported. The probe exits 0 because a token is PRESENT — measured: a
+  // fabricated token yields exit 0 and loggedIn:true — so recording "authenticated" asserts
+  // validity that was never established. On the reporting host /health said authenticated while
+  // every request 500'd on authentication.
+  const dir = ltMkdir(); const fake = ltAuthFake(dir);
+  const { child, buf, port } = await ltBootFresh({
+    CLAUDE_BIN: fake, CLAUDE_CODE_OAUTH_TOKEN: "sk-ant-oat01-present-but-unverified",
+    CLAUDE_AUTH_CHECK_INTERVAL_MS: "300",
+  }, dir);
+  try {
+    const h = await ltWaitHealth(port, b => b.auth && b.auth.lastOutcome !== "none", 15000);
+    assert.ok(h, `no probe ever landed — ${ltDiag(buf)}`);
+    assert.equal(h.auth.lastOutcome, "token-present",
+      `a probe that only saw a token must say so; got ${JSON.stringify(h.auth)}`);
+    assert.equal(h.auth.ok, null,
+      "presence is not validity — the honest verdict is 'not established', which ADR 0010 already defines");
+    // The token-present branch is the one the slice guard could not see; assert its provenance
+    // fields behaviourally, so the contract does not rest on a source pattern alone.
+    assert.equal(h.auth.okSource, "probe", "a probe established this verdict and must say so");
+    assert.ok(Number.isFinite(h.auth.okAt) && h.auth.okAt > 0, "and when — a verdict with no okAt cannot expire");
+    assert.notEqual(h.auth.ok, true, "this is the #308 defect: asserting authenticated on presence alone");
+    assert.equal(h.status, "ok",
+      "and the health VERDICT must not move — proxyHealthStatus reads consecutiveFailures, never ok");
+  } finally { child.kill("SIGKILL"); _ltRmRetry(dir); }
+});
+
+ltTest("integration (#308 control): with NO token in the env, exit 0 still means authenticated", async () => {
+  if (!LT_POSIX) return;
+  // Proves the change is scoped to the env-token case and did not simply delete the success path.
+  const dir = ltMkdir(); const fake = ltAuthFake(dir);
+  const { child, buf, port } = await ltBootFresh({ CLAUDE_BIN: fake, CLAUDE_AUTH_CHECK_INTERVAL_MS: "300" }, dir);
+  try {
+    const h = await ltWaitHealth(port, b => b.auth && b.auth.ok === true, 15000);
+    assert.ok(h, `the no-token path must still reach a conclusive ok:true — ${ltDiag(buf)}`);
+    assert.equal(h.auth.lastOutcome, "authenticated", "unchanged for a child that resolved its own credential");
+  } finally { child.kill("SIGKILL"); _ltRmRetry(dir); }
+});
+
+ltTest("integration (#308): a completed REQUEST raises the verdict the probe could not establish", async () => {
+  if (!LT_POSIX) return;
+  // C. The request is the strongest evidence available and it is free — it was happening anyway.
+  const dir = ltMkdir(); const fake = ltAuthFake(dir);
+  const { child, buf, port } = await ltBootFresh({
+    CLAUDE_BIN: fake, CLAUDE_CODE_OAUTH_TOKEN: "sk-ant-oat01-present-but-unverified",
+    CLAUDE_AUTH_CHECK_INTERVAL_MS: "300",
+  }, dir);
+  try {
+    const before = await ltWaitHealth(port, b => b.auth && b.auth.lastOutcome === "token-present", 15000);
+    assert.ok(before, `precondition: the probe must land on token-present first — ${ltDiag(buf)}`);
+    assert.equal(before.auth.ok, null, "precondition: not established before the request");
+    await ltPost(port, { model: "sonnet", messages: [{ role: "user", content: "hi" }] });
+    const after = await ltWaitHealth(port, b => b.auth && b.auth.okSource === "request", 15000);
+    assert.ok(after, `a completed request must raise the verdict — ${ltDiag(buf)}`);
+    assert.equal(after.auth.okSource, "request", "and the verdict must record that a REQUEST established it, not a probe");
+    assert.equal(after.auth.ok, true, "a request that reached the model proves the credential works");
+  } finally { child.kill("SIGKILL"); _ltRmRetry(dir); }
+});
+
+ltTest("integration (#327): a declared instance reports its name on /health", async () => {
+  if (!LT_POSIX) return;
+  const dir = ltMkdir(); const fake = ltFake(dir);
+  const { child, buf, port } = await ltBootFresh({ CLAUDE_BIN: fake, OCP_INSTANCE_NAME: "wifibot" }, dir);
+  try {
+    const h = await ltWaitHealth(port, b => b.instanceName !== undefined, 15000);
+    assert.ok(h, `/health never reported instanceName — ${ltDiag(buf)}`);
+    assert.equal(h.instanceName, "wifibot",
+      "a second instance must be discoverable from OUTSIDE — a fleet sweep that can only read unit files silently misses it");
+  } finally { child.kill("SIGKILL"); _ltRmRetry(dir); }
+});
+
+ltTest("integration (#327): the primary reports an EMPTY name, not a missing field", async () => {
+  if (!LT_POSIX) return;
+  // Empty rather than absent, so a consumer can distinguish "this is the primary" from "this
+  // build predates the field" — the same distinction #324's backward-compatibility test turns on.
+  const dir = ltMkdir(); const fake = ltFake(dir);
+  const { child, buf, port } = await ltBootFresh({ CLAUDE_BIN: fake }, dir);
+  try {
+    const h = await ltWaitHealth(port, b => b.instanceName !== undefined, 15000);
+    assert.ok(h, `/health must always carry the field — ${ltDiag(buf)}`);
+    assert.equal(h.instanceName, "", "the primary declares itself by reporting an empty name");
+  } finally { child.kill("SIGKILL"); _ltRmRetry(dir); }
+});
+
 ltTest("integration: an INCONCLUSIVE auth probe (signal death, as a timeout arrives) preserves ok and the verdict (#232 defect B)", async () => {
   if (!LT_POSIX) return;
   const dir = ltMkdir(); const fake = ltAuthFake(dir);
@@ -2027,6 +2651,101 @@ ltTest("integration: an INCONCLUSIVE auth probe (signal death, as a timeout arri
     assert.equal(after.auth.consecutiveFailures, 0, "an inconclusive probe must not touch the tally");
     assert.equal(after.status, "ok",
       `status must stay ok across an inconclusive probe; got ${after.status}`);
+  } finally { child.kill("SIGKILL"); _ltRmRetry(dir); }
+});
+
+// #339 — the money test. This pins the WIRING, which is what was missing: applyRequestVerdictTtl
+// was unit-tested and correct, and nothing asserted that /health calls it. A duplicate `auth:`
+// key in the response literal (JS keeps the LAST one, silently) meant the TTL-applied value was
+// computed and thrown away in favour of the raw latch it exists to expire.
+//
+// The first attempt at this shipped a source-grep guard with a written justification that a
+// behavioural test was unreachable: the TTL is a hardcoded 15 minutes, and applyRequestVerdictTtl
+// is a no-op unless okSource === "request", whose only writer stamps a fresh finite okAt. That
+// justification was REASONED, not executed, and it was wrong — the reviewer executed it. ltBoot's
+// third argument lands before the script (`_ltSpawn(execPath, [...nodeArgs, LT_SERVER])`), so
+// `--import` can step the child's clock with no production change, no env knob, and no new ADR.
+// The grep guard is gone: it also had a proven bypass (`"auth": authStatus` counts as one key and
+// still serves the latch), which is precisely what a source-text check cannot see and a
+// behavioural one cannot miss.
+ltTest("integration (#339, the money test): a request-verified verdict EXPIRES — /health must apply the read-time TTL", async () => {
+  if (!LT_POSIX) return;
+  const dir = ltMkdir(); const fake = ltAuthFake(dir);
+
+  // Step the child's clock forward past the 15-minute window, after the request has landed.
+  // Real time until SWITCH_MS so boot, probe and request all happen on an honest clock; then a
+  // jump larger than AUTH_REQUEST_VERDICT_TTL_MS (900000) so the NEXT /health read expires it.
+  const SWITCH_MS = 4000, JUMP_MS = 16 * 60 * 1000;
+  const preload = join(dir, "clockstep.mjs");
+  _ltWrite(preload, `const REAL = Date.now, START = REAL();\n` +
+    `Date.now = () => { const r = REAL(); return r + (r - START > ${SWITCH_MS} ? ${JUMP_MS} : 0); };\n`);
+
+  // Two independent reasons a probe cannot mask the state under test, neither of which is the
+  // interval doing the obvious thing — `checkAuth()` at server.mjs:1309 is a bare top-level call,
+  // so the interval governs only the first TICK, never the boot probe:
+  //
+  //   1. `setInterval` runs on libuv's MONOTONIC clock, so moving `Date.now` cannot advance the
+  //      scheduler at all. (Verified: a +16min jump leaves a 200ms interval ticking normally.)
+  //      The long interval below just pushes the first tick past the end of the test; the 600000
+  //      default already would.
+  //   2. The boot probe is harmless even if it lands late. CLAUDE_CODE_OAUTH_TOKEN is NOT in
+  //      INBOUND_AUTH_ENV_VARS, so it survives the spawn scrub, so the probe takes the
+  //      `keepRequestVerdict` branch (server.mjs:1261) — which preserves a fresher request verdict
+  //      rather than clobbering it. A probe that measured less must not overwrite evidence that
+  //      measured more, and that is enforced in production, not here.
+  const { child, buf, port } = await ltBootFresh({
+    CLAUDE_BIN: fake, CLAUDE_CODE_OAUTH_TOKEN: "sk-ant-oat01-present-but-unverified",
+    CLAUDE_AUTH_CHECK_INTERVAL_MS: "3600000",
+  }, dir, [`--import=file://${preload}`]); // POSIX-only test, so a bare file:// prefix is safe
+
+  try {
+    // Order is load-bearing: the request must land BEFORE the clock steps, so that okAt is
+    // stamped on the honest clock and the jump puts it outside the window. Waiting for the raise
+    // first would burn the pre-step budget polling for a state nothing has caused yet, and the
+    // request would then stamp okAt on the ALREADY-jumped clock — permanently fresh, never
+    // expiring, and the test would fail against correct code. (It did, on the first run.)
+    const t0 = Date.now(); // real clock: this process is NOT preloaded
+    await ltPost(port, { model: "sonnet", messages: [{ role: "user", content: "hi" }] });
+
+    // Assert the fault's PRECONDITION actually fired rather than assuming it. Without this a
+    // never-raised verdict would reach the final assertion and fail for the wrong reason.
+    const raised = await ltWaitHealth(port, b => b.auth && b.auth.okSource === "request", 15000);
+    assert.ok(raised, `precondition: a completed request must raise the verdict first — ${ltDiag(buf)}`);
+    assert.equal(raised.auth.ok, true, "precondition: the raised verdict is ok:true");
+
+    // Did the request land BEFORE the clock step? okAt is stamped on the child's clock, t0 on the
+    // real one, so a late request shows up as a ~JUMP_MS gap.
+    //
+    // The dangerous misfire — calling a REAL regression a flake — is impossible by construction,
+    // not merely improbable: the preload sets START before server.mjs loads, and t0 is captured
+    // after ltBootFresh returns, so t0 > START strictly. If the request landed before the step
+    // then okAt - START <= SWITCH_MS, hence lateBy = okAt - t0 < okAt - START <= SWITCH_MS. (t0
+    // is taken AFTER the boot so an EADDRINUSE retry cannot inflate it.) A run that is both slow
+    // and regressed still fails red and labels itself inconclusive, which it genuinely is — on
+    // such a run okAt is fresh by construction and carries no evidence either way.
+    //
+    // Margin, measured as okAt - START (an UPPER bound on lateBy, since t0 > START): 178-491ms
+    // idle and 184-217ms under 24 CPU hogs on 10 cores, against the 4000ms budget — 8-22x, and
+    // near-flat under load because the path is spawn/IO-bound. Both arms of this branch have been
+    // proven reachable: the regression arm by re-adding the duplicate key, the flake arm by
+    // forcing SWITCH_MS to 1 (which yielded lateBy = 960116 ≈ JUMP_MS, the predicted shape).
+    const lateBy = raised.auth.okAt - t0;
+    const landedAfterStep = lateBy > SWITCH_MS;
+
+    // The clock steps at SWITCH_MS; this poll outlives that. The TEST process is not preloaded,
+    // so ltWaitHealth's own timeout runs on a real clock.
+    const expired = await ltWaitHealth(port, b => b.auth && b.auth.okSource === "expired", 20000);
+    assert.ok(expired, landedAfterStep
+      ? `HARNESS FLAKE, not a regression: the request landed ${lateBy}ms after this run's clock ` +
+        `origin, past the ${SWITCH_MS}ms step, so okAt was stamped on the already-jumped clock and ` +
+        `is permanently fresh by construction. Widen SWITCH_MS. ${ltDiag(buf)}`
+      : `/health must apply the read-time TTL. A verdict raised by a request went past the ` +
+        `freshness window and /health still served it — which is how #336's duplicate \`auth:\` key ` +
+        `disconnected #334 and re-opened #308's exact symptom. (Request landed ${lateBy}ms in, ` +
+        `well inside the ${SWITCH_MS}ms budget, so this is not a timing artifact.) ${ltDiag(buf)}`);
+    assert.equal(expired.auth.okSource, "expired", "okSource must record that the window lapsed");
+    assert.equal(expired.auth.ok, null,
+      "an expired verdict is 'we do not know now' — null, not a stale true (ADR 0014)");
   } finally { child.kill("SIGKILL"); _ltRmRetry(dir); }
 });
 
@@ -2056,6 +2775,55 @@ ltTest("integration: a non-executable claude binary still yields degraded (#232 
   } finally { _ltChmod(fake, 0o755); child.kill("SIGKILL"); _ltRmRetry(dir); }
 });
 
+// NOTE ON PLACEMENT: this lives here, with the other auth-probe integration tests and AHEAD of
+// the #248 serialization sentinel below, not down in the ADR 0010 CONSUMER REPLAY section it
+// logically belongs to. The sentinel's claim is 'registered last in the ltTest chain, so no NEW
+// ltBoot call will happen after this point'; registering an ltTest after it would silently
+// falsify that comment and leave this boot outside the peak-concurrency invariant it asserts.
+// `rpHealth` is a hoisted function declaration defined in that later section, and its body is
+// only evaluated when this async test runs (well after module evaluation), so the forward
+// reference is safe.
+// LIVE-SERVER PREMISE GUARD (independent review LOW-1 on #289). The self-check below asserts the
+// fixture against itself, which cannot catch the fixture being wrong about what server.mjs really
+// emits. The ESTABLISHED shape is already pinned against a real boot by the #232 integration test
+// ("an INCONCLUSIVE auth probe ... preserves ok and the verdict"), but the FRESH shape — the only
+// one post-flight ever sees, and the entire basis of this fix — was pinned by nothing. Reasoning
+// about a payload in prose while asserting only a hand-written copy of it is precisely the gap
+// #289 exists to close, so it is closed here too rather than only argued about.
+//
+// AUTH_PROBE_MODE=signal WITHOUT AUTH_PROBE_FIRST_OK is a fresh boot whose very first probe dies
+// on a signal — the same branch a real AUTH_CHECK_TIMEOUT_MS expiry takes, in milliseconds
+// instead of 10s, and with no prior conclusive verdict to preserve.
+ltTest("replay premise (LIVE): a real server.mjs whose FIRST probe dies on a signal emits exactly rpHealth('fresh')", async () => {
+  if (!LT_POSIX) return;
+  const dir = ltMkdir(); const fake = ltAuthFake(dir);
+  const probeLog = join(dir, "probes.txt");
+  const { child, buf, port } = await ltBootFresh({
+    CLAUDE_BIN: fake, AUTH_PROBE_LOG: probeLog, AUTH_PROBE_MODE: "signal",
+    CLAUDE_AUTH_CHECK_INTERVAL_MS: "300",
+  }, dir);
+  try {
+    const h = await ltWaitHealth(port, b => b.auth && b.auth.lastOutcome === "timeout", 15000);
+    assert.ok(h, `the signal-killed first probe never landed — ${ltDiag(buf)}`);
+    const f = rpHealth("fresh");
+    assert.equal(h.auth.ok, null,
+      `a fresh boot with no conclusive probe must report auth.ok=null; got ${JSON.stringify(h.auth)}`);
+    assert.equal(h.auth.ok, f.auth.ok, "fixture must match the live shape");
+    assert.equal(h.auth.lastOutcome, f.auth.lastOutcome, "fixture must match the live lastOutcome");
+    assert.equal(h.auth.consecutiveFailures, f.auth.consecutiveFailures,
+      "fixture must match the live tally");
+    assert.equal(h.status, f.status,
+      `the serving verdict postFlightOk now reads must be "ok" on a real inconclusive boot; got ${h.status}`);
+    // The decision, driven by the REAL payload rather than the fixture — this is the end-to-end
+    // statement of the fix: main's predicate returns false here, and that was the whole defect.
+    // Passing the body's OWN version as the target satisfies the version arm tautologically, so
+    // this line exercises the STATUS arm only. That is exactly what it is for — the version arm
+    // is covered by the unit tests above — but do not credit this test with version-arm coverage.
+    assert.equal(postFlightOk(h, h.version), true,
+      "postFlightOk must accept a real, live, freshly-booted proxy whose first auth probe timed out");
+  } finally { child.kill("SIGKILL"); _ltRmRetry(dir); }
+});
+
 // Deterministic close for the ltTest serialization claim: a fact about how many server.mjs
 // children were EVER alive at once during this block, not a race against wall-clock luck (see
 // the comment on _ltPeakBoots above ltBoot's definition). Registered last in the ltTest chain —
@@ -2077,32 +2845,102 @@ ltTest("integration: ltTest serialization keeps peak concurrent server.mjs child
 });
 
 // ── Upgrade Tests ──
-import { runUpgrade, postFlightOk, runPostFlightCheck } from "./scripts/upgrade.mjs";
+import { runUpgrade, postFlightOk, runPostFlightCheck, parseFlagValue, classifyPostFlightProbeFailure, postFlightFailureSuffix, probeLaunchdDomains } from "./scripts/upgrade.mjs";
 
 console.log("\nUpgrade:");
 
-// ── postFlightOk (issue #173) — the acceptance predicate for phase 6 ─────────
-// Mutation-proof: revert the version comparison to auth-only and the "stale process
-// still holds the port" test below goes green-to-red (that case is the 2026-07-17
-// Oracle incident: orphan answered auth.ok=true while serving the OLD version).
+// ── postFlightOk (issue #173, re-anchored by #289) — phase 6's acceptance predicate ──
+// Mutation-proof: revert the version comparison to the serving check alone and the "stale
+// process still holds the port" test below goes green-to-red (that case is the 2026-07-17
+// Oracle incident: an orphan answered healthy while serving the OLD version).
+//
+// The fixtures below carry `status`, because a real /health always does — continuously from
+// v3.4.0, doctor's from_version_supported floor. The pre-#289 fixtures omitted it, which is why
+// they could not express the state that broke production.
 test("postFlightOk: rejects a healthy-looking probe that serves the WRONG version (orphan case)", () => {
-  assert.equal(postFlightOk({ auth: { ok: true }, version: "3.21.1" }, "v3.22.1"), false);
+  assert.equal(postFlightOk({ status: "ok", auth: { ok: true }, version: "3.21.1" }, "v3.22.1"), false);
 });
 
-test("postFlightOk: accepts auth.ok + exact target version, tolerating the leading v", () => {
-  assert.equal(postFlightOk({ auth: { ok: true }, version: "3.22.1" }, "v3.22.1"), true);
-  assert.equal(postFlightOk({ auth: { ok: true }, version: "3.22.1" }, "3.22.1"), true);
+test("postFlightOk: accepts status=ok + exact target version, tolerating the leading v", () => {
+  assert.equal(postFlightOk({ status: "ok", auth: { ok: true }, version: "3.22.1" }, "v3.22.1"), true);
+  assert.equal(postFlightOk({ status: "ok", auth: { ok: true }, version: "3.22.1" }, "3.22.1"), true);
 });
 
-test("postFlightOk: auth failure rejects regardless of version", () => {
-  assert.equal(postFlightOk({ auth: { ok: false }, version: "3.22.1" }, "v3.22.1"), false);
-  assert.equal(postFlightOk({ version: "3.22.1" }, "v3.22.1"), false);
+test("postFlightOk: a degraded server rejects regardless of version", () => {
+  assert.equal(postFlightOk({ status: "degraded", auth: { ok: false }, version: "3.22.1" }, "v3.22.1"), false);
+  assert.equal(postFlightOk({ version: "3.22.1" }, "v3.22.1"), false, "no status field must fail CLOSED");
   assert.equal(postFlightOk(null, "v3.22.1"), false);
 });
 
-test("postFlightOk: unknown/empty target degrades to the auth-only check (never blocks)", () => {
-  assert.equal(postFlightOk({ auth: { ok: true }, version: "3.22.1" }, ""), true);
-  assert.equal(postFlightOk({ auth: { ok: true }, version: "3.22.1" }, undefined), true);
+// The DISCLOSED WEAKER DIRECTION, pinned (independent review MEDIUM-2 on #289). #289 accepts,
+// deliberately, that ONE conclusive rejection no longer blocks post-flight: ADR 0010 degrades
+// only after AUTH_DEGRADE_AFTER = 2 because one rejection is a token-rotation race, and
+// post-flight sees exactly that first probe on a fresh process. Before this test, that trade was
+// argued in a comment and asserted nowhere — so `if (body?.status !== "ok" || body?.auth?.ok ===
+// false) return false;` silently PARTIALLY REVERTED the fix and the whole suite still passed.
+// A deliberate relaxation that no test can see is indistinguishable from an accidental one.
+test("postFlightOk: #289 — ONE conclusive rejection does NOT block a good restart (the accepted weaker direction)", () => {
+  const body = { status: "ok", version: "3.27.0",
+                 auth: { ok: false, message: "Invalid refresh token",
+                         lastOutcome: "rejected", consecutiveFailures: 1 } };
+  assert.equal(body.auth.consecutiveFailures, 1,
+    "premise: exactly ONE rejection — two would legitimately make status degraded");
+  assert.equal(postFlightOk(body, "v3.27.0"), true,
+    "post-flight verifies a RESTART, not credentials; ADR 0010 holds one rejection is a " +
+    "token-rotation race, and a real outage is caught by doctor's fix_oauth pre-flight gate");
+});
+
+// DOCUMENTATION, NOT INDEPENDENT COVERAGE. Its input is the same shape the "a degraded server
+// rejects regardless of version" test above already drives (status:"degraded"), so no mutation
+// dies here that does not also die there. It exists to state, next to the relaxation it bounds,
+// exactly where that relaxation stops — do not count it in a mutation table.
+test("postFlightOk: #289 — TWO conclusive rejections DO block (status has gone degraded)", () => {
+  const body = { status: "degraded", version: "3.27.0",
+                 auth: { ok: false, lastOutcome: "rejected", consecutiveFailures: 2 } };
+  assert.equal(postFlightOk(body, "v3.27.0"), false,
+    "the weaker direction stops exactly where ADR 0010 says a rejection becomes a condition");
+});
+
+test("postFlightOk: unknown/empty target degrades to the serving check alone (never blocks)", () => {
+  assert.equal(postFlightOk({ status: "ok", auth: { ok: true }, version: "3.22.1" }, ""), true);
+  assert.equal(postFlightOk({ status: "ok", auth: { ok: true }, version: "3.22.1" }, undefined), true);
+});
+
+// ── #289 regression: the ADR 0010 inconclusive-probe state ──────────────────
+// This is the defect. ADR 0010 made an inconclusive probe (its own 10s timeout firing on a
+// loaded host) leave auth.ok at the last CONCLUSIVE verdict. Post-flight always runs against a
+// process that was just restarted, so there is no earlier conclusive verdict and auth.ok is
+// `null` — for up to CLAUDE_AUTH_CHECK_INTERVAL_MS (600000ms) with no accelerated re-probe,
+// against a 10 x 1s retry budget. The old predicate required `auth.ok === true`, so a
+// SUCCESSFUL restart/update/rollback reported failure on exactly the host shape ADR 0010 was
+// written about. `status` is "ok" throughout, because ADR 0010 deliberately does not let an
+// inconclusive probe move the verdict.
+test("postFlightOk: #289 — a fresh boot whose auth probe TIMED OUT (auth.ok=null) is still a pass", () => {
+  const body = {
+    status: "ok",
+    version: "3.27.0",
+    auth: { ok: null, lastCheck: Date.now(), message: "spawnSync /usr/local/bin/claude ETIMEDOUT",
+            lastOutcome: "timeout", consecutiveFailures: 0 },
+  };
+  assert.equal(body.auth.ok, null, "premise: the ADR 0010 inconclusive state really is auth.ok=null");
+  assert.equal(postFlightOk(body, "v3.27.0"), true,
+    "a successful restart must not be reported as a failure because one probe timed out (#289)");
+});
+
+test("postFlightOk: #289 — auth.ok=null still rejects when the version is WRONG (orphan is still caught)", () => {
+  const body = { status: "ok", version: "3.21.1", auth: { ok: null, lastOutcome: "timeout" } };
+  assert.equal(postFlightOk(body, "v3.27.0"), false,
+    "relaxing the auth arm must not relax the version arm — #173's orphan case still fails");
+});
+
+test("postFlightOk: #289 — status=degraded rejects even with a stale auth.ok=true (unusable binary)", () => {
+  // A non-executable claude binary makes the probe fail to SPAWN, which ADR 0010 classifies as
+  // INCONCLUSIVE, so a stale conclusive `ok: true` survives it. proxyHealthStatus catches it via
+  // binaryOk. The old auth.ok-only predicate missed this case entirely; reading `status` gains it.
+  const body = { status: "degraded", version: "3.27.0",
+                 auth: { ok: true, lastOutcome: "unavailable", consecutiveFailures: 0 } };
+  assert.equal(postFlightOk(body, "v3.27.0"), false,
+    "a proxy that cannot execute its claude binary must not pass post-flight");
 });
 
 // ── runPostFlightCheck (issue #214, MED-1 on PR #217 review) ────────────────
@@ -2113,13 +2951,86 @@ test("postFlightOk: unknown/empty target degrades to the auth-only check (never 
 // is the fix: it polls /health and reuses postFlightOk() (tested above) rather than a second
 // hand-rolled predicate. opts.mockProbe/attempts/intervalMs make the retry loop itself
 // testable without a live server or real sleeps.
+// ── Issue #291: the REAL probe lane, and what it tells the operator ──────────
+// Every pre-existing test in the section below drives `opts.mockProbe`. The lane that SHIPS is the
+// execSync one, and that is the lane whose bare `catch { /* retry */ }` collapsed five distinct
+// failures into one "(unreachable)" — a claim about the SERVICE, printed just as readily when curl
+// could not run on this machine at all. Verifying the fix through mockProbe would have verified it
+// on the lane that was never broken, which is why `opts.execFn` exists and why every test here
+// uses it. The message is the deliverable of this fix, so it is asserted too.
+const _pf291 = (props) => { const e = new Error(props.message || "probe failed"); Object.assign(e, props); return e; };
+const _pf291Run = (execFn) => runPostFlightCheck("v3.27.0", { execFn, attempts: 1, intervalMs: 0 });
+
+console.log("\nrunPostFlightCheck's real probe lane distinguishes a local fault from a remote condition (#291):");
+
+test("#291 (the money test): a probe that COULD NOT RUN must not be reported as the service being unreachable", async () => {
+  const r = await _pf291Run(() => { throw _pf291({ status: 127, stderr: "sh: 1: curl: not found" }); });
+  assert.equal(r.ok, false);
+  assert.equal(r.lastFailure.kind, "probe-could-not-run",
+    `exit 127 is bash's own "command not found" — a LOCAL fault; got ${JSON.stringify(r.lastFailure)}`);
+  const msg = postFlightFailureSuffix(r);
+  assert.match(msg, /could not run on THIS machine/,
+    `the operator must be told the fault is local; got ${JSON.stringify(msg)}`);
+  assert.ok(!/\(unreachable\)/.test(msg),
+    `and must NOT get the bare "(unreachable)" verdict about a service this probe never reached — ` +
+    `that is the #261-family conflation, in the function the bash layer now delegates its final ` +
+    `truth-telling to; got ${JSON.stringify(msg)}`);
+});
+
+test("#291 control: a genuinely refused connection IS still reported as unreachable", async () => {
+  const r = await _pf291Run(() => { throw _pf291({ status: 7, stderr: "curl: (7) Failed to connect" }); });
+  assert.equal(r.lastFailure.kind, "unreachable",
+    `curl exit 7 is a real remote condition and must keep saying so — proves the fix does not just ` +
+    `relabel every failure as local; got ${JSON.stringify(r.lastFailure)}`);
+  assert.match(postFlightFailureSuffix(r), /unreachable/);
+});
+
+test("#291: exit 126 (found but not executable) is also a local fault", async () => {
+  const r = await _pf291Run(() => { throw _pf291({ status: 126, stderr: "bash: curl: Permission denied" }); });
+  assert.equal(r.lastFailure.kind, "probe-could-not-run", JSON.stringify(r.lastFailure));
+});
+
+test("#291: a non-JSON body is 'unparseable', not 'unreachable' — something answered", async () => {
+  const r = await _pf291Run(() => ({ toString: () => "<html>not json</html>" }));
+  assert.equal(r.lastFailure.kind, "unparseable",
+    `JSON.parse throws SyntaxError, which carries no .status — without its own arm it falls through ` +
+    `to the network default and gets narrated as a connection problem; got ${JSON.stringify(r.lastFailure)}`);
+  assert.match(postFlightFailureSuffix(r), /not this proxy/);
+});
+
+test("#291: an HTTP error and a timeout are each named, not merged into 'unreachable'", async () => {
+  const http = await _pf291Run(() => { throw _pf291({ status: 22, stderr: "curl: (22) The requested URL returned error: 503" }); });
+  assert.equal(http.lastFailure.kind, "http-error", JSON.stringify(http.lastFailure));
+  const to = await _pf291Run(() => { throw _pf291({ status: 28, stderr: "curl: (28) Operation timed out" }); });
+  assert.equal(to.lastFailure.kind, "timeout", JSON.stringify(to.lastFailure));
+  assert.notEqual(postFlightFailureSuffix(http), postFlightFailureSuffix(to),
+    "two different faults must not render the same sentence");
+});
+
+test("#291: a reachable service on the WRONG version keeps the pre-existing message byte-for-byte", async () => {
+  const r = await _pf291Run(() => ({ toString: () => JSON.stringify({ status: "ok", version: "3.26.0" }) }));
+  assert.equal(r.lastSeen, "3.26.0");
+  assert.equal(r.lastFailure.kind, "version-mismatch", JSON.stringify(r.lastFailure));
+  assert.equal(postFlightFailureSuffix(r),
+    " (last saw version=3.26.0 — a stale process may still hold the port; check `ss -ltnp` / `lsof -i`)",
+    "this branch was already correct and specific; rewording it would be churn");
+});
+
+test("#291: the real lane still SUCCEEDS when the service is serving the target", async () => {
+  // Non-vacuity for the whole group: if execFn injection had broken the happy path, every test
+  // above would still pass while the shipped lane was dead.
+  const r = await _pf291Run(() => ({ toString: () => JSON.stringify({ status: "ok", version: "3.27.0" }) }));
+  assert.equal(r.ok, true, "the injected lane must exercise the same success path as production");
+  assert.equal(r.lastFailure, null, "and must not leave a stale failure behind on success");
+});
+
 console.log("\nrunPostFlightCheck (#214):");
 
 test("runPostFlightCheck: succeeds immediately when the first probe already matches target", async () => {
   let calls = 0;
   const result = await runPostFlightCheck("v3.26.0", {
     attempts: 5, intervalMs: 0,
-    mockProbe: () => { calls++; return { auth: { ok: true }, version: "3.26.0" }; }
+    mockProbe: () => { calls++; return { status: "ok", auth: { ok: true }, version: "3.26.0" }; }
   });
   assert.equal(result.ok, true);
   assert.equal(calls, 1, "must not keep polling once the target is already reached");
@@ -2132,8 +3043,8 @@ test("runPostFlightCheck: retries past a stale/unreachable probe and succeeds on
     mockProbe: () => {
       calls++;
       if (calls === 1) throw new Error("ECONNREFUSED"); // service mid-restart
-      if (calls === 2) return { auth: { ok: true }, version: "3.25.0" }; // old process still holding the port
-      return { auth: { ok: true }, version: "3.26.0" }; // new process finally serving
+      if (calls === 2) return { status: "ok", auth: { ok: true }, version: "3.25.0" }; // old process still holding the port
+      return { status: "ok", auth: { ok: true }, version: "3.26.0" }; // new process finally serving
     }
   });
   assert.equal(result.ok, true);
@@ -2144,7 +3055,7 @@ test("runPostFlightCheck: exhausts attempts and reports ok:false + lastSeen when
   let calls = 0;
   const result = await runPostFlightCheck("v3.26.0", {
     attempts: 3, intervalMs: 0,
-    mockProbe: () => { calls++; return { auth: { ok: true }, version: "3.25.0" }; }
+    mockProbe: () => { calls++; return { status: "ok", auth: { ok: true }, version: "3.25.0" }; }
   });
   assert.equal(result.ok, false);
   assert.equal(result.lastSeen, "3.25.0");
@@ -2301,8 +3212,12 @@ test("#260 (the money test): runUpgrade refuses --target on kind=fresh_install -
 });
 
 test("#260 control: runUpgrade fresh_install WITHOUT --target still runs ai_executable (proves the money test above can fail)", async () => {
+  // Issue #227 (landed after #260): fresh_install now ALSO requires --fresh-install, separate
+  // from --yes -- this test is about --target handling, not that gate, so opt in explicitly
+  // (freshInstall: true) to keep exercising the --target-specific behavior it was written for.
   const result = await runUpgrade({
     yes: true,
+    freshInstall: true,
     mockExec: true,
     mockDoctor: { ready_to_upgrade: false, from_version_supported: false,
                   next_action: { kind: "fresh_install", ai_executable: ["echo step-1", "echo step-2"] },
@@ -3254,7 +4169,7 @@ test("upgrade error after snapshot carries snapshotPath + hint", async () => {
   assert.equal(result.executed, true);
 });
 
-test("upgrade fresh_install requires --yes for non-interactive", async () => {
+test("upgrade fresh_install with neither flag refuses", async () => {
   await assert.rejects(async () => {
     await runUpgrade({
       yes: false,
@@ -3263,12 +4178,55 @@ test("upgrade fresh_install requires --yes for non-interactive", async () => {
                     next_action: { kind: "fresh_install", ai_executable: ["echo would-rm-rf"] },
                     current_version: "v3.2.0", latest_version: "v3.14.0" }
     });
-  }, /requires --yes/);
+  }, /execution-verified/);
 });
 
-test("upgrade fresh_install with --yes runs ai_executable", async () => {
+// Issue #227: doctor selecting kind="fresh_install" used to run for real off the SAME --yes
+// flag every other non-interactive `ocp update` invocation already passes (see `ocp`'s own
+// help text -- "AI agents pass this" -- and doctor.mjs's own ai_executable suggestion for
+// update/upgrade/restart: `${ocpDir}/ocp update --yes`). This path has never been execution-
+// verified (not in CI -- this suite only ever reaches runFreshInstall with opts.mockExec:
+// true -- and not by hand, since the arm was reconnected by #217): its real ai_executable
+// steps run `mv ~/.ocp ...` and `rm -rf ${ocpDir}` against a live host. The money test: a
+// bare --yes, with no separate opt-in, must now refuse instead of executing -- the exact
+// shape an AI agent following doctor's own generic remediation would otherwise hit by
+// accident on a host that happens to classify as pre-v3.4.0.
+console.log("\nfresh_install requires an explicit, separate opt-in (issue #227):");
+
+test("#227 (the money test): fresh_install refuses on a BARE --yes -- the routine ocp-update shape doctor itself suggests for every other kind", async () => {
+  await assert.rejects(async () => {
+    await runUpgrade({
+      yes: true,
+      mockExec: true,
+      mockDoctor: { ready_to_upgrade: false, from_version_supported: false,
+                    next_action: { kind: "fresh_install", ai_executable: ["echo would-rm-rf"] },
+                    current_version: "v3.2.0", latest_version: "v3.14.0" }
+    });
+  }, (err) => {
+    assert.match(err.message, /fresh_install/, `message=${JSON.stringify(err.message)}`);
+    assert.match(err.message, /227/, `message=${JSON.stringify(err.message)}`);
+    assert.match(err.message, /--fresh-install --yes/, `message=${JSON.stringify(err.message)}`);
+    return true;
+  });
+});
+
+test("#227 control: --fresh-install alone (no --yes) still refuses -- both flags are independently required", async () => {
+  await assert.rejects(async () => {
+    await runUpgrade({
+      yes: false,
+      freshInstall: true,
+      mockExec: true,
+      mockDoctor: { ready_to_upgrade: false, from_version_supported: false,
+                    next_action: { kind: "fresh_install", ai_executable: ["echo would-rm-rf"] },
+                    current_version: "v3.2.0", latest_version: "v3.14.0" }
+    });
+  }, /execution-verified/);
+});
+
+test("#227: fresh_install with BOTH --fresh-install and --yes runs ai_executable (the explicit, accepted-risk path)", async () => {
   const result = await runUpgrade({
     yes: true,
+    freshInstall: true,
     mockExec: true,
     mockDoctor: { ready_to_upgrade: false, from_version_supported: false,
                   next_action: { kind: "fresh_install",
@@ -3277,6 +4235,18 @@ test("upgrade fresh_install with --yes runs ai_executable", async () => {
   });
   assert.equal(result.path, "fresh_install");
   assert.equal(result.steps.length, 3);
+});
+
+test("#227 non-regression: kind=upgrade with a BARE --yes (no --fresh-install) is UNAFFECTED -- the new gate is scoped to fresh_install only", async () => {
+  const result = await runUpgrade({
+    yes: true,
+    mockExec: true,
+    mockDoctor: { ready_to_upgrade: true, from_version_supported: true,
+                  next_action: { kind: "upgrade" },
+                  current_version: "v3.10.0", latest_version: "v3.14.0" }
+  });
+  assert.equal(result.path, "upgrade");
+  assert.equal(result.executed, true);
 });
 
 test("rollback --list returns snapshots", async () => {
@@ -3302,6 +4272,86 @@ test("rollback --list returns snapshots", async () => {
 // advice with --target still attached would land on the WRONG restored state while reporting
 // success, the exact #260 shape this whole guard chain exists to close, on the one path that
 // actually mutates disk.
+// ── Issue #297: the Node argv parser dropped `--target=vX.Y.Z` ──────────────────────────────
+// `ocp`'s bash layer has understood both `--target vX.Y.Z` and `--target=vX.Y.Z` since #272
+// (_detect_target_flag), and ocp:1289 forwards the user's argv to this script VERBATIM
+// (`exec node .../upgrade.mjs "$@"`). The Node side only did `args.indexOf("--target")`, so the
+// equals form arrived as `target: undefined`: #272's refusal never fired on fresh_install, and
+// on the full/cross-minor path #259's pin was silently not applied — the upgrade went to
+// doctor.latest_version. That is the "believes they pinned and did not" failure #260 exists to
+// prevent, reintroduced across a layer boundary.
+//
+// Why it slipped is the useful part: #272's tests exercised the equals form at the BASH layer,
+// where the fix was, and every #272 Node-side test calls runUpgrade({target}) directly. Nothing
+// ever drove argv -> parse -> runUpgrade, so the boundary itself was untested. These tests test
+// the parser as a unit AND feed its output into runUpgrade, which is the seam that was missing.
+console.log("\n--target=vX.Y.Z equals form is parsed at the Node layer too (issue #297):");
+
+test("#297 parseFlagValue: the equals form yields the same value as the separate form", () => {
+  assert.deepEqual(parseFlagValue(["--target=v3.27.0"], "--target"), { seen: true, value: "v3.27.0" });
+  assert.deepEqual(parseFlagValue(["--target", "v3.27.0"], "--target"), { seen: true, value: "v3.27.0" });
+});
+
+test("#297 parseFlagValue: the equals form is found mid-argv, not only in first position", () => {
+  assert.deepEqual(parseFlagValue(["--yes", "--target=v3.27.0", "--dry-run"], "--target"), { seen: true, value: "v3.27.0" });
+});
+
+test("#297 parseFlagValue: absent flag reports seen=false (not merely an undefined value)", () => {
+  assert.deepEqual(parseFlagValue(["--yes", "--dry-run"], "--target"), { seen: false, value: undefined });
+});
+
+test("#297 parseFlagValue: a typed-but-empty flag is seen=true — the distinction a bare `undefined` destroys", () => {
+  // `--target=` and a trailing `--target` are the shapes that used to collapse into "not passed",
+  // silently dropping a pin the user typed. `seen` is what lets the caller refuse instead.
+  assert.deepEqual(parseFlagValue(["--target="], "--target"), { seen: true, value: "" });
+  assert.deepEqual(parseFlagValue(["--target"], "--target"), { seen: true, value: undefined });
+});
+
+test("#297 parseFlagValue: `--targetv3.27.0` (no separator) is NOT this flag", () => {
+  assert.deepEqual(parseFlagValue(["--targetv3.27.0"], "--target"), { seen: false, value: undefined },
+    "silently honouring a typo'd flag would be a new way to pin a version the user never asked for");
+});
+
+test("#297 parseFlagValue: the first occurrence wins, matching bash's own `break`", () => {
+  assert.deepEqual(parseFlagValue(["--target=a", "--target=b"], "--target"), { seen: true, value: "a" });
+});
+
+test("#297 (the money test): a value parsed from the EQUALS form reaches runUpgrade and triggers the same refusal the separate form does", async () => {
+  // The seam #297 was about: parse argv the way the CLI entry point now does, hand the result to
+  // runUpgrade, and require the pin to be refused on a path that cannot honour it. Before the
+  // fix this call would have received target=undefined and returned a plan instead of throwing.
+  const parsed = parseFlagValue(["--target=v9.9.9"], "--target");
+  const mockDoctor = { ready_to_upgrade: true, current_version: "v3.27.0", latest_version: "v3.27.0", next_action: { kind: "noop" } };
+  await assert.rejects(
+    () => runUpgrade({ target: parsed.value, mockDoctor }),
+    (e) => /--target v9\.9\.9 was requested/.test(e.message),
+    "the equals form's value must reach the #272 refusal — its absence there is the whole defect",
+  );
+});
+
+// Wiring test. Everything above proves parseFlagValue is CORRECT; nothing above proves the CLI
+// entry point actually calls it — and "the fix exists but the caller never reaches it" is a real
+// shape (see #298's classifyBindCheck threading test for the sibling case). This drives the real
+// argv boundary in a child process, using the typed-but-empty refusal because it is the one CLI
+// outcome here that needs neither the network nor a doctor run: `--target=` is unreachable from
+// the old indexOf-only parser (it would see no `--target` token at all and stay silent), so this
+// test is discriminating for the wiring specifically.
+test("#297 wiring: the real CLI entry point parses the equals form — `--target=` refuses instead of being silently dropped", () => {
+  const r = spawnSync(process.execPath, ["scripts/upgrade.mjs", "--target="], { encoding: "utf-8", cwd: process.cwd() });
+  assert.equal(r.status, 1, `expected a refusal exit; status=${r.status} stdout=${JSON.stringify(r.stdout)} stderr=${JSON.stringify(r.stderr)}`);
+  assert.match(r.stderr, /--target requires a version argument/,
+    `a typed-but-empty pin must be refused at the CLI boundary, not dropped to undefined; stderr=${JSON.stringify(r.stderr)}`);
+});
+
+test("#297 control: the separate form still refuses identically (proves the money test is not asserting something new)", async () => {
+  const parsed = parseFlagValue(["--target", "v9.9.9"], "--target");
+  const mockDoctor = { ready_to_upgrade: true, current_version: "v3.27.0", latest_version: "v3.27.0", next_action: { kind: "noop" } };
+  await assert.rejects(
+    () => runUpgrade({ target: parsed.value, mockDoctor }),
+    (e) => /--target v9\.9\.9 was requested/.test(e.message),
+  );
+});
+
 console.log("\n--rollback + --target guard (issue #260/#272 review round 2):");
 
 test("#272 (the money test): runUpgrade refuses --rollback + --target together -- never reaches runRollback at all", async () => {
@@ -3407,7 +4457,7 @@ test("#274 (the money test): rollback reports FAILURE when post-flight does not 
       // A stale/orphan process still answers auth.ok=true but serves the version rollback was
       // trying to LEAVE, not the one it restored — exactly the "reports success while serving
       // the wrong tree" shape #274 describes.
-      mockProbe: () => ({ auth: { ok: true }, version: "3.14.0" }),
+      mockProbe: () => ({ status: "ok", auth: { ok: true }, version: "3.14.0" }),
       postFlightAttempts: 1, postFlightIntervalMs: 0,
     });
   }, /rollback post-flight failed/);
@@ -3418,7 +4468,7 @@ test("#274 control: rollback reports SUCCESS when post-flight confirms the snaps
     rollback: true, yes: true, mockExec: true,
     mockSnapshots: [{ name: "upgrade-snapshot-2026-05-11T08:30:00Z", path: "/tmp/snap-x" }],
     mockSnapshotMeta: { fromCommit: "abc1234", fromVersion: "v3.10.0", toVersion: "v3.14.0", path: "/tmp/snap-x" },
-    mockProbe: () => ({ auth: { ok: true }, version: "3.10.0" }),
+    mockProbe: () => ({ status: "ok", auth: { ok: true }, version: "3.10.0" }),
     postFlightAttempts: 1, postFlightIntervalMs: 0,
   });
   assert.equal(result.path, "rollback");
@@ -3438,7 +4488,7 @@ test("#274: rollback post-flight targets meta.fromVersion, NOT toVersion — a p
       rollback: true, yes: true, mockExec: true,
       mockSnapshots: [{ name: "upgrade-snapshot-2026-05-11T08:30:00Z", path: "/tmp/snap-x" }],
       mockSnapshotMeta: { fromCommit: "abc1234", fromVersion: "v3.10.0", toVersion: "v3.14.0", path: "/tmp/snap-x" },
-      mockProbe: () => ({ auth: { ok: true }, version: "3.14.0" }), // toVersion, not fromVersion
+      mockProbe: () => ({ status: "ok", auth: { ok: true }, version: "3.14.0" }), // toVersion, not fromVersion
       postFlightAttempts: 1, postFlightIntervalMs: 0,
     });
   }, /rollback post-flight failed/);
@@ -4073,10 +5123,50 @@ test("buildBindCheckCommand: darwin falls back to the bare name when the absolut
 // `grep` exits 1, never 127). No pipe, no grep -- port matching now happens in JS
 // (ssLineMatchesPort) against the unfiltered `ss -tlnp` output, so `ss`'s own real exit status
 // survives to classifyBindCheck()'s catch block.
-test("buildBindCheckCommand: linux uses bare 'ss -tlnp', no pipe/grep (issue #246 second half, MED-2 fix)", () => {
-  const cmd = buildBindCheckCommand({ port: _startShTestPort, platform: "linux" });
-  assert.equal(cmd, "ss -tlnp");
-  assert.ok(!cmd.includes("|"), `must not pipe through grep (masks ss's own exit status): ${cmd}`);
+// Issue #298: this test used to assert `cmd === "ss -tlnp"` with no `existsSyncFn` injected,
+// which made it host-dependent the moment the linux branch gained absolute-path resolution:
+// it passes on macOS (where /usr/sbin/ss does not exist, so the fallback fires) and fails on a
+// Debian CI runner (where it does). Both branches are now driven explicitly, mirroring the
+// darwin pair directly above — that is what makes them discriminating rather than incidentally
+// green on whatever host happens to run them.
+test("buildBindCheckCommand: linux prefers the resolveBinaryPath-preferred absolute ss path (#298)", () => {
+  const cmd = buildBindCheckCommand({ port: _startShTestPort, platform: "linux", ssPath: "/usr/sbin/ss", existsSyncFn: () => true });
+  assert.equal(cmd, "/usr/sbin/ss -tlnp",
+    `a restricted PATH without /usr/sbin loses bare 'ss' on Debian/Raspberry Pi OS — the same ` +
+    `exposure #246 fixed for lsof on the darwin branch; got ${cmd}`);
+});
+
+test("buildBindCheckCommand: linux falls back to the bare name when the absolute ss path does not exist (#298)", () => {
+  const cmd = buildBindCheckCommand({ port: _startShTestPort, platform: "linux", ssPath: "/usr/sbin/ss", existsSyncFn: () => false });
+  assert.equal(cmd, "ss -tlnp",
+    `a host whose ss is elsewhere must be no worse off than before the fix — same fallback ` +
+    `direction as the darwin branch; got ${cmd}`);
+});
+
+test("buildBindCheckCommand: linux checks the absolute ss path, not some other path (#298)", () => {
+  let seen = null;
+  buildBindCheckCommand({ port: _startShTestPort, platform: "linux", ssPath: "/usr/sbin/ss", existsSyncFn: (p) => { seen = p; return true; } });
+  assert.equal(seen, "/usr/sbin/ss", `expected the ss absolute path to be the one probed, got ${JSON.stringify(seen)}`);
+});
+
+test("buildBindCheckCommand: linux still uses no pipe/grep (issue #246 second half, MED-2 fix — preserved by #298)", () => {
+  for (const exists of [true, false]) {
+    const cmd = buildBindCheckCommand({ port: _startShTestPort, platform: "linux", existsSyncFn: () => exists });
+    assert.ok(!cmd.includes("|"), `must not pipe through grep (masks ss's own exit status): ${cmd}`);
+    assert.ok(cmd.endsWith(" -tlnp"), `flags must be unchanged by the path resolution: ${cmd}`);
+  }
+});
+
+test("classifyBindCheck: threads ssPath through to the command it runs (#298 — otherwise the fix is unreachable from the caller)", () => {
+  let ran = null;
+  classifyBindCheck({
+    port: _startShTestPort, platform: "linux", ssPath: "/opt/custom/ss",
+    existsSyncFn: () => true,
+    execFn: (cmd) => { ran = cmd; return ""; },
+  });
+  assert.equal(ran, "/opt/custom/ss -tlnp",
+    `classifyBindCheck is the only caller setup.mjs reaches; if it drops ssPath the resolution ` +
+    `never happens in production. got ${JSON.stringify(ran)}`);
 });
 
 test("buildBindCheckCommand: darwin branch never redirects stderr to /dev/null (issue #246 second half's actual defect)", () => {
@@ -5127,6 +6217,54 @@ test("LEGACY_SESSION_NAME_RE matches only the exact old bare-prefix shape, never
 
 console.log("\nTUI command construction (proxy-purity / #4):");
 
+test("#328 (P1 from review 5): the pane prefix unsets ALIASED carriers, not just the three names", () => {
+  // The alias layer added in response to review 4 was NOT pinned: neutering it left the suite at
+  // exactly the baseline, and the test above only asserts the three constants — the `...aliased`
+  // spread was invisible to it. So a reviewer reading that test would reasonably conclude the
+  // review-4 fix was covered when it was not. This is the test that actually covers it.
+  const saved = process.env.OPENAI_API_KEY;
+  process.env.OPENAI_API_KEY = "ocp_" + randomBytes(24).toString("base64url");
+  try {
+    const cmd = buildTuiCmd("/usr/bin/claude", "claude-haiku", "sid-alias", "/home/u", "cli");
+    assert.match(cmd, /-u '?OPENAI_API_KEY'?/,
+      `the pane must unset a variable that CARRIES an OCP credential, even though its name is not ` +
+      `on INBOUND_AUTH_ENV_VARS; got: ${cmd.slice(0, 220)}`);
+  } finally {
+    if (saved === undefined) delete process.env.OPENAI_API_KEY; else process.env.OPENAI_API_KEY = saved;
+  }
+});
+
+test("#328 (P2 from review 5): a metacharacter-bearing variable NAME cannot escape the pane command", () => {
+  // Every other runtime value in the pane prefix goes through shq(); the alias names were the
+  // first runtime-derived value to reach it and did not. A reviewer executed the gap to a created
+  // marker file via tmux.
+  const evil = "EVIL;touch /tmp/ocp-should-not-exist;X";
+  process.env[evil] = "ocp_" + randomBytes(24).toString("base64url");
+  try {
+    const cmd = buildTuiCmd("/usr/bin/claude", "claude-haiku", "sid-shq", "/home/u", "cli");
+    assert.ok(!cmd.includes("-u EVIL;touch"), `the name must be quoted, not spliced raw; got: ${cmd.slice(0, 260)}`);
+    assert.ok(cmd.includes("'" + evil + "'"), "and it must appear single-quoted");
+  } finally { delete process.env[evil]; }
+});
+
+test("#328 (P0, found by independent review): buildTuiCmd unsets OCP's inbound credentials in the PANE", () => {
+  // The third copy of the four-name denylist lived here, and this is the ONLY request path when
+  // CLAUDE_TUI_MODE=true — server.mjs picks callClaudeTui over callClaude wholesale, so a fix
+  // applied only to spawnClaudeProcess leaves every TUI request unprotected. Behavioural: this
+  // asserts the argv `buildTuiCmd` actually returns, which is the pane's real command line.
+  const cmd = buildTuiCmd("/usr/bin/claude", "claude-haiku", "sid-328", "/home/u", "cli"); // already a string
+  for (const name of INBOUND_AUTH_ENV_VARS) {
+    assert.ok(cmd.includes(`-u '${name}'`), `pane command must unset ${name} (shq-quoted since review 5); got: ${cmd.slice(0, 200)}`);
+  }
+  // Control: the pre-existing four are still unset (this must EXTEND the list, not replace it),
+  // and the outbound credential is not among the unsets.
+  for (const name of ["CLAUDECODE", "ANTHROPIC_API_KEY", "ANTHROPIC_BASE_URL", "ANTHROPIC_AUTH_TOKEN"]) {
+    assert.ok(cmd.includes(`-u '${name}'`), `pane command must still unset ${name} — the list was replaced, not extended`);
+  }
+  assert.ok(!cmd.includes("-u 'CLAUDE_CODE_OAUTH_TOKEN'"),
+    "the OUTBOUND credential must NOT be unset — the pane's claude needs it to authenticate");
+});
+
 test("buildTuiCmd suppresses host CLAUDE.md + auto-memory (proxy purity, #4)", () => {
   const cmd = buildTuiCmd("/usr/bin/claude", "claude-haiku", "sid-1", "/home/u", "cli");
   // OCP is a proxy: the host's CLAUDE.md / auto-memory must never leak into the proxied turn.
@@ -5164,7 +6302,7 @@ test("buildTuiCmd keeps version pin + entrypoint label + MCP wall", () => {
   // 'auto' mode must NOT pin the entrypoint (claude self-classifies via TTY).
   const auto = buildTuiCmd("/usr/bin/claude", "m", "sid-3", "/home/u", "auto");
   assert.ok(!/CLAUDE_CODE_ENTRYPOINT=/.test(auto), "auto mode leaves entrypoint unset");
-  assert.ok(/-u CLAUDE_CODE_ENTRYPOINT/.test(auto), "auto mode unsets any inherited entrypoint");
+  assert.ok(/-u '?CLAUDE_CODE_ENTRYPOINT'?/.test(auto), "auto mode unsets any inherited entrypoint");
 });
 
 // CLAUDE_CODE_OAUTH_TOKEN passthrough (PI231 401 incident): tmux doesn't forward the parent
@@ -7009,89 +8147,79 @@ test("models.json: claude-opus-5 is present in models[] (the entry this PR adds)
   assert.ok(_spotModelIds.has("claude-opus-5"), "claude-opus-5 must exist as a models[].id");
 });
 
-// The prompt-char budget is GLOBAL (max across every entry × 3 chars/token), not
-// per-model — see lib/prompt.mjs derivePromptCharBudget. An entry declaring a native 1M
-// window would therefore raise the truncation ceiling for claude-haiku-4-5 too (genuinely
-// 200k), turning OCP-side truncation into an upstream API rejection.
+// ADR 0011 removed the coupling this slot used to guard. Until #213 the budget was GLOBAL
+// (max across every entry × 3), so a single 1M entry raised the truncation ceiling for
+// claude-haiku-4-5 too and the test here pinned `max(contextWindow) === 200000` to stop that.
+// The budget is now looked up per model (lib/prompt.mjs promptCharBudgetFor), so a large
+// entry no longer perturbs anything else and pinning the max would only forbid the truth.
 //
-// Asserts the MAX, deliberately, not every entry: ADR 0009 states the budget "scales
-// automatically — no code change", so a future entry with a SMALLER window (say a 128k
-// model) must stay legal and must not fail this suite. Only raising the ceiling is the
-// hazard, and that is an ADR-level decision requiring per-model budgets first.
-test("models.json: max contextWindow is 200000 (global prompt-budget ceiling)", () => {
-  const windows = _spotModels.models.map(m => m.contextWindow);
-  assert.equal(Math.max(...windows), 200000,
-    `max contextWindow re-scales MAX_PROMPT_CHARS for ALL models incl. the 200k-native haiku (see lib/prompt.mjs + ADR 0009)`);
+// What replaces it is NOT weaker: the per-entry registry check below pins every row to its
+// own CLI-registry value, and the isolation property the old max() test was really protecting
+// — haiku keeping its 600k ceiling while opus-5 gets 3M — is asserted behaviourally, twice:
+// on the pure function ("promptCharBudgetFor: a 1M model gets 3M chars while a 200k model in
+// the SAME registry still gets 600k") and end-to-end against a live server ("integration
+// (#213): the SAME oversized prompt is truncated for a 200k model and NOT for a 1M model").
+test("models.json: every contextWindow is a positive integer (shape guard; the ceiling is per-model since ADR 0011)", () => {
+  for (const m of _spotModels.models) {
+    assert.ok(Number.isInteger(m.contextWindow) && m.contextWindow > 0,
+      `${m.id}: contextWindow must be a positive integer, got ${JSON.stringify(m.contextWindow)} — ` +
+      `a non-numeric or zero window sends promptCharBudgetFor to the fallback and silently gives ` +
+      `this model the smallest budget in the registry`);
+  }
 });
 
-// contextWindow vs the CLI registry (#213). Be honest about what this buys, because it is less than
-// it looks: TODAY every one of the seven rows resolves to a required value of exactly 200000, so this
-// test is currently EQUIVALENT to `assert.equal(m.contextWindow, 200000)`. The table earns its place
-// for two other reasons — symmetry with the reviewed _spotRegistryMaxTokens pattern below, and
-// failure messages that tell the next maintainer what to do — NOT for extra detection power.
-// Branch 1 only starts discriminating if a model with a registry window BELOW 200000 is ever added.
+// contextWindow vs the CLI registry (#213, resolved). This USED to allow two legal values per row —
+// the registry's, or a deliberate 200000 cap — because ADR 0009's global max() meant one 1e6 entry
+// re-scaled the ceiling for every model. ADR 0011 made the budget per-model, so the cap is gone and
+// there is now exactly ONE legal value per row: the registry's. That makes the table discriminating
+// for the first time — before, all seven rows resolved to 200000 and it was equivalent to
+// `assert.equal(m.contextWindow, 200000)`; now four rows require 1000000 and three require 200000,
+// so a copy-paste that flattens them fails.
 //
-// It is also a FROZEN SNAPSHOT, not a live check. If Anthropic promotes claude-opus-4-6 from 200k to
-// 1M in a CLI update, this table still says 200000, models.json still says 200000, branch 1 compares
-// equal, and the suite stays GREEN while every message here asserts something the registry no longer
-// says. This detects models.json drift only. Re-extract the table when bumping the pinned CLI.
+// It remains a FROZEN SNAPSHOT, not a live check. If Anthropic promotes claude-opus-4-6 from 200k to
+// 1M in a CLI update, this table still says 200000, models.json still says 200000, they compare
+// equal, and the suite stays GREEN while asserting something the registry no longer says. This
+// detects models.json drift only. Re-extract the table when bumping the pinned CLI.
 //
-// models.json UNDER-declares contextWindow for every native-1M model, and that is a DECISION, not
-// drift. #195/#208 established that SPOT values should be the truth about the model, so without
-// this test the four capped rows read as unfixed bugs. Why they are capped: derivePromptCharBudget
-// (lib/prompt.mjs, ADR 0009) takes max(contextWindow) × 3 across ALL entries, so ONE 1e6 row would
-// raise MAX_PROMPT_CHARS from 600k to 3M for EVERY model — including claude-haiku-4-5-20251001,
-// which is genuinely 200k native — turning clean OCP-side truncation into upstream API rejections.
-// Declaring the true 1M needs per-model budgets instead of a single global max(); tracked in #213.
-//
-// Values extracted id-anchored from the compiled CLI 2.1.220 registry (`grep -ao 'id:"<id>"…'` plus
-// the following bytes) — never by bare-string search, which matches cross-references inside OTHER
-// records. NOTE the haiku key is the models.json id; the registry record is id:"claude-haiku-4-5",
-// and the dated string appears only as a provider alias — measured, under FOUR keys (first_party,
-// anthropic_aws, anthropic_google_cloud, gateway) and never as an `id:` — so
-// `grep 'id:"claude-haiku-4-5-20251001"'` returns 0 hits.
+// Values extracted id-anchored from the compiled CLI 2.1.220 registry
+// (sha256 8addc857f3fe64d5a0368af9ee50321b50afb4a6918ba3ef018ab84f5dbbe081) — never by bare-string
+// search, which matches cross-references inside OTHER records. Two extraction hazards, both hit
+// while producing this table:
+//   1. The haiku key is the models.json id; the registry record is id:"claude-haiku-4-5", and the
+//      dated string appears only as a provider alias (first_party, anthropic_aws,
+//      anthropic_google_cloud, gateway) and never as an `id:` — so an `id:"claude-haiku-4-5-20251001"`
+//      anchor returns 0 hits.
+//   2. A FIXED-WIDTH window after the anchor bleeds into the NEXT record. Reading 2000 bytes past
+//      claude-opus-4-6 picks up the neighbouring 1M record's `context:{...}` and reports opus-4-6 as
+//      native_1m, which it is not. Bound each slice at the next `{id:"` separator. Cross-validated
+//      binary-wide and independently of the per-id slices: `native_1m:!0` occurs 6x and
+//      `context:{window:1e6` occurs 6x, over the same six records — the four below plus
+//      claude-fable-5 and claude-mythos-5, which OCP does not expose.
 const _spotRegistryContextWindow = {
   "claude-opus-5": 1000000, "claude-opus-4-8": 1000000, "claude-opus-4-7": 1000000,
   "claude-opus-4-6": 200000, "claude-sonnet-5": 1000000, "claude-sonnet-4-6": 200000,
   "claude-haiku-4-5-20251001": 200000,      // registry id: claude-haiku-4-5
 };
-const _SPOT_CTX_CAP = 200000;
 
-test("models.json: contextWindow equals the registry, or is the deliberate 200000 cap (#213)", () => {
+test("models.json: contextWindow equals the CLI registry exactly, for every model (#213)", () => {
   for (const m of _spotModels.models) {
     const reg = _spotRegistryContextWindow[m.id];
     assert.ok(reg !== undefined,
       `${m.id} has no recorded registry contextWindow — extract it id-anchored from the CLI binary ` +
-      `(see the comment above; the haiku row shows how a models.json id can differ from the registry id) ` +
-      `and add a row. Do NOT guess, and do NOT delete this assertion.`);
-    if (reg <= _SPOT_CTX_CAP) {
-      // PRESUMED a typo, not proven one. The model's real window fits under the cap, so there is no
-      // prompt-budget reason to differ — but this PR's own schema edit records that contextWindow also
-      // drives OpenClaw's compaction budget, and that budget is LINEAR in it (contextWindowTokens x
-      // maxHistoryShare x SAFETY_MARGIN), which OpenClaw documents as a tuning axis. So declaring
-      // BELOW the registry to compact earlier and leave more generation headroom is a coherent
-      // decision. If that is what you are doing, change this row and record why — do not delete the
-      // assertion. This deliberately tightens the latitude the aggregate test's comment above leaves
-      // for "a future entry with a SMALLER window".
-      assert.equal(m.contextWindow, reg,
-        `${m.id}: registry says ${reg}, which is at or below the ${_SPOT_CTX_CAP} cap, so models.json ` +
-        // JSON.stringify, not bare interpolation: a STRING "200000" would otherwise render as
-        // `must match it exactly — it says 200000`, reading as a self-contradiction. assert.equal is
-        // strict here (the file imports `strict as assert`), so the type is the whole defect.
-        `must match it exactly — it says ${JSON.stringify(m.contextWindow)}`);
-    } else {
-      // Registry window exceeds the cap: the ONLY legitimate value is the cap itself. Declaring the
-      // true window re-scales the global prompt budget for every other model (see above).
-      // The label is DERIVED, not hardcoded: for a future 500k model a literal "(native 1M)" would be
-      // a lie, and the message would then lecture about a 1M window that does not exist.
-      const _regLabel = reg === 1000000 ? "native 1M" : `above the ${_SPOT_CTX_CAP} cap`;
-      assert.equal(m.contextWindow, _SPOT_CTX_CAP,
-        `${m.id}: registry says ${reg} (${_regLabel}), so models.json must declare exactly ` +
-        `${_SPOT_CTX_CAP} — it says ${JSON.stringify(m.contextWindow)}. If you RAISED it: ` +
-        `derivePromptCharBudget takes max() across ALL entries, so that re-scales the budget for the ` +
-        `genuinely-200k models too, and is not a one-line change. If you LOWERED it: that may be ` +
-        `deliberate OpenClaw compaction tuning — change this row and record why. See #213, ADR 0009.`);
-    }
+      `(see the comment above; the haiku row shows how a models.json id can differ from the registry id, ` +
+      `and the window-bleed hazard shows how to get native_1m wrong) and add a row. Do NOT guess, and ` +
+      `do NOT delete this assertion.`);
+    // JSON.stringify, not bare interpolation: a STRING "200000" would otherwise render as
+    // `must match it exactly — it says 200000`, reading as a self-contradiction. assert.equal is
+    // strict here (the file imports `strict as assert`), so the type is the whole defect.
+    assert.equal(m.contextWindow, reg,
+      `${m.id}: the CLI registry says ${reg}, so models.json must say exactly that — it says ` +
+      `${JSON.stringify(m.contextWindow)}. Since ADR 0011 the budget is per-model, so this value ` +
+      `affects ONLY this model's truncation ceiling (contextWindow x 3) and no longer re-scales any ` +
+      `other model. If you LOWERED it deliberately — contextWindow also drives OpenClaw's compaction ` +
+      `budget, which is LINEAR in it (contextWindowTokens x maxHistoryShare x SAFETY_MARGIN), so ` +
+      `declaring below the registry to compact earlier is coherent — change this row and record why. ` +
+      `Do not delete the assertion. See #213, ADR 0011.`);
   }
   // Reverse direction. Both loops above walk models.json, so the mapping is ONE-WAY and a deleted
   // entry is simply never visited: removing claude-sonnet-4-6 leaves the suite at 463 passed, 0
@@ -7328,6 +8456,246 @@ test("isLoopbackBind: '100.64.0.1' → false (Tailscale IP)", () => {
 });
 
 // ── Spawn-auth primitives (F3 / F5 / F6, lib/spawn-auth.mjs) ──
+
+// #328 — scrubInboundAuthEnv. The integration tests prove the wiring; these pin the contract at
+// the boundary, where the integration tests cannot reach (absent vars, unrelated vars, aliasing).
+test("#328: scrubInboundAuthEnv removes every inbound-auth var and reports which", () => {
+  const env = { PROXY_API_KEY: "a", OCP_ADMIN_KEY: "b", PROXY_ANONYMOUS_KEY: "c", PATH: "/usr/bin" };
+  const { env: out, removed } = scrubInboundAuthEnv(env);
+  assert.deepEqual(removed.sort(), ["OCP_ADMIN_KEY", "PROXY_ANONYMOUS_KEY", "PROXY_API_KEY"]);
+  assert.deepEqual(Object.keys(out), ["PATH"], "only the non-secret survives");
+  assert.equal(out, env, "mutates in place, so it composes with the existing delete-blocks");
+});
+
+test("#328: absent vars are not an error, and unrelated vars are untouched", () => {
+  const { removed, env } = scrubInboundAuthEnv({ PATH: "/usr/bin", CLAUDE_CODE_OAUTH_TOKEN: "keep-me" });
+  assert.deepEqual(removed, [], "nothing to remove reports nothing removed");
+  assert.equal(env.CLAUDE_CODE_OAUTH_TOKEN, "keep-me",
+    "the OUTBOUND credential the child genuinely needs must survive — stripping it would break every request");
+});
+
+test("#328: an empty-string secret is still removed (falsy value, real leak)", () => {
+  // `if (env[name])` would skip this and leave the name visible to the child. Presence is the
+  // criterion, not truthiness.
+  const { removed } = scrubInboundAuthEnv({ PROXY_API_KEY: "" });
+  assert.deepEqual(removed, ["PROXY_API_KEY"]);
+});
+
+// ── setup.mjs's two spawns, tested by SLICE (#328, review-3 P2-1) ───────────
+// An earlier revision of this PR declared these two sites "fixed but untestable" because running
+// the real setup.mjs writes configs and installs autostart, and AGENTS.md records an incident from
+// a harness doing exactly that. A reviewer showed that was a false dichotomy: the choice was never
+// "run it or don't test it", it is "run it or SLICE it" — the technique AGENTS.md itself endorses
+// for ocp-connect. This slices only the two `execSync(...)` statements and evaluates them with a
+// recording execSync, so nothing is spawned and nothing is written.
+function _s328Slice(marker) {
+  const src = _ltRead(spotJoin(_spotDir, "setup.mjs"), "utf8");
+  const i = src.indexOf(marker);
+  assert.notEqual(i, -1, `anchor drift: ${JSON.stringify(marker)} not found in setup.mjs`);
+  const start = src.lastIndexOf("execSync(", i + marker.length);
+  assert.notEqual(start, -1, "no execSync( before the anchor — slice boundary wrong");
+  // Balance parens from `execSync(` to its close, so the slice is the whole call and not a prefix.
+  let depth = 0, end = -1;
+  for (let k = start + "execSync".length; k < src.length; k++) {
+    if (src[k] === "(") depth++;
+    else if (src[k] === ")") { depth--; if (depth === 0) { end = k + 1; break; } }
+  }
+  assert.notEqual(end, -1, "unbalanced parens — slice boundary wrong");
+  const slice = src.slice(start, end);
+  assert.ok(slice.length > 0 && slice.includes("execSync("), "empty or malformed slice — anchor drift");
+  return slice;
+}
+
+function _s328Env(slice) {
+  let seen = null;
+  const execSync = (_cmd, opts) => { seen = opts; return ""; };
+  // Only the names the sliced expressions actually reference. Not a sandbox — a drift guard.
+  const fn = new Function("execSync", "process", "scrubInboundAuthEnv", `return (${slice});`);
+  fn(execSync, { env: { PROXY_API_KEY: "ocp_secretlongvalue1", OCP_ADMIN_KEY: "ocp_adminlongvalue1",
+                        PROXY_ANONYMOUS_KEY: "ocp_anonlongvalue11", CLAUDE_CODE_OAUTH_TOKEN: "sk-ant-outbound",
+                        PATH: "/usr/bin" } },
+     scrubInboundAuthEnv);
+  return seen;
+}
+
+for (const [label, marker] of [["which claude", "which claude 2>/dev/null"],
+                               ["claude --version", "claude --version 2>/dev/null"],
+                               ["claude -p auth probe", "--no-session-persistence"]]) {
+  test(`#328: setup.mjs's \`${label}\` spawn does not hand the child OCP's inbound credentials`, () => {
+    const opts = _s328Env(_s328Slice(marker));
+    assert.ok(opts && opts.env, `${label}: the sliced call passed no env at all — that IS the leak`);
+    // Control first: the env is populated and the outbound credential survives, so an empty
+    // object cannot satisfy the assertions below.
+    assert.equal(opts.env.CLAUDE_CODE_OAUTH_TOKEN, "sk-ant-outbound",
+      `${label}: control — the OUTBOUND credential must reach the child`);
+    for (const name of INBOUND_AUTH_ENV_VARS) {
+      assert.ok(!(name in opts.env), `${label}: ${name} reaches the child`);
+    }
+    assert.ok(!JSON.stringify(opts.env).includes("ocp_secretlongvalue1"),
+      `${label}: the VALUE reached the child under some other name`);
+  });
+}
+
+test("#328 (P1 from review 3): a secret aliased under ANOTHER name is removed by VALUE", () => {
+  // OCP itself creates this: `ocp-connect` writes the user's OCP credential into OPENAI_API_KEY —
+  // shell rc, `launchctl setenv` (user domain), `~/.config/environment.d/` — and OCP's own
+  // autostart runs in exactly those scopes. So on any host that ran `ocp connect`, deleting by
+  // name alone left the same secret reaching the child under a different variable.
+  const SECRET = "ocp_averylongsecretvalue123456";
+  const { env, removed } = scrubInboundAuthEnv({
+    PROXY_API_KEY: SECRET, OPENAI_API_KEY: SECRET, OPENAI_BASE_URL: "http://127.0.0.1:3456/v1", PATH: "/usr/bin",
+  });
+  assert.ok(!("OPENAI_API_KEY" in env), "the aliased carrier must go, even though its NAME is not on the list");
+  assert.ok(removed.includes("OPENAI_API_KEY"), "and it must be reported, so the behaviour is assertable");
+  assert.ok(!JSON.stringify(env).includes(SECRET), "the VALUE must not survive under any name");
+  assert.equal(env.OPENAI_BASE_URL, "http://127.0.0.1:3456/v1",
+    "a same-prefix variable that is NOT the secret must survive — this removes a credential, not a namespace");
+  assert.equal(env.PATH, "/usr/bin", "and unrelated variables are untouched");
+});
+
+test("#328 (P1 from review 4): a PER-USER `ocp keys add` credential is removed by FORMAT", () => {
+  // The path both earlier passes are structurally blind to. `ocp-connect`'s documented flow when
+  // the remote requires auth is `ocp keys add <name>`; that key lives in OCP's SQLite store, not
+  // in any environment variable the scrub can observe, so it is neither one of the three names
+  // nor equal to any of their values. In multi mode PROXY_API_KEY is typically unset, which makes
+  // the by-VALUE pass entirely inert — measured: removed: [] with the key untouched.
+  const perUser = "ocp_" + "A".repeat(32);
+  const { env, removed } = scrubInboundAuthEnv({ CLAUDE_AUTH_MODE: "multi", OPENAI_API_KEY: perUser,
+                                                 OPENAI_BASE_URL: "http://host:3456/v1", PATH: "/usr/bin" });
+  assert.ok(removed.includes("OPENAI_API_KEY"), "a key this proxy issued must not reach a child, under any name");
+  assert.ok(!JSON.stringify(env).includes(perUser), "and its value must be gone entirely");
+  assert.equal(env.OPENAI_BASE_URL, "http://host:3456/v1", "the base URL is not a secret and must survive");
+});
+
+test("#328: the issued-key pattern is exact — it matches what keys.mjs mints and nothing else", () => {
+  // Matched by FORMAT rather than by name because ocp-connect puts it in OPENAI_API_KEY today but
+  // nothing constrains it to that. The shape is `ocp_` + exactly 32 base64url chars, which is
+  // `randomBytes(24).toString("base64url")` — asserted against a REAL mint, not a hand-written
+  // literal, so a change to the key format fails this instead of silently disabling the pass.
+  const real = "ocp_" + randomBytes(24).toString("base64url");
+  assert.ok(scrubInboundAuthEnv({ X: real }).removed.includes("X"), "a genuinely minted key must match");
+  for (const near of ["ocp_short", "ocp_" + "A".repeat(31), "ocp_" + "A".repeat(33),
+                      "sk-proj-a-genuine-openai-key", "ocp-" + "A".repeat(32), "prefix_ocp_" + "A".repeat(32)]) {
+    assert.ok(!scrubInboundAuthEnv({ X: near }).removed.includes("X"),
+      `${near.slice(0, 22)}… must NOT match — over-matching would delete unrelated variables`);
+  }
+});
+
+test("#328: a legitimate OPENAI_API_KEY that is NOT OCP's credential is left alone", () => {
+  // The reason this is done by value and not by adding OPENAI_API_KEY to the name list: a child
+  // can legitimately need a real OpenAI key (an MCP server loaded via CLAUDE_MCP_CONFIG). The
+  // goal is to remove OCP's credential, not to blank that variable.
+  const { env } = scrubInboundAuthEnv({ PROXY_API_KEY: "ocp_thisisocpsownkey000000", OPENAI_API_KEY: "sk-proj-a-real-openai-key" });
+  assert.equal(env.OPENAI_API_KEY, "sk-proj-a-real-openai-key", "an unrelated key must survive");
+});
+
+test("#328: a SHORT secret does not trigger collateral deletion by value", () => {
+  // Value-matching on a short secret would strip every variable that happens to share it. Below
+  // the length floor only the name-based pass applies — stated as a deliberate limit, not a bug.
+  const { env, removed } = scrubInboundAuthEnv({ PROXY_API_KEY: "1", DEBUG: "1", VERBOSE: "1" });
+  assert.deepEqual(removed, ["PROXY_API_KEY"], "only the named one goes");
+  assert.equal(env.DEBUG, "1", "a flag that merely shares the value must not be collateral");
+  assert.equal(env.VERBOSE, "1");
+});
+
+test("#328: the var list is the single source both scrub sites read", () => {
+  // Not a source-grep: this asserts the exported list's CONTENT, which is what server.mjs's two
+  // call sites consume. Adding a fourth inbound-auth var without adding it here makes this fail.
+  assert.deepEqual([...INBOUND_AUTH_ENV_VARS].sort(), ["OCP_ADMIN_KEY", "PROXY_ANONYMOUS_KEY", "PROXY_API_KEY"]);
+  assert.throws(() => { INBOUND_AUTH_ENV_VARS.push("X"); }, "frozen, so no caller can widen it at runtime");
+});
+
+// #308 / ADR 0014 — applyRequestVerdictTtl. The LATCH guard: a verdict raised by a real request
+// must expire, because on an env-token host nothing else can ever lower it.
+test("#308: a request-verified verdict decays to null past the window", () => {
+  const st = { ok: true, okSource: "request", okAt: 1000, lastCheck: 1000, lastOutcome: "token-present" };
+  assert.equal(applyRequestVerdictTtl(st, 1000 + 900000, 900000).ok, true, "exactly at the window edge is still fresh");
+  const stale = applyRequestVerdictTtl(st, 1000 + 900001, 900000);
+  assert.equal(stale.ok, null, "past the window the honest value is 'we do not know', not 'it works'");
+  assert.equal(stale.okSource, "expired", "and it must say WHY it is null, not just that it is");
+  assert.match(stale.message, /older than the verification window/);
+});
+
+test("#308 (P2 from review 2): every verdict-writing branch carries okSource and okAt", async () => {
+  // The rejected branch built a fresh object without them, so after a conclusive rejection the
+  // two fields VANISHED from /health — a fifth state ("absent") outside the domain ADR 0014 and
+  // the README document. Found by execution, not by reading.
+  const src = _ltRead(spotJoin(_spotDir, "server.mjs"), "utf8");
+  const block = src.slice(src.indexOf("async function checkAuth("), src.indexOf("// Check auth on start"));
+  assert.ok(block.length > 0, "anchor drift — checkAuth slice is empty");
+  // `authStatus = [^;]*;`, not `authStatus = \{...\};`. The narrower pattern could not match the
+  // token-present write, which is a TERNARY (`authStatus = cond ? {…} : {…};`) — measured: 4 of 5
+  // assignments matched, and the `>= 4` floor passed with the most complex branch invisible. A
+  // guard that silently excludes the hardest case is the defect this PR was bitten by twice.
+  const writes = block.match(/authStatus = [^;]*;/gs) || [];
+  assert.equal(writes.length, 5,
+    `expected EXACTLY the five verdict-writing branches — an exact count fails when one is added ` +
+    `or hidden, which a floor does not; found ${writes.length}`);
+  for (const w of writes) {
+    // The inconclusive branches spread ...authStatus, which carries the fields forward; the
+    // others must name them. Either satisfies the contract; neither is allowed to drop them.
+    assert.ok(w.includes("...authStatus") || (w.includes("okSource") && w.includes("okAt")),
+      `a verdict write neither preserves nor sets okSource/okAt: ${w.replace(/\s+/g, " ").slice(0, 120)}`);
+  }
+});
+
+test("#308 (P1 from review): ONE inconclusive probe must not disarm the window forever", () => {
+  // The reviewer's sequence, executed. Before the fix this returned ok:true at T+100h: the TTL
+  // keyed on lastOutcome, and an inconclusive probe rewrites lastOutcome while preserving ok, so
+  // a request-established verdict stopped matching and became permanent — the unbounded false
+  // `true` this whole design exists to prevent, reintroduced by its own guard.
+  const T = 1_000_000, TTL = 900_000;
+  const afterTimeoutProbe = { ok: true, okSource: "request", okAt: T,
+                              lastCheck: T + 600_000, lastOutcome: "timeout" };
+  assert.equal(applyRequestVerdictTtl(afterTimeoutProbe, T + 10 * 60_000, TTL).ok, true,
+    "inside the window it is still fresh — the probe outcome is irrelevant to that");
+  for (const mins of [16, 60, 6000]) {
+    const r = applyRequestVerdictTtl(afterTimeoutProbe, T + mins * 60_000, TTL);
+    assert.equal(r.ok, null, `at T+${mins}min the verdict must have expired despite the probe having rewritten lastOutcome`);
+  }
+});
+
+test("#308: the window is keyed on okAt, which only a REQUEST advances", () => {
+  // The other half of the same defect: probes complete every ~610s by default, so a window keyed
+  // on lastCheck could never elapse — dead code describing a semantic the system did not have.
+  const T = 0, TTL = 900_000;
+  let st = { ok: true, okSource: "request", okAt: T, lastCheck: T, lastOutcome: "token-present" };
+  for (let tick = 1; tick <= 3; tick++) st = { ...st, lastCheck: tick * 600_000, lastOutcome: "token-present" };
+  assert.equal(applyRequestVerdictTtl(st, 1_800_000, TTL).ok, null,
+    "three probe ticks must not have refreshed the request verdict's clock");
+});
+
+test("#308: only a request-verified verdict decays — probe verdicts are not this function's business", () => {
+  const now = 10_000_000;
+  for (const src of ["probe", "none", "expired", undefined]) {
+    const st = { ok: true, okAt: 0, okSource: src, lastOutcome: "authenticated" };
+    assert.equal(applyRequestVerdictTtl(st, now, 1).ok, true,
+      `okSource=${String(src)} is not a request verdict and must be left alone, however old`);
+  }
+});
+
+test("#308: a malformed okAt EXPIRES the verdict — the guard must fail closed", () => {
+  // A missing/NaN timestamp must not evaluate as "infinitely old" — NaN comparisons are false,
+  // which happens to be the safe direction here, but relying on that by accident is how the
+  // NaN-passes-every-threshold class of bug happens. Asserted so it is by construction.
+  // This test asserted the OPPOSITE for one revision, and the assertion was wrong rather than the
+  // code. A verdict whose timestamp cannot be read is a verdict whose freshness cannot be
+  // established, and this field grants trust — so the unexamined input must fall to "expired",
+  // not to "still valid". A reviewer caught that the fix for the original NaN bug had inverted
+  // the failure direction of the criterion it was written to serve.
+  //
+  // Labels are String(), not JSON.stringify(): JSON.stringify(NaN) is "null", which made an
+  // earlier failure of this test point at the wrong value entirely.
+  for (const bad of [undefined, null, "1000", NaN, Infinity, {}]) {
+    const st = { ok: true, okSource: "request", okAt: bad, lastOutcome: "token-present" };
+    const r = applyRequestVerdictTtl(st, 10_000_000, 1);
+    assert.equal(r.ok, null, `okAt=${String(bad)} must expire the verdict, not preserve it`);
+    assert.equal(r.okSource, "expired", `okAt=${String(bad)} must say why`);
+  }
+  // A probe verdict with a malformed okAt is NOT this function's business and stays untouched.
+  assert.equal(applyRequestVerdictTtl({ ok: true, okSource: "probe", okAt: NaN }, 10_000_000, 1).ok, true);
+});
+
 // Pure, dependency-injected primitives extracted from server.mjs so the spawn-token concurrency /
 // caching / expiry logic is testable without booting the server or mocking execFileSync/spawn.
 console.log("\nSpawn-auth (F3 mutex / F5 TTL cache + label memo / F6 expiry gate):");
@@ -8020,15 +9388,23 @@ import { tmpdir as tmpdir2 } from "node:os";
 // Fake tmux that records the spawned pane command and always looks ready + pasted.
 function makeTmuxRecorder() {
   const cmds = [];
-  const tmux = (args) => {
+  const opts = [];
+  // #328: the second argument was dropped, which is why the tmux-SERVER env scrub had no test —
+  // removing it left the suite fully green while an execution probe showed the layer is
+  // load-bearing. Capturing it makes that a unit test needing no real tmux at all.
+  const tmux = (args, o) => {
     cmds.push(args);
+    opts.push(o);
     if (args[0] === "capture-pane") {
       // input bar present AND the prompt visibly landed → both polls pass immediately
       return { status: 0, stdout: "[Pasted text #1 +2 lines]\n ? for shortcuts" };
     }
     return { status: 0, stdout: "" };
   };
-  return { tmux, cmds, paneCmd: () => (cmds.find((a) => a[0] === "new-session") || []).slice(-1)[0] || "" };
+  const newSessionIdx = () => cmds.findIndex((a) => a[0] === "new-session");
+  return { tmux, cmds, opts,
+    paneCmd: () => (cmds.find((a) => a[0] === "new-session") || []).slice(-1)[0] || "",
+    newSessionOpts: () => { const i = newSessionIdx(); return i === -1 ? undefined : opts[i]; } };
 }
 
 // A HOME with one already-terminal transcript for `sid`, so readTuiTranscript returns at once.
@@ -8041,6 +9417,36 @@ function seedTranscript(home, sid, text) {
     turn_duration: 1234, cc_entrypoint: "cli",
   }) + "\n");
 }
+
+test("#328: bootTuiPane scrubs the inbound secrets from the TMUX SERVER's environment too", async () => {
+  // A tmux server STARTED by this spawn inherits this env, and every later pane inherits from the
+  // server — so this layer leaks independently of the pane's `env -u` prefix, and it is reachable
+  // cross-platform from inside the pane via `tmux show-environment -g`, not only through Linux
+  // /proc. An independent reviewer measured both. Without this test, deleting the scrub left the
+  // whole suite green.
+  const saved = {};
+  for (const k of INBOUND_AUTH_ENV_VARS) { saved[k] = process.env[k]; process.env[k] = `lt-${k}`; }
+  const savedTok = process.env.CLAUDE_CODE_OAUTH_TOKEN;
+  process.env.CLAUDE_CODE_OAUTH_TOKEN = "lt-outbound";
+  try {
+    const home = mkdtemp2(`${tmpdir2()}/ocp-t-`);
+    const rec = makeTmuxRecorder();
+    await bootPaneUnderTest({ model: "sonnet", claudeBin: "claude", home, realHome: home,
+                              cwd: `${home}/wk`, port: 3456, tmux: rec.tmux });
+    const o = rec.newSessionOpts();
+    assert.ok(o && o.env, "new-session must have been given an env — otherwise this asserts nothing");
+    // Control first: the instrument works and the env is a real one, not an empty object.
+    assert.equal(o.env.CLAUDE_CODE_OAUTH_TOKEN, "lt-outbound",
+      "the OUTBOUND credential must reach the tmux server — control that this env is populated");
+    for (const k of INBOUND_AUTH_ENV_VARS) {
+      assert.ok(!(k in o.env), `${k} must not reach the tmux server's environment`);
+      assert.ok(!JSON.stringify(o.env).includes(`lt-${k}`), `${k}'s VALUE must not survive under another name`);
+    }
+  } finally {
+    for (const k of INBOUND_AUTH_ENV_VARS) { if (saved[k] === undefined) delete process.env[k]; else process.env[k] = saved[k]; }
+    if (savedTok === undefined) delete process.env.CLAUDE_CODE_OAUTH_TOKEN; else process.env.CLAUDE_CODE_OAUTH_TOKEN = savedTok;
+  }
+});
 
 test("bootTuiPane with a streamDir installs the hook AT BOOT and hands the sink back on the pane", async () => {
   const home = mkdtemp2(`${tmpdir2()}/ocp-t-`);
@@ -8525,10 +9931,17 @@ finally:
 // ~/.openclaw/openclaw.json model picker); or maxTokens silently becoming a STRING (JS's `<=`
 // operator coerces `"32000" <= 32000` to `true`). This is the one assertion that catches all
 // four (#218 review HIGH-2 / MED-4).
+// #309 added `contextWindow` to every row and four SPECIFIC-id rows. contextWindow is not a
+// family property — claude-opus-5 is 1M and claude-opus-4-6 is 200k, same prefix — so the
+// specific rows are what express it, winning via get_model_meta's existing longest-prefix sort.
 const _OC_EXPECTED_MODEL_META_TABLE = {
-  "claude-opus": { name: "Claude Opus (OCP)", reasoning: true, maxTokens: 64000 },
-  "claude-sonnet": { name: "Claude Sonnet (OCP)", reasoning: true, maxTokens: 32000 },
-  "claude-haiku": { name: "Claude Haiku (OCP)", reasoning: false, maxTokens: 32000 },
+  "claude-opus": { name: "Claude Opus (OCP)", reasoning: true, maxTokens: 64000, contextWindow: 200000 },
+  "claude-sonnet": { name: "Claude Sonnet (OCP)", reasoning: true, maxTokens: 32000, contextWindow: 200000 },
+  "claude-haiku": { name: "Claude Haiku (OCP)", reasoning: false, maxTokens: 32000, contextWindow: 200000 },
+  "claude-opus-5": { name: "Claude Opus (OCP)", reasoning: true, maxTokens: 64000, contextWindow: 1000000 },
+  "claude-opus-4-8": { name: "Claude Opus (OCP)", reasoning: true, maxTokens: 64000, contextWindow: 1000000 },
+  "claude-opus-4-7": { name: "Claude Opus (OCP)", reasoning: true, maxTokens: 64000, contextWindow: 1000000 },
+  "claude-sonnet-5": { name: "Claude Sonnet (OCP)", reasoning: true, maxTokens: 64000, contextWindow: 1000000 },
 };
 
 test("ocp-connect: model_meta table matches a pinned snapshot EXACTLY (name + reasoning + maxTokens, not just an upper bound)", () => {
@@ -8537,6 +9950,43 @@ test("ocp-connect: model_meta table matches a pinned snapshot EXACTLY (name + re
     "ocp-connect's model_meta table drifted from the pinned snapshot above — a deleted row, an " +
     "under-advertising drift, a changed `name`, or a stringified maxTokens would all pass the " +
     "<=-based tests below silently; this is the test that catches them");
+});
+
+// Issue #309. The test immediately below asserts `<=` — "never OVER-advertises". #309 was an
+// UNDER-advertisement, which `<=` passes by definition, so the suite was structurally blind to
+// it: `contextWindow` was a hardcoded 200000 in the write loop and four of the seven models are
+// natively 1M, and separately `claude-sonnet-5` inherited the family's 32000 maxTokens when its
+// real value is 64000. Neither could ever fail a `<=` check.
+//
+// This asserts EQUALITY against models.json for both numeric columns, for every id the SPOT
+// declares. It is what makes a future model added to models.json — or a window changed there —
+// fail here until ocp-connect is updated too, instead of silently shipping a client capped low.
+test("#309: every models.json id classifies to EXACTLY the SPOT's contextWindow and maxTokens (equality — the <= test below cannot see an under-advertisement)", () => {
+  const ids = _spotModels.models.map((m) => m.id);
+  const classified = _ocClassify(ids);
+  const mismatches = [];
+  for (const m of _spotModels.models) {
+    const got = classified[m.id];
+    assert.ok(got, `ocp-connect get_model_meta returned nothing for ${m.id}`);
+    const wantCtx = m.contextWindow;
+    const wantMax = m.maxOutputTokens ?? m.maxTokens;
+    assert.equal(typeof got.contextWindow, "number", `${m.id}: contextWindow must be a number, got ${typeof got.contextWindow}`);
+    assert.equal(typeof got.maxTokens, "number", `${m.id}: maxTokens must be a number, got ${typeof got.maxTokens}`);
+    if (got.contextWindow !== wantCtx) mismatches.push(`${m.id}: contextWindow=${got.contextWindow}, models.json says ${wantCtx}`);
+    if (got.maxTokens !== wantMax) mismatches.push(`${m.id}: maxTokens=${got.maxTokens}, models.json says ${wantMax}`);
+  }
+  assert.deepEqual(mismatches, [],
+    `ocp-connect writes these numbers straight into a user's ~/.openclaw/openclaw.json, so a ` +
+    `divergence from the SPOT caps (or over-promises) every client it onboards:\n  ` + mismatches.join("\n  "));
+});
+
+test("#309 control: an id absent from the table still falls back to the conservative floor, not to a 1M row", () => {
+  // The specific 1M rows must not become a default for unknown ids: get_model_meta's fallback is
+  // the smallest window any known model declares, so an unrecognised id is capped at a value
+  // every model can honour rather than handed a promise the server would have to truncate.
+  const got = _ocClassify(["claude-3-5-haiku-20241022"])["claude-3-5-haiku-20241022"];
+  assert.equal(got.contextWindow, 200000, `unknown ids must inherit the floor; got ${got.contextWindow}`);
+  assert.equal(got.maxTokens, 8192, `unknown-id maxTokens fallback must be unchanged by #309; got ${got.maxTokens}`);
 });
 
 test("ocp-connect: every models.json id classifies at or below its CLI-registry maxTokens (never over-advertises)", () => {
@@ -8574,10 +10024,14 @@ test("ocp-connect: reasoning classification matches models.json ground truth for
 // same way HIGH-2 pins the model_meta table — this is what closes that gap and is what makes the
 // "covers ... the loop" scope claim above actually true (previously only 4 of the 7 fields the
 // loop writes were checked).
+// #309 moved `contextWindow` OUT of this snapshot. It was pinned here precisely BECAUSE
+// get_model_meta() did not return it, so the meta-diff below structurally could not see it. That
+// is no longer true — it is a classifier output now, asserted against the classifier below and
+// against models.json itself in the #309 test above. Leaving a literal 200000 pinned here would
+// have re-frozen the exact number the issue was about, in the exact place that made it invisible.
 const _OC_EXPECTED_PROVIDER_MODEL_LITERALS = {
   input: ["text"],
   cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-  contextWindow: 200000,
 };
 
 test("ocp-connect: the provider.models write loop produces the exact entry — meta-derived fields verbatim, plus the pinned literal constants", () => {
@@ -8608,13 +10062,18 @@ test("ocp-connect: the provider.models write loop produces the exact entry — m
       `get_model_meta's classification (${JSON.stringify(meta.reasoning)})`);
     assert.equal(entry.name, meta.name,
       `${entry.id}: provider.models.name=${JSON.stringify(entry.name)} does not match get_model_meta's classification`);
-    // MED-2: the three literal-constant fields — invisible to the meta-diff above by construction.
+    // #309: contextWindow is meta-derived now, not a literal. This is what proves the write loop
+    // actually reads meta["contextWindow"] rather than re-hardcoding a number — exactly the
+    // mapping-level mutation MED-3 added this test for, applied to the field #309 was about.
+    assert.equal(entry.contextWindow, meta.contextWindow,
+      `${entry.id}: provider.models contextWindow=${JSON.stringify(entry.contextWindow)} does not match ` +
+      `get_model_meta's contextWindow=${JSON.stringify(meta.contextWindow)} — the write loop is not ` +
+      `copying the classifier's output verbatim`);
+    // MED-2: the remaining literal-constant fields — invisible to the meta-diff above by construction.
     assert.deepEqual(entry.input, _OC_EXPECTED_PROVIDER_MODEL_LITERALS.input,
       `${entry.id}: provider.models.input=${JSON.stringify(entry.input)}, want ${JSON.stringify(_OC_EXPECTED_PROVIDER_MODEL_LITERALS.input)}`);
     assert.deepEqual(entry.cost, _OC_EXPECTED_PROVIDER_MODEL_LITERALS.cost,
       `${entry.id}: provider.models.cost=${JSON.stringify(entry.cost)}, want ${JSON.stringify(_OC_EXPECTED_PROVIDER_MODEL_LITERALS.cost)}`);
-    assert.equal(entry.contextWindow, _OC_EXPECTED_PROVIDER_MODEL_LITERALS.contextWindow,
-      `${entry.id}: provider.models.contextWindow=${JSON.stringify(entry.contextWindow)}, want ${JSON.stringify(_OC_EXPECTED_PROVIDER_MODEL_LITERALS.contextWindow)}`);
   }
 });
 
@@ -10064,6 +11523,125 @@ test("classifyWorkingTree: no expected working tree provided → unknown (never 
   assert.equal(classifyWorkingTree("/home/opc/ocp", "").state, "unknown");
   assert.equal(classifyWorkingTree("/home/opc/ocp", null).state, "unknown");
   assert.equal(classifyWorkingTree("/home/opc/ocp", undefined).state, "unknown");
+});
+
+// ── Issue #290: launchd has TWO domains, and only one was ever probed ────────
+// The gather step ran `launchctl print gui/$(id -u)/dev.ocp.proxy` and nothing else. A root
+// LaunchDaemon — a supported deployment; scripts/doctor.mjs's own multi-unit-risk check looks for
+// /Library/LaunchDaemons — is genuinely not registered in `gui`, so the probe returned the
+// "not-registered" sentinel, resolution reported no-unit, and the operator was told to bring up a
+// service that was already running. Fail-closed and loud, but on a false premise, and permanent.
+//
+// This module's own comments were why nobody looked: both said there is "no multi-label ambiguity
+// to resolve the way Linux has system-vs-user scope". That conflates two things and denies the
+// real one — there is no multi-LABEL ambiguity, but launchd has exactly the system-vs-user DOMAIN
+// split those words dismissed. Corrected in place.
+//
+// Scope: this DETECTS the system domain and refuses accurately. It does not restart a root
+// LaunchDaemon — that needs `sudo launchctl`, and running sudo from the upgrade path is a
+// different operation with its own hazard surface. The deliverable is that a confusing dead end
+// becomes an actionable one.
+console.log("\nRestart-unit resolution (issue #290) — launchd's gui vs system domain:");
+
+const _d290_running =
+  "dev.ocp.proxy = {\n\tpid = 4242\n\tstate = running\n\targuments = {\n" +
+  "\t\t/opt/homebrew/bin/node\n\t\t/Users/tester/ocp/server.mjs\n\t}\n}";
+const _d290_lsof = "node 4242 tester 22u IPv4 0x1 0t0 TCP 127.0.0.1:3456 (LISTEN)";
+const _d290_probe = (extra) => ({ platform: "darwin", lsofOutput: _d290_lsof, ...extra });
+
+// The escalation RULE itself. Everything above proves what happens once a domain is known; these
+// prove how it becomes known — and specifically that "" (gui says not registered here) escalates
+// while `null` (gui could not tell) does NOT. Getting that backwards would trade a permanent
+// refusal for a confident claim about a domain with no evidence behind it, which is the failure
+// mode mapLaunchctlPrintFailureToProbeValue exists to prevent.
+const _d290_notFound = (dom) => { const e = new Error("Bad request."); e.stdout = ""; e.stderr = `Could not find service "dev.ocp.proxy" in domain for ${dom}`; return e; };
+
+test("#290: gui says NOT REGISTERED → the system domain is probed, and a daemon found there wins", () => {
+  const calls = [];
+  const r = probeLaunchdDomains((cmd) => {
+    calls.push(cmd);
+    if (cmd.includes("gui/")) throw _d290_notFound("user gui: 501");
+    return _d290_running;
+  }, "dev.ocp.proxy");
+  assert.equal(r.launchdDomain, "system", `expected escalation; calls=${JSON.stringify(calls)}`);
+  assert.equal(r.launchdPrintOutput, _d290_running);
+  assert.equal(calls.length, 2, `both domains must be probed; got ${JSON.stringify(calls)}`);
+  assert.match(calls[1], /launchctl print system\/dev\.ocp\.proxy/);
+});
+
+test("#290 (the gate): gui COULD NOT TELL (null) → the system domain must NOT be probed", () => {
+  // A permission failure, a missing launchctl, or an unrecognised error. Escalating here would
+  // turn an honest "unknown" into a claim about a domain we have no evidence for — and "unknown"
+  // is the verdict that makes resolveOwningUnit refuse rather than guess.
+  const calls = [];
+  const r = probeLaunchdDomains((cmd) => {
+    calls.push(cmd);
+    const e = new Error("Operation not permitted"); e.stdout = ""; e.stderr = "launchctl: Operation not permitted"; throw e;
+  }, "dev.ocp.proxy");
+  assert.equal(r.launchdPrintOutput, null, "an unrecognised failure stays 'unknown'");
+  assert.equal(calls.length, 1, `only gui may be probed; got ${JSON.stringify(calls)}`);
+  assert.equal(r.launchdDomain, "gui");
+});
+
+test("#290: registered in NEITHER domain stays 'not-registered' in the gui domain (the install-it remediation target)", () => {
+  const calls = [];
+  const r = probeLaunchdDomains((cmd) => {
+    calls.push(cmd);
+    throw _d290_notFound(cmd.includes("gui/") ? "user gui: 501" : "system");
+  }, "dev.ocp.proxy");
+  assert.equal(r.launchdPrintOutput, "", "both said not-registered, so the answer is still not-registered");
+  assert.equal(r.launchdDomain, "gui", "and the remediation target stays gui, where `ocp` installs it");
+  assert.equal(calls.length, 2, "but both were asked");
+});
+
+test("#290: the common case (registered in gui) never probes the system domain at all", () => {
+  const calls = [];
+  const r = probeLaunchdDomains((cmd) => { calls.push(cmd); return _d290_running; }, "dev.ocp.proxy");
+  assert.equal(r.launchdDomain, "gui");
+  assert.equal(calls.length, 1, `no extra shell-out on the common path; got ${JSON.stringify(calls)}`);
+});
+
+test("#290 (the money test): a job found in the SYSTEM domain gets its own outcome, not 'no-unit'", () => {
+  const owner = resolveOwningUnit(_d290_probe({ launchdPrintOutput: _d290_running, launchdDomain: "system" }),
+    { expectedUnit: "dev.ocp.proxy", port: 3456 });
+  assert.equal(owner.kind, "launchd-system-domain",
+    `a root LaunchDaemon that is running, owns the port, and runs server.mjs is not "unmanaged" — ` +
+    `reporting no-unit here is what made this a permanent dead end; got ${JSON.stringify(owner)}`);
+  assert.equal(owner.pid, "4242");
+});
+
+test("#290: planRestart REFUSES a system-domain job, and hands over the sudo commands instead of blaming the service", () => {
+  const owner = resolveOwningUnit(_d290_probe({ launchdPrintOutput: _d290_running, launchdDomain: "system" }),
+    { expectedUnit: "dev.ocp.proxy", port: 3456 });
+  assert.throws(
+    () => planRestart(owner, { expectedUnit: "dev.ocp.proxy", plistPath: "/x.plist" }),
+    (e) => {
+      assert.match(e.message, /is running correctly/, "must not imply the service is broken");
+      assert.match(e.message, /sudo launchctl bootout system\/dev\.ocp\.proxy/, "must give the exact bootout");
+      assert.match(e.message, /sudo launchctl bootstrap system \/Library\/LaunchDaemons\//, "must give the exact bootstrap");
+      assert.ok(!/bring it under launchd/.test(e.message),
+        "must NOT repeat the pre-#290 advice to bring up a service that is already running");
+      return true;
+    },
+  );
+});
+
+test("#290 control: a gui-domain job still produces the normal restart plan (the fix refuses only the domain it must)", () => {
+  const owner = resolveOwningUnit(_d290_probe({ launchdPrintOutput: _d290_running, launchdDomain: "gui" }),
+    { expectedUnit: "dev.ocp.proxy", port: 3456 });
+  assert.equal(owner.kind, "launchd");
+  const plan = planRestart(owner, { expectedUnit: "dev.ocp.proxy", plistPath: "/x.plist" });
+  assert.ok(plan.cmds.some(c => /bootstrap gui\/\$\(id -u\)/.test(c.cmd)),
+    `the common case must be untouched; got ${JSON.stringify(plan.cmds.map(c => c.cmd))}`);
+});
+
+test("#290 back-compat: a probe with NO launchdDomain field behaves exactly as before (pre-#290 callers)", () => {
+  // Mirrors the `probe.launchdPrintOutput === undefined` convention a few lines away in the module:
+  // a field a caller never set must not newly refuse restarts that worked before it existed.
+  const owner = resolveOwningUnit(_d290_probe({ launchdPrintOutput: _d290_running }),
+    { expectedUnit: "dev.ocp.proxy", port: 3456 });
+  assert.equal(owner.kind, "launchd", `absent domain must not be treated as "system"; got ${JSON.stringify(owner)}`);
+  assert.doesNotThrow(() => planRestart(owner, { expectedUnit: "dev.ocp.proxy", plistPath: "/x.plist" }));
 });
 
 console.log("\nRestart-unit resolution (issue #239) — classifyLaunchdJob:");
@@ -13015,6 +14593,180 @@ test("#278 cmd_connect: the diagnostic now goes to stderr, not stdout (previousl
   assert.equal(r.stdout.includes("Cannot reach"), false, `the diagnostic must not land on stdout; got stdout=${JSON.stringify(r.stdout)}`);
 });
 
+// Issues #296, #299, #300: the probes the #261 → #267 → #273 → #278 → #286 arc left behind.
+// Each collapsed "curl could not be run" into an `else` branch that asserts a SPECIFIC cause —
+// "bound to localhost only", "Proxy not responding after restart", "key may be invalid or
+// revoked", "proxy is reachable but chat completion did not succeed" — so a local environment
+// fault was narrated as a fact about the proxy, with remediation pointing the wrong way.
+//
+// These are behavioral, not textual. A source-grep for `curl` would have been the cheap guard
+// (#300 suggested one), but it passes the moment a bare curl reappears in a shape the pattern
+// did not anticipate — which is exactly how three separate enumeration passes each believed
+// they had the full list and each was wrong. Every case below removes curl (or makes it exit
+// 127) and asserts on what the command SAYS, and every one is paired with a control proving the
+// genuine-remote-failure diagnosis is still produced — otherwise "we deleted the wrong message"
+// would pass just as well as "we fixed it".
+console.log("\nocp: the remaining bare-curl probes distinguish a local fault from a remote condition (#296, #299, #300):");
+
+test("#296 ocp lan: curl missing from $PATH must NOT be narrated as 'bound to localhost only'", () => {
+  const r = _bwHarnessRun({ args: ["lan"], curlAbsent: true });
+  assert.ok(!r.stdout.includes("bound to localhost only") && !r.stderr.includes("bound to localhost only"),
+    `a missing local curl must not be reported as a proxy bind-address fact — the remediation printed ` +
+    `directly under that line sends the operator to set CLAUDE_BIND and restart a service that was ` +
+    `never the problem; stdout=${JSON.stringify(r.stdout)} stderr=${JSON.stringify(r.stderr)}`);
+  assert.ok(/curl/i.test(r.stderr), `expected the message to name curl, got stderr=${JSON.stringify(r.stderr)}`);
+  assert.ok(r.stdout.includes("Undetermined"),
+    `the status line must decline to characterise LAN reachability at all, got stdout=${JSON.stringify(r.stdout)}`);
+});
+
+test("#296 control: ocp lan with curl present but the port genuinely unreachable still says 'Not LAN-accessible'", () => {
+  const r = _bwHarnessRun({ args: ["lan"] });
+  assert.ok(r.stdout.includes("Not LAN-accessible"),
+    `a GENUINE unreachable port must still produce the original diagnosis — proves the fix does not ` +
+    `simply delete the message, got stdout=${JSON.stringify(r.stdout)}`);
+  assert.ok(!r.stdout.includes("Undetermined"),
+    `and must NOT take the undetermined arm, got stdout=${JSON.stringify(r.stdout)}`);
+});
+
+test("#299 cmd_restart: curl missing from $PATH must NOT report a successful restart as 'Proxy not responding after restart'", () => {
+  const r = _bwHarnessRun({ args: ["restart"], overrideCmdRestart: false, serviceStubsSucceed: true, curlAbsent: true });
+  assert.ok(!r.stdout.includes("Proxy not responding after restart") && !r.stderr.includes("Proxy not responding after restart"),
+    `this probe is the restart's OWN verdict and it reaches _cmd_update_light's restart_status (#255) — ` +
+    `a local curl fault must not be reported as the proxy being down; ` +
+    `stdout=${JSON.stringify(r.stdout)} stderr=${JSON.stringify(r.stderr)}`);
+  assert.ok(r.stdout.includes("UNKNOWN"),
+    `the verdict must say the proxy's state is unknown rather than asserting either outcome, got stdout=${JSON.stringify(r.stdout)}`);
+  assert.ok(/curl/i.test(r.stderr), `expected the message to name curl, got stderr=${JSON.stringify(r.stderr)}`);
+});
+
+test("#299 control: cmd_restart with curl present but the proxy genuinely not answering still says 'Proxy not responding after restart'", () => {
+  const r = _bwHarnessRun({ args: ["restart"], overrideCmdRestart: false, serviceStubsSucceed: true, curlHealthExit: 1 });
+  assert.ok(r.stdout.includes("Proxy not responding after restart"),
+    `a GENUINE post-restart failure must still be reported as such — proves the fix does not just ` +
+    `delete the failure branch, got stdout=${JSON.stringify(r.stdout)}`);
+  assert.ok(!r.stdout.includes("UNKNOWN"),
+    `and must NOT take the undetermined arm, got stdout=${JSON.stringify(r.stdout)}`);
+});
+
+// ── #325: a restart that cannot start must not leave the service DOWN silently ──
+// The incident: on macOS the resolver emits `launchctl bootout …` then `launchctl bootstrap …`.
+// bootout succeeded, bootstrap returned EIO, and cmd_restart printed "✗ Restart command failed."
+// and returned 1 — with a healthy proxy unloaded and the port dead. "Restart command failed"
+// reads like the restart was declined; the service was in fact stopped, by this command.
+//
+// Two behaviours are pinned here: the failing command is RETRIED (the observed failure was
+// transient — the identical bootstrap succeeded by hand seconds later), and the verdict now
+// comes from the health probe rather than a subcommand's exit status, so the four combinations
+// of (command ok?, proxy up?) get four distinct messages instead of two.
+
+test("#325 (the money test): a command that fails ONCE then succeeds is retried, and the restart succeeds", () => {
+  // A self-counting command: exits 1 on the first invocation, 0 on the second. If cmd_restart
+  // still ran each resolved command exactly once, this restart would be reported as failed.
+  // NO `$`, backticks or `$((...))` anywhere in this command. The harness emits each resolved
+  // line from a fake `node` as `echo "<line>"` (test-features.mjs, resolveRestartStdout), so any
+  // shell expansion would run inside the STUB and hand cmd_restart an already-rewritten string —
+  // a harness-premise bug that makes the test measure nothing. Counting is done by appending one
+  // byte per invocation and reading the file's LENGTH; branching by the presence of a flag file.
+  const stamp = Date.now();
+  const count = join(_ltTmp(), `ocp325-count-${stamp}`);
+  const flag = join(_ltTmp(), `ocp325-flag-${stamp}`);
+  const cmd = `sh -c 'printf x >> ${count}; if [ -f ${flag} ]; then exit 0; fi; : > ${flag}; exit 1'`;
+  const r = _bwHarnessRun({ args: ["restart"], overrideCmdRestart: false, resolveRestartStdout: [cmd], curlHealthExit: 0 });
+  assert.ok(_ltExists(count), "the resolved command ran at all — if this fails the harness never executed it");
+  assert.equal(_ltRead(count, "utf8").length, 2,
+    `expected exactly 2 attempts (one failure, one retry that succeeded) — 1 means no retry happened, ` +
+    `3+ means it retried past success; got ${JSON.stringify(_ltRead(count, "utf8"))}`);
+  assert.ok(r.stdout.includes("Proxy restarted successfully"),
+    `a transient first failure must end in a plain success, got stdout=${JSON.stringify(r.stdout)} stderr=${JSON.stringify(r.stderr)}`);
+  assert.ok(!r.stdout.includes("DOWN") && !r.stderr.includes("DOWN"),
+    "a recovered transient failure must not be reported as the proxy being down");
+});
+
+test("#325: command fails after retries AND the proxy is not answering → says the service is DOWN, and how to start it", () => {
+  // A resolved command is REQUIRED: resolveRestartStdout defaults to [], the loop reads nothing,
+  // and restart_failed stays 0 no matter what serviceStubsSucceed says.
+  const r = _bwHarnessRun({ args: ["restart"], overrideCmdRestart: false, serviceStubsSucceed: false,
+    resolveRestartStdout: ["systemctl restart -- ocp.service"], curlHealthExit: 1 });
+  assert.ok(/THE PROXY IS DOWN/.test(r.stderr),
+    `the operator must be told the service is stopped RIGHT NOW, not that a command "failed"; ` +
+    `stdout=${JSON.stringify(r.stdout)} stderr=${JSON.stringify(r.stderr)}`);
+  assert.ok(/start/i.test(r.stderr), `the message must tell them how to bring it back, got stderr=${JSON.stringify(r.stderr)}`);
+  assert.notEqual(r.status, 0, "and it must still be a failure exit");
+});
+
+test("#325: command fails after retries but the proxy IS answering → not a plain success, and not DOWN", () => {
+  const r = _bwHarnessRun({ args: ["restart"], overrideCmdRestart: false, serviceStubsSucceed: false,
+    resolveRestartStdout: ["systemctl restart -- ocp.service"], curlHealthExit: 0 });
+  assert.ok(/service is UP/i.test(r.stdout) || /responding, but a restart command failed/i.test(r.stdout),
+    `a command failed but the outcome is fine — say both, got stdout=${JSON.stringify(r.stdout)}`);
+  assert.ok(!/THE PROXY IS DOWN/.test(r.stderr), "must not claim DOWN when the probe says it is up");
+  assert.equal(r.status, 0, "the service is up, so this is not a failure for callers like _cmd_update_light");
+});
+
+test("#325 (precedence): a LOCAL curl fault must stay UNKNOWN and must never be reported as DOWN", () => {
+  // The dangerous interaction: the new DOWN branch keys on "probe non-zero", and the local-fault
+  // arm (#299) is also non-zero. If ordering were wrong, a machine that merely cannot RUN curl
+  // would be told its proxy is dead — asserting a state nobody measured, which is the exact
+  // defect class #299 exists to prevent.
+  const r = _bwHarnessRun({ args: ["restart"], overrideCmdRestart: false, serviceStubsSucceed: false,
+    resolveRestartStdout: ["systemctl restart -- ocp.service"], curlAbsent: true });
+  assert.ok(!/THE PROXY IS DOWN/.test(r.stderr) && !/THE PROXY IS DOWN/.test(r.stdout),
+    `a local fault is not evidence about the proxy; stdout=${JSON.stringify(r.stdout)} stderr=${JSON.stringify(r.stderr)}`);
+  assert.ok(r.stdout.includes("UNKNOWN"), `must still say UNKNOWN, got stdout=${JSON.stringify(r.stdout)}`);
+  // The rc==2 arm is reachable in TWO states and must not describe them alike (review P2-2).
+  // Here a command also failed, so "Restart command ran" would be false — and would contradict
+  // the warning printed immediately above it.
+  assert.ok(!/Restart command ran/.test(r.stdout),
+    `with a failed command this must not claim the command ran; got stdout=${JSON.stringify(r.stdout)}`);
+  assert.ok(/FAILED after retries/.test(r.stdout),
+    `it must say the command failed; got stdout=${JSON.stringify(r.stdout)}`);
+  assert.ok(/may be down/i.test(r.stdout) && /systemctl restart/.test(r.stdout),
+    `and must offer the start command, since the stop half already ran; got stdout=${JSON.stringify(r.stdout)}`);
+});
+
+test("#325 control: rc==2 with all commands SUCCEEDING keeps the original wording byte-for-byte", () => {
+  // Proves the split above did not simply rewrite the pre-existing #299 message for everyone.
+  const r = _bwHarnessRun({ args: ["restart"], overrideCmdRestart: false, serviceStubsSucceed: true,
+    resolveRestartStdout: ["systemctl restart -- ocp.service"], curlAbsent: true });
+  assert.ok(r.stdout.includes("Restart command ran, but this machine could not run curl to confirm it"),
+    `the succeeded-commands wording must be unchanged; got stdout=${JSON.stringify(r.stdout)}`);
+  assert.ok(!/FAILED after retries/.test(r.stdout), "and must not borrow the failure wording");
+});
+
+// For the two `cmd_connect` sites the local fault has to be injected at the /v1/models step
+// SPECIFICALLY: `curlAbsent` would kill the flow at cmd_connect's first probe (already covered
+// by the #278 tests above) and never reach these. A `curlResponses` arm that exits 127 does it —
+// the stub runs and returns 127, which is indistinguishable from bash's own "command not found"
+// to `_curl_or_die`, since all it ever sees is the exit status and the captured stderr.
+test("#300 cmd_connect /v1/models: a local curl fault must NOT be narrated as 'key may be invalid or revoked'", () => {
+  const r = _bwHarnessRun({
+    args: ["connect", "192.0.2.1"],
+    curlHealthExit: 0,
+    curlResponses: [{ match: "/v1/models", body: "", exit: 127 }],
+  });
+  assert.ok(!r.stdout.includes("key may be invalid or revoked") && !r.stderr.includes("key may be invalid or revoked"),
+    `'ocp connect' is what a new user runs against an unverified machine — a local curl fault must not ` +
+    `send them to regenerate a perfectly good key; stdout=${JSON.stringify(r.stdout)} stderr=${JSON.stringify(r.stderr)}`);
+  assert.ok(/curl/i.test(r.stderr),
+    `expected _curl_or_die's local-fault message to name curl, got stderr=${JSON.stringify(r.stderr)}`);
+});
+
+test("#300 control: cmd_connect /v1/models with curl running and the remote genuinely refusing still names the key as a possible cause", () => {
+  const r = _bwHarnessRun({
+    args: ["connect", "192.0.2.1"],
+    curlHealthExit: 0,
+    curlResponses: [{ match: "/v1/models", body: "", exit: 22 }],
+  });
+  // The keyless arm carries the label without the "(the key may be invalid or revoked)"
+  // parenthetical — that clause belongs only to the arm that actually sent a key, which is the
+  // point of having two labels. Assert the part both arms share.
+  assert.ok(r.stderr.includes("the remote refused or did not serve /v1/models"),
+    `a GENUINE remote refusal must still be diagnosed as a remote refusal — proves the fix does not ` +
+    `just delete the diagnosis, got stderr=${JSON.stringify(r.stderr)}`);
+  assert.ok(!/could not run curl/.test(r.stderr),
+    `and must NOT be misreported as a local fault, got stderr=${JSON.stringify(r.stderr)}`);
+});
+
 console.log("\nRestart-unit resolution (issue #233 defect 1) — macOS lsof exit-code handling:");
 
 // Background: `lsof -nP -iTCP:<port> -sTCP:LISTEN` EXITS 1 with EMPTY stdout when nothing
@@ -13683,11 +15435,11 @@ test("#241 MEDIUM-1 control: with python3 fully healthy, the SAME scenario still
 test("#241 MEDIUM-1: postFlightOk() itself, driven directly, confirms WHY 'v?' is unverifiable -- the predicate this fix routes around", () => {
   // Direct, unmocked exercise of the real predicate (imported at the top of this file's upgrade
   // full-path section) -- this is the evidence for the fix above, not a duplicate of it.
-  assert.equal(postFlightOk({ auth: { ok: true }, version: "3.27.0" }, "v3.27.0"), true,
+  assert.equal(postFlightOk({ status: "ok", auth: { ok: true }, version: "3.27.0" }, "v3.27.0"), true,
     "a matching version must pass");
-  assert.equal(postFlightOk({ auth: { ok: true }, version: "3.27.0" }, "v?"), false,
+  assert.equal(postFlightOk({ status: "ok", auth: { ok: true }, version: "3.27.0" }, "v?"), false,
     "target 'v?' must NOT pass against any real version -- this is the MEDIUM-1 defect made concrete");
-  assert.equal(postFlightOk({ auth: { ok: true }, version: "3.27.0" }, ""), true,
+  assert.equal(postFlightOk({ status: "ok", auth: { ok: true }, version: "3.27.0" }, ""), true,
     "an EMPTY target degrades to the auth-only check and passes -- 'v?' is categorically different from empty, which is why substituting an empty string was considered and rejected (the CLI's own --post-flight-only entrypoint fails closed on a falsy/empty target argument by design)");
 });
 
@@ -14091,6 +15843,532 @@ test("ocp-connect: every user-defined array expansion is guarded (no bare \"${na
   assert.deepEqual(findings, [],
     `unguarded array expansion(s) in ocp-connect: ${JSON.stringify(findings)} -- wrap with ` +
     `\${name[@]+"\${name[@]}"} (see rc_files for the pattern)`);
+});
+
+// ════════════════════════════════════════════════════════════════════════════
+// ADR 0010 CONSUMER REPLAY (issue #289)
+// ════════════════════════════════════════════════════════════════════════════
+// ADR 0010 changed what `/health` reports during an inconclusive auth probe, then reasoned
+// about the downstream effect in prose (§ "Consumers of `status`"). Prose is what got it
+// wrong: the ADR concluded post-flight was "unchanged", which is true of the return VALUE and
+// false of the OPERATOR OUTCOME — the value it is unchanged at is `false`, on a restart that
+// succeeded. An outside review's finding was that this repo asserts on the endpoint payload
+// and never on what the consumers DECIDE from it. This section is that missing artifact:
+// it replays ADR 0010's own motivating incident and asserts the DECISION of every consumer.
+//
+// The incident (ADR 0010 § Context, and the production capture it quotes): a loaded host makes
+// `claude auth status` exceed AUTH_CHECK_TIMEOUT_MS; Node kills it (killed:true,
+// signal:"SIGTERM"); server.mjs classifies signal death as INCONCLUSIVE, so the probe records
+// lastOutcome "timeout" and does NOT move `ok` or the failure tally. Credentials are fine —
+// POST /v1/chat/completions returned 200 in the same minute on the same credentials.
+//
+// Two shapes of the same incident matter, and they differ only in what came BEFORE the timeout:
+//   FRESH        — the process was just restarted, so there is no prior conclusive verdict to
+//                  preserve and `ok` is still its initial `null`. This is what post-flight ALWAYS
+//                  sees: runPostFlightCheck only ever runs after a restart.
+//   ESTABLISHED  — a long-running process with a prior conclusive success; preservation keeps
+//                  `ok: true`. This is what `ocp doctor` usually sees, and it is the case ADR
+//                  0010 § "Downstream: scripts/doctor.mjs" claims now PASSes.
+// `status` is "ok" in BOTH: ADR 0010 deliberately does not let an inconclusive probe degrade
+// the verdict, and the binary is executable in this incident.
+import { createServer as _rpHttpServer } from "node:http";
+
+console.log("\nADR 0010 consumer replay (#289):");
+
+const RP_VERSION = "3.27.0";
+
+// The /health body, byte-faithful to what server.mjs emits for this incident.
+function rpHealth(shape) {
+  const auth = shape === "fresh"
+    ? { ok: null, lastCheck: Date.now(), message: "spawnSync /usr/local/bin/claude ETIMEDOUT",
+        lastOutcome: "timeout", consecutiveFailures: 0 }
+    : { ok: true, lastCheck: Date.now(), message: "spawnSync /usr/local/bin/claude ETIMEDOUT",
+        lastOutcome: "timeout", consecutiveFailures: 0 };
+  return {
+    status: "ok",                 // proxyHealthStatus(binaryOk=true): inconclusive never degrades
+    version: RP_VERSION,
+    uptimeHuman: "36h 12m",
+    claudeBinaryOk: true,
+    authMode: "none",
+    auth,
+  };
+}
+
+// The /status projection of the SAME authStatus (server.mjs handleStatus):
+//   proxy.status = proxyHealthStatus(binaryOk); proxy.auth = authStatus.ok ? "ok" : authStatus.message
+function rpStatus(shape) {
+  const h = rpHealth(shape);
+  return {
+    proxy: {
+      status: h.status, version: h.version, uptime: h.uptimeHuman,
+      auth: h.auth.ok ? "ok" : h.auth.message,
+      activeSessions: 0,
+    },
+    requests: { total: 12, active: 0, errors: 0, timeouts: 0 },
+  };
+}
+
+// Premise guard. Everything below is worthless if the fixture is not actually the ADR 0010
+// inconclusive state, so assert the fixture's own shape before trusting any decision read off it.
+test("replay premise: the fixture IS ADR 0010's inconclusive state (status ok, tally untouched)", () => {
+  const fresh = rpHealth("fresh"), est = rpHealth("established");
+  assert.equal(fresh.auth.ok, null, "FRESH: no conclusive verdict has ever been recorded");
+  assert.equal(est.auth.ok, true, "ESTABLISHED: the prior conclusive success is PRESERVED");
+  for (const h of [fresh, est]) {
+    assert.equal(h.auth.lastOutcome, "timeout", "the probe died on a signal → INCONCLUSIVE");
+    assert.equal(h.auth.consecutiveFailures, 0, "an inconclusive probe must not touch the tally");
+    assert.equal(h.status, "ok", "and must not move the serving verdict");
+  }
+});
+
+// ── Consumer 1: postFlightOk (scripts/upgrade.mjs) ──────────────────────────
+test("replay → postFlightOk DECIDES accept on the FRESH incident (was: reject a good restart)", () => {
+  assert.equal(postFlightOk(rpHealth("fresh"), `v${RP_VERSION}`), true);
+});
+
+test("replay → postFlightOk DECIDES accept on the ESTABLISHED incident", () => {
+  assert.equal(postFlightOk(rpHealth("established"), `v${RP_VERSION}`), true);
+});
+
+// ── Consumer 2: runPostFlightCheck (the real retry loop, real budget) ───────
+// Driven at the SHIPPED budget (attempts=10) rather than a shortened one, because the budget
+// is half the defect: 10 x 1s cannot outlast a 600000ms probe interval. intervalMs=0 keeps the
+// test fast without changing the attempt count that matters.
+test("replay → runPostFlightCheck DECIDES ok on a restart whose every probe stays inconclusive", async () => {
+  let calls = 0;
+  const r = await runPostFlightCheck(`v${RP_VERSION}`, {
+    attempts: 10, intervalMs: 0,
+    mockProbe: () => { calls++; return rpHealth("fresh"); },
+  });
+  assert.equal(r.ok, true, "a successful restart must not be reported as a failed one (#289)");
+  assert.equal(calls, 1, "and it must settle on the FIRST probe, not burn the whole budget");
+});
+
+// ── Consumer 3: runRollback's post-flight (scripts/upgrade.mjs) ─────────────
+// The user-visible symptom this closes: "rollback post-flight failed: restored tree may not be
+// what's running" thrown about a rollback that worked.
+test("replay → runRollback DECIDES success (no 'restored tree may not be what's running' throw)", async () => {
+  const restored = { ...rpHealth("fresh"), version: "3.10.0" }; // the snapshot's fromVersion
+  const result = await runUpgrade({
+    rollback: true, yes: true, mockExec: true,
+    mockSnapshots: [{ name: "upgrade-snapshot-2026-05-11T08:30:00Z", path: "/tmp/snap-x" }],
+    mockSnapshotMeta: { fromCommit: "abc1234", fromVersion: "v3.10.0", toVersion: "v3.14.0", path: "/tmp/snap-x" },
+    mockProbe: () => restored,
+    postFlightAttempts: 10, postFlightIntervalMs: 0,
+  });
+  assert.equal(result.path, "rollback");
+  const pf = result.phases.find(p => p.name === "post-flight");
+  assert.ok(pf, "post-flight phase must be recorded");
+  assert.equal(pf.status, "ok",
+    "a rollback that restored a SERVING proxy must not throw 'restored tree may not be what's running' (#289)");
+});
+
+test("replay control → runRollback still THROWS when the restored proxy serves the wrong version", async () => {
+  await assert.rejects(async () => {
+    await runUpgrade({
+      rollback: true, yes: true, mockExec: true,
+      mockSnapshots: [{ name: "upgrade-snapshot-2026-05-11T08:30:00Z", path: "/tmp/snap-x" }],
+      mockSnapshotMeta: { fromCommit: "abc1234", fromVersion: "v3.10.0", toVersion: "v3.14.0", path: "/tmp/snap-x" },
+      mockProbe: () => ({ ...rpHealth("fresh"), version: "3.14.0" }), // toVersion, not fromVersion
+      postFlightAttempts: 1, postFlightIntervalMs: 0,
+    });
+  }, /rollback post-flight failed/);
+});
+
+// ── Consumer 4: scripts/doctor.mjs, full run ────────────────────────────────
+// Three decisions, not one: the check LEVEL, the next_action.kind (which gates the next
+// `ocp update`), and ready_to_upgrade. The message is asserted too — doctor previously printed
+// a hard-coded "auth.ok=false" for a value that was null, which is the confident-wrong-answer
+// class this repo's recent work exists to remove.
+test("replay → doctor DECIDES kind!=fix_oauth and does not block the next update (FRESH)", async () => {
+  const r = await runDoctor({
+    mockVersion: `v${RP_VERSION}`, mockLatest: `v${RP_VERSION}`, skipNetwork: false,
+    mockHealth: { status: 200, body: rpHealth("fresh") },
+  });
+  const oauth = r.checks.find(c => c.id === "oauth_ok");
+  assert.ok(oauth, "doctor must still report an oauth_ok check");
+  assert.notEqual(oauth.level, "FAIL", "an inconclusive probe is not a credential rejection");
+  assert.equal(oauth.level, "WARN", "but it IS worth surfacing — it is 'not known', not 'fine'");
+  assert.notEqual(r.next_action.kind, "fix_oauth",
+    "must not route the operator to debug credentials that were never rejected (#289)");
+  assert.equal(r.ready_to_upgrade, true, "and must not refuse the next `ocp update`");
+  // Independent review MEDIUM-3: warn_count was asserted only for key-presence and for ==0, so
+  // NO test could observe a non-zero value and `const warn_count = 0` survived as a mutation.
+  // doctor.mjs prints "Summary: N FAIL, M WARN" from these two numbers, so an uncounted WARN is
+  // a WARN the operator is told does not exist.
+  //
+  // Asserted as the INVARIANT (warn_count === the number of WARN checks) rather than as the
+  // literal 1. This test runs with skipNetwork unset, so detectMultiUnitBootRace probes the real
+  // host: a machine with two enabled OCP units legitimately pushes a second WARN, and pinning the
+  // literal would fail there for a reason having nothing to do with #289. The invariant still
+  // kills `const warn_count = 0` (1 !== 0) and is host-independent.
+  const warns = r.checks.filter(c => c.level === "WARN");
+  assert.ok(warns.some(c => c.id === "oauth_ok"), "oauth_ok must be among the WARN checks");
+  assert.equal(r.warn_count, warns.length,
+    `warn_count must equal the number of WARN checks; got ${r.warn_count} vs ${warns.length}`);
+  assert.ok(r.warn_count >= 1, "and the oauth_ok WARN alone makes it non-zero");
+  assert.equal(r.fail_count, 0);
+});
+
+// ── Issue #304: warn_count's WARN-multiplicity gap ──────────────────────────
+// `warn_count` has two computation sites, and the issue reports that mutating EITHER to
+// `Math.min(1, checks.filter(c => c.level === "WARN").length)` survives the whole suite. Both
+// survive, but for DIFFERENT reasons, and the categories are the point — conflating them would
+// produce one useless test and leave the real gap open:
+//
+//   - doctor.mjs:879 (the full run) — genuinely (a) NO COVERAGE. A 2-WARN shape is perfectly
+//     reachable there; nothing in the suite produced one, so every exercised shape had at most
+//     one WARN and a cap at 1 was indistinguishable from the truth. The first test below closes it.
+//
+//   - doctor.mjs:981 (`runOauthOnly`, the `--check oauth` path) — (c) UNREACHABLE BY
+//     CONSTRUCTION. That function has exactly three push sites and all three push the same id,
+//     `oauth_ok`, on mutually exclusive branches, so its `checks` array can never hold more than
+//     one entry and warn_count there is 0 or 1 by construction. A cap at 1 is not wrong on that
+//     path; it is simply unobservable, and a test claiming to "cover" it would be asserting
+//     something the code cannot violate.
+//
+// What the second test pins is therefore the PREMISE, not the cap: if a future change adds a
+// second check to that path, the gap becomes real, and this test fails at that moment rather than
+// leaving a silent cap behind. That is the only guard that has any content there.
+console.log("\nwarn_count counts every WARN, not just the first (#304):");
+
+test("#304 (the money test): a doctor shape with TWO WARNs reports warn_count === 2", async () => {
+  // Both WARN sources are already in this file, from different issues; the gap was that no test
+  // ever combined them. oauth_ok WARN comes from #289's FRESH (inconclusive) auth body;
+  // multi_unit_boot_race WARN comes from #220's two-enabled-units mock. Fully mocked host, so
+  // this is deterministic rather than depending on how many units the runner happens to have.
+  const r = await runDoctor({
+    skipNetwork: false,
+    mockVersion: "v3.26.0",
+    mockLatest: "v3.26.0",
+    mockHealth: { status: 200, body: { ...rpHealth("fresh"), version: "3.26.0" } },
+    mockPlatform: "linux",
+    run: (cmd) => {
+      if (cmd.includes("--user list-unit-files")) return "ocp-proxy.service enabled\n";
+      if (cmd.includes("list-unit-files")) return "ocp.service enabled\n";
+      if (cmd.includes("--user show")) return FIELD_INCIDENT_USER_SHOW;
+      if (cmd.includes("systemctl show")) return FIELD_INCIDENT_SYSTEM_SHOW;
+      throw new Error("unexpected: " + cmd);
+    },
+  });
+  const warnIds = r.checks.filter(c => c.level === "WARN").map(c => c.id).sort();
+  // Non-vacuous on the input side first: if the mock ever stops producing two distinct WARNs,
+  // this test would "pass" a cap-at-1 mutation for the wrong reason.
+  assert.deepEqual(warnIds, ["multi_unit_boot_race", "oauth_ok"],
+    `precondition: this shape must carry exactly these two WARNs, got ${JSON.stringify(warnIds)}`);
+  assert.equal(r.warn_count, 2,
+    `doctor.mjs prints "Summary: N FAIL, M WARN" from this number, so a cap at 1 tells the ` +
+    `operator one of two real warnings does not exist; got ${r.warn_count}`);
+  assert.equal(r.fail_count, 0, "neither WARN may be counted as a failure");
+});
+
+test("#304 premise: the --check oauth path pushes exactly one check, which is why a cap at 1 is unobservable THERE", async () => {
+  // Three health shapes covering runOauthOnly's three mutually exclusive push branches
+  // (unreachable / 200-but-unparseable / parsed-and-classified). Each must yield exactly one
+  // check. When that stops being true, the warn_count cap on that path becomes observable and
+  // this test is the thing that says so.
+  const shapes = [
+    { label: "service unreachable", health: { status: 0, error: "connect ECONNREFUSED" } },
+    { label: "200 with an empty body", health: { status: 200, body: null } },
+    { label: "parsed + classified (FRESH → WARN)", health: { status: 200, body: rpHealth("fresh") } },
+  ];
+  for (const { label, health } of shapes) {
+    const r = await runDoctor({ checkOnly: "oauth", skipNetwork: true, mockHealth: health });
+    assert.equal(r.checks.length, 1,
+      `${label}: runOauthOnly must push exactly one check — if this ever exceeds 1, a 2-WARN ` +
+      `shape becomes reachable on that path and doctor.mjs:981 needs the same coverage as :879; ` +
+      `got ${JSON.stringify(r.checks.map(c => c.id))}`);
+    assert.equal(r.checks[0].id, "oauth_ok", `${label}: and it must be oauth_ok`);
+    assert.ok(r.warn_count === 0 || r.warn_count === 1,
+      `${label}: with one check, warn_count is 0 or 1 by construction; got ${r.warn_count}`);
+  }
+});
+
+test("replay → doctor's message states the OBSERVED value, never a hard-coded auth.ok=false", async () => {
+  const r = await runDoctor({
+    mockVersion: `v${RP_VERSION}`, mockLatest: `v${RP_VERSION}`,
+    mockHealth: { status: 200, body: rpHealth("fresh") },
+  });
+  const msg = r.checks.find(c => c.id === "oauth_ok").message;
+  assert.ok(!/auth\.ok=false/.test(msg),
+    `doctor must not assert a state that did not occur; got: ${msg}`);
+  assert.ok(/auth\.ok=null/.test(msg), `must report what it actually saw; got: ${msg}`);
+  assert.ok(/lastOutcome=timeout/.test(msg),
+    `and must carry the reason an operator needs to act on; got: ${msg}`);
+});
+
+test("replay → doctor DECIDES PASS on the ESTABLISHED incident (ADR 0010's own claim)", async () => {
+  const r = await runDoctor({
+    mockVersion: `v${RP_VERSION}`, mockLatest: `v${RP_VERSION}`,
+    mockHealth: { status: 200, body: rpHealth("established") },
+  });
+  const oauth = r.checks.find(c => c.id === "oauth_ok");
+  assert.equal(oauth.level, "PASS", "a preserved conclusive success is still a success");
+  assert.notEqual(r.next_action.kind, "fix_oauth");
+});
+
+// ── Consumer 5: scripts/doctor.mjs, the `--check oauth` fast path ───────────
+// A SEPARATE code path from the full run (runOauthOnly), with its own copy of the same read.
+// It is also the path doctor's own fix_oauth remediation tells the operator to re-run, so a
+// wrong answer here is self-confirming.
+test("replay → doctor --check oauth DECIDES kind!=fix_oauth and exits 0 (FRESH)", async () => {
+  const r = await runDoctor({
+    checkOnly: "oauth",
+    mockHealth: { status: 200, body: rpHealth("fresh") },
+  });
+  const oauth = r.checks.find(c => c.id === "oauth_ok");
+  assert.equal(oauth.level, "WARN");
+  assert.notEqual(r.next_action.kind, "fix_oauth");
+  assert.equal(r.fail_count, 0, "`ocp doctor --check oauth` exits on fail_count; 0 keeps exit 0");
+  // Independent review MEDIUM-1: this path hard-coded `warn_count: 0`, which was true while only
+  // PASS/FAIL were reachable and became a lie the moment #289 made WARN reachable — printing
+  // "Summary: 0 FAIL, 0 WARN" directly beneath the [WARN] line it had just emitted.
+  //
+  // The literal IS deterministic here, unlike the full run above: runOauthOnly pushes exactly one
+  // check and never runs the multi-unit probe (an existing test pins `ids === ["oauth_ok"]`). The
+  // invariant is asserted alongside it so this cannot rot into a coincidence.
+  assert.equal(r.warn_count, r.checks.filter(c => c.level === "WARN").length,
+    "warn_count must equal the number of WARN checks, not a hard-coded constant");
+  assert.equal(r.warn_count, 1,
+    "the oauth_ok WARN must be counted on the --check oauth path too, not hard-coded to 0");
+  assert.ok(!/auth\.ok=false/.test(oauth.message), `got: ${oauth.message}`);
+  // The next_action must not claim health it never established, on the very path doctor's own
+  // fix_oauth remediation tells the operator to re-run.
+  assert.ok(!/OAuth healthy/.test(r.next_action.verify),
+    `--check oauth must not report "OAuth healthy" for a state it never established; got: ${r.next_action.verify}`);
+  assert.match(r.next_action.verify, /not yet established/, `got: ${r.next_action.verify}`);
+});
+
+// Independent review LOW-2 on #289: neither fix_oauth `verify` string was pinned by any test, so
+// reverting that wording survived the suite — asymmetric with its sibling on the noop path, which
+// IS pinned. Both remediations RESTART the service, and by ADR 0010 a freshly restarted proxy
+// reports oauth_ok WARN until its first probe concludes, so telling the operator to expect PASS
+// immediately afterwards describes a state the remediation itself makes temporarily unreachable.
+test("replay → both fix_oauth remediations warn that PASS is not immediate after the restart", async () => {
+  const rejected = { status: "ok", version: RP_VERSION,
+    auth: { ok: false, message: "Invalid refresh token", lastOutcome: "rejected", consecutiveFailures: 1 } };
+  const full = await runDoctor({
+    mockVersion: `v${RP_VERSION}`, mockLatest: `v${RP_VERSION}`, skipNetwork: false,
+    mockHealth: { status: 200, body: rejected },
+  });
+  const fast = await runDoctor({ checkOnly: "oauth", mockHealth: { status: 200, body: rejected } });
+  for (const [label, r] of [["full run", full], ["--check oauth", fast]]) {
+    assert.equal(r.next_action.kind, "fix_oauth", `${label}: premise — this must be the fix_oauth path`);
+    assert.match(r.next_action.verify, /WARN/,
+      `${label}: the remediation restarts the service, so its verify string must say a WARN ` +
+      `immediately afterwards is expected; got: ${r.next_action.verify}`);
+    assert.match(r.next_action.verify, /PASS/,
+      `${label}: it must still name PASS as the eventual success condition; got: ${r.next_action.verify}`);
+  }
+});
+
+test("replay control → doctor --check oauth still reports 'OAuth healthy' on a real PASS", async () => {
+  const r = await runDoctor({
+    checkOnly: "oauth",
+    mockHealth: { status: 200, body: rpHealth("established") },
+  });
+  assert.equal(r.checks.find(c => c.id === "oauth_ok").level, "PASS");
+  assert.equal(r.next_action.kind, "noop");
+  assert.equal(r.next_action.verify, "OAuth healthy",
+    "the PASS wording must be untouched — only the WARN case changes");
+});
+
+// A conclusive rejection must still FAIL, on both doctor paths. Without this, the fix above
+// could have been "make oauth_ok never fail", which would be a worse bug than the one closed.
+test("replay control → a CONCLUSIVE rejection still DECIDES FAIL + fix_oauth on both doctor paths", async () => {
+  const rejected = { ...rpHealth("fresh"),
+    auth: { ok: false, lastCheck: Date.now(), message: "Invalid refresh token",
+            lastOutcome: "rejected", consecutiveFailures: 1 } };
+  const full = await runDoctor({
+    mockVersion: `v${RP_VERSION}`, mockLatest: `v${RP_VERSION}`,
+    mockHealth: { status: 200, body: rejected },
+  });
+  assert.equal(full.checks.find(c => c.id === "oauth_ok").level, "FAIL");
+  assert.equal(full.next_action.kind, "fix_oauth");
+  assert.equal(full.ready_to_upgrade, false);
+
+  const fast = await runDoctor({ checkOnly: "oauth", mockHealth: { status: 200, body: rejected } });
+  assert.equal(fast.checks.find(c => c.id === "oauth_ok").level, "FAIL");
+  assert.equal(fast.next_action.kind, "fix_oauth");
+});
+
+// classifyAuthOk is imported LAZILY, not at module scope. A static `import { classifyAuthOk }`
+// makes the whole suite fail to LOAD against a tree that lacks the export (SyntaxError before a
+// single test runs), which reports as "everything failed" and destroys the ability to name the
+// tests that actually invert. Dynamic import keeps this one test's failure local and named.
+test("#324: a latched ok:false with enough inconclusive probes since is WARN, not FAIL", async () => {
+  const { classifyAuthOk } = await import("./scripts/doctor.mjs");
+  const { AUTH_STALE_AFTER_INCONCLUSIVE } = await import("./lib/constants.mjs");
+  const r = classifyAuthOk({ auth: { ok: false, lastOutcome: "timeout", message: "Command failed",
+                                     consecutiveInconclusive: AUTH_STALE_AFTER_INCONCLUSIVE } });
+  assert.equal(r.level, "WARN", "stale evidence must not be a FAIL — FAIL sets kind=fix_oauth and ocp update refuses outright");
+  assert.equal(r.oauthOk, true, "and it must not mark oauth as not-ok, which is what blocks the upgrade");
+  assert.match(r.message, /stale/i, "the operator has to be told WHY it is not a rejection");
+});
+
+test("#324 (P1, found by mutation in review): a FRESH rejection is never stale, whatever the counter says", async () => {
+  // The gap the counter alone left open. If a server ever emitted lastOutcome="rejected" together
+  // with a non-zero inconclusive counter — which a correct one cannot, but a regression in the
+  // reset would — the decider used to call that stale and unlock the gate SECONDS after a
+  // conclusive rejection. An independent reviewer produced exactly that state by mutation and the
+  // whole suite stayed green.
+  const { classifyAuthOk } = await import("./scripts/doctor.mjs");
+  const { AUTH_STALE_AFTER_INCONCLUSIVE } = await import("./lib/constants.mjs");
+  for (const n of [AUTH_STALE_AFTER_INCONCLUSIVE, AUTH_STALE_AFTER_INCONCLUSIVE + 5, 999]) {
+    const r = classifyAuthOk({ auth: { ok: false, lastOutcome: "rejected", message: "denied", consecutiveInconclusive: n } });
+    assert.equal(r.level, "FAIL", `counter=${n} with a REJECTED last outcome must never read as stale`);
+    assert.equal(r.oauthOk, false);
+  }
+});
+
+test("#324: only the two INCONCLUSIVE outcomes can make a latched rejection stale", async () => {
+  const { classifyAuthOk } = await import("./scripts/doctor.mjs");
+  const { AUTH_STALE_AFTER_INCONCLUSIVE } = await import("./lib/constants.mjs");
+  const n = AUTH_STALE_AFTER_INCONCLUSIVE;
+  for (const outcome of ["timeout", "unavailable"]) {
+    assert.equal(classifyAuthOk({ auth: { ok: false, lastOutcome: outcome, consecutiveInconclusive: n } }).level,
+      "WARN", `${outcome} is inconclusive, so a latched rejection behind it is stale evidence`);
+  }
+  // Anything else — including an older server that omits the field entirely — stays FAIL.
+  for (const outcome of ["rejected", "authenticated", "none", undefined, null, "TIMEOUT"]) {
+    assert.equal(classifyAuthOk({ auth: { ok: false, lastOutcome: outcome, consecutiveInconclusive: n } }).level,
+      "FAIL", `lastOutcome=${JSON.stringify(outcome)} must not unlock the gate`);
+  }
+});
+
+test("#324 control: a latched ok:false with FEWER inconclusive probes is still a FAIL", async () => {
+  const { classifyAuthOk } = await import("./scripts/doctor.mjs");
+  const { AUTH_STALE_AFTER_INCONCLUSIVE } = await import("./lib/constants.mjs");
+  const r = classifyAuthOk({ auth: { ok: false, lastOutcome: "rejected", message: "denied",
+                                     consecutiveInconclusive: AUTH_STALE_AFTER_INCONCLUSIVE - 1 } });
+  assert.equal(r.level, "FAIL",
+    "a genuine, current rejection must still block the upgrade — this proves the fix does not " +
+    "simply delete the FAIL branch, which would be a much worse bug than the one being fixed");
+  assert.equal(r.oauthOk, false);
+});
+
+test("#324 (backward compatibility): an OLDER server that does not emit the field still FAILs", async () => {
+  // The upgrade path reads /health from whatever version is RUNNING, which during an upgrade is
+  // the old one. If an absent field defaulted to "stale", every pre-#324 server would silently
+  // stop reporting real credential rejections to the gate — turning a fix into a new hole.
+  const { classifyAuthOk } = await import("./scripts/doctor.mjs");
+  const r = classifyAuthOk({ auth: { ok: false, lastOutcome: "rejected", message: "denied" } });
+  assert.equal(r.level, "FAIL", "absent counter must read as 0, never as 'stale'");
+});
+
+test("#324: a non-numeric counter is treated as 0, not as stale", async () => {
+  const { classifyAuthOk } = await import("./scripts/doctor.mjs");
+  for (const bad of ["lots", null, {}, [], NaN, -1]) {
+    const r = classifyAuthOk({ auth: { ok: false, lastOutcome: "rejected", consecutiveInconclusive: bad } });
+    assert.equal(r.level, "FAIL", `junk counter ${JSON.stringify(bad)} must not unlock the gate`);
+  }
+});
+
+test("replay control → classifyAuthOk maps the three-valued domain to three distinct decisions", async () => {
+  const { classifyAuthOk: _rpClassifyAuthOk } = await import("./scripts/doctor.mjs");
+  assert.equal(typeof _rpClassifyAuthOk, "function",
+    "doctor.mjs must export the three-valued classifier that replaced the falsy check (#289)");
+  const mk = ok => ({ auth: { ok, message: "m", lastOutcome: "timeout" } });
+  assert.equal(_rpClassifyAuthOk(mk(true)).level, "PASS");
+  assert.equal(_rpClassifyAuthOk(mk(false)).level, "FAIL");
+  assert.equal(_rpClassifyAuthOk(mk(null)).level, "WARN");
+  assert.equal(_rpClassifyAuthOk({}).level, "WARN", "an absent field is 'not known', not 'rejected'");
+  assert.equal(_rpClassifyAuthOk(mk(false)).oauthOk, false, "only a rejection may select fix_oauth");
+  assert.equal(_rpClassifyAuthOk(mk(null)).oauthOk, true);
+  assert.match(_rpClassifyAuthOk({}).message, /auth\.ok=missing/,
+    "an absent field must be reported as absent, not as null and not as false");
+});
+
+// ── Consumer 6+7: ocp-plugin/index.js (cmdHealth :97 / :95, cmdStatus :113) ──
+// ADR 0010 § "Consumers of `status`" lists cmdHealth as reading only `d.status`; it also reads
+// `d.auth?.ok` two lines below (index.js:97), which the ADR's auth.ok enumeration omits. Driven
+// through the REAL plugin: its default export, its real command handler, its real fetchJSON,
+// over real HTTP against a real listener. Nothing is stubbed or sliced.
+//
+// PROXY is a module-level const resolved at IMPORT time from OCP_PROXY_URL, so the listener has
+// to exist and the env has to be set before the dynamic import — hence the lazy shared harness.
+// The harness is shared, so its mutable payload is serialized through _rpChain: these tests
+// would otherwise race each other through pendingAsync.
+let _rpHarness = null;
+let _rpServed = { "/health": null, "/status": null };
+let _rpChain = Promise.resolve();
+const _rpSerial = (fn) => { const p = _rpChain.then(fn); _rpChain = p.then(() => {}, () => {}); return p; };
+
+async function rpPluginHandler() {
+  if (_rpHarness) return _rpHarness;
+  const port = await ltFreePort();
+  const srv = _rpHttpServer((req, res) => {
+    const path = req.url.split("?")[0];
+    const body = _rpServed[path];
+    if (!body) { res.writeHead(404).end("{}"); return; }
+    res.writeHead(200, { "content-type": "application/json" });
+    res.end(JSON.stringify(body));
+  });
+  await new Promise(r => srv.listen(port, "127.0.0.1", r));
+  srv.unref();
+  process.env.OCP_PROXY_URL = `http://127.0.0.1:${port}`;
+  const mod = await import("./ocp-plugin/index.js");
+  let handler = null;
+  mod.default({ registerCommand: (c) => { handler = c.handler; } });
+  assert.ok(typeof handler === "function",
+    "harness premise: the plugin must have registered a command handler");
+  _rpHarness = { handler, srv };
+  return _rpHarness;
+}
+
+test("replay → ocp-plugin `/ocp health` DECIDES what to print for an inconclusive auth.ok", () => _rpSerial(async () => {
+  const { handler } = await rpPluginHandler();
+  _rpServed["/health"] = rpHealth("fresh");
+  const out = (await handler({ args: "health" })).text;
+  // index.js:95 — `Status: ${d.status}` echoed verbatim. The serving verdict is the truthful one.
+  assert.match(out, /Status: ok \| v3\.27\.0/, `cmdHealth must echo the serving verdict; got:\n${out}`);
+  // index.js:97 — `d.auth?.ok ? "ok" : d.auth?.message || "unknown"`. A falsy check again, so
+  // `null` prints the raw ETIMEDOUT string. That is DISPLAY only: it drives no branch, blocks
+  // nothing, and is honest about what happened rather than asserting a rejection. Asserted so
+  // the behaviour is pinned and a future change to it is a deliberate one.
+  assert.match(out, /Auth: spawnSync .*ETIMEDOUT/,
+    `cmdHealth surfaces the probe message when no conclusive verdict exists; got:\n${out}`);
+  assert.ok(!/Auth: (ok|unknown)\b/.test(out),
+    `must not claim a verdict it does not have; got:\n${out}`);
+}));
+
+test("replay → ocp-plugin `/ocp status` DECIDES the GREEN icon (not 🟡 degraded)", () => _rpSerial(async () => {
+  const { handler } = await rpPluginHandler();
+  _rpServed["/status"] = rpStatus("fresh");
+  const out = (await handler({ args: "status" })).text;
+  assert.ok(out.includes("🟢"), `the repo's only literal "degraded" comparison must stay green; got:\n${out}`);
+  assert.ok(!out.includes("🟡") && !out.includes("🔴"), `got:\n${out}`);
+}));
+
+test("replay control → ocp-plugin `/ocp status` still DECIDES 🟡 on a real degraded verdict", () => _rpSerial(async () => {
+  const { handler } = await rpPluginHandler();
+  const degraded = rpStatus("fresh");
+  degraded.proxy.status = "degraded";
+  _rpServed["/status"] = degraded;
+  const out = (await handler({ args: "status" })).text;
+  assert.ok(out.includes("🟡"), `got:\n${out}`);
+}));
+
+// ── Consumer 8: dashboard.html:151 — the Status card ────────────────────────
+// A browser file, so the real ternary is sliced out and evaluated. Per AGENTS.md § "Testing
+// discipline", a textual assertion is acceptable for a SLICE BOUNDARY but never for the
+// behaviour under test — so the slice is asserted non-empty (anchor-drift guard) and then the
+// extracted expression is EXECUTED. A slice that silently missed would otherwise pass vacuously.
+test("replay → dashboard.html Status card DECIDES tag-ok (the green card) on the incident", () => {
+  const src = _ltRead(_ltF2P(new URL("./dashboard.html", import.meta.url)), "utf8");
+  const m = src.match(/p\.status === 'ok' \? '([\w-]+)' : '([\w-]+)'/);
+  assert.ok(m, "anchor drift: dashboard.html's Status-card ternary was not found — fix the slice");
+  assert.ok(m[1] && m[2] && m[1] !== m[2], `slice produced a degenerate ternary: ${m[0]}`);
+  const decide = new Function("p", `return (${m[0]});`);
+  // Asserted against the LITERAL class names, not against m[1]/m[2]. Comparing the result to the
+  // arm it was extracted from is self-referential: swapping the ternary's two arms would leave
+  // such an assertion green while the card rendered red on a healthy proxy. Found by mutating
+  // this very test (M12) after M10 killed it only via the anchor guard above — the guard proves
+  // the slice was found, which is not the same as proving the decision was checked.
+  assert.equal(decide(rpStatus("fresh").proxy), "tag-ok",
+    "the operator's Status card must not flip red because one probe timed out");
+  assert.equal(decide({ status: "degraded" }), "tag-err",
+    "control: a real degraded verdict must still render the error tag");
 });
 
 runAsyncTests().then(() => Promise.all(pendingAsync)).then(() => {

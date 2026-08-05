@@ -1,15 +1,15 @@
 # ADR 0010 — `/health` and `/status` verdict semantics (what `degraded` means)
 
 **Date:** 2026-08-01
-**Status:** Proposed — implemented, awaiting maintainer sign-off
+**Status:** Accepted
 
-> Per `AGENTS.md` § "ADR writing protocol (Category A)", an ADR is drafted, shown to the
-> maintainer, and only then accepted. This one was authored by an agent alongside the
-> implementation and has **not** been reviewed by the maintainer yet, so it must not claim
-> otherwise. The code it describes is independently reviewed and verified; what is pending is
-> sign-off on the *semantics* — specifically what `degraded` is allowed to mean, since
-> `ocp update`'s post-flight check and human operators both read it.
-**Deciders:** pending — proposed by an implementing agent, not yet ratified
+> **Ratified 2026-08-02 by the project maintainer.** This ADR was drafted by an
+> implementing agent and initially recorded itself as Accepted before anyone had read it; that
+> was corrected to Proposed, and the maintainer has now signed off explicitly. What was ratified
+> is the Decision section below, unchanged since it was first shown. The Consequences section
+> carries a later in-place correction (issue #289) to its consumer enumeration — that correction
+> is agent-authored analysis, not part of what was ratified.
+**Deciders:** project maintainer (ratified 2026-08-02)
 **Related:** issue #232; ADR 0006 (Class A/B taxonomy + the B.2 grandfather provision); ADR 0007 (precedent for amending a grandfathered B.2 endpoint's response); `ALIGNMENT.md` § "Current Class B inventory"
 
 ---
@@ -140,6 +140,42 @@ There are exactly three readers in the repo:
 | `ocp-plugin/index.js:95` (`cmdHealth`) | `d.status`, echoed verbatim | Prints the new verdict. No parsing, no comparison. |
 
 `postFlightOk` (`scripts/upgrade.mjs:453`), `scripts/doctor.mjs:668` / `:869`, the `ocp` CLI, `ocp-connect` and `setup.mjs` all read `auth.ok` / `version` **directly** and never read `status`. Of those, only `doctor.mjs` changes behaviour — see the two subsections above for why post-flight does not.
+
+> **Correction (issue #289).** Both enumerations above were audited against the tree and are
+> partly wrong. Recorded in place rather than rewritten, on the same principle this ADR already
+> applied to its own withdrawn post-flight claim: a wrong enumeration is exactly the kind of
+> confident-but-unverified statement this repo's governance exists to catch, and silently
+> deleting it would hide that the error was made.
+>
+> 1. **The `auth.ok` list names three files that do not read it.** `ocp`, `ocp-connect` and
+>    `setup.mjs` read `/health`'s `version` and `authMode`; none of them reads `auth.ok`. The
+>    `auth` keys near them (`setup.mjs:206-208`, `ocp-connect:198-199`) are `config.auth.profiles`
+>    in **OpenClaw's** config JSON — an unrelated `auth`. The clause "and never read `status`" is
+>    correct for all three.
+> 2. **The `auth.ok` list omits a real reader.** `ocp-plugin/index.js:97`
+>    (`d.auth?.ok ? "ok" : d.auth?.message || "unknown"`) reads it, two lines below the `d.status`
+>    read the table above *does* cite. `ocp-plugin/index.js:114` also reads `proxy.auth`, the
+>    `/status` projection of the same value. Both are display-only — neither drives a branch —
+>    which is why #289 leaves their behaviour as it is, but "exactly three readers" understated
+>    the surface.
+> 3. **`postFlightOk` no longer reads `auth.ok`; it reads `status`** (#289). The subsection above
+>    is right that ADR 0010 did not *change* post-flight's return value — and that is precisely
+>    the defect it failed to draw. The value it left unchanged is `false`, on a restart that
+>    succeeded: `auth.ok` is `null` on the fresh process post-flight always probes, the predicate
+>    required a strict `true`, and the retry budget (10 × 1s) is two orders of magnitude smaller
+>    than the wait for the next probe (600s, not shortened by an inconclusive result). "Unchanged
+>    return value" and "unchanged operator outcome" are different claims; only the first was
+>    checked.
+> 4. **Doctor's falsy check is gone.** `:668` / `:869` collapsed `null` into `false` and then
+>    printed a hard-coded `auth.ok=false` for a state that never occurred. Both sites now route
+>    through one `classifyAuthOk()` helper that keeps the three-valued domain three-valued. The
+>    subsection above ("Downstream: `scripts/doctor.mjs`") remains correct on its own case: a
+>    preserved conclusive success still PASSes.
+>
+> The general lesson, and the reason #289's regression tests are shaped the way they are: this
+> section reasoned about consumers **in prose** while the test suite asserted only on the endpoint
+> payload. `test-features.mjs` § "ADR 0010 CONSUMER REPLAY" now replays this ADR's own motivating
+> incident through every consumer and asserts each one's **decision**.
 
 ### Field additions
 

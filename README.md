@@ -159,6 +159,16 @@ OCP translates OpenAI-compatible `/v1/chat/completions` requests into `claude --
 
 OCP is a **text-prompt bridge** to the official `claude` CLI. It does **not** pass through OpenAI `tools`/`functions` payloads or Anthropic `tool_use` blocks to the client. Clients (Cline, Cursor, OpenClaw, etc.) pointed at OCP receive **assistant TEXT only** — they never get `tool_calls` to execute locally.
 
+**Offering tools is fine; *forcing* a tool call gets a 400.** Because OCP never emits `tool_calls`, a request that *requires* one cannot be answered correctly, so it is refused rather than answered with prose that claims the turn ended normally:
+
+| Request | OCP |
+|---|---|
+| `tools` with no `tool_choice`, or `tool_choice` `"auto"` / `"none"` / `allowed_tools` `mode: "auto"` | **served normally** — text, `finish_reason: "stop"` |
+| `tool_choice` `"required"`, `{"type":"function"}`, `{"type":"custom"}`, or `allowed_tools` `mode: "required"` | **`400`** — `error.code: "unsupported_parameter"`, `error.param: "tool_choice"` |
+| legacy `function_call: {"name": …}` | **`400`**, same shape, `error.param: "function_call"` |
+
+Simply sending a tool list is never an error — that is the common case (every OpenClaw turn carries one) and it is unchanged. Only the instruction OCP cannot obey is refused, and it is refused loudly so a client can fall back to another provider or retry with `"auto"` instead of silently receiving a wrong answer. See [ADR 0013](docs/adr/0013-no-openai-tool-calling.md) for why this is a refusal rather than an implementation.
+
 Any tool use happens server-side, under the `--allowedTools` set configured on the OCP host. In default mode (no `CLAUDE_NO_CONTEXT`), the `claude` CLI's own built-in tools are available to the model; in TUI mode, the operator controls the tool surface via `OCP_TUI_FULL_TOOLS`. Either way, the tools run under the operator's credentials on the server, and the client sees only the final text output. Note that on the `-p` path OCP prepends a system-prompt wrapper telling the model it has **no** local access (right for a shared gateway) — a single-user loopback instance whose model *should* use its tools can flip this with `OCP_LOCAL_TOOLS=1` (see Environment Variables).
 
 **Client-local tool execution is not supported by design.** Supporting it would require bypassing the `claude` CLI to call the raw Anthropic API directly — that is a different product, and is out of scope per `ALIGNMENT.md` (every OCP endpoint must correspond to something `cli.js` actually does).
@@ -167,15 +177,19 @@ Any tool use happens server-side, under the `--allowedTools` set configured on t
 
 ## Available Models
 
-| Model ID | Notes |
-|----------|-------|
-| `claude-opus-5` | Most capable (default for `opus` alias) |
-| `claude-opus-4-8` | Previous Opus, retained for pinning |
-| `claude-opus-4-7` | Older Opus, retained for pinning |
-| `claude-opus-4-6` | Older Opus, retained for pinning |
-| `claude-sonnet-5` | Latest Sonnet (default for `sonnet` alias) |
-| `claude-sonnet-4-6` | Previous Sonnet, retained for pinning |
-| `claude-haiku-4-5-20251001` | Fastest, lightweight (default for `haiku` alias) |
+| Model ID | Context window | Notes |
+|----------|---------------:|-------|
+| `claude-opus-5` | 1M | Most capable (default for `opus` alias) |
+| `claude-opus-4-8` | 1M | Previous Opus, retained for pinning |
+| `claude-opus-4-7` | 1M | Older Opus, retained for pinning |
+| `claude-opus-4-6` | 200k | Older Opus, retained for pinning |
+| `claude-sonnet-5` | 1M | Latest Sonnet (default for `sonnet` alias) |
+| `claude-sonnet-4-6` | 200k | Previous Sonnet, retained for pinning |
+| `claude-haiku-4-5-20251001` | 200k | Fastest, lightweight (default for `haiku` alias) |
+
+Context windows match the Claude Code CLI registry. Each model's prompt truncation ceiling is
+derived from its own window (`contextWindow × 3` chars) — see [ADR 0011](docs/adr/0011-per-model-prompt-char-budget.md)
+and `CLAUDE_MAX_PROMPT_CHARS` in [Environment Variables](#environment-variables).
 
 The canonical list lives in [`models.json`](./models.json) — the single source of truth as of v3.11.0, validated in CI against [`models.schema.json`](./models.schema.json). Both `server.mjs` (the `/v1/models` endpoint) and `setup.mjs` (the OpenClaw registration) derive from it. Adding a new model is now a one-file edit:
 
@@ -194,7 +208,7 @@ The canonical list lives in [`models.json`](./models.json) — the single source
 |----------|--------|-------------|
 | `/v1/models` | GET | List available models |
 | `/v1/chat/completions` | POST | Chat completion (streaming + non-streaming) |
-| `/health` | GET | Comprehensive health check (includes a `tui` block for TUI-mode drift/concurrency monitoring) |
+| `/health` | GET | Comprehensive health check (includes a `tui` block for TUI-mode drift/concurrency monitoring, an `auth` block — see § "What `auth.ok` means" — and `instanceName` — see § "Running more than one instance on a host") |
 | `/usage` | GET | Plan usage limits + per-model stats |
 | `/status` | GET | Combined overview (usage + health) |
 | `/settings` | GET/PATCH | View or update settings at runtime |
@@ -223,16 +237,16 @@ The canonical list lives in [`models.json`](./models.json) — the single source
 | `CLAUDE_MAX_CONCURRENT` | `8` | Max concurrent claude processes (`-p`/stream-json path) |
 | `CLAUDE_MAX_QUEUE` | `16` | Max requests **waiting** for a `-p` concurrency slot. Beyond `CLAUDE_MAX_CONCURRENT`, requests queue (up to this cap) instead of being rejected; when the queue is **also** full, the request gets `HTTP 429` + `Retry-After` (not an opaque 500). Surfaced on `/health.concurrency` + `/health.stats.queueRejections`. |
 | `CLAUDE_QUEUE_RETRY_AFTER` | `5` | Seconds advertised in the `Retry-After` header on a `-p` concurrency-overflow `429`. |
-| `CLAUDE_MAX_PROMPT_CHARS` | *(derived)* | Prompt truncation limit in chars. Default derives from the models.json SPOT: `max(contextWindow) × 3` — currently **600,000** (≈150–200k tokens). Setting this env var (or the runtime settings API) overrides the derivation absolutely. See [ADR 0009](docs/adr/0009-spot-derived-prompt-budget.md). Note: very large prompts burn subscription-window quota quickly and slow TTFT; the TUI-mode paste path is untested beyond ~hundreds of KB. Applies to **text only** — image bytes bypass this budget (see [Images / Multimodal](#images--multimodal-vision)). |
+| `CLAUDE_MAX_PROMPT_CHARS` | *(derived per model)* | Prompt truncation limit in chars. By default there is **no single limit**: each request is bounded by the named model's own `contextWindow × 3` from the models.json SPOT — **3,000,000** for the native-1M models (`claude-opus-5`, `-4-8`, `-4-7`, `claude-sonnet-5`) and **600,000** for the 200k models (`claude-opus-4-6`, `claude-sonnet-4-6`, `claude-haiku-4-5`). Setting this env var (or `ocp settings maxPromptChars`) overrides the derivation absolutely, applying that one number to **every** model. See [ADR 0011](docs/adr/0011-per-model-prompt-char-budget.md) (supersedes [ADR 0009](docs/adr/0009-spot-derived-prompt-budget.md)'s single global ceiling). Note: very large prompts burn subscription-window quota quickly and slow TTFT; the TUI-mode paste path is untested beyond ~hundreds of KB. Applies to **text only** — image bytes bypass this budget (see [Images / Multimodal](#images--multimodal-vision)). |
 | `OCP_STRUCTURED_MAX_ATTEMPTS` | `3` | Max attempts (initial + retries) to coerce a schema-valid JSON reply when a request uses OpenAI `response_format`. Fail-closed: a non-numeric value keeps the default. See [Structured Outputs](#structured-outputs-openai-response_format). |
 | `CLAUDE_SESSION_TTL` | `3600000` | Session expiry (ms, default: 1 hour) |
-| `CLAUDE_AUTH_CHECK_INTERVAL_MS` | `600000` | How often the background `claude auth status` probe runs (ms, default: 10 min). Lower it for faster detection of a real credential outage — the verdict needs **2 consecutive** conclusive rejections, so onset is reported within roughly one interval. Fail-closed parsing: an empty/garbage value keeps the default. See [ADR 0010](docs/adr/0010-health-verdict-semantics.md). |
+| `CLAUDE_AUTH_CHECK_INTERVAL_MS` | `600000` | How often the background `claude auth status` probe runs (ms, default: 10 min). Lower it for faster detection of a real credential outage — the verdict needs **2 consecutive** conclusive rejections, so onset is reported within roughly one interval. Fail-closed parsing: an empty/garbage value keeps the default. Probe outcome is surfaced on `/health.auth.lastOutcome` (`authenticated`/`rejected`/`timeout`/`unavailable`) and the running tally on `/health.auth.consecutiveFailures`, so an operator can tell a host-load timeout from a real credential rejection. See [ADR 0010](docs/adr/0010-health-verdict-semantics.md). |
 | `CLAUDE_AUTH_CHECK_TIMEOUT_MS` | `10000` | Per-probe timeout for that same probe (ms). The probe runs **asynchronously** and never blocks request serving; this only bounds a stuck child. A probe killed by this timeout is **inconclusive** — it measures host load, not credentials, so it never changes `/health.status` or `auth.ok`. Fail-closed parsing: an empty/garbage value keeps the default. |
 | `CLAUDE_CACHE_TTL` | `0` | Response cache TTL (ms, 0 = disabled). Set to e.g. `300000` for 5-min cache. See [Response Cache](#response-cache). |
 | `CLAUDE_ALLOWED_TOOLS` | `Bash,Read,...,Agent` | Comma-separated tools to pre-approve |
 | `CLAUDE_SKIP_PERMISSIONS` | `false` | Bypass all permission checks |
 | `CLAUDE_MCP_CONFIG` | *(unset)* | Path to an MCP server config JSON, passed to the spawned `claude` as `--mcp-config` (both the `-p` path and TUI `OCP_TUI_FULL_TOOLS` panes) |
-| `CLAUDE_MAX_BODY_SIZE` | `5242880` | Max request body size (bytes, default 5 MB). Base64 image payloads inflate ~33%; raise this to admit larger multimodal requests. Fail-closed parsing: a garbage value keeps the default. |
+| `CLAUDE_MAX_BODY_SIZE` | `5242880` | Max request body size, counted in **characters** (UTF-16 code units), not bytes — the body is accumulated as a JS string, so a multi-byte payload can be several times this size on the wire and still be admitted (5,242,880 CJK characters is ~15 MB). Base64 image payloads are ASCII, so for those the two counts coincide and the ~33% base64 inflation applies as written; raise this to admit larger multimodal requests. Fail-closed parsing: a garbage value keeps the default. |
 | `CLAUDE_IMAGE_ALLOW_URL` | `false` | Allow remote `http(s)` image URLs in `image_url` parts. **Off by default** (v1 supports base64 `data:` URIs only). When on, the URL is passed through to Anthropic as a `url` image source — **OCP does not fetch it** (no OCP-side SSRF surface); unreachable/blocked URLs surface as an API error. |
 | `CLAUDE_MAX_IMAGE_BYTES` | `5242880` | Per-image decoded-byte cap (default 5 MB). Over-cap images get `HTTP 413`. |
 | `CLAUDE_MAX_IMAGES` | `20` | Max image parts per request. Over-cap gets `HTTP 413`. |
@@ -252,6 +266,7 @@ The canonical list lives in [`models.json`](./models.json) — the single source
 | `OCP_TUI_ENTRYPOINT` | `cli` | (TUI-mode) Billing-classifier labeling: `cli` pins `cc_entrypoint=cli`; `auto` self-classifies via TTY; `off` leaves inherited env untouched. See [docs/tui-mode.md](docs/tui-mode.md#tui-entrypoint). |
 | `OCP_TUI_EFFORT` | `low` | (TUI-mode) `--effort` level for the interactive spawn (`low`/`medium`/`high`/`xhigh`/`max`/`inherit`). Explicit `low` cuts TTFT p50 ~40% vs an inherited `xhigh`; invalid values fall back to `low`. See [docs/tui-mode.md](docs/tui-mode.md#tui-other-vars). |
 | `OCP_TUI_STREAM` | `0` (off) | (TUI-mode) `=1` emits real SSE `delta.content` chunks (block-level) from claude's `MessageDisplay` hook instead of buffering; transcript stays authoritative and divergent turns are refused. Caveats (tool-using turns, zero-delta detection) in [docs/tui-mode.md § `OCP_TUI_STREAM`](docs/tui-mode.md#ocp-tui-stream). |
+| `OCP_INSTANCE_NAME` | *(empty)* | Operator label for a NON-primary instance, reported on `/health` as `instanceName`. Empty means the primary. Nothing in OCP branches on the value — it exists so a second instance on the same host is discoverable rather than indistinguishable from a leftover duplicate. |
 | `OCP_TUI_STREAM_HOLDBACK` | `100` | (TUI-mode, streaming) Characters withheld before the first chunk — keeps the auth-banner gate alive and is the knob for tool-using turns. See [docs/tui-mode.md § `OCP_TUI_STREAM_HOLDBACK`](docs/tui-mode.md#ocp-tui-stream-holdback). |
 | `OCP_TUI_STREAM_DIR` | `$HOME/.ocp-tui/stream` | (TUI-mode, streaming) Directory for the hook script/settings + per-session delta sink (one sink per session-id, so concurrent turns never interleave). See [docs/tui-mode.md](docs/tui-mode.md#ocp-tui-stream). |
 | `OCP_TUI_STREAM_POLL_MS` | `100` | (TUI-mode, streaming) Interval at which OCP drains the delta sink; the hook fires at block granularity so a finer poll buys nothing. See [docs/tui-mode.md](docs/tui-mode.md#ocp-tui-stream). |
@@ -259,6 +274,53 @@ The canonical list lives in [`models.json`](./models.json) — the single source
 | `OCP_TUI_POOL_SIZE` | `0` (off) | (TUI-mode) Number of pre-booted warm `claude` panes (max `4`) so a request skips the cold boot — measured p50 `10.17s` → `6.00s`. Each warm pane is a live idle process; panes are single-use. See [docs/tui-mode.md § `OCP_TUI_POOL_SIZE`](docs/tui-mode.md#ocp-tui-pool-size). |
 | `OCP_SKIP_AUTH_TEST` | *(unset)* | When `=1`, skip the `claude -p` auth probe during `setup.mjs`. Under the announced (currently **paused**) 2026-06-15 billing split this probe would draw from the metered Agent SDK credit pool; set this to avoid burning a probe on re-installs or `ocp update` runs. Auth is validated at the first real request. |
 | `OCP_TUI_FULL_TOOLS` | *(unset)* | (TUI-mode, **single-user only**) `=1` grants the interactive session the same tool surface as the `-p` path (`--allowedTools` + optional `--mcp-config`) so a trusted single operator can run a tool-using / MCP agent on the subscription pool. Safe because TUI refuses to boot under `AUTH_MODE=multi`. See [docs/tui-mode.md § `OCP_TUI_FULL_TOOLS`](docs/tui-mode.md#ocp-tui-full-tools). |
+
+### What `auth.ok` means
+
+`/health`'s `auth` block answers "can this proxy authenticate", and it is deliberately conservative about saying yes. Two pairs of fields, deliberately separate: **`okSource` / `okAt`** say how and when `auth.ok` was established, while **`lastOutcome` / `lastCheck`** describe the last probe. A probe that cannot conclude updates only the second pair.
+
+**The table is keyed on `okSource`**, because that is the field the verdict's meaning turns on. `lastOutcome` describes the probe, and the probe is not always what set `auth.ok`.
+
+| `okSource` | `auth.ok` | `lastOutcome` | what was actually established |
+|---|---|---|---|
+| `none` | `null` | `none` | no probe has completed yet — the state at boot |
+| `probe` | `true` | `authenticated` | the probe ran and the child resolved its own credential from a file or the keychain |
+| `probe` | `null` | `token-present` | a token was in the child's environment and the probe exited 0. **That proves presence, not validity** |
+| `probe` | `false` | `rejected` | the probe ran to completion and the credential was refused |
+| `request` | `true` | *preserved* | a real completion succeeded — the strongest evidence available, and free |
+| `expired` | `null` | *preserved* | a request established it, but longer ago than the freshness window: "it worked; we do not know now" |
+
+**`lastOutcome` is not part of the request-verified verdict, and that is deliberate.** A completed request sets `okSource: "request"` and leaves `lastOutcome` exactly as the probe last set it — overwriting it would make `/health` claim a probe ran when none did. So on a host that supplies the token through the environment, the **steady state is `okSource: "request"` + `lastOutcome: "token-present"`**, and that pairing is normal rather than contradictory. It is also the state three of the four instances in the reference fleet spend most of their time in.
+
+> **There is no `lastOutcome: "verified-by-request"`.** Earlier revisions of this table, of ADR 0014 and of the CHANGELOG all promised one; the server has never emitted it and by design never will (see the paragraph above). A monitor written against that value could not match any real response. **Key on `okSource: "request"`.** Corrected in #342.
+
+**Inconclusive probes are not a row here**, because they leave the verdict alone: a `timeout` or `unavailable` writes `lastOutcome`, `lastCheck`, `message` and `consecutiveInconclusive`, and leaves `ok`, `okSource` and `okAt` untouched. That is the point — a probe killed by host load measured load, not the credential.
+
+**Why `token-present` is not `authenticated`.** `claude auth status` exits 0 whenever a token is present, without checking it: a fabricated token yields exit 0 and `loggedIn: true`. On a host that supplies `CLAUDE_CODE_OAUTH_TOKEN` through a systemd `EnvironmentFile` or an inlined unit — which is how OCP is normally deployed on Linux — the probe therefore cannot distinguish a working credential from an expired one. Reporting `authenticated` there is what issue #308 found: `/health` asserting the proxy was authenticated while every request failed on authentication. See [ADR 0014](docs/adr/0014-auth-verdict-measures-what-it-measured.md).
+
+**A `null` is not a failure.** It means no conclusive verdict, `ocp doctor` reports it as WARN rather than FAIL, and it does not block `ocp update`. On such a host the first successful request moves it to `true`.
+
+**`status` is unaffected by any of this.** The proxy's `ok` / `degraded` verdict is driven by consecutive conclusive probe *rejections* (ADR 0010), never by `auth.ok`.
+### Running more than one instance on a host
+
+`DEFAULT_PORT` (3456) is the primary and never changes — it is the single source of truth in `lib/constants.mjs`, and CI hard-fails any other port literal in source. A host that needs a **second** instance takes `DEFAULT_PORT + n` in allocation order, and **must declare itself**:
+
+```ini
+# /etc/systemd/system/ocp-<name>.service
+Environment=OCP_INSTANCE_NAME=<name>
+Environment=CLAUDE_PROXY_PORT=3457
+Environment=CLAUDE_BIND=127.0.0.1
+User=<the identity this instance's spawns should have>
+```
+
+The name appears on `/health` as `instanceName` (empty string on the primary), so an instance is discoverable from the outside rather than only by reading the box's unit files.
+
+**The reason a second instance exists at all is Unix identity, not load.** OCP spawns a `claude` child per request and that child inherits the *service's* identity. An agent that answers untrusted users therefore needs its own instance under its own user — otherwise a prompt injection runs with whatever the primary's account can do. This cannot be solved inside one process: the spawn identity comes from the unit's `User=`, so it is one identity per unit.
+
+**Two things this convention exists to prevent**, both of which happened:
+
+- A version sweep that probes only `:3456` reports the fleet clean while a second instance sits a release behind. Enumerate declared instances, not hosts.
+- `ocp doctor`'s multi-unit check cannot tell a deliberate second instance from a leftover duplicate, so it warns on a correct configuration every run — and a warning that always fires is one people learn to skip. (Teaching `doctor` to read the declaration is not done yet; see issue #327.)
 
 ### Streaming heartbeat
 
@@ -281,6 +343,12 @@ $ ocp settings maxPromptChars 200000
 $ ocp settings maxConcurrent 4
 ✓ maxConcurrent = 4
 ```
+
+`maxPromptChars` is a **global** override: setting it pins the truncation ceiling to that one
+number for every model, replacing the per-model derivation. Left unset, `ocp settings` reports
+the fallback (600,000) and each model uses its own `contextWindow × 3`. There is no way to
+clear the override back to per-model derivation over `PATCH` — restart without
+`CLAUDE_MAX_PROMPT_CHARS` to do that. See [ADR 0011](docs/adr/0011-per-model-prompt-char-budget.md).
 
 ## LAN & multi-user
 
@@ -487,7 +555,7 @@ silent drop):
 
 | Cap | Env var | Default | Error |
 |-----|---------|---------|-------|
-| Request body | `CLAUDE_MAX_BODY_SIZE` | 5 MB | `413` request body too large |
+| Request body | `CLAUDE_MAX_BODY_SIZE` | 5,242,880 characters | `413` request body too large |
 | Per-image bytes | `CLAUDE_MAX_IMAGE_BYTES` | 5 MB | `413` `image_too_large` |
 | Total image bytes | `CLAUDE_MAX_IMAGE_TOTAL_BYTES` | 20 MB | `413` `images_too_large` |
 | Image count | `CLAUDE_MAX_IMAGES` | 20 | `413` `too_many_images` |
@@ -545,6 +613,7 @@ The simplest path: ask your AI — paste `Run `ocp doctor` and follow its `next_
 - **A TUI session vanished right after upgrading OCP** — if a pre-3.21.1 and a post-3.21.1 instance ran on the same host at the same time during an upgrade, the new instance's one-time boot reap can, once, kill an old-format (`ocp-tui-<8hex>`) live TUI session belonging to the still-running old instance. Restart the affected session (`ocp restart` or re-run your TUI turn) and it returns under the new instance's port-scoped naming.
 - **OpenClaw shows old models after `ocp update` (v3.10→v3.11 only)** — the running shell had the old `cmd_update` cached, so the sync hook doesn't fire on that single jump. Run once: `node ~/ocp/scripts/sync-openclaw.mjs && openclaw gateway restart`. Every future update syncs automatically.
 - **Response-cache hit rate drops once after upgrading to v3.25.0** — only if you run with the cache on (`CLAUDE_CACHE_TTL > 0`; it is off by default). v3.25.0 keys the cache on the resolved model instead of the string the client sent, so alias-addressed rows (and *all* structured-output rows) orphan and are reaped by the TTL cleanup within one window. **No action required.** Details: [docs/troubleshooting.md#cache-rekey-v3250](docs/troubleshooting.md#cache-rekey-v3250).
+- **`ocp update`'s fresh-install path (pre-v3.4.0 hosts) is execution-unverified and now requires an explicit `--fresh-install` flag, dated 2026-08-01 (issue #227)** — this path (`rm -rf ~/ocp`, a fresh `git clone`, `node setup.mjs`) was dead on `main` until #217 reconnected it as a side effect of an unrelated fix; its kind-detection logic and its `--yes` gate are unit-tested, but the real commands it runs have never executed, in CI or by hand. `ocp update --yes` alone no longer runs it — see [docs/upgrading.md § Old version (< v3.4.0)](docs/upgrading.md) for exactly what is and isn't verified, and run `ocp update --fresh-install --yes` only once you've read that.
 - **`start.sh` keeps its pre-issue-#246 bare-`lsof` port check on a host that only ever takes patch bumps** — `start.sh` (the manual launcher; the auto-start service unit/plist never calls it) is regenerated only by `setup.mjs`, which only the full (cross-minor) upgrade path and a fresh install run — `ocp update`'s light/patch-bump path (`_cmd_update_light`) never calls `setup.mjs` and so never rewrites `start.sh`. A host that stays on patch bumps for a while therefore keeps whatever `start.sh` it last got from a full upgrade or install, even after `ocp update`s that already fixed the underlying `scripts/lib/start-sh.mjs` generator. Force a regeneration with `node setup.mjs --reconfigure-only` (writes `start.sh` without enabling/starting the service), or just wait for the next cross-minor upgrade.
 
 Full manual — setup failures, env-var-not-taking-effect-after-restart (launchd bootout+bootstrap vs `kickstart -k`), stuck sessions, "OpenClaw registry out of sync", and the two-layer TUI-mode 401 root cause + fix: **[docs/troubleshooting.md](docs/troubleshooting.md)**.
@@ -562,10 +631,20 @@ Top-level files a contributor or operator may need to know:
 | `models.json` | Single source of truth for model IDs, aliases, context windows. See ADR 0003. |
 | `ocp` / `ocp-connect` | User-facing CLI wrappers (server-side / client-side respectively). |
 | `dashboard.html` | Static dashboard served from `/dashboard`. |
+| `lib/constants.mjs` | Shared constants (default port, loopback host, local proxy URL) — one definition for `server.mjs`, `setup.mjs`, the `scripts/` helpers and `lib/tui/`. The bash CLIs cannot import it and carry a keep-in-sync note instead. |
+| `lib/env.mjs` | Fail-closed positive-integer parsing for the numeric env caps (body size, image bytes, …). |
+| `lib/multimodal.mjs` | OpenAI `image_url` content parts → Anthropic image blocks for `claude -p --input-format stream-json`. See § "Images / Multimodal (Vision)". |
+| `lib/net.mjs` | `isLoopbackBind()` — true only for addresses that **cannot** be reached from another host; anything else (`0.0.0.0`, `::`, a concrete LAN/Tailscale IP) counts as network-exposed. Gates TUI mode (`OCP_TUI_ALLOW_LAN`) and the `OCP_LOCAL_TOOLS` boot check, both of which fail closed on a non-loopback bind. |
+| `lib/prompt.mjs` | Pure system-prompt assembly: operator append, per-model truncation budget, wrapper selection. See ADR 0011. |
+| `lib/spawn-auth.mjs` | Pure primitives for `-p` spawn-token resolution and HOME isolation (serial mutex, TTL cache, expiry, label ordering). |
+| `lib/structured-output.mjs` | OpenAI `response_format` helpers — detection, JSON-Schema validation, payload extraction. Class B.1, ADR 0006. |
+| `lib/tool-support.mjs` | `classifyToolRequest()` — which `tools` / `tool_choice` / `function_call` shapes OCP must refuse. See ADR 0013. |
+| `lib/tui/` | Subscription-pool (TUI) mode internals: warm-pane pool, semaphore, session, stream, transcript. |
 | `scripts/sync-openclaw.mjs` | Idempotent OpenClaw registry sync invoked by `ocp update`. See ADR 0004. |
 | `scripts/lib/service-mode.mjs` | Pure decision layer for `setup.mjs`'s auto-start step — first install vs. `--reconfigure-only` (issue #226). |
 | `scripts/lib/install-autostart.mjs` | Injectable `installAutoStart()` — setup.mjs's auto-start install (legacy-unit migration, unit write, enable/start/bootstrap), extracted so tests can observe real run/fs calls instead of asserting on source text (issue #226). |
-| `scripts/lib/restart-unit.mjs` | Resolves which systemd unit actually owns the OCP port (Linux), or whether the port is listening at all (macOS), before the upgrade/rollback restart phase touches anything — refuses rather than guesses when it can't tell. **Coverage is Linux-complete but macOS-partial**: macOS has no unit-ownership/`no-unit` determination yet (issue #239). See [docs/upgrading.md § Restart target resolution](docs/upgrading.md#restart-target-resolution). |
+| `scripts/lib/restart-unit.mjs` | Resolves which systemd unit (Linux) or launchd job (macOS) actually owns the OCP port before the upgrade/rollback restart phase touches anything — refuses rather than guesses when it can't tell. The two platforms verify different things (issue #239): Linux discovers whichever unit actually holds the port via a `/proc/<pid>/cgroup` walk and compares that discovery against the expected unit; macOS only checks whether its one hard-coded expected job (`dev.ocp.proxy`, gui-domain only) is the port's holder, and cannot identify an unexpected job if that check fails — a root-owned `dev.ocp.proxy` LaunchDaemon hits a permanent refusal there today (issue #290). The working-tree comparison that distinguishes a second local OCP checkout from the production install (issue #254) is Linux-only (`/proc/<pid>/cwd` has no macOS equivalent), and the darwin branch is exercised nowhere in this repo's CI (Linux-only runners) — verified only live, read-only, against a real host. See [docs/upgrading.md § Restart target resolution](docs/upgrading.md#restart-target-resolution). |
+| `scripts/lib/start-sh.mjs` | Builds the standalone `start.sh` launcher `setup.mjs` writes (issue #246) — extracted so this logic can be driven by injected fake binaries in tests, since `setup.mjs` itself must never be executed by the test suite. Two distinct port checks live here, each with its own Linux/macOS split, and they are not symmetric with each other: `start.sh`'s own nohup-gating check (`darwinListeningCheck`/`nonDarwinListeningCheck`) uses absolute-path `lsof`/`netstat` plus a `netstat` cross-check for `lsof`'s privilege-gap ambiguity on macOS (a restricted `PATH`, e.g. a launchd job's default environment, can omit `/usr/sbin` entirely), and a bare, non-absolute-path `lsof` on Linux, deliberately; the separate post-install bind check (`buildBindCheckCommand`) uses absolute-path `lsof` only — no `netstat` cross-check — on macOS, and a bare `ss -tlnp` on Linux. |
 | `.claude/skills/` | Project-specific Claude Code skills. |
 | `ocp-plugin/` | OpenClaw gateway plugin (optional installation). |
 | `docs/lan-mode.md` | LAN & multi-user operations manual (server/client setup, keys, quotas, anonymous access, security model). |
@@ -597,7 +676,7 @@ OCP runs under a small set of binding documents so contributions stay aligned wi
 - **[`models.json`](./models.json)** — single source of truth for the model registry. See [ADR 0003](./docs/adr/0003-models-json-spot.md).
 - **[`docs/adr/`](./docs/adr/)** — architecture decision records explaining why current structure exists.
 
-If you want to contribute: read `ALIGNMENT.md` first, search `cli.js` for the operation you're proposing, and cite the line number in your PR.
+If you want to contribute: read `ALIGNMENT.md` first, then classify the change before writing anything — Class A (the `cli.js`-mirror surface) needs a `cli.js:NNNN` line citation; Class B.1 (`/v1/chat/completions`, `/v1/models`) needs the relevant OpenAI specification section plus ADR 0006; Class B.2 (`/health`, `/dashboard`, `/sessions`, `/logs`, `/status`, `/settings`, `/api/keys*`, `/api/usage`, `/cache*`) needs the endpoint's authorizing ADR. See `CLAUDE.md` § "Classify the change first" for the full table.
 
 ## Support OCP
 
