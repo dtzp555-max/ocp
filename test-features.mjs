@@ -5923,6 +5923,36 @@ test("LEGACY_SESSION_NAME_RE matches only the exact old bare-prefix shape, never
 
 console.log("\nTUI command construction (proxy-purity / #4):");
 
+test("#328 (P1 from review 5): the pane prefix unsets ALIASED carriers, not just the three names", () => {
+  // The alias layer added in response to review 4 was NOT pinned: neutering it left the suite at
+  // exactly the baseline, and the test above only asserts the three constants — the `...aliased`
+  // spread was invisible to it. So a reviewer reading that test would reasonably conclude the
+  // review-4 fix was covered when it was not. This is the test that actually covers it.
+  const saved = process.env.OPENAI_API_KEY;
+  process.env.OPENAI_API_KEY = "ocp_" + randomBytes(24).toString("base64url");
+  try {
+    const cmd = buildTuiCmd("/usr/bin/claude", "claude-haiku", "sid-alias", "/home/u", "cli");
+    assert.match(cmd, /-u '?OPENAI_API_KEY'?/,
+      `the pane must unset a variable that CARRIES an OCP credential, even though its name is not ` +
+      `on INBOUND_AUTH_ENV_VARS; got: ${cmd.slice(0, 220)}`);
+  } finally {
+    if (saved === undefined) delete process.env.OPENAI_API_KEY; else process.env.OPENAI_API_KEY = saved;
+  }
+});
+
+test("#328 (P2 from review 5): a metacharacter-bearing variable NAME cannot escape the pane command", () => {
+  // Every other runtime value in the pane prefix goes through shq(); the alias names were the
+  // first runtime-derived value to reach it and did not. A reviewer executed the gap to a created
+  // marker file via tmux.
+  const evil = "EVIL;touch /tmp/ocp-should-not-exist;X";
+  process.env[evil] = "ocp_" + randomBytes(24).toString("base64url");
+  try {
+    const cmd = buildTuiCmd("/usr/bin/claude", "claude-haiku", "sid-shq", "/home/u", "cli");
+    assert.ok(!cmd.includes("-u EVIL;touch"), `the name must be quoted, not spliced raw; got: ${cmd.slice(0, 260)}`);
+    assert.ok(cmd.includes("'" + evil + "'"), "and it must appear single-quoted");
+  } finally { delete process.env[evil]; }
+});
+
 test("#328 (P0, found by independent review): buildTuiCmd unsets OCP's inbound credentials in the PANE", () => {
   // The third copy of the four-name denylist lived here, and this is the ONLY request path when
   // CLAUDE_TUI_MODE=true — server.mjs picks callClaudeTui over callClaude wholesale, so a fix
@@ -5930,14 +5960,14 @@ test("#328 (P0, found by independent review): buildTuiCmd unsets OCP's inbound c
   // asserts the argv `buildTuiCmd` actually returns, which is the pane's real command line.
   const cmd = buildTuiCmd("/usr/bin/claude", "claude-haiku", "sid-328", "/home/u", "cli"); // already a string
   for (const name of INBOUND_AUTH_ENV_VARS) {
-    assert.ok(cmd.includes(`-u ${name}`), `pane command must unset ${name}; got: ${cmd.slice(0, 200)}`);
+    assert.ok(cmd.includes(`-u '${name}'`), `pane command must unset ${name} (shq-quoted since review 5); got: ${cmd.slice(0, 200)}`);
   }
   // Control: the pre-existing four are still unset (this must EXTEND the list, not replace it),
   // and the outbound credential is not among the unsets.
   for (const name of ["CLAUDECODE", "ANTHROPIC_API_KEY", "ANTHROPIC_BASE_URL", "ANTHROPIC_AUTH_TOKEN"]) {
-    assert.ok(cmd.includes(`-u ${name}`), `pane command must still unset ${name} — the list was replaced, not extended`);
+    assert.ok(cmd.includes(`-u '${name}'`), `pane command must still unset ${name} — the list was replaced, not extended`);
   }
-  assert.ok(!cmd.includes("-u CLAUDE_CODE_OAUTH_TOKEN"),
+  assert.ok(!cmd.includes("-u 'CLAUDE_CODE_OAUTH_TOKEN'"),
     "the OUTBOUND credential must NOT be unset — the pane's claude needs it to authenticate");
 });
 
@@ -5978,7 +6008,7 @@ test("buildTuiCmd keeps version pin + entrypoint label + MCP wall", () => {
   // 'auto' mode must NOT pin the entrypoint (claude self-classifies via TTY).
   const auto = buildTuiCmd("/usr/bin/claude", "m", "sid-3", "/home/u", "auto");
   assert.ok(!/CLAUDE_CODE_ENTRYPOINT=/.test(auto), "auto mode leaves entrypoint unset");
-  assert.ok(/-u CLAUDE_CODE_ENTRYPOINT/.test(auto), "auto mode unsets any inherited entrypoint");
+  assert.ok(/-u '?CLAUDE_CODE_ENTRYPOINT'?/.test(auto), "auto mode unsets any inherited entrypoint");
 });
 
 // CLAUDE_CODE_OAUTH_TOKEN passthrough (PI231 401 incident): tmux doesn't forward the parent
