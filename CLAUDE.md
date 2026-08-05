@@ -164,19 +164,41 @@ release_kit:
     - name: ADR 0012 additive-field sweep
       when: every release, during the release_kit walk
       how: |
-        Count ENTRIES carrying the marker, case-INSENSITIVELY, not raw occurrences:
+        Count ENTRIES carrying the marker, not raw occurrences:
 
-          grep -in 'additive under ADR 0012' CHANGELOG.md
+          grep -inE 'additive under \[?ADR[^0-9]{0,10}0012' CHANGELOG.md
 
-        Case-insensitive because condition 5 requires the marker, not a
-        capitalisation, and prose capitalises at a sentence start. Then subtract
-        by inspection any hit that is META-TEXT — a line describing the sweep
-        mechanism necessarily quotes the marker it greps for. A field entry names
-        an endpoint and a field; meta-text does not. Read every hit; do not report
-        the raw number.
+        Then subtract by inspection any hit that is META-TEXT — a line describing
+        the sweep mechanism necessarily quotes the marker it greps for. A field
+        entry names an endpoint and a field; meta-text does not. Read every hit;
+        do not report the raw number.
 
         Do the same over the section being dated (this cycle) and over the whole
         file (cumulative).
+
+        Why the pattern is shaped like that, since a plain substring was tried
+        first and failed twice on the SAME axis: condition 5 requires the marker,
+        not a spelling. The literal `additive under ADR 0012` finds only 2 of the
+        5 spellings that comply with it. Missed, and not hypothetically — the
+        markdown-link form is already used 10 times elsewhere in this repo:
+
+          additive under [ADR 0012](docs/adr/0012-….md)     <- link form
+          **Additive under [ADR 0012](….md).**              <- link + bold + capital
+          additive under ADR&nbsp;0012                      <- non-breaking space
+
+        Case-insensitivity covers the sentence-initial capital; `\[?` covers the
+        link form; `[^0-9]{0,10}` covers whatever separates "ADR" from "0012".
+
+        HONEST LIMIT, because this is the second narrowing of the same grep and
+        that pattern usually means the mechanism is wrong: a substring or regex
+        match CANNOT be complete over the space of ways to write a reference in
+        prose. What makes it acceptable here rather than in a security control is
+        that there is no adversary — the author is complying — and the variation
+        space is bounded by markdown conventions rather than open. If a THIRD
+        compliant spelling is ever found to be missed, stop widening the regex:
+        that is the signal to make the marker's canonical form part of ADR 0012's
+        condition 5, or to diff each B.2 endpoint's real response key set per
+        release instead of reading prose at all.
       report: list the field names and their endpoints in the release PR body,
         plus the cumulative count to date; write "none this cycle" when there are
         none, so silence is a result rather than an omission. If the raw grep count
