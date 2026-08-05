@@ -414,6 +414,19 @@ const PROXY_ANONYMOUS_KEY = process.env.PROXY_ANONYMOUS_KEY || "";
 // LAN-reachable device (issue #109 P0). Localhost callers always see it regardless,
 // since localhost is already fully trusted by the auth path.
 const ADVERTISE_ANON_KEY = process.env.PROXY_ADVERTISE_ANON_KEY === "1";
+
+// #327, additive under ADR 0012. A non-primary OCP instance names itself.
+//
+// A host can legitimately run more than one instance — the documented case is an isolated
+// backend for an agent that serves untrusted users, bound to loopback under its own Unix user so
+// the `claude` children it spawns cannot inherit the primary's identity. Nothing in OCP could
+// express that, so a second instance was indistinguishable from a leftover duplicate: `ocp
+// doctor`'s multi-unit check reported "too many candidates" on a correct configuration, every
+// run, and a version sweep that probed only the default port silently missed the other one.
+//
+// Empty is the default and means "the primary". The value is an operator label, not an
+// identifier OCP acts on — nothing branches on it.
+const INSTANCE_NAME = (process.env.OCP_INSTANCE_NAME || "").trim();
 let CACHE_TTL = parseInt(process.env.CLAUDE_CACHE_TTL || "0", 10); // 0 = disabled, value in ms
 
 // ── TUI-mode (subscription-pool bridge) — opt-in; default OFF ───────────
@@ -3517,6 +3530,11 @@ const server = createServer(async (req, res) => {
       authMode: AUTH_MODE,
       ...((isLocalhost || ADVERTISE_ANON_KEY) ? { anonymousKey: PROXY_ANONYMOUS_KEY || null } : {}),
       auth: effectiveAuthStatus(), // #308: the TTL on a request-verified verdict is applied at read time
+      // #327: empty string rather than omitted, so a consumer can tell "primary" from "an older
+      // build that does not report this at all" — the same distinction #324's backward-compat
+      // test turned on.
+      instanceName: INSTANCE_NAME,
+      auth: authStatus,
       config: {
         timeout: TIMEOUT,
         maxConcurrent: MAX_CONCURRENT,

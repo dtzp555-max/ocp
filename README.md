@@ -209,6 +209,7 @@ The canonical list lives in [`models.json`](./models.json) — the single source
 | `/v1/models` | GET | List available models |
 | `/v1/chat/completions` | POST | Chat completion (streaming + non-streaming) |
 | `/health` | GET | Comprehensive health check (includes a `tui` block for TUI-mode drift/concurrency monitoring, and an `auth` block — see § "What `auth.ok` means") |
+| `/health` | GET | Comprehensive health check (includes a `tui` block for TUI-mode drift/concurrency monitoring, and `instanceName` — see § "Running more than one instance on a host") |
 | `/usage` | GET | Plan usage limits + per-model stats |
 | `/status` | GET | Combined overview (usage + health) |
 | `/settings` | GET/PATCH | View or update settings at runtime |
@@ -266,6 +267,7 @@ The canonical list lives in [`models.json`](./models.json) — the single source
 | `OCP_TUI_ENTRYPOINT` | `cli` | (TUI-mode) Billing-classifier labeling: `cli` pins `cc_entrypoint=cli`; `auto` self-classifies via TTY; `off` leaves inherited env untouched. See [docs/tui-mode.md](docs/tui-mode.md#tui-entrypoint). |
 | `OCP_TUI_EFFORT` | `low` | (TUI-mode) `--effort` level for the interactive spawn (`low`/`medium`/`high`/`xhigh`/`max`/`inherit`). Explicit `low` cuts TTFT p50 ~40% vs an inherited `xhigh`; invalid values fall back to `low`. See [docs/tui-mode.md](docs/tui-mode.md#tui-other-vars). |
 | `OCP_TUI_STREAM` | `0` (off) | (TUI-mode) `=1` emits real SSE `delta.content` chunks (block-level) from claude's `MessageDisplay` hook instead of buffering; transcript stays authoritative and divergent turns are refused. Caveats (tool-using turns, zero-delta detection) in [docs/tui-mode.md § `OCP_TUI_STREAM`](docs/tui-mode.md#ocp-tui-stream). |
+| `OCP_INSTANCE_NAME` | *(empty)* | Operator label for a NON-primary instance, reported on `/health` as `instanceName`. Empty means the primary. Nothing in OCP branches on the value — it exists so a second instance on the same host is discoverable rather than indistinguishable from a leftover duplicate. |
 | `OCP_TUI_STREAM_HOLDBACK` | `100` | (TUI-mode, streaming) Characters withheld before the first chunk — keeps the auth-banner gate alive and is the knob for tool-using turns. See [docs/tui-mode.md § `OCP_TUI_STREAM_HOLDBACK`](docs/tui-mode.md#ocp-tui-stream-holdback). |
 | `OCP_TUI_STREAM_DIR` | `$HOME/.ocp-tui/stream` | (TUI-mode, streaming) Directory for the hook script/settings + per-session delta sink (one sink per session-id, so concurrent turns never interleave). See [docs/tui-mode.md](docs/tui-mode.md#ocp-tui-stream). |
 | `OCP_TUI_STREAM_POLL_MS` | `100` | (TUI-mode, streaming) Interval at which OCP drains the delta sink; the hook fires at block granularity so a finer poll buys nothing. See [docs/tui-mode.md](docs/tui-mode.md#ocp-tui-stream). |
@@ -292,6 +294,26 @@ The canonical list lives in [`models.json`](./models.json) — the single source
 **A `null` is not a failure.** It means no conclusive verdict, `ocp doctor` reports it as WARN rather than FAIL, and it does not block `ocp update`. On such a host the first successful request moves it to `true`.
 
 **`status` is unaffected by any of this.** The proxy's `ok` / `degraded` verdict is driven by consecutive conclusive probe *rejections* (ADR 0010), never by `auth.ok`.
+### Running more than one instance on a host
+
+`DEFAULT_PORT` (3456) is the primary and never changes — it is the single source of truth in `lib/constants.mjs`, and CI hard-fails any other port literal in source. A host that needs a **second** instance takes `DEFAULT_PORT + n` in allocation order, and **must declare itself**:
+
+```ini
+# /etc/systemd/system/ocp-<name>.service
+Environment=OCP_INSTANCE_NAME=<name>
+Environment=CLAUDE_PROXY_PORT=3457
+Environment=CLAUDE_BIND=127.0.0.1
+User=<the identity this instance's spawns should have>
+```
+
+The name appears on `/health` as `instanceName` (empty string on the primary), so an instance is discoverable from the outside rather than only by reading the box's unit files.
+
+**The reason a second instance exists at all is Unix identity, not load.** OCP spawns a `claude` child per request and that child inherits the *service's* identity. An agent that answers untrusted users therefore needs its own instance under its own user — otherwise a prompt injection runs with whatever the primary's account can do. This cannot be solved inside one process: the spawn identity comes from the unit's `User=`, so it is one identity per unit.
+
+**Two things this convention exists to prevent**, both of which happened:
+
+- A version sweep that probes only `:3456` reports the fleet clean while a second instance sits a release behind. Enumerate declared instances, not hosts.
+- `ocp doctor`'s multi-unit check cannot tell a deliberate second instance from a leftover duplicate, so it warns on a correct configuration every run — and a warning that always fires is one people learn to skip. (Teaching `doctor` to read the declaration is not done yet; see issue #327.)
 
 ### Streaming heartbeat
 
