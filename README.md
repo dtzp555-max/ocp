@@ -276,14 +276,14 @@ The canonical list lives in [`models.json`](./models.json) — the single source
 
 ### What `auth.ok` means
 
-`/health`'s `auth` block answers "can this proxy authenticate", and it is deliberately conservative about saying yes.
+`/health`'s `auth` block answers "can this proxy authenticate", and it is deliberately conservative about saying yes. Two pairs of fields, deliberately separate: **`okSource` / `okAt`** say how and when `auth.ok` was established, while **`lastOutcome` / `lastCheck`** describe the last probe. A probe that cannot conclude updates only the second pair.
 
 | `auth.ok` | `lastOutcome` | what was actually established |
 |---|---|---|
 | `true` | `verified-by-request` | a real completion succeeded — the strongest evidence available, and free |
 | `true` | `authenticated` | the probe ran and the child resolved its own credential from a file or the keychain |
 | `null` | `token-present` | a token was in the child's environment and the probe exited 0. **That proves presence, not validity** |
-| `null` | `verified-by-request` | it worked, but longer ago than the freshness window — "we do not know now" |
+| `null` | any | `okSource: "expired"` — it worked, but longer ago than the freshness window: "we do not know now" |
 | `false` | `rejected` | the probe ran to completion and the credential was refused |
 | unchanged | `timeout` / `unavailable` | the probe could not conclude; the previous verdict is preserved |
 

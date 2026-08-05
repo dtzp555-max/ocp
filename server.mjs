@@ -52,11 +52,7 @@ import { detectTuiUpstreamError } from "./lib/tui/transcript.mjs";
 import { TuiSemaphore, SemaphoreAbortError, recordTuiEntrypoint, buildTuiHealthBlock } from "./lib/tui/semaphore.mjs";
 import { TuiPanePool, resolvePoolSize, POOL_MAX_SIZE } from "./lib/tui/pool.mjs";
 import { TuiDeltaAssembler, DEFAULT_HOLDBACK_CHARS, resolveStreamHoldback } from "./lib/tui/stream.mjs";
-<<<<<<< HEAD
-import { createSerialMutex, createTtlCache, isTokenExpiring, orderLabelsLastGoodFirst, scrubInboundAuthEnv } from "./lib/spawn-auth.mjs";
-=======
-import { createSerialMutex, createTtlCache, isTokenExpiring, orderLabelsLastGoodFirst, applyRequestVerdictTtl } from "./lib/spawn-auth.mjs";
->>>>>>> ddd5cf1 (fix(auth): /health stops reporting a token's PRESENCE as authentication (#308, ADR 0014))
+import { createSerialMutex, createTtlCache, isTokenExpiring, orderLabelsLastGoodFirst, scrubInboundAuthEnv, applyRequestVerdictTtl } from "./lib/spawn-auth.mjs";
 import { hasImageContent, buildImageBlocks, buildStreamJsonInput, MultimodalError } from "./lib/multimodal.mjs";
 import { parsePositiveInt } from "./lib/env.mjs";
 import { appendOperatorPrompt, promptCharBudgetFor, fallbackPromptCharBudget, resolveGlobalPromptCharOverride, selectPromptWrapper, localToolsSafetyError } from "./lib/prompt.mjs";
@@ -1154,6 +1150,11 @@ let authStatus = {
   // B.2 field (the ADR 0010 test). Consumers that must DECIDE — doctor, and through it the
   // `ocp update` gate — read this alongside `ok` instead.
   consecutiveInconclusive: 0,
+  // #308 / ADR 0014. HOW and WHEN `ok` was established — distinct from lastOutcome/lastCheck,
+  // which describe the last PROBE. Conflating them made the freshness window both unreachable
+  // under the default config and permanently disarmable by a single inconclusive probe.
+  okSource: "none",          // "none" | "probe" | "request" | "expired"
+  okAt: 0,                   // when `ok` was established, by whichever source
 };
 
 // The single definition of "can this proxy serve?", used by BOTH /status and /health (#232).
@@ -1181,8 +1182,12 @@ const AUTH_REQUEST_VERDICT_TTL_MS = 900000; // 15 min
 // Deliberately does NOT touch consecutiveFailures: that tally counts CONCLUSIVE PROBE rejections
 // and drives ADR 0010's degraded verdict, which this change does not alter.
 function noteAuthVerifiedByRequest() {
-  authStatus = { ...authStatus, ok: true, lastCheck: Date.now(), message: "verified by a completed request",
-                 lastOutcome: "verified-by-request" };
+  const now = Date.now();
+  // Does NOT touch lastOutcome/lastCheck: those belong to the probe, and overwriting them would
+  // make /health claim a probe ran when none did. A successful request also clears the rejection
+  // tally, because it is direct evidence the credential is not being refused.
+  authStatus = { ...authStatus, ok: true, okSource: "request", okAt: now,
+                 message: "verified by a completed request", consecutiveFailures: 0 };
 }
 
 // #308: apply the TTL at READ time rather than on a timer — no extra interval to keep alive, and
@@ -1232,10 +1237,8 @@ async function checkAuth() {
         // explicitly — the message below depends on it.
         (err, _stdout, stderr) => (err ? reject(Object.assign(err, { stderr })) : resolve()));
     });
-<<<<<<< HEAD
     authStatus = { ok: true, lastCheck: Date.now(), message: "authenticated",
                    lastOutcome: "authenticated", consecutiveFailures: 0, consecutiveInconclusive: 0 };
-=======
     // #308 / ADR 0014. `claude auth status` reports whether a token is PRESENT, not whether it is
     // VALID. Measured in an isolated empty HOME: with no token it exits 1 (loggedIn:false); with a
     // FABRICATED token — a string that never existed — it exits 0 and reports loggedIn:true,
@@ -1252,7 +1255,25 @@ async function checkAuth() {
           lastOutcome: "token-present", consecutiveFailures: authStatus.consecutiveFailures }
       : { ok: true, lastCheck: Date.now(), message: "authenticated",
           lastOutcome: "authenticated", consecutiveFailures: 0 };
->>>>>>> ddd5cf1 (fix(auth): /health stops reporting a token's PRESENCE as authentication (#308, ADR 0014))
+    const nowP = Date.now();
+    // An exit-0 probe always resets the rejection tally, both branches. Preserving it on the
+    // token-present branch removed ADR 0010's self-healing on exactly the hosts that use the
+    // env-token mechanism: once the tally reached the degrade threshold it could never come back
+    // down, because a successful probe was the only thing that lowered it.
+    if (tokenFromEnv) {
+      // Presence, not validity. But do NOT clobber a FRESHER verdict that a real request
+      // established — a probe that measured less must not overwrite evidence that measured more.
+      const keepRequestVerdict = authStatus.okSource === "request" &&
+                                 nowP - authStatus.okAt <= AUTH_REQUEST_VERDICT_TTL_MS;
+      authStatus = keepRequestVerdict
+        ? { ...authStatus, lastCheck: nowP, lastOutcome: "token-present", consecutiveFailures: 0 }
+        : { ...authStatus, ok: null, okSource: "probe", okAt: nowP, lastCheck: nowP,
+            message: "a token is present; the probe cannot tell whether it is valid",
+            lastOutcome: "token-present", consecutiveFailures: 0 };
+    } else {
+      authStatus = { ok: true, okSource: "probe", okAt: nowP, lastCheck: nowP, message: "authenticated",
+                     lastOutcome: "authenticated", consecutiveFailures: 0 };
+    }
   } catch (e) {
     const msg = (e.stderr || e.message || "").slice(0, 200);
     const now = Date.now();

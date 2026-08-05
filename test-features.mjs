@@ -2555,8 +2555,9 @@ ltTest("integration (#308): a completed REQUEST raises the verdict the probe cou
     assert.ok(before, `precondition: the probe must land on token-present first — ${ltDiag(buf)}`);
     assert.equal(before.auth.ok, null, "precondition: not established before the request");
     await ltPost(port, { model: "sonnet", messages: [{ role: "user", content: "hi" }] });
-    const after = await ltWaitHealth(port, b => b.auth && b.auth.lastOutcome === "verified-by-request", 15000);
+    const after = await ltWaitHealth(port, b => b.auth && b.auth.okSource === "request", 15000);
     assert.ok(after, `a completed request must raise the verdict — ${ltDiag(buf)}`);
+    assert.equal(after.auth.okSource, "request", "and the verdict must record that a REQUEST established it, not a probe");
     assert.equal(after.auth.ok, true, "a request that reached the model proves the credential works");
   } finally { child.kill("SIGKILL"); _ltRmRetry(dir); }
 });
@@ -8447,21 +8448,46 @@ test("#328: the var list is the single source both scrub sites read", () => {
 // #308 / ADR 0014 — applyRequestVerdictTtl. The LATCH guard: a verdict raised by a real request
 // must expire, because on an env-token host nothing else can ever lower it.
 test("#308: a request-verified verdict decays to null past the window", () => {
-  const st = { ok: true, lastCheck: 1000, lastOutcome: "verified-by-request", message: "verified by a completed request" };
-  const fresh = applyRequestVerdictTtl(st, 1000 + 900000, 900000);
-  assert.equal(fresh.ok, true, "exactly at the window edge is still fresh");
+  const st = { ok: true, okSource: "request", okAt: 1000, lastCheck: 1000, lastOutcome: "verified-by-request" };
+  assert.equal(applyRequestVerdictTtl(st, 1000 + 900000, 900000).ok, true, "exactly at the window edge is still fresh");
   const stale = applyRequestVerdictTtl(st, 1000 + 900001, 900000);
   assert.equal(stale.ok, null, "past the window the honest value is 'we do not know', not 'it works'");
+  assert.equal(stale.okSource, "expired", "and it must say WHY it is null, not just that it is");
   assert.match(stale.message, /older than the verification window/);
-  assert.equal(stale.lastOutcome, "verified-by-request", "how it was established is history and must not be rewritten");
+});
+
+test("#308 (P1 from review): ONE inconclusive probe must not disarm the window forever", () => {
+  // The reviewer's sequence, executed. Before the fix this returned ok:true at T+100h: the TTL
+  // keyed on lastOutcome, and an inconclusive probe rewrites lastOutcome while preserving ok, so
+  // a request-established verdict stopped matching and became permanent — the unbounded false
+  // `true` this whole design exists to prevent, reintroduced by its own guard.
+  const T = 1_000_000, TTL = 900_000;
+  const afterTimeoutProbe = { ok: true, okSource: "request", okAt: T,
+                              lastCheck: T + 600_000, lastOutcome: "timeout" };
+  assert.equal(applyRequestVerdictTtl(afterTimeoutProbe, T + 10 * 60_000, TTL).ok, true,
+    "inside the window it is still fresh — the probe outcome is irrelevant to that");
+  for (const mins of [16, 60, 6000]) {
+    const r = applyRequestVerdictTtl(afterTimeoutProbe, T + mins * 60_000, TTL);
+    assert.equal(r.ok, null, `at T+${mins}min the verdict must have expired despite the probe having rewritten lastOutcome`);
+  }
+});
+
+test("#308: the window is keyed on okAt, which only a REQUEST advances", () => {
+  // The other half of the same defect: probes complete every ~610s by default, so a window keyed
+  // on lastCheck could never elapse — dead code describing a semantic the system did not have.
+  const T = 0, TTL = 900_000;
+  let st = { ok: true, okSource: "request", okAt: T, lastCheck: T, lastOutcome: "verified-by-request" };
+  for (let tick = 1; tick <= 3; tick++) st = { ...st, lastCheck: tick * 600_000, lastOutcome: "token-present" };
+  assert.equal(applyRequestVerdictTtl(st, 1_800_000, TTL).ok, null,
+    "three probe ticks must not have refreshed the request verdict's clock");
 });
 
 test("#308: only a request-verified verdict decays — probe verdicts are not this function's business", () => {
   const now = 10_000_000;
-  for (const outcome of ["authenticated", "token-present", "rejected", "timeout", "unavailable", "none"]) {
-    const st = { ok: true, lastCheck: 0, lastOutcome: outcome };
+  for (const src of ["probe", "none", "expired", undefined]) {
+    const st = { ok: true, okAt: 0, okSource: src, lastOutcome: "authenticated" };
     assert.equal(applyRequestVerdictTtl(st, now, 1).ok, true,
-      `${outcome} is the probe's verdict and must be left alone, however old`);
+      `okSource=${String(src)} is not a request verdict and must be left alone, however old`);
   }
 });
 
@@ -8472,8 +8498,8 @@ test("#308: a malformed lastCheck cannot silently expire a verdict", () => {
   // Labels are String(), not JSON.stringify(): JSON.stringify(NaN) is "null", which made the
   // first failure of this test point at the wrong value entirely.
   for (const bad of [undefined, null, "1000", NaN, Infinity, {}]) {
-    const st = { ok: true, lastCheck: bad, lastOutcome: "verified-by-request" };
-    assert.equal(applyRequestVerdictTtl(st, 10_000_000, 1).ok, true, `lastCheck=${String(bad)} must not expire it`);
+    const st = { ok: true, okSource: "request", okAt: bad, lastOutcome: "verified-by-request" };
+    assert.equal(applyRequestVerdictTtl(st, 10_000_000, 1).ok, true, `okAt=${String(bad)} must not expire it`);
   }
 });
 

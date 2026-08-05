@@ -57,7 +57,8 @@ When the spawned `claude` resolves its credential from **the environment**, `cla
 A request that reaches the model and succeeds proves the credential is valid. A request that fails proves something, and OCP already counts those (`stats.errors`, `recentErrors`, populated by `trackError`).
 
 - **A successful completion sets `auth.ok = true`, `lastOutcome = "verified-by-request"`.** This is stronger evidence than any probe and costs nothing — the request was happening anyway.
-- **That verdict EXPIRES.** Past `AUTH_REQUEST_VERDICT_TTL_MS` (15 min) with no new success it decays to `null`. This was added after the draft, and it is not a refinement — without it the design has a defect worse than the one it fixes. See below.
+- **That verdict EXPIRES.** Past `AUTH_REQUEST_VERDICT_TTL_MS` (15 min) with no new success it decays to `null`, and `okSource` becomes `expired` so the reason is legible. Not a refinement — without it the design has a defect worse than the one it fixes. See below.
+- **The verdict's provenance is separate from the probe's outcome.** `okSource` (`none` / `probe` / `request` / `expired`) and `okAt` record *how and when* `ok` was established; `lastOutcome` and `lastCheck` stay the probe's business. **This separation is not tidiness — it is the fix for two defects found in review**, both of which made the window above a fiction.
 - **Request failures do not set `auth.ok = false`.** See the open question below.
 
 ### Why the raise must expire — the latch this design would otherwise create
@@ -72,6 +73,16 @@ A raised verdict that never expires is a latch, and on an env-token host **nothi
 Step 4 is the trap. The result is **byte-identical to the state #308 reported** — `/health` asserting the credential works while nothing can be served — reached by a different path.
 
 This is #324's defect shape in the opposite direction, and the criterion recorded there applies verbatim: *do not ask what the clearing condition is, ask whether it is reachable.* Here it is not.
+
+### The two ways the first implementation got this wrong
+
+Both found by independent review, both proven by execution, both because the window was keyed on `lastOutcome`:
+
+**(a) It was unreachable under the default configuration.** Every probe completion rewrites `lastOutcome`, and a probe always completes within `AUTH_CHECK_INTERVAL_MS + AUTH_CHECK_TIMEOUT_MS` — 610s by default, shorter than any sane window. So the decay branch could never fire, and the ADR, README and CHANGELOG all described a semantic the system did not have. The visible `true` → `null` transition operators would have seen came from the *next probe tick* overwriting the verdict, not from the window.
+
+**(b) One inconclusive probe disarmed it permanently.** The inconclusive branches preserve `ok` — correct, a timeout measures host load, not credentials — while rewriting `lastOutcome` and advancing `lastCheck`. A request-established verdict therefore stopped matching the window and became permanent. Replayed: `T+100h` still read `auth.ok: true`. **That is precisely the unbounded false `true` this design exists to prevent, reintroduced by the guard meant to prevent it.**
+
+Keying on `okSource`/`okAt` fixes both: only a request advances `okAt`, and no probe outcome can change `okSource`. The same replay now expires at `T+16min`.
 
 The expiry closes it without classifying anything. A serving proxy refreshes the verdict on every request and never decays; only one that has stopped succeeding does. `applyRequestVerdictTtl` is a pure, injectable function rather than a constant read from the environment — the window must be testable at arbitrary values **without** becoming an operator knob, because a knob on a safety decision is a knob for turning the safety off (the same argument ADR 0010 makes for `AUTH_DEGRADE_AFTER`).
 
@@ -108,6 +119,9 @@ This is deliberately asymmetric and the asymmetry is safe in the right direction
 - **`/health`'s `status` is unaffected.** `proxyHealthStatus` reads `consecutiveFailures`, never `ok`, and nothing here writes that tally. ADR 0010's degraded rule is untouched.
 - Two contract changes on a grandfathered B.2 endpoint: the rule determining `auth.ok`, and a new `lastOutcome` value. Both are why this needs its own ADR rather than ADR 0012's additive-field authorization — ADR 0012 condition 1 excludes exactly this.
 - The fleet's three env-token hosts will report `auth.ok: null` until their first successful request, then `true` — in practice one request — and back to `null` after 15 minutes of no successful traffic. An idle proxy therefore reports "not established" rather than a stale "works", which is the correct answer to a question nobody has evidence for.
+- **An exit-0 probe resets the rejection tally on both branches.** The first implementation preserved it on the token-present branch, which silently removed ADR 0010's self-healing on exactly the hosts that use the env-token mechanism: once the tally reached the degrade threshold nothing could lower it again, because a successful probe was the only thing that did. Restored, and a successful request clears it too.
+- **A probe never overwrites a fresher request verdict.** The token-present branch measured *less* than a recent completed request; letting it clobber that would contradict this ADR's own evidence hierarchy.
+- **Clock movement, recorded rather than handled.** `now - okAt` uses `Date.now()`, a wall clock, so a backwards step extends a verdict's freshness by the step size. Bounded and in the safe direction (the alternative — expiring early — is also safe), so no monotonic-clock machinery. Stated so it is a known limit rather than an unexamined one.
 - **A NaN guard, recorded because it was written wrong first.** The expiry check used `typeof x === "number"`, which `NaN` satisfies; every comparison against `NaN` is false, so `now - NaN <= ttl` fell through and a malformed timestamp silently expired the verdict. `Number.isFinite` now. The unit test that caught it exists precisely because this repo has been bitten by NaN-passes-every-threshold before — and it was written wrong here anyway, which is the argument for the test rather than for care.
 - **Unrelated finding, recorded because it was found while writing this:** the circuit breaker is a stub. `breakerRecordSuccess()` and `breakerRecordTimeout()` have empty bodies, `/health` reports `circuitBreaker: "disabled"`, and four `CLAUDE_BREAKER_*` env vars are documented at `server.mjs:31-34` and parsed at `:382-385`. Documented interface, dead implementation. Its own issue, not this ADR's business.
 
