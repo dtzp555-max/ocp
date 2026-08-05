@@ -2436,7 +2436,6 @@ ltTest("integration: TWO consecutive conclusive auth rejections DO flip /health 
 // SAME branch a real AUTH_CHECK_TIMEOUT_MS expiry takes (Node reports killed:true,
 // signal:"SIGTERM" there). Exercising the branch this way costs milliseconds instead of 10s.
 // On the pre-fix build the second probe sets ok:false and status goes degraded.
-<<<<<<< HEAD
 ltTest("integration (#324, the money test): a latched ok:false with only inconclusive probes since becomes OBSERVABLE as stale", async () => {
   if (!LT_POSIX) return;
   // The wedge, reproduced end to end: probe 1 rejects conclusively (ok -> false), and every probe
@@ -2564,7 +2563,9 @@ ltTest("integration (#308): a completed REQUEST raises the verdict the probe cou
     assert.ok(after, `a completed request must raise the verdict — ${ltDiag(buf)}`);
     assert.equal(after.auth.okSource, "request", "and the verdict must record that a REQUEST established it, not a probe");
     assert.equal(after.auth.ok, true, "a request that reached the model proves the credential works");
-=======
+  } finally { child.kill("SIGKILL"); _ltRmRetry(dir); }
+});
+
 ltTest("integration (#327): a declared instance reports its name on /health", async () => {
   if (!LT_POSIX) return;
   const dir = ltMkdir(); const fake = ltFake(dir);
@@ -2587,7 +2588,6 @@ ltTest("integration (#327): the primary reports an EMPTY name, not a missing fie
     const h = await ltWaitHealth(port, b => b.instanceName !== undefined, 15000);
     assert.ok(h, `/health must always carry the field — ${ltDiag(buf)}`);
     assert.equal(h.instanceName, "", "the primary declares itself by reporting an empty name");
->>>>>>> b38cda0 (feat(health): a non-primary OCP instance can declare itself (#327))
   } finally { child.kill("SIGKILL"); _ltRmRetry(dir); }
 });
 
