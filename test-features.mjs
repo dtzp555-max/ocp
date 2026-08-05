@@ -2524,6 +2524,10 @@ ltTest("integration (#308, the money test): a token in the ENV must not be repor
       `a probe that only saw a token must say so; got ${JSON.stringify(h.auth)}`);
     assert.equal(h.auth.ok, null,
       "presence is not validity — the honest verdict is 'not established', which ADR 0010 already defines");
+    // The token-present branch is the one the slice guard could not see; assert its provenance
+    // fields behaviourally, so the contract does not rest on a source pattern alone.
+    assert.equal(h.auth.okSource, "probe", "a probe established this verdict and must say so");
+    assert.ok(Number.isFinite(h.auth.okAt) && h.auth.okAt > 0, "and when — a verdict with no okAt cannot expire");
     assert.notEqual(h.auth.ok, true, "this is the #308 defect: asserting authenticated on presence alone");
     assert.equal(h.status, "ok",
       "and the health VERDICT must not move — proxyHealthStatus reads consecutiveFailures, never ok");
@@ -8463,8 +8467,14 @@ test("#308 (P2 from review 2): every verdict-writing branch carries okSource and
   const src = _ltRead(spotJoin(_spotDir, "server.mjs"), "utf8");
   const block = src.slice(src.indexOf("async function checkAuth("), src.indexOf("// Check auth on start"));
   assert.ok(block.length > 0, "anchor drift — checkAuth slice is empty");
-  const writes = block.match(/authStatus = \{[^;]*\};/gs) || [];
-  assert.ok(writes.length >= 4, `expected every verdict-writing branch; found ${writes.length}`);
+  // `authStatus = [^;]*;`, not `authStatus = \{...\};`. The narrower pattern could not match the
+  // token-present write, which is a TERNARY (`authStatus = cond ? {…} : {…};`) — measured: 4 of 5
+  // assignments matched, and the `>= 4` floor passed with the most complex branch invisible. A
+  // guard that silently excludes the hardest case is the defect this PR was bitten by twice.
+  const writes = block.match(/authStatus = [^;]*;/gs) || [];
+  assert.equal(writes.length, 5,
+    `expected EXACTLY the five verdict-writing branches — an exact count fails when one is added ` +
+    `or hidden, which a floor does not; found ${writes.length}`);
   for (const w of writes) {
     // The inconclusive branches spread ...authStatus, which carries the fields forward; the
     // others must name them. Either satisfies the contract; neither is allowed to drop them.

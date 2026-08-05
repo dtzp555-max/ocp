@@ -3,16 +3,32 @@
 **Date:** 2026-08-04
 **Status:** Accepted (maintainer sign-off 2026-08-05), **materially amended after sign-off — see below**
 
-> **Ratification provenance.** Sign-off was recorded at `529b059`. The commit after it, `163e657`,
-> **rewrote this ADR's Decision mechanism**: an independent review proved the freshness window as
-> originally specified was unreachable under the default configuration *and* permanently
-> disarmable by a single inconclusive probe, and the fix introduced `okSource`/`okAt` — a
-> structure the maintainer did not see when signing. Two consequence bullets were added at the
-> same time. What was ratified was the *direction* (B + C, with an expiring request verdict); the
-> mechanism that implements it changed afterwards.
+> **Ratification provenance.** Sign-off was recorded on the commit titled *"docs(adr): record
+> maintainer sign-off of ADR 0014"*. This ADR has been amended **twice since**, and both
+> amendments are material:
 >
-> Recorded rather than quietly re-dated, following ADR 0010's precedent for the same situation. A
-> re-sign is warranted; until then this note is the honest statement of what the label covers.
+> 1. *"fix(auth): the freshness window was a fiction…"* **rewrote the Decision's mechanism.** An
+>    independent review proved the window as originally specified was unreachable under the
+>    default configuration *and* permanently disarmable by a single inconclusive probe; the fix
+>    introduced `okSource`/`okAt` — a structure the maintainer did not see when signing. It also
+>    added **three** consequence bullets: the exit-0 tally reset, probe-never-overwrites-a-fresher-
+>    verdict, and clock movement.
+> 2. *"fix(auth): a rejected verdict lost its provenance…"* — the commit carrying **this note** —
+>    additionally rewrote the `status`/tally consequence bullet (text that *was* part of what was
+>    signed) and corrected "a new `lastOutcome` value" to "two".
+>
+> An earlier version of this note said "two consequence bullets" and attributed all amendment to
+> the first commit, omitting the second. In the one paragraph whose only job is exact provenance,
+> that under-enumeration is itself the defect — corrected here, and stated because it must be
+> right before anyone re-signs against it.
+>
+> Commits are cited by subject rather than by hash: the hashes changed under a rebase and dangling
+> ones are worse than none. ADR 0010's precedent note uses descriptive anchors for the same reason.
+>
+> **What was ratified is the *direction*** — B + C, with an expiring request verdict. The mechanism
+> that implements it, and three of the consequences, changed afterwards. Recorded rather than
+> quietly re-dated. **A re-sign is warranted**; until then this note is the honest statement of
+> what the label covers.
 **Scope:** Class B.2 — `/health` and `/status`. Authority: [ADR 0006](0006-openai-shim-scope.md) (grandfathered as of v3.16.4), amending [ADR 0010](0010-health-verdict-semantics.md).
 **Supersedes for `auth.ok`:** ADR 0010's rule that the `claude auth status` probe is the sole writer of the auth verdict.
 

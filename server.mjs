@@ -1239,29 +1239,9 @@ async function checkAuth() {
         // explicitly — the message below depends on it.
         (err, _stdout, stderr) => (err ? reject(Object.assign(err, { stderr })) : resolve()));
     });
-    authStatus = { ok: true, lastCheck: Date.now(), message: "authenticated",
-                   lastOutcome: "authenticated", consecutiveFailures: 0, consecutiveInconclusive: 0 };
-    // #308 / ADR 0014. `claude auth status` reports whether a token is PRESENT, not whether it is
-    // VALID. Measured in an isolated empty HOME: with no token it exits 1 (loggedIn:false); with a
-    // FABRICATED token — a string that never existed — it exits 0 and reports loggedIn:true,
-    // authMethod:"oauth_token". So when the child resolved its credential from the ENVIRONMENT,
-    // exit 0 establishes presence and nothing more, and recording it as "authenticated" is the
-    // defect #308 reported: /health asserted the proxy was authenticated while every request it
-    // was asked to serve failed on authentication.
-    //
-    // `null` is not a new state — ADR 0010 already defines it as "no conclusive verdict" and
-    // doctor already treats it as WARN rather than FAIL. This degrades into a handled state.
     const tokenFromEnv = typeof env.CLAUDE_CODE_OAUTH_TOKEN === "string" && env.CLAUDE_CODE_OAUTH_TOKEN.length > 0;
-    authStatus = tokenFromEnv
-      ? { ok: null, lastCheck: Date.now(), message: "a token is present; the probe cannot tell whether it is valid",
-          lastOutcome: "token-present", consecutiveFailures: authStatus.consecutiveFailures }
-      : { ok: true, lastCheck: Date.now(), message: "authenticated",
-          lastOutcome: "authenticated", consecutiveFailures: 0 };
     const nowP = Date.now();
-    // An exit-0 probe always resets the rejection tally, both branches. Preserving it on the
-    // token-present branch removed ADR 0010's self-healing on exactly the hosts that use the
-    // env-token mechanism: once the tally reached the degrade threshold it could never come back
-    // down, because a successful probe was the only thing that lowered it.
+
     if (tokenFromEnv) {
       // Presence, not validity. But do NOT clobber a FRESHER verdict that a real request
       // established — a probe that measured less must not overwrite evidence that measured more.
@@ -1274,7 +1254,7 @@ async function checkAuth() {
             lastOutcome: "token-present", consecutiveFailures: 0 };
     } else {
       authStatus = { ok: true, okSource: "probe", okAt: nowP, lastCheck: nowP, message: "authenticated",
-                     lastOutcome: "authenticated", consecutiveFailures: 0 };
+                     lastOutcome: "authenticated", consecutiveFailures: 0, consecutiveInconclusive: 0 };
     }
   } catch (e) {
     const msg = (e.stderr || e.message || "").slice(0, 200);
@@ -1297,13 +1277,13 @@ async function checkAuth() {
       // CONCLUSIVE REJECTION. claude ran to completion and exited non-zero. checkAuth and
       // spawnClaudeProcess scrub the environment identically, so the probe resolves the SAME
       // credentials the request path uses — a non-zero exit genuinely predicts serving failure.
-      authStatus = { ok: false, lastCheck: now, message: msg, lastOutcome: "rejected",
-                     consecutiveFailures: authStatus.consecutiveFailures + 1, consecutiveInconclusive: 0 };
+
       // okSource/okAt on this branch too: a conclusive rejection IS a probe-established verdict.
       // Omitting them made the fields VANISH after a rejection — a fifth state ("absent") outside
       // the domain ADR 0014 and the README document, found by execution in review.
       authStatus = { ok: false, okSource: "probe", okAt: now, lastCheck: now, message: msg,
-                     lastOutcome: "rejected", consecutiveFailures: authStatus.consecutiveFailures + 1 };
+                     lastOutcome: "rejected", consecutiveFailures: authStatus.consecutiveFailures + 1,
+                     consecutiveInconclusive: 0 };
     }
     // Carries the outcome class so an operator can tell a timeout from a real rejection.
     console.error(`[auth] check ${authStatus.lastOutcome}: ${msg}`);
