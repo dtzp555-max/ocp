@@ -137,116 +137,128 @@ release_kit:
   governance_audits:
     # ADR 0012 grants a STANDING authorization for additive read-only fields on
     # grandfathered Class B.2 endpoints, and names its own failure mode: "surface
-    # growing one 'obviously fine' field at a time". Condition 5 already puts the
-    # field names in the PR body and the CHANGELOG — but nothing ever reads them,
-    # which is the state #288 found in the first place. This is the read.
+    # growing one 'obviously fine' field at a time". This is the read that makes
+    # that failure mode visible.
     #
-    # KNOWN BLIND SPOT, stated so nobody mistakes a green result for coverage:
-    # this sweep finds only additions whose author COMPLIED with condition 5 and
-    # wrote the marker. A field added with no marker — which is the exact shape of
-    # the four pre-#288 additions — produces "none this cycle", a POSITIVE-looking
-    # result for the case this is least able to see. It instruments the compliant
-    # path; it does not detect silent growth. Detecting that needs a per-release
-    # record of each B.2 endpoint's actual response key set, diffed across
-    # releases, which is real machinery and is deliberately not built here.
-    # Both defects below were found on the sweep's FIRST real run (v3.29.0, #337)
-    # and pushed the count in OPPOSITE directions, which is why the how: below is
-    # this specific and not just "grep for the marker":
+    # #346 REPLACED THE MECHANISM. Until then this clause prescribed a grep of the
+    # CHANGELOG for ADR 0012's condition-5 marker. That grep missed a COMPLIANT
+    # spelling three times running — sentence-initial capital (#338), markdown link
+    # (#344 first pass), bold wrapped around the reference (#344 second pass) — each
+    # caught by a human reviewer and never by the mechanism. Its own stopping rule
+    # ("if a THIRD compliant spelling is missed, stop widening") had fired.
     #
-    #   case-sensitive grep   UNDER-count   a real field vanished from the audit
-    #   counts its own prose  OVER-count    total permanently +1
-    #
-    # The under-count is the dangerous one and it fires on the COMPLIANT path: the
-    # author wrote the marker exactly as condition 5 requires, opened a sentence
-    # with it, and a literal `grep` missed the capital A. It was caught only
-    # because a reviewer happened to re-run the grep with different flags. That is
-    # not a control. See #338.
-    - name: ADR 0012 additive-field sweep
-      when: every release, during the release_kit walk
+    # The spelling was the symptom. The disease was reading PROSE to learn what
+    # shipped: every version of that grep, including a perfect one, could only see
+    # additions whose author WROTE the marker. A field added with no marker returned
+    # "none this cycle" — a green result for the case the audit was least able to
+    # see, and the exact shape of the four pre-#288 additions that motivated ADR 0012
+    # in the first place. The primary audit below reads the WIRE instead. The marker
+    # grep survives only as a secondary cross-check, and its incompleteness is no
+    # longer load-bearing.
+    - name: Class B.2 response key-set diff (PRIMARY)
+      when: |
+        Every release, during the release_kit walk — and automatically on every PR,
+        because `npm test` fails on any difference. The release walk reads the diff;
+        it does not discover it.
       how: |
-        Count ENTRIES carrying the marker, not raw occurrences:
+        The mechanism is scripts/b2-key-snapshot.mjs and the checked-in record is
+        docs/governance/b2-response-keys.json. It boots a real server.mjs against a
+        fixture that pins every shape-deciding setting, probes all 16 Class B.2
+        endpoint+method pairs in ALIGNMENT.md's inventory, and records each response's
+        recursive KEY PATH set plus its status and content-type. Values are never
+        recorded, so uptime, timestamps and counters cannot make it flap; the suite
+        proves that by probing two fresh boots and requiring identical output.
+
+        To read the release's surface change:
+
+          git diff v<previous-tag>..HEAD -- docs/governance/b2-response-keys.json
+
+        Added lines are new B.2 surface. Removed lines are removed or renamed surface.
+        The whole history is the per-release record:
+
+          git log -p docs/governance/b2-response-keys.json
+
+        The suite also checks the probe plan against ALIGNMENT.md's inventory table, so
+        a B.2 endpoint added to the constitution with no probe added to the plan fails
+        rather than silently going unreported.
+
+        To run it alone, or to regenerate after a deliberate addition:
+
+          node scripts/b2-key-snapshot.mjs            # diff only, exit 1 on drift
+          node scripts/b2-key-snapshot.mjs --write    # rewrite the snapshot
+
+        Regenerating is not authorization. It records that the surface moved; the PR
+        still has to say under what.
+      report: |
+        For the section being dated, list every added and removed key path with its
+        endpoint, taken from the snapshot diff rather than from the CHANGELOG, and for
+        each ADDITION state whether the PR that introduced it carries its ADR 0012
+        citation. Write "no B.2 key-set change this cycle" when the diff is empty, so
+        silence is a result rather than an omission — and note that this silence is now
+        evidence, which the marker grep's silence never was.
+
+        The cumulative count ADR 0012 names as load-bearing ("a monotonically rising
+        integer is what makes the accumulation visible at all") is still reported, but
+        it is now DERIVED from the snapshot's git history rather than recounted with
+        whichever grep flags the releaser happens to use. That recomputation is what
+        produced both of #338's defects.
+      baseline: |
+        As of v3.29.0 the cumulative ADR 0012 count is 2, both on /health:
+          instanceName                  (#327)
+          auth.consecutiveInconclusive  (#324)
+
+        RECONCILED AGAINST THE WIRE when the snapshot was first recorded (#346): both
+        key paths are present in docs/governance/b2-response-keys.json's "GET /health"
+        record, so the anchored count and the wire agree. auth.okAt and auth.okSource
+        are also present, exactly as the previous version of this clause predicted a
+        reader would find — they landed under ADR 0014 as part of a contract change,
+        not as additive fields, and are correctly not counted here.
+      blind_spots: |
+        STATED SO NOBODY MISTAKES A GREEN RUN FOR COVERAGE. This is a strictly larger
+        set of detections than the grep it replaced, not a complete one. The full list
+        with the reasoning lives in the snapshot's own "notCovered" block; the headline
+        items are:
+
+          - TYPE changes under an unchanged key path. A key set records names, not
+            types, so string -> number under the same name is invisible. Container
+            changes ARE caught (object <-> scalar, array <-> object).
+          - RENAMES, as renames. A rename fails the test as one removal plus one
+            addition; the mechanism cannot tell it apart from two unrelated changes.
+          - Shapes that exist only under a NON-DEFAULT configuration — TUI mode and
+            CLAUDE_SKIP_PERMISSIONS both change /health's shape, and the fixture pins
+            both off.
+          - ERROR and non-localhost responses. Only the localhost success path of each
+            pair is recorded.
+          - /usage, which is Hybrid rather than B.2 and cannot be probed without a live
+            Anthropic wire call.
+          - AUTHORIZATION. This detects that surface moved. It never decides whether the
+            move was allowed. ADR 0012 condition 5 is still a human obligation; what
+            changed is that forgetting it is now detectable from the other side.
+    - name: ADR 0012 marker cross-check (SECONDARY — no longer the mechanism)
+      when: every release, after the key-set diff above
+      how: |
+        Reading the marker is now a convenience, not a control: the key-set diff already
+        told you what shipped. This answers the different question of whether the author
+        CLAIMED the authorization in the place ADR 0012 condition 5 requires.
 
           grep -inE 'additive under \[?ADR[^0-9]{0,10}0012' CHANGELOG.md
 
-        Then subtract by inspection any hit that is META-TEXT — a line describing
-        the sweep mechanism necessarily quotes the marker it greps for. A field
-        entry names an endpoint and a field; meta-text does not. Read every hit;
-        do not report the raw number.
+        Read every hit; subtract by inspection any that is META-TEXT (a line describing
+        the sweep necessarily quotes the marker it greps for — that was #338's over-count).
+        A field entry names an endpoint and a field; meta-text does not.
 
-        Do the same over the section being dated (this cycle) and over the whole
-        file (cumulative).
+        >> DO NOT WIDEN THIS PATTERN. Its stopping rule fired in #346 and the pattern is
+        >> deliberately left MISSING a known compliant spelling — bold wrapped around the
+        >> reference, `additive under **[ADR 0012](…)**` — so the gap stays visible rather
+        >> than appearing closed. Widening it a fourth time is how a guard becomes theatre.
 
-        Why the pattern is shaped like that, since a plain substring was tried
-        first and failed twice on the SAME axis: condition 5 requires the marker,
-        not a spelling. The literal `additive under ADR 0012` finds only 2 of the
-        5 spellings that comply with it. Missed, and not hypothetically — the
-        markdown-link form is already used 10 times elsewhere in this repo:
-
-          additive under [ADR 0012](docs/adr/0012-….md)     <- link form
-          **Additive under [ADR 0012](….md).**              <- link + bold + capital
-          additive under ADR&nbsp;0012                      <- non-breaking space
-
-        Case-insensitivity covers the sentence-initial capital; `\[?` covers the
-        link form; `[^0-9]{0,10}` covers whatever separates "ADR" from "0012".
-
-        HONEST LIMIT, because this is the second narrowing of the same grep and
-        that pattern usually means the mechanism is wrong: a substring or regex
-        match CANNOT be complete over the space of ways to write a reference in
-        prose. What makes it acceptable here rather than in a security control is
-        that there is no adversary — the author is complying — and the variation
-        space is bounded by markdown conventions rather than open.
-
-        >> THE STOPPING RULE BELOW HAS ALREADY FIRED. Read this before touching
-        >> the pattern. <<
-
-        The rule was: if a THIRD compliant spelling is found to be missed, stop
-        widening. Within one review round of writing it, a reviewer constructed
-        twelve spellings and this pattern got 7. The third miss is bold wrapped
-        AROUND the reference:
-
-          additive under **[ADR 0012](docs/adr/0012-….md)**
-
-        `\[?` handles bold outside the whole phrase but not this, and the repo
-        already contains `authorized by **[ADR 0010](…)**` — an authorization
-        sentence about a grandfathered B.2 change, which is the exact slot an
-        ADR 0012 marker occupies. Census of reference forms in CHANGELOG+README:
-        bare link 12, bold-wrapped 1. A real minority risk, not the house style.
-
-        So: capital (round 1) -> link (round 2) -> bold-wrapped (round 3).
-        DO NOT WIDEN THE PATTERN AGAIN. Three rounds of "one spelling over" is
-        the mechanism telling you it is the wrong mechanism, and widening a
-        fourth time is how a guard becomes theatre. The pattern above is
-        deliberately left MISSING a known spelling rather than patched, so the
-        gap stays visible instead of appearing closed.
-
-        The two real fixes, both tracked in #346, both too large to land on a
-        release eve: make the marker's canonical form part of ADR 0012's
-        condition 5 (a sign-off cycle), or diff each B.2 endpoint's real response
-        key set per release and stop reading prose altogether (real machinery,
-        and the only one that also closes the original no-marker blind spot).
-
-        Until one of those lands, a releaser who finds ZERO field entries should
-        treat that as unproven rather than clean, and grep for `ADR 0012` alone
-        as a cross-check.
-      report: list the field names and their endpoints in the release PR body,
-        plus the cumulative count to date; write "none this cycle" when there are
-        none, so silence is a result rather than an omission. If the raw grep count
-        and the reported count differ, say so and say why — a corrected number
-        without its correction is indistinguishable from a miscount. The cumulative
-        number is the point — the failure mode ADR 0012 accepts is per-release
-        increments each of which looks fine, so a monotonically rising integer is
-        what makes the accumulation visible at all.
-      baseline: |
-        As of v3.29.0 the cumulative count is 2, both on /health:
-          instanceName                  (#327)
-          auth.consecutiveInconclusive  (#324)
-        Anchored here so future releasers INCREMENT a known-good number rather
-        than recompute it with whichever grep flags they happen to use — the
-        recomputation is exactly what produced both defects above.
-
-        Not counted, correctly: /health's okSource and okAt also landed in
-        v3.29.0, but under ADR 0014 as part of a contract change rather than as
-        additive fields. They carry no marker by design. Noted because anyone
-        diffing /health's key set against this number will find two extra keys
-        and should not read that as a miss.
+        What changed in #346 is that this incompleteness is no longer load-bearing. A
+        marker this grep misses now shows up from the other side: the key appeared in the
+        snapshot diff, and the reviewer goes looking for its authorization. A marker
+        nobody wrote at all — the case no version of this grep could ever see — is caught
+        the same way.
+      report: |
+        For each addition the key-set diff found, whether a matching marker exists. A
+        found key with no marker is an ADR 0012 condition 5 failure, not a grep defect,
+        and is fixed in the PR that added the key.
 ```
