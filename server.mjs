@@ -3534,7 +3534,6 @@ const server = createServer(async (req, res) => {
       // build that does not report this at all" — the same distinction #324's backward-compat
       // test turned on.
       instanceName: INSTANCE_NAME,
-      auth: authStatus,
       config: {
         timeout: TIMEOUT,
         maxConcurrent: MAX_CONCURRENT,

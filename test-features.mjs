@@ -2618,6 +2618,101 @@ ltTest("integration: an INCONCLUSIVE auth probe (signal death, as a timeout arri
   } finally { child.kill("SIGKILL"); _ltRmRetry(dir); }
 });
 
+// #339 — the money test. This pins the WIRING, which is what was missing: applyRequestVerdictTtl
+// was unit-tested and correct, and nothing asserted that /health calls it. A duplicate `auth:`
+// key in the response literal (JS keeps the LAST one, silently) meant the TTL-applied value was
+// computed and thrown away in favour of the raw latch it exists to expire.
+//
+// The first attempt at this shipped a source-grep guard with a written justification that a
+// behavioural test was unreachable: the TTL is a hardcoded 15 minutes, and applyRequestVerdictTtl
+// is a no-op unless okSource === "request", whose only writer stamps a fresh finite okAt. That
+// justification was REASONED, not executed, and it was wrong — the reviewer executed it. ltBoot's
+// third argument lands before the script (`_ltSpawn(execPath, [...nodeArgs, LT_SERVER])`), so
+// `--import` can step the child's clock with no production change, no env knob, and no new ADR.
+// The grep guard is gone: it also had a proven bypass (`"auth": authStatus` counts as one key and
+// still serves the latch), which is precisely what a source-text check cannot see and a
+// behavioural one cannot miss.
+ltTest("integration (#339, the money test): a request-verified verdict EXPIRES — /health must apply the read-time TTL", async () => {
+  if (!LT_POSIX) return;
+  const dir = ltMkdir(); const fake = ltAuthFake(dir);
+
+  // Step the child's clock forward past the 15-minute window, after the request has landed.
+  // Real time until SWITCH_MS so boot, probe and request all happen on an honest clock; then a
+  // jump larger than AUTH_REQUEST_VERDICT_TTL_MS (900000) so the NEXT /health read expires it.
+  const SWITCH_MS = 4000, JUMP_MS = 16 * 60 * 1000;
+  const preload = join(dir, "clockstep.mjs");
+  _ltWrite(preload, `const REAL = Date.now, START = REAL();\n` +
+    `Date.now = () => { const r = REAL(); return r + (r - START > ${SWITCH_MS} ? ${JUMP_MS} : 0); };\n`);
+
+  // Two independent reasons a probe cannot mask the state under test, neither of which is the
+  // interval doing the obvious thing — `checkAuth()` at server.mjs:1309 is a bare top-level call,
+  // so the interval governs only the first TICK, never the boot probe:
+  //
+  //   1. `setInterval` runs on libuv's MONOTONIC clock, so moving `Date.now` cannot advance the
+  //      scheduler at all. (Verified: a +16min jump leaves a 200ms interval ticking normally.)
+  //      The long interval below just pushes the first tick past the end of the test; the 600000
+  //      default already would.
+  //   2. The boot probe is harmless even if it lands late. CLAUDE_CODE_OAUTH_TOKEN is NOT in
+  //      INBOUND_AUTH_ENV_VARS, so it survives the spawn scrub, so the probe takes the
+  //      `keepRequestVerdict` branch (server.mjs:1261) — which preserves a fresher request verdict
+  //      rather than clobbering it. A probe that measured less must not overwrite evidence that
+  //      measured more, and that is enforced in production, not here.
+  const { child, buf, port } = await ltBootFresh({
+    CLAUDE_BIN: fake, CLAUDE_CODE_OAUTH_TOKEN: "sk-ant-oat01-present-but-unverified",
+    CLAUDE_AUTH_CHECK_INTERVAL_MS: "3600000",
+  }, dir, [`--import=file://${preload}`]); // POSIX-only test, so a bare file:// prefix is safe
+
+  try {
+    // Order is load-bearing: the request must land BEFORE the clock steps, so that okAt is
+    // stamped on the honest clock and the jump puts it outside the window. Waiting for the raise
+    // first would burn the pre-step budget polling for a state nothing has caused yet, and the
+    // request would then stamp okAt on the ALREADY-jumped clock — permanently fresh, never
+    // expiring, and the test would fail against correct code. (It did, on the first run.)
+    const t0 = Date.now(); // real clock: this process is NOT preloaded
+    await ltPost(port, { model: "sonnet", messages: [{ role: "user", content: "hi" }] });
+
+    // Assert the fault's PRECONDITION actually fired rather than assuming it. Without this a
+    // never-raised verdict would reach the final assertion and fail for the wrong reason.
+    const raised = await ltWaitHealth(port, b => b.auth && b.auth.okSource === "request", 15000);
+    assert.ok(raised, `precondition: a completed request must raise the verdict first — ${ltDiag(buf)}`);
+    assert.equal(raised.auth.ok, true, "precondition: the raised verdict is ok:true");
+
+    // Did the request land BEFORE the clock step? okAt is stamped on the child's clock, t0 on the
+    // real one, so a late request shows up as a ~JUMP_MS gap.
+    //
+    // The dangerous misfire — calling a REAL regression a flake — is impossible by construction,
+    // not merely improbable: the preload sets START before server.mjs loads, and t0 is captured
+    // after ltBootFresh returns, so t0 > START strictly. If the request landed before the step
+    // then okAt - START <= SWITCH_MS, hence lateBy = okAt - t0 < okAt - START <= SWITCH_MS. (t0
+    // is taken AFTER the boot so an EADDRINUSE retry cannot inflate it.) A run that is both slow
+    // and regressed still fails red and labels itself inconclusive, which it genuinely is — on
+    // such a run okAt is fresh by construction and carries no evidence either way.
+    //
+    // Margin, measured as okAt - START (an UPPER bound on lateBy, since t0 > START): 178-491ms
+    // idle and 184-217ms under 24 CPU hogs on 10 cores, against the 4000ms budget — 8-22x, and
+    // near-flat under load because the path is spawn/IO-bound. Both arms of this branch have been
+    // proven reachable: the regression arm by re-adding the duplicate key, the flake arm by
+    // forcing SWITCH_MS to 1 (which yielded lateBy = 960116 ≈ JUMP_MS, the predicted shape).
+    const lateBy = raised.auth.okAt - t0;
+    const landedAfterStep = lateBy > SWITCH_MS;
+
+    // The clock steps at SWITCH_MS; this poll outlives that. The TEST process is not preloaded,
+    // so ltWaitHealth's own timeout runs on a real clock.
+    const expired = await ltWaitHealth(port, b => b.auth && b.auth.okSource === "expired", 20000);
+    assert.ok(expired, landedAfterStep
+      ? `HARNESS FLAKE, not a regression: the request landed ${lateBy}ms after this run's clock ` +
+        `origin, past the ${SWITCH_MS}ms step, so okAt was stamped on the already-jumped clock and ` +
+        `is permanently fresh by construction. Widen SWITCH_MS. ${ltDiag(buf)}`
+      : `/health must apply the read-time TTL. A verdict raised by a request went past the ` +
+        `freshness window and /health still served it — which is how #336's duplicate \`auth:\` key ` +
+        `disconnected #334 and re-opened #308's exact symptom. (Request landed ${lateBy}ms in, ` +
+        `well inside the ${SWITCH_MS}ms budget, so this is not a timing artifact.) ${ltDiag(buf)}`);
+    assert.equal(expired.auth.okSource, "expired", "okSource must record that the window lapsed");
+    assert.equal(expired.auth.ok, null,
+      "an expired verdict is 'we do not know now' — null, not a stale true (ADR 0014)");
+  } finally { child.kill("SIGKILL"); _ltRmRetry(dir); }
+});
+
 // B4 — the genuine serving precondition still degrades. binaryOk is recomputed per request
 // (accessSync(CLAUDE, X_OK) inside the handler), so dropping the execute bit on this test's OWN
 // fake — it lives in this test's private ltMkdir() temp dir, so no other test can see it — flips
