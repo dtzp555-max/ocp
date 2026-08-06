@@ -1149,7 +1149,23 @@ let authStatus = {
   ok: null,                  // last CONCLUSIVE verdict: true | false | null (never established)
   lastCheck: 0,              // when the last probe COMPLETED, any outcome
   message: "",               // human-readable detail of the last probe
-  lastOutcome: "none",       // "none" | "authenticated" | "rejected" | "timeout" | "unavailable"
+  // Domain: "none" | "authenticated" | "token-present" | "rejected" | "timeout" | "unavailable".
+  //
+  // NOT the authority, and the tiebreak is scoped rather than absolute: ADR 0014 § B's table
+  // governs the five PROBE OUTCOMES, and if this line disagrees with it about one of those, the
+  // ADR wins and this line is the bug. "none" is deliberately outside that table — it is the
+  // pre-probe initial value on the next line, not an outcome any probe produces. An earlier
+  // revision of this comment gave an unscoped "the ADR wins", which read literally would have
+  // deleted the very value it annotates. README § "What `auth.ok` means" covers the same domain
+  // for operators but is NOT the same table — it is keyed on okSource, carries a `none` row, and
+  // omits timeout/unavailable, because those change lastOutcome without touching the verdict.
+  // Calling the two "the same" would re-conflate okSource with lastOutcome, which is the exact
+  // confusion lib/spawn-auth.mjs:199 exists to warn about.
+  //
+  // This is a reading aid and it has already drifted once: it omitted "token-present" from the day
+  // ADR 0014 shipped it until #345, so the only enumeration in CODE contradicted the docs. The
+  // values are written by checkAuth's branches below; that is where to look for what sets what.
+  lastOutcome: "none",
   consecutiveFailures: 0,    // consecutive CONCLUSIVE rejections only
   // #324, additive under ADR 0012. Consecutive INCONCLUSIVE probes (timeout / unavailable) since
   // the last conclusive one. Reset to 0 by BOTH conclusive outcomes, so it means "nothing has
@@ -2927,6 +2943,18 @@ async function handleSettings(req, res) {
   }
 
   // PATCH
+  // #359: decode the request body as UTF-8 ACROSS chunk boundaries. Without this, `body += chunk`
+  // coerces each Buffer to a string independently, so a multi-byte character whose bytes straddle
+  // two chunks is decoded as replacement characters BEFORE the pieces are joined — the join can
+  // never repair it, and the JSON stays syntactically valid, so nothing errors. setEncoding installs
+  // a StringDecoder on the stream, which holds an incomplete trailing sequence until the next chunk
+  // completes it (node/lib/internal/streams/readable.js `setEncoding` + `onEofChunk`; stream.md:
+  // "The Readable stream will properly handle multi-byte characters delivered through the stream
+  // that would otherwise become improperly decoded if simply pulled from the stream as Buffer
+  // objects"). `chunk` is now already a correctly-decoded string, so `body` stays a string and the
+  // cap below keeps counting UTF-16 code units — the unit is deliberately unchanged (see #310 at
+  // the MAX_BODY_SIZE comment), and the early abort still fires mid-stream.
+  req.setEncoding("utf8");
   let body = "";
   try {
     for await (const chunk of req) {
@@ -2968,7 +2996,8 @@ async function handleSettings(req, res) {
 
 // ── Handle chat completions ─────────────────────────────────────────────
 // This cap is compared against `body.length` — UTF-16 code units, i.e. CHARACTERS — because the
-// accumulator below is a JS string (`body += chunk` decodes each Buffer as UTF-8). Issue #310: it
+// accumulator below is a JS string (the reader calls `req.setEncoding("utf8")`, so each `chunk` is
+// already a decoded string and `body += chunk` concatenates strings). Issue #310: it
 // was labelled "5MB", which reads as bytes to every reader, including two review rounds that
 // concluded a 3,000,000-character CJK prompt would be rejected here. It would not: 3,000,000 is
 // well under the 5,242,880-character cap, though it is 9,000,000 bytes on the wire. That label
@@ -3027,6 +3056,11 @@ async function runStructuredCompletion(upstreamCall, model, messages, conversati
 }
 
 async function handleChatCompletions(req, res) {
+  // #359: see handleSettings. Chunk boundaries are chosen by the kernel and the network, so a
+  // multi-byte character in a prompt is split unpredictably rather than rarely; setEncoding makes
+  // the stream decode across those boundaries instead of per-Buffer. The accumulator and the
+  // character-counted cap below are deliberately unchanged.
+  req.setEncoding("utf8");
   let body = "";
   try {
     for await (const chunk of req) {
@@ -3655,6 +3689,7 @@ const server = createServer(async (req, res) => {
 
   if (req.url === "/api/keys" && req.method === "POST") {
     if (!isAdmin) return jsonResponse(res, 403, { error: "Admin access required" });
+    req.setEncoding("utf8"); // #359: decode UTF-8 across chunk boundaries (see handleSettings)
     let body = "";
     try {
       for await (const chunk of req) { body += chunk; if (body.length > 10000) return jsonResponse(res, 413, { error: "Body too large" }); }
@@ -3691,6 +3726,7 @@ const server = createServer(async (req, res) => {
   if (req.url?.match(/^\/api\/keys\/[^/]+\/quota$/) && req.method === "PATCH") {
     if (!isAdmin) return jsonResponse(res, 403, { error: "Admin access required" });
     const idOrName = decodeURIComponent(req.url.split("/api/keys/")[1].replace("/quota", ""));
+    req.setEncoding("utf8"); // #359: decode UTF-8 across chunk boundaries (see handleSettings)
     let body = "";
     try {
       for await (const chunk of req) { body += chunk; if (body.length > 10000) return jsonResponse(res, 413, { error: "Body too large" }); }
