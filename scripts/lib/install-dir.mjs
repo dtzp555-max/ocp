@@ -74,11 +74,17 @@ import { readdirSync, readFileSync } from "node:fs";
 // package.json, so a rename cannot silently make every install unrecognizable.
 export const OCP_PACKAGE_NAME = "open-claude-proxy";
 
-// Top-level files that only an OCP checkout has all of. Any TWO of them is treated as an OCP
-// install even when package.json is missing or corrupt — a half-broken install is exactly the
-// state fresh_install exists to repair, so requiring a pristine package.json would refuse the
-// legitimate case. One alone is not enough: a stray `ocp` or `server.mjs` in a home directory
-// should not license `rm -rf $HOME`.
+// Top-level entry NAMES that only an OCP checkout has all of. Any TWO of them is treated as an
+// OCP install even when package.json is missing or corrupt — a half-broken install is exactly
+// the state fresh_install exists to repair, so requiring a pristine package.json would refuse
+// the legitimate case. One alone is not enough: a stray `ocp` or `server.mjs` in a home
+// directory should not license `rm -rf $HOME`.
+//
+// Name-only, deliberately stated: this matches directory ENTRIES and does not stat them, so a
+// directory named `ocp/` counts the same as a file named `ocp`. Two such entries would have to
+// coincide for that to matter, and the threshold of 2 — not any type check — is what refuses a
+// `/opt`-shaped directory (which scores exactly one). Tightening this to a type check is filed
+// as follow-up rather than done here; the comment says what the code does in the meantime.
 const INSTALL_MARKERS = ["server.mjs", "setup.mjs", "ocp", "models.json"];
 
 /**

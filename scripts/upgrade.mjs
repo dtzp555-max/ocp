@@ -789,7 +789,21 @@ export async function runUpgrade(opts = {}) {
   }
 
   // --- doctor pre-flight ---
-  const doctor = opts.mockDoctor || await runDoctor();
+  // Issue #348 review round-2 MEDIUM-A: this was a bare `runDoctor()`, while runFullUpgrade,
+  // runRollback and runFreshInstall all resolve their directory through
+  // `resolveInstallDir(opts)`. Whenever opts.ocpDir was set the two disagreed -- doctor
+  // describing one tree while the phase that mutates disk operated on another. That is the
+  // same defect class this whole issue is about, one function apart, and it survived the first
+  // revision because opts.ocpDir is dead in production so nothing ever diverged in practice.
+  //
+  // Forwarded deliberately narrowly rather than passing `opts` wholesale: these are the two
+  // options that decide WHICH tree and host doctor is describing. runUpgrade's other opts
+  // (`run`, `mockPlatform`, `mockExec`, `target`, ...) are about restart resolution and
+  // execution, and several are names doctor ALSO reads for unrelated purposes -- handing it
+  // the whole bag would silently repoint doctor's multi-unit probe at the restart tests' fake
+  // command runner. Undefined values are inert: resolveInstallDir falls through to $OCP_DIR
+  // and then its own file location exactly as before.
+  const doctor = opts.mockDoctor || await runDoctor({ ocpDir: opts.ocpDir, skipNetwork: opts.skipNetwork });
   if (!doctor.ready_to_upgrade && doctor.next_action.kind !== "fresh_install") {
     throw new Error(`doctor FAIL: ${doctor.next_action.kind} (run "ocp doctor" for details)`);
   }
@@ -1149,15 +1163,41 @@ async function runFreshInstall({ doctor, opts }) {
   const { dir: freshDir, source: freshSource } = resolveInstallDir(opts);
   const freshTarget = classifyInstallDir(freshDir);
 
-  // Issue #348 review, HIGH-2: the thing that actually runs `rm -rf` re-derives the verdict
-  // itself rather than trusting doctor's JSON. doctor already withholds the destructive step
-  // for an unsafe target, so in the normal flow this never fires -- but `runFreshInstall`
-  // executes whatever ai_executable[] it is handed (including opts.mockDoctor, and any future
-  // caller), and "the guard lives in the component that produces the argument, not the one
-  // that runs it" is exactly the shape that lets a second producer reopen the hole. Checked
-  // BEFORE the --fresh-install/--yes gate below: a target this tool must not delete is a
-  // refusal regardless of how much consent was given, and saying so first is more useful than
-  // telling the operator to re-run with flags that will then also refuse.
+  // Issue #348 review, HIGH-2, and then round-2 MEDIUM-A which corrected this comment.
+  //
+  // WHAT THIS CHECK COVERS, exactly: the directory THIS FUNCTION resolves. It re-runs the
+  // resolution and the classification itself instead of reading doctor's verdict out of the
+  // JSON, so a resolution that lands on something unsafe is refused here even when the JSON
+  // handed in says otherwise. That is a real, independent check and the "#348 HIGH-2 (defence
+  // in depth)" test pins it: the fixture's mockDoctor asserts nothing about safety and the
+  // refusal still fires.
+  //
+  // WHAT IT DOES NOT COVER, and the first revision of this comment wrongly implied it did:
+  // the contents of ai_executable[]. Those strings are executed verbatim and are never
+  // inspected. A caller that hands in a plan built for some OTHER directory gets that plan
+  // run -- demonstrated by review with `mockDoctor: { ai_executable: ["rm -rf /etc/..."] }`,
+  // which executed. Not production-reachable today (opts.mockDoctor is test-only and
+  // opts.ocpDir is set by nothing in production; the `ocp` wrapper passes neither), but the
+  // claim was false as written, and a comment promising protection is exactly where the next
+  // maintainer stops looking.
+  //
+  // WHY IT IS NOT FIXED BY INSPECTING THE COMMANDS: ai_executable[] is arbitrary shell.
+  // Deciding "this list cannot delete anything foreign" by pattern-matching its text is the
+  // substring-denylist shape this repo has already had bypassed three times in one PR (#218,
+  // recorded in AGENTS.md: "Guards on dynamic execution must bound capability, not scan text
+  // ... Claiming 'this code cannot do X' while the implementation is 'its text doesn't contain
+  // Y' is false"). A scan here would read as a stronger guarantee than the one above while
+  // being weaker than it looks -- strictly worse than saying plainly what is checked.
+  //
+  // WHERE THE PROTECTION ACTUALLY LIVES: doctor is the only producer of ai_executable[] in
+  // production, and it withholds every destructive step for an unsafe target (see its
+  // fresh_install next_action). IF A SECOND PRODUCER IS EVER ADDED -- a new caller, an
+  // imported plan, a --plan-file flag -- it does NOT inherit that, and this function will run
+  // whatever it is given. Bounding a new producer is that change's job, not this one's.
+  //
+  // Checked BEFORE the --fresh-install/--yes gate below: a target this tool must not delete is
+  // a refusal regardless of how much consent was given, and saying so first is more useful
+  // than telling the operator to re-run with flags that will then also refuse.
   if (!freshTarget.safeToReplace) {
     throw new Error(
       `Refusing the fresh_install path: ${freshTarget.why}. The first destructive step would ` +

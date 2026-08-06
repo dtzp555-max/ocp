@@ -13166,6 +13166,28 @@ test("#348 HIGH-2 (defence in depth): runFreshInstall refuses an unsafe target e
   }
 });
 
+test("#348 MEDIUM-A: runUpgrade's doctor pre-flight describes the SAME tree the mutating phases operate on", async () => {
+  // Round-2 review root finding: `runUpgrade` called a bare `runDoctor()` while every phase
+  // below it resolves through `resolveInstallDir(opts)`. With opts.ocpDir set the two named
+  // different directories — doctor describing one tree, the phase that mutates disk operating
+  // on another. Behavioural, and it discriminates: the scratch install carries a version this
+  // repo will never be at, so a doctor still resolving script-relative reports the repo's own
+  // version instead.
+  const scratch = mkdtempSync(testJoin(tmpdir(), "ocp-348-preflight-"));
+  try {
+    testWriteFile(testJoin(scratch, "package.json"), JSON.stringify({ name: OCP_PACKAGE_NAME, version: "3.5.0" }));
+    const result = await runUpgrade({ dryRun: true, skipNetwork: true, ocpDir: scratch });
+    const text = result.plan.join("\n");
+    assert.ok(text.includes("from=v3.5.0"),
+      `doctor must read the version from the SAME directory the phases use (${scratch}); got:\n${text}`);
+    const repoVersion = JSON.parse(_ltRead(testJoin(_D348_REPO_ROOT, "package.json"), "utf8")).version;
+    assert.ok(!text.includes(`from=v${repoVersion}`),
+      `premise: the scratch version must differ from this repo's own (${repoVersion}), or this proves nothing`);
+  } finally {
+    rmSync(scratch, { recursive: true, force: true });
+  }
+});
+
 test("#348 HIGH-2: `--dry-run` on a refused target shows the refusal, not an empty plan", async () => {
   // --dry-run is the command an operator runs precisely to find out what WOULD happen. Once
   // the guard can withhold ai_executable[], the preview loop printed a header with nothing
