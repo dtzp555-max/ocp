@@ -24,8 +24,11 @@
  * adds a field must update the snapshot, and the snapshot's git history is the per-release record
  * of how B.2 surface actually grew — independent of whether anyone wrote a marker.
  *
- * WHAT IT DOES NOT SEE is enumerated in the snapshot file's own `notCovered` block and in
- * `CLAUDE.md`'s governance_audits clause. Read it before treating a green run as coverage.
+ * WHAT IT DOES NOT SEE is enumerated in TWO places, and deliberately not here: the snapshot
+ * file's own `notCovered` block (13 entries, each tagged [measured] or [reasoned]) and
+ * `CLAUDE.md`'s `governance_audits.blind_spots` (7 headline items). This header keeps no third
+ * copy — a third would be the one that goes stale. Read one of those two before treating a green
+ * run as coverage.
  *
  * USAGE
  *   node scripts/b2-key-snapshot.mjs            # probe a fresh server, print the diff, exit 1 on drift
@@ -222,6 +225,18 @@ export function makeB2Fixture() {
 // revoked. `:id` is substituted with the id of the key created by the POST /api/keys probe, and
 // each record is filed under the INVENTORY's spelling of the path so the coverage check can match
 // it against ALIGNMENT.md directly.
+//
+// REQUEST-SHAPED RESPONSES ARE A CATEGORY, not a one-off — ask about every probe you add.
+// Some handlers echo the request, so the recorded key set is decided by the BODY BELOW rather
+// than by the server, and this snapshot can never detect an addition inside such a sub-object.
+// Two of the probes here are in that category and are handled differently on purpose:
+//   PATCH /api/keys/:id/quota  sends all three dimensions, so the echo is complete.
+//   PATCH /settings            echoes one results.<key> per setting in the body; measured,
+//                              {timeout} gives results.timeout{,.ok,.value} and {cacheTTL} gives
+//                              results.cacheTTL{,.ok,.value}. The body is pinned to {timeout};
+//                              changing it shows up as drift with no server change behind it.
+// The quota probe got this right and the settings probe did not, for three lines, until #354's
+// review noticed. Writing the rule down once is why this comment exists.
 export const B2_PROBE_PLAN = [
   { name: "POST /api/keys", method: "POST", path: "/api/keys", body: { name: "b2-key-snapshot" } },
   { name: "GET /health", method: "GET", path: "/health" },

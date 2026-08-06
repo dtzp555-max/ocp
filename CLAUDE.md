@@ -216,17 +216,27 @@ release_kit:
       blind_spots: |
         STATED SO NOBODY MISTAKES A GREEN RUN FOR COVERAGE. This is a strictly larger
         set of detections than the grep it replaced, not a complete one. The full list
-        with the reasoning lives in the snapshot's own "notCovered" block; the headline
-        items are:
+        lives in the snapshot's own "notCovered" block, where each entry is tagged
+        [measured] or [reasoned] so a reader can tell which claims were observed from a
+        running server and which were read off the source. That tagging exists because
+        #354's review found a REASONED claim written in a measured voice, and wrong.
+        The headline items:
 
           - TYPE changes under an unchanged key path. A key set records names, not
             types, so string -> number under the same name is invisible. Container
             changes ARE caught (object <-> scalar, array <-> object).
           - RENAMES, as renames. A rename fails the test as one removal plus one
             addition; the mechanism cannot tell it apart from two unrelated changes.
-          - Shapes that exist only under a NON-DEFAULT configuration — TUI mode and
-            CLAUDE_SKIP_PERMISSIONS both change /health's shape, and the fixture pins
-            both off.
+          - Shapes that exist only under a NON-DEFAULT configuration, MEASURED at 12
+            key paths total: CLAUDE_TUI_MODE=true alone is -1 (spawn.reason) and leaves
+            tui.pool NULL; tui.pool becomes an object only with OCP_TUI_POOL_SIZE>=1,
+            adding 10 paths; CLAUDE_SKIP_PERMISSIONS=true is -1 (config.allowedTools[]).
+            10 of the 12 are inside tui.pool, which is where the next field is most
+            likely to land. A second fixture profile is tracked as issue #357.
+          - REQUEST-SHAPED responses, where the recorded keys come from the probe's own
+            body rather than from the server. PATCH /settings echoes one results.<key>
+            per setting sent; the probe pins {timeout}. Ask this of every new probe —
+            the quota probe already sends all three dimensions for the same reason.
           - ERROR and non-localhost responses. Only the localhost success path of each
             pair is recorded.
           - /usage, which is Hybrid rather than B.2 and cannot be probed without a live
