@@ -113,6 +113,31 @@ This project's overlay per iron rule v1.4's 5.5. Machine-checkable declaration.
 release_kit:
   version_source: package.json
   changelog: CHANGELOG.md
+  changelog_convention: |
+    INSERT the new version heading BELOW a retained empty `## Unreleased`.
+    Do NOT rename `## Unreleased` in place.
+
+    Renaming in place is what caused v3.29.0's release notes to be relabelled
+    `## Unreleased` by a later merge — #354's branch predated the rename and
+    carried its own older copy of that line, so it won. Measured, holding base
+    and feature branch fixed and varying only this convention:
+
+      rename-in-place  -> exit 0, CLEAN merge; the feature entry files
+                          SILENTLY into the just-shipped section
+      insert-below     -> exit 1, CONFLICT; a human resolves it
+
+    The cure is not that entries land in the right section. It is that git can
+    no longer silently file into a SHIPPED one, because the release commit and
+    the feature branch now contend for the same region.
+
+    So: after a release, a CHANGELOG conflict on an open branch is the EXPECTED
+    outcome, not a nuisance. A clean auto-merge on a branch whose entry predates
+    the release is the symptom, not the happy path.
+
+    Coverage is partial and the boundary was measured: a branch created AFTER
+    the release lands its entry inside `## Unreleased` correctly; a branch that
+    ALREADY EXISTED still needs its entry moved BY HAND on merge-forward,
+    because git merges by context lines, not by section semantics.
   release_channel:
     type: github-release
     tag_format: v{semver}
@@ -203,9 +228,15 @@ release_kit:
         whichever grep flags the releaser happens to use. That recomputation is what
         produced both of #338's defects.
       baseline: |
-        As of v3.29.0 the cumulative ADR 0012 count is 2, both on /health:
-          instanceName                  (#327)
-          auth.consecutiveInconclusive  (#324)
+        As of v3.29.1 the cumulative ADR 0012 count is 2, both on /health:
+          instanceName                  (#327)   added in v3.29.0
+          auth.consecutiveInconclusive  (#324)   added in v3.29.0
+
+        v3.29.1: NONE THIS CYCLE. Recorded rather than omitted, per the report:
+        clause above — a releaser reading only the count cannot otherwise tell a
+        cycle that was audited and added nothing from a cycle nobody audited.
+        The B.2 key-set snapshot also matched unchanged, which is the stronger
+        of the two signals: it would have caught a field added with no marker.
 
         RECONCILED AGAINST THE WIRE when the snapshot was first recorded (#346): both
         key paths are present in docs/governance/b2-response-keys.json's "GET /health"

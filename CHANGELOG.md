@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## v3.29.1 — 2026-08-06
+
 ### Fixed
 
 - **UTF-8 was silently corrupted whenever a character straddled a chunk boundary (#359, P0).** All four request-body readers accumulated with `body += chunk`, which coerces each `Buffer` to a string **independently**. A multi-byte character whose bytes arrive in two chunks is decoded as replacement characters *before* the pieces are joined, so the join can never repair it: `你好世界` became `\uFFFD\uFFFD\uFFFD好世界`. Each of the four readers now calls `req.setEncoding("utf8")`, which installs a `StringDecoder` on the stream so an incomplete trailing sequence is held until the next chunk completes it. Sites: `PATCH /settings`, `POST /v1/chat/completions`, `POST /api/keys`, `PATCH /api/keys/:id/quota`.
@@ -27,6 +29,10 @@
 
 ### Changed
 
+- **`listKeys` redacts in SQL, so raw key material never enters process memory (#295).** External contribution by @anupamme. The preview is now computed by the query (`substr(key,1,8)||'...'||substr(key,-4)`) and the full `key` column is no longer SELECTed, so `GET /api/keys`, the dashboard and `ocp keys` get identical output while the secret never reaches Node. Behaviour-preserving on a grandfathered B.2 endpoint: JSON property *order* changes, and all three consumers read by name — verified at `server.mjs:3679`, `dashboard.html:224`, `ocp:594`.
+  - **Review found the three-layer test design is load-bearing, not redundant.** A mutation the author did not write — a full-key leak hidden *inside* `substr(key,1,36)` — is invisible to the SQL-shape test by construction (its regex strips exactly the region the leak hides in) and invisible to the `db.prepare` spy. Only the byte-equality test against a real key catches it.
+  - After this change **no query in `keys.mjs` selects the raw `key` column at all** — `validateKey` and `findKey` already selected only `id, name`, so `listKeys` was the last read-path door.
+
 - **The ADR 0012 additive-field audit now reads the wire instead of the CHANGELOG (#346).** The sweep in `CLAUDE.md`'s `release_kit.governance_audits` used to grep the CHANGELOG for ADR 0012's condition-5 marker. It missed a **compliant** spelling three times running — sentence-initial capital (#338), markdown link (#344 first pass), bold wrapped *around* the reference (#344 second pass) — every one caught by a human reviewer and none by the mechanism. Its own written stopping rule ("if a THIRD compliant spelling is missed, stop widening") had fired, so this replaces it rather than widening it a fourth time.
   - **The spelling was the symptom; reading prose to learn what shipped was the disease.** Every version of that grep, including a hypothetically perfect one, could only see additions whose author *wrote the marker*. A field added with no marker returned "none this cycle" — a positive-looking result for the case the audit was least able to see, and the exact shape of the four pre-#288 additions that motivated ADR 0012 in the first place.
   - **New mechanism: a per-release record of each grandfathered Class B.2 endpoint's real response key set.** `scripts/b2-key-snapshot.mjs` boots a real `server.mjs`, probes **all 16 endpoint+method pairs** across the 12 Class B.2 rows in `ALIGNMENT.md` § "Current Class B inventory", and records each response's recursive **key paths** plus its status and content-type into `docs/governance/b2-response-keys.json`. `npm test` fails on any difference, naming every added and removed key path and stating which authorization each kind needs. The snapshot's git history is the per-release record: `git log -p docs/governance/b2-response-keys.json`.
@@ -39,6 +45,8 @@
   - **The marker grep is kept as a secondary cross-check**, unchanged and still deliberately missing a known compliant spelling so the gap stays visible. Its incompleteness is no longer load-bearing: a marker it misses now surfaces from the key-set diff instead.
   - **Found while building it, recorded rather than fixed here, now tracked as #355:** nothing in `server.mjs` ever writes the `sessions` Map (declared at `server.mjs:965`; **0 occurrences of `sessions.set(` and 0 of `sessions.get(`** — only `.delete` and `.clear`), so `/health`'s and `/sessions`'s `sessions[]` are empty on every request. The blast radius is wider than one empty array: `/status`'s `activeSessions` and `stats.sessionHits` / `sessionMisses` are permanently constant too, and `CLAUDE_SESSION_TTL` is a documented env var whose only effect is timing a GC sweep whose loop body cannot execute. The snapshot recording `sessions[]` as an empty key set is the first mechanism that would catch a writer being added.
   - **No `server.mjs` change**, so no endpoint class is declared: this PR adds test and governance surface only.
+
+## v3.29.0 — 2026-08-05
 
 ### Changed
 
