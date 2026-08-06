@@ -3014,7 +3014,7 @@ ltTest("integration: ltTest serialization keeps peak concurrent server.mjs child
 });
 
 // ── Upgrade Tests ──
-import { runUpgrade, postFlightOk, runPostFlightCheck, parseFlagValue, classifyPostFlightProbeFailure, postFlightFailureSuffix, probeLaunchdDomains, execRestartRetry, RESTART_ATTEMPTS, recoveryPlanCommands } from "./scripts/upgrade.mjs";
+import { runUpgrade, postFlightOk, runPostFlightCheck, parseFlagValue, classifyPostFlightProbeFailure, postFlightFailureSuffix, probeLaunchdDomains, execRestartRetry, RESTART_ATTEMPTS, recoveryPlanCommands, postFlightOnlyCommand } from "./scripts/upgrade.mjs";
 
 console.log("\nUpgrade:");
 
@@ -3849,8 +3849,20 @@ test("#347 F2: the restoration pass re-runs the WHOLE plan, not just the command
     `and in plan order (bootout then bootstrap); got ${JSON.stringify(restore)}`);
 
   // The tear-down therefore runs twice overall: once in the restart phase, once in the restore.
-  // Safe only because the resolved bootout ends in `2>/dev/null || true` — assert that premise
-  // here rather than trusting a property that lives in another file (restart-unit.mjs:865).
+  //
+  // WHAT THIS NEXT ASSERTION PINS, precisely — it is weaker than it looks, and an independent
+  // review established the boundary both ways rather than by argument (#347 review):
+  //   - Rewriting restart-unit.mjs:865 to `[ -d / ] || true; launchctl bootout … 2>/dev/null`
+  //     keeps both substrings this test reads while the bootout's exit status once again
+  //     propagates. Full suite stayed GREEN with the premise false.
+  //   - Deleting `|| true` outright turns this test RED, and only this test.
+  // So it is not vacuous, and it is the only guard against that drift — but it pins the TOKEN'S
+  // PRESENCE, not that the token still guards the bootout. A semantics-deep pin would need this
+  // repo's fake-binary idiom (an `sh -c` command plus a scratch-PATH `launchctl` stub asserting
+  // exit 0), because `_u347Runner` is a plain JS function with no shell anywhere in the path.
+  // Deliberately not built here: see the corrected `.slice(0)` comment in scripts/upgrade.mjs —
+  // the safety argument no longer rests on `|| true` at all, so a deeper pin would be guarding a
+  // premise nothing depends on.
   assert.equal(run.count("launchctl bootout"), 2,
     `expected the tear-down to run in both passes; got calls=${JSON.stringify(run.calls)}`);
   assert.ok(run.calls.filter(c => c.includes("launchctl bootout")).every(c => c.includes("|| true")),
@@ -3926,6 +3938,76 @@ test("#347 F5: on systemd the recovery hint leads with `reset-failed`, because t
     `reset-failed must come BEFORE the restart or it does not help; got hint=${JSON.stringify(caught.hint)}`);
 });
 
+test("#347 G1: the re-check hint names an invocation that ACCEPTS --post-flight-only, not `ocp update`", async () => {
+  // Review finding G1. `--post-flight-only` exists only on `node scripts/upgrade.mjs`
+  // (invoked exactly that way at ocp:1629 and ocp:1684). The bash `cmd_update` matches `--check`
+  // and `--rollback` and nothing else, so `ocp update --post-flight-only vX` silently ignores the
+  // flag and runs a FULL UPDATE DISPATCH — on a host already in an unknown state. Both the F1 arm
+  // and postFlightFailureSuffix said the wrong one.
+  const cmd = postFlightOnlyCommand("v3.14.0");
+  assert.ok(!/\bocp update\b/.test(cmd),
+    `must not tell the operator to run a full update dispatch; got ${JSON.stringify(cmd)}`);
+  assert.match(cmd, /^node .*scripts\/upgrade\.mjs --post-flight-only v3\.14\.0$/,
+    `must name the invocation ocp:1629 itself uses; got ${JSON.stringify(cmd)}`);
+  // Never a guessed ~/ocp: issue #348 is about installs outside $HOME/ocp, where that path is a
+  // file that does not exist. The path is this module's own resolved location.
+  assert.ok(cmd.includes(_ltF2P(new URL("./scripts/upgrade.mjs", import.meta.url))),
+    `the path must be this installation's real one, not a guess; got ${JSON.stringify(cmd)}`);
+
+  // And it must reach the operator through the arm that actually fires.
+  const run = _u347Runner({});
+  let caught = null;
+  try {
+    await runUpgrade(_u347Opts({
+      execFn: run,
+      mockProbe: () => { throw Object.assign(new Error("sh: curl: command not found"), { status: 127 }); },
+    }));
+  } catch (e) { caught = e; }
+  assert.ok(caught);
+  assert.ok(!/ocp update --post-flight-only/.test(caught.hint),
+    `the F1 recovery hint must not carry the flag that ocp update ignores; got hint=${JSON.stringify(caught.hint)}`);
+  assert.ok(caught.hint.includes("scripts/upgrade.mjs --post-flight-only"),
+    `it must carry the invocation that works; got hint=${JSON.stringify(caught.hint)}`);
+});
+
+test("#347 G2: the reset-failed step cannot suppress the restart behind it in the ` && ` chain", async () => {
+  // Review finding G2. The hint joins with " && ", so a reset-failed that exits non-zero (no such
+  // unit in this scope, no running user manager / missing XDG_RUNTIME_DIR) would short-circuit the
+  // restart — F5's own failure mode one command earlier: the un-wedge step preventing the recovery.
+  const run = _u347Runner({ "systemctl": Infinity });
+  let caught = null;
+  try { await runUpgrade(_u347Opts({ mockPlatform: "linux", execFn: run, mockProbe: _u347Unreachable })); }
+  catch (e) { caught = e; }
+  assert.ok(caught);
+
+  // Slice from the recovery command list to the sentence that follows it. NOT `[^.]*` — unit
+  // names contain dots (`ocp-proxy.service`), so that truncates mid-command and the assertions
+  // below would read a fragment.
+  //
+  // Assert both ANCHORS were found, by index, before slicing at all. A first version of this
+  // checked the resulting slice instead (`length > 40 && includes("restart")`) and a control
+  // mutation proved that insufficient: a missing end marker makes `indexOf` return -1, and
+  // `slice(start, -1)` silently yields a LONGER slice running to one-before-end — 185 chars
+  // instead of 109 — which passes every "looks healthy" check. That is AGENTS.md's anchor-drift
+  // trap with the sign flipped: the documented form silently yields `''`, this one silently
+  // yields more, which is harder to notice because the slice looks richer rather than emptier.
+  const chainStart = caught.hint.indexOf("systemctl --user reset-failed");
+  const chainEnd = caught.hint.indexOf("Then, and only then");
+  assert.ok(chainStart > -1 && chainEnd > chainStart,
+    `harness premise: both slice anchors must be found and ordered — a missing one makes the ` +
+    `slice longer, not empty; start=${chainStart} end=${chainEnd} hint=${JSON.stringify(caught.hint)}`);
+  const chain = caught.hint.slice(chainStart, chainEnd);
+  assert.ok(/reset-failed -- ocp-proxy\.service \|\| true/.test(chain),
+    `reset-failed must be best-effort; got ${JSON.stringify(chain)}`);
+  // `A || true && B` parses as `(A || true) && B`, so B always runs. Assert the ordering that
+  // makes that true, not merely that both tokens appear somewhere.
+  assert.ok(chain.indexOf("|| true") < chain.indexOf("systemctl --user restart"),
+    `the guard must sit between reset-failed and the restart; got ${JSON.stringify(chain)}`);
+  // The launchd pair must NOT get the same treatment — there `&&` is genuinely sequential, and
+  // `bootstrap` should not run if `bootout` really failed. Covered by the F5 launchd control test,
+  // which asserts macOS hints carry no reset-failed at all.
+});
+
 test("#347 F5 control: launchd hints carry NO reset-failed (launchctl has no start limit)", async () => {
   const run = _u347Runner({ "launchctl bootstrap": Infinity });
   let caught = null;
@@ -3942,11 +4024,11 @@ test("#347 F5: recoveryPlanCommands inherits sudo / --user / unit from the plan 
   const mk = (action, cmds) => ({ plan: { action, cmds: cmds.map(c => ({ cmd: c, label: "restart" })) } });
   assert.deepEqual(
     recoveryPlanCommands(mk("system-unit", ["sudo systemctl restart -- ocp.service"])),
-    ["sudo systemctl reset-failed -- ocp.service", "sudo systemctl restart -- ocp.service"],
+    ["sudo systemctl reset-failed -- ocp.service || true", "sudo systemctl restart -- ocp.service"],
     "a sudo plan must produce a sudo reset-failed — re-deriving the prefix is how the two drift apart");
   assert.deepEqual(
     recoveryPlanCommands(mk("system-unit", ["systemctl restart -- ocp.service"])),
-    ["systemctl reset-failed -- ocp.service", "systemctl restart -- ocp.service"],
+    ["systemctl reset-failed -- ocp.service || true", "systemctl restart -- ocp.service"],
     "and a root plan must NOT gain a sudo it never had");
   assert.deepEqual(
     recoveryPlanCommands(mk("launchd", ["launchctl bootout x 2>/dev/null || true", "launchctl bootstrap y"])),

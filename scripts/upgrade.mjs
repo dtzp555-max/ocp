@@ -618,6 +618,29 @@ export function classifyPostFlightProbeFailure(e) {
 //
 // The `lastSeen` branch is deliberately byte-identical to the pre-#291 text: when a body WAS read,
 // the old message was already correct and specific, and changing it would be churn.
+// #347 review finding G1. The ONE invocation that actually accepts `--post-flight-only`.
+//
+// Both message sites used to say `ocp update --post-flight-only vX.Y.Z`. That flag does not exist
+// on the bash CLI: `cmd_update` matches `--check` and `--rollback` and nothing else, so the flag is
+// silently ignored and `ocp update …` runs a FULL UPDATE DISPATCH instead — on a host whose state
+// is, by construction at both of these call sites, already unknown. An arm whose entire job is
+// naming the right next action was naming one that does something else.
+//
+// Fixed by naming the invocation rather than teaching `cmd_update` a new flag. That alternative is
+// a real option, but it adds user-facing CLI surface (a new accepted flag, its exit-code
+// pass-through, its interaction with `--target`, a README entry per the release_kit overlay) and
+// belongs in its own reviewable unit; this is a wrong-advice bug in a string, and the string is in
+// this file. The form below is exactly what `ocp` itself already invokes at ocp:1629 and ocp:1684.
+//
+// Path comes from `import.meta.url`, never a hardcoded `~/ocp`: this module always lives at
+// `<ocpDir>/scripts/upgrade.mjs`, and issue #348 is specifically about installs that are not under
+// `$HOME/ocp`, where a guessed path would send the operator to a file that does not exist.
+export function postFlightOnlyCommand(target) {
+  let self;
+  try { self = fileURLToPath(import.meta.url); } catch { self = "scripts/upgrade.mjs"; }
+  return `node ${self} --post-flight-only ${target}`;
+}
+
 export function postFlightFailureSuffix(result) {
   if (result?.lastSeen) {
     return ` (last saw version=${result.lastSeen} — a stale process may still hold the port; check \`ss -ltnp\` / \`lsof -i\`)`;
@@ -629,7 +652,7 @@ export function postFlightFailureSuffix(result) {
       return ` — the post-flight probe could not run on THIS machine (${f.detail}).`
         + ` That is a local environment fault and says nothing about the service:`
         + ` the upgrade may well have succeeded. Fix the local curl, then re-check with`
-        + ` \`ocp update --post-flight-only v${result.target}\`.`;
+        + ` \`${postFlightOnlyCommand(`v${result.target}`)}\`.`;
     case "unparseable":
       return ` — ${f.detail}. Something is answering on the port, but it is not this proxy.`;
     case "http-error":
@@ -727,7 +750,22 @@ export function recoveryPlanCommands(restartPlan) {
   if (action !== "user-unit" && action !== "system-unit") return cmds;
   const restartCmd = cmds.find(c => c.includes(" restart -- "));
   if (!restartCmd) return cmds;
-  return [restartCmd.replace(" restart -- ", " reset-failed -- "), ...cmds];
+  // #347 review finding G2: `|| true`, because the caller joins this list with " && ".
+  //
+  // Without it, a `reset-failed` that exits non-zero SUPPRESSES the restart behind it — which is
+  // F5's own failure mode arriving one command earlier: the thing added to un-wedge a stuck unit
+  // would itself prevent the recovery. And it genuinely can exit non-zero (no such unit under this
+  // scope, no running user manager / missing XDG_RUNTIME_DIR — the same conditions runRollback's
+  // MED-E note already documents for `systemctl --user daemon-reload`).
+  //
+  // Deliberately different from the rest of the chain, and that is the point: the launchd pair IS
+  // sequential — `bootstrap` should not run if `bootout` genuinely failed — so " && " stays right
+  // for it. This one command is best-effort housekeeping ahead of the real action. Written as a
+  // suffix on the command rather than as a special separator in the join, so a future edit to the
+  // joining code cannot silently drop it. Precedence is safe: `A || true && B` parses as
+  // `(A || true) && B`, and `(A || true)` always succeeds, so B always runs. Same `|| true` idiom
+  // the repo already uses on the resolved bootout (scripts/lib/restart-unit.mjs:865).
+  return [`${restartCmd.replace(" restart -- ", " reset-failed -- ")} || true`, ...cmds];
 }
 
 export async function runPostFlightCheck(target, opts = {}) {
@@ -1204,13 +1242,25 @@ async function runFullUpgrade({ doctor, opts }) {
       // than the recovery it prescribes, and weaker than what actually ended the real incident,
       // which was the full pair. Re-run the WHOLE plan so the two agree by construction.
       //
-      // Why re-running the tear-down cannot make things worse, written here because the property
-      // lives in another file and a safety argument that depends on a distant line is one
-      // refactor from being false: the only multi-command plan is launchd's, and its first
-      // command is `launchctl bootout … 2>/dev/null || true` (scripts/lib/restart-unit.mjs:865).
-      // The `|| true` is load-bearing — it makes the tear-down incapable of a non-zero exit, so
-      // re-running it against an already-unloaded job is a no-op rather than a new failure. If
-      // that `|| true` is ever removed, this `.slice(0)` becomes unsafe and must be revisited.
+      // Why re-running the tear-down is the right trade. CORRECTED after review (#347 finding G3):
+      // an earlier version of this comment justified it by `restart-unit.mjs:865`'s
+      // `2>/dev/null || true`. That argument does not hold. **`|| true` bounds the tear-down's exit
+      // CODE, not its EFFECT.** If a partially-completed bootstrap had left the job loaded, this
+      // `.slice(0)` re-runs `bootout` against a LIVE service — something `.slice(index)` structurally
+      // could not do. The `|| true` would hide the exit status of exactly that.
+      //
+      // The real reason: by the time this line runs, the set-up half has failed `restartAttempts`
+      // times in a row after a tear-down that already succeeded, so the service is almost certainly
+      // already down — there is, in practice, nothing live left to tear down. And in the residual
+      // case where something IS still loaded, `bootout` then `bootstrap` is precisely the restart
+      // the operator would perform by hand; it does not leave the service worse off, it leaves it
+      // restarted. That is a judgement about likely state and bounded downside, not a guarantee,
+      // and it is stated as one so the next reader does not check a premise, find it true, and
+      // conclude a safety property holds that never followed from it.
+      //
+      // `|| true` still matters, for the narrower thing it actually does: it keeps a no-op bootout
+      // against an already-unloaded job from being recorded as a failed restore step.
+      //
       // Every other plan shape is a single `systemctl … restart --` command, for which
       // `.slice(0)` and `.slice(index)` are identical.
       const restoreCmds = restartCmds.slice(0);
@@ -1325,7 +1375,7 @@ async function runFullUpgrade({ doctor, opts }) {
             + `exited 0, and the post-flight probe could not RUN here (${postFlight.lastFailure.detail}). `
             + `That is a local environment fault and says nothing about the service. Check by hand from a `
             + `working shell (\`curl -sf http://127.0.0.1:${port}/health\`), or fix the local curl and re-check `
-            + `with \`ocp update --post-flight-only ${upgradeTarget}\`. Only if the service is genuinely not `
+            + `with \`${postFlightOnlyCommand(upgradeTarget)}\`. Only if the service is genuinely not `
             + `serving ${upgradeTarget} is \`ocp update --rollback\` the right move.` }
       );
     }
