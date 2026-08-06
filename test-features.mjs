@@ -1180,7 +1180,8 @@ test("localToolsSafetyError: multi is checked before loopback/anon (most severe 
 // wiring (extractSystemPrompt using SYSTEM_PROMPT_WRAPPER, the boot gate, the epoch fold) can be
 // silently reverted with the unit suite still green — the maintainer's #1 rejection pattern.
 import { spawn as _ltSpawn, execFileSync as _ltExecFile } from "node:child_process";
-import { createServer as _ltNetServer } from "node:net";
+import { createServer as _ltNetServer, connect as _ltNetConnect } from "node:net";
+import { createServer as _ltHttpServer } from "node:http";
 import { writeFileSync as _ltWrite, chmodSync as _ltChmod, readFileSync as _ltRead, existsSync as _ltExists, rmSync as _ltRm, mkdtempSync as _ltMkdtemp } from "node:fs";
 import { tmpdir as _ltTmp } from "node:os";
 import { fileURLToPath as _ltF2P } from "node:url";
@@ -2991,6 +2992,367 @@ ltTest("integration (#346): every grandfathered B.2 endpoint's response key set 
   //    key path and tells the author which authorization each kind needs.
   const drift = diffB2KeySets(readB2Snapshot().probes, first);
   assert.equal(drift, null, drift || "");
+});
+
+// ── #359: request bodies must decode UTF-8 ACROSS chunk boundaries ──────────────────────────
+//
+// The defect: all four request-body readers accumulated with `body += chunk`, which coerces each
+// Buffer to a string INDEPENDENTLY. A multi-byte character whose bytes straddle two chunks is
+// decoded as replacement characters before the pieces are joined, so joining cannot repair it.
+// Chunk boundaries are chosen by the kernel and the network, so this is unpredictable rather than
+// rare, and it is silent: the JSON stays syntactically valid and every observable says the request
+// succeeded. The fix is `req.setEncoding("utf8")` at each reader, which installs a StringDecoder
+// that holds an incomplete trailing sequence until the next chunk completes it.
+//
+// Why the existing CJK coverage cannot catch this: it sends whole bodies through fetch(), and a
+// body that ARRIVES WHOLE cannot exhibit the defect. Everything below controls the chunk
+// boundaries explicitly, via a raw socket.
+//
+// Two premises are MEASURED on every case rather than assumed, because either failing quietly
+// would make this whole block vacuous:
+//   1. the split really reaches the application layer as >= 2 'data' events — counted by a control
+//      server in this process (ltNaiveEcho), not inferred from the client's write pattern; and
+//   2. the pre-fix accumulation really does corrupt this input — the same control server
+//      reproduces `body += chunk` verbatim, so an input that happened to be immune says so.
+// The decisive evidence that the fragmentation also reaches server.mjs itself is the mutation
+// proof (delete the four setEncoding lines → these tests go red), recorded in the PR.
+
+// Raw HTTP/1.1 client with EXPLICIT control over where the body is cut. `splits` are byte offsets
+// into `bytes`; each piece is written separately with a real pause, so the kernel delivers separate
+// segments instead of coalescing the body into a single read. `contentLength` may deliberately
+// overstate what is sent (with `stopAfterSplits`) to prove the cap aborts mid-stream.
+function ltRawSend(port, { method = "POST", path = "/", bytes, splits = [], contentLength,
+                          gapMs = 40, stopAfterSplits = false, timeoutMs = 20000 }) {
+  return new Promise((resolve) => {
+    const sock = _ltNetConnect(port, "127.0.0.1");
+    let raw = Buffer.alloc(0), settled = false;
+    const finish = (v) => { if (settled) return; settled = true; clearTimeout(timer); try { sock.destroy(); } catch {} resolve(v); };
+    const timer = setTimeout(() => finish({ status: 0, text: "", timedOut: true }), timeoutMs);
+    // A mid-body 413 makes the server close on us while we are still writing; that is the
+    // behaviour under test, not a failure, so socket errors are collected rather than thrown.
+    sock.on("error", () => {});
+    sock.on("data", d => { raw = Buffer.concat([raw, d]); });
+    sock.on("close", () => finish(ltParseHttp(raw)));
+    sock.on("connect", async () => {
+      sock.write(`${method} ${path} HTTP/1.1\r\nHost: 127.0.0.1\r\n` +
+                 `Content-Type: application/json\r\nContent-Length: ${contentLength ?? bytes.length}\r\n` +
+                 `Connection: close\r\n\r\n`);
+      let prev = 0;
+      for (const at of splits) {
+        if (sock.destroyed || settled) return;
+        sock.write(bytes.subarray(prev, at));
+        prev = at;
+        await new Promise(r => setTimeout(r, gapMs));
+      }
+      if (!stopAfterSplits && !sock.destroyed && !settled) sock.write(bytes.subarray(prev));
+    });
+  });
+}
+
+// Minimal response parser. Handles both Content-Length and chunked framing so it does not depend
+// on which one Node picks for a given response size — the body is UTF-8 JSON either way.
+function ltParseHttp(raw) {
+  const sep = raw.indexOf("\r\n\r\n");
+  if (sep < 0) return { status: 0, text: "" };
+  const head = raw.subarray(0, sep).toString("latin1");
+  const status = Number(head.slice(0, head.indexOf("\r\n")).split(" ")[1] || 0);
+  let body = raw.subarray(sep + 4);
+  if (/^transfer-encoding:\s*chunked/im.test(head)) {
+    const out = [];
+    let p = 0;
+    for (;;) {
+      const nl = body.indexOf("\r\n", p);
+      if (nl < 0) break;
+      const n = parseInt(body.subarray(p, nl).toString("latin1"), 16);
+      if (!Number.isFinite(n) || n === 0) break;
+      out.push(body.subarray(nl + 2, nl + 2 + n));
+      p = nl + 2 + n + 2;
+    }
+    body = Buffer.concat(out);
+  }
+  return { status, text: body.toString("utf8") };
+}
+
+// The control. Reproduces server.mjs's PRE-#359 accumulation verbatim (`body += chunk`, no
+// setEncoding) and reports how many 'data' events it actually saw. Its job is to prove, per case,
+// that the client's split reached the application layer and that this input is genuinely
+// corruptible — without which every assertion against the real server would pass vacuously.
+function ltNaiveEcho() {
+  return new Promise((resolve) => {
+    const srv = _ltHttpServer(async (req, res) => {
+      let body = "", chunks = 0;
+      for await (const chunk of req) { body += chunk; chunks++; }   // the defect, verbatim
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ body, chunks }));
+    });
+    srv.listen(0, "127.0.0.1", () => resolve({
+      port: srv.address().port,
+      close: () => new Promise(r => srv.close(r)),
+    }));
+  });
+}
+
+// Byte offsets that fall strictly INSIDE a multi-byte character (a UTF-8 continuation byte).
+// Splitting at one of these is what triggers the defect; splitting anywhere else is harmless.
+function ltContinuationOffsets(buf) {
+  const out = [];
+  for (let i = 1; i < buf.length; i++) if ((buf[i] & 0xc0) === 0x80) out.push(i);
+  return out;
+}
+
+// The pre-fix operation, computed in this process: `body += chunk` for exactly two chunks. Used to
+// PREDICT which split offsets the defect corrupts, so the control server can be checked against a
+// derived expectation instead of a hand-picked threshold.
+function ltNaiveJoin(buf, at) { return buf.subarray(0, at).toString("utf8") + buf.subarray(at).toString("utf8"); }
+function ltNaiveCorruptOffsets(buf) {
+  const whole = buf.toString("utf8"), out = [];
+  for (let i = 1; i < buf.length; i++) if (ltNaiveJoin(buf, i) !== whole) out.push(i);
+  return out;
+}
+
+const LT_U8_TWO = "é";    // U+00E9   C3 A9           — Latin-1 supplement, 2 bytes
+const LT_U8_THREE = "你"; // U+4F60   E4 BD A0        — CJK, 3 bytes
+const LT_U8_FOUR = "🙂";  // U+1F642  F0 9F 99 82     — astral, 4 bytes / 2 UTF-16 units
+
+console.log("\nUTF-8 across chunk boundaries in request-body readers (#359):");
+
+// (1) Every internal byte offset, for a 2-byte, a 3-byte and a 4-byte character in one body.
+// (2) Malformed UTF-8 that is not a split character at all — bytes that are simply not valid.
+// Both assert the SAME invariant: the decoded body must equal the whole-buffer decode of the exact
+// bytes sent, no matter where the stream was cut. `/settings` PATCH is the echo channel — an
+// unrecognised setting comes back as a key of `results` and inside `unknown setting: <key>`, so the
+// response carries the decoded text verbatim rather than a proxy for it.
+ltTest("integration (#359): /settings decodes UTF-8 across EVERY byte offset, valid and malformed", async () => {
+  if (!LT_POSIX) return;
+  const dir = ltMkdir(); const fake = ltFake(dir);
+  const { child, buf, port } = await ltBootFresh({ CLAUDE_BIN: fake }, dir);
+  const ctl = await ltNaiveEcho();
+  try {
+    assert.ok(await ltWait(() => buf.out.includes("listening on")), `did not start: ${buf.err.slice(0, 300)}`);
+
+    const cases = [
+      // Every internal byte offset of a 2-byte, a 3-byte and a 4-byte character, in one body.
+      { name: "valid 2+3+4-byte characters",
+        bytes: Buffer.from(JSON.stringify({ [`p-${LT_U8_TWO}-${LT_U8_THREE}-${LT_U8_FOUR}-q`]: 1 }), "utf8") },
+      // Bytes that are not valid UTF-8 at all: 0xFF and 0xFE are never valid; 0x80 is a
+      // continuation with no lead; 0xC3 is a 2-byte lead followed by a non-continuation; E4 BD is
+      // a 3-byte sequence one byte short. Decoded whole this is "a" + five U+FFFD + "b" — still
+      // valid JSON, which is exactly why the defect is silent. DECIDED BEHAVIOUR: lossy
+      // substitution, unchanged from what a whole-buffer decode already did, and identical no
+      // matter where the stream was cut. Worth keeping even though the pre-fix code corrupts it at
+      // only ONE offset (see the predicted set below) — that is the point: a test built only from
+      // invalid bytes would be very nearly vacuous.
+      { name: "invalid UTF-8 bytes mid-body",
+        bytes: Buffer.concat([Buffer.from('{"a', "utf8"), Buffer.from([0xff, 0xfe, 0x80, 0xc3, 0xe4, 0xbd]), Buffer.from('b":1}', "utf8")]) },
+      // Invalid bytes INTERLEAVED with real multi-byte characters — the realistic shape of a
+      // partially-corrupt body, and the one where the two failure modes could mask each other.
+      { name: "invalid bytes interleaved with valid multi-byte characters",
+        bytes: Buffer.concat([Buffer.from('{"a', "utf8"), Buffer.from([0xff]), Buffer.from(LT_U8_THREE, "utf8"),
+                              Buffer.from([0xfe, 0x80]), Buffer.from(LT_U8_FOUR, "utf8"), Buffer.from('b":1}', "utf8")]) },
+    ];
+
+    for (const c of cases) {
+      const whole = c.bytes.toString("utf8");                       // the reference decode
+      const key = Object.keys(JSON.parse(whole))[0];
+      assert.ok(key && key.length > 0, `${c.name}: reference payload does not parse — the cases below would be meaningless`);
+      // Predicted from the pre-fix operation itself, not guessed: these are the offsets at which
+      // `body += chunk` produces something other than the whole-buffer decode.
+      const predicted = ltNaiveCorruptOffsets(c.bytes);
+      assert.ok(predicted.length >= 1,
+        `${c.name}: the pre-fix accumulation does not corrupt this payload at ANY offset — it does not exercise the defect`);
+
+      const observed = [];
+      for (let at = 1; at < c.bytes.length; at++) {
+        // Premise, measured per offset: the split really reached the application layer.
+        const ctlRes = await ltRawSend(ctl.port, { path: "/", bytes: c.bytes, splits: [at] });
+        assert.equal(ctlRes.status, 200, `${c.name}@${at}: control server did not answer`);
+        const ctlBody = JSON.parse(ctlRes.text);
+        assert.ok(ctlBody.chunks >= 2,
+          `${c.name}@${at}: the split did NOT reach the application layer (saw ${ctlBody.chunks} chunk(s)) — ` +
+          `every assertion below would pass vacuously`);
+        if (ctlBody.body !== whole) observed.push(at);
+
+        const res = await ltRawSend(port, { method: "PATCH", path: "/settings", bytes: c.bytes, splits: [at] });
+        assert.equal(res.status, 400, `${c.name}@${at}: expected 400 (unknown setting), got ${res.status}: ${res.text.slice(0, 200)}`);
+        const got = Object.keys(JSON.parse(res.text).results);
+        assert.deepStrictEqual(got, [key],
+          `${c.name}@${at}: body cut at byte ${at} decoded to ${JSON.stringify(got[0])}, expected ${JSON.stringify(key)}`);
+      }
+      // The control must reproduce the defect EXACTLY — same offsets, no more, no fewer. A control
+      // that broke everywhere (bad harness) or nowhere (immune payload) would leave the loop above
+      // proving nothing, and both failure modes are silent without this.
+      assert.deepStrictEqual(observed, predicted,
+        `${c.name}: the pre-fix control corrupted offsets ${JSON.stringify(observed)} but the pre-fix ` +
+        `operation itself corrupts ${JSON.stringify(predicted)} — the control is not reproducing the defect`);
+    }
+  } finally { await ctl.close(); child.kill("SIGKILL"); _ltRmRetry(dir); }
+});
+
+// Decoder finalisation. `setEncoding` buffers an incomplete trailing sequence; at end-of-stream
+// that sequence is never completed. Node flushes it: readable.js `onEofChunk` calls
+// `decoder.end()`, which the string_decoder docs define as replacing "bytes representing
+// incomplete UTF-8 and UTF-16 characters ... with substitution characters".
+//
+// DECIDED BEHAVIOUR: flush, not drop — and the assertion is written to tell them apart, because
+// they are not equally safe. A truncated body must not be silently accepted as though it were
+// complete. The probe puts the partial character AFTER an otherwise complete JSON document, so
+// flushing appends U+FFFD and JSON.parse fails (400), whereas dropping would leave valid JSON and
+// the setting would be applied (200). The paired control sends the same document WITHOUT the
+// partial tail and must get 200 — otherwise the 400 would prove nothing.
+ltTest("integration (#359): a body ending mid-character is REJECTED, not silently truncated to valid JSON", async () => {
+  if (!LT_POSIX) return;
+  const dir = ltMkdir(); const fake = ltFake(dir);
+  const { child, buf, port } = await ltBootFresh({ CLAUDE_BIN: fake }, dir);
+  try {
+    assert.ok(await ltWait(() => buf.out.includes("listening on")), `did not start: ${buf.err.slice(0, 300)}`);
+    // cacheTTL=0 is what ltBoot already configured (CLAUDE_CACHE_TTL=0) and is in range, so the
+    // control write is accepted AND changes nothing — the probe must not perturb the boot it runs on.
+    const doc = Buffer.from(JSON.stringify({ cacheTTL: 0 }), "utf8");
+
+    const ok = await ltRawSend(port, { method: "PATCH", path: "/settings", bytes: doc });
+    assert.equal(ok.status, 200, `control: an intact body must be accepted, got ${ok.status}: ${ok.text.slice(0, 200)}`);
+    assert.equal(JSON.parse(ok.text).results.cacheTTL.ok, true, "control: the intact body must have been applied");
+
+    for (const keep of [1, 2]) {                                    // 1 and 2 bytes of a 3-byte char
+      const cut = Buffer.concat([doc, Buffer.from(LT_U8_THREE, "utf8").subarray(0, keep)]);
+      const res = await ltRawSend(port, { method: "PATCH", path: "/settings", bytes: cut, splits: [doc.length] });
+      assert.equal(res.status, 400,
+        `a body ending ${keep} byte(s) into a 3-byte character must be rejected — got ${res.status}: ${res.text.slice(0, 200)}. ` +
+        `A 200 here means the partial sequence was DROPPED at end-of-stream and the truncated body was accepted as complete.`);
+      assert.equal(JSON.parse(res.text).error, "Invalid JSON",
+        "the rejection must come from JSON.parse seeing the flushed substitution character");
+    }
+    // Not wedged: the same connection pattern still works afterwards.
+    const after = await ltRawSend(port, { method: "PATCH", path: "/settings", bytes: doc });
+    assert.equal(after.status, 200, "the server must still serve requests after a truncated body");
+  } finally { child.kill("SIGKILL"); _ltRmRetry(dir); }
+});
+
+// Build a JSON document whose TEXT is exactly `n` characters, padded with a 3-byte character.
+// `make(pad)` must return the document for a given pad string.
+function ltDocOfChars(n, make) {
+  const base = make("").length;
+  assert.ok(n > base, `cap ${n} is too small for this document shape (${base} chars of overhead)`);
+  const doc = make(LT_U8_THREE.repeat(n - base));
+  assert.equal(doc.length, n, `document is ${doc.length} chars, wanted exactly ${n}`);
+  return Buffer.from(doc, "utf8");
+}
+// A split offset strictly inside a character, near the middle of the payload.
+function ltMidCharSplit(bytes) {
+  const inside = ltContinuationOffsets(bytes);
+  assert.ok(inside.length > 0, "payload has no mid-character offset to cut at");
+  return inside[Math.floor(inside.length / 2)];
+}
+
+// THE COMPATIBILITY TEST. All four caps compare `body.length` — UTF-16 code units, i.e. characters
+// (server.mjs, the MAX_BODY_SIZE comment; #310). The fix must not change what is counted, so a body
+// of EXACTLY cap characters in multi-byte text still has to be accepted and cap+1 still rejected.
+//
+// The exact-cap arm is cut mid-character on purpose, which makes it fail two different ways:
+//   - pre-fix (`body += chunk`): the split inflates one character into replacement characters, so
+//     the count crosses the cap and a legitimate body gets a 413;
+//   - Buffer.concat + byte-counting: ~3 bytes per character, so a cap-length CJK body is ~3x the
+//     cap in bytes and gets a 413 too.
+// Only a fix that decodes across the boundary AND keeps counting characters passes both arms.
+ltTest("integration (#359/#310): exactly-cap multi-byte bodies stay accepted, cap+1 stays rejected (3 admin routes)", async () => {
+  if (!LT_POSIX) return;
+  const CAP = 10000;                                    // the literal in all three handlers
+  const dir = ltMkdir(); const fake = ltFake(dir);
+  const { child, buf, port } = await ltBootFresh({ CLAUDE_BIN: fake }, dir);
+  try {
+    assert.ok(await ltWait(() => buf.out.includes("listening on")), `did not start: ${buf.err.slice(0, 300)}`);
+
+    const made = await ltRawSend(port, { path: "/api/keys", bytes: Buffer.from(JSON.stringify({ name: "lt-359-cap" }), "utf8") });
+    assert.equal(made.status, 201, `could not create the key the quota route needs: ${made.status} ${made.text.slice(0, 200)}`);
+    const keyId = JSON.parse(made.text).id;
+    assert.ok(keyId, "created key has no id");
+
+    const routes = [
+      { what: "PATCH /settings", method: "PATCH", path: "/settings",
+        make: pad => JSON.stringify({ [pad]: 1 }), accepted: 400 },        // unknown setting
+      { what: "POST /api/keys", method: "POST", path: "/api/keys",
+        make: pad => JSON.stringify({ name: "lt-359-a", pad }), accepted: 201 },
+      { what: "PATCH /api/keys/:id/quota", method: "PATCH", path: `/api/keys/${keyId}/quota`,
+        make: pad => JSON.stringify({ daily: 7, pad }), accepted: 200 },
+    ];
+
+    for (const r of routes) {
+      const atCap = ltDocOfChars(CAP, r.make);
+      const cut = ltMidCharSplit(atCap);
+      const ok = await ltRawSend(port, { method: r.method, path: r.path, bytes: atCap, splits: [cut] });
+      assert.notEqual(ok.status, 413,
+        `${r.what}: a body of exactly ${CAP} CHARACTERS (${atCap.length} bytes) was rejected with 413. ` +
+        `The cap counts UTF-16 code units (#310) and this body is at, not over, it.`);
+      assert.equal(ok.status, r.accepted,
+        `${r.what}: expected ${r.accepted} for an at-cap body, got ${ok.status}: ${ok.text.slice(0, 200)}`);
+
+      const over = ltDocOfChars(CAP + 1, r.make);
+      const tooBig = await ltRawSend(port, { method: r.method, path: r.path, bytes: over, splits: [ltMidCharSplit(over)] });
+      assert.equal(tooBig.status, 413,
+        `${r.what}: a body of ${CAP + 1} characters must still be rejected, got ${tooBig.status}: ${tooBig.text.slice(0, 200)}`);
+    }
+
+    // The early abort is part of the shape too: the cap must fire from inside the read loop, before
+    // the stream ends. Content-Length overstates what is sent and the client stops early, so a
+    // reader that deferred the check to end-of-stream (the Buffer.concat shape) would hang here
+    // instead of answering — the timeout is reported as a distinct failure, not a wrong status.
+    const huge = ltDocOfChars(CAP * 2, pad => JSON.stringify({ [pad]: 1 }));
+    const early = await ltRawSend(port, {
+      method: "PATCH", path: "/settings", bytes: huge, splits: [huge.length],
+      contentLength: huge.length + 4096, stopAfterSplits: true, timeoutMs: 8000,
+    });
+    assert.ok(!early.timedOut, "the cap must abort mid-stream: the server never answered a body it had not finished receiving");
+    assert.equal(early.status, 413, `expected an early 413, got ${early.status}: ${early.text.slice(0, 200)}`);
+  } finally { child.kill("SIGKILL"); _ltRmRetry(dir); }
+});
+
+// The Class B.1 reader, end to end: bytes cut mid-character on the wire must reach the spawned
+// claude process intact. A `role: "system"` message's content lands verbatim in `--system-prompt`
+// (extractSystemPrompt → buildCliArgs), which the fake binary writes to SP_CAPTURE — so the
+// assertion reads what the CHILD actually received, not what the proxy echoed back.
+ltTest("integration (#359): a prompt cut mid-character on the wire reaches the spawned CLI intact", async () => {
+  if (!LT_POSIX) return;
+  const CAP = 4000;
+  const dir = ltMkdir(); const fake = ltFake(dir); const cap = join(dir, "sp.txt");
+  const { child, buf, port } = await ltBootFresh({ CLAUDE_BIN: fake, SP_CAPTURE: cap, CLAUDE_MAX_BODY_SIZE: String(CAP) }, dir);
+  const ctl = await ltNaiveEcho();
+  try {
+    assert.ok(await ltWait(() => buf.out.includes("listening on")), `did not start: ${buf.err.slice(0, 300)}`);
+
+    const marker = `359-${LT_U8_TWO}${LT_U8_THREE}${LT_U8_FOUR}-${LT_U8_THREE.repeat(20)}-end`;
+    const bytes = Buffer.from(JSON.stringify({
+      model: "haiku",
+      messages: [{ role: "system", content: marker }, { role: "user", content: "probe" }],
+    }), "utf8");
+    const at = ltMidCharSplit(bytes);
+
+    const ctlRes = await ltRawSend(ctl.port, { path: "/", bytes, splits: [at] });
+    const ctlBody = JSON.parse(ctlRes.text);
+    assert.ok(ctlBody.chunks >= 2, `the split did not reach the application layer (${ctlBody.chunks} chunk(s))`);
+    assert.notEqual(ctlBody.body, bytes.toString("utf8"),
+      "premise: the pre-fix accumulation must corrupt this payload, or the assertion below proves nothing");
+
+    const res = await ltRawSend(port, { path: "/v1/chat/completions", bytes, splits: [at] });
+    assert.equal(res.status, 200, `expected 200, got ${res.status}: ${res.text.slice(0, 300)}`);
+    assert.ok(await ltWait(() => _ltExists(cap)), "fake claude was spawned and captured --system-prompt");
+    const sp = _ltRead(cap, "utf8");
+    assert.ok(sp.includes(marker),
+      `the system prompt handed to the CLI lost the character the body was cut inside. ` +
+      `Expected to find ${JSON.stringify(marker)} in ${JSON.stringify(sp.slice(-120))}`);
+
+    // Same cap contract as the admin routes, on the B.1 surface.
+    const atCap = ltDocOfChars(CAP, pad => JSON.stringify({ model: "haiku", messages: [{ role: "user", content: pad }] }));
+    const okCap = await ltRawSend(port, { path: "/v1/chat/completions", bytes: atCap, splits: [ltMidCharSplit(atCap)] });
+    assert.notEqual(okCap.status, 413,
+      `a body of exactly ${CAP} CHARACTERS (${atCap.length} bytes) was rejected; the cap counts characters (#310)`);
+    assert.equal(okCap.status, 200, `expected 200 for an at-cap body, got ${okCap.status}: ${okCap.text.slice(0, 200)}`);
+
+    const over = ltDocOfChars(CAP + 1, pad => JSON.stringify({ model: "haiku", messages: [{ role: "user", content: pad }] }));
+    const tooBig = await ltRawSend(port, { path: "/v1/chat/completions", bytes: over, splits: [ltMidCharSplit(over)] });
+    assert.equal(tooBig.status, 413, `${CAP + 1} characters must still be rejected, got ${tooBig.status}: ${tooBig.text.slice(0, 200)}`);
+    assert.match(tooBig.text, /counts characters, not bytes/,
+      "the 413 must still name its unit (#310) — the message is part of the contract");
+  } finally { await ctl.close(); child.kill("SIGKILL"); _ltRmRetry(dir); }
 });
 
 // Deterministic close for the ltTest serialization claim: a fact about how many server.mjs
