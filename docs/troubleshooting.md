@@ -126,6 +126,11 @@ Symptom, from [issue #348](https://github.com/dtzp555-max/ocp/issues/348) — an
   or unparseable). This path … runs `rm -rf ~/ocp` and reinstalls from scratch …
 ```
 
+(That is the **pre-fix** wording, reproduced as the operator saw it. The `~/ocp` in it was a
+hardcoded constant, and it is now interpolated from the resolved install directory — so the
+current message names the directory that would actually be deleted. If you are reading a
+refusal that literally says `~/ocp`, you are on a version older than this fix.)
+
 on a host sitting on a perfectly parseable version. The refusal is correct — never pass `--fresh-install --yes` to get past it on a live host — but the *conclusion* was wrong. Before the fix, `scripts/doctor.mjs` and `scripts/upgrade.mjs` assumed the install was at `$HOME/ocp`. Under `sudo` that is `/root/ocp`, which does not exist, so `package.json` could not be read, `current_version` became `unknown`, and `from_version_supported` failed with `unknown < v3.4.0` — a message that reads as "your version is too old" when the real answer is "I could not find your install". Setting `OCP_DIR` did not help, because nothing read it.
 
 **Once a host is on the fixed version this resolves itself**: the maintenance scripts locate the install from their own file location, the same way the `ocp` bash entrypoint always has, so `/opt/ocp` and `sudo` are both fine with no configuration. `ocp doctor` now prints the directory it used on its first line:
@@ -134,7 +139,15 @@ on a host sitting on a perfectly parseable version. The refusal is correct — n
 [PASS] install_dir: /opt/ocp (resolved from script)
 ```
 
-If that line names the wrong directory, override it with an **absolute** `OCP_DIR` (a relative value is refused, and the `install_dir` line says so). If the version genuinely cannot be read, `current_version` now **FAILs** and names the path it tried, instead of reporting `PASS` with the value `unknown`.
+If that line names the wrong directory, override it with an **absolute** `OCP_DIR` (a relative value is refused, and the `install_dir` line is raised to WARN so the refusal survives `ocp update`'s output filter). If the version genuinely cannot be read, `current_version` now **FAILs** and names the path it tried, instead of reporting `PASS` with the value `unknown`.
+
+**`OCP_DIR` is not a free-form path.** The fresh-install path begins with `rm -rf <install dir>`, so a mistyped-but-absolute value would otherwise become an `rm -rf` argument. A directory is only accepted as a deletion target when it is **absent, empty, or verifiably an OCP install** (a `package.json` named `open-claude-proxy`, or at least two of `server.mjs` / `setup.mjs` / `ocp` / `models.json`). Anything else — `/`, `/etc`, a home directory, a typo — is refused before any step runs:
+
+```
+[FAIL] install_dir: /etc (resolved from OCP_DIR) — /etc exists and is NOT an OCP install …
+```
+
+and `ocp update` refuses the same way even with `--fresh-install --yes`. If you genuinely want a non-empty, non-OCP directory replaced, remove it yourself first.
 
 **On an older host that cannot update itself out of this**, the manual, non-destructive path is:
 

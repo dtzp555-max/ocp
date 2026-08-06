@@ -792,8 +792,9 @@ test("doctor --json shape: required top-level keys", async () => {
   const result = await runDoctor({ skipNetwork: true, mockVersion: "v3.10.0", mockLatest: "v3.14.0" });
   for (const k of ["schema_version", "ready_to_upgrade", "current_version", "latest_version",
                    "from_version_supported", "fail_count", "warn_count", "checks", "next_action",
-                   // #348: which tree every other field in this object describes.
-                   "install_dir", "install_dir_source"]) {
+                   // #348: which tree every other field in this object describes, and
+                   // (review HIGH-2) whether that tree may be handed to `rm -rf`.
+                   "install_dir", "install_dir_source", "install_dir_safe_to_replace"]) {
     assert.ok(k in result, `missing key: ${k}`);
   }
   assert.equal(result.schema_version, "1");
@@ -998,13 +999,19 @@ test("#348: a RELATIVE OCP_DIR is refused and SAID SO — never silently ignored
   try {
     const r = _d348RunDoctor({ HOME: fakeHome, OCP_DIR: "relative/ocp" });
     assert.equal(r.install_dir, _D348_REPO_ROOT, "must fall back to the script-relative answer");
-    assert.ok(r.install_dir_source.includes("ignored"),
-      `source must state that OCP_DIR was ignored; got: ${r.install_dir_source}`);
-    assert.ok(r.install_dir_source.includes("relative/ocp"),
-      `source must quote back the value it refused; got: ${r.install_dir_source}`);
+    assert.equal(r.install_dir_source, "script");
     const check = r.checks.find(c => c.id === "install_dir");
+    // Review MEDIUM-1: the level is the whole point. `ocp`'s cmd_update pipes doctor's JSON
+    // through a filter that prints WARN and INFO lines only, so a refusal carried at PASS
+    // reaches an operator running `ocp update` exactly never — which is what the first cut
+    // shipped, directly contradicting this module's own stated principle. Asserting the
+    // message alone would have passed against that bug.
+    assert.equal(check.level, "WARN",
+      `a refused OCP_DIR must be WARN so it survives ocp update's WARN/INFO-only filter; got ${check.level}`);
     assert.ok(check.message.includes("ignored"),
       `the refusal must reach the printed check line, not just the JSON; got: ${check.message}`);
+    assert.ok(check.message.includes("relative/ocp"),
+      `the refusal must quote back the value it refused; got: ${check.message}`);
   } finally {
     rmSync(fakeHome, { recursive: true, force: true });
   }
@@ -1057,6 +1064,145 @@ test("#348 safety: a KNOWN-but-unsupported version still PASSes current_version 
   assert.equal(byId.current_version, "PASS", "v3.2.0 was successfully determined — that check succeeded");
   assert.equal(byId.from_version_supported, "FAIL");
   assert.equal(result.next_action.kind, "fresh_install");
+});
+
+// ── Issue #348 independent review, HIGH-2: OCP_DIR is an `rm -rf` argument ──
+//
+// Adding OCP_DIR created a capability that did not exist before it: `opts.ocpDir` is dead in
+// production and no --ocp-dir flag exists, so there was NO reachable way to point doctor's
+// fresh_install `rm -rf ${ocpDir}` anywhere but $HOME/ocp. With OCP_DIR read, a typo'd-but-
+// absolute value ("/", "/etc", "$HOME") resolves fine, has no package.json, fails
+// current_version, selects kind="fresh_install", and becomes the argument.
+//
+// classifyInstallDir is the guard: absent, empty, or verifiably an OCP install — nothing else
+// may be deleted. Tested as a table (the classifier) and then end to end (doctor withholds the
+// steps; runFreshInstall refuses even with full consent).
+import { resolveInstallDir, classifyInstallDir, OCP_PACKAGE_NAME } from "./scripts/lib/install-dir.mjs";
+
+console.log("\nInstall-dir deletion guard (#348 review HIGH-2):");
+
+test("#348 HIGH-2 premise: OCP_PACKAGE_NAME still matches this repo's own package.json name", () => {
+  // The guard's strongest signal is "package.json says open-claude-proxy". If the project is
+  // ever renamed and this constant is not, every real install silently stops being recognised
+  // as one — the guard would then refuse the legitimate path everywhere. This is a premise of
+  // the harness, so a textual read of package.json is the right instrument here.
+  const pkg = JSON.parse(_ltRead(testJoin(_D348_REPO_ROOT, "package.json"), "utf8"));
+  assert.equal(OCP_PACKAGE_NAME, pkg.name);
+});
+
+test("#348 HIGH-2: classifyInstallDir — only absent, empty, or a real OCP install may be deleted", () => {
+  const root = mkdtempSync(testJoin(tmpdir(), "ocp-348-classify-"));
+  try {
+    const mk = (name, build) => {
+      const d = testJoin(root, name);
+      tMkdirSync(d, { recursive: true });
+      build?.(d);
+      return d;
+    };
+
+    const cases = [];
+
+    // Safe: absent.
+    cases.push([testJoin(root, "never-created"), true, "absent"]);
+    // Safe: exists but empty — the real shape of `sudo mkdir -p /opt/ocp` before installing.
+    cases.push([mk("empty"), true, "empty"]);
+    // Safe: package.json names this project, even with nothing else present.
+    cases.push([mk("named-pkg-only", d =>
+      testWriteFile(testJoin(d, "package.json"), JSON.stringify({ name: OCP_PACKAGE_NAME }))), true, "named package.json"]);
+    // Safe: no package.json at all, but two marker files — a half-broken install, which is
+    // exactly the state fresh_install exists to repair.
+    cases.push([mk("two-markers", d => {
+      testWriteFile(testJoin(d, "server.mjs"), "");
+      testWriteFile(testJoin(d, "setup.mjs"), "");
+    }), true, "two markers, no package.json"]);
+
+    // UNSAFE: non-empty, nothing identifying — the /etc and typo shapes.
+    cases.push([mk("foreign", d => testWriteFile(testJoin(d, "passwd"), "root:x:0:0")), false, "foreign directory"]);
+    // UNSAFE: exactly ONE marker. A stray `server.mjs` in a home directory must not license
+    // `rm -rf $HOME`; this is the case a naive "any marker" rule would have got wrong.
+    cases.push([mk("one-marker", d => {
+      testWriteFile(testJoin(d, "server.mjs"), "");
+      testWriteFile(testJoin(d, "notes.txt"), "");
+    }), false, "single marker"]);
+    // UNSAFE: a package.json that is some OTHER project.
+    cases.push([mk("other-pkg", d => {
+      testWriteFile(testJoin(d, "package.json"), JSON.stringify({ name: "something-else" }));
+      testWriteFile(testJoin(d, "index.js"), "");
+    }), false, "another project's package.json"]);
+    // UNSAFE: unreadable / not a directory at all. Fail closed — "could not confirm what this
+    // is" must never license deleting it.
+    const aFile = testJoin(root, "a-file");
+    testWriteFile(aFile, "not a directory");
+    cases.push([aFile, false, "a file, not a directory (ENOTDIR)"]);
+
+    for (const [dir, expected, label] of cases) {
+      const c = classifyInstallDir(dir);
+      assert.equal(c.safeToReplace, expected,
+        `${label} (${dir}): expected safeToReplace=${expected}, got ${c.safeToReplace} — ${c.why}`);
+      if (!expected) {
+        assert.ok(c.why && c.why.includes(dir),
+          `a refusal must name the directory it refused; got: ${c.why}`);
+      }
+    }
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("#348 HIGH-2 (the money test): doctor emits NO `rm -rf` for a directory that is not an OCP install", async () => {
+  const foreign = mkdtempSync(testJoin(tmpdir(), "ocp-348-foreign-"));
+  try {
+    testWriteFile(testJoin(foreign, "passwd"), "root:x:0:0"); // non-empty, not an OCP install
+    const result = await runDoctor({ skipNetwork: true, mockLatest: "v9.9.9", ocpDir: foreign });
+
+    // The chain the review measured: no package.json -> current_version FAIL -> fresh_install.
+    assert.equal(result.next_action.kind, "fresh_install",
+      "premise: this input must still reach the destructive kind, or the guard is untested");
+
+    const everyStep = JSON.stringify(result.next_action.ai_executable);
+    assert.ok(!everyStep.includes("rm -rf"),
+      `no destructive step may be generated for a non-install directory; got: ${everyStep}`);
+    assert.deepEqual(result.next_action.ai_executable, [],
+      "withholding only the rm would leave a git clone that cannot succeed into a non-empty dir");
+    assert.equal(result.install_dir_safe_to_replace, false);
+
+    const check = result.checks.find(c => c.id === "install_dir");
+    assert.equal(check.level, "FAIL");
+    assert.ok(check.message.includes(foreign), `the FAIL must name the directory; got: ${check.message}`);
+    assert.ok(result.next_action.human_required.some(h => h.includes(foreign)),
+      `the operator must be told which directory was refused; got: ${JSON.stringify(result.next_action.human_required)}`);
+  } finally {
+    rmSync(foreign, { recursive: true, force: true });
+  }
+});
+
+test("#348 HIGH-2 control: a genuinely absent install dir DOES still get the full fresh-install plan", async () => {
+  // The guard must not break the legitimate path. Without this, "emits no rm -rf" would be
+  // satisfiable by never emitting one at all.
+  const result = await runDoctor({ skipNetwork: true, mockLatest: "v9.9.9", ocpDir: "/nonexistent-ocp-install-for-348" });
+  assert.equal(result.next_action.kind, "fresh_install");
+  assert.equal(result.install_dir_safe_to_replace, true);
+  assert.ok(result.next_action.ai_executable.some(c => c.includes("rm -rf /nonexistent-ocp-install-for-348")),
+    `an absent target is a safe rm target; got: ${JSON.stringify(result.next_action.ai_executable)}`);
+});
+
+test("#348 HIGH-2: the default (script-relative) resolution is always PASS — the new FAIL cannot fire on an existing host", async () => {
+  // The safety argument for adding a second FAIL-capable check: reaching it requires an
+  // explicitly-set OCP_DIR (or an injected opts.ocpDir), and OCP_DIR is new in this change.
+  // The default answer is the tree doctor.mjs is running from, which always has a package.json
+  // named open-claude-proxy.
+  const result = await runDoctor({ skipNetwork: true, mockLatest: "v9.9.9" });
+  const check = result.checks.find(c => c.id === "install_dir");
+  assert.equal(check.level, "PASS", `default resolution must never FAIL; got ${check.level}: ${check.message}`);
+  assert.equal(result.install_dir_safe_to_replace, true);
+});
+
+test("#348: resolveInstallDir is a distinct name from keys.mjs's resolveOcpDir (data dir), and returns a structured source", () => {
+  // Follow-up from the review: keys.mjs already exports a `resolveOcpDir()` meaning the ~/.ocp
+  // DATA directory. Two same-named functions about "the OCP directory" with different meanings
+  // is a miscall waiting to happen, so this one is resolveInstallDir and lives in install-dir.mjs.
+  const r = resolveInstallDir({ ocpDir: "/explicit/override" });
+  assert.deepEqual(r, { dir: "/explicit/override", source: "opts.ocpDir", ignored: "" });
 });
 
 // ── Issue #214: doctor's noop must reflect the RUNNING SERVICE's version, not just the tree ──
@@ -12932,6 +13078,134 @@ test("#348: runFullUpgrade's git/npm/setup target is THIS installation, never $H
     const offenders = cmds.filter(c => c.includes(`${homeOcp}/`) || c.includes(` ${homeOcp} `) || c.endsWith(` ${homeOcp}`));
     assert.equal(offenders.length, 0,
       `no upgrade command may target $HOME/ocp when the running install is elsewhere; got: ${JSON.stringify(offenders)}`);
+  }
+});
+
+test("#348: runRollback's checkout/npm target is THIS installation too, never $HOME/ocp", async () => {
+  // Review follow-up: runRollback was converted alongside runFullUpgrade but shipped with no
+  // test and no mutation entry, so nothing held it in place. Same shape as the sibling above —
+  // rollback git-checks-out and npm-installs into ocpDir, so a wrong answer here mutates the
+  // wrong tree.
+  const rawRoot = _ltF2P(new URL(".", import.meta.url)).replace(/\/$/, "");
+  const result = await runUpgrade({
+    rollback: true, yes: true, mockExec: true, mockPlatform: "darwin",
+    mockSnapshots: [{ name: "upgrade-snapshot-2026-08-01T10:00:00Z", path: "/tmp/snap-348" }],
+    mockSnapshotMeta: { fromCommit: "abc1234" },
+    // Deliberately NO ocpDir override.
+  });
+  const cmds = result.phases.map(p => p.cmd).filter(Boolean);
+  assert.ok(cmds.length > 0, "premise: mockExec must still record the commands it skipped");
+  for (const needle of [`git -C ${rawRoot} checkout abc1234`, `npm --prefix ${rawRoot} install`]) {
+    assert.ok(cmds.some(c => c.includes(needle)),
+      `expected a command containing "${needle}"; got: ${JSON.stringify(cmds)}`);
+  }
+  const homeOcp = testJoin(homedir(), "ocp");
+  if (homeOcp !== rawRoot) {
+    const offenders = cmds.filter(c => c.includes(`${homeOcp}/`) || c.includes(` ${homeOcp} `) || c.endsWith(` ${homeOcp}`));
+    assert.equal(offenders.length, 0,
+      `no rollback command may target $HOME/ocp; got: ${JSON.stringify(offenders)}`);
+  }
+});
+
+console.log("\nfresh_install consent + deletion guard (#348 review HIGH-1/HIGH-2):");
+
+test("#348 HIGH-1: the consent message names the RESOLVED install dir, not a hardcoded ~/ocp", async () => {
+  // This message is the last thing an operator reads before typing --fresh-install --yes. It
+  // hardcoded `rm -rf ~/ocp`, which was true only while doctor's step was hardcoded too. Once
+  // doctor started interpolating the resolved dir, the gate described deleting one directory
+  // while the command deleted another — on exactly the /opt/ocp host this change exists for.
+  const install = mkdtempSync(testJoin(tmpdir(), "ocp-348-consent-"));
+  try {
+    // A real-looking install, so the HIGH-2 guard passes and we reach the consent gate.
+    testWriteFile(testJoin(install, "package.json"), JSON.stringify({ name: OCP_PACKAGE_NAME, version: "3.0.0" }));
+    await assert.rejects(
+      async () => runUpgrade({
+        yes: false, freshInstall: false, mockExec: true, ocpDir: install,
+        mockDoctor: { ready_to_upgrade: false, next_action: { kind: "fresh_install", ai_executable: [] },
+                      current_version: "unknown", latest_version: "v3.30.0" },
+      }),
+      (err) => {
+        assert.ok(err.message.includes(`rm -rf ${install}`),
+          `consent text must name the directory that will actually be deleted; got: ${err.message}`);
+        assert.ok(!err.message.includes("rm -rf ~/ocp"),
+          `consent text must not restate a hardcoded ~/ocp; got: ${err.message}`);
+        assert.ok(err.message.includes("--fresh-install --yes"), "must still say how to proceed");
+        return true;
+      }
+    );
+  } finally {
+    rmSync(install, { recursive: true, force: true });
+  }
+});
+
+test("#348 HIGH-2 (defence in depth): runFreshInstall refuses an unsafe target even WITH --fresh-install --yes", async () => {
+  // doctor already withholds the steps, but runFreshInstall executes whatever ai_executable[]
+  // it is handed — including from opts.mockDoctor and any future producer. The guard has to
+  // live in the component that runs `rm -rf`, not only in the one that writes the string.
+  // This mockDoctor deliberately carries a destructive step doctor itself would never emit.
+  const foreign = mkdtempSync(testJoin(tmpdir(), "ocp-348-foreign-exec-"));
+  try {
+    testWriteFile(testJoin(foreign, "passwd"), "root:x:0:0");
+    await assert.rejects(
+      async () => runUpgrade({
+        yes: true, freshInstall: true, mockExec: true, ocpDir: foreign,
+        mockDoctor: { ready_to_upgrade: false,
+                      next_action: { kind: "fresh_install", ai_executable: [`rm -rf ${foreign}`] },
+                      current_version: "unknown", latest_version: "v3.30.0" },
+      }),
+      (err) => {
+        assert.ok(/Refusing the fresh_install path/.test(err.message), `got: ${err.message}`);
+        assert.ok(err.message.includes(foreign), `must name the refused directory; got: ${err.message}`);
+        assert.ok(/absent, empty, or verifiably an OCP install/.test(err.message),
+          `must state the rule it applied; got: ${err.message}`);
+        return true;
+      }
+    );
+  } finally {
+    rmSync(foreign, { recursive: true, force: true });
+  }
+});
+
+test("#348 HIGH-2: `--dry-run` on a refused target shows the refusal, not an empty plan", async () => {
+  // --dry-run is the command an operator runs precisely to find out what WOULD happen. Once
+  // the guard can withhold ai_executable[], the preview loop printed a header with nothing
+  // under it — an empty plan is indistinguishable from "no work needed", which is the
+  // invisible-failure shape this whole issue is about.
+  const foreign = mkdtempSync(testJoin(tmpdir(), "ocp-348-dryrun-"));
+  try {
+    testWriteFile(testJoin(foreign, "passwd"), "root:x:0:0");
+    const result = await runUpgrade({
+      dryRun: true, mockExec: true, ocpDir: foreign,
+      mockDoctor: { ready_to_upgrade: false, current_version: "unknown", latest_version: "v3.30.0",
+                    next_action: { kind: "fresh_install", ai_executable: [],
+                                   human_required: [`Refusing to generate a fresh-install plan: ${foreign} is not an OCP install.`] } },
+    });
+    assert.equal(result.executed, false, "premise: --dry-run must not execute anything");
+    const text = result.plan.join("\n");
+    assert.ok(/REFUSED/.test(text), `the preview must say it was refused; got:\n${text}`);
+    assert.ok(text.includes(foreign),
+      `the preview must name the directory that was refused; got:\n${text}`);
+  } finally {
+    rmSync(foreign, { recursive: true, force: true });
+  }
+});
+
+test("#348 HIGH-2 control: a SAFE target with full consent still executes the fresh-install steps", async () => {
+  // Without this, the refusal above would be satisfiable by refusing everything.
+  const install = mkdtempSync(testJoin(tmpdir(), "ocp-348-safe-exec-"));
+  try {
+    testWriteFile(testJoin(install, "package.json"), JSON.stringify({ name: OCP_PACKAGE_NAME, version: "3.0.0" }));
+    const result = await runUpgrade({
+      yes: true, freshInstall: true, mockExec: true, ocpDir: install,
+      mockDoctor: { ready_to_upgrade: false,
+                    next_action: { kind: "fresh_install", ai_executable: [`rm -rf ${install}`] },
+                    current_version: "unknown", latest_version: "v3.30.0" },
+    });
+    assert.equal(result.path, "fresh_install");
+    assert.equal(result.executed, true);
+    assert.deepEqual(result.steps.map(s => s.status), ["skipped-mock"]);
+  } finally {
+    rmSync(install, { recursive: true, force: true });
   }
 });
 

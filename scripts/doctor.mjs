@@ -16,7 +16,7 @@ import { join } from "node:path";
 import { homedir } from "node:os";
 import { execSync } from "node:child_process";
 import { DEFAULT_PORT, AUTH_STALE_AFTER_INCONCLUSIVE } from "../lib/constants.mjs";
-import { resolveOcpDir } from "./lib/ocp-dir.mjs";
+import { resolveInstallDir, classifyInstallDir } from "./lib/install-dir.mjs";
 
 const SCHEMA_VERSION = "1";
 
@@ -674,12 +674,32 @@ export async function runDoctor(opts = {}) {
   }
 
   // --- install directory (issue #348) ---
-  // Resolved from THIS FILE's own location, not from $HOME — see scripts/lib/ocp-dir.mjs for
-  // the full failure it fixes. Pushed as a visible check, first, because #348's real cost was
-  // not that the answer was wrong: it was that a wrong answer was invisible, and surfaced three
-  // checks downstream as "your version is too old".
-  const { dir: ocpDir, source: ocpDirSource } = resolveOcpDir(opts);
-  push("install_dir", "PASS", `${ocpDir} (resolved from ${ocpDirSource})`);
+  // Resolved from THIS FILE's own location, not from $HOME — see scripts/lib/install-dir.mjs
+  // for the full failure it fixes. Pushed as a visible check, first, because #348's real cost
+  // was not that the answer was wrong: it was that a wrong answer was invisible, and surfaced
+  // three checks downstream as "your version is too old".
+  const { dir: ocpDir, source: ocpDirSource, ignored: ocpDirIgnored } = resolveInstallDir(opts);
+  const install = classifyInstallDir(ocpDir);
+
+  // Three levels, and the level is what decides whether an operator ever sees this line:
+  //
+  //   FAIL — the resolved directory exists and is NOT an OCP install (review HIGH-2). This is
+  //     the state in which the fresh_install path would otherwise hand it to `rm -rf`, so the
+  //     destructive step is withheld below and this says why. It cannot fire on the default
+  //     path: the script-relative answer is the tree doctor.mjs is running from, which always
+  //     has a package.json named "open-claude-proxy". Reaching it requires an explicitly-set
+  //     $OCP_DIR (or an injected opts.ocpDir), and $OCP_DIR is new in this change — so no host
+  //     that previously updated can be newly refused by it.
+  //   WARN — an $OCP_DIR was supplied and could not be used (review MEDIUM-1). This was PASS
+  //     in the first cut, and `ocp`'s cmd_update filter prints WARN and INFO only, so the
+  //     refusal reached exactly nobody on the command it matters on. This module's own header
+  //     states the opposite principle; WARN is what makes it true.
+  //   PASS — otherwise.
+  const installLevel = !install.safeToReplace ? "FAIL" : ocpDirIgnored ? "WARN" : "PASS";
+  push("install_dir", installLevel,
+       `${ocpDir} (resolved from ${ocpDirSource})` +
+       (ocpDirIgnored ? ` — ${ocpDirIgnored}` : "") +
+       (installLevel === "FAIL" ? ` — ${install.why}` : ""));
 
   // --- version detection ---
   const pkgPath = join(ocpDir, "package.json");
@@ -902,7 +922,13 @@ export async function runDoctor(opts = {}) {
   // --- next_action shape ---
   let next_action;
   if (kind === "fresh_install") {
-    next_action = {
+    // Review HIGH-2: `rm -rf ${ocpDir}` is emitted ONLY when the target is absent, empty, or a
+    // verifiable OCP install. Otherwise no automated steps are offered at all — an
+    // ai_executable[] that silently dropped just the `rm` would leave a `git clone` that
+    // cannot succeed into a non-empty directory, reporting a confusing clone failure instead
+    // of the real problem. Saying "I will not generate steps for this target, here is why" is
+    // the honest shape, and `human_required` is the field that already means exactly that.
+    next_action = install.safeToReplace ? {
       kind,
       human_required: ["claude auth login (only if OAuth becomes invalid after reinstall)"],
       ai_executable: [
@@ -915,6 +941,15 @@ export async function runDoctor(opts = {}) {
         `${ocpDir}/ocp doctor`
       ],
       verify: "ocp doctor expects PASS on all checks"
+    } : {
+      kind,
+      human_required: [
+        `Refusing to generate a fresh-install plan: ${install.why}.`,
+        `A fresh install would begin with \`rm -rf ${ocpDir}\`, and this tool only does that to a directory that is absent, empty, or verifiably an OCP install.`,
+        `If OCP is installed somewhere else, set OCP_DIR to that path (absolute). If you genuinely want this directory replaced, remove it yourself first, then re-run.`,
+      ],
+      ai_executable: [],
+      verify: "ocp doctor expects install_dir=PASS once OCP_DIR points at an OCP install (or is unset)"
     };
   } else if (kind === "noop") {
     next_action = { kind, human_required: [], ai_executable: [], verify: "already at latest" };
@@ -965,6 +1000,9 @@ export async function runDoctor(opts = {}) {
     // reading --json can see WHICH tree every other field in this object describes.
     install_dir: ocpDir,
     install_dir_source: ocpDirSource,
+    // #348 review HIGH-2: whether this directory may be handed to `rm -rf` by the
+    // fresh_install path. False withholds every automated step; see the next_action shape.
+    install_dir_safe_to_replace: install.safeToReplace,
     current_version: currentVersion,
     latest_version: latestVersion,
     from_version_supported: fromSupported,
@@ -1006,10 +1044,10 @@ function runOauthOnly(opts, checks, push) {
   const kind = !healthOk ? "fix_service" : !oauthOk ? "fix_oauth" : "noop";
 
   let next_action;
-  // Issue #348: same resolution as the full path. This one only builds the ai_executable
+  // Issue #348: same resolution as the full path (see scripts/lib/install-dir.mjs). This one only builds the ai_executable
   // strings, but printing `~/ocp/ocp doctor --check oauth` to an operator whose install is at
   // /opt/ocp is a remediation step that cannot work when pasted.
-  const { dir: ocpDir } = resolveOcpDir(opts);
+  const { dir: ocpDir } = resolveInstallDir(opts);
   if (kind === "noop") {
     // `ocp doctor --check oauth` exists to answer "is OAuth OK?", so reporting "OAuth healthy"
     // when the honest answer is "no probe has concluded yet" is the same overclaim #289 is about,
