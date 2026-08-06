@@ -2824,6 +2824,175 @@ ltTest("replay premise (LIVE): a real server.mjs whose FIRST probe dies on a sig
   } finally { child.kill("SIGKILL"); _ltRmRetry(dir); }
 });
 
+// ── Class B.2 response key-set snapshot (#346) ──────────────────────────────────
+// Replaces the ADR 0012 prose grep. The grep read the CHANGELOG to learn what shipped; it missed
+// a condition-5-compliant spelling three times running (#338, twice more inside #344's review),
+// and #346 recorded the verdict that no regex can be complete over prose reference formatting.
+// The deeper problem was never the spelling: ANY grep sees only additions whose author WROTE the
+// marker, so a field added silently produces "none this cycle" — a green result for the exact
+// case the audit is least able to see, and the shape of the four pre-#288 additions that
+// motivated ADR 0012. This reads the wire instead.
+//
+// Everything here is behavioral: real server.mjs children, real HTTP, real response bodies.
+// Nothing greps source. The fixture that pins each response's SHAPE lives in
+// scripts/b2-key-snapshot.mjs so the CLI a releaser runs and the test the suite runs cannot
+// drift apart — a fixture difference would silently change what "the snapshot" means.
+import {
+  makeB2Fixture, probeB2KeySets, responseKeyPaths, parseB2Inventory, diffB2KeySets,
+  readB2Snapshot, ALIGNMENT_PATH,
+} from "./scripts/b2-key-snapshot.mjs";
+
+console.log("\nClass B.2 response key-set snapshot (#346):");
+
+test("responseKeyPaths: a present-but-null field is IN the key set, an absent one is NOT", () => {
+  // The distinction /health's instanceName exists to preserve (#327): "" rather than omitted, so
+  // a consumer can tell "this is the primary" from "this build predates the field". A key-set
+  // representation that collapsed null/"" into "absent" would erase exactly that.
+  assert.deepStrictEqual(responseKeyPaths({ instanceName: null }), ["instanceName"]);
+  assert.deepStrictEqual(responseKeyPaths({ instanceName: "" }), ["instanceName"]);
+  assert.deepStrictEqual(responseKeyPaths({}), []);
+});
+
+test("responseKeyPaths: nested objects recurse — a flat top-level set would have missed BOTH baseline ADR 0012 fields", () => {
+  // auth.consecutiveInconclusive (#324) is one of the two fields in the v3.29.0 baseline, and it
+  // lives one level down. A top-level-only key set would report /health unchanged when it landed.
+  assert.deepStrictEqual(
+    responseKeyPaths({ auth: { ok: true, consecutiveInconclusive: 0 } }),
+    ["auth", "auth.consecutiveInconclusive", "auth.ok"]);
+});
+
+test("responseKeyPaths: arrays carry a [] marker and union their element keys", () => {
+  assert.deepStrictEqual(responseKeyPaths({ a: [] }), ["a", "a[]"]);
+  assert.deepStrictEqual(responseKeyPaths({ a: [{ b: 1 }, { c: 2 }] }), ["a", "a[]", "a[].b", "a[].c"]);
+  assert.deepStrictEqual(responseKeyPaths({ a: [[1]] }), ["a", "a[]", "a[][]"]);
+});
+
+test("responseKeyPaths: an empty array turning into an empty object is still visible", () => {
+  // Both are "no child keys", so without the [] marker these two would compare equal and a
+  // container swap on an empty collection would pass unnoticed.
+  assert.notDeepStrictEqual(responseKeyPaths({ a: [] }), responseKeyPaths({ a: {} }));
+});
+
+test("responseKeyPaths: VALUES never reach the key set, so uptime/timestamps/counters cannot make the snapshot flap", () => {
+  assert.deepStrictEqual(
+    responseKeyPaths({ uptime: 1, ts: "2026-01-01T00:00:00.000Z", n: 0 }),
+    responseKeyPaths({ uptime: 999999, ts: "2026-08-06T12:34:56.789Z", n: 41 }));
+});
+
+test("parseB2Inventory: reads ALIGNMENT.md's real inventory, expands multi-method rows, and excludes B.1", () => {
+  const pairs = parseB2Inventory(_ltRead(ALIGNMENT_PATH, "utf8"));
+  // Anchor-drift guard, asserted BEFORE anything downstream trusts the result: a parser that
+  // recognised no rows would "cover" every probe vacuously.
+  assert.ok(pairs.length >= 12,
+    `anchor drift: only ${pairs.length} B.2 pairs parsed out of ALIGNMENT.md's inventory table`);
+  assert.ok(pairs.includes("GET /health"), `expected GET /health among ${JSON.stringify(pairs)}`);
+  assert.ok(pairs.includes("GET /sessions") && pairs.includes("DELETE /sessions"),
+    "a 'GET, DELETE' row must expand into one pair per method");
+  assert.ok(pairs.includes("PATCH /api/keys/:id/quota"), "the :id rows must survive verbatim");
+  assert.ok(!pairs.some(p => p.endsWith("/v1/chat/completions") || p.endsWith("/v1/models")),
+    `B.1 rows must not be treated as B.2: ${JSON.stringify(pairs)}`);
+});
+
+test("diffB2KeySets: an ADDED key is reported as + and named", () => {
+  const base = { "GET /health": { status: 200, contentType: "application/json", keys: ["a"] } };
+  const grown = { "GET /health": { status: 200, contentType: "application/json", keys: ["a", "newField"] } };
+  const msg = diffB2KeySets(base, grown);
+  assert.ok(msg, "a grown key set must not compare equal");
+  const lines = msg.split("\n");
+  assert.ok(lines.includes("      + newField"), msg);
+  assert.ok(!lines.some(l => l.startsWith("      - ")), `an addition must not be reported as a removal:\n${msg}`);
+  assert.ok(msg.includes("additive under ADR 0012"),
+    "the failure must tell the author what to cite, not just that something changed");
+});
+
+test("diffB2KeySets: a REMOVED key is reported as - and routed to its own ADR, not to ADR 0012", () => {
+  const base = { "GET /health": { status: 200, contentType: "application/json", keys: ["a", "gone"] } };
+  const shrunk = { "GET /health": { status: 200, contentType: "application/json", keys: ["a"] } };
+  const msg = diffB2KeySets(base, shrunk);
+  assert.ok(msg, "a shrunk key set must not compare equal");
+  const lines = msg.split("\n");
+  assert.ok(lines.includes("      - gone"), msg);
+  assert.ok(!lines.some(l => l.startsWith("      + ")), `a removal must not be reported as an addition:\n${msg}`);
+  assert.ok(msg.includes("OWN ADR"), "a removal fails ADR 0012 condition 1 and the message must say so");
+});
+
+test("diffB2KeySets: status and content-type changes fail even when the key set is identical", () => {
+  const k = ["a"];
+  assert.ok(diffB2KeySets({ p: { status: 200, contentType: "application/json", keys: k } },
+                          { p: { status: 207, contentType: "application/json", keys: k } }));
+  // The /dashboard case: recorded as keys:null so that turning JSON is a FAILURE, not a silent
+  // exclusion that quietly starts covering nothing.
+  assert.ok(diffB2KeySets({ p: { status: 200, contentType: "text/html", keys: null } },
+                          { p: { status: 200, contentType: "application/json", keys: ["a"] } }));
+});
+
+test("diffB2KeySets control: identical records — including key ORDER — compare equal and return null", () => {
+  const a = { p: { status: 200, contentType: "application/json", keys: ["x", "y"] } };
+  const b = { p: { status: 200, contentType: "application/json", keys: ["x", "y"] } };
+  assert.equal(diffB2KeySets(a, b), null);
+});
+
+// The live half. Two boots, not one: the stability assertion is the proof that no volatile VALUE
+// leaked into the key set. A snapshot that flapped would be worse than none — it would train
+// every releaser to regenerate it without reading the diff, which is precisely how a real field
+// addition would then slip through.
+ltTest("integration (#346): every grandfathered B.2 endpoint's response key set matches the checked-in snapshot", async () => {
+  if (!LT_POSIX) return;
+
+  async function collect() {
+    const fx = makeB2Fixture();
+    const { child, buf, port } = await ltBootFresh(fx.env, fx.dir);
+    try {
+      assert.ok(await ltWait(() => buf.out.includes("listening on"), 45000),
+        `the B.2 key-set probe could not boot server.mjs — ${ltDiag(buf)}`);
+      return await probeB2KeySets(port);
+    } finally {
+      child.kill("SIGKILL");
+      await ltWait(() => buf.closed, 5000);
+      fx.cleanup();
+    }
+  }
+
+  const first = await collect();
+  const second = await collect();
+
+  // 1. Stability. Any difference between two fresh boots means a value reached the key set.
+  //    Reported per-probe rather than as one deepStrictEqual, because assert's own diff on two
+  //    71-key records says which BYTES differ and not which endpoint is unstable — and the whole
+  //    point of failing here is to send the reader to the right response.
+  const allProbes = [...new Set([...Object.keys(first), ...Object.keys(second)])].sort();
+  const unstable = allProbes.filter(k => JSON.stringify(first[k]) !== JSON.stringify(second[k]));
+  assert.deepStrictEqual(unstable, [],
+    "two fresh boots produced DIFFERENT key sets — a VALUE has leaked into the key set, or a " +
+    "probe is order-dependent. A snapshot that flaps is worse than none: it trains every releaser " +
+    "to regenerate without reading the diff, which is exactly how a real field addition would " +
+    "then slip through.\n" +
+    unstable.map(k =>
+      `  ${k}\n    boot1: ${JSON.stringify(first[k]).slice(0, 400)}\n    boot2: ${JSON.stringify(second[k]).slice(0, 400)}`,
+    ).join("\n"));
+
+  // 2. Coverage. The constitution decides what the B.2 inventory IS, so the probe plan is checked
+  //    against ALIGNMENT.md rather than against a hand-kept list that can fall behind silently.
+  const inventory = parseB2Inventory(_ltRead(ALIGNMENT_PATH, "utf8"));
+  assert.ok(inventory.length >= 12,
+    `anchor drift: only ${inventory.length} B.2 pairs parsed from ALIGNMENT.md — the coverage ` +
+    `check below would pass vacuously, so it is refused instead`);
+  const probed = Object.keys(first);
+  const unprobed = inventory.filter(p => !probed.includes(p));
+  assert.deepStrictEqual(unprobed, [],
+    `ALIGNMENT.md lists Class B.2 endpoint+method pairs that this snapshot never probes: ` +
+    `${JSON.stringify(unprobed)}. Add them to B2_PROBE_PLAN in scripts/b2-key-snapshot.mjs — ` +
+    `an unprobed endpoint is surface this mechanism reports nothing about.`);
+  const notInInventory = probed.filter(p => !inventory.includes(p));
+  assert.deepStrictEqual(notInInventory, [],
+    `the probe plan probes pairs that are not Class B.2 rows in ALIGNMENT.md: ${JSON.stringify(notInInventory)}`);
+
+  // 3. The snapshot itself. `drift` is the actionable message; it names every added and removed
+  //    key path and tells the author which authorization each kind needs.
+  const drift = diffB2KeySets(readB2Snapshot().probes, first);
+  assert.equal(drift, null, drift || "");
+});
+
 // Deterministic close for the ltTest serialization claim: a fact about how many server.mjs
 // children were EVER alive at once during this block, not a race against wall-clock luck (see
 // the comment on _ltPeakBoots above ltBoot's definition). Registered last in the ltTest chain —

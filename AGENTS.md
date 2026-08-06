@@ -34,6 +34,7 @@ Runtime: Node.js (ESM, `.mjs` throughout). No build step. No bundler. `server.mj
 - `setup.mjs` — first-time installer; reads `models.json` to derive bootstrap config.
 - `scripts/sync-openclaw.mjs` — idempotent OpenClaw registry sync invoked by `ocp update`. See ADR 0004.
 - `ocp` — user-facing CLI (install, update, start, stop, status, logs, etc.).
+- `scripts/b2-key-snapshot.mjs` + `docs/governance/b2-response-keys.json` — the per-release record of every grandfathered Class B.2 endpoint's **response key set**, read from the wire. `npm test` boots a real `server.mjs`, probes every B.2 endpoint+method pair in `ALIGNMENT.md`'s inventory, and fails on any key-path difference from the snapshot. **If you add a field to a B.2 response, the suite goes red until you regenerate the snapshot (`node scripts/b2-key-snapshot.mjs --write`) — and regenerating is not authorization: ADR 0012 condition 5 still requires the field names in the PR body and the CHANGELOG.** A removed or renamed key is not covered by ADR 0012 at all and needs its own ADR. Introduced by #346 to replace a CHANGELOG grep that could only ever see additions whose author wrote the marker. The snapshot's own `notCovered` block states what it cannot see; read it before treating a green run as coverage.
 - `ALIGNMENT.md` — the constitution. Binding for any `server.mjs` change. See ADR 0002.
 - `.github/workflows/alignment.yml` — CI blacklist grep; fails the build on known-hallucinated tokens.
 - `CLAUDE.md` — Claude-Code-specific session instructions + release_kit overlay (Iron Rule 5.5).
