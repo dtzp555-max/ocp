@@ -1149,7 +1149,23 @@ let authStatus = {
   ok: null,                  // last CONCLUSIVE verdict: true | false | null (never established)
   lastCheck: 0,              // when the last probe COMPLETED, any outcome
   message: "",               // human-readable detail of the last probe
-  lastOutcome: "none",       // "none" | "authenticated" | "rejected" | "timeout" | "unavailable"
+  // Domain: "none" | "authenticated" | "token-present" | "rejected" | "timeout" | "unavailable".
+  //
+  // NOT the authority, and the tiebreak is scoped rather than absolute: ADR 0014 § B's table
+  // governs the five PROBE OUTCOMES, and if this line disagrees with it about one of those, the
+  // ADR wins and this line is the bug. "none" is deliberately outside that table — it is the
+  // pre-probe initial value on the next line, not an outcome any probe produces. An earlier
+  // revision of this comment gave an unscoped "the ADR wins", which read literally would have
+  // deleted the very value it annotates. README § "What `auth.ok` means" covers the same domain
+  // for operators but is NOT the same table — it is keyed on okSource, carries a `none` row, and
+  // omits timeout/unavailable, because those change lastOutcome without touching the verdict.
+  // Calling the two "the same" would re-conflate okSource with lastOutcome, which is the exact
+  // confusion lib/spawn-auth.mjs:199 exists to warn about.
+  //
+  // This is a reading aid and it has already drifted once: it omitted "token-present" from the day
+  // ADR 0014 shipped it until #345, so the only enumeration in CODE contradicted the docs. The
+  // values are written by checkAuth's branches below; that is where to look for what sets what.
+  lastOutcome: "none",
   consecutiveFailures: 0,    // consecutive CONCLUSIVE rejections only
   // #324, additive under ADR 0012. Consecutive INCONCLUSIVE probes (timeout / unavailable) since
   // the last conclusive one. Reset to 0 by BOTH conclusive outcomes, so it means "nothing has
