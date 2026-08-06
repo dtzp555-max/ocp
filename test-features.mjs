@@ -3693,7 +3693,7 @@ ltTest("integration: ltTest serialization keeps peak concurrent server.mjs child
 });
 
 // ── Upgrade Tests ──
-import { runUpgrade, postFlightOk, runPostFlightCheck, parseFlagValue, classifyPostFlightProbeFailure, postFlightFailureSuffix, probeLaunchdDomains } from "./scripts/upgrade.mjs";
+import { runUpgrade, postFlightOk, runPostFlightCheck, parseFlagValue, classifyPostFlightProbeFailure, postFlightFailureSuffix, probeLaunchdDomains, execRestartRetry, RESTART_ATTEMPTS, recoveryPlanCommands, postFlightOnlyCommand } from "./scripts/upgrade.mjs";
 
 console.log("\nUpgrade:");
 
@@ -4389,6 +4389,418 @@ test("#257: --dry-run with an invalid --target still throws (dry-run skips MUTAT
                     current_version: "v3.10.0", latest_version: "v3.14.0" },
     });
   }, /not newer than the current version/);
+});
+
+// ── #347: `ocp update`'s restart phase must retry, restore, and say the service is DOWN ──────
+//
+// The other half of #325. #325 gave `_restart_exec_retry` to bash's `cmd_restart` (ocp:173/1026);
+// `ocp update` never reaches that function — it goes through scripts/upgrade.mjs's runFullUpgrade,
+// whose restart phase was `for (const c of restartPlan.plan.cmds) exec(c.cmd, c.label)`, one shot,
+// with `exec` THROWING on failure. On production during the v3.29.0 rollout: `launchctl bootout`
+// succeeded, `launchctl bootstrap` returned EIO, the throw skipped the post-flight probe entirely,
+// and a healthy proxy stayed stopped for 2–3 minutes. The identical bootstrap succeeded by hand on
+// the first attempt.
+//
+// WHY THESE TESTS CANNOT TOUCH A REAL SERVICE — the AGENTS.md § "unreachable by construction"
+// requirement, discharged rather than asserted:
+//   - `opts.execFn` is a plain JavaScript function. No `launchctl`/`systemctl` string is ever
+//     handed to a shell, a child process, or an exec* call. This is not "a stub intercepts the
+//     command"; there is no shell anywhere in the call path to intercept.
+//   - `mockExec: true` in every test below keeps the two commands that do NOT flow through
+//     `execFn` (phase 2's `git rev-parse`, phase 3's argv-form `git checkout`) skipped, and keeps
+//     `writeSnapshot` from writing.
+//   - `opts.mockProbe` replaces the post-flight curl the same way, so no network probe runs.
+//   - Snapshot GC is now skipped under mockExec too (see scripts/upgrade.mjs's own note) — that
+//     was the last step on the success path that mutated real state.
+//
+// HARNESS PREMISE, asserted rather than assumed (the "assert the slice is non-empty" rule): the
+// incident's shape needs a plan with a SEPARATE tear-down and set-up command, so every test that
+// depends on that shape asserts the resolved plan really is the two-command launchd pair. With a
+// one-command plan the "tear-down succeeded, set-up failed" premise would be vacuous and these
+// tests would measure nothing.
+console.log("\n#347 — `ocp update`'s restart phase (retry / restore / say it is DOWN):");
+
+// A command runner for opts.execFn. `plan` maps a command substring to how many LEADING
+// invocations must throw; Infinity means "always throw". The thrown error carries `.stderr` and
+// `.status` so it is shaped like a real execSync rejection, which is what the code under test
+// reads for its detail string.
+function _u347Runner(plan = {}) {
+  const calls = [];
+  const seen = new Map();
+  const run = (cmd) => {
+    calls.push(cmd);
+    for (const [needle, failures] of Object.entries(plan)) {
+      if (!cmd.includes(needle)) continue;
+      const n = (seen.get(needle) ?? 0) + 1;
+      seen.set(needle, n);
+      if (n <= failures) {
+        throw Object.assign(new Error(`Bootstrap failed: 5: Input/output error`), {
+          status: 5, stderr: Buffer.from("Bootstrap failed: 5: Input/output error"),
+        });
+      }
+    }
+    return "";
+  };
+  run.calls = calls;
+  run.count = (needle) => calls.filter(c => c.includes(needle)).length;
+  return run;
+}
+
+// Shared opts. Backoff and settle delays are zeroed so the suite does not actually sleep 3s per
+// retry; the retry COUNT, not the wall time, is what is under test.
+function _u347Opts(extra = {}) {
+  return {
+    yes: true, dryRun: false, mockExec: true, mockPlatform: "darwin",
+    restartBackoffMs: 0, restartRestoreDelayMs: 0,
+    postFlightAttempts: 1, postFlightIntervalMs: 0,
+    mockDoctor: { ready_to_upgrade: true, next_action: { kind: "upgrade" },
+                  current_version: "v3.10.0", latest_version: "v3.14.0" },
+    ...extra,
+  };
+}
+const _u347Healthy = () => ({ status: "ok", auth: { ok: true }, version: "3.14.0" });
+const _u347Unreachable = () => {
+  // No literal port number: `alignment.yml`'s SPOT check exempts this file, but a fixture that
+  // only passes because of an exemption is one refactor away from failing CI for no reason.
+  throw Object.assign(new Error("curl: (7) Failed to connect to 127.0.0.1"), { status: 7 });
+};
+
+test("#347 (the money test): a restart command that fails TWICE then succeeds is retried, and the upgrade succeeds with no manual intervention", async () => {
+  const run = _u347Runner({ "launchctl bootstrap": 2 });
+  const result = await runUpgrade(_u347Opts({ execFn: run, mockProbe: _u347Healthy }));
+
+  // Premise: the plan really is tear-down + set-up, so "the bootout already ran" is a real state.
+  assert.equal(run.count("launchctl bootout"), 1,
+    `harness premise: the darwin plan must emit exactly one bootout; got calls=${JSON.stringify(run.calls)}`);
+
+  assert.equal(run.count("launchctl bootstrap"), 3,
+    `expected 3 attempts (two transient failures, then success) — 1 means the retry is gone, which ` +
+    `is the mutation this test exists to catch; got calls=${JSON.stringify(run.calls)}`);
+  const restartPhases = result.phases.filter(p => p.name === "restart");
+  assert.ok(restartPhases.length >= 2 && restartPhases.every(p => p.status === "ok"),
+    `every restart command must end ok; got ${JSON.stringify(restartPhases)}`);
+  assert.equal(result.phases.find(p => p.name === "post-flight").status, "ok");
+  assert.ok(!result.phases.some(p => p.name === "restart-restore"),
+    "a transient failure that recovered inside the retry budget needs no restoration pass");
+  assert.equal(result.path, "upgrade");
+});
+
+test("#347: a restart command that fails ALWAYS reports the SERVICE as down (not the working tree), and the restoration attempt is visible", async () => {
+  const run = _u347Runner({ "launchctl bootstrap": Infinity });
+  let caught = null;
+  try { await runUpgrade(_u347Opts({ execFn: run, mockProbe: _u347Unreachable })); }
+  catch (e) { caught = e; }
+
+  assert.ok(caught, "an unrecoverable restart with a dead /health must not return success");
+
+  // 1. Retried to the budget, then 2. restoration attempted — 3 + 1 invocations.
+  assert.equal(run.count("launchctl bootstrap"), 4,
+    `expected 3 retry attempts + 1 restoration attempt; got calls=${JSON.stringify(run.calls)}`);
+  const restore = caught.phases.filter(p => p.name === "restart-restore");
+  assert.ok(restore.length >= 1 && restore.some(p => p.cmd.includes("launchctl bootstrap")),
+    `the restoration attempt must be recorded as its own phase so the operator can see it happened; ` +
+    `got phases=${JSON.stringify(caught.phases.map(p => `${p.name}:${p.status}`))}`);
+
+  // 3. The headline is SERVICE state. The pre-#347 hint led with "Working tree may be at new
+  // version. Run `ocp update --rollback`" and never said the proxy was not running — the only
+  // fact that mattered during the incident.
+  assert.ok(caught.hint.startsWith("THE PROXY IS DOWN"),
+    `the hint must LEAD with service state, not tree state; got hint=${JSON.stringify(caught.hint)}`);
+  assert.ok(caught.hint.includes("launchctl bootstrap"),
+    `and must name the command that brings it back; got hint=${JSON.stringify(caught.hint)}`);
+});
+
+test("#347 F2: the restoration pass re-runs the WHOLE plan, not just the command that failed", async () => {
+  // Review finding F2. The restore used `.slice(restartFailure.index)`, so on macOS it re-ran
+  // `bootstrap` ALONE while the hint told the operator to run `bootout && bootstrap` — the restore
+  // was weaker than the recovery it prescribes, and weaker than what actually ended the incident.
+  // This asserts the restore phase carries BOTH commands, in plan order.
+  const run = _u347Runner({ "launchctl bootstrap": Infinity });
+  let caught = null;
+  try { await runUpgrade(_u347Opts({ execFn: run, mockProbe: _u347Unreachable })); }
+  catch (e) { caught = e; }
+  assert.ok(caught);
+
+  const restore = caught.phases.filter(p => p.name === "restart-restore").map(p => p.cmd);
+  assert.equal(restore.length, 2,
+    `the restore must re-run the full tear-down + set-up pair, not just the failed command; got ${JSON.stringify(restore)}`);
+  assert.ok(restore[0].includes("launchctl bootout") && restore[1].includes("launchctl bootstrap"),
+    `and in plan order (bootout then bootstrap); got ${JSON.stringify(restore)}`);
+
+  // The tear-down therefore runs twice overall: once in the restart phase, once in the restore.
+  //
+  // WHAT THIS NEXT ASSERTION PINS, precisely — it is weaker than it looks, and an independent
+  // review established the boundary both ways rather than by argument (#347 review):
+  //   - Rewriting restart-unit.mjs:865 to `[ -d / ] || true; launchctl bootout … 2>/dev/null`
+  //     keeps both substrings this test reads while the bootout's exit status once again
+  //     propagates. Full suite stayed GREEN with the premise false.
+  //   - Deleting `|| true` outright turns this test RED, and only this test.
+  // So it is not vacuous, and it is the only guard against that drift — but it pins the TOKEN'S
+  // PRESENCE, not that the token still guards the bootout. A semantics-deep pin would need this
+  // repo's fake-binary idiom (an `sh -c` command plus a scratch-PATH `launchctl` stub asserting
+  // exit 0), because `_u347Runner` is a plain JS function with no shell anywhere in the path.
+  // Deliberately not built here: see the corrected `.slice(0)` comment in scripts/upgrade.mjs —
+  // the safety argument no longer rests on `|| true` at all, so a deeper pin would be guarding a
+  // premise nothing depends on.
+  assert.equal(run.count("launchctl bootout"), 2,
+    `expected the tear-down to run in both passes; got calls=${JSON.stringify(run.calls)}`);
+  assert.ok(run.calls.filter(c => c.includes("launchctl bootout")).every(c => c.includes("|| true")),
+    `harness premise: re-running the tear-down is only safe because it cannot exit non-zero; ` +
+    `got ${JSON.stringify(run.calls.filter(c => c.includes("bootout")))}`);
+});
+
+test("#347 F1: commands OK but the probe could not RUN must never headline `ocp update --rollback`", async () => {
+  // Review finding F1. `ocp` has this cell (ocp:1063-1067); this path did not, so it fell through
+  // to the generic post-flight failure and the CLI headline became "Working tree may be at new
+  // version. Run `ocp update --rollback`" — telling a host whose CURL is broken to roll back an
+  // upgrade that may well have succeeded.
+  const run = _u347Runner({});           // every restart command succeeds
+  let caught = null;
+  try {
+    await runUpgrade(_u347Opts({
+      execFn: run,
+      mockProbe: () => { throw Object.assign(new Error("sh: curl: command not found"), { status: 127 }); },
+    }));
+  } catch (e) { caught = e; }
+
+  assert.ok(caught, "an unverifiable post-flight is still not a success");
+  assert.equal(run.count("launchctl bootstrap"), 1, "premise: the restart itself was clean, one attempt");
+  assert.ok(!/^Working tree may be at new version/.test(caught.hint),
+    `a local probe fault must not headline rollback advice; got hint=${JSON.stringify(caught.hint)}`);
+  assert.ok(caught.hint.startsWith("THE UPGRADE MAY HAVE SUCCEEDED"),
+    `it must lead with what is actually known; got hint=${JSON.stringify(caught.hint)}`);
+  assert.ok(/do NOT roll back/i.test(caught.hint) && /local environment fault/.test(caught.hint),
+    `and must say why rolling back is wrong here; got hint=${JSON.stringify(caught.hint)}`);
+});
+
+test("#347 F1 control: a probe that genuinely RAN and said no keeps the original tree-state hint", async () => {
+  // Proves F1's new arm is scoped to the could-not-RUN classification and did not rewrite the
+  // hint for every post-flight failure. Here curl runs fine and reports a connection refusal —
+  // a real statement about the service, for which rollback advice is correct.
+  const run = _u347Runner({});
+  let caught = null;
+  try { await runUpgrade(_u347Opts({ execFn: run, mockProbe: _u347Unreachable })); }
+  catch (e) { caught = e; }
+
+  assert.ok(caught);
+  assert.match(caught.message, /post-flight failed/);
+  assert.ok(/^Working tree may be at new version/.test(caught.hint),
+    `a genuine remote failure keeps the pre-#347 hint; got hint=${JSON.stringify(caught.hint)}`);
+});
+
+test("#347 F5: on systemd the recovery hint leads with `reset-failed`, because this PR's own retries can trip the start limit", async () => {
+  // Review finding F5. This PR turns one restart into up to four in ~5s (t=0,1,3 + restore at
+  // t=5). install-autostart.mjs writes Restart=always/RestartSec=5 and no StartLimit override, so
+  // systemd's default 5-starts-per-10s applies and its OWN auto-restarts stack with ours. If the
+  // limit trips the unit latches `failed` and a plain `systemctl restart` keeps failing — which
+  // would make the hint's own re-run command fail, a worse end state than the bug being fixed.
+  const run = _u347Runner({ "systemctl": Infinity });
+  let caught = null;
+  try {
+    // No mockOwnerProbe: that option takes a RAW probe (ss/cgroup output) for resolveOwningUnit to
+    // classify, not an already-classified result — passing a result-shaped object silently
+    // resolves to "unknown" and planRestart refuses before emitting any command. Caught by this
+    // test's own premise assertion. `mockExec` with no `run` already resolves to the expected
+    // user unit on linux (scripts/upgrade.mjs's documented third path).
+    await runUpgrade(_u347Opts({ mockPlatform: "linux", execFn: run, mockProbe: _u347Unreachable }));
+  } catch (e) { caught = e; }
+
+  assert.ok(caught);
+  assert.equal(run.count("systemctl --user restart -- ocp-proxy.service"), 4,
+    `premise: 3 retries + 1 restoration is what creates the exposure; got calls=${JSON.stringify(run.calls)}`);
+  assert.ok(caught.hint.includes("systemctl --user reset-failed -- ocp-proxy.service"),
+    `the hint must unwedge a tripped start limit, inheriting the plan's own --user scope and unit; ` +
+    `got hint=${JSON.stringify(caught.hint)}`);
+  const resetAt = caught.hint.indexOf("reset-failed");
+  const restartAt = caught.hint.indexOf("systemctl --user restart");
+  assert.ok(resetAt > -1 && restartAt > resetAt,
+    `reset-failed must come BEFORE the restart or it does not help; got hint=${JSON.stringify(caught.hint)}`);
+});
+
+test("#347 G1: the re-check hint names an invocation that ACCEPTS --post-flight-only, not `ocp update`", async () => {
+  // Review finding G1. `--post-flight-only` exists only on `node scripts/upgrade.mjs`
+  // (invoked exactly that way at ocp:1629 and ocp:1684). The bash `cmd_update` matches `--check`
+  // and `--rollback` and nothing else, so `ocp update --post-flight-only vX` silently ignores the
+  // flag and runs a FULL UPDATE DISPATCH — on a host already in an unknown state. Both the F1 arm
+  // and postFlightFailureSuffix said the wrong one.
+  const cmd = postFlightOnlyCommand("v3.14.0");
+  assert.ok(!/\bocp update\b/.test(cmd),
+    `must not tell the operator to run a full update dispatch; got ${JSON.stringify(cmd)}`);
+  assert.match(cmd, /^node .*scripts\/upgrade\.mjs --post-flight-only v3\.14\.0$/,
+    `must name the invocation ocp:1629 itself uses; got ${JSON.stringify(cmd)}`);
+  // Never a guessed ~/ocp: issue #348 is about installs outside $HOME/ocp, where that path is a
+  // file that does not exist. The path is this module's own resolved location.
+  assert.ok(cmd.includes(_ltF2P(new URL("./scripts/upgrade.mjs", import.meta.url))),
+    `the path must be this installation's real one, not a guess; got ${JSON.stringify(cmd)}`);
+
+  // And it must reach the operator through the arm that actually fires.
+  const run = _u347Runner({});
+  let caught = null;
+  try {
+    await runUpgrade(_u347Opts({
+      execFn: run,
+      mockProbe: () => { throw Object.assign(new Error("sh: curl: command not found"), { status: 127 }); },
+    }));
+  } catch (e) { caught = e; }
+  assert.ok(caught);
+  assert.ok(!/ocp update --post-flight-only/.test(caught.hint),
+    `the F1 recovery hint must not carry the flag that ocp update ignores; got hint=${JSON.stringify(caught.hint)}`);
+  assert.ok(caught.hint.includes("scripts/upgrade.mjs --post-flight-only"),
+    `it must carry the invocation that works; got hint=${JSON.stringify(caught.hint)}`);
+});
+
+test("#347 G2: the reset-failed step cannot suppress the restart behind it in the ` && ` chain", async () => {
+  // Review finding G2. The hint joins with " && ", so a reset-failed that exits non-zero (no such
+  // unit in this scope, no running user manager / missing XDG_RUNTIME_DIR) would short-circuit the
+  // restart — F5's own failure mode one command earlier: the un-wedge step preventing the recovery.
+  const run = _u347Runner({ "systemctl": Infinity });
+  let caught = null;
+  try { await runUpgrade(_u347Opts({ mockPlatform: "linux", execFn: run, mockProbe: _u347Unreachable })); }
+  catch (e) { caught = e; }
+  assert.ok(caught);
+
+  // Slice from the recovery command list to the sentence that follows it. NOT `[^.]*` — unit
+  // names contain dots (`ocp-proxy.service`), so that truncates mid-command and the assertions
+  // below would read a fragment.
+  //
+  // Assert both ANCHORS were found, by index, before slicing at all. A first version of this
+  // checked the resulting slice instead (`length > 40 && includes("restart")`) and a control
+  // mutation proved that insufficient: a missing end marker makes `indexOf` return -1, and
+  // `slice(start, -1)` silently yields a LONGER slice running to one-before-end — 185 chars
+  // instead of 109 — which passes every "looks healthy" check. That is AGENTS.md's anchor-drift
+  // trap with the sign flipped: the documented form silently yields `''`, this one silently
+  // yields more, which is harder to notice because the slice looks richer rather than emptier.
+  const chainStart = caught.hint.indexOf("systemctl --user reset-failed");
+  const chainEnd = caught.hint.indexOf("Then, and only then");
+  assert.ok(chainStart > -1 && chainEnd > chainStart,
+    `harness premise: both slice anchors must be found and ordered — a missing one makes the ` +
+    `slice longer, not empty; start=${chainStart} end=${chainEnd} hint=${JSON.stringify(caught.hint)}`);
+  const chain = caught.hint.slice(chainStart, chainEnd);
+  assert.ok(/reset-failed -- ocp-proxy\.service \|\| true/.test(chain),
+    `reset-failed must be best-effort; got ${JSON.stringify(chain)}`);
+  // `A || true && B` parses as `(A || true) && B`, so B always runs. Assert the ordering that
+  // makes that true, not merely that both tokens appear somewhere.
+  assert.ok(chain.indexOf("|| true") < chain.indexOf("systemctl --user restart"),
+    `the guard must sit between reset-failed and the restart; got ${JSON.stringify(chain)}`);
+  // The launchd pair must NOT get the same treatment — there `&&` is genuinely sequential, and
+  // `bootstrap` should not run if `bootout` really failed. Covered by the F5 launchd control test,
+  // which asserts macOS hints carry no reset-failed at all.
+});
+
+test("#347 F5 control: launchd hints carry NO reset-failed (launchctl has no start limit)", async () => {
+  const run = _u347Runner({ "launchctl bootstrap": Infinity });
+  let caught = null;
+  try { await runUpgrade(_u347Opts({ execFn: run, mockProbe: _u347Unreachable })); }
+  catch (e) { caught = e; }
+  assert.ok(caught);
+  assert.ok(!/reset-failed/.test(caught.hint),
+    `the systemd-only remedy must not leak onto macOS hints; got hint=${JSON.stringify(caught.hint)}`);
+  assert.ok(caught.hint.includes("launchctl bootstrap"),
+    `but the launchd recovery command must still be there; got hint=${JSON.stringify(caught.hint)}`);
+});
+
+test("#347 F5: recoveryPlanCommands inherits sudo / --user / unit from the plan rather than re-deriving them", async () => {
+  const mk = (action, cmds) => ({ plan: { action, cmds: cmds.map(c => ({ cmd: c, label: "restart" })) } });
+  assert.deepEqual(
+    recoveryPlanCommands(mk("system-unit", ["sudo systemctl restart -- ocp.service"])),
+    ["sudo systemctl reset-failed -- ocp.service || true", "sudo systemctl restart -- ocp.service"],
+    "a sudo plan must produce a sudo reset-failed — re-deriving the prefix is how the two drift apart");
+  assert.deepEqual(
+    recoveryPlanCommands(mk("system-unit", ["systemctl restart -- ocp.service"])),
+    ["systemctl reset-failed -- ocp.service || true", "systemctl restart -- ocp.service"],
+    "and a root plan must NOT gain a sudo it never had");
+  assert.deepEqual(
+    recoveryPlanCommands(mk("launchd", ["launchctl bootout x 2>/dev/null || true", "launchctl bootstrap y"])),
+    ["launchctl bootout x 2>/dev/null || true", "launchctl bootstrap y"],
+    "launchd plans pass through untouched");
+});
+
+test("#347: the retry is scoped to restart commands — a failing `npm install` still fails FAST, on the first attempt", async () => {
+  // Fails exactly ONCE, then would succeed. If the retry had been applied to `exec` generally
+  // instead of to the restart commands, this upgrade would silently SUCCEED on attempt 2 — so the
+  // test distinguishes "not retried" from "retried and still failed", which a fail-always fixture
+  // could not.
+  const run = _u347Runner({ "npm --prefix": 1 });
+  let caught = null;
+  try { await runUpgrade(_u347Opts({ execFn: run, mockProbe: _u347Healthy })); }
+  catch (e) { caught = e; }
+
+  assert.ok(caught, "a failing npm install must abort the upgrade, not be retried into success");
+  assert.equal(run.count("npm --prefix"), 1,
+    `npm install must be attempted exactly once; got calls=${JSON.stringify(run.calls)}`);
+  assert.match(caught.message, /phase fetch\+install failed/);
+  assert.equal(run.count("launchctl"), 0,
+    "and a failed install must never reach the restart phase at all");
+  assert.ok(/^Working tree may be at new version/.test(caught.hint),
+    `a non-restart failure keeps the ORIGINAL tree-state hint — proves #347 did not simply rewrite ` +
+    `the hint for everyone; got hint=${JSON.stringify(caught.hint)}`);
+});
+
+test("#347 (precedence): a LOCAL probe fault must stay UNKNOWN and must never be reported as the proxy being DOWN", async () => {
+  // The dangerous interaction, inherited from #299/#325: the DOWN branch keys on "probe not ok",
+  // and a machine that cannot RUN curl also produces "probe not ok". Ordering decides whether a
+  // broken local curl is told its proxy is dead — a state nobody measured.
+  const run = _u347Runner({ "launchctl bootstrap": Infinity });
+  let caught = null;
+  try {
+    await runUpgrade(_u347Opts({
+      execFn: run,
+      mockProbe: () => { throw Object.assign(new Error("sh: curl: command not found"), { status: 127 }); },
+    }));
+  } catch (e) { caught = e; }
+
+  assert.ok(caught);
+  assert.ok(!/THE PROXY IS DOWN/.test(caught.hint),
+    `a local fault is not evidence about the proxy; got hint=${JSON.stringify(caught.hint)}`);
+  assert.ok(/UNKNOWN/.test(caught.hint), `it must still say UNKNOWN; got hint=${JSON.stringify(caught.hint)}`);
+  assert.ok(/may be DOWN/.test(caught.hint) && /launchctl bootstrap/.test(caught.hint),
+    `and must still offer the start command, because the stop half already ran; got hint=${JSON.stringify(caught.hint)}`);
+});
+
+test("#347: a restart command that failed but a proxy that IS serving the target is a WARNED success, not a failure", async () => {
+  // Mirrors ocp:1092's cell. The verdict belongs to the probe, not to a subcommand's exit status:
+  // a failed command does not prove the service is down (the service manager may have started it
+  // anyway). Reporting this as a failure is what #299/#255 already fixed on the bash side.
+  const run = _u347Runner({ "launchctl bootstrap": Infinity });
+  const result = await runUpgrade(_u347Opts({ execFn: run, mockProbe: _u347Healthy }));
+
+  assert.equal(result.path, "upgrade", "post-flight confirms the target is serving, so the upgrade landed");
+  const warn = result.phases.find(p => p.name === "restart" && p.status === "warn");
+  assert.ok(warn, `it must not be a silent success either; got phases=${JSON.stringify(result.phases.map(p => `${p.name}:${p.status}`))}`);
+  assert.match(warn.note, /ocp doctor/);
+});
+
+test("#347 control: the pre-existing all-mock lane is untouched — no execFn, no probe, everything still skipped-mock", async () => {
+  // Proves the seam is opt-in. Without opts.execFn / opts.mockProbe nothing executes and nothing
+  // probes, exactly as before this change — which is what every other runFullUpgrade test relies on.
+  const result = await runUpgrade(_u347Opts());
+  for (const name of ["restart", "post-flight", "gc"]) {
+    const ph = result.phases.filter(p => p.name === name);
+    assert.ok(ph.length > 0 && ph.every(p => p.status === "skipped-mock"),
+      `phase ${name} must stay skipped-mock in the all-mock lane; got ${JSON.stringify(ph)}`);
+  }
+});
+
+test("#347: execRestartRetry stops at the FIRST success and does not keep going (bounded, not fixed-count)", async () => {
+  let n = 0;
+  const r = await execRestartRetry("some command", {
+    attempts: 3, backoffMs: 0, log: () => {},
+    run: () => { n++; if (n < 2) throw new Error("transient"); },
+  });
+  assert.deepEqual({ ok: r.ok, attempts: r.attempts }, { ok: true, attempts: 2 });
+  assert.equal(n, 2, "must not retry past success");
+});
+
+test("#347: execRestartRetry honours RESTART_ATTEMPTS — the same budget ocp:1026 passes _restart_exec_retry", async () => {
+  let n = 0;
+  const r = await execRestartRetry("some command", {
+    backoffMs: 0, log: () => {},
+    run: () => { n++; throw new Error("always"); },
+  });
+  assert.equal(RESTART_ATTEMPTS, 3, "the two ocp update paths must not disagree about how hard they try");
+  assert.equal(n, RESTART_ATTEMPTS);
+  assert.equal(r.ok, false);
+  assert.match(r.detail, /always/);
 });
 
 // ── Reconfigure-only service mode (#226) ──────────────────────────────────

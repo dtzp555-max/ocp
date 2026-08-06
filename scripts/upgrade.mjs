@@ -32,6 +32,10 @@ function execRun(cmd) {
   return execSync(cmd, { stdio: ["pipe", "pipe", "pipe"] }).toString();
 }
 
+// Issue #347: attempts per restart command. Same number `ocp`'s `_restart_exec_retry` is called
+// with at ocp:1026 — the two `ocp update` paths must not disagree about how hard they try.
+export const RESTART_ATTEMPTS = 3;
+
 // issue #254: the working tree THIS installation (the one this process is actually running from)
 // is rooted in.
 //
@@ -624,6 +628,29 @@ export function classifyPostFlightProbeFailure(e) {
 //
 // The `lastSeen` branch is deliberately byte-identical to the pre-#291 text: when a body WAS read,
 // the old message was already correct and specific, and changing it would be churn.
+// #347 review finding G1. The ONE invocation that actually accepts `--post-flight-only`.
+//
+// Both message sites used to say `ocp update --post-flight-only vX.Y.Z`. That flag does not exist
+// on the bash CLI: `cmd_update` matches `--check` and `--rollback` and nothing else, so the flag is
+// silently ignored and `ocp update …` runs a FULL UPDATE DISPATCH instead — on a host whose state
+// is, by construction at both of these call sites, already unknown. An arm whose entire job is
+// naming the right next action was naming one that does something else.
+//
+// Fixed by naming the invocation rather than teaching `cmd_update` a new flag. That alternative is
+// a real option, but it adds user-facing CLI surface (a new accepted flag, its exit-code
+// pass-through, its interaction with `--target`, a README entry per the release_kit overlay) and
+// belongs in its own reviewable unit; this is a wrong-advice bug in a string, and the string is in
+// this file. The form below is exactly what `ocp` itself already invokes at ocp:1629 and ocp:1684.
+//
+// Path comes from `import.meta.url`, never a hardcoded `~/ocp`: this module always lives at
+// `<ocpDir>/scripts/upgrade.mjs`, and issue #348 is specifically about installs that are not under
+// `$HOME/ocp`, where a guessed path would send the operator to a file that does not exist.
+export function postFlightOnlyCommand(target) {
+  let self;
+  try { self = fileURLToPath(import.meta.url); } catch { self = "scripts/upgrade.mjs"; }
+  return `node ${self} --post-flight-only ${target}`;
+}
+
 export function postFlightFailureSuffix(result) {
   if (result?.lastSeen) {
     return ` (last saw version=${result.lastSeen} — a stale process may still hold the port; check \`ss -ltnp\` / \`lsof -i\`)`;
@@ -635,7 +662,7 @@ export function postFlightFailureSuffix(result) {
       return ` — the post-flight probe could not run on THIS machine (${f.detail}).`
         + ` That is a local environment fault and says nothing about the service:`
         + ` the upgrade may well have succeeded. Fix the local curl, then re-check with`
-        + ` \`ocp update --post-flight-only v${result.target}\`.`;
+        + ` \`${postFlightOnlyCommand(`v${result.target}`)}\`.`;
     case "unparseable":
       return ` — ${f.detail}. Something is answering on the port, but it is not this proxy.`;
     case "http-error":
@@ -645,6 +672,110 @@ export function postFlightFailureSuffix(result) {
     default:
       return ` (unreachable — ${f.detail})`;
   }
+}
+
+// Issue #347. The bounded-retry primitive for ONE resolved restart command, ported from `ocp`'s
+// `_restart_exec_retry` (ocp:173, shipped by #325) so the two `ocp update` paths agree.
+//
+// Why this exists at all, in this file, fifteen minutes after #325: `ocp update` does NOT go
+// through bash's `cmd_restart`. It goes through runFullUpgrade below, whose restart phase was
+// `for (const c of restartPlan.plan.cmds) exec(c.cmd, c.label)` — one shot, and `exec` THROWS on
+// failure. On macOS the resolved plan is `launchctl bootout …` then `launchctl bootstrap …`; on
+// production the bootout succeeded, the bootstrap returned EIO ("5: Input/output error"), the
+// throw skipped the post-flight probe entirely, and a healthy proxy was left stopped for 2–3
+// minutes. The identical bootstrap succeeded by hand on the first attempt, unchanged plist,
+// unchanged domain, unchanged user — the signature of a transient fault racing the bootout that
+// had just completed, which is exactly the shape a short rising backoff absorbs.
+//
+// Deliberately NOT applied to `exec` generally: a failing `git checkout` or `npm install` is not
+// transient and must still fail fast on the first attempt. The retry is scoped to the restart
+// commands, at their one call site, for the same reason #325 scoped it to `cmd_restart`'s loop.
+//
+// Returns a verdict instead of throwing — the caller has to keep going after a failure (to attempt
+// restoration and then MEASURE), and a throw here would reintroduce the defect in a louder form.
+// Same reasoning as `_restart_exec_retry`'s `|| rc=$?` under `set -euo pipefail`.
+export async function execRestartRetry(cmd, {
+  attempts = RESTART_ATTEMPTS,
+  backoffMs = 1000,
+  run,
+  log = (m) => console.error(m),
+  sleep = (ms) => new Promise(r => setTimeout(r, ms)),
+} = {}) {
+  let detail = null;
+  for (let i = 1; i <= attempts; i++) {
+    try {
+      run(cmd);
+      return { ok: true, attempts: i, detail: null };
+    } catch (err) {
+      detail = err?.stderr?.toString().trim() || err?.message || String(err);
+      if (i < attempts) {
+        // The delay is stated from the value actually used, not hard-coded as `${i}s` the way
+        // `_restart_exec_retry` can afford to (its `sleep $i` is literally i seconds). Here the
+        // backoff is a parameter, and a message that says "1s" while sleeping 0 is a small lie in
+        // exactly the place an operator reads to judge how long the command has been trying.
+        const delayMs = i * backoffMs;
+        log(`    attempt ${i}/${attempts} failed (${detail}) — retrying in ${delayMs / 1000}s`);
+        await sleep(delayMs);
+      } else {
+        log(`    attempt ${i}/${attempts} failed (${detail}) — giving up on this command`);
+      }
+    }
+  }
+  return { ok: false, attempts, detail };
+}
+
+// #347 review finding F5. The operator-facing recovery command list: what to run by hand to bring
+// the service back. Every "the proxy may be down, run this" hint goes through here so they cannot
+// drift apart from each other or from the restore pass.
+//
+// Why this is not simply `plan.cmds`: THIS PR is what creates the exposure. Before it, a failed
+// restart ran the resolved command ONCE. Now it can run up to four times in about five seconds
+// (attempts at t=0, t=1, t=3 under the rising backoff, plus the restoration pass at t=5), and on
+// Linux every one of those is a `systemctl … restart`, which systemd counts as a start.
+//
+// The arithmetic, since it decides whether a hint is enough. `scripts/lib/install-autostart.mjs`
+// writes `Restart=always` + `RestartSec=5` and sets NO `StartLimitIntervalSec`/`StartLimitBurst`,
+// so systemd's defaults apply: 5 starts per 10 s. Our own four invocations stay under that on
+// their own. They do not stay under it in the scenario that actually gets here — a unit that
+// starts and immediately exits is why `systemctl restart` is failing in the first place, and
+// `Restart=always` then schedules systemd's OWN restarts into the same 10 s window. Four of ours
+// plus one or two of systemd's reaches or exceeds the burst.
+//
+// So spacing our attempts is NOT a sufficient fix, and that is why this takes the other route the
+// review offered: systemd's contribution is not ours to schedule, and stretching the failure path
+// past 10 s would slow the fleet-rollout command's worst case for a guarantee it still could not
+// give. What matters is the END STATE. When the limit trips the unit latches `failed` with "start
+// request repeated too quickly", and a plain `systemctl restart` KEEPS FAILING until the latch is
+// cleared — which would make the hint's own re-run command fail, a worse outcome than the bug this
+// PR fixes. `reset-failed` clears it, so the recovery command list leads with it.
+//
+// Derived by rewriting the plan's own command rather than re-deriving the unit name, the `--user`
+// scope and the `sudo` prefix: every systemd shape planRestart emits contains ` restart -- `
+// (restart-unit.mjs:993, :1094, :1106, :1113), so this inherits all three exactly. Launchd plans
+// carry no such substring and are additionally excluded by the `action` guard — `launchctl` has no
+// start limit and no equivalent command.
+export function recoveryPlanCommands(restartPlan) {
+  const cmds = (restartPlan?.plan?.cmds || []).map(c => c.cmd);
+  const action = restartPlan?.plan?.action;
+  if (action !== "user-unit" && action !== "system-unit") return cmds;
+  const restartCmd = cmds.find(c => c.includes(" restart -- "));
+  if (!restartCmd) return cmds;
+  // #347 review finding G2: `|| true`, because the caller joins this list with " && ".
+  //
+  // Without it, a `reset-failed` that exits non-zero SUPPRESSES the restart behind it — which is
+  // F5's own failure mode arriving one command earlier: the thing added to un-wedge a stuck unit
+  // would itself prevent the recovery. And it genuinely can exit non-zero (no such unit under this
+  // scope, no running user manager / missing XDG_RUNTIME_DIR — the same conditions runRollback's
+  // MED-E note already documents for `systemctl --user daemon-reload`).
+  //
+  // Deliberately different from the rest of the chain, and that is the point: the launchd pair IS
+  // sequential — `bootstrap` should not run if `bootout` genuinely failed — so " && " stays right
+  // for it. This one command is best-effort housekeeping ahead of the real action. Written as a
+  // suffix on the command rather than as a special separator in the join, so a future edit to the
+  // joining code cannot silently drop it. Precedence is safe: `A || true && B` parses as
+  // `(A || true) && B`, and `(A || true)` always succeeds, so B always runs. Same `|| true` idiom
+  // the repo already uses on the resolved bootout (scripts/lib/restart-unit.mjs:865).
+  return [`${restartCmd.replace(" restart -- ", " reset-failed -- ")} || true`, ...cmds];
 }
 
 export async function runPostFlightCheck(target, opts = {}) {
@@ -922,15 +1053,37 @@ export async function runUpgrade(opts = {}) {
 async function runFullUpgrade({ doctor, opts }) {
   const phases = [];
   let snapshotPath = null;
+  // Issue #347 test seam. `opts.execFn(cmd)` — string in, throws on nonzero exit — replaces the
+  // real `execSync` for every shell-form command this function runs. It exists because the ONE
+  // seam this function had (`opts.mockExec`) makes `exec` a total no-op: under it no command can
+  // FAIL, so the retry/restore behaviour this issue is about was unreachable from a test. It
+  // follows the convention already established for `opts.run` (resolveRestartPlan's gathering) and
+  // `opts.mockProbe` (runRollback's post-flight): plain `mockExec` with no injected function stays
+  // bookkeeping-only and every pre-existing all-mock test is untouched; an explicit injection means
+  // a test wants to drive this specific lane end to end.
+  //
+  // This is also what makes the #347 tests INCAPABLE of touching a real service rather than merely
+  // unlikely to (AGENTS.md § "Constraints must be unreachable by construction"): the injected
+  // runner is a plain JavaScript function, so no `launchctl`/`systemctl` string is ever handed to a
+  // shell — not "the stub happens to intercept it", but no shell in the call path at all. In
+  // production `opts.execFn` is undefined and this is the same `execSync` call as before.
+  //
+  // Name collision, deliberate and deliberately NOT forwarded: `runPostFlightCheck` has its own
+  // `opts.execFn` (the execSync behind the post-flight curl, #291). Same conventional name for the
+  // same kind of seam, but a different lane — this one answers "did the phase command succeed",
+  // that one has to return a parseable /health body. The `runPostFlightCheck` call below passes
+  // `opts.mockProbe` and never `opts.execFn`, because handing a runner that returns "" to the
+  // probe would make every post-flight fail on a JSON parse.
+  const runShell = opts.execFn || ((cmd) => execSync(cmd, { stdio: ["pipe", "pipe", "pipe"] }).toString());
   const exec = (cmd, label) => {
-    if (opts.mockExec) {
+    if (opts.mockExec && !opts.execFn) {
       phases.push({ name: label, cmd, status: "skipped-mock" });
       return "";
     }
     try {
-      const out = execSync(cmd, { stdio: ["pipe", "pipe", "pipe"] }).toString();
+      const out = runShell(cmd);
       phases.push({ name: label, cmd, status: "ok" });
-      return out;
+      return out ?? "";
     } catch (err) {
       const detail = err.stderr?.toString().trim();
       phases.push({ name: label, cmd, status: "fail", stderr: detail });
@@ -1079,47 +1232,242 @@ async function runFullUpgrade({ doctor, opts }) {
       console.error(w);
       phases.push({ name: "restart-resolve", status: "warn", note: w });
     }
-    for (const c of restartPlan.plan.cmds) exec(c.cmd, c.label);
+    // Issue #347. This loop used to be `for (const c of restartPlan.plan.cmds) exec(c.cmd, c.label)`
+    // — and `exec` throws, so the FIRST failing command aborted the function with the tear-down
+    // half of the plan already executed and the post-flight probe below never reached. Three
+    // changes, in the order they matter:
+    //
+    //   1. Each restart command gets `execRestartRetry` (see its own comment above) instead of one
+    //      shot. Only the restart commands: phases 3 and 4 still use plain `exec` and still fail
+    //      fast, because a broken checkout or a broken `npm install` is not a transient fault.
+    //   2. A failure no longer throws. It records the failure and falls through, because the stop
+    //      half of a stop/start pair has already run and the operator's actual question is "is the
+    //      service up?", which a subcommand's exit status cannot answer. Same conclusion #325
+    //      reached for `cmd_restart` (ocp:1029-1037).
+    //   3. Before giving up, the commands from the failure point onward are re-run once, after a
+    //      settle delay, as an explicit `restart-restore` phase. Those are the commands that would
+    //      have brought the service back up; running them is the difference between reporting a
+    //      down service and repairing one. It is bounded (one pass, no recursion) and safe to
+    //      repeat: the plan's commands are the same idempotent bootout/bootstrap or `systemctl
+    //      restart` pair the operator would run by hand, which is precisely what fixed the
+    //      incident.
+    const restartAttempts = opts.restartAttempts ?? RESTART_ATTEMPTS;
+    const restartBackoffMs = opts.restartBackoffMs ?? 1000;
+    const restartCmds = restartPlan.plan.cmds;
+    const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+    let restartFailure = null;
+    let restoreOutcome = null;
 
-    // phase 6: post-flight (10s budget; skipped under mockExec)
-    if (!opts.mockExec) {
-      let ok = false;
-      let lastSeen = null;
-      for (let i = 0; i < 10; i++) {
-        try {
-          const out = execSync(`curl -sf --max-time 2 http://127.0.0.1:${port}/health`).toString();
-          const body = JSON.parse(out);
-          lastSeen = body.version;
-          // Issue #257: verify against upgradeTarget (the validated pin, when given) — checking
-          // against doctor.latest_version unconditionally would report a PINNED upgrade as
-          // "failed" once the service correctly landed on the (older, requested) target, or
-          // wrongly "succeeded" if some other process happened to already be serving latest.
-          if (postFlightOk(body, upgradeTarget)) { ok = true; break; }
-        } catch { /* retry */ }
-        await new Promise(r => setTimeout(r, 1000));
-      }
-      if (!ok) {
+    if (opts.mockExec && !opts.execFn) {
+      for (const c of restartCmds) phases.push({ name: c.label, cmd: c.cmd, status: "skipped-mock" });
+    } else {
+      for (let i = 0; i < restartCmds.length; i++) {
+        const c = restartCmds[i];
+        const r = await execRestartRetry(c.cmd, { attempts: restartAttempts, backoffMs: restartBackoffMs, run: runShell });
         phases.push({
-          name: "post-flight", status: "fail",
-          message: `health did not return status=ok AND version=${upgradeTarget} within 10s`
-            + (lastSeen ? ` (last saw version=${lastSeen} — a stale process may still hold the port; check \`ss -ltnp\` / \`lsof -i\`)` : ""),
+          name: c.label, cmd: c.cmd, status: r.ok ? "ok" : "fail",
+          attempts: r.attempts, ...(r.ok ? {} : { stderr: r.detail }),
         });
-        throw new Error("post-flight failed");
+        if (!r.ok) { restartFailure = { index: i, cmd: c.cmd, detail: r.detail, attempts: r.attempts }; break; }
       }
-      execSync(`curl -sf --max-time 3 http://127.0.0.1:${port}/v1/models > /dev/null`);
-      phases.push({ name: "post-flight", status: "ok" });
+    }
+
+    if (restartFailure) {
+      console.error(`[restart] "${restartFailure.cmd}" failed ${restartFailure.attempts} times: ${restartFailure.detail}`);
+      console.error(`[restart] the tear-down half of this restart has already run — the service may be DOWN right now.`);
+      console.error(`[restart] attempting to bring it back before giving up...`);
+      await sleep(opts.restartRestoreDelayMs ?? 2000);
+      // #347 review finding F2: this used to be `.slice(restartFailure.index)` — the commands
+      // from the failure point onward. On macOS that re-ran `bootstrap` ALONE, while the hint
+      // below told the operator to run `bootout && bootstrap`. The restore was therefore weaker
+      // than the recovery it prescribes, and weaker than what actually ended the real incident,
+      // which was the full pair. Re-run the WHOLE plan so the two agree by construction.
+      //
+      // Why re-running the tear-down is the right trade. CORRECTED after review (#347 finding G3):
+      // an earlier version of this comment justified it by `restart-unit.mjs:865`'s
+      // `2>/dev/null || true`. That argument does not hold. **`|| true` bounds the tear-down's exit
+      // CODE, not its EFFECT.** If a partially-completed bootstrap had left the job loaded, this
+      // `.slice(0)` re-runs `bootout` against a LIVE service — something `.slice(index)` structurally
+      // could not do. The `|| true` would hide the exit status of exactly that.
+      //
+      // The real reason: by the time this line runs, the set-up half has failed `restartAttempts`
+      // times in a row after a tear-down that already succeeded, so the service is almost certainly
+      // already down — there is, in practice, nothing live left to tear down. And in the residual
+      // case where something IS still loaded, `bootout` then `bootstrap` is precisely the restart
+      // the operator would perform by hand; it does not leave the service worse off, it leaves it
+      // restarted. That is a judgement about likely state and bounded downside, not a guarantee,
+      // and it is stated as one so the next reader does not check a premise, find it true, and
+      // conclude a safety property holds that never followed from it.
+      //
+      // `|| true` still matters, for the narrower thing it actually does: it keeps a no-op bootout
+      // against an already-unloaded job from being recorded as a failed restore step.
+      //
+      // Every other plan shape is a single `systemctl … restart --` command, for which
+      // `.slice(0)` and `.slice(index)` are identical.
+      const restoreCmds = restartCmds.slice(0);
+      restoreOutcome = { ok: true, cmds: [] };
+      for (const c of restoreCmds) {
+        const r = await execRestartRetry(c.cmd, { attempts: 1, backoffMs: 0, run: runShell });
+        phases.push({
+          name: "restart-restore", cmd: c.cmd, status: r.ok ? "ok" : "fail",
+          ...(r.ok ? {} : { stderr: r.detail }),
+        });
+        restoreOutcome.cmds.push(c.cmd);
+        if (!r.ok) { restoreOutcome.ok = false; break; }
+      }
+      console.error(restoreOutcome.ok
+        ? `[restart] restoration commands ran without error — the probe below decides whether that worked.`
+        : `[restart] restoration ALSO failed. The probe below reports what is actually serving.`);
+    }
+
+    // phase 6: post-flight. Now runs UNCONDITIONALLY after the restart phase, including after a
+    // failed restart command (#347: the old `throw` from `exec` meant the one measurement that
+    // could have detected the downed service never happened). Delegates to runPostFlightCheck —
+    // the same polling loop and the same postFlightOk() acceptance predicate this function used to
+    // hand-roll — so the failure CLASSIFICATION (`lastFailure`, issue #291) comes along with it.
+    // That classification is load-bearing below, not decoration: a machine that cannot run curl
+    // must never be told its proxy is dead.
+    //
+    // Issue #257's requirement is unchanged and carried through: verify against `upgradeTarget`
+    // (the validated pin when given), not doctor.latest_version.
+    //
+    // Gate matches runRollback's own post-flight (#274): `opts.mockProbe || !opts.mockExec` — a
+    // plain all-mock test still records "skipped-mock" exactly as before.
+    let postFlight = { ok: true, lastSeen: null, target: String(upgradeTarget || "").replace(/^v/, ""), lastFailure: null };
+    let postFlightMeasured = false;
+    if (opts.mockProbe || !opts.mockExec) {
+      postFlightMeasured = true;
+      postFlight = await runPostFlightCheck(upgradeTarget, {
+        mockProbe: opts.mockProbe,
+        attempts: opts.postFlightAttempts,
+        intervalMs: opts.postFlightIntervalMs,
+      });
+      phases.push({
+        name: "post-flight", status: postFlight.ok ? "ok" : "fail",
+        ...(postFlight.ok ? {} : {
+          // Wording matches runRollback's sibling phase verbatim; the budget is a parameter now, so
+          // the old hard-coded "within 10s" would be a claim this function no longer guarantees.
+          message: `health did not return status=ok AND version=${upgradeTarget} within the post-flight budget`
+            + postFlightFailureSuffix(postFlight),
+        }),
+      });
     } else {
       phases.push({ name: "post-flight", status: "skipped-mock" });
     }
 
+    // The four outcome cells, mirroring `ocp`'s cmd_restart (ocp:1051-1127) so the two paths tell
+    // the operator the same story. The ordering is the load-bearing part: the local-fault arm is
+    // checked FIRST, because it is also a non-ok probe, and getting this backwards would tell a
+    // machine with a broken curl that its proxy is dead — asserting a state nobody measured.
+    const probeCouldNotRun = postFlight.lastFailure?.kind === "probe-could-not-run";
+    // F5: single source for "what to run by hand", shared by every hint below.
+    const recoveryCmds = recoveryPlanCommands(restartPlan).join(" && ");
+
+    if (restartFailure && !postFlightMeasured) {
+      // Only reachable from a test that injects execFn but no probe. Never claim success when a
+      // restart command failed and nothing measured the result.
+      throw Object.assign(
+        new Error(`phase restart failed: ${restartFailure.detail} — and post-flight did not run, so the service state is UNKNOWN`),
+        { phases, cmd: restartFailure.cmd, snapshotPath,
+          hint: `THE SERVICE STATE IS UNKNOWN. A restart command failed and nothing probed /health.` }
+      );
+    }
+
+    if (restartFailure && !postFlight.ok && probeCouldNotRun) {
+      throw Object.assign(
+        new Error(`phase restart failed: ${restartFailure.detail} — and this machine could not run the /health probe (${postFlight.lastFailure.detail})`),
+        { phases, cmd: restartFailure.cmd, snapshotPath,
+          hint: `THE SERVICE STATE IS UNKNOWN, and it may be DOWN: the stop half of the restart already ran. `
+            + `This machine could not run curl, so nothing here is evidence about the proxy either way. `
+            + `Check it by hand (\`curl -sf http://127.0.0.1:${port}/health\` from a working shell); if it is down, `
+            + `re-run: ${recoveryCmds}` }
+      );
+    }
+
+    if (restartFailure && !postFlight.ok) {
+      // The incident, named. Service state leads; tree state is demoted to the second sentence,
+      // because "run `ocp update --rollback`" was the ONLY thing the old hint said and version
+      // state was not what mattered at 2am with the port dead.
+      throw Object.assign(
+        new Error(`phase restart failed: ${restartFailure.detail}`),
+        { phases, cmd: restartFailure.cmd, snapshotPath,
+          hint: `THE PROXY IS DOWN. A restart command failed after ${restartFailure.attempts} attempts, `
+            + `${restoreOutcome?.ok ? "the restoration attempt ran but did not bring it back" : "the restoration attempt also failed"}, `
+            + `and /health is not answering on 127.0.0.1:${port}. This command stopped the service and could not start it again — `
+            + `nothing will start it on its own. Bring it back with: ${recoveryCmds}  `
+            + `Then, and only then, consider the working tree: it may be at the new version, and \`ocp update --rollback\` restores from the snapshot.` }
+      );
+    }
+
+    // #347 review finding F1: the `commands OK + probe could not RUN` cell. `ocp` has it
+    // (ocp:1063-1067); this function did not, so it fell through to the generic post-flight
+    // failure below and the CLI headline became "Run `ocp update --rollback`" — telling a host
+    // whose CURL is broken to roll back an upgrade that may well have succeeded. That is the same
+    // defect class #347 was filed for: the headline naming the wrong thing to do. The #291
+    // classification was already correct in the phase message; only the headline contradicted it.
+    //
+    // Ordered after the restart-failure arms deliberately: those describe a service that may be
+    // down, which outranks a broken probe. Reaching here means every restart command exited 0.
+    if (!postFlight.ok && probeCouldNotRun) {
+      throw Object.assign(
+        new Error(`post-flight could not run on this machine (${postFlight.lastFailure.detail})`),
+        { phases, snapshotPath, target: upgradeTarget,
+          hint: `THE UPGRADE MAY HAVE SUCCEEDED — do NOT roll back on this evidence. Every restart command `
+            + `exited 0, and the post-flight probe could not RUN here (${postFlight.lastFailure.detail}). `
+            + `That is a local environment fault and says nothing about the service. Check by hand from a `
+            + `working shell (\`curl -sf http://127.0.0.1:${port}/health\`), or fix the local curl and re-check `
+            + `with \`${postFlightOnlyCommand(upgradeTarget)}\`. Only if the service is genuinely not `
+            + `serving ${upgradeTarget} is \`ocp update --rollback\` the right move.` }
+      );
+    }
+
+    if (!postFlight.ok) {
+      // Restart commands all succeeded and the probe genuinely ran and said no (orphan holding the
+      // port, wrong version serving, ...). Unchanged pre-#347 behaviour, including the generic
+      // tree-state hint from the catch below, which is correct for this cell.
+      throw new Error("post-flight failed");
+    }
+
+    if (restartFailure) {
+      // A restart command failed and the proxy is nonetheless serving the right version. Not a
+      // silent success: reporting a bare "✓" here trains operators to ignore the retry warnings
+      // that are the early signal for the DOWN case above (same reasoning as ocp:1092-1099).
+      phases.push({
+        name: "restart", status: "warn",
+        note: `"${restartFailure.cmd}" failed after ${restartFailure.attempts} attempts`
+          + `${restoreOutcome?.ok ? " and the restoration pass brought the service back" : ""}; `
+          + `post-flight confirms the service is UP and serving ${postFlight.target}. `
+          + `Worth checking \`ocp doctor\` — this usually means the resolver's expected unit and the unit that actually owns the port have drifted apart.`,
+      });
+      console.error(`[restart] WARNING: a restart command failed after retries, but the service is UP and serving ${postFlight.target}. Run \`ocp doctor\`.`);
+    }
+
+    if (postFlightMeasured && !opts.mockProbe) {
+      execSync(`curl -sf --max-time 3 http://127.0.0.1:${port}/v1/models > /dev/null`);
+    }
+
     // Auto-GC old snapshots after successful upgrade (best-effort, never throws).
-    try {
-      const gc = gcSnapshots(homedir(), { keepCount: 5, keepDays: 30 });
-      if (gc.removed.length > 0) {
-        console.error(`[gc] removed ${gc.removed.length} old snapshots; kept ${gc.kept.length}`);
+    //
+    // Issue #347 (found while writing this issue's tests, reported in the PR body rather than left
+    // silent): this is the ONE step on the success path that mutates real state — it `rmSync`es
+    // directories under the REAL `homedir()` — and it was not gated on mockExec, so every all-mock
+    // test that reaches a successful return has been running a real snapshot GC against whoever is
+    // running `npm test`. It has not deleted anything to date only because gcSnapshots keeps
+    // anything within `keepDays` (an OR, not an AND, with keepCount) and no developer has had a
+    // >5-snapshot, >30-day-old collection. That is luck, not a constraint. Every other mutating
+    // step in this function is already skipped under mockExec; this one now is too, which is what
+    // makes the #347 tests below unable to touch real state rather than merely unlikely to.
+    if (opts.mockExec) {
+      phases.push({ name: "gc", status: "skipped-mock" });
+    } else {
+      try {
+        const gc = gcSnapshots(homedir(), { keepCount: 5, keepDays: 30 });
+        if (gc.removed.length > 0) {
+          console.error(`[gc] removed ${gc.removed.length} old snapshots; kept ${gc.kept.length}`);
+        }
+      } catch (e) {
+        console.error(`[gc] warn: snapshot GC failed: ${e.message}`);
       }
-    } catch (e) {
-      console.error(`[gc] warn: snapshot GC failed: ${e.message}`);
     }
 
     // `target` (issue #257): the ACTUAL version this upgrade landed on — the validated --target
@@ -1128,11 +1476,16 @@ async function runFullUpgrade({ doctor, opts }) {
     // real (see this file's own test-features.mjs coverage note).
     return { path: "upgrade", executed: true, changed: true, snapshotPath, phases, target: upgradeTarget };
   } catch (err) {
+    // Issue #347: `hint` is now set at the throw site for the restart-failure cells, and that
+    // hint leads with SERVICE state. This generic one is about TREE state — correct for a failed
+    // checkout or a failed post-flight, and exactly the wrong headline when the proxy is down.
+    // `err.hint ||` is what stops it overwriting the specific one; the `!err.snapshotPath` guard
+    // above cannot be relied on for that, since a caller could set one without the other.
     if (snapshotPath && !err.snapshotPath) {
       Object.assign(err, {
         snapshotPath,
         phases,
-        hint: "Working tree may be at new version. Run `ocp update --rollback` to restore from snapshot."
+        hint: err.hint || "Working tree may be at new version. Run `ocp update --rollback` to restore from snapshot."
       });
     }
     throw err;
