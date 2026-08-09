@@ -3897,8 +3897,34 @@ ltTest("integration (#365): callClaudeStreaming forwards the child's stdout iden
     assert.ok(await ltWait(() => buf.out.includes("listening on")), `did not start: ${buf.err.slice(0, 300)}`);
     const bytes = lt365StreamJson(LT365_MARK);
     const offsets = lt365Offsets(bytes);
-    assert.ok(lt365AssertSweepCovers(bytes, offsets).length >= 6,
+    const predicted = lt365AssertSweepCovers(bytes, offsets);
+    assert.ok(predicted.length >= 6,
       "premise: the pre-fix join must corrupt this payload at the mid-character offsets");
+
+    // The SAME two measured premises test 1 makes — deliberately repeated here rather than
+    // inherited, and this is a corrected defect rather than belt-and-braces. An independent review
+    // of this PR found this test originally had NEITHER: its only premise was
+    // lt365AssertSweepCovers, which is a pure in-process computation over Buffers and says nothing
+    // about what reached the child's pipe. Mutation M4 (stage every payload whole, so the split
+    // never happens) reddened tests 1, 3 and 4 and left THIS one printing a green tick while
+    // asserting nothing — the evidence was already in the mutation table and the conclusion had
+    // not been drawn from it.
+    const observed = [];
+    let minChunks = Infinity;
+    const whole = bytes.toString("utf8");
+    for (const at of offsets) {
+      lt365Stage(p, { out: bytes, outAt: at });
+      const ctl = await lt365NaiveRun(fake, fakeEnv);
+      assert.ok(!ctl.spawnFailed, `@${at}: the control could not spawn the fake claude`);
+      minChunks = Math.min(minChunks, ctl.outChunks);
+      if (ctl.out !== whole) observed.push(at);
+    }
+    assert.ok(minChunks >= 2,
+      `the two writes did NOT reach the reader as separate 'data' events (min ${minChunks}) — ` +
+      "every assertion below would pass vacuously");
+    assert.deepStrictEqual(observed, predicted,
+      `the pre-fix control corrupted offsets ${JSON.stringify(observed)} but the pre-fix operation ` +
+      `itself corrupts ${JSON.stringify(predicted)} — the control is not reproducing the defect`);
 
     for (const at of offsets) {
       lt365Stage(p, { out: bytes, outAt: at });

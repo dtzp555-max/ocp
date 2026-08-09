@@ -1659,7 +1659,11 @@ function spawnClaudeProcess(model, messages, conversationId, keyName, releaseSlo
   // Type is unchanged, which is what makes this safe for the stderr accumulators specifically:
   // `stderr` starts as "" and `+=` already coerced each Buffer with toString("utf8"), so it was
   // always a string. Both accumulators stay strings and every downstream consumer — slice(0,300),
-  // logEvent, trackError, sanitizeError, new Error(...) — keeps its exact current meaning.
+  // logEvent, trackError, sanitizeError, new Error(...) — keeps its exact current meaning. The
+  // corrected values also reach /logs (via logEvent's `stderr` field) and /api/usage +
+  // /cache/stats (via responseChars/size, which the corruption inflated); all Class B.2,
+  // grandfathered under ADR 0006, route (a) — no field's rule changes, only its value stops
+  // being wrong.
   //
   // Deliberately NOT `?.`-guarded: spawnOpts.stdio is unconditionally ["pipe","pipe","pipe"] a few
   // lines up, so both streams exist even when the spawn itself fails (measured: an ENOENT spawn
@@ -1813,8 +1817,11 @@ async function callClaude(model, messages, conversationId, keyName, res) {
     proc.stdout.on("data", (d) => {
       markFirstByte();
       // `d` is already a decoded string: spawnClaudeProcess calls proc.stdout.setEncoding("utf8")
-      // at the spawn boundary (#365). toString() is a no-op on a string and is kept only so this
-      // reader cannot corrupt if a future caller of spawnClaudeProcess arrives without it.
+      // at the spawn boundary (#365), so toString() here is a no-op and is kept only to leave this
+      // line byte-compatible with both stream modes. It is NOT a safeguard, and an earlier version
+      // of this comment wrongly claimed it was (caught by #365's independent review): if a future
+      // caller of spawnClaudeProcess omits the setEncoding, `d` is a Buffer again and
+      // `lineBuffer += d.toString()` is this bug VERBATIM. The guarantee lives at the boundary.
       lineBuffer += d.toString();
       const { events, remainder } = parseStreamJsonLines(lineBuffer);
       lineBuffer = remainder;
