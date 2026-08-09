@@ -1499,7 +1499,7 @@ test("localToolsSafetyError: multi is checked before loopback/anon (most severe 
 import { spawn as _ltSpawn, execFileSync as _ltExecFile } from "node:child_process";
 import { createServer as _ltNetServer, connect as _ltNetConnect } from "node:net";
 import { createServer as _ltHttpServer } from "node:http";
-import { writeFileSync as _ltWrite, chmodSync as _ltChmod, readFileSync as _ltRead, existsSync as _ltExists, rmSync as _ltRm, mkdtempSync as _ltMkdtemp } from "node:fs";
+import { writeFileSync as _ltWrite, chmodSync as _ltChmod, readFileSync as _ltRead, existsSync as _ltExists, rmSync as _ltRm, mkdtempSync as _ltMkdtemp, renameSync as _ltRename } from "node:fs";
 import { tmpdir as _ltTmp } from "node:os";
 import { fileURLToPath as _ltF2P } from "node:url";
 
@@ -3670,6 +3670,397 @@ ltTest("integration (#359): a prompt cut mid-character on the wire reaches the s
     assert.match(tooBig.text, /counts characters, not bytes/,
       "the 413 must still name its unit (#310) — the message is part of the contract");
   } finally { await ctl.close(); child.kill("SIGKILL"); _ltRmRetry(dir); }
+});
+
+// ── #365: the CHILD's stdout/stderr must decode UTF-8 ACROSS chunk boundaries ───────────────
+//
+// The other half of #359. `lineBuffer += d.toString()` and `stderr += d` decoded each Buffer from
+// the spawned claude INDEPENDENTLY, so a multi-byte character split across two 'data' events on
+// the pipe became replacement characters before the pieces were joined. On stdout that is altered
+// COMPLETION TEXT delivered to the client, silently — the NDJSON line stays valid, nothing throws.
+//
+// The fix is two lines at the shared spawn boundary (spawnClaudeProcess), not four at the readers:
+// that one function is the sole spawn site for the -p/stream-json path and callClaude +
+// callClaudeStreaming are its only callers, so it covers all four accumulators.
+//
+// The fake claude writes its stdout/stderr from FILES, in two `cat`s separated by a real sleep, so
+// the test chooses the byte offset at which the pipe is cut. The files are re-staged per case
+// while the server stays booted — a boot per offset would be unaffordable.
+//
+// Two premises are measured, never assumed (either failing quietly makes the block vacuous):
+//   1. the two writes really arrive as >= 2 'data' events — counted by lt365NaiveRun, which spawns
+//      the same fake with the same staged files and reproduces the pre-fix accumulation verbatim;
+//   2. that pre-fix accumulation really corrupts this payload, at exactly the offsets
+//      ltNaiveCorruptOffsets predicts from the two-chunk join.
+// lt365NaiveRun is a DIFFERENT child from the server's, so like #359's control server it cannot by
+// itself prove the fragmentation reaches server.mjs. The mutation proof (delete the two
+// setEncoding lines → these tests go red) is what closes that, and is recorded in the PR.
+const LT365_FAKE = `#!/bin/sh
+# The boot-time auth probe must not consume a staged case (server.mjs invokes CLAUDE with exactly
+# these two args). Same reason as LT_FAKE's early exit.
+if [ "$1" = "auth" ] && [ "$2" = "status" ]; then exit 0; fi
+gap=\${LT365_GAP:-0.1}
+if [ -f "$LT365_O1" ]; then cat "$LT365_O1"; fi
+if [ -f "$LT365_O2" ]; then sleep "$gap"; cat "$LT365_O2"; fi
+if [ -f "$LT365_E1" ]; then cat "$LT365_E1" >&2; fi
+if [ -f "$LT365_E2" ]; then sleep "$gap"; cat "$LT365_E2" >&2; fi
+ex=0
+if [ -f "$LT365_EX" ]; then ex=$(cat "$LT365_EX"); fi
+exit "$ex"
+`;
+function lt365Fake(dir) { const p = join(dir, "claude-365"); _ltWrite(p, LT365_FAKE); _ltChmod(p, 0o755); return p; }
+function lt365Paths(dir) {
+  return { o1: join(dir, "o1.bin"), o2: join(dir, "o2.bin"), e1: join(dir, "e1.bin"), e2: join(dir, "e2.bin"), ex: join(dir, "ex.txt") };
+}
+// Stage one case. Every file is written-then-renamed (rename(2) is atomic) so a fake that is still
+// exiting from the previous case can never read a HALF-written payload — that would surface as a
+// mismatch, i.e. loudly, but the suite already learned this lesson once (LT_FAKE's env dump).
+// Files not used by this case are REMOVED, so a stale payload from the previous case cannot stand
+// in for a missing one.
+function lt365Stage(p, { out = null, outAt = null, err = null, errAt = null, exit = 0 }) {
+  const w = (path, b) => { _ltWrite(`${path}.tmp`, b); _ltRename(`${path}.tmp`, path); };
+  for (const f of [p.o1, p.o2, p.e1, p.e2]) _ltRm(f, { force: true });
+  if (out) { w(p.o1, out.subarray(0, outAt ?? out.length)); if (outAt != null) w(p.o2, out.subarray(outAt)); }
+  if (err) { w(p.e1, err.subarray(0, errAt ?? err.length)); if (errAt != null) w(p.e2, err.subarray(errAt)); }
+  w(p.ex, Buffer.from(`${exit}\n`, "utf8"));
+}
+// The control. Spawns the SAME fake against the SAME staged files and accumulates exactly the way
+// server.mjs did before this fix (`+= d.toString()` on stdout, `+= d` on stderr), reporting how
+// many 'data' events each stream actually produced.
+function lt365NaiveRun(fakePath, env) {
+  return new Promise((resolve) => {
+    const p = _ltSpawn(fakePath, [], { env: { ...process.env, ...env }, stdio: ["ignore", "pipe", "pipe"] });
+    let out = "", err = "", outChunks = 0, errChunks = 0;
+    p.stdout.on("data", d => { out += d.toString(); outChunks++; });  // the defect, verbatim
+    p.stderr.on("data", d => { err += d; errChunks++; });             // the defect, verbatim
+    p.on("error", () => resolve({ out, err, outChunks, errChunks, spawnFailed: true }));
+    p.on("close", () => resolve({ out, err, outChunks, errChunks, spawnFailed: false }));
+  });
+}
+// One stream-json turn: an aggregate `assistant` message carrying `text`, then the terminal
+// `result`. This is the shape LT_FAKE already emits and the shape parseStreamJsonLines parses.
+function lt365StreamJson(text) {
+  return Buffer.from(
+    `${JSON.stringify({ type: "assistant", message: { content: [{ type: "text", text }] } })}\n` +
+    `${JSON.stringify({ type: "result" })}\n`, "utf8");
+}
+// A distinct body per request: CLAUDE_CACHE_TTL is 0 under ltBoot so nothing is cached, but the
+// single-flight dedup key is computed regardless of the cache, and two identical bodies must never
+// be able to collapse into one spawn and make an offset silently untested.
+async function lt365Chat(port, nonce, stream) {
+  const r = await fetch(`http://127.0.0.1:${port}/v1/chat/completions`, {
+    method: "POST", headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ model: "haiku", stream, messages: [{ role: "user", content: `probe-365 ${nonce}` }] }),
+  });
+  return { status: r.status, text: await r.text() };
+}
+// Concatenate an SSE stream's delta.content. Heartbeat frames are comments and error frames carry
+// no `choices`, so both are skipped here; lt365SseError reads the latter.
+function lt365SseContent(text) {
+  let out = "";
+  for (const line of text.split("\n")) {
+    if (!line.startsWith("data: ")) continue;
+    const payload = line.slice(6).trim();
+    if (payload === "[DONE]") continue;
+    let ev; try { ev = JSON.parse(payload); } catch { continue; }
+    const d = ev?.choices?.[0]?.delta?.content;
+    if (typeof d === "string") out += d;
+  }
+  return out;
+}
+function lt365SseError(text) {
+  for (const line of text.split("\n")) {
+    if (!line.startsWith("data: ")) continue;
+    const payload = line.slice(6).trim();
+    if (payload === "[DONE]") continue;
+    let ev; try { ev = JSON.parse(payload); } catch { continue; }
+    if (ev?.error?.message !== undefined) return ev.error.message;
+  }
+  return null;
+}
+// server.mjs's sanitizeError, copied so the expected 500 body can be computed rather than
+// pattern-matched. A copy that drifts from production fails these tests loudly, which is the point:
+// the stderr accumulator is consumed THROUGH this function and the exact output is the contract.
+function lt365Sanitize(msg) { return String(msg || "Internal error").replace(/\/[\w/.\-]+/g, "[path]"); }
+// /health, not /status: both carry recentErrors (slice(-5) and slice(-3)) and both are Class B.2,
+// but handleStatus awaits fetchUsageFromApi() — a real call to api.anthropic.com — and a test that
+// asserts on a local accumulator must not depend on the network to read it.
+async function lt365Health(port) {
+  const r = await fetch(`http://127.0.0.1:${port}/health`);
+  assert.equal(r.status, 200, "GET /health must answer 200 for the recentErrors assertions");
+  return r.json();
+}
+
+// One marker carrying a 2-byte, a 3-byte and a 4-byte character, with ASCII between them so a
+// wrong-length decode shifts visibly rather than merely substituting.
+const LT365_MARK = `a${LT_U8_TWO}b${LT_U8_THREE}c${LT_U8_FOUR}d`;
+
+// The offsets each sweep cuts at. NOT every byte offset, and the reason is measured rather than
+// assumed. Every offset costs a real child spawn per path, so an exhaustive sweep of this
+// 102-byte payload is 303 spawns against this set's 72; and this suite already documents a
+// contention-sensitive flake elsewhere (`_runStartShScenario` polls for a BACKGROUNDED `node` to
+// be scheduled, and its own comment records that poll flaking on a loaded shared host). With the
+// exhaustive sweep in place, 2 of 6 full runs on a host at load average ~11 produced unrelated
+// failures of exactly that class, while the unmodified base tree produced none in 2 runs under
+// the same conditions. With this set, the same six runs produced none.
+//
+// So the set is narrowed to one that is PROVABLY sufficient instead of exhaustive by brute force:
+//   - every continuation-byte offset — the only offsets at which this defect can corrupt anything
+//     — plus the offset on either side, so each character's leading and trailing edge is also cut;
+//   - a fixed stride across the remainder, which is invariance coverage where nothing can go wrong.
+// Sufficiency is ASSERTED, not argued: ltNaiveCorruptOffsets() is computed over ALL offsets in
+// this process (free — it is a pure two-chunk join, no I/O) and every element it returns must be
+// in this set, or the sweep fails before it runs.
+function lt365Offsets(bytes) {
+  const set = new Set();
+  for (const o of ltContinuationOffsets(bytes)) { set.add(o - 1); set.add(o); set.add(o + 1); }
+  for (let i = 1; i < bytes.length; i += 8) set.add(i);
+  return [...set].filter(o => o >= 1 && o < bytes.length).sort((a, b) => a - b);
+}
+// Guard for the above: every offset the pre-fix join can corrupt must actually be swept.
+function lt365AssertSweepCovers(bytes, offsets) {
+  const predicted = ltNaiveCorruptOffsets(bytes);
+  assert.ok(predicted.length >= 1,
+    "the pre-fix accumulation does not corrupt this payload at ANY offset — it does not exercise the defect");
+  const missed = predicted.filter(o => !offsets.includes(o));
+  assert.deepStrictEqual(missed, [],
+    `the swept offsets omit ${JSON.stringify(missed)}, which the pre-fix join DOES corrupt — the sweep is not sufficient`);
+  return predicted;
+}
+
+console.log("\nUTF-8 across chunk boundaries in the child's stdout/stderr (#365):");
+
+// (1) The buffered path. Cutting the child's stdout at every offset the defect can reach — which
+// is every internal byte offset of the 2-, 3- and 4-byte characters in the marker — plus a stride
+// sample of the rest, must produce the same completion text. The assertion reads
+// `choices[0].message.content`, i.e. what the CLIENT is told the model said, not an intermediate.
+ltTest("integration (#365): callClaude assembles the child's stdout identically at every reachable byte offset", async () => {
+  if (!LT_POSIX) return;
+  const dir = ltMkdir(); const fake = lt365Fake(dir); const p = lt365Paths(dir);
+  const fakeEnv = { LT365_O1: p.o1, LT365_O2: p.o2, LT365_E1: p.e1, LT365_E2: p.e2, LT365_EX: p.ex, LT365_GAP: "0.1" };
+  const { child, buf, port } = await ltBootFresh({ CLAUDE_BIN: fake, ...fakeEnv }, dir);
+  try {
+    assert.ok(await ltWait(() => buf.out.includes("listening on")), `did not start: ${buf.err.slice(0, 300)}`);
+    const bytes = lt365StreamJson(LT365_MARK);
+    const offsets = lt365Offsets(bytes);
+
+    // Predicted from the pre-fix operation itself, not guessed — and the sweep must cover all of
+    // it, or narrowing the offset set would have silently dropped coverage.
+    const predicted = lt365AssertSweepCovers(bytes, offsets);
+    // Every internal offset of every multi-byte character must be among them: that is the coverage
+    // the issue asks for, checked rather than assumed from the marker's spelling.
+    const inside = ltContinuationOffsets(bytes);
+    assert.ok(inside.length >= 6,
+      `the payload must contain a 2-, 3- and 4-byte character (>= 6 continuation bytes), found ${inside.length}`);
+    assert.deepStrictEqual(predicted, inside,
+      "every mid-character offset, and only those, must be the ones the pre-fix join corrupts");
+
+    // Premise pass: the control reproduces the defect at exactly those offsets, and each staged
+    // case really does reach the reader as >= 2 'data' events.
+    const observed = [];
+    let minChunks = Infinity;
+    const whole = bytes.toString("utf8");
+    for (const at of offsets) {
+      lt365Stage(p, { out: bytes, outAt: at });
+      const ctl = await lt365NaiveRun(fake, fakeEnv);
+      assert.ok(!ctl.spawnFailed, `@${at}: the control could not spawn the fake claude`);
+      minChunks = Math.min(minChunks, ctl.outChunks);
+      if (ctl.out !== whole) observed.push(at);
+    }
+    assert.ok(minChunks >= 2,
+      `the two writes did NOT reach the reader as separate 'data' events (min ${minChunks}) — ` +
+      "every assertion below would pass vacuously");
+    assert.deepStrictEqual(observed, predicted,
+      `the pre-fix control corrupted offsets ${JSON.stringify(observed)} but the pre-fix operation ` +
+      `itself corrupts ${JSON.stringify(predicted)} — the control is not reproducing the defect`);
+
+    // The real assertion, against server.mjs.
+    for (const at of offsets) {
+      lt365Stage(p, { out: bytes, outAt: at });
+      const res = await lt365Chat(port, `buffered-${at}`, false);
+      assert.equal(res.status, 200, `@${at}: expected 200, got ${res.status}: ${res.text.slice(0, 200)}`);
+      const content = JSON.parse(res.text).choices[0].message.content;
+      assert.equal(content, LT365_MARK,
+        `@${at}: stdout cut at byte ${at} produced completion ${JSON.stringify(content)}, expected ${JSON.stringify(LT365_MARK)}`);
+    }
+  } finally { child.kill("SIGKILL"); _ltRmRetry(dir); }
+});
+
+// (2) The streaming path — the same lineBuffer defect in callClaudeStreaming, where the corrupted
+// text is forwarded to the client inside SSE deltas rather than a JSON body.
+ltTest("integration (#365): callClaudeStreaming forwards the child's stdout identically at every reachable byte offset", async () => {
+  if (!LT_POSIX) return;
+  const dir = ltMkdir(); const fake = lt365Fake(dir); const p = lt365Paths(dir);
+  const fakeEnv = { LT365_O1: p.o1, LT365_O2: p.o2, LT365_E1: p.e1, LT365_E2: p.e2, LT365_EX: p.ex, LT365_GAP: "0.1" };
+  const { child, buf, port } = await ltBootFresh({ CLAUDE_BIN: fake, ...fakeEnv }, dir);
+  try {
+    assert.ok(await ltWait(() => buf.out.includes("listening on")), `did not start: ${buf.err.slice(0, 300)}`);
+    const bytes = lt365StreamJson(LT365_MARK);
+    const offsets = lt365Offsets(bytes);
+    assert.ok(lt365AssertSweepCovers(bytes, offsets).length >= 6,
+      "premise: the pre-fix join must corrupt this payload at the mid-character offsets");
+
+    for (const at of offsets) {
+      lt365Stage(p, { out: bytes, outAt: at });
+      const res = await lt365Chat(port, `stream-${at}`, true);
+      assert.equal(res.status, 200, `@${at}: expected 200, got ${res.status}: ${res.text.slice(0, 200)}`);
+      assert.equal(lt365SseError(res.text), null, `@${at}: the stream carried an error frame: ${res.text.slice(0, 200)}`);
+      const content = lt365SseContent(res.text);
+      assert.equal(content, LT365_MARK,
+        `@${at}: stdout cut at byte ${at} streamed ${JSON.stringify(content)}, expected ${JSON.stringify(LT365_MARK)}`);
+    }
+  } finally { child.kill("SIGKILL"); _ltRmRetry(dir); }
+});
+
+// (3) THE PART #359's TESTS DID NOT HAVE TO COVER. `stderr`'s consumers are not JSON.parse and a
+// length cap; it is string-sliced at 300, logged, run through sanitizeError, turned into an Error
+// message and surfaced to the client, and truncated again at 200 into /status's recentErrors. Each
+// of those is asserted here on a stderr long enough that slice(0,300) actually cuts, and containing
+// a path so sanitizeError actually substitutes — so a change in the accumulator's TYPE or in what
+// those consumers see would fail rather than pass silently.
+ltTest("integration (#365): the stderr consumers — slice(300), sanitizeError, Error message, /health recentErrors", async () => {
+  if (!LT_POSIX) return;
+  const dir = ltMkdir(); const fake = lt365Fake(dir); const p = lt365Paths(dir);
+  const fakeEnv = { LT365_O1: p.o1, LT365_O2: p.o2, LT365_E1: p.e1, LT365_E2: p.e2, LT365_EX: p.ex, LT365_GAP: "0.1" };
+  const { child, buf, port } = await ltBootFresh({ CLAUDE_BIN: fake, ...fakeEnv }, dir);
+  try {
+    assert.ok(await ltWait(() => buf.out.includes("listening on")), `did not start: ${buf.err.slice(0, 300)}`);
+
+    // Longer than 300 characters on purpose, with the marker up front and a path in it.
+    const head = `claude failed: /Users/x/.claude/creds.json ${LT365_MARK} `;
+    const errText = head + LT_U8_THREE.repeat(320) + " END";
+    const errBytes = Buffer.from(errText, "utf8");
+    assert.ok(errText.length > 300, `stderr must exceed the 300-character slice, got ${errText.length}`);
+    const expected = lt365Sanitize(errText.slice(0, 300));
+    assert.ok(expected.includes("[path]"), "premise: sanitizeError must actually substitute in this payload");
+    assert.ok(expected.includes(LT365_MARK), "premise: the marker must survive into the sliced+sanitized message");
+
+    // Split offsets: every internal byte offset of the marker's three multi-byte characters (the
+    // coverage the issue asks for), plus two inside the padding far past the head.
+    const headBytes = Buffer.byteLength(head, "utf8");
+    const markStart = Buffer.byteLength(head.slice(0, head.indexOf(LT365_MARK)), "utf8");
+    assert.ok(head.indexOf(LT365_MARK) > 0, "anchor: the marker must be found inside the head");
+    const markEnd = markStart + Buffer.byteLength(LT365_MARK, "utf8");
+    assert.ok(markEnd < headBytes, `anchor: the marker's byte range [${markStart},${markEnd}) must lie inside the head (${headBytes}B)`);
+    const offsets = ltContinuationOffsets(errBytes).filter(o => o > markStart && o < markEnd);
+    assert.equal(offsets.length, 6,
+      `expected the 1+2+3 internal offsets of a 2-, 3- and 4-byte character, got ${JSON.stringify(offsets)}`);
+    offsets.push(headBytes + 4, errBytes.length - 6);   // inside the padding, and near the tail
+
+    for (const at of offsets) {
+      lt365Stage(p, { err: errBytes, errAt: at, exit: 1 });
+      // Premise, per offset: two 'data' events, and the pre-fix accumulation is genuinely wrong
+      // wherever the cut is mid-character.
+      const ctl = await lt365NaiveRun(fake, fakeEnv);
+      assert.ok(ctl.errChunks >= 2, `@${at}: stderr did not arrive as >= 2 'data' events (saw ${ctl.errChunks})`);
+      const naiveExpected = ltNaiveJoin(errBytes, at) === errText;
+      assert.equal(ctl.err === errText, naiveExpected,
+        `@${at}: the control does not match the pre-fix join it is supposed to reproduce`);
+
+      // Buffered path: an Error carrying stderr.slice(0,300), sanitized into the 500 body.
+      const res = await lt365Chat(port, `stderr-buf-${at}`, false);
+      assert.equal(res.status, 500, `@${at}: expected 500, got ${res.status}: ${res.text.slice(0, 200)}`);
+      const msg = JSON.parse(res.text).error.message;
+      assert.ok(!msg.includes("�"), `@${at}: the 500 body carries replacement characters: ${JSON.stringify(msg.slice(0, 120))}`);
+      assert.equal(msg, expected, `@${at}: 500 body message is not sanitizeError(stderr.slice(0,300))`);
+
+      // Streaming path: headers are already sent, so the same string arrives as an SSE error frame.
+      lt365Stage(p, { err: errBytes, errAt: at, exit: 1 });
+      const sres = await lt365Chat(port, `stderr-sse-${at}`, true);
+      assert.equal(sres.status, 200, `@${at}: SSE headers are eager, so the status must still be 200, got ${sres.status}`);
+      assert.equal(lt365SseError(sres.text), expected, `@${at}: SSE error frame is not sanitizeError(stderr.slice(0,300))`);
+    }
+
+    // trackError's consumer, on a real Class B.2 response: recentErrors[].message is
+    // String(stderr.slice(0,300)).slice(0,200).
+    const h = await lt365Health(port);
+    const last = h.recentErrors[h.recentErrors.length - 1];
+    assert.ok(last, "/health must report the errors this test just produced");
+    assert.equal(last.message, errText.slice(0, 200),
+      "/health recentErrors[].message must be the first 200 characters of the DECODED stderr");
+    assert.ok(!last.message.includes("�"), "/health recentErrors[].message carries replacement characters");
+  } finally { child.kill("SIGKILL"); _ltRmRetry(dir); }
+});
+
+// (4) THE END-OF-STREAM DECISION, stated and made observable.
+//
+// setEncoding buffers an incomplete trailing sequence; when the child dies mid-character it is
+// never completed. Node FLUSHES it (readable.js `onEofChunk` calls `decoder.end()`), it does not
+// drop it. Keeping the flush is a decision, and it differs from #359's for a reason:
+//
+//   - On STDOUT it is inert, and that is the point. A truncated final line has no terminating "\n",
+//     so parseStreamJsonLines already leaves it in `remainder`, which is discarded. The flushed
+//     U+FFFD therefore never reaches a JSON.parse, the completion is exactly the complete lines'
+//     text, and a child that died mid-write still surfaces as its REAL cause (non-zero exit / no
+//     result event) rather than as a spurious NDJSON parse error. The first arm asserts that: a
+//     truncated tail changes neither the completion nor the error counter.
+//   - On STDERR the flush is observable, and dropping would silently shorten a diagnostic. That is
+//     the arm that distinguishes flush from drop: the sanitized 500 body must END with the
+//     substitution character, with a paired control on the intact stderr that must NOT.
+ltTest("integration (#365): a stream that ends mid-character — stdout truncation is inert, stderr keeps the flushed tail", async () => {
+  if (!LT_POSIX) return;
+  const dir = ltMkdir(); const fake = lt365Fake(dir); const p = lt365Paths(dir);
+  const fakeEnv = { LT365_O1: p.o1, LT365_O2: p.o2, LT365_E1: p.e1, LT365_E2: p.e2, LT365_EX: p.ex, LT365_GAP: "0.1" };
+  const { child, buf, port } = await ltBootFresh({ CLAUDE_BIN: fake, ...fakeEnv }, dir);
+  try {
+    assert.ok(await ltWait(() => buf.out.includes("listening on")), `did not start: ${buf.err.slice(0, 300)}`);
+    const turn = lt365StreamJson(LT365_MARK);
+
+    // ── stdout: truncated tail must not corrupt the completion and must not manufacture an error.
+    const before = (await lt365Health(port)).stats.errors;
+    for (const keep of [1, 2]) {                              // 1 and 2 bytes of a 3-byte character
+      const cut = Buffer.concat([turn, Buffer.from(LT_U8_THREE, "utf8").subarray(0, keep)]);
+      lt365Stage(p, { out: cut, outAt: turn.length });
+      const ctl = await lt365NaiveRun(fake, fakeEnv);
+      assert.ok(ctl.outChunks >= 2, `keep=${keep}: the truncated tail did not arrive as its own 'data' event`);
+
+      const res = await lt365Chat(port, `trunc-buf-${keep}`, false);
+      assert.equal(res.status, 200,
+        `keep=${keep}: a child whose LAST line is truncated must still return its complete lines, got ${res.status}: ${res.text.slice(0, 200)}`);
+      const content = JSON.parse(res.text).choices[0].message.content;
+      assert.equal(content, LT365_MARK,
+        `keep=${keep}: the flushed substitution character leaked into the completion: ${JSON.stringify(content)}`);
+
+      lt365Stage(p, { out: cut, outAt: turn.length });
+      const sres = await lt365Chat(port, `trunc-sse-${keep}`, true);
+      assert.equal(lt365SseError(sres.text), null, `keep=${keep}: the truncated tail produced an error frame`);
+      assert.equal(lt365SseContent(sres.text), LT365_MARK, `keep=${keep}: the streamed text changed`);
+    }
+    const after = (await lt365Health(port)).stats.errors;
+    assert.equal(after, before,
+      "a truncated trailing line must not be turned into an error — the incomplete line is discarded, as it always was");
+
+    // ── stderr: flush vs drop, made observable.
+    //
+    // Every split in this test is at an ASCII offset (errAt 3 is inside "boom ", and the stdout arm
+    // cuts exactly at the turn/tail boundary), DELIBERATELY: this test must isolate FINALISATION,
+    // not mid-chunk decoding. That makes it the second half of a control pair — deleting the
+    // setEncoding calls (M1) leaves this test green, while removing only the flush (M2) is the one
+    // thing that turns it red. A test that failed under both would not tell them apart.
+    const errBase = Buffer.from(`boom ${LT365_MARK} tail`, "utf8");
+    lt365Stage(p, { err: errBase, errAt: 3, exit: 1 });
+    const intact = await lt365Chat(port, "trunc-err-control", false);
+    assert.equal(intact.status, 500, `control: expected 500, got ${intact.status}`);
+    const intactMsg = JSON.parse(intact.text).error.message;
+    assert.equal(intactMsg, lt365Sanitize(errBase.toString("utf8")),
+      "control: an intact stderr must arrive whole");
+    assert.ok(!intactMsg.endsWith("�"),
+      "control: an intact stderr must NOT end in a substitution character, or the arm below proves nothing");
+
+    for (const keep of [1, 2, 3]) {                          // 1..3 bytes of a 4-byte character
+      const cut = Buffer.concat([errBase, Buffer.from(LT_U8_FOUR, "utf8").subarray(0, keep)]);
+      lt365Stage(p, { err: cut, errAt: 3, exit: 1 });
+      const res = await lt365Chat(port, `trunc-err-${keep}`, false);
+      assert.equal(res.status, 500, `keep=${keep}: expected 500, got ${res.status}: ${res.text.slice(0, 200)}`);
+      const msg = JSON.parse(res.text).error.message;
+      assert.equal(msg, lt365Sanitize(cut.toString("utf8")),
+        `keep=${keep}: the error message must equal the whole-buffer decode of what the child wrote`);
+      assert.ok(msg.endsWith("�"),
+        `keep=${keep}: a stderr ending ${keep} byte(s) into a 4-byte character must keep the FLUSHED substitution ` +
+        "character. Its absence means the partial sequence was DROPPED at end-of-stream and the diagnostic was " +
+        "silently shortened.");
+    }
+  } finally { child.kill("SIGKILL"); _ltRmRetry(dir); }
 });
 
 // Deterministic close for the ltTest serialization claim: a fact about how many server.mjs

@@ -1632,6 +1632,42 @@ function spawnClaudeProcess(model, messages, conversationId, keyName, releaseSlo
   }
 
   const proc = spawn(CLAUDE, cliArgs, spawnOpts);
+  // #365 (the other half of #359): decode the child's stdout/stderr as UTF-8 ONCE, here, at the
+  // shared spawn boundary — this function is the SOLE spawn site for the -p/stream-json path and
+  // callClaude + callClaudeStreaming are its only two callers, so these two lines cover all four
+  // `on("data")` accumulators (two `lineBuffer`, two `stderr`) instead of four separate edits.
+  //
+  // Without it each Buffer is decoded independently (`lineBuffer += d.toString()`, `stderr += d`),
+  // so a multi-byte character whose bytes straddle two 'data' events becomes replacement
+  // characters BEFORE the pieces are joined, and joining cannot repair it. On stdout that means
+  // altered completion text reaching the client, silently: the NDJSON line stays syntactically
+  // valid, nothing throws, nothing logs. setEncoding installs a StringDecoder on the stream, which
+  // holds an incomplete trailing sequence until the next chunk completes it
+  // (node/lib/internal/streams/readable.js `Readable.prototype.setEncoding`; stream.md: "The
+  // Readable stream will properly handle multi-byte characters delivered through the stream that
+  // would otherwise become improperly decoded if simply pulled from the stream as Buffer objects").
+  //
+  // END-OF-STREAM IS A DECISION, not a default: `onEofChunk` calls `decoder.end()`, so a sequence
+  // still incomplete when the child dies is FLUSHED as U+FFFD, not dropped. Flush is what we want
+  // on BOTH streams, for different reasons. On stdout it is inert — a truncated final line has no
+  // terminating "\n", so parseStreamJsonLines already leaves it in `remainder`, which is discarded;
+  // a child that died mid-write therefore still surfaces as its real cause (non-zero exit / no
+  // result event), never as a spurious NDJSON parse error. On stderr the flushed U+FFFD keeps the
+  // diagnostic byte-identical to what a whole-buffer decode produces today, so an error message
+  // can never be silently shortened by dropping its tail.
+  //
+  // Type is unchanged, which is what makes this safe for the stderr accumulators specifically:
+  // `stderr` starts as "" and `+=` already coerced each Buffer with toString("utf8"), so it was
+  // always a string. Both accumulators stay strings and every downstream consumer — slice(0,300),
+  // logEvent, trackError, sanitizeError, new Error(...) — keeps its exact current meaning.
+  //
+  // Deliberately NOT `?.`-guarded: spawnOpts.stdio is unconditionally ["pipe","pipe","pipe"] a few
+  // lines up, so both streams exist even when the spawn itself fails (measured: an ENOENT spawn
+  // still exposes both, and setEncoding on them does not throw). An optional-chain here would turn
+  // a future stdio change into a SILENT return of this bug; a throw is caught by both callers,
+  // which release the slot and answer 500.
+  proc.stdout.setEncoding("utf8");
+  proc.stderr.setEncoding("utf8");
   activeProcesses.add(proc);
   // Counter drift (#180, reported by @konceptnet): increment ONLY after the spawn has
   // succeeded and the process is registered. Incrementing before the spawn (as this did) leaked
@@ -1776,6 +1812,9 @@ async function callClaude(model, messages, conversationId, keyName, res) {
 
     proc.stdout.on("data", (d) => {
       markFirstByte();
+      // `d` is already a decoded string: spawnClaudeProcess calls proc.stdout.setEncoding("utf8")
+      // at the spawn boundary (#365). toString() is a no-op on a string and is kept only so this
+      // reader cannot corrupt if a future caller of spawnClaudeProcess arrives without it.
       lineBuffer += d.toString();
       const { events, remainder } = parseStreamJsonLines(lineBuffer);
       lineBuffer = remainder;
@@ -1800,6 +1839,10 @@ async function callClaude(model, messages, conversationId, keyName, res) {
         }
       }
     });
+    // Decoded upstream (#365): proc.stderr.setEncoding("utf8") in spawnClaudeProcess. `stderr` was
+    // always a string here — `"" += Buffer` coerces — so its type and every consumer below
+    // (slice(0,300) → logEvent / trackError / new Error) are unchanged; only the bytes are now
+    // decoded across chunk boundaries instead of per chunk.
     proc.stderr.on("data", (d) => (stderr += d));
 
     proc.on("close", (code, signal) => {
@@ -2249,6 +2292,9 @@ async function callClaudeStreaming(model, messages, conversationId, res, authInf
 
   proc.stdout.on("data", (d) => {
     markFirstByte();
+    // Already a decoded string — see the twin reader in callClaude and the setEncoding pair in
+    // spawnClaudeProcess (#365). This is the streaming path, so a character split across two
+    // 'data' events used to be forwarded corrupted to the client inside an SSE delta.
     lineBuffer += d.toString();
     const { events, remainder } = parseStreamJsonLines(lineBuffer);
     lineBuffer = remainder;
@@ -2316,6 +2362,8 @@ async function callClaudeStreaming(model, messages, conversationId, res, authInf
     }
   });
 
+  // Decoded upstream (#365) — same note as callClaude's stderr reader. Consumers here are
+  // slice(0,300) → logEvent / trackError / sanitizeError, into a 500 body or an SSE error frame.
   proc.stderr.on("data", (d) => (stderr += d));
 
   proc.on("close", (code, signal) => {
