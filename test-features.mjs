@@ -1555,6 +1555,9 @@ function ltFake(dir) { const p = join(dir, "claude"); _ltWrite(p, LT_FAKE); _ltC
 // wall-clock luck. See the assertion at the end of this integration block.
 let _ltActiveBoots = 0;
 let _ltPeakBoots = 0;
+// #358: every ltTest drain that timed out, with the test it followed and how long it waited.
+// Non-empty means _ltPeakBoots is UNATTRIBUTABLE — see the assertions at the end of the file.
+const _ltDrainTimeouts = [];
 function ltBoot(env, dir, nodeArgs = []) {
   const child = _ltSpawn(process.execPath, [...nodeArgs, LT_SERVER], {
     env: { ...process.env, NODE_ENV: "test", OCP_DIR_OVERRIDE: dir, OCP_SKIP_AUTH_TEST: "1",
@@ -1796,7 +1799,23 @@ function ltTest(name, fn) {
     // false claim of "at most one at a time" — caught by the peak-count regression test below).
     // Draining to 0 here, not in the individual finally blocks, keeps the guarantee in ONE
     // place instead of requiring every ltBoot-based test to get its own teardown wait right.
-    _ltQueue = run.catch(() => {}).then(() => ltWait(() => _ltActiveBoots === 0, 5000));
+    // #358: ltWait RETURNS whether the condition held, and the previous version of this line
+    // discarded it. That discard is the whole defect: when the drain times out the next test boots
+    // anyway, _ltActiveBoots reaches 2, and _ltPeakBoots latches there via Math.max with no reset —
+    // so a slow teardown became indistinguishable from a serialization regression, permanently, for
+    // the rest of the run. Two PRs had a real failure dismissed as "load" on that evidence.
+    //
+    // Keeping the boolean makes the two causes separable, because they are the SAME event: if the
+    // drain confirms _ltActiveBoots === 0 then the adjacent tests provably did not overlap, so
+    // peak > 1 can ONLY arise from a drain that timed out. Recording the timeout measures that
+    // directly; the peak was always a proxy for it.
+    _ltQueue = run.catch(() => {}).then(async () => {
+      const t0 = Date.now();
+      const drained = await ltWait(() => _ltActiveBoots === 0, 5000);
+      if (!drained) {
+        _ltDrainTimeouts.push({ test: name, ms: Date.now() - t0, active: _ltActiveBoots });
+      }
+    });
     return run;
   });
 }
@@ -3688,8 +3707,33 @@ ltTest("integration: ltTest serialization keeps peak concurrent server.mjs child
   await ltWait(() => _ltActiveBoots === 0, 5000);
   assert.equal(_ltActiveBoots, 0,
     `all boots in this block must have closed by the time the last queued test runs, got ${_ltActiveBoots} still active`);
-  assert.equal(_ltPeakBoots, 1,
-    `ltTest must serialize ltBoot-spawned children to 1 at a time; peak observed was ${_ltPeakBoots}`);
+  // #358: assert the DRAIN first, because it is the direct measurement and the peak is a proxy
+  // for it. If any drain timed out, the next test booted while the previous child was still
+  // closing, so a peak above 1 says nothing about whether ltTest serializes — it says a teardown
+  // was slow. Reporting the peak in that state is what let two real failures be dismissed as
+  // "load": the number was true and its meaning was not what the message claimed.
+  //
+  // Note ltWait already stretches its 5s budget by observed overshoot up to 10x, so a timeout
+  // here means ~50s of wall clock, not a tight deadline losing a race.
+  assert.equal(_ltDrainTimeouts.length, 0,
+    `${_ltDrainTimeouts.length} ltTest drain(s) timed out, so the serialization claim is ` +
+    `UNPROVEN rather than violated (#358). This is a slow teardown, not necessarily a ` +
+    `serialization regression — the peak assertion below cannot distinguish them once this ` +
+    `fires. Offenders: ${JSON.stringify(_ltDrainTimeouts)}`);
+
+  // Both directions of "not 1" are failures, and they mean different things — say which.
+  // Measured while mutation-proving this: bypassing the _ltQueue chain yields peak 0, not 2,
+  // because this assertion then runs concurrently and reads the counter before anything has
+  // booted. A message that reported that as "children overlapped" would be a true number under
+  // a false claim, which is the exact defect #358 is about.
+  assert.equal(_ltPeakBoots, 1, _ltPeakBoots > 1
+    ? `ltTest must serialize ltBoot-spawned children to 1 at a time; peak observed was ` +
+      `${_ltPeakBoots}. Every drain completed (0 timed out), so adjacent tests provably did NOT ` +
+      `overlap through a slow teardown — this is a real serialization regression.`
+    : `peak observed was ${_ltPeakBoots}, i.e. this assertion ran BEFORE any ltBoot did. That is ` +
+      `an ordering failure, not an overlap: ltTest's queue no longer guarantees this test runs ` +
+      `last, so the count it reads is meaningless rather than good. Check that ltTest still ` +
+      `chains through _ltQueue.`);
 });
 
 // ── Upgrade Tests ──
