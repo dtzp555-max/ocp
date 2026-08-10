@@ -2738,24 +2738,30 @@ ltTest("integration: boot gate REFUSES each unsafe config (multi / non-loopback 
 //   operand                        mutate to  MEASURED (delta vs. a 0-failure baseline)
 //   -----------------------------  ---------  ----------------------------------------------------
 //   !isLoopbackBind(BIND_ADDRESS)  false      +1 failure:  THIS test, alone    <- the #339 defect
-//   !isLoopbackBind(BIND_ADDRESS)  true       +6 failures: TUI boots; BOTH #370 tests SURVIVE
+//   !isLoopbackBind(BIND_ADDRESS)  true       EVERY live TUI boot reddens; BOTH #370 tests SURVIVE
 //   OCP_TUI_ALLOW_LAN !== "1"      true       +1 failure:  the escape-hatch test below, alone
 //
 // Deleting `isLoopbackBind(...)` outright is ambiguous between rows 1 and 2, and only row 1 is the
 // "call site quietly stopped consulting the helper" shape this issue is about — row 2 makes the gate
 // refuse EVERY TUI boot, which existing tests already catch.
 //
-// Row 2's number is the one to distrust, and the reason is worth stating rather than leaving to be
-// rediscovered. It is not a property of this gate at all: it is a CENSUS of the suite's live TUI
-// boots, so it rises whenever anyone adds a TUI test. Measured, it went 3 -> 6 across two merges
-// while this PR was open (#390 added `integration (#361)` and both `integration (#362)` boots), and
-// #395 changed the sixth one's fixture without changing the count. Re-measure it rather than trust
-// it. What row 2 actually pins — and what does NOT drift — is that BOTH #370 tests survive: the gate
-// widening into refusing everything must not be mistaken for the gate being consulted. The six as
-// measured: the OCP_LOCAL_TOOLS-inert TUI boot just below, `integration (#213)`'s prompt-budget
-// boot, `integration (#361)`'s TUI-lane auth verdict, both `integration (#362)` shutdown boots, and
-// — the one a reader would not predict — `integration (#346)`'s B.2 key-set snapshot, whose
-// `tui-pool` profile (#382) boots TUI mode too.
+// Row 2 deliberately carries NO number, and that is the one piece of this table worth explaining.
+// A count there would not be a property of the gate at all — it is a CENSUS of the suite's live TUI
+// boots, so it rises whenever anyone adds a TUI test, and it is guaranteed to be wrong later.
+// Measured while this PR was open it went 3 -> 6 -> 7: #390 added `integration (#361)` and both
+// `integration (#362)` boots, #395 changed the B.2 fixture without changing the count, and #393
+// added `integration (#384)`. Three revisions of this comment carried three different numbers, each
+// true when written. The RULE is stable where the count is not: every test that boots a live
+// server.mjs with CLAUDE_TUI_MODE=true reddens, because the mutation makes the gate refuse all of
+// them. Re-measure if you need the number; `grep -n CLAUDE_TUI_MODE` is the denominator.
+//
+// What row 2 actually pins — and what does NOT drift — is that BOTH #370 tests survive. The gate
+// widening into refusing everything must not be mistaken for the gate being consulted; that
+// confusion is precisely what rows 1 and 2 exist to keep apart. The census as last measured, for
+// orientation only: the OCP_LOCAL_TOOLS-inert TUI boot just below, `integration (#213)`'s
+// prompt-budget boot, `integration (#361)`'s TUI-lane auth verdict, both `integration (#362)`
+// shutdown boots, `integration (#384)`'s tmux pin, and — the one a reader would not predict —
+// `integration (#346)`'s B.2 key-set snapshot, whose `tui-pool` profile (#382) boots TUI mode too.
 //
 // Row 1 is also where the choice of bind address pays off. Its recorded failure is `process never
 // closed … listen EADDRNOTAVAIL: address not available 192.0.2.1:55616 … stdout(0B)=""` — so with
