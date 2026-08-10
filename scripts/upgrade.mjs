@@ -967,6 +967,30 @@ export async function execRestartRetry(cmd, {
 // (restart-unit.mjs:993, :1094, :1106, :1113), so this inherits all three exactly. Launchd plans
 // carry no such substring and are additionally excluded by the `action` guard — `launchctl` has no
 // start limit and no equivalent command.
+export function recoveryPlanCommands(restartPlan) {
+  const cmds = (restartPlan?.plan?.cmds || []).map(c => c.cmd);
+  const action = restartPlan?.plan?.action;
+  if (action !== "user-unit" && action !== "system-unit") return cmds;
+  const restartCmd = cmds.find(c => c.includes(" restart -- "));
+  if (!restartCmd) return cmds;
+  // #347 review finding G2: `|| true`, because the caller joins this list with " && ".
+  //
+  // Without it, a `reset-failed` that exits non-zero SUPPRESSES the restart behind it — which is
+  // F5's own failure mode arriving one command earlier: the thing added to un-wedge a stuck unit
+  // would itself prevent the recovery. And it genuinely can exit non-zero (no such unit under this
+  // scope, no running user manager / missing XDG_RUNTIME_DIR — the same conditions runRollback's
+  // MED-E note already documents for `systemctl --user daemon-reload`).
+  //
+  // Deliberately different from the rest of the chain, and that is the point: the launchd pair IS
+  // sequential — `bootstrap` should not run if `bootout` genuinely failed — so " && " stays right
+  // for it. This one command is best-effort housekeeping ahead of the real action. Written as a
+  // suffix on the command rather than as a special separator in the join, so a future edit to the
+  // joining code cannot silently drop it. Precedence is safe: `A || true && B` parses as
+  // `(A || true) && B`, and `(A || true)` always succeeds, so B always runs. Same `|| true` idiom
+  // the repo already uses on the resolved bootout (scripts/lib/restart-unit.mjs:865).
+  return [`${restartCmd.replace(" restart -- ", " reset-failed -- ")} || true`, ...cmds];
+}
+
 // Issue #356 F3, DECIDED — and the decision REVERSED for launchd in round 3 of #388's review, on
 // evidence rather than on wording. The restoration pass's retry budget, per plan shape.
 //
@@ -1003,8 +1027,27 @@ export async function execRestartRetry(cmd, {
 //     `execRestartRetry`'s own header records as having "succeeded by hand on the first attempt".
 //     The asymmetry decides it: retrying and being wrong costs ~3s of wall clock before the same
 //     DOWN verdict; NOT retrying and being wrong leaves the proxy down until a human runs the
-//     printed command. A spurious retry cannot even produce a wrong verdict, because the verdict
-//     comes from the post-flight probe and never from a command's exit status (#325's rule).
+//     printed command. A spurious retry cannot even produce a wrong verdict — and that holds, but
+//     for a NARROWER reason than the first draft of this line gave.
+//
+//     #388 review finding F2. That draft read "the verdict comes from the post-flight probe and
+//     never from a command's exit status (#325's rule)", and both halves are false. `restartFailure`
+//     IS a command exit status, and it gates five of `classifyRestartOutcome`'s ten arms
+//     (:1277-1281 — UNMEASURED and the four RESTART_FAILED_* verdicts all lead with it). And #325
+//     does not say that. `ocp:1032-1034` bans the exit status from SUBSTITUTING for the probe —
+//     "a failing command does not prove the proxy is down ... So fall through and measure" — and
+//     then `ocp:1070-1075` keeps it as an explicit CO-INPUT: `if [[ $probe_rc -ne 0 &&
+//     $restart_failed -ne 0 ]]`, under the note that "the probe and the command outcome are two
+//     independent facts, and the message has to name the combination". The cited authority contains
+//     the counterexample to the sentence that cited it.
+//
+//     The true premise is specific to THIS pass rather than to exit statuses in general: the
+//     RESTORE's exit statuses are not classifier inputs at all, and `restartFailure` is already
+//     fixed before the restore runs. It is assigned only inside the forward restart loop (:1753 on
+//     this path, :2625 on the rollback one) and never reassigned; `restoreOutcome` is not among
+//     `classifyRestartOutcome`'s parameters, which are `{ restartFailure, postFlight,
+//     postFlightMeasured }` at both call sites (:1925, :2790). So a retry inside the restore can
+//     reach the verdict only by delaying the probe — which is the ~3s the asymmetry already prices.
 //
 //   user-unit / system-unit — DO NOT RETRY. Reason 1 is decisive on `user-unit`, and on a
 //     `system-unit` OCP never reads the unit's `Restart=` or `StartLimit*` at all, so one attempt is
@@ -1015,30 +1058,6 @@ export async function execRestartRetry(cmd, {
 export function restoreRetryBudget(action, { attempts, backoffMs }) {
   if (action === "launchd") return { attempts, backoffMs };
   return { attempts: 1, backoffMs: 0 };
-}
-
-export function recoveryPlanCommands(restartPlan) {
-  const cmds = (restartPlan?.plan?.cmds || []).map(c => c.cmd);
-  const action = restartPlan?.plan?.action;
-  if (action !== "user-unit" && action !== "system-unit") return cmds;
-  const restartCmd = cmds.find(c => c.includes(" restart -- "));
-  if (!restartCmd) return cmds;
-  // #347 review finding G2: `|| true`, because the caller joins this list with " && ".
-  //
-  // Without it, a `reset-failed` that exits non-zero SUPPRESSES the restart behind it — which is
-  // F5's own failure mode arriving one command earlier: the thing added to un-wedge a stuck unit
-  // would itself prevent the recovery. And it genuinely can exit non-zero (no such unit under this
-  // scope, no running user manager / missing XDG_RUNTIME_DIR — the same conditions runRollback's
-  // MED-E note already documents for `systemctl --user daemon-reload`).
-  //
-  // Deliberately different from the rest of the chain, and that is the point: the launchd pair IS
-  // sequential — `bootstrap` should not run if `bootout` genuinely failed — so " && " stays right
-  // for it. This one command is best-effort housekeeping ahead of the real action. Written as a
-  // suffix on the command rather than as a special separator in the join, so a future edit to the
-  // joining code cannot silently drop it. Precedence is safe: `A || true && B` parses as
-  // `(A || true) && B`, and `(A || true)` always succeeds, so B always runs. Same `|| true` idiom
-  // the repo already uses on the resolved bootout (scripts/lib/restart-unit.mjs:865).
-  return [`${restartCmd.replace(" restart -- ", " reset-failed -- ")} || true`, ...cmds];
 }
 
 // #381 review finding F4. "Will anything start the service on its own?" — answered per plan shape,

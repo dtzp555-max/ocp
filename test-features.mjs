@@ -8900,6 +8900,100 @@ test("#356 F3 (#388 round 3): the restore budget is per shape, and the systemd s
     `while bootstrap — the transiently-failing one — is retried in both passes; got calls=${JSON.stringify(mac.calls)}`);
 });
 
+test("#356 F3 (#388 round 3 F1): the restore's BACKOFF reaches execRestartRetry, not just restoreRetryBudget", async () => {
+  // #388 review finding F1. The test above pins the backoff at the HELPER — `restoreRetryBudget`'s
+  // returned `backoffMs` — and the commit message claimed that "proves the backoff is part of the
+  // decision and not decoration". It does not. The reviewer mutated the same property ONE LAYER OUT,
+  // at the call site:
+  //
+  //     await execRestartRetry(c.cmd, { ...restoreBudget, backoffMs: 0, run: runShell });
+  //
+  // and the whole suite stayed green — `1165 passed, 0 failed`, exit 0. The cause is structural, not
+  // a coverage gap that happened to be missed: `restartBackoffMs` appeared in the entire suite
+  // EXACTLY TWICE, `_u347Opts` and `_u352Opts`, and both pinned it to 0 (deliberately, so the suite
+  // does not sleep). So `restoreBudget.backoffMs` was 0 in every end-to-end test no matter what the
+  // helper returned, and a NON-ZERO restore backoff was unobservable by construction. Every backoff
+  // assertion in the repo was a `restoreRetryBudget(...)` deepEqual on the return value.
+  //
+  // That gap sits directly under this PR's load-bearing claim — "three INSTANT retries would be the
+  // low-yield fourth immediate attempt this decision rejects; the delay is what lets a transient
+  // clear". A refactor could drop the delay and keep the count, and nothing would go red.
+  //
+  // Pinned BEHAVIOURALLY through the operator-facing message, which `execRestartRetry` deliberately
+  // formats from the delay it is about to sleep for rather than from a hard-coded `${i}s` (see its
+  // own comment: "a message that says 1s while sleeping 0 is a small lie in exactly the place an
+  // operator reads to judge how long the command has been trying"). Reading it back is therefore
+  // reading the real value. `restartBackoffMs: 50` costs ~300ms of real sleep across both passes,
+  // which is why this is one test and not a change to the shared fixtures.
+  assert.equal(RESTART_ATTEMPTS, 3,
+    "premise: the literal delay strings below are written for a 3-attempt budget (i*50ms => 0.05s, 0.1s)");
+
+  // WHY A DEDICATED RUNNER INSTEAD OF `_u347Runner`, and why the lines are identified by TAG rather
+  // than by position. `test()` does NOT await an async body (:51-73) — it collects the promise and
+  // moves on — so every async test in this file is in flight at once, and a global `console.error`
+  // spy captures a SHARED, INTERLEAVED stream. The first draft of this test anchored on the restore
+  // pass's own markers and sliced between them, which is the idiom #347's G2 lesson prescribes; it
+  // failed on the first run with **twelve** foreign `retrying in 0s` lines inside the window, from
+  // concurrent tests driving this same path under the fixtures' `restartBackoffMs: 0`. Anchoring by
+  // index is the right defence against a MISSING marker and no defence at all against a marker that
+  // is present but belongs to somebody else.
+  //
+  // So identity comes from the data instead: this runner puts a unique tag, plus which pass it is
+  // in, into the failure detail — the string `execRestartRetry` interpolates into the very message
+  // being read. A line either carries this test's tag or it is not this test's line, no matter who
+  // else is writing to the stream or in what order.
+  const TAG = "u388f1";
+  const calls = [];
+  let bootouts = 0;
+  const run = (cmd) => {
+    calls.push(cmd);
+    if (cmd.includes("launchctl bootout")) { bootouts++; return ""; }
+    if (cmd.includes("launchctl bootstrap")) {
+      // `bootouts` is 1 throughout the forward loop and 2 throughout the restoration pass, because
+      // the restore re-runs the WHOLE plan (`restartCmds.slice(0)`) and its tear-down lands first.
+      const detail = `${TAG}-${bootouts >= 2 ? "restore" : "forward"}`;
+      throw Object.assign(new Error(detail), { status: 5, stderr: Buffer.from(detail) });
+    }
+    return "";
+  };
+
+  const lines = [];
+  const savedErr = console.error;
+  let caught = null;
+  try {
+    // Records AND forwards. A spy that only records would delete every other in-flight test's
+    // stderr from the run output for the ~300ms this one holds it — invisible while green, and
+    // exactly the diagnostics a reader wants when something else fails during that window.
+    console.error = (...a) => { lines.push(a.join(" ")); savedErr(...a); };
+    try { await runUpgrade(_u347Opts({ execFn: run, mockProbe: _u347Unreachable, restartBackoffMs: 50 })); }
+    catch (e) { caught = e; }
+  } finally {
+    console.error = savedErr;
+  }
+  assert.ok(caught, "premise: an unrecoverable restart with a dead probe must throw");
+  assert.equal(calls.filter(c => c.includes("launchctl bootout")).length, 2,
+    `harness premise: BOTH passes must have run their tear-down — that second bootout is what makes ` +
+    `the two retry sets distinguishable at all, so without it the split below is vacuous; ` +
+    `got calls=${JSON.stringify(calls)}`);
+
+  const delaysFor = (pass) => lines
+    .map(l => (new RegExp(`\\(${TAG}-${pass}\\) — retrying in ([0-9.]+)s$`).exec(l) || [])[1])
+    .filter(d => d !== undefined);
+
+  // PREMISE, and it is what makes the assertion below mean "the RESTORE dropped the backoff" rather
+  // than "the fixture never set one": the forward loop — which this test does not guard — must
+  // already be reporting the fixture's rising 50ms.
+  assert.deepEqual(delaysFor("forward"), ["0.05", "0.1"],
+    "harness premise: `restartBackoffMs: 50` must reach the FORWARD restart loop with a rising delay");
+
+  // THE ASSERTION. `restoreRetryBudget` RETURNING the backoff is not the property under test; the
+  // backoff ARRIVING at `execRestartRetry` is.
+  assert.deepEqual(delaysFor("restore"), ["0.05", "0.1"],
+    "the RESTORE pass must retry with the same rising backoff the forward loop uses — `0, 0` here is " +
+    "the launchd exemption degraded to three INSTANT retries, which is the low-yield immediate attempt " +
+    "#356 F3 explicitly rejects, and it is invisible to every `restoreRetryBudget` deepEqual");
+});
+
 test("#356 F7: `success with no measurement` is expressible ONLY for the all-mock lane, and the dangerous half throws", async () => {
   // Decided: yes, for the bookkeeping lane only. It is unreachable in production (the post-flight
   // gate is `opts.mockProbe || !opts.mockExec`, and `mockExec` is test-only), the absence of a
