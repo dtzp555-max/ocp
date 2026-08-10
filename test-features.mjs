@@ -4316,7 +4316,7 @@ ltTest("replay premise (LIVE): a real server.mjs whose FIRST probe dies on a sig
 // drift apart — a fixture difference would silently change what "the snapshot" means.
 import {
   makeB2Fixture, probeB2KeySets, responseKeyPaths, parseB2Inventory, diffB2KeySets,
-  readB2Snapshot, ALIGNMENT_PATH, B2_PROFILES,
+  readB2Snapshot, ALIGNMENT_PATH, B2_PROFILES, B2_PROBE_PLAN,
 } from "./scripts/b2-key-snapshot.mjs";
 
 console.log("\nClass B.2 response key-set snapshot (#346):");
@@ -4363,8 +4363,8 @@ test("parseB2Inventory: reads ALIGNMENT.md's real inventory, expands multi-metho
   assert.ok(pairs.length >= 12,
     `anchor drift: only ${pairs.length} B.2 pairs parsed out of ALIGNMENT.md's inventory table`);
   assert.ok(pairs.includes("GET /health"), `expected GET /health among ${JSON.stringify(pairs)}`);
-  assert.ok(pairs.includes("GET /sessions") && pairs.includes("DELETE /sessions"),
-    "a 'GET, DELETE' row must expand into one pair per method");
+  assert.ok(pairs.includes("GET /settings") && pairs.includes("PATCH /settings"),
+    "a 'GET, PATCH' row must expand into one pair per method");
   assert.ok(pairs.includes("PATCH /api/keys/:id/quota"), "the :id rows must survive verbatim");
   assert.ok(!pairs.some(p => p.endsWith("/v1/chat/completions") || p.endsWith("/v1/models")),
     `B.1 rows must not be treated as B.2: ${JSON.stringify(pairs)}`);
@@ -4704,6 +4704,113 @@ function ltNaiveCorruptOffsets(buf) {
 }
 
 const LT_U8_TWO = "é";    // U+00E9   C3 A9           — Latin-1 supplement, 2 bytes
+// ── ADR 0016: the dead session surface is GONE (issue #355) ──────────────────
+// Every assertion below is BEHAVIOURAL — a live server.mjs answering a real request — because a
+// removal is exactly the change a source-grep test cannot police: grepping for the absence of a
+// token passes just as well when the handler is still registered under a different spelling.
+//
+// The mutations that prove each of these can fail are recorded in the PR body; each one RESTORES
+// a piece of the surface (re-registering a handler, putting a key back in a response, re-adding
+// `sessionTTL` to SETTINGS_SCHEMA) and the named test goes red.
+console.log("\nADR 0016 — removal of the dead session surface (#355):");
+
+test("ADR 0016: ALIGNMENT.md's B.2 inventory no longer lists /sessions", () => {
+  const pairs = parseB2Inventory(_ltRead(ALIGNMENT_PATH, "utf8"));
+  // Anchor-drift guard first: a parser that read no rows would satisfy every "does not include"
+  // assertion below vacuously.
+  assert.ok(pairs.length >= 12,
+    `anchor drift: only ${pairs.length} B.2 pairs parsed out of ALIGNMENT.md's inventory table`);
+  assert.ok(!pairs.includes("GET /sessions"), `GET /sessions is still in the inventory: ${JSON.stringify(pairs)}`);
+  assert.ok(!pairs.includes("DELETE /sessions"), `DELETE /sessions is still in the inventory: ${JSON.stringify(pairs)}`);
+});
+
+test("ADR 0016: the B.2 probe plan carries no /sessions probe, so the inventory and the plan agree", () => {
+  const names = B2_PROBE_PLAN.map(p => p.name);
+  assert.ok(names.length >= 12, `anchor drift: only ${names.length} probes in the plan`);
+  assert.ok(!names.some(n => n.endsWith(" /sessions")), `a /sessions probe survives: ${JSON.stringify(names)}`);
+});
+
+ltTest("integration (ADR 0016): the whole session surface is gone from the wire, and CLAUDE_SESSION_TTL is inert rather than fatal", async () => {
+  if (!LT_POSIX) return;
+  const dir = ltMkdir(); const fake = ltFake(dir);
+  // CLAUDE_SESSION_TTL is deliberately still EXPORTED. An operator's env file or launchd plist
+  // may still carry it after upgrading, and the removal must not turn that into a boot failure.
+  // This also makes the boot-banner assertion below meaningful: the value is present, so a
+  // surviving `Sessions: TTL=` line would have something to print.
+  const { child, buf, port } = await ltBootFresh({ CLAUDE_BIN: fake, CLAUDE_SESSION_TTL: "60000" }, dir);
+  try {
+    assert.ok(await ltWait(() => buf.out.includes("listening on")),
+      `did not start with CLAUDE_SESSION_TTL set — the var must be inert, not fatal: ${buf.err.slice(0, 400)}`);
+
+    const req = async (method, path, body) => {
+      const r = await fetch(`http://127.0.0.1:${port}${path}`, {
+        method,
+        headers: body === undefined ? {} : { "Content-Type": "application/json" },
+        body: body === undefined ? undefined : JSON.stringify(body),
+      });
+      const text = await r.text();
+      let json = null; try { json = JSON.parse(text); } catch { /* non-JSON */ }
+      return { status: r.status, json, text };
+    };
+
+    // Premise, measured before anything below is trusted: this server answers at all. Without it
+    // every "is 404" assertion would also pass against a dead port.
+    const health = await req("GET", "/health");
+    assert.equal(health.status, 200, `premise: /health did not answer 200, got ${health.status}`);
+
+    // 1. Both endpoints are unrouted. 404 is not assumed — it is what this router already gave
+    //    for an unknown path, and what POST /sessions gave before the removal.
+    for (const [method, path] of [["GET", "/sessions"], ["DELETE", "/sessions"]]) {
+      const r = await req(method, path);
+      assert.equal(r.status, 404, `${method} ${path} must be unrouted, got ${r.status} ${r.text.slice(0, 200)}`);
+    }
+    const unknown = await req("GET", "/definitely-not-a-route");
+    assert.equal(unknown.status, 404, "control: an unknown path is 404, so the two above are the SAME answer");
+    assert.ok(!unknown.json.error.includes("/sessions"),
+      `the 404's endpoint list still advertises /sessions: ${unknown.json.error}`);
+
+    // 2. The response keys are gone from every endpoint that carried them.
+    assert.ok(!Object.hasOwn(health.json, "sessions"), "/health still returns a `sessions` array");
+    assert.ok(!Object.hasOwn(health.json.config, "sessionTTL"), "/health still returns `config.sessionTTL`");
+    const status = await req("GET", "/status");
+    assert.equal(status.status, 200, "premise: /status answered");
+    assert.ok(!Object.hasOwn(status.json.proxy, "activeSessions"), "/status still returns `proxy.activeSessions`");
+    const settings = await req("GET", "/settings");
+    assert.equal(settings.status, 200, "premise: /settings answered");
+    assert.ok(!Object.hasOwn(settings.json, "sessionTTL"), "GET /settings still reports `sessionTTL`");
+
+    // 3. sessionTTL was WRITABLE, so this removes an accepted REQUEST field too. ADR 0016 asks
+    //    that it be rejected explicitly rather than ignored, "so a caller learns rather than
+    //    guesses" — i.e. the caller must be able to tell refusal from silent acceptance.
+    const patched = await req("PATCH", "/settings", { sessionTTL: 120000 });
+    assert.equal(patched.status, 400, `PATCH sessionTTL must be REFUSED, got ${patched.status}`);
+    assert.ok(patched.json.errors.some(e => e.includes("sessionTTL")),
+      `the refusal must NAME the field, got ${JSON.stringify(patched.json.errors)}`);
+    assert.ok(!Object.hasOwn(patched.json.current, "sessionTTL"),
+      "the echoed `current` block must not reintroduce the field the PATCH was refused for");
+
+    // The refusal is the SAME one any unknown key gets — no bespoke second way of saying no.
+    const bogus = await req("PATCH", "/settings", { notASetting: 1 });
+    assert.equal(bogus.status, 400, "control: an unknown key is also 400");
+    assert.equal(patched.json.results.sessionTTL.error.replace("sessionTTL", "notASetting"),
+      bogus.json.results.notASetting.error,
+      "sessionTTL must be refused by the generic unknown-key path, not a special-cased branch");
+
+    // And a partial PATCH still applies the valid key while refusing this one (207), so a caller
+    // mixing the two is not silently rolled back.
+    const mixed = await req("PATCH", "/settings", { timeout: 600000, sessionTTL: 120000 });
+    assert.equal(mixed.status, 207, `a mixed valid/removed PATCH must be 207, got ${mixed.status}`);
+    assert.equal(mixed.json.results.timeout.ok, true, "the valid key in a mixed PATCH must still apply");
+
+    // 4. The boot banner no longer prints a TTL for a reaper that no longer exists.
+    assert.ok(!/^Sessions:/m.test(buf.out),
+      `the boot banner still prints a Sessions line: ${buf.out.split("\n").filter(l => /Session/.test(l)).join(" | ")}`);
+  } finally {
+    child.kill("SIGKILL");
+    await ltDrain(() => buf.closed, "adr0016-session-removal", 5000);
+  }
+});
+
 const LT_U8_THREE = "你"; // U+4F60   E4 BD A0        — CJK, 3 bytes
 const LT_U8_FOUR = "🙂";  // U+1F642  F0 9F 99 82     — astral, 4 bytes / 2 UTF-16 units
 
@@ -18247,7 +18354,7 @@ function _bwHarnessRun({
   openclawFailExit = undefined,
   openclawFailOutput = undefined,
   // Issue #242: generic curl response fixtures for the nine read-only display commands
-  // (usage/logs/models/sessions/clear/keys/settings), none of which existed as a harness
+  // (usage/logs/models/keys/settings), none of which existed as a harness
   // capability before this issue (every prior call site here only ever needed the `/health`
   // arm). Each entry is `{ match, body, exit }`: `match` is matched as a `case "$*" in
   // *"<match>"*)` substring against curl's full argv (so it discriminates by URL/path, same
@@ -18474,7 +18581,7 @@ function _bwHarnessRun({
     //
     // Issue #242: curlResponses (see its own doc comment above) adds arbitrary fixture arms,
     // checked BEFORE "/health" and the default refusal, for the nine display commands' own
-    // curl calls (/api/usage, /usage, /logs, /v1/models, /sessions, /api/keys, /settings).
+    // curl calls (/api/usage, /usage, /logs, /v1/models, /api/keys, /settings).
     //
     // Issue #261: curlAbsent simulates "curl is not on $PATH" the SAME way pythonAbsent already
     // simulates "python3 is not on $PATH" a few lines below (see that stub's own comment: "a
@@ -18854,7 +18961,7 @@ test("#236 control: cmd_update with python3 PRESENT reaches the kind dispatch an
 
 // ═════════════════════════════════════════════════════════════════════════════
 // Issue #242 (audit follow-up to #236): nine MORE `<curl-or-var> | python3 -c "..."` call sites
-// across the read-only display commands (usage/logs/models/sessions/clear/keys/settings) have
+// across the read-only display commands (usage/logs/models/keys/settings) have
 // the identical shape #236 fixed exactly once for cmd_update's own doctor-json formatter — a
 // bare pipeline, not inside an if/while, that `set -euo pipefail` (ocp:7) kills SILENTLY the
 // instant python3 exits non-zero, whether because python3 is missing (exit 127) or because the
@@ -18867,9 +18974,10 @@ test("#236 control: cmd_update with python3 PRESENT reaches the kind dispatch an
 // Each site below gets two tests: the MONEY test (pythonAbsent:true — must NOT reproduce #236's
 // signature of silent death, and must show the raw data, not a blank screen) and a CONTROL test
 // (real python3 — the formatted, happy-path output must be byte-for-byte unaffected by this
-// fix). Two representative sites (cmd_clear, cmd_keys add — chosen because one is the
-// "underlying mutation already happened, only reporting fails" case and the other is the
-// highest-stakes "only view of a value" case) also get a THIRD test proving the fallback also
+// fix). Two representative sites (cmd_models, cmd_keys add — chosen because one is an ordinary
+// read-only display command and the other is the highest-stakes "only view of a value" case;
+// the first of the two was `cmd_clear` until ADR 0016 removed that command, and its third test
+// was re-hosted onto cmd_models rather than retired) also get a THIRD test proving the fallback also
 // catches a REAL (non-stubbed) python3 crashing on malformed JSON, not merely "python3 missing"
 // — this is real /usr/bin/python3 on this harness's scratch $PATH, not a fake stub, genuinely
 // exercising `json.loads` raising a `JSONDecodeError`.
@@ -18958,42 +19066,18 @@ test("#242 control: cmd_models with python3 PRESENT still prints the formatted l
   assert.equal(r.stdout.trim(), "claude-sonnet-5-marker", `expected the formatted model id line, got: ${JSON.stringify(r.stdout)}`);
 });
 
-test("#242 cmd_sessions: absent python3 shows the raw sessions JSON instead of dying silently", () => {
-  const body = JSON.stringify({ sessions: [{ id: "abcdefabcdefabcdef0123456789", model: "claude-sonnet-5", messages: 3, lastUsed: "2026-08-01T00:00:00Z" }] });
-  const r = _bwHarnessRun({ args: ["sessions"], pythonAbsent: true, curlResponses: [{ match: "/sessions", body }] });
-  assert.ok(!(r.status === 127 && r.stdout === ""), `must not reproduce #236's silent-127 signature; status=${r.status} stdout=${JSON.stringify(r.stdout)}`);
-  assert.ok(r.stderr.includes("python3 is unavailable or failed to format the response"), `expected the _pyfail warning, got: ${JSON.stringify(r.stderr)}`);
-  assert.ok(r.stdout.includes("abcdefabcdefabcdef0123456789"), `expected the raw sessions JSON on stdout, got: ${JSON.stringify(r.stdout)}`);
-});
-
-test("#242 control: cmd_sessions with python3 PRESENT still prints the formatted session row", () => {
-  const body = JSON.stringify({ sessions: [{ id: "abcdefabcdefabcdef0123456789", model: "claude-sonnet-5", messages: 3, lastUsed: "2026-08-01T00:00:00Z" }] });
-  const r = _bwHarnessRun({ args: ["sessions"], curlResponses: [{ match: "/sessions", body }] });
-  assert.equal(r.status, 0, `expected a clean exit, got status=${r.status} stderr=${r.stderr}`);
-  assert.ok(r.stdout.includes("model=claude-sonnet-5"), `expected the formatted session row, got: ${JSON.stringify(r.stdout)}`);
-});
-
-test("#242 cmd_clear: absent python3 still reports the clear happened (the DELETE already ran) with the raw count JSON, not a silent death", () => {
-  const r = _bwHarnessRun({ args: ["clear"], pythonAbsent: true, curlResponses: [{ match: "/sessions", body: JSON.stringify({ cleared: 7 }) }] });
-  assert.ok(!(r.status === 127 && r.stdout === ""), `must not reproduce #236's silent-127 signature; status=${r.status} stdout=${JSON.stringify(r.stdout)}`);
-  assert.ok(r.stderr.includes("Sessions were cleared, but the count could not be formatted"), `expected the clear-specific fallback message (not a generic one), got stderr=${JSON.stringify(r.stderr)}`);
-  assert.ok(r.stdout.includes('"cleared": 7') || r.stdout.includes('"cleared":7') || r.stdout.includes("cleared"), `expected the raw {"cleared":7} JSON on stdout, got: ${JSON.stringify(r.stdout)}`);
-});
-
-test("#242 control: cmd_clear with python3 PRESENT still prints 'Cleared N sessions.'", () => {
-  const r = _bwHarnessRun({ args: ["clear"], curlResponses: [{ match: "/sessions", body: JSON.stringify({ cleared: 7 }) }] });
-  assert.equal(r.status, 0, `expected a clean exit, got status=${r.status} stderr=${r.stderr}`);
-  assert.ok(r.stdout.includes("Cleared 7 sessions."), `expected the formatted count line, got: ${JSON.stringify(r.stdout)}`);
-});
-
-test("#242 cmd_clear: python3 PRESENT but the response is malformed JSON — the fallback fires for a REAL crash, not just a missing binary", () => {
+// #242 / ADR 0016: this test used to run against `ocp clear`, which is gone with DELETE
+// /sessions. Its SUBJECT was never sessions — it is that `_pyfail`'s `||` guard keys on the
+// PIPELINE's exit status rather than on "is python3 on PATH", a property every display command
+// shares. Re-hosted onto `ocp models` instead of deleted, because deleting it would have
+// retired the only coverage of that distinction.
+test("#242 cmd_models: python3 PRESENT but the response is malformed JSON — the fallback fires for a REAL crash, not just a missing binary", () => {
   // Real (unstubbed) /usr/bin/python3 on this harness's scratch $PATH — json.loads() genuinely
   // raises json.decoder.JSONDecodeError on this body, a different failure mode than
-  // pythonAbsent:true's exit-127 stub. Proves _pyfail's `||` guard is keyed on the PIPELINE's
-  // exit status, not merely "is python3 on PATH".
-  const r = _bwHarnessRun({ args: ["clear"], curlResponses: [{ match: "/sessions", body: "not-json-at-all" }] });
+  // pythonAbsent:true's exit-127 stub.
+  const r = _bwHarnessRun({ args: ["models"], curlResponses: [{ match: "/v1/models", body: "not-json-at-all" }] });
   assert.notEqual(r.status, 0, `a malformed response must not be silently reported as success; status=${r.status}`);
-  assert.ok(r.stderr.includes("Sessions were cleared, but the count could not be formatted"), `expected the clear-specific fallback message, got stderr=${JSON.stringify(r.stderr)}`);
+  assert.ok(r.stderr.includes("Could not format model list"), `expected the models-specific fallback label, got stderr=${JSON.stringify(r.stderr)}`);
   assert.ok(r.stdout.includes("not-json-at-all"), `expected the raw (malformed) response echoed back, got: ${JSON.stringify(r.stdout)}`);
 });
 
@@ -19082,7 +19166,7 @@ test("#242 (10th site) control: cmd_keys list with a genuinely unreachable proxy
 test("#242 cmd_settings (GET): absent python3 shows the raw settings JSON instead of dying silently", () => {
   const body = JSON.stringify({
     timeout: { value: 60000, unit: "ms", desc: "x" }, firstByteTimeout: { value: 15000, unit: "ms", desc: "x" },
-    maxConcurrent: { value: 4, unit: "", desc: "x" }, sessionTTL: { value: 600000, unit: "ms", desc: "x" },
+    maxConcurrent: { value: 4, unit: "", desc: "x" },
     maxPromptChars: { value: 100000, unit: "", desc: "x" },
     tiers: { opus: { base: 30000, perPromptChar: 0.001 }, sonnet: { base: 20000, perPromptChar: 0.0005 }, haiku: { base: 15000, perPromptChar: 0.0002 } },
   });
@@ -19095,7 +19179,7 @@ test("#242 cmd_settings (GET): absent python3 shows the raw settings JSON instea
 test("#242 control: cmd_settings (GET) with python3 PRESENT still prints the formatted panel", () => {
   const body = JSON.stringify({
     timeout: { value: 60000, unit: "ms", desc: "x" }, firstByteTimeout: { value: 15000, unit: "ms", desc: "x" },
-    maxConcurrent: { value: 4, unit: "", desc: "x" }, sessionTTL: { value: 600000, unit: "ms", desc: "x" },
+    maxConcurrent: { value: 4, unit: "", desc: "x" },
     maxPromptChars: { value: 100000, unit: "", desc: "x" },
     tiers: { opus: { base: 30000, perPromptChar: 0.001 }, sonnet: { base: 20000, perPromptChar: 0.0005 }, haiku: { base: 15000, perPromptChar: 0.0002 } },
   });
@@ -19106,7 +19190,7 @@ test("#242 control: cmd_settings (GET) with python3 PRESENT still prints the for
 });
 
 // ── Independent review, PR #252 round 1, fix 3: the "Error: proxy unreachable" guards THIS PR
-// introduced (logs/models/sessions/settings/clear/keys-revoke) used to write to stdout, unlike
+// introduced (logs/models/settings/keys-revoke) used to write to stdout, unlike
 // `cmd_usage`'s own PRE-EXISTING guards (left untouched, per the review — see the money/control
 // tests above, none of which touch that wording). `ocp models` piped into a consumer would read
 // a stdout error line as data. No `curlResponses` entry is registered for the relevant URL below,
@@ -19128,22 +19212,8 @@ test("#242 fix-3 cmd_models: 'Error: proxy unreachable' goes to stderr, stdout s
   assert.equal(r.stdout, "", `stdout must stay clean; got: ${JSON.stringify(r.stdout)}`);
 });
 
-test("#242 fix-3 cmd_sessions: 'Error: proxy unreachable' goes to stderr, stdout stays empty", () => {
-  const r = _bwHarnessRun({ args: ["sessions"] });
-  assert.notEqual(r.status, 0);
-  assert.ok(r.stderr.includes("Error: proxy unreachable"), `expected the message on stderr, got: ${JSON.stringify(r.stderr)}`);
-  assert.equal(r.stdout, "", `stdout must stay clean; got: ${JSON.stringify(r.stdout)}`);
-});
-
 test("#242 fix-3 cmd_settings (GET): 'Error: proxy unreachable' goes to stderr, stdout stays empty", () => {
   const r = _bwHarnessRun({ args: ["settings"] });
-  assert.notEqual(r.status, 0);
-  assert.ok(r.stderr.includes("Error: proxy unreachable"), `expected the message on stderr, got: ${JSON.stringify(r.stderr)}`);
-  assert.equal(r.stdout, "", `stdout must stay clean; got: ${JSON.stringify(r.stdout)}`);
-});
-
-test("#242 fix-3 cmd_clear: 'Error: proxy unreachable' goes to stderr, stdout stays empty", () => {
-  const r = _bwHarnessRun({ args: ["clear"] });
   assert.notEqual(r.status, 0);
   assert.ok(r.stderr.includes("Error: proxy unreachable"), `expected the message on stderr, got: ${JSON.stringify(r.stderr)}`);
   assert.equal(r.stdout, "", `stdout must stay clean; got: ${JSON.stringify(r.stdout)}`);
@@ -19477,36 +19547,6 @@ test("#278 fold-in (exit 126 coverage): cmd_models with curl present but NOT EXE
 
 test("#278 control: cmd_models with curl present but the proxy genuinely unreachable still says 'proxy unreachable'", () => {
   const r = _bwHarnessRun({ args: ["models"] });
-  assert.notEqual(r.status, 0, `expected a nonzero exit; status=${r.status}`);
-  assert.ok(r.stderr.includes("Error: proxy unreachable"),
-    `a GENUINE network failure must still be reported as such, got stderr=${JSON.stringify(r.stderr)}`);
-});
-
-test("#278 cmd_sessions: curl missing from $PATH must be reported as a local fault, not 'proxy unreachable'", () => {
-  const r = _bwHarnessRun({ args: ["sessions"], curlAbsent: true });
-  assert.notEqual(r.status, 0, `expected a nonzero exit; status=${r.status}`);
-  assert.ok(!r.stderr.includes("proxy unreachable") && !r.stdout.includes("proxy unreachable"),
-    `must NOT misattribute a missing curl binary to the proxy; stderr=${JSON.stringify(r.stderr)} stdout=${JSON.stringify(r.stdout)}`);
-  assert.ok(/curl/i.test(r.stderr), `expected the message to name curl/the local command failure, got stderr=${JSON.stringify(r.stderr)}`);
-});
-
-test("#278 control: cmd_sessions with curl present but the proxy genuinely unreachable still says 'proxy unreachable'", () => {
-  const r = _bwHarnessRun({ args: ["sessions"] });
-  assert.notEqual(r.status, 0, `expected a nonzero exit; status=${r.status}`);
-  assert.ok(r.stderr.includes("Error: proxy unreachable"),
-    `a GENUINE network failure must still be reported as such, got stderr=${JSON.stringify(r.stderr)}`);
-});
-
-test("#278 cmd_clear: curl missing from $PATH must be reported as a local fault, not 'proxy unreachable'", () => {
-  const r = _bwHarnessRun({ args: ["clear"], curlAbsent: true });
-  assert.notEqual(r.status, 0, `expected a nonzero exit; status=${r.status}`);
-  assert.ok(!r.stderr.includes("proxy unreachable") && !r.stdout.includes("proxy unreachable"),
-    `must NOT misattribute a missing curl binary to the proxy; stderr=${JSON.stringify(r.stderr)} stdout=${JSON.stringify(r.stdout)}`);
-  assert.ok(/curl/i.test(r.stderr), `expected the message to name curl/the local command failure, got stderr=${JSON.stringify(r.stderr)}`);
-});
-
-test("#278 control: cmd_clear with curl present but the proxy genuinely unreachable still says 'proxy unreachable'", () => {
-  const r = _bwHarnessRun({ args: ["clear"] });
   assert.notEqual(r.status, 0, `expected a nonzero exit; status=${r.status}`);
   assert.ok(r.stderr.includes("Error: proxy unreachable"),
     `a GENUINE network failure must still be reported as such, got stderr=${JSON.stringify(r.stderr)}`);
@@ -20900,7 +20940,6 @@ function rpStatus(shape) {
     proxy: {
       status: h.status, version: h.version, uptime: h.uptimeHuman,
       auth: h.auth.ok ? "ok" : h.auth.message,
-      activeSessions: 0,
     },
     requests: { total: 12, active: 0, errors: 0, timeouts: 0 },
   };
