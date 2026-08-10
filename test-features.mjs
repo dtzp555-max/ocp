@@ -3198,6 +3198,111 @@ printf '%s\\n' '{"type":"result"}'
 exit 0
 `;
 function ltAuthFake(dir) { const p = join(dir, "claude-auth"); _ltWrite(p, LT_AUTH_FAKE); _ltChmod(p, 0o755); return p; }
+
+// ── TUI live-boot fixture: a STUB tmux that can drive one COMPLETE interactive turn ──────
+//
+// The existing stub (scripts/b2-key-snapshot.mjs's FIXTURE_TMUX) is `exit 1` — enough to prove
+// nothing spawns, not enough to reach any code past `tui_spawn_failed`. This one succeeds, so a
+// live `server.mjs` under CLAUDE_TUI_MODE=true runs callClaudeTui end to end and returns 200.
+//
+// IT MUST NEVER TOUCH A REAL TMUX. Two independent reasons, both already paid for in this repo:
+// server.mjs's TUI boot reap issues `kill-server` (server.mjs's listen callback →
+// reapStaleTuiSessions), which against the operator's real tmux would destroy their sessions; and
+// AGENTS.md records a review that took production down through exactly this class of test. The
+// mechanism is the same one #357's review settled for the B.2 snapshot: pin OCP_TUI_TMUX_BIN
+// rather than rely on PATH order, because lib/tui/session.mjs:54 resolves
+// `process.env.OCP_TUI_TMUX_BIN || "tmux"` at module load and that variable is the only thing
+// that can win against a tmux on PATH. Callers get the pin from `env` below; they must spread it.
+//
+// HOW THE TURN COMPLETES, i.e. which of the driver's positive checks this stub has to satisfy:
+//   - `new-session` must exit 0, or bootTuiPane throws tui_spawn_failed before any wait.
+//   - `capture-pane` must render BOTH an input bar and the landed prompt, because the driver
+//     polls tuiInputReady() at boot and then tuiPromptLanded() after the paste, and each is a
+//     POSITIVE check that fast-fails. The two-line payload below satisfies both at once — it is
+//     copied from makeTmuxRecorder (the in-process fake), so the two harnesses agree.
+//   - a TERMINAL transcript must exist at <pane HOME>/.claude/projects/*/<session-id>.jsonl, or
+//     readTuiTranscript spins to the 120s wallclock and the turn is rejected as truncated.
+//     MEASURED, not assumed: with `stop_reason` omitted the first cut of this fixture produced
+//     `tui_wallclock_truncated` with chars:4 — the text was found and the line was simply not
+//     terminal (isTerminalLine requires message.stop_reason ∈ TERMINAL_STOP_REASONS,
+//     lib/tui/transcript.mjs:57). `entrypoint` (NOT `cc_entrypoint`) is what verifyEntrypoint
+//     reads (:117), and omitting it logs a tui_entrypoint_mismatch that is harmless but noisy.
+//
+// The session-id is minted inside `server.mjs` (randomUUID, per pane) so the harness cannot know
+// it in advance. The stub recovers it from the pane command's own `--session-id` (session.mjs:537)
+// and writes the transcript under $HOME — which is the PANE's home, because bootTuiPane sets
+// env.HOME = ehome on the spawnSync. That is why this needs no knowledge of resolveTuiHome().
+//
+// `hang` (#362) inverts exactly one thing: the transcript is NEVER written, so
+// readTuiTranscript's poll loop never sees a terminal marker and the turn stays IN FLIGHT until
+// the 120 s wallclock. That is the state #362 is about, and it is reached by OMITTING work rather
+// than by adding a delay — no sleep to race, and the pane is genuinely held the whole time.
+// MEASURED rather than assumed: with the file absent, `findTranscriptPath` returns null and the
+// loop keeps polling (it throws `tui_transcript_timeout` only at the cap), so a test that signals
+// well before 120 s always finds the turn live.
+//
+// `neverReady` (#362 review) stalls the turn one stage EARLIER than `hang`, and the distinction is
+// the whole point of having both. `hang` holds the turn at the TRANSCRIPT wait, which is after
+// `bootTuiPane` has resolved. `neverReady` makes `capture-pane` render a boot splash with no input
+// bar, so `tuiInputReady` stays false and the turn is held INSIDE `bootTuiPane`'s readiness
+// `await` — the window in which the tmux session already exists (new-session is synchronous) but
+// `runTuiTurn` has not yet been handed a pane. BOOT_MS is 4 s by default, which is the size of
+// that window and far longer than a test needs.
+const LT_TUI_TMUX = (logPath, replyText, hang, neverReady) => `#!/bin/sh
+printf '%s\\n' "$*" >> ${JSON.stringify(logPath)}
+case "$1" in
+  new-session)
+    sid=\`printf '%s' "$*" | sed -n 's/.*--session-id \\([0-9a-fA-F-]*\\).*/\\1/p'\`
+    if [ -n "$sid" ] && [ ${hang || neverReady ? "0" : "1"} -eq 1 ]; then
+      mkdir -p "$HOME/.claude/projects/x"
+      printf '%s\\n' '{"type":"assistant","message":{"role":"assistant","stop_reason":"end_turn","content":[{"type":"text","text":${JSON.stringify(replyText)}}]},"entrypoint":"cli"}' > "$HOME/.claude/projects/x/$sid.jsonl"
+    fi
+    exit 0 ;;
+  capture-pane)
+${neverReady
+  ? `    printf '%s\\n' ' ✻ Welcome to Claude Code!'\n    printf '%s\\n' ''`
+  : `    printf '%s\\n' '[Pasted text #1 +2 lines]'\n    printf '%s\\n' ' ? for shortcuts'`}
+    exit 0 ;;
+  *) exit 0 ;;
+esac
+`;
+// Returns { bin, log, env, calls() }. `env` carries the pin AND the shape-deciding TUI settings a
+// caller would otherwise have to remember; spread it into ltBootFresh's env.
+// `calls()` is every stub invocation, one argv string per line — the positive evidence that the
+// stub really was the binary server.mjs resolved. An EMPTY log is equally consistent with "the
+// stub was never reached", so tests assert on what IS in it, never only on what is not.
+function ltTuiTmux(dir, replyText = "PONG", { hang = false, neverReady = false } = {}) {
+  const log = join(dir, "tmux-calls.log");
+  _ltWrite(log, "");
+  const bin = join(dir, "tmux-stub");
+  _ltWrite(bin, LT_TUI_TMUX(log, replyText, hang, neverReady));
+  _ltChmod(bin, 0o755);
+  return {
+    bin, log,
+    // The tmux session name this turn's pane was booted under, read back off the stub's own log
+    // (`new-session -d -s <name> …`). Returns null before any pane has booted, so a caller must
+    // assert on it rather than interpolate it blindly — an undefined name would turn the
+    // kill-session assertion below into a comparison against the string "undefined".
+    paneName: () => {
+      const line = (_ltExists(log) ? _ltRead(log, "utf8").split("\n") : []).find(c => c.startsWith("new-session "));
+      const m = line && /(?:^| )-s (\S+)/.exec(line);
+      return m ? m[1] : null;
+    },
+    env: {
+      CLAUDE_TUI_MODE: "true",
+      OCP_TUI_TMUX_BIN: bin,
+      // Pool OFF — the DEFAULT, and the state #362 is about: a cold pane was never in the pool.
+      OCP_TUI_POOL_SIZE: "0",
+      // Empty, not deleted: resolveTuiHome() tests truthiness, so "" takes the same branch as
+      // absent (→ TUI_HOME === HOME) while still overriding a token inherited from the operator's
+      // real environment. Without it, whether this fixture runs in a scratch home or a
+      // <HOME>/.ocp-tui/home scratch depends on the machine the suite happens to run on.
+      CLAUDE_CODE_OAUTH_TOKEN: "",
+    },
+    calls: () => (_ltExists(log) ? _ltRead(log, "utf8").split("\n").filter(Boolean) : []),
+  };
+}
+
 function ltProbeCount(logPath) {
   if (!_ltExists(logPath)) return 0;
   return _ltRead(logPath, "utf8").split("\n").filter(Boolean).length;
@@ -3502,6 +3607,193 @@ ltTest("integration (#308): a completed REQUEST raises the verdict the probe cou
   } finally { child.kill("SIGKILL"); _ltRmRetry(dir); }
 });
 
+// The same claim as the test directly above, ONE LANE OVER. That is the whole point: the
+// mechanism above is correct, tested, and — until #361 — not wired into the TUI lane, which is
+// #339's shape and the reason a green suite proved nothing here. ADR 0014 § C states the rule for
+// "a request that reaches the model and succeeds", unqualified by lane; ADR 0015's table records
+// the consequence as an IMPLEMENTATION OMISSION (route (a)) rather than a contract change, which
+// is why this ships as a behaviour-preserving fix and not with an ADR.
+//
+// Why the failure survived so long, and why the precondition below is built the way it is: the
+// broken direction is the SAFE one. A TUI host that serves every request sits at auth.ok:null,
+// never at a false true, so nothing alarms. Starting from `null` would therefore make a weak test
+// — `null → true` and `null → null` are both quiet. This starts from a CONCLUSIVE ok:false
+// (AUTH_PROBE_MODE=reject), so the pre-state is unambiguous and positively asserted.
+ltTest("integration (#361): a completed TUI-lane request raises the verdict too — ADR 0014 was inapplicable in TUI mode", async () => {
+  if (!LT_POSIX) return;
+  const dir = ltMkdir(); const home = ltMkdir(); const fake = ltAuthFake(dir);
+  const tmux = ltTuiTmux(dir);
+  const { child, buf, port } = await ltBootFresh({
+    ...tmux.env, CLAUDE_BIN: fake, HOME: home, AUTH_PROBE_MODE: "reject",
+  }, dir);
+  try {
+    // Precondition, positively asserted: the PROBE has concluded and it concluded REJECTED.
+    const before = await ltWaitHealth(port, b => b.auth && b.auth.lastOutcome === "rejected", 15000);
+    assert.ok(before, `precondition: the probe must conclude rejected first — ${ltDiag(buf)}`);
+    assert.equal(before.auth.ok, false, "precondition: a conclusive rejection, not an inconclusive null");
+    assert.equal(before.auth.okSource, "probe", "precondition: the verdict is the PROBE's at this point");
+    // Pin the pre-state NON-ZERO, so the post-state assertion below measures a transition rather
+    // than a value that was already 0. Structurally implied by lastOutcome === "rejected" (the
+    // rejection branch increments it), but asserting the implication is what makes the later
+    // `=== 0` a claim about this fix instead of a claim about the fixture.
+    assert.ok(before.auth.consecutiveFailures > 0,
+      `precondition: the rejection tally must have climbed before the request; got ${before.auth.consecutiveFailures}`);
+
+    // The turn must genuinely COMPLETE. Asserting the body — not merely that a request was sent —
+    // is what stops this passing vacuously: a turn rejected by either honesty gate is a 500, and
+    // a 500 would leave auth.ok:false for a reason that has nothing to do with the code under test.
+    const r = await ltPostStatus(port, { model: "sonnet", messages: [{ role: "user", content: "ping" }] });
+    assert.equal(r.status, 200, `the TUI turn must complete — ${r.text.slice(0, 300)} ${ltDiag(buf)}`);
+    assert.match(r.text, /"content":"PONG"/, `and it must be the stub's transcript text — got ${r.text.slice(0, 300)}`);
+
+    // Harness premise: server.mjs really resolved OUR stub. An empty log would be equally
+    // consistent with the real tmux having run instead, which is a predicate passing on a missing
+    // operand (AGENTS.md). `new-session` is the positive form — it is the pane this turn booted.
+    assert.ok(tmux.calls().some(c => c.startsWith("new-session ")),
+      `premise: the stub tmux must be the binary that booted the pane; got ${JSON.stringify(tmux.calls())}`);
+
+    const after = await ltWaitHealth(port, b => b.auth && b.auth.okSource === "request", 15000);
+    assert.ok(after, `a completed TUI request must raise the verdict — ${ltDiag(buf)}`);
+    assert.equal(after.auth.ok, true, "a TUI request that reached the model proves the credential works");
+    assert.equal(after.auth.okSource, "request", "and the verdict records that a REQUEST established it");
+    // ADR 0014's separation, which this fix must not breach: okSource/okAt are the VERDICT's
+    // provenance, lastOutcome/lastCheck stay the PROBE's business. noteAuthVerifiedByRequest
+    // deliberately leaves lastOutcome alone so /health never claims a probe ran when none did —
+    // and the probe here really did conclude "rejected", so that value is still the honest one.
+    assert.equal(after.auth.lastOutcome, "rejected",
+      "the request verdict must NOT overwrite the probe's outcome — that conflation is what ADR 0014 § C separated");
+    // Named consequence, pinned rather than left implicit: noteAuthVerifiedByRequest also clears
+    // consecutiveFailures (server.mjs:1220), so reaching it from the TUI lane now clears a tally
+    // that ADR 0010's degraded verdict reads. The RULE is untouched — >= AUTH_DEGRADE_AFTER is
+    // still what degrades — but the input becomes truthful on a lane where it never moved.
+    assert.equal(after.auth.consecutiveFailures, 0,
+      "a completed request is direct evidence the credential is not being refused, so the rejection tally clears");
+  } finally { child.kill("SIGKILL"); _ltRmRetry(dir); _ltRmRetry(home); }
+});
+
+// #362. The pool has two green tests either side of this state and none on it:
+// "M1b: shutdown drain kills the booting pane SYNCHRONOUSLY" proves cleanup for a pane the pool
+// still owns, and "a pane handed out for a turn leaves the spare set immediately" proves an
+// acquired pane leaves the pool. Both pass, both are correct, and their CONJUNCTION — handed out
+// AND shutdown — is the only state where the defect lives. Both are named above rather than cited
+// by line: the issue pointed at :6899 / :6972, and an earlier revision of THIS comment "fixed"
+// that by substituting the line numbers they held at the time — which were stale again within one
+// merge, landing on an unrelated `assert.equal(pool.warm, 3, …)`. Grep the name, not a number;
+// that is the rule the #361 comment in server.mjs states, and this is the paragraph that proved
+// it by breaking the same way twice.
+//
+// This is deliberately an END-TO-END test against a real `server.mjs` child rather than another
+// pool unit test, because the defect is not IN the pool: it is in the gap between the pool,
+// `activeProcesses`, and `gracefulShutdown`, and only a real shutdown of a real process exercises
+// that gap. The pool fakes cannot reach it by construction.
+//
+// It never touches a real tmux server — `ltTuiTmux` pins OCP_TUI_TMUX_BIN at a scratch stub, and
+// `HOME` is a scratch dir. AGENTS.md records a review that took production OCP down through
+// exactly this class of test, and `server.mjs`'s TUI boot reap issues `kill-server`.
+ltTest("integration (#362): a shutdown landing MID-TURN kills the pane that turn is holding", async () => {
+  if (!LT_POSIX) return;
+  const dir = ltMkdir(); const home = ltMkdir(); const fake = ltFake(dir);
+  // hang: the stub writes no transcript, so the turn blocks in readTuiTranscript and the pane is
+  // genuinely held when the signal arrives.
+  const tmux = ltTuiTmux(dir, "PONG", { hang: true });
+  const { child, buf, port } = await ltBootFresh({ ...tmux.env, CLAUDE_BIN: fake, HOME: home }, dir);
+  try {
+    assert.ok(await ltWait(() => buf.out.includes("listening on")), `did not start: ${ltDiag(buf)}`);
+
+    // Start a turn and do NOT await it — the pane must still be held when the signal lands.
+    // ltPostStatus swallows the transport error the shutdown causes, so this never rejects.
+    const inflight = ltPostStatus(port, { model: "sonnet", messages: [{ role: "user", content: "ping" }] });
+
+    // Two independent positive premises that the turn really is in flight, because "the pane was
+    // never booted" would satisfy the kill-session assertion below vacuously — by leaving nothing
+    // to kill, not by killing it.
+    assert.ok(await ltWait(() => tmux.calls().some(c => c.startsWith("send-keys ")), 20000),
+      `premise: the prompt must have been submitted, i.e. the pane booted and the turn began; ` +
+      `got ${JSON.stringify(tmux.calls())} ${ltDiag(buf)}`);
+    const live = await ltWaitHealth(port, b => b.tui && b.tui.inflight === 1, 20000);
+    assert.ok(live, `premise: /health must report exactly one TUI turn in flight — ${ltDiag(buf)}`);
+
+    const pane = tmux.paneName();
+    assert.ok(pane, `premise: a pane name must be readable from the stub log; got ${JSON.stringify(tmux.calls())}`);
+    const killLine = `kill-session -t ${pane}`;
+    // The discriminating premise. If the pane were ALREADY dead here, the assertion after the
+    // signal would pass without shutdown having done anything — so establish that the only
+    // kill-session that can appear from now on is the one shutdown issues.
+    assert.ok(!tmux.calls().includes(killLine),
+      `premise: the pane must still be alive before the signal, or this test proves nothing; ` +
+      `got ${JSON.stringify(tmux.calls())}`);
+
+    child.kill("SIGTERM");
+    // 'close', not 'exit': a terminated child's stdio may still hold unread data (#203).
+    assert.ok(await ltWait(() => buf.closed, 20000), `the server must exit on SIGTERM — ${ltDiag(buf)}`);
+
+    assert.ok(tmux.calls().includes(killLine),
+      `the pane held by the in-flight turn must be killed BY SHUTDOWN. runTuiTurn's own finally ` +
+      `cannot do it: gracefulShutdown calls process.exit(0) in the same tick whenever ` +
+      `activeProcesses is empty, which on a TUI host it always is — so an unkilled pane here is a ` +
+      `live, interactive, AUTHENTICATED claude outliving OCP. Expected ${JSON.stringify(killLine)} ` +
+      `in ${JSON.stringify(tmux.calls())}`);
+    await inflight;
+  } finally { child.kill("SIGKILL"); _ltRmRetry(dir); _ltRmRetry(home); }
+});
+
+// #362, second window — found by this PR's own independent review, and it is the SAME defect the
+// first fix left one stage earlier. `bootTuiPane` creates the tmux session SYNCHRONOUSLY and then
+// awaits readiness for up to BOOT_MS (4 s default); the first cut registered the pane only after
+// that await returned, so for the whole boot window the session was live, never in the pool (a
+// cold boot never is), and absent from `activeProcesses`. Owned by nothing, exactly as before.
+//
+// Worth its own test rather than folding into the one above, because the two stall the turn at
+// different stages and only this one exercises the pre-boot registration: the test above holds the
+// turn at the TRANSCRIPT wait, which is reached only after the boot has already resolved. A fix
+// that registered late would still pass it — as the shipped first cut did.
+//
+// Cold boot is the DEFAULT (`OCP_TUI_POOL_SIZE=0`), so this window is the common case, not a
+// corner. lib/tui/pool.mjs already solved the identical ordering for a booting POOL pane ("Mint
+// the identity BEFORE booting"); this is the request path finally doing the same.
+ltTest("integration (#362): a shutdown landing INSIDE the boot window kills the pane too — the session exists before bootTuiPane resolves", async () => {
+  if (!LT_POSIX) return;
+  const dir = ltMkdir(); const home = ltMkdir(); const fake = ltFake(dir);
+  // neverReady: capture-pane renders a boot splash, so the turn is held inside bootTuiPane's
+  // readiness await rather than after it.
+  const tmux = ltTuiTmux(dir, "PONG", { neverReady: true });
+  const { child, buf, port } = await ltBootFresh({ ...tmux.env, CLAUDE_BIN: fake, HOME: home }, dir);
+  try {
+    assert.ok(await ltWait(() => buf.out.includes("listening on")), `did not start: ${ltDiag(buf)}`);
+
+    const inflight = ltPostStatus(port, { model: "sonnet", messages: [{ role: "user", content: "ping" }] });
+
+    // Premise 1: the pane EXISTS — new-session is synchronous, so this is true the moment the
+    // boot begins, which is precisely why the window is dangerous.
+    assert.ok(await ltWait(() => tmux.calls().some(c => c.startsWith("capture-pane ")), 20000),
+      `premise: the readiness poll must have started; got ${JSON.stringify(tmux.calls())} ${ltDiag(buf)}`);
+    const pane = tmux.paneName();
+    assert.ok(pane, `premise: a pane must have been created; got ${JSON.stringify(tmux.calls())}`);
+
+    // Premise 2 — THE control that makes this a different test from the one above. Being inside
+    // the BOOT poll means the turn has not progressed to pasting or submitting, both of which
+    // happen only after bootTuiPane resolves. Without this the test could be measuring the
+    // post-boot window and would pass against the very code it exists to reject.
+    const calls = tmux.calls();
+    assert.ok(!calls.some(c => c.startsWith("paste-buffer ")) && !calls.some(c => c.startsWith("send-keys ")),
+      `premise: the turn must still be INSIDE the boot readiness poll, not past it; got ${JSON.stringify(calls)}`);
+
+    const killLine = `kill-session -t ${pane}`;
+    assert.ok(!calls.includes(killLine),
+      `premise: the pane must still be alive before the signal; got ${JSON.stringify(calls)}`);
+
+    child.kill("SIGTERM");
+    assert.ok(await ltWait(() => buf.closed, 20000), `the server must exit on SIGTERM — ${ltDiag(buf)}`);
+
+    assert.ok(tmux.calls().includes(killLine),
+      `a pane whose BOOT was in flight must still be killed by shutdown. bootTuiPane creates the ` +
+      `tmux session synchronously and only then awaits readiness (BOOT_MS, 4s default), so a fix ` +
+      `that registers the pane after that await leaves it owned by nothing for the whole window — ` +
+      `on the DEFAULT cold-boot path. Expected ${JSON.stringify(killLine)} in ${JSON.stringify(tmux.calls())}`);
+    await inflight;
+  } finally { child.kill("SIGKILL"); _ltRmRetry(dir); _ltRmRetry(home); }
+});
+
 ltTest("integration (#327): a declared instance reports its name on /health", async () => {
   if (!LT_POSIX) return;
   const dir = ltMkdir(); const fake = ltFake(dir);
@@ -3739,7 +4031,7 @@ ltTest("replay premise (LIVE): a real server.mjs whose FIRST probe dies on a sig
 // drift apart — a fixture difference would silently change what "the snapshot" means.
 import {
   makeB2Fixture, probeB2KeySets, responseKeyPaths, parseB2Inventory, diffB2KeySets,
-  readB2Snapshot, ALIGNMENT_PATH, B2_PROFILES,
+  readB2Snapshot, ALIGNMENT_PATH, B2_PROFILES, B2_PROBE_PLAN,
 } from "./scripts/b2-key-snapshot.mjs";
 
 console.log("\nClass B.2 response key-set snapshot (#346):");
@@ -3786,8 +4078,8 @@ test("parseB2Inventory: reads ALIGNMENT.md's real inventory, expands multi-metho
   assert.ok(pairs.length >= 12,
     `anchor drift: only ${pairs.length} B.2 pairs parsed out of ALIGNMENT.md's inventory table`);
   assert.ok(pairs.includes("GET /health"), `expected GET /health among ${JSON.stringify(pairs)}`);
-  assert.ok(pairs.includes("GET /sessions") && pairs.includes("DELETE /sessions"),
-    "a 'GET, DELETE' row must expand into one pair per method");
+  assert.ok(pairs.includes("GET /settings") && pairs.includes("PATCH /settings"),
+    "a 'GET, PATCH' row must expand into one pair per method");
   assert.ok(pairs.includes("PATCH /api/keys/:id/quota"), "the :id rows must survive verbatim");
   assert.ok(!pairs.some(p => p.endsWith("/v1/chat/completions") || p.endsWith("/v1/models")),
     `B.1 rows must not be treated as B.2: ${JSON.stringify(pairs)}`);
@@ -4127,6 +4419,113 @@ function ltNaiveCorruptOffsets(buf) {
 }
 
 const LT_U8_TWO = "é";    // U+00E9   C3 A9           — Latin-1 supplement, 2 bytes
+// ── ADR 0016: the dead session surface is GONE (issue #355) ──────────────────
+// Every assertion below is BEHAVIOURAL — a live server.mjs answering a real request — because a
+// removal is exactly the change a source-grep test cannot police: grepping for the absence of a
+// token passes just as well when the handler is still registered under a different spelling.
+//
+// The mutations that prove each of these can fail are recorded in the PR body; each one RESTORES
+// a piece of the surface (re-registering a handler, putting a key back in a response, re-adding
+// `sessionTTL` to SETTINGS_SCHEMA) and the named test goes red.
+console.log("\nADR 0016 — removal of the dead session surface (#355):");
+
+test("ADR 0016: ALIGNMENT.md's B.2 inventory no longer lists /sessions", () => {
+  const pairs = parseB2Inventory(_ltRead(ALIGNMENT_PATH, "utf8"));
+  // Anchor-drift guard first: a parser that read no rows would satisfy every "does not include"
+  // assertion below vacuously.
+  assert.ok(pairs.length >= 12,
+    `anchor drift: only ${pairs.length} B.2 pairs parsed out of ALIGNMENT.md's inventory table`);
+  assert.ok(!pairs.includes("GET /sessions"), `GET /sessions is still in the inventory: ${JSON.stringify(pairs)}`);
+  assert.ok(!pairs.includes("DELETE /sessions"), `DELETE /sessions is still in the inventory: ${JSON.stringify(pairs)}`);
+});
+
+test("ADR 0016: the B.2 probe plan carries no /sessions probe, so the inventory and the plan agree", () => {
+  const names = B2_PROBE_PLAN.map(p => p.name);
+  assert.ok(names.length >= 12, `anchor drift: only ${names.length} probes in the plan`);
+  assert.ok(!names.some(n => n.endsWith(" /sessions")), `a /sessions probe survives: ${JSON.stringify(names)}`);
+});
+
+ltTest("integration (ADR 0016): the whole session surface is gone from the wire, and CLAUDE_SESSION_TTL is inert rather than fatal", async () => {
+  if (!LT_POSIX) return;
+  const dir = ltMkdir(); const fake = ltFake(dir);
+  // CLAUDE_SESSION_TTL is deliberately still EXPORTED. An operator's env file or launchd plist
+  // may still carry it after upgrading, and the removal must not turn that into a boot failure.
+  // This also makes the boot-banner assertion below meaningful: the value is present, so a
+  // surviving `Sessions: TTL=` line would have something to print.
+  const { child, buf, port } = await ltBootFresh({ CLAUDE_BIN: fake, CLAUDE_SESSION_TTL: "60000" }, dir);
+  try {
+    assert.ok(await ltWait(() => buf.out.includes("listening on")),
+      `did not start with CLAUDE_SESSION_TTL set — the var must be inert, not fatal: ${buf.err.slice(0, 400)}`);
+
+    const req = async (method, path, body) => {
+      const r = await fetch(`http://127.0.0.1:${port}${path}`, {
+        method,
+        headers: body === undefined ? {} : { "Content-Type": "application/json" },
+        body: body === undefined ? undefined : JSON.stringify(body),
+      });
+      const text = await r.text();
+      let json = null; try { json = JSON.parse(text); } catch { /* non-JSON */ }
+      return { status: r.status, json, text };
+    };
+
+    // Premise, measured before anything below is trusted: this server answers at all. Without it
+    // every "is 404" assertion would also pass against a dead port.
+    const health = await req("GET", "/health");
+    assert.equal(health.status, 200, `premise: /health did not answer 200, got ${health.status}`);
+
+    // 1. Both endpoints are unrouted. 404 is not assumed — it is what this router already gave
+    //    for an unknown path, and what POST /sessions gave before the removal.
+    for (const [method, path] of [["GET", "/sessions"], ["DELETE", "/sessions"]]) {
+      const r = await req(method, path);
+      assert.equal(r.status, 404, `${method} ${path} must be unrouted, got ${r.status} ${r.text.slice(0, 200)}`);
+    }
+    const unknown = await req("GET", "/definitely-not-a-route");
+    assert.equal(unknown.status, 404, "control: an unknown path is 404, so the two above are the SAME answer");
+    assert.ok(!unknown.json.error.includes("/sessions"),
+      `the 404's endpoint list still advertises /sessions: ${unknown.json.error}`);
+
+    // 2. The response keys are gone from every endpoint that carried them.
+    assert.ok(!Object.hasOwn(health.json, "sessions"), "/health still returns a `sessions` array");
+    assert.ok(!Object.hasOwn(health.json.config, "sessionTTL"), "/health still returns `config.sessionTTL`");
+    const status = await req("GET", "/status");
+    assert.equal(status.status, 200, "premise: /status answered");
+    assert.ok(!Object.hasOwn(status.json.proxy, "activeSessions"), "/status still returns `proxy.activeSessions`");
+    const settings = await req("GET", "/settings");
+    assert.equal(settings.status, 200, "premise: /settings answered");
+    assert.ok(!Object.hasOwn(settings.json, "sessionTTL"), "GET /settings still reports `sessionTTL`");
+
+    // 3. sessionTTL was WRITABLE, so this removes an accepted REQUEST field too. ADR 0016 asks
+    //    that it be rejected explicitly rather than ignored, "so a caller learns rather than
+    //    guesses" — i.e. the caller must be able to tell refusal from silent acceptance.
+    const patched = await req("PATCH", "/settings", { sessionTTL: 120000 });
+    assert.equal(patched.status, 400, `PATCH sessionTTL must be REFUSED, got ${patched.status}`);
+    assert.ok(patched.json.errors.some(e => e.includes("sessionTTL")),
+      `the refusal must NAME the field, got ${JSON.stringify(patched.json.errors)}`);
+    assert.ok(!Object.hasOwn(patched.json.current, "sessionTTL"),
+      "the echoed `current` block must not reintroduce the field the PATCH was refused for");
+
+    // The refusal is the SAME one any unknown key gets — no bespoke second way of saying no.
+    const bogus = await req("PATCH", "/settings", { notASetting: 1 });
+    assert.equal(bogus.status, 400, "control: an unknown key is also 400");
+    assert.equal(patched.json.results.sessionTTL.error.replace("sessionTTL", "notASetting"),
+      bogus.json.results.notASetting.error,
+      "sessionTTL must be refused by the generic unknown-key path, not a special-cased branch");
+
+    // And a partial PATCH still applies the valid key while refusing this one (207), so a caller
+    // mixing the two is not silently rolled back.
+    const mixed = await req("PATCH", "/settings", { timeout: 600000, sessionTTL: 120000 });
+    assert.equal(mixed.status, 207, `a mixed valid/removed PATCH must be 207, got ${mixed.status}`);
+    assert.equal(mixed.json.results.timeout.ok, true, "the valid key in a mixed PATCH must still apply");
+
+    // 4. The boot banner no longer prints a TTL for a reaper that no longer exists.
+    assert.ok(!/^Sessions:/m.test(buf.out),
+      `the boot banner still prints a Sessions line: ${buf.out.split("\n").filter(l => /Session/.test(l)).join(" | ")}`);
+  } finally {
+    child.kill("SIGKILL");
+    await ltDrain(() => buf.closed, "adr0016-session-removal", 5000);
+  }
+});
+
 const LT_U8_THREE = "你"; // U+4F60   E4 BD A0        — CJK, 3 bytes
 const LT_U8_FOUR = "🙂";  // U+1F642  F0 9F 99 82     — astral, 4 bytes / 2 UTF-16 units
 
@@ -17973,7 +18372,7 @@ function _bwHarnessRun({
   openclawFailExit = undefined,
   openclawFailOutput = undefined,
   // Issue #242: generic curl response fixtures for the nine read-only display commands
-  // (usage/logs/models/sessions/clear/keys/settings), none of which existed as a harness
+  // (usage/logs/models/keys/settings), none of which existed as a harness
   // capability before this issue (every prior call site here only ever needed the `/health`
   // arm). Each entry is `{ match, body, exit }`: `match` is matched as a `case "$*" in
   // *"<match>"*)` substring against curl's full argv (so it discriminates by URL/path, same
@@ -18200,7 +18599,7 @@ function _bwHarnessRun({
     //
     // Issue #242: curlResponses (see its own doc comment above) adds arbitrary fixture arms,
     // checked BEFORE "/health" and the default refusal, for the nine display commands' own
-    // curl calls (/api/usage, /usage, /logs, /v1/models, /sessions, /api/keys, /settings).
+    // curl calls (/api/usage, /usage, /logs, /v1/models, /api/keys, /settings).
     //
     // Issue #261: curlAbsent simulates "curl is not on $PATH" the SAME way pythonAbsent already
     // simulates "python3 is not on $PATH" a few lines below (see that stub's own comment: "a
@@ -18580,7 +18979,7 @@ test("#236 control: cmd_update with python3 PRESENT reaches the kind dispatch an
 
 // ═════════════════════════════════════════════════════════════════════════════
 // Issue #242 (audit follow-up to #236): nine MORE `<curl-or-var> | python3 -c "..."` call sites
-// across the read-only display commands (usage/logs/models/sessions/clear/keys/settings) have
+// across the read-only display commands (usage/logs/models/keys/settings) have
 // the identical shape #236 fixed exactly once for cmd_update's own doctor-json formatter — a
 // bare pipeline, not inside an if/while, that `set -euo pipefail` (ocp:7) kills SILENTLY the
 // instant python3 exits non-zero, whether because python3 is missing (exit 127) or because the
@@ -18593,9 +18992,10 @@ test("#236 control: cmd_update with python3 PRESENT reaches the kind dispatch an
 // Each site below gets two tests: the MONEY test (pythonAbsent:true — must NOT reproduce #236's
 // signature of silent death, and must show the raw data, not a blank screen) and a CONTROL test
 // (real python3 — the formatted, happy-path output must be byte-for-byte unaffected by this
-// fix). Two representative sites (cmd_clear, cmd_keys add — chosen because one is the
-// "underlying mutation already happened, only reporting fails" case and the other is the
-// highest-stakes "only view of a value" case) also get a THIRD test proving the fallback also
+// fix). Two representative sites (cmd_models, cmd_keys add — chosen because one is an ordinary
+// read-only display command and the other is the highest-stakes "only view of a value" case;
+// the first of the two was `cmd_clear` until ADR 0016 removed that command, and its third test
+// was re-hosted onto cmd_models rather than retired) also get a THIRD test proving the fallback also
 // catches a REAL (non-stubbed) python3 crashing on malformed JSON, not merely "python3 missing"
 // — this is real /usr/bin/python3 on this harness's scratch $PATH, not a fake stub, genuinely
 // exercising `json.loads` raising a `JSONDecodeError`.
@@ -18684,42 +19084,18 @@ test("#242 control: cmd_models with python3 PRESENT still prints the formatted l
   assert.equal(r.stdout.trim(), "claude-sonnet-5-marker", `expected the formatted model id line, got: ${JSON.stringify(r.stdout)}`);
 });
 
-test("#242 cmd_sessions: absent python3 shows the raw sessions JSON instead of dying silently", () => {
-  const body = JSON.stringify({ sessions: [{ id: "abcdefabcdefabcdef0123456789", model: "claude-sonnet-5", messages: 3, lastUsed: "2026-08-01T00:00:00Z" }] });
-  const r = _bwHarnessRun({ args: ["sessions"], pythonAbsent: true, curlResponses: [{ match: "/sessions", body }] });
-  assert.ok(!(r.status === 127 && r.stdout === ""), `must not reproduce #236's silent-127 signature; status=${r.status} stdout=${JSON.stringify(r.stdout)}`);
-  assert.ok(r.stderr.includes("python3 is unavailable or failed to format the response"), `expected the _pyfail warning, got: ${JSON.stringify(r.stderr)}`);
-  assert.ok(r.stdout.includes("abcdefabcdefabcdef0123456789"), `expected the raw sessions JSON on stdout, got: ${JSON.stringify(r.stdout)}`);
-});
-
-test("#242 control: cmd_sessions with python3 PRESENT still prints the formatted session row", () => {
-  const body = JSON.stringify({ sessions: [{ id: "abcdefabcdefabcdef0123456789", model: "claude-sonnet-5", messages: 3, lastUsed: "2026-08-01T00:00:00Z" }] });
-  const r = _bwHarnessRun({ args: ["sessions"], curlResponses: [{ match: "/sessions", body }] });
-  assert.equal(r.status, 0, `expected a clean exit, got status=${r.status} stderr=${r.stderr}`);
-  assert.ok(r.stdout.includes("model=claude-sonnet-5"), `expected the formatted session row, got: ${JSON.stringify(r.stdout)}`);
-});
-
-test("#242 cmd_clear: absent python3 still reports the clear happened (the DELETE already ran) with the raw count JSON, not a silent death", () => {
-  const r = _bwHarnessRun({ args: ["clear"], pythonAbsent: true, curlResponses: [{ match: "/sessions", body: JSON.stringify({ cleared: 7 }) }] });
-  assert.ok(!(r.status === 127 && r.stdout === ""), `must not reproduce #236's silent-127 signature; status=${r.status} stdout=${JSON.stringify(r.stdout)}`);
-  assert.ok(r.stderr.includes("Sessions were cleared, but the count could not be formatted"), `expected the clear-specific fallback message (not a generic one), got stderr=${JSON.stringify(r.stderr)}`);
-  assert.ok(r.stdout.includes('"cleared": 7') || r.stdout.includes('"cleared":7') || r.stdout.includes("cleared"), `expected the raw {"cleared":7} JSON on stdout, got: ${JSON.stringify(r.stdout)}`);
-});
-
-test("#242 control: cmd_clear with python3 PRESENT still prints 'Cleared N sessions.'", () => {
-  const r = _bwHarnessRun({ args: ["clear"], curlResponses: [{ match: "/sessions", body: JSON.stringify({ cleared: 7 }) }] });
-  assert.equal(r.status, 0, `expected a clean exit, got status=${r.status} stderr=${r.stderr}`);
-  assert.ok(r.stdout.includes("Cleared 7 sessions."), `expected the formatted count line, got: ${JSON.stringify(r.stdout)}`);
-});
-
-test("#242 cmd_clear: python3 PRESENT but the response is malformed JSON — the fallback fires for a REAL crash, not just a missing binary", () => {
+// #242 / ADR 0016: this test used to run against `ocp clear`, which is gone with DELETE
+// /sessions. Its SUBJECT was never sessions — it is that `_pyfail`'s `||` guard keys on the
+// PIPELINE's exit status rather than on "is python3 on PATH", a property every display command
+// shares. Re-hosted onto `ocp models` instead of deleted, because deleting it would have
+// retired the only coverage of that distinction.
+test("#242 cmd_models: python3 PRESENT but the response is malformed JSON — the fallback fires for a REAL crash, not just a missing binary", () => {
   // Real (unstubbed) /usr/bin/python3 on this harness's scratch $PATH — json.loads() genuinely
   // raises json.decoder.JSONDecodeError on this body, a different failure mode than
-  // pythonAbsent:true's exit-127 stub. Proves _pyfail's `||` guard is keyed on the PIPELINE's
-  // exit status, not merely "is python3 on PATH".
-  const r = _bwHarnessRun({ args: ["clear"], curlResponses: [{ match: "/sessions", body: "not-json-at-all" }] });
+  // pythonAbsent:true's exit-127 stub.
+  const r = _bwHarnessRun({ args: ["models"], curlResponses: [{ match: "/v1/models", body: "not-json-at-all" }] });
   assert.notEqual(r.status, 0, `a malformed response must not be silently reported as success; status=${r.status}`);
-  assert.ok(r.stderr.includes("Sessions were cleared, but the count could not be formatted"), `expected the clear-specific fallback message, got stderr=${JSON.stringify(r.stderr)}`);
+  assert.ok(r.stderr.includes("Could not format model list"), `expected the models-specific fallback label, got stderr=${JSON.stringify(r.stderr)}`);
   assert.ok(r.stdout.includes("not-json-at-all"), `expected the raw (malformed) response echoed back, got: ${JSON.stringify(r.stdout)}`);
 });
 
@@ -18808,7 +19184,7 @@ test("#242 (10th site) control: cmd_keys list with a genuinely unreachable proxy
 test("#242 cmd_settings (GET): absent python3 shows the raw settings JSON instead of dying silently", () => {
   const body = JSON.stringify({
     timeout: { value: 60000, unit: "ms", desc: "x" }, firstByteTimeout: { value: 15000, unit: "ms", desc: "x" },
-    maxConcurrent: { value: 4, unit: "", desc: "x" }, sessionTTL: { value: 600000, unit: "ms", desc: "x" },
+    maxConcurrent: { value: 4, unit: "", desc: "x" },
     maxPromptChars: { value: 100000, unit: "", desc: "x" },
     tiers: { opus: { base: 30000, perPromptChar: 0.001 }, sonnet: { base: 20000, perPromptChar: 0.0005 }, haiku: { base: 15000, perPromptChar: 0.0002 } },
   });
@@ -18821,7 +19197,7 @@ test("#242 cmd_settings (GET): absent python3 shows the raw settings JSON instea
 test("#242 control: cmd_settings (GET) with python3 PRESENT still prints the formatted panel", () => {
   const body = JSON.stringify({
     timeout: { value: 60000, unit: "ms", desc: "x" }, firstByteTimeout: { value: 15000, unit: "ms", desc: "x" },
-    maxConcurrent: { value: 4, unit: "", desc: "x" }, sessionTTL: { value: 600000, unit: "ms", desc: "x" },
+    maxConcurrent: { value: 4, unit: "", desc: "x" },
     maxPromptChars: { value: 100000, unit: "", desc: "x" },
     tiers: { opus: { base: 30000, perPromptChar: 0.001 }, sonnet: { base: 20000, perPromptChar: 0.0005 }, haiku: { base: 15000, perPromptChar: 0.0002 } },
   });
@@ -18832,7 +19208,7 @@ test("#242 control: cmd_settings (GET) with python3 PRESENT still prints the for
 });
 
 // ── Independent review, PR #252 round 1, fix 3: the "Error: proxy unreachable" guards THIS PR
-// introduced (logs/models/sessions/settings/clear/keys-revoke) used to write to stdout, unlike
+// introduced (logs/models/settings/keys-revoke) used to write to stdout, unlike
 // `cmd_usage`'s own PRE-EXISTING guards (left untouched, per the review — see the money/control
 // tests above, none of which touch that wording). `ocp models` piped into a consumer would read
 // a stdout error line as data. No `curlResponses` entry is registered for the relevant URL below,
@@ -18854,22 +19230,8 @@ test("#242 fix-3 cmd_models: 'Error: proxy unreachable' goes to stderr, stdout s
   assert.equal(r.stdout, "", `stdout must stay clean; got: ${JSON.stringify(r.stdout)}`);
 });
 
-test("#242 fix-3 cmd_sessions: 'Error: proxy unreachable' goes to stderr, stdout stays empty", () => {
-  const r = _bwHarnessRun({ args: ["sessions"] });
-  assert.notEqual(r.status, 0);
-  assert.ok(r.stderr.includes("Error: proxy unreachable"), `expected the message on stderr, got: ${JSON.stringify(r.stderr)}`);
-  assert.equal(r.stdout, "", `stdout must stay clean; got: ${JSON.stringify(r.stdout)}`);
-});
-
 test("#242 fix-3 cmd_settings (GET): 'Error: proxy unreachable' goes to stderr, stdout stays empty", () => {
   const r = _bwHarnessRun({ args: ["settings"] });
-  assert.notEqual(r.status, 0);
-  assert.ok(r.stderr.includes("Error: proxy unreachable"), `expected the message on stderr, got: ${JSON.stringify(r.stderr)}`);
-  assert.equal(r.stdout, "", `stdout must stay clean; got: ${JSON.stringify(r.stdout)}`);
-});
-
-test("#242 fix-3 cmd_clear: 'Error: proxy unreachable' goes to stderr, stdout stays empty", () => {
-  const r = _bwHarnessRun({ args: ["clear"] });
   assert.notEqual(r.status, 0);
   assert.ok(r.stderr.includes("Error: proxy unreachable"), `expected the message on stderr, got: ${JSON.stringify(r.stderr)}`);
   assert.equal(r.stdout, "", `stdout must stay clean; got: ${JSON.stringify(r.stdout)}`);
@@ -19203,36 +19565,6 @@ test("#278 fold-in (exit 126 coverage): cmd_models with curl present but NOT EXE
 
 test("#278 control: cmd_models with curl present but the proxy genuinely unreachable still says 'proxy unreachable'", () => {
   const r = _bwHarnessRun({ args: ["models"] });
-  assert.notEqual(r.status, 0, `expected a nonzero exit; status=${r.status}`);
-  assert.ok(r.stderr.includes("Error: proxy unreachable"),
-    `a GENUINE network failure must still be reported as such, got stderr=${JSON.stringify(r.stderr)}`);
-});
-
-test("#278 cmd_sessions: curl missing from $PATH must be reported as a local fault, not 'proxy unreachable'", () => {
-  const r = _bwHarnessRun({ args: ["sessions"], curlAbsent: true });
-  assert.notEqual(r.status, 0, `expected a nonzero exit; status=${r.status}`);
-  assert.ok(!r.stderr.includes("proxy unreachable") && !r.stdout.includes("proxy unreachable"),
-    `must NOT misattribute a missing curl binary to the proxy; stderr=${JSON.stringify(r.stderr)} stdout=${JSON.stringify(r.stdout)}`);
-  assert.ok(/curl/i.test(r.stderr), `expected the message to name curl/the local command failure, got stderr=${JSON.stringify(r.stderr)}`);
-});
-
-test("#278 control: cmd_sessions with curl present but the proxy genuinely unreachable still says 'proxy unreachable'", () => {
-  const r = _bwHarnessRun({ args: ["sessions"] });
-  assert.notEqual(r.status, 0, `expected a nonzero exit; status=${r.status}`);
-  assert.ok(r.stderr.includes("Error: proxy unreachable"),
-    `a GENUINE network failure must still be reported as such, got stderr=${JSON.stringify(r.stderr)}`);
-});
-
-test("#278 cmd_clear: curl missing from $PATH must be reported as a local fault, not 'proxy unreachable'", () => {
-  const r = _bwHarnessRun({ args: ["clear"], curlAbsent: true });
-  assert.notEqual(r.status, 0, `expected a nonzero exit; status=${r.status}`);
-  assert.ok(!r.stderr.includes("proxy unreachable") && !r.stdout.includes("proxy unreachable"),
-    `must NOT misattribute a missing curl binary to the proxy; stderr=${JSON.stringify(r.stderr)} stdout=${JSON.stringify(r.stdout)}`);
-  assert.ok(/curl/i.test(r.stderr), `expected the message to name curl/the local command failure, got stderr=${JSON.stringify(r.stderr)}`);
-});
-
-test("#278 control: cmd_clear with curl present but the proxy genuinely unreachable still says 'proxy unreachable'", () => {
-  const r = _bwHarnessRun({ args: ["clear"] });
   assert.notEqual(r.status, 0, `expected a nonzero exit; status=${r.status}`);
   assert.ok(r.stderr.includes("Error: proxy unreachable"),
     `a GENUINE network failure must still be reported as such, got stderr=${JSON.stringify(r.stderr)}`);
@@ -20626,7 +20958,6 @@ function rpStatus(shape) {
     proxy: {
       status: h.status, version: h.version, uptime: h.uptimeHuman,
       auth: h.auth.ok ? "ok" : h.auth.message,
-      activeSessions: 0,
     },
     requests: { total: 12, active: 0, errors: 0, timeouts: 0 },
   };

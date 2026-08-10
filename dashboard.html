@@ -152,7 +152,6 @@ async function refreshStatus() {
     <div class="card"><div class="label">Uptime</div><div class="value">${escapeHtml(p.uptime || '?')}</div></div>
     <div class="card"><div class="label">Requests</div><div class="value">${r.total || 0}</div><div class="sub">${r.active || 0} active</div></div>
     <div class="card"><div class="label">Errors</div><div class="value">${r.errors || 0}</div><div class="sub">${r.timeouts || 0} timeouts</div></div>
-    <div class="card"><div class="label">Sessions</div><div class="value">${p.activeSessions || 0}</div></div>
   `;
 
   const plan = data.plan;

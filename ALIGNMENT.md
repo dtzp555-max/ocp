@@ -123,7 +123,6 @@ ADR 0006 retroactively authorizes the B.2 endpoints listed in the inventory tabl
 | `/v1/models` | GET | B.1 (OpenAI-compat) | ADR 0006; content sourced from `models.json` per ADR 0003 |
 | `/health` | GET | B.2 (administrative) | ADR 0006 (grandfathered as of v3.16.4); status verdict per ADR 0010 |
 | `/dashboard` | GET | B.2 (administrative) | ADR 0006 (grandfathered as of v3.16.4) |
-| `/sessions` | GET, DELETE | B.2 (administrative) | ADR 0006 (grandfathered as of v3.16.4) |
 | `/logs` | GET | B.2 (administrative) | ADR 0006 (grandfathered as of v3.16.4) |
 | `/status` | GET | B.2 (administrative) | ADR 0006 (grandfathered as of v3.16.4); status verdict per ADR 0010 |
 | `/settings` | GET, PATCH | B.2 (administrative) | ADR 0006 (grandfathered as of v3.16.4) |

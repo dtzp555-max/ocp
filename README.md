@@ -213,7 +213,6 @@ The canonical list lives in [`models.json`](./models.json) — the single source
 | `/status` | GET | Combined overview (usage + health) |
 | `/settings` | GET/PATCH | View or update settings at runtime |
 | `/logs` | GET | Recent log entries (`?n=20&level=error`) |
-| `/sessions` | GET/DELETE | List or clear active sessions |
 | `/dashboard` | GET | Web dashboard (always public) |
 | `/api/keys` | GET/POST | List or create API keys (admin only) |
 | `/api/keys/:id` | DELETE | Revoke an API key (admin only) |
@@ -239,7 +238,6 @@ The canonical list lives in [`models.json`](./models.json) — the single source
 | `CLAUDE_QUEUE_RETRY_AFTER` | `5` | Seconds advertised in the `Retry-After` header on a `-p` concurrency-overflow `429`. |
 | `CLAUDE_MAX_PROMPT_CHARS` | *(derived per model)* | Prompt truncation limit in chars. By default there is **no single limit**: each request is bounded by the named model's own `contextWindow × 3` from the models.json SPOT — **3,000,000** for the native-1M models (`claude-opus-5`, `-4-8`, `-4-7`, `claude-sonnet-5`) and **600,000** for the 200k models (`claude-opus-4-6`, `claude-sonnet-4-6`, `claude-haiku-4-5`). Setting this env var (or `ocp settings maxPromptChars`) overrides the derivation absolutely, applying that one number to **every** model. See [ADR 0011](docs/adr/0011-per-model-prompt-char-budget.md) (supersedes [ADR 0009](docs/adr/0009-spot-derived-prompt-budget.md)'s single global ceiling). Note: very large prompts burn subscription-window quota quickly and slow TTFT; the TUI-mode paste path is untested beyond ~hundreds of KB. Applies to **text only** — image bytes bypass this budget (see [Images / Multimodal](#images--multimodal-vision)). |
 | `OCP_STRUCTURED_MAX_ATTEMPTS` | `3` | Max attempts (initial + retries) to coerce a schema-valid JSON reply when a request uses OpenAI `response_format`. Fail-closed: a non-numeric value keeps the default. See [Structured Outputs](#structured-outputs-openai-response_format). |
-| `CLAUDE_SESSION_TTL` | `3600000` | Session expiry (ms, default: 1 hour) |
 | `CLAUDE_AUTH_CHECK_INTERVAL_MS` | `600000` | How often the background `claude auth status` probe runs (ms, default: 10 min). Lower it for faster detection of a real credential outage — the verdict needs **2 consecutive** conclusive rejections, so onset is reported within roughly one interval. Fail-closed parsing: an empty/garbage value keeps the default. Probe outcome is surfaced on `/health.auth.lastOutcome` (`authenticated`/`token-present`/`rejected`/`timeout`/`unavailable`) and the running tally on `/health.auth.consecutiveFailures`, so an operator can tell a host-load timeout from a real credential rejection. **`token-present` is not `authenticated`** — see § "What `auth.ok` means". See [ADR 0010](docs/adr/0010-health-verdict-semantics.md) and [ADR 0014](docs/adr/0014-auth-verdict-measures-what-it-measured.md). |
 | `CLAUDE_AUTH_CHECK_TIMEOUT_MS` | `10000` | Per-probe timeout for that same probe (ms). The probe runs **asynchronously** and never blocks request serving; this only bounds a stuck child. A probe killed by this timeout is **inconclusive** — it measures host load, not credentials, so it never changes `/health.status` or `auth.ok`. Fail-closed parsing: an empty/garbage value keeps the default. |
 | `CLAUDE_CACHE_TTL` | `0` | Response cache TTL (ms, 0 = disabled). Set to e.g. `300000` for 5-min cache. See [Response Cache](#response-cache). |
@@ -301,7 +299,11 @@ The canonical list lives in [`models.json`](./models.json) — the single source
 
 **A `null` is not a failure.** It means no conclusive verdict, `ocp doctor` reports it as WARN rather than FAIL, and it does not block `ocp update`. On such a host the first successful request moves it to `true`.
 
-**`status` is unaffected by any of this.** The proxy's `ok` / `degraded` verdict is driven by consecutive conclusive probe *rejections* (ADR 0010), never by `auth.ok`.
+**`auth.ok` never moves `status`.** `proxyHealthStatus` reads `consecutiveFailures` and never `ok`, so no verdict in the table above can flip a host to `degraded`.
+
+**The tally it reads is a different matter, and this is the part worth knowing.** Conclusive probe *rejections* raise `consecutiveFailures` (ADR 0010), and **any successful request clears it** — a deliberate restoration of ADR 0010's self-heal, unqualified by which lane served the request (see [ADR 0014](docs/adr/0014-auth-verdict-measures-what-it-measured.md) § Consequences). So a host reporting `degraded` can return to `ok` on the first request that succeeds, with no probe having run in between. If you are debugging `status` — `ocp update`'s post-flight check and the dashboard's status card both read it, and the dashboard has no other auth signal — do not assume it is probe-driven only.
+
+*(This paragraph said "**`status` is unaffected by any of this** … never by `auth.ok`" until #361. The second clause was true and the bolded headline was not: it read as though nothing in this section could touch `status`, while a successful request has always cleared the tally that decides it.)*
 ### Running more than one instance on a host
 
 `DEFAULT_PORT` (3456) is the primary and never changes — it is the single source of truth in `lib/constants.mjs`, and CI hard-fails any other port literal in source. A host that needs a **second** instance takes `DEFAULT_PORT + n` in allocation order, and **must declare itself**:
@@ -423,8 +425,6 @@ ocp settings           View tunable settings
 ocp settings <k> <v>   Update a setting at runtime
 ocp logs [N] [level]   Recent logs (default: 20, error)
 ocp models             Available models
-ocp sessions           Active sessions
-ocp clear              Clear all sessions
 ocp restart            Restart proxy
 ocp restart gateway    Restart gateway
 ocp update             Update to latest version
@@ -642,7 +642,7 @@ Top-level files a contributor or operator may need to know:
 | `lib/tool-support.mjs` | `classifyToolRequest()` — which `tools` / `tool_choice` / `function_call` shapes OCP must refuse. See ADR 0013. |
 | `lib/tui/` | Subscription-pool (TUI) mode internals: warm-pane pool, semaphore, session, stream, transcript. |
 | `scripts/sync-openclaw.mjs` | Idempotent OpenClaw registry sync invoked by `ocp update`. See ADR 0004. |
-| `scripts/b2-key-snapshot.mjs` | Records every grandfathered Class B.2 endpoint's response **key set** from the wire (boots a real `server.mjs` against a fixture, probes each endpoint+method pair in `ALIGNMENT.md`'s inventory, records key paths but never values). Two configuration profiles since #357 — `probes` (the default fleet config) and `probesTuiPool` (`CLAUDE_TUI_MODE=true`, `OCP_TUI_POOL_SIZE=1`, `CLAUDE_SKIP_PERMISSIONS=true`), which is what guards `/health`'s `tui.pool` counter bag; both get all 16 pairs and their own coverage check. No real `claude` pane is ever booted: `OCP_TUI_TMUX_BIN` points at a stub `tmux`, and the suite asserts from its log that the only invocation is `list-sessions`. `npm test` fails on any difference from the checked-in snapshot. Run standalone with `node scripts/b2-key-snapshot.mjs`, or `--write` to regenerate after a deliberate, authorized addition (every command covers every profile). |
+| `scripts/b2-key-snapshot.mjs` | Records every grandfathered Class B.2 endpoint's response **key set** from the wire (boots a real `server.mjs` against a fixture, probes each endpoint+method pair in `ALIGNMENT.md`'s inventory, records key paths but never values). Two configuration profiles since #357 — `probes` (the default fleet config) and `probesTuiPool` (`CLAUDE_TUI_MODE=true`, `OCP_TUI_POOL_SIZE=1`, `CLAUDE_SKIP_PERMISSIONS=true`), which is what guards `/health`'s `tui.pool` counter bag; both get all 14 pairs and their own coverage check. No real `claude` pane is ever booted: `OCP_TUI_TMUX_BIN` points at a stub `tmux`, and the suite asserts from its log that the only invocation is `list-sessions`. `npm test` fails on any difference from the checked-in snapshot. Run standalone with `node scripts/b2-key-snapshot.mjs`, or `--write` to regenerate after a deliberate, authorized addition (every command covers every profile). |
 | `docs/governance/b2-response-keys.json` | The checked-in snapshot, one block per profile. Its git history is the per-release record of how B.2 surface actually grew — `git log -p docs/governance/b2-response-keys.json`. Its `notCovered` block states what the mechanism cannot see; read it before treating a green run as coverage. |
 | `scripts/lib/service-mode.mjs` | Pure decision layer for `setup.mjs`'s auto-start step — first install vs. `--reconfigure-only` (issue #226). |
 | `scripts/lib/install-autostart.mjs` | Injectable `installAutoStart()` — setup.mjs's auto-start install (legacy-unit migration, unit write, enable/start/bootstrap), extracted so tests can observe real run/fs calls instead of asserting on source text (issue #226). |
@@ -680,7 +680,7 @@ OCP runs under a small set of binding documents so contributions stay aligned wi
 - **[`models.json`](./models.json)** — single source of truth for the model registry. See [ADR 0003](./docs/adr/0003-models-json-spot.md).
 - **[`docs/adr/`](./docs/adr/)** — architecture decision records explaining why current structure exists.
 
-If you want to contribute: read `ALIGNMENT.md` first, then classify the change before writing anything — Class A (the `cli.js`-mirror surface) needs a `cli.js:NNNN` line citation; Class B.1 (`/v1/chat/completions`, `/v1/models`) needs the relevant OpenAI specification section plus ADR 0006; Class B.2 (`/health`, `/dashboard`, `/sessions`, `/logs`, `/status`, `/settings`, `/api/keys*`, `/api/usage`, `/cache*`) needs the endpoint's authorizing ADR. See `CLAUDE.md` § "Classify the change first" for the full table.
+If you want to contribute: read `ALIGNMENT.md` first, then classify the change before writing anything — Class A (the `cli.js`-mirror surface) needs a `cli.js:NNNN` line citation; Class B.1 (`/v1/chat/completions`, `/v1/models`) needs the relevant OpenAI specification section plus ADR 0006; Class B.2 (`/health`, `/dashboard`, `/logs`, `/status`, `/settings`, `/api/keys*`, `/api/usage`, `/cache*`) needs the endpoint's authorizing ADR. See `CLAUDE.md` § "Classify the change first" for the full table.
 
 ## Support OCP
 

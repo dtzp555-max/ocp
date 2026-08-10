@@ -96,7 +96,6 @@ async function cmdHealth() {
   out += `Uptime: ${d.uptimeHuman}\n`;
   out += `Auth: ${d.auth?.ok ? "ok" : d.auth?.message || "unknown"}\n`;
   out += `Binary: ${d.claudeBinaryOk ? "ok" : "missing"}\n`;
-  out += `Sessions: ${d.sessions?.length || 0} active\n`;
   out += `Requests: ${d.stats?.totalRequests || 0} total, ${d.stats?.activeRequests || 0} active\n`;
   out += `Errors: ${d.stats?.errors || 0} | Timeouts: ${d.stats?.timeouts || 0}\n`;
   if (d.recentErrors?.length) {
@@ -112,7 +111,6 @@ async function cmdStatus() {
   const d = await fetchJSON("/status");
   const icon = d.proxy?.status === "ok" ? "🟢" : d.proxy?.status === "degraded" ? "🟡" : "🔴";
   let out = `${icon} ${d.proxy?.status} | v${d.proxy?.version} | up ${d.proxy?.uptime} | auth ${d.proxy?.auth}\n`;
-  out += `Sessions: ${d.proxy?.activeSessions || 0}\n`;
   out += `Requests: ${d.requests?.total || 0} | active ${d.requests?.active || 0} | err ${d.requests?.errors || 0} | timeout ${d.requests?.timeouts || 0}\n`;
   if (d.plan?.currentSession) {
     out += `\nSession: ${d.plan.currentSession.percent} (resets ${d.plan.currentSession.resetsIn})\n`;
@@ -125,7 +123,7 @@ async function cmdSettings(args) {
   if (!args) {
     const d = await fetchJSON("/settings");
     let out = "OCP Settings\n─────────────────────────────\n";
-    for (const k of ["timeout", "firstByteTimeout", "maxConcurrent", "sessionTTL", "maxPromptChars"]) {
+    for (const k of ["timeout", "firstByteTimeout", "maxConcurrent", "maxPromptChars"]) {
       const v = d[k];
       if (v) out += `${k.padEnd(20)} ${String(v.value).padStart(8)} ${(v.unit || "").padEnd(6)} ${v.desc}\n`;
     }
@@ -142,7 +140,7 @@ async function cmdSettings(args) {
   // Parse "key value"
   const parts = args.trim().split(/\s+/);
   if (parts.length < 2 || parts[0] === "--help" || parts[0] === "-h") {
-    return "Usage: /ocp settings <key> <value>\nKeys: timeout, firstByteTimeout, maxConcurrent, sessionTTL, maxPromptChars, tiers.opus.base, tiers.sonnet.base, tiers.haiku.base, tiers.*.perChar";
+    return "Usage: /ocp settings <key> <value>\nKeys: timeout, firstByteTimeout, maxConcurrent, maxPromptChars, tiers.opus.base, tiers.sonnet.base, tiers.haiku.base, tiers.*.perChar";
   }
   const [key, val] = parts;
   const numVal = Number(val);
@@ -164,17 +162,7 @@ async function cmdModels() {
   return (d.data || []).map((m) => `  ${m.id}`).join("\n") || "No models.";
 }
 
-async function cmdSessions() {
-  const d = await fetchJSON("/sessions");
-  if (!d.sessions?.length) return "No active sessions.";
-  return d.sessions.map((s) => `  ${s.id.slice(0, 16)}… model=${s.model} msgs=${s.messages}`).join("\n");
-}
-
-async function cmdClear() {
-  const resp = await fetch(`${PROXY}/sessions`, { method: "DELETE", signal: AbortSignal.timeout(5000) });
-  const d = await resp.json();
-  return `Cleared ${d.cleared} sessions.`;
-}
+// cmdSessions/cmdClear removed under ADR 0016 along with GET|DELETE /sessions.
 
 async function cmdVersion() {
   const d = await fetchJSON("/health");
@@ -262,8 +250,6 @@ function cmdHelp() {
 /ocp settings <k> <v>   Update a setting
 /ocp logs [N] [level]   Recent logs (default: 20, error)
 /ocp models             Available models
-/ocp sessions           Active sessions
-/ocp clear              Clear all sessions
 /ocp restart            Restart proxy
 /ocp restart gateway    Restart gateway
 /ocp restart all        Restart both
@@ -294,8 +280,6 @@ export default function (api) {
           case "status":   text = await cmdStatus(); break;
           case "settings": text = await cmdSettings(subargs || null); break;
           case "models":   text = await cmdModels(); break;
-          case "sessions": text = await cmdSessions(); break;
-          case "clear":    text = await cmdClear(); break;
           case "restart":  text = await cmdRestart(subargs); break;
           case "version":  text = await cmdVersion(); break;
           case "test":     text = await cmdTest(); break;

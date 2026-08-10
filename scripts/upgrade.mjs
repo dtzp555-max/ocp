@@ -1033,20 +1033,22 @@ export function recoveryPlanCommands(restartPlan) {
 //     #388 review finding F2. That draft read "the verdict comes from the post-flight probe and
 //     never from a command's exit status (#325's rule)", and both halves are false. `restartFailure`
 //     IS a command exit status, and it gates five of `classifyRestartOutcome`'s ten arms
-//     (:1277-1281 — UNMEASURED and the four RESTART_FAILED_* verdicts all lead with it). And #325
-//     does not say that. `ocp:1032-1034` bans the exit status from SUBSTITUTING for the probe —
+//     (:1279-1283 — UNMEASURED and the four RESTART_FAILED_* verdicts all lead with it). And #325
+//     does not say that. `ocp:983-985` bans the exit status from SUBSTITUTING for the probe —
 //     "a failing command does not prove the proxy is down ... So fall through and measure" — and
-//     then `ocp:1070-1075` keeps it as an explicit CO-INPUT: `if [[ $probe_rc -ne 0 &&
+//     then `ocp:1021-1026` keeps it as an explicit CO-INPUT: `if [[ $probe_rc -ne 0 &&
 //     $restart_failed -ne 0 ]]`, under the note that "the probe and the command outcome are two
 //     independent facts, and the message has to name the combination". The cited authority contains
-//     the counterexample to the sentence that cited it.
+//     the counterexample to the sentence that cited it. (Both passages are quoted here rather than
+//     only pointed at, because `ocp` line numbers move: these two were :1032-1034 and :1070-1075
+//     before #395 shifted them by 49. Grep the quoted text if the numbers no longer land.)
 //
 //     The true premise is specific to THIS pass rather than to exit statuses in general: the
 //     RESTORE's exit statuses are not classifier inputs at all, and `restartFailure` is already
-//     fixed before the restore runs. It is assigned only inside the forward restart loop (:1753 on
-//     this path, :2625 on the rollback one) and never reassigned; `restoreOutcome` is not among
+//     fixed before the restore runs. It is assigned only inside the forward restart loop (:1755 on
+//     this path, :2627 on the rollback one) and never reassigned; `restoreOutcome` is not among
 //     `classifyRestartOutcome`'s parameters, which are `{ restartFailure, postFlight,
-//     postFlightMeasured }` at both call sites (:1925, :2790). So a retry inside the restore can
+//     postFlightMeasured }` at both call sites (:1927, :2792). So a retry inside the restore can
 //     reach the verdict only by delaying the probe — which is the ~3s the asymmetry already prices.
 //
 //   user-unit / system-unit — DO NOT RETRY. Reason 1 is decisive on `user-unit`, and on a
