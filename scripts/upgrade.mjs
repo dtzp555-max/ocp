@@ -1029,6 +1029,19 @@ export async function runPostFlightCheck(target, opts = {}) {
       // an array or object `version` reached every consumer that renders `lastSeen` as a version —
       // producing "last saw version=[object Object]". `lastSeen` means "the version string this
       // proxy reported", so it now holds only that.
+      // `lastSeen` IS STICKY, and every consumer has to know it: it is assigned here on each probe
+      // that returns a body and is NEVER reset, while `lastFailure` is overwritten every attempt.
+      // A probe that answers `3.14.0` at t=0 and is connection-refused for the rest of the budget
+      // therefore ends with `lastSeen = "3.14.0"` and `lastFailure = {kind:"unreachable"}`.
+      //
+      // That is why the verdict cells key on `lastFailure.kind` and not on `lastSeen != null`
+      // (#352 review finding LOW-D): keyed on `lastSeen`, a service that is now DOWN was reported
+      // "UP BUT SERVING THE WRONG VERSION". `lastSeen` is still READ inside the version-mismatch
+      // arm, where it is current by construction — assigned in the same iteration that set the kind
+      // — and inside `postFlightFailureSuffix`'s `version-mismatch` case, for the same reason.
+      // `postFlightFailureSuffix`'s own note points HERE for this paragraph; #385's review caught
+      // that #373 had deleted it from `runRollback` while claiming it had been relocated, leaving
+      // that pointer aimed at nothing.
       lastSeen = typeof body?.version === "string" ? body.version : null;
       if (postFlightOk(body, target)) { ok = true; lastFailure = null; break; }
       // Reached the service and read a body, and the body was REJECTED. Which of the three
@@ -1046,15 +1059,37 @@ export async function runPostFlightCheck(target, opts = {}) {
 // Issue #373. The post-restart verdict, as ONE decision shared by both `ocp update` paths.
 //
 // WHAT IS SHARED AND WHAT IS NOT. `runFullUpgrade` and `runRollback` each carried their own copy of
-// this ladder — ~60 lines, eight arms — and #351's own PR body named the property that made the
-// duplication dangerous:
-//
-//   > Ordering is load-bearing. The local-probe-fault arm is checked first, because it is also a
-//   > non-ok probe; getting it backwards tells a machine with a broken `curl` that its proxy is dead.
-//
-// Two copies of an ordering constraint is two places to get it wrong, and the failure is SILENT —
-// every arm still fires, just the wrong one first. The duplication had already produced one real
+// this ladder — ~60 lines, eight arms — and the duplication had already produced one real
 // divergence (#372: the answering-but-wrong-version arm existed on one path and not the other).
+//
+// WHAT THE ORDERING CONSTRAINT ACTUALLY IS NOW — corrected by #385's review, because the claim this
+// comment used to make was TRUE AT v3.29.2 AND IS NO LONGER TRUE, and the PR that broke it was mine.
+// #351's body said: "Ordering is load-bearing. The local-probe-fault arm is checked first, because
+// it is also a non-ok probe; getting it backwards tells a machine with a broken `curl` that its
+// proxy is dead." That was exact when the DOWN cell was `restartFailure && !postFlight.ok` — an
+// `else` that genuinely OVERLAPPED the local-fault arm. #372/#381 re-keyed it to `didNotReach`, so
+// every restart-failure arm below now tests a DISJOINT `kind`, and their relative order is free.
+//
+// Measured exhaustively over this function's complete input domain (80 inputs), not sampled:
+//
+//   swap RF_PLF <-> RF_ANO ........ NO-OP     move RF_PLF after RF_DOWN ......... NO-OP
+//   swap RF_ANO <-> RF_WV ......... NO-OP     reverse ALL FOUR restart arms ..... NO-OP
+//   swap RF_WV  <-> RF_DOWN ....... NO-OP
+//
+// The constraints that DO survive, each with the mutation that proves it:
+//
+//   - UNMEASURED must precede everything .................. 10 of 80 inputs change if it moves
+//   - specific arms must precede the two CATCH-ALLS ....... UNCONFIRMED above PLF: 5 of 80;
+//     (`UNCONFIRMED` and `WARNED_SUCCESS` are the only                 WARNED above UNCONFIRMED: 2 of 80
+//     non-disjoint predicates left, being bare tests)
+//   - PROBE_LOCAL_FAULT vs RESTART_FAILED_PROBE_LOCAL_FAULT — THE ONE OVERLAPPING PAIR, and the
+//     only surviving descendant of #351's incident: both fire on `probe-could-not-run`, and the
+//     general one must come second or a host that merely failed a restart is told its local curl is
+//     the whole story. Hoisting it changes 4 of 108 end-to-end cases ON BOTH LANES from one edit.
+//
+// Recording the retraction rather than quietly rewriting it: a comment that keeps asserting a
+// constraint the code no longer has is worse than no comment, because the next reader trusts it,
+// reorders freely, and nothing fails.
 //
 // So the CLASSIFICATION moves here and the WORDING stays at the call sites, because the wording
 // genuinely differs and must keep differing: `runFullUpgrade`'s hints may end by pointing at
@@ -1062,11 +1097,15 @@ export async function runPostFlightCheck(target, opts = {}) {
 // sends an operator round the same loop. Unifying the strings would be the wrong fix and would have
 // to be undone.
 //
-// WHY THIS MAKES THE ORDERING IMPOSSIBLE TO GET WRONG IN ONE PATH AND RIGHT IN THE OTHER, which is
-// what the issue actually asks for — the extraction alone would not do it. Callers receive a SINGLE
-// verdict and `switch` on it. The arms are mutually exclusive equality tests on one value, so a
-// caller has no ordering to state and therefore none to state differently. The precedence exists in
-// exactly one place: the sequence below.
+// WHAT THIS DOES AND DOES NOT GUARANTEE FOR CALLERS — narrowed by #385's review, which showed the
+// stronger claim was false. Callers receive a SINGLE verdict, so the CLASSIFICATION's precedence
+// lives in exactly one place: the sequence below. What callers still state for themselves is where
+// their CATCH-ALL sits, because that arm is a `!==` test rather than an equality test and its
+// position therefore is load-bearing: moving `runRollback`'s catch-all above its own
+// PROBE_LOCAL_FAULT cell changes 2 of 108 end-to-end cases, on the rollback lane ONLY — the #372
+// drift shape, recreated. So the honest statement is not "callers have no ordering to state"; it is
+// that the classification's ordering is shared, each caller still places one catch-all, and the
+// anti-drift test holds the two consistent (it catches exactly that mutation).
 //
 // ADR 0015's method applied, since it landed the same day and rejected a refactor for counting text
 // rather than tracing behaviour: the claim that the two ladders were identical was established by
@@ -1114,7 +1153,19 @@ export function classifyRestartOutcome({ restartFailure, postFlight, postFlightM
   // DOWN requires POSITIVE evidence of non-reach rather than being the `else` (#372). Anything the
   // classifier did not produce one of these kinds for falls to UNCONFIRMED.
   const didNotReach = kind === "unreachable" || kind === "timeout";
-  const probeFailed = postFlight?.ok === false;
+  // #385 review finding F3. This was `postFlight?.ok === false`, which is fail-OPEN on an
+  // unpopulated `ok`: the pre-#373 code was `!postFlight.ok`, which threw on `undefined` and
+  // treated `{}` as a failure, while `=== false` treats both as SUCCESS. Measured on the exported
+  // function — `undefined`, `null`, `{}`, `{ok:0}` and `{ok:undefined}` all returned
+  // `warned-success`, and `classifyRestartOutcome({})` returned `ok`.
+  //
+  // Not reachable from either in-module caller (both initialise `postFlight` with `ok: true` and
+  // only ever replace it with `runPostFlightCheck`'s return), but this function is EXPORTED, and
+  // its whole selling point is that an unhandled verdict is refused by default. A classifier that
+  // answers "success" for input it does not understand contradicts that in the one direction that
+  // matters. `!== true` keeps identical behaviour for every well-formed input — `ok` is a boolean
+  // there, so the two agree — and sends malformed input to a non-success verdict instead.
+  const probeFailed = postFlight?.ok !== true;
 
   if (restartFailure && !postFlightMeasured) return RESTART_VERDICT.UNMEASURED;
   if (restartFailure && probeFailed && probeCouldNotRun) return RESTART_VERDICT.RESTART_FAILED_PROBE_LOCAL_FAULT;
@@ -1694,9 +1745,11 @@ async function runFullUpgrade({ doctor, opts }) {
     // divergence rather than dressed up as fidelity. What IS inherited from bash is the ORDERING
     // and the refusal to call a local fault a dead proxy.
     //
-    // The ordering is the load-bearing part: the local-fault arm is
-    // checked FIRST, because it is also a non-ok probe, and getting this backwards would tell a
-    // machine with a broken curl that its proxy is dead — asserting a state nobody measured.
+    // The ordering that is still load-bearing is narrower than this comment used to say (#385 F1):
+    // the restart-failure arms are disjoint since #372/#381 and may be reordered freely, but the
+    // two CATCH-ALLS must come last, and PROBE_LOCAL_FAULT must stay AFTER its restart-failure
+    // sibling — they are the one overlapping pair, and getting that backwards is what tells a
+    // machine with a broken curl that its proxy is dead. Full measurement in the classifier.
     //
     // ISSUE #372. This ladder used to end its restart-failure half at `restartFailure &&
     // !postFlight.ok` — DOWN as the `else`. `runPostFlightCheck` reports `ok: false` for seven
@@ -1731,10 +1784,10 @@ async function runFullUpgrade({ doctor, opts }) {
     //
     // ISSUE #373. The classification and its ORDERING now live in `classifyRestartOutcome`, shared
     // with `runRollback`. What stays here is the wording, which genuinely differs between the two
-    // paths and must keep differing. The arms below are mutually exclusive equality tests on one
-    // value, so this path has no ordering to state and therefore none to state differently from its
-    // sibling — which is the property #351's PR body named as load-bearing and which two copies
-    // could only ever preserve by coincidence.
+    // paths and must keep differing. The arms below are equality tests on one value, so this path
+    // states no CLASSIFICATION ordering — but it does place its own catch-all, whose position is
+    // load-bearing (#385 F2). The anti-drift test is what holds the two paths' catch-alls
+    // consistent; see the classifier for the measurement.
     const verdict = classifyRestartOutcome({ restartFailure, postFlight, postFlightMeasured });
     // F5: single source for "what to run by hand", shared by every hint below.
     const recoveryCmds = recoveryPlanCommands(restartPlan).join(" && ");
@@ -2531,7 +2584,9 @@ async function runRollback(opts) {
   // of runFullUpgrade's, not a call into one. #352's issue text predicted "the four-cell verdict
   // logic [is] already exported / in place from #347"; only `execRestartRetry`,
   // `recoveryPlanCommands`, `postFlightFailureSuffix` and `postFlightOnlyCommand` actually are. The
-  // arm ordering is the load-bearing property and it is now duplicated rather than shared — an
+  // arm ordering was the load-bearing property AT THAT TIME (#372/#381 has since made the
+  // restart-failure arms disjoint, so only the catch-alls and the one overlapping pair still
+  // order-depend — see the classifier) and it was then duplicated rather than shared — an
   // extraction touches runFullUpgrade and belongs in its own reviewable unit (Iron Rule 11), so it
   // is filed rather than folded in here. The hint TAILS differ (below); the opening clauses of the
   // DOWN hint are byte-identical to the sibling's, and are not claimed to be re-derived.
@@ -2542,15 +2597,21 @@ async function runRollback(opts) {
   // the only thing missing is a running service.
   //
   // ISSUE #373. The classification and its ORDERING moved to `classifyRestartOutcome`, shared with
-  // `runFullUpgrade`. The long note this replaces recorded WHY the two kinds mean what they mean and
-  // why DOWN needs positive evidence of non-reach; that reasoning now lives with the code it
-  // governs, next to the classifier, rather than in one of the two copies that happened to carry it.
+  // `runFullUpgrade`. The long note this replaces recorded two separate things, and #385's review
+  // caught that only one of them was actually relocated: the kind semantics and "DOWN needs
+  // positive evidence" reasoning went to the classifier, but the sticky-`lastSeen` paragraph
+  // (#352's LOW-D) was DELETED while this comment claimed it had moved — leaving
+  // `postFlightFailureSuffix`'s pointer to it aimed at nothing. It now lives beside the assignment
+  // that creates the stickiness, in `runPostFlightCheck`, which is where that pointer already led.
   //
   // What remains here is this path's WORDING, which is not shared and must not become shared:
   // `runFullUpgrade`'s hints may end by pointing at `ocp update --rollback`; here that is the command
   // already running, and repeating it sends an operator round the same loop a second time. What is
   // true on this path instead is that the tree IS restored and the only thing missing is a running
-  // service. The arms are equality tests on one value, so this path states no ordering at all.
+  // service. The arms are equality tests on one value, so this path states no CLASSIFICATION
+  // ordering — but its catch-all's position IS load-bearing (#385 F2: hoisting it above this path's
+  // PROBE_LOCAL_FAULT cell changes 2 of 108 cases, rollback lane only), which is what the
+  // anti-drift test guards.
   const verdict = classifyRestartOutcome({ restartFailure, postFlight, postFlightMeasured });
   const recoveryCmds = recoveryPlanCommands(restartPlan).join(" && ");
 
