@@ -2553,7 +2553,10 @@ ltTest("integration: flag OFF → the -p spawn receives the EXACT negative wrapp
 // TEST-NET-1 is reserved for documentation and is not routed, so even a host that DOES let the bind
 // succeed (an interface holding the address, or Linux's `ip_nonlocal_bind`) is not reachable at it.
 // The escape-hatch test asserts the absence of "listening on" precisely so that a host where the
-// first claim stops holding says so, loudly, instead of quietly weakening these tests.
+// first claim stops holding says so, loudly, instead of quietly weakening these tests. That
+// assertion is the FIRST rung of its ladder, not the last: every other rung there takes
+// EADDRNOTAVAIL as a precondition, so a guard placed below them can never run on the one host it
+// was written for.
 const LT_NONLOOPBACK_BIND = "192.0.2.1";
 
 ltTest("integration: boot gate REFUSES each unsafe config (multi / non-loopback / anon key)", async () => {
@@ -2594,11 +2597,18 @@ ltTest("integration: boot gate REFUSES each unsafe config (multi / non-loopback 
 // which is three operands and therefore three separate pins. Which arm a mutation kills is the part
 // #343 asks to be stated explicitly, because the obvious mutation kills the wrong one:
 //
-//   operand                        mutate to  MEASURED (baseline: 1157 passed, 0 failed, 2 skipped)
+// Recorded as a DELTA in failures plus the IDENTITY of every test that reddens, against a baseline
+// of 0 failures on the same tree in the same run. Absolute pass counts are deliberately not written
+// down: this comment's first draft carried them, and they read +5 stale within two unrelated merges
+// (#389, #390), at which point a reader re-running a row cannot tell suite drift from a defect.
+// Pinning a base SHA beside them would only date the staleness — which test dies is the invariant,
+// so that is what is recorded.
+//
+//   operand                        mutate to  MEASURED (delta vs. a 0-failure baseline)
 //   -----------------------------  ---------  ----------------------------------------------------
-//   !isLoopbackBind(BIND_ADDRESS)  false      1156/1 failed: THIS test, alone  <- the #339 defect
-//   !isLoopbackBind(BIND_ADDRESS)  true       1154/3 failed: loopback boots; this test SURVIVES
-//   OCP_TUI_ALLOW_LAN !== "1"      true       1156/1 failed: the escape-hatch test below, alone
+//   !isLoopbackBind(BIND_ADDRESS)  false      +1 failure:  THIS test, alone    <- the #339 defect
+//   !isLoopbackBind(BIND_ADDRESS)  true       +3 failures: loopback boots; this test SURVIVES
+//   OCP_TUI_ALLOW_LAN !== "1"      true       +1 failure:  the escape-hatch test below, alone
 //
 // Deleting `isLoopbackBind(...)` outright is ambiguous between rows 1 and 2, and only row 1 is the
 // "call site quietly stopped consulting the helper" shape this issue is about — row 2 makes the gate
@@ -2655,21 +2665,36 @@ ltTest("integration (#370): OCP_TUI_ALLOW_LAN=1 is consulted — the documented 
     CLAUDE_BIN: fake, CLAUDE_PROXY_PORT: String(port),
   }, dir);
   try {
+    // Settle first, then the SAFETY guard, then the claim. The order is the whole point and it is
+    // the reverse of the obvious one. Every rung after the guard takes EADDRNOTAVAIL as a
+    // PRECONDITION, so a guard placed after them is unreachable on the only host it exists for:
+    // where the bind succeeds there is no EADDRNOTAVAIL, the earlier rung throws first, and it
+    // throws with a message describing the opposite of what happened. Measured on a synthetic
+    // successful-bind `buf` against this exact ladder — see the mutation record in the PR body.
+    // The wait must therefore admit the successful-bind outcome too, or the guard is starved of
+    // the run that reaches it; widening the wait ALONE is not enough, because the EADDRNOTAVAIL
+    // assertion blocks it as well. Both had to move below the guard.
+    assert.ok(await ltWait(() =>
+      /EADDRNOTAVAIL/.test(buf.err) || buf.out.includes("listening on") || buf.closed || buf.spawnErr),
+      `boot produced no bind attempt, no listener and no exit — ${ltDiag(buf)}`);
+    // The safety property this whole pair rests on: TEST-NET-1 is unroutable and unassigned, so
+    // "past the gate" never becomes a real listener on this machine. This is the rung that says so
+    // loudly on a host where that stops holding — an interface actually holding the address, or
+    // Linux's `net.ipv4.ip_nonlocal_bind`. It fires before anything else can mis-describe the run.
+    assert.ok(!buf.out.includes("listening on"),
+      `${LT_NONLOOPBACK_BIND} BOUND on this host, so the gate tests are no longer exposure-free ` +
+      `and the address must be changed — this boot deliberately passes the LAN gate, so a bindable ` +
+      `address means a TUI-mode CLAUDE_AUTH_MODE=none server just listened off-loopback — ${ltDiag(buf)}`);
     // POSITIVE evidence that the gate was passed, not the absence of its message. `!/is unsafe/`
     // on its own is satisfied by a child that died before ever reaching :831 — a cell firing on a
     // missing operand, which is what 4022be4 was written for. Reaching listen() at all is the
-    // observation that proves the override was honoured.
-    assert.ok(await ltWait(() => /EADDRNOTAVAIL/.test(buf.err) || buf.closed || buf.spawnErr),
-      `boot produced neither a bind attempt nor an exit — ${ltDiag(buf)}`);
+    // observation that proves the override was honoured. Past the guard above, a run with no
+    // EADDRNOTAVAIL is one that closed or failed to spawn without ever attempting a bind.
     assert.ok(/EADDRNOTAVAIL/.test(buf.err),
-      `with the override set the boot must get PAST the gate and reach listen() — ${ltDiag(buf)}`);
+      `with the override set the boot must get PAST the gate and reach listen(), but this child ` +
+      `ended without ever attempting a bind — ${ltDiag(buf)}`);
     assert.ok(!/is unsafe/.test(buf.err),
       `OCP_TUI_ALLOW_LAN=1 must suppress the LAN gate — ${ltDiag(buf)}`);
-    // The safety property this whole pair rests on: TEST-NET-1 is unroutable and unassigned, so
-    // "past the gate" never becomes a real listener on this machine.
-    assert.ok(!buf.out.includes("listening on"),
-      `${LT_NONLOOPBACK_BIND} must never actually bind — this host has it on an interface, so the ` +
-      `gate tests are no longer exposure-free and the address must be changed — ${ltDiag(buf)}`);
   } finally { child.kill("SIGKILL"); _ltRmRetry(dir); }
 });
 
