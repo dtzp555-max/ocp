@@ -5515,18 +5515,31 @@ ltTest("integration (#383 / ADR 0017, the money test): a non-object body is 400 
 
     // ── LIVENESS FIRST. Every "no key was created" assertion below is a NEGATIVE over this store
     // read, so the read is proven able to OBSERVE a creation before anything depends on its
-    // silence. Without this, a store read that always reported the same string would pass every
+    // silence. Without this, a store read that could not see the creation would pass every
     // rejected case vacuously — the exact way a negative test goes quietly dead.
+    //
+    // THE PROBE IS `{}`, NOT A NAMED BODY, AND THAT IS THE WHOLE POINT. A rejected body can only
+    // ever mint through the AUTO-NAME path — `parsed.name` is `undefined` on every non-object, so
+    // the key it would create is named `key-<epoch-ms>`. Proving the read can see a *named* key is
+    // therefore the wrong premise: it is a different observation from the one the four negatives
+    // depend on. Found by an independent reviewer of this PR, who mutated `GET /api/keys` to
+    // `listKeys().filter(k => !/^key-\d+$/.test(k.name))` — blind to auto-named keys only — and
+    // measured a named-body liveness probe PASSING while all four negative store assertions passed
+    // vacuously. `{}` takes the identical code path a rejected body would have taken, so the thing
+    // proven observable is the thing whose absence is later asserted.
     const empty = await lt383Keys(port, "liveness baseline");
     assert.equal(empty, "", `this test needs a fresh key store; GET /api/keys already had: ${empty}`);
-    const live = await ltRawSend(port, { path: "/api/keys", bytes: Buffer.from('{"name":"lt-383-live"}', "utf8"), timeoutMs: LT383_BUDGET });
-    assert.equal(live.status, 201, `a named object body must still mint a key: ${live.status} ${live.text.slice(0, 200)}`);
-    assert.equal(JSON.parse(live.text).name, "lt-383-live", `the supplied name must be echoed: ${live.text.slice(0, 200)}`);
+    const live = await ltRawSend(port, { path: "/api/keys", bytes: Buffer.from("{}", "utf8"), timeoutMs: LT383_BUDGET });
+    assert.equal(live.status, 201, `an object body must still mint a key: ${live.status} ${live.text.slice(0, 200)}`);
+    assert.match(JSON.parse(live.text).name, /^key-\d+$/,
+      `the liveness probe must mint an AUTO-NAMED key, because that is the only name a rejected ` +
+      `body could ever produce and therefore the only observation the negatives below rest on: ` +
+      `${live.text.slice(0, 200)}`);
     const afterLive = await lt383Keys(port, "liveness");
     assert.notEqual(afterLive, empty,
-      `the store read cannot see a creation, so every "no key was minted" assertion below would be ` +
-      `vacuous. Baseline was ${JSON.stringify(empty)} and it is still ${JSON.stringify(afterLive)} ` +
-      `after a 201.`);
+      `the store read cannot see an AUTO-NAMED creation, so every "no key was minted" assertion ` +
+      `below would be vacuous. Baseline was ${JSON.stringify(empty)} and it is still ` +
+      `${JSON.stringify(afterLive)} after a 201.`);
 
     // ── The four changed productions. Assertion order is deliberate: `timedOut` first (a hang is a
     // different, worse bug than a wrong status and must not be reported as one), then the STORE,

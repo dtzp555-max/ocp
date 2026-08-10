@@ -2596,7 +2596,8 @@ const isLegalInOperand = (v) => typeof v === "object" && v !== null;
 // (getRecentUsage, getUsageTimeline) are byte-identical to the pre-fix code. The grandfathered
 // snapshot therefore IS the defective behaviour — the hang is inside what ADR 0006 froze, not
 // something added after it. Contrast #383, where POST /api/keys' name regex entered between
-// v3.17.1 and v3.18.0 and is consequently unauthorized. `limit`'s documented meaning — "how
+// v3.17.1 and v3.18.0, so ADR 0006's snapshot never covered it and it needed — and now has —
+// its own authorization, ADR 0017 § Decision 2. `limit`'s documented meaning — "how
 // many recent rows, default 50, capped at 500" — is unchanged. Same reasoning as #360's
 // `parsed === null` guard: a request that currently receives NO RESPONSE AT ALL is not a
 // behaviour anyone can be relying on.
