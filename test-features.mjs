@@ -7921,8 +7921,14 @@ test("#373 (the anti-drift guard): both `ocp update` paths reach the SAME verdic
   // it requires `postFlightMeasured === false`, which needs a run with no `mockProbe` at all, and
   // every case in this sweep supplies one. It has its own test (`#352 LOW-4`, and `#356 F7` for the
   // forward path).
-  const expectedVerdicts = new Set(Object.values(RESTART_VERDICT).map(v =>
-    Object.keys(RESTART_VERDICT).find(k => RESTART_VERDICT[k] === v)));
+  //
+  // #385 re-review (a): this was `Object.values(...).map(v => Object.keys(...).find(...))`, a
+  // round-trip through the VALUES — which silently drops any verdict whose value string duplicates
+  // an existing one. Measured: adding `SHADOWED: "unconfirmed"` to the enum leaves the round-trip at
+  // 6 entries and the guard GREEN, while `Object.keys` reports 7 and goes red. So the guard added to
+  // catch a forgotten verdict had its own way of adding one that it could not catch — the same
+  // defect class, inside the fix for it. `Object.keys` is otherwise exactly equivalent.
+  const expectedVerdicts = new Set(Object.keys(RESTART_VERDICT));
   expectedVerdicts.delete("UNMEASURED");
   for (const v of expectedVerdicts) {
     assert.ok(seen.has(v),

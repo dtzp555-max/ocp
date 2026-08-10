@@ -1078,14 +1078,30 @@ export async function runPostFlightCheck(target, opts = {}) {
 //
 // The constraints that DO survive, each with the mutation that proves it:
 //
-//   - UNMEASURED must precede everything .................. 10 of 80 inputs change if it moves
+//   - UNMEASURED must precede everything .................. moved to LAST: 20 of 80 inputs change
+//     (#385 re-review (b): there are eight relocations and they do not agree — they span 1 (just
+//      after RF_PLF) to 20 (last). An earlier draft cited "10", which is only the just-after-
+//      UNCONFIRMED case, while its two neighbours below name theirs precisely. The end position is
+//      quoted because it is the one the words "precede everything" actually describe.)
 //   - specific arms must precede the two CATCH-ALLS ....... UNCONFIRMED above PLF: 5 of 80;
 //     (`UNCONFIRMED` and `WARNED_SUCCESS` are the only                 WARNED above UNCONFIRMED: 2 of 80
 //     non-disjoint predicates left, being bare tests)
 //   - PROBE_LOCAL_FAULT vs RESTART_FAILED_PROBE_LOCAL_FAULT — THE ONE OVERLAPPING PAIR, and the
 //     only surviving descendant of #351's incident: both fire on `probe-could-not-run`, and the
-//     general one must come second or a host that merely failed a restart is told its local curl is
-//     the whole story. Hoisting it changes 4 of 108 end-to-end cases ON BOTH LANES from one edit.
+//     general one must come second. Hoisting it changes 4 of 108 end-to-end cases ON BOTH LANES
+//     from one edit.
+//
+//     WHAT GETTING IT WRONG ACTUALLY PRINTS, measured under that mutation rather than described —
+//     and it is worse than "the operator is told their local curl is the whole story":
+//
+//       hint   : "THE UPGRADE MAY HAVE SUCCEEDED — do NOT roll back on this evidence.
+//                 Every restart command exited 0, and the post-flight probe could not RUN here…"
+//       phases : the `restart` statuses in that SAME thrown error are ["ok","fail"]
+//
+//     One error, two contradictory statements about one measurement — #372's opening shape exactly,
+//     reintroduced by an ordering edit rather than by a predicate. That is the real reason this pair
+//     must stay in order, and it is why the general arm may not swallow the specific one: the
+//     specific cell exists precisely to say that a restart command DID fail.
 //
 // Recording the retraction rather than quietly rewriting it: a comment that keeps asserting a
 // constraint the code no longer has is worse than no comment, because the next reader trusts it,
