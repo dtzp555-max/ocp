@@ -3875,9 +3875,24 @@ ltTest("integration (#359): a prompt cut mid-character on the wire reaches the s
 // folded in here.
 const LT360_BUDGET = 15000;   // a hang is unbounded, so a generous budget costs no detection power
 
-// Every scalar body the issue names, plus the array forms, as raw bytes.
-const LT360_SCALARS = [
-  ["null", "null"], ["42", "42"], ['"a string"', '"a string"'], ["true", "true"], ["[]", "[]"],
+// Every scalar body the issue names, plus the array forms. The literal IS the label, so there is no
+// second tuple element to carry one (review F6: the previous `[label, body]` shape had every label
+// discarded at the destructuring site, which is a claim the code was not using).
+const LT360_SCALARS = ["null", "42", '"a string"', "true", "[]"];
+
+// Review F1. The scalar guard closes the scalar door only. These are all OBJECTS — they pass the
+// shape guard — and every one of them still reached the `||` chain that manufactures
+// `[{role:"user",content:""}]` and pays for a real spawn. Measured before the F1 guard: each of
+// these returned 200 with spawns=1. `{"model":"haiku"}` is the one that matters: it is a far more
+// plausible accidental client body than `42`, and it is the reason fixing only the scalars left an
+// unbounded family of billed no-op requests rather than closing the door.
+const LT360_EMPTY_HANDED = ['{}', '{"messages":null}', '{"messages":0}', '{"model":"haiku"}', '{"prompt":""}'];
+
+// The control for F1's guard: these must STILL reach the model, so the guard is proven to be
+// narrow. A guard that 400s everything would pass every assertion above and break the product.
+const LT360_STILL_VALID = [
+  ['{"prompt":"probe-360-prompt"}', "the undocumented `prompt` fallback still works"],
+  ['{"messages":[{"role":"user","content":"probe-360-messages"}]}', "an ordinary request still works"],
 ];
 
 // One probe. Asserts, in order: the server ANSWERED at all, the answer was 4xx, and it arrived
@@ -3922,16 +3937,26 @@ ltTest("integration (#360, the money test): every scalar JSON body is answered w
 
     // ── B.1: OpenAI's spec defines the body as an object with a required `messages`. Every scalar
     // and array form is therefore a 400, and — the half that costs money — none may reach a spawn.
-    for (const [, body] of LT360_SCALARS) {
+    for (const body of LT360_SCALARS) {
       await lt360Expect(port, {
         method: "POST", path: "/v1/chat/completions", body, status: 400,
         what: "POST /v1/chat/completions", bodyRe: /invalid_request_error/,
       });
     }
 
+    // ── B.1, review F1: an OBJECT body carrying no usable messages must not buy a spawn either.
+    // These pass the shape guard, so only the F1 guard can stop them. Class B.1: OpenAI's spec makes
+    // `messages` required, and ADR 0006's grandfather provision explicitly does not extend to B.1.
+    for (const body of LT360_EMPTY_HANDED) {
+      await lt360Expect(port, {
+        method: "POST", path: "/v1/chat/completions", body, status: 400,
+        what: "POST /v1/chat/completions (empty-handed object)", bodyRe: /'messages' is required/,
+      });
+    }
+
     // ── B.2 /settings: `null` must land on the SAME 400 the other non-objects already got. Asserting
     // the shared message is the point — a separate message would mean a new error body was invented.
-    for (const [, body] of LT360_SCALARS) {
+    for (const body of LT360_SCALARS) {
       await lt360Expect(port, {
         method: "PATCH", path: "/settings", body, status: 400,
         what: "PATCH /settings", bodyRe: /Expected JSON object with key-value pairs/,
@@ -3944,8 +3969,10 @@ ltTest("integration (#360, the money test): every scalar JSON body is answered w
       what: "POST /api/keys", bodyRe: /Expected JSON object with key-value pairs/,
     });
 
-    // ── B.2 quota: all four primitives hung before the fix, not just null.
-    for (const [, body] of [["null", "null"], ["42", "42"], ['"a string"', '"a string"'], ["true", "true"]]) {
+    // ── B.2 quota: all four primitives hung before the fix, not just null. Arrays are excluded on
+    // purpose and asserted separately below (review F6: this list was a re-inlined duplicate of
+    // LT360_SCALARS with the array dropped; derive it instead so the two cannot drift).
+    for (const body of LT360_SCALARS.filter(b => b !== "[]")) {
       await lt360Expect(port, {
         method: "PATCH", path: `/api/keys/${keyId}/quota`, body, status: 400,
         what: "PATCH /api/keys/:id/quota", bodyRe: /Expected JSON object with key-value pairs/,
@@ -3957,17 +3984,23 @@ ltTest("integration (#360, the money test): every scalar JSON body is answered w
     // returned 400 but still spawned would pass every assertion above and still bill the operator.
     const spawns = Number(_ltRead(counter, "utf8").trim() || "0");
     assert.equal(spawns, 0,
-      `a scalar body must never reach the upstream: ${spawns} spawn(s) happened. Before #360 each ` +
-      `non-null scalar became [{role:"user",content:""}] and was forwarded as a real, billed call.`);
+      `no body carrying zero usable messages may reach the upstream: ${spawns} spawn(s) happened. ` +
+      `Before this PR every non-null scalar AND every empty-handed object ({}, {"messages":null}, ` +
+      `{"messages":0}, {"model":"haiku"}) became [{role:"user",content:""}] and was forwarded as a ` +
+      `real, billed call. Both families are probed above, so a non-zero count here names the ` +
+      `quota-burn defect and not merely a status regression.`);
 
     // ── Deliberate scope, pinned. These are ANSWERED inputs today; changing them is a contract
     // change on a grandfathered B.2 endpoint, so this PR must NOT have changed them.
     const keyScalar = await ltRawSend(port, { path: "/api/keys", bytes: Buffer.from("42", "utf8"), timeoutMs: LT360_BUDGET });
     assert.ok(!keyScalar.timedOut, "POST /api/keys with 42 must still answer");
     assert.equal(keyScalar.status, 201,
-      `POST /api/keys with a non-null scalar answered 201 before this PR (auto-named key, same as {}). ` +
-      `Tightening it is a request-shape change on a grandfathered B.2 endpoint and is out of scope ` +
-      `here — got ${keyScalar.status}: ${keyScalar.text.slice(0, 200)}`);
+      `POST /api/keys with a non-null scalar answered 201 before this PR — it MINTS A REAL KEY from ` +
+      `a body it never validated, which is tracked as ISSUE #383 and is a defect, not a feature. ` +
+      `It is pinned here rather than fixed because tightening it is a request-shape change on a ` +
+      `grandfathered B.2 endpoint (ALIGNMENT.md:114) and needs its own ADR. If you are fixing #383, ` +
+      `this assertion is the one to change, in the same PR, with that ADR cited — ` +
+      `got ${keyScalar.status}: ${keyScalar.text.slice(0, 200)}`);
 
     const quotaArr = await ltRawSend(port, { method: "PATCH", path: `/api/keys/${keyId}/quota`, bytes: Buffer.from("[]", "utf8"), timeoutMs: LT360_BUDGET });
     assert.ok(!quotaArr.timedOut, "PATCH quota with [] must still answer");
@@ -3975,6 +4008,22 @@ ltTest("integration (#360, the money test): every scalar JSON body is answered w
     assert.match(quotaArr.text, /Provide at least one of/,
       `an array body answered "Provide at least one of…" before this PR (typeof [] === "object", so ` +
       `it reaches the loop). The new guard must not capture it and change that message: ${quotaArr.text.slice(0, 200)}`);
+
+    // ── The CONTROL for review F1's guard, and the reason it can be trusted to be narrow. A guard
+    // that rejected everything would satisfy every assertion above while breaking the product, so
+    // these must still reach the model and return 200. The `prompt` fallback is undocumented but it
+    // is existing behaviour, and F1 deliberately preserves it — only the empty-handed case is
+    // refused. Each is asserted to have SPAWNED, not merely to have returned 200, so a future
+    // change that answers 200 from cache without calling the model cannot pass this vacuously.
+    for (const [body, why] of LT360_STILL_VALID) {
+      _ltWrite(counter, "0");
+      const still = await ltRawSend(port, { path: "/v1/chat/completions", bytes: Buffer.from(body, "utf8"), timeoutMs: LT360_BUDGET });
+      assert.equal(still.status, 200,
+        `${why}: ${body} must still be served, got ${still.status}: ${still.text.slice(0, 200)}. ` +
+        `F1's guard must refuse only bodies with NO usable messages, not narrow the endpoint.`);
+      const n = Number(_ltRead(counter, "utf8").trim() || "0");
+      assert.equal(n, 1, `${why}: expected exactly one upstream spawn, got ${n}`);
+    }
 
     // ── Not wedged, and nothing was logged as unhandled. The second half of #360 is that the
     // process-level listener SWALLOWS these; if a guard is ever removed this is the other tell.
