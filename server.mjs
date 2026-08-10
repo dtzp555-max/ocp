@@ -2559,8 +2559,20 @@ const isLegalInOperand = (v) => typeof v === "object" && v !== null;
 // — a contract change, caught by independent review after the first version of this patch did
 // exactly that. Guarding after the clamp keeps `+Infinity → cap` intact and still catches NaN
 // (`Math.min(NaN, cap)` is NaN) and `-Infinity` (which is NOT answered today: it reaches the
-// bind and throws). Verified against the REAL sinks over 47 raw inputs × both parameters:
-// ZERO inputs that the old code answered change value, and 20 that it could not answer now do.
+// bind and throws).
+//
+// ROUTE (a) IS SOUND BY CASE EXHAUSTION HERE, not merely by sampling — which is worth stating
+// because a sampled argument is what let the `+Infinity` case through in the first place.
+// `parseInt` returns exactly one of NaN, +Infinity, -Infinity, or a finite integer, so the
+// non-finite values `Math.min(parseInt(…), cap)` can produce are exactly TWO:
+//   NaN        -> `Math.min(NaN, cap)` is NaN                       -> guard fires
+//   -Infinity  -> `Math.min(-Infinity, cap)` is -Infinity           -> guard fires
+//   +Infinity  -> `Math.min(+Infinity, cap)` is CAP, a finite value -> guard CANNOT fire
+// So the guard is reachable only for NaN and -Infinity, and BOTH were measured to throw at both
+// sinks (`datatype mismatch` / `Invalid time value`), i.e. both were unanswered. The set of
+// inputs whose value changes is therefore EXACTLY the set that received no response — not a
+// sample of it. Corroborated empirically over 47 raw inputs × both parameters against the real
+// sinks: ZERO inputs the old code answered change value, and 20 that it could not answer now do.
 //
 // WHAT THIS DOES NOT FIX, STATED SO THE NEXT READER DOES NOT TRUST IT TOO FAR. A FINITE value
 // can still reach both sinks and throw, and those requests still hang. Measured, on this tree,
@@ -2574,11 +2586,14 @@ const isLegalInOperand = (v) => typeof v === "object" && v !== null;
 // ISSUE #400, which carries both sinks' measured acceptance sets. This guard closes the NaN
 // class only, and the ?hours=-1 test arm records the string-comparison defect it runs into.
 //
-// Authorized by ADR 0006 (grandfathered as of v3.16.4) — behaviour-preserving, route (a). The
-// v3.16.4 snapshot of both call sites is byte-identical to the pre-fix lines here
-// (`git rev-list -n1 v3.16.4` → 9e25160; note v3.16.4 and main share NO ancestor), so the
-// defect is inside the grandfathered behaviour, and `limit`'s documented meaning — "how many
-// recent rows, default 50, capped at 500" — is unchanged. Same reasoning as #360's
+// Authorized by ADR 0006 (grandfathered as of v3.16.4) — behaviour-preserving, route (a). At
+// v3.16.4 (`git rev-list -n1 v3.16.4` → 9e25160; note v3.16.4 and main share NO ancestor, so
+// `git log -S` on main cannot see this) BOTH call sites here AND both sinks in keys.mjs
+// (getRecentUsage, getUsageTimeline) are byte-identical to the pre-fix code. The grandfathered
+// snapshot therefore IS the defective behaviour — the hang is inside what ADR 0006 froze, not
+// something added after it. Contrast #383, where POST /api/keys' name regex entered between
+// v3.17.1 and v3.18.0 and is consequently unauthorized. `limit`'s documented meaning — "how
+// many recent rows, default 50, capped at 500" — is unchanged. Same reasoning as #360's
 // `parsed === null` guard: a request that currently receives NO RESPONSE AT ALL is not a
 // behaviour anyone can be relying on.
 function usageQueryInt(raw, fallback, cap) {

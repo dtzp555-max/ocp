@@ -5438,6 +5438,43 @@ ltTest("integration (#360, the money test): every scalar JSON body is answered w
 //                                       `LIMIT -1` = unbounded) would both change.
 // Hence the guard under test is `Number.isFinite` ONLY, and these arms are what make that
 // narrowness a measured property rather than a claim in a comment.
+// ── What these arms do NOT pin, stated so a green run is not mistaken for coverage ──────────
+// Same discipline as docs/governance/b2-response-keys.json's `notCovered` block, and written
+// for the same reason: this suite's #379 arms were twice found unable to fail (the ?limit
+// default pinned ">= 3" rather than 50; the ?hours default compared against a baseline that
+// moved with it). Both are fixed. These are what remain unpinned.
+//
+//   - THE TWO CAPS — 500 for `limit`, 720 for `hours`. [measured] Booted a real server.mjs at
+//     this commit with the caps changed to 1000 and 1440, seeded the same 60 rows with the same
+//     30 backdated, and probed all eight paths these arms read: `status`, `recent.length` and
+//     `timeline.length` are IDENTICAL to the unmutated tree for every one. The cap cannot be
+//     observed because 60 seeded rows sits below both caps, so `Math.min(x, cap)` is never the
+//     binding constraint on anything asserted. This is the SAME SHAPE as the ?limit default
+//     defect one field over — an expectation that cannot discriminate because the fixture's row
+//     count is below the value it would have to distinguish. It is a COVERAGE GAP, not a defect:
+//     this PR preserves both caps and the R1/H/D/M1 mutations still fail as intended.
+//     Pinning `limit`'s cap honestly needs >500 seeded rows, which is a fixture-cost decision
+//     rather than a one-line fix; it is recorded on ISSUE #400, which already has to reason
+//     about both sinks' boundaries.
+//
+//     NOTE FOR WHOEVER PINS IT: do not compare response BODIES to detect a cap change. The body
+//     embeds `created_at`, so its hash differs between any two runs — a digest comparison reports
+//     a difference that has nothing to do with the cap. [measured] That false positive was hit
+//     while establishing the line above. Compare the COUNTS, which is what these arms assert.
+//
+//   - THE THROWING FINITE INPUTS. [measured] `?limit=-100000000000000000000` and
+//     `?hours=-2400000000` are finite, pass this guard, reach the sinks and still hang. Not a
+//     regression — identical at v3.16.4 and on main — and deliberately out of scope; ISSUE #400.
+//
+//   - THE `getUsageTimeline` DATETIME MISMATCH. [measured] `?hours=+1` returns 0 buckets for a
+//     row written seconds ago, because `since` is built with `.toISOString()` ("…T15:09:39.023Z")
+//     while `created_at` is stored SQLite-style ("… 16:09:39") and `' ' < 'T'`. That is why the
+//     ?hours=-1 arm cannot detect a sign-losing guard. Pre-existing; ISSUE #400.
+//
+//   - NON-LOOPBACK AND NON-DEFAULT AUTH MODES. [reasoned] Every probe here is loopback with
+//     CLAUDE_AUTH_MODE=none. The clamp is downstream of the auth gate, so the mode cannot change
+//     its behaviour — but that is read off the code, NOT measured, and 127.0.0.2 is not bound on
+//     macOS so a non-loopback arm could not be added without binding a LAN interface.
 const LT379_BUDGET = 15000;   // a hang is unbounded, so a generous budget costs no detection power
 
 // MUST exceed the documented default of 50, or the default arm cannot pin 50. With 3 rows (the
@@ -5601,6 +5638,19 @@ ltTest("integration (#379 case 3): GET /api/usage answers a non-numeric limit/ho
     // comparison. keys.mjs already has `sqliteDatetime` for exactly this mismatch and this
     // function does not use it. Not fixed here — it is a different defect on a different line,
     // and changing which rows a timeline returns is a contract change needing its own ADR.
+    // The ?hours side of the +Infinity regression arm. `parseInt` of 400 digits is `+Infinity` and
+    // `Math.min(+Infinity, 720)` is 720, so this is ANSWERED today with the 720 h window — the same
+    // contract question as the ?limit arm, one parameter over. It is currently redundant with that
+    // arm because `usageQueryInt` is shared, and it stops being redundant the moment the two call
+    // sites diverge; that is precisely when a missing arm costs something. Proven non-vacuous by a
+    // mutation that makes ONLY the hours call site finiteness-first (R1H), which this catches and
+    // the ?limit arm does not.
+    const hoursInf = await lt379Get(port, `/api/usage?hours=${"9".repeat(400)}`, "an already-answered ?hours");
+    assert.deepEqual(hoursInf.timeline, win720.timeline,
+      `?hours=<400 nines> overflows parseInt to +Infinity, which Math.min pins to the 720 h cap, so ` +
+      `it must return exactly what ?hours=720 returns. A finiteness guard placed BEFORE the clamp ` +
+      `substitutes the 24 h default instead — a contract change on an answered request.`);
+
     const futureWindow = await lt379Get(port, "/api/usage?hours=-1", "an already-answered ?hours");
     assert.equal(futureWindow.timeline.length, 0,
       `?hours=-1 returns 0 buckets today; got ${futureWindow.timeline.length}. A guard that ` +
