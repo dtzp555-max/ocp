@@ -1892,6 +1892,15 @@ async function runFullUpgrade({ doctor, opts }) {
     // FAIL CLOSED over the enumeration — see the long note on `runRollback`'s copy of this arm for
     // the regression that motivated it (a verdict no arm names used to fall through to a successful
     // return). "Not a success verdict" rather than a list, so a future verdict is refused by default.
+    //
+    // ON THIS PATH THE FORM IS PURELY FORWARD-LOOKING, and the mutation says so: reverting it to
+    // `verdict === UNCONFIRMED` (mutation N5) leaves the suite GREEN at 1146/0, because every
+    // non-success verdict reachable today already has its own cell above — `NOT_OK_STATUS` included,
+    // which is exactly the one that was NOT true of `runRollback` (mutation N4: 1142/4, four tests
+    // including #352's own R2-1). So the honest claim is asymmetric: on the rollback path this shape
+    // fixes a live regression; here it prevents a future one and no test can currently tell. Stated
+    // rather than left as an unreported green, per AGENTS.md/#376 — an unreported green mutation is
+    // indistinguishable from one nobody ran.
     if (verdict !== RESTART_VERDICT.OK && verdict !== RESTART_VERDICT.WARNED_SUCCESS) {
       // Restart commands all succeeded and the probe genuinely ran and said no (orphan holding the
       // port, wrong version serving, ...). Unchanged pre-#347 behaviour, including the generic
