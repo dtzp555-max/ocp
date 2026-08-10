@@ -3841,6 +3841,202 @@ ltTest("integration (#359): a prompt cut mid-character on the wire reaches the s
   } finally { await ctl.close(); child.kill("SIGKILL"); _ltRmRetry(dir); }
 });
 
+// ── #360: a parsed body that is not an object must be ANSWERED, not walked into ──────────────
+//
+// `JSON.parse` verifies SYNTAX, not that the result is a non-null object. `JSON.parse("null")`
+// succeeds, and the four body-reading handlers then indexed the result — `parsed.messages`,
+// `Object.entries(updates)`, `parsed.name`, `k in quotaBody`. Each throws, and the throw escapes
+// an `async` request callback: Node never observes the promise a request handler returns, so
+// `unhandledRejection` logs the error and NOTHING answers or closes the socket.
+//
+// That failure mode is why every assertion below is on the CLOCK as well as the status. A test
+// that only checked for 4xx would pass against a handler that answers by luck and, worse, would
+// report the defect as a status mismatch when it is really silence — so `ltRawSend`'s `timedOut`
+// is asserted FIRST and with its own message. Removing any guard under test makes these fail on
+// the timeout arm, not the status arm; that is the recorded mutation result, not a prediction.
+//
+// The set of bodies is measured, not assumed. Before the fix, on this tree:
+//   POST /v1/chat/completions  null -> HUNG.  42 / "str" / true / [] -> HTTP 200 with a REAL
+//                              spawn each, i.e. a billed upstream call built from a body that
+//                              carried no messages. Both halves are covered below, and the spawn
+//                              counter is what makes the second half non-vacuous.
+//   PATCH /settings            null -> HUNG (its `typeof updates !== "object"` guard reads as
+//                              complete; `typeof null === "object"` defeats it). Everything else
+//                              already answered 400.
+//   POST /api/keys             null -> HUNG. Every other scalar answered 201 and CREATED A KEY.
+//   PATCH /api/keys/:id/quota  null / 42 / "str" / true -> ALL FOUR HUNG (`in` needs an object on
+//                              its right), where the issue reported one. `[]` answered 400.
+//
+// The two "unchanged" arms are deliberate scope, pinned by assertion so the narrowness cannot be
+// mistaken for an oversight and cannot silently widen later: POST /api/keys still answers 201 to a
+// non-null scalar, and the quota route still answers its own "Provide at least one of" message to
+// an array. Both are ANSWERED inputs today, so tightening them would change which requests a
+// grandfathered B.2 endpoint accepts — a contract change needing its own ADR, reported rather than
+// folded in here.
+const LT360_BUDGET = 15000;   // a hang is unbounded, so a generous budget costs no detection power
+
+// Every scalar body the issue names, plus the array forms. The literal IS the label, so there is no
+// second tuple element to carry one (review F6: the previous `[label, body]` shape had every label
+// discarded at the destructuring site, which is a claim the code was not using).
+const LT360_SCALARS = ["null", "42", '"a string"', "true", "[]"];
+
+// Review F1. The scalar guard closes the scalar door only. These are all OBJECTS — they pass the
+// shape guard — and every one of them still reached the `||` chain that manufactures
+// `[{role:"user",content:""}]` and pays for a real spawn. Measured before the F1 guard: each of
+// these returned 200 with spawns=1. `{"model":"haiku"}` is the one that matters: it is a far more
+// plausible accidental client body than `42`, and it is the reason fixing only the scalars left an
+// unbounded family of billed no-op requests rather than closing the door.
+const LT360_EMPTY_HANDED = ['{}', '{"messages":null}', '{"messages":0}', '{"model":"haiku"}', '{"prompt":""}'];
+
+// The control for F1's guard: these must STILL reach the model, so the guard is proven to be
+// narrow. A guard that 400s everything would pass every assertion above and break the product.
+const LT360_STILL_VALID = [
+  ['{"prompt":"probe-360-prompt"}', "the undocumented `prompt` fallback still works"],
+  ['{"messages":[{"role":"user","content":"probe-360-messages"}]}', "an ordinary request still works"],
+];
+
+// One probe. Asserts, in order: the server ANSWERED at all, the answer was 4xx, and it arrived
+// inside the budget. The first assertion is the one #360 is about.
+async function lt360Expect(port, { method, path, body, status, what, bodyRe = null }) {
+  const r = await ltRawSend(port, {
+    method, path, bytes: Buffer.from(body, "utf8"), timeoutMs: LT360_BUDGET,
+  });
+  assert.ok(!r.timedOut,
+    `${what} with body ${body}: NO RESPONSE within ${LT360_BUDGET}ms and the socket was never ` +
+    `closed. This is #360 itself — the handler threw, the throw escaped the async request ` +
+    `callback into unhandledRejection, and the client is left waiting on a connection the server ` +
+    `will never release. A status mismatch would be a different (lesser) bug.`);
+  assert.equal(r.status, status,
+    `${what} with body ${body}: expected ${status}, got ${r.status}: ${r.text.slice(0, 200)}`);
+  if (bodyRe) assert.match(r.text, bodyRe, `${what} with body ${body}: unexpected error body`);
+  return r;
+}
+
+ltTest("integration (#360, the money test): every scalar JSON body is answered within a bounded time, never left hanging", async () => {
+  if (!LT_POSIX) return;
+  const dir = ltMkdir(); const fake = ltFake(dir);
+  const counter = join(dir, "spawns.txt");
+  // SP_CAPTURE is set even though nothing reads it: LT_FAKE redirects to it unconditionally once it
+  // sees --system-prompt, which server.mjs passes on the default path (the negative local-tools
+  // wrapper), and an unset variable there is a redirection to an empty filename.
+  const { child, buf, port } = await ltBootFresh(
+    { CLAUDE_BIN: fake, SP_COUNTER: counter, SP_CAPTURE: join(dir, "sp.txt") }, dir);
+  try {
+    assert.ok(await ltWait(() => buf.out.includes("listening on") || buf.spawnErr, 20000) && !buf.spawnErr,
+      `did not start: ${buf.spawnErr ? buf.spawnErr.message : buf.err.slice(0, 300)}`);
+
+    // A real key, so the quota route exercises its body guard rather than 404-ing on the id.
+    const made = await ltRawSend(port, { path: "/api/keys", bytes: Buffer.from(JSON.stringify({ name: "lt-360" }), "utf8") });
+    assert.equal(made.status, 201, `could not create the key the quota route needs: ${made.status} ${made.text.slice(0, 200)}`);
+    const keyId = JSON.parse(made.text).id;
+    assert.ok(keyId, "created key has no id");
+
+    // The counter must mean "spawns caused by the scalar probes", so zero it AFTER the setup above
+    // (which spawns nothing) and read it only at the end.
+    _ltWrite(counter, "0");
+
+    // ── B.1: OpenAI's spec defines the body as an object with a required `messages`. Every scalar
+    // and array form is therefore a 400, and — the half that costs money — none may reach a spawn.
+    for (const body of LT360_SCALARS) {
+      await lt360Expect(port, {
+        method: "POST", path: "/v1/chat/completions", body, status: 400,
+        what: "POST /v1/chat/completions", bodyRe: /invalid_request_error/,
+      });
+    }
+
+    // ── B.1, review F1: an OBJECT body carrying no usable messages must not buy a spawn either.
+    // These pass the shape guard, so only the F1 guard can stop them. Class B.1: OpenAI's spec makes
+    // `messages` required, and ADR 0006's grandfather provision explicitly does not extend to B.1.
+    for (const body of LT360_EMPTY_HANDED) {
+      await lt360Expect(port, {
+        method: "POST", path: "/v1/chat/completions", body, status: 400,
+        what: "POST /v1/chat/completions (empty-handed object)", bodyRe: /'messages' is required/,
+      });
+    }
+
+    // ── B.2 /settings: `null` must land on the SAME 400 the other non-objects already got. Asserting
+    // the shared message is the point — a separate message would mean a new error body was invented.
+    for (const body of LT360_SCALARS) {
+      await lt360Expect(port, {
+        method: "PATCH", path: "/settings", body, status: 400,
+        what: "PATCH /settings", bodyRe: /Expected JSON object with key-value pairs/,
+      });
+    }
+
+    // ── B.2 /api/keys: `null` only. See the block comment — the other scalars are ANSWERED today.
+    await lt360Expect(port, {
+      method: "POST", path: "/api/keys", body: "null", status: 400,
+      what: "POST /api/keys", bodyRe: /Expected JSON object with key-value pairs/,
+    });
+
+    // ── B.2 quota: all four primitives hung before the fix, not just null. Arrays are excluded on
+    // purpose and asserted separately below (review F6: this list was a re-inlined duplicate of
+    // LT360_SCALARS with the array dropped; derive it instead so the two cannot drift).
+    for (const body of LT360_SCALARS.filter(b => b !== "[]")) {
+      await lt360Expect(port, {
+        method: "PATCH", path: `/api/keys/${keyId}/quota`, body, status: 400,
+        what: "PATCH /api/keys/:id/quota", bodyRe: /Expected JSON object with key-value pairs/,
+      });
+    }
+
+    // ── The money assertion for the SECOND failure mode. Before the fix each of `42`, `"a string"`,
+    // `true` and `[]` produced a real `claude` spawn from a body with no messages. A guard that
+    // returned 400 but still spawned would pass every assertion above and still bill the operator.
+    const spawns = Number(_ltRead(counter, "utf8").trim() || "0");
+    assert.equal(spawns, 0,
+      `no body carrying zero usable messages may reach the upstream: ${spawns} spawn(s) happened. ` +
+      `Before this PR every non-null scalar AND every empty-handed object ({}, {"messages":null}, ` +
+      `{"messages":0}, {"model":"haiku"}) became [{role:"user",content:""}] and was forwarded as a ` +
+      `real, billed call. Both families are probed above, so a non-zero count here names the ` +
+      `quota-burn defect and not merely a status regression.`);
+
+    // ── Deliberate scope, pinned. These are ANSWERED inputs today; changing them is a contract
+    // change on a grandfathered B.2 endpoint, so this PR must NOT have changed them.
+    const keyScalar = await ltRawSend(port, { path: "/api/keys", bytes: Buffer.from("42", "utf8"), timeoutMs: LT360_BUDGET });
+    assert.ok(!keyScalar.timedOut, "POST /api/keys with 42 must still answer");
+    assert.equal(keyScalar.status, 201,
+      `POST /api/keys with a non-null scalar answered 201 before this PR — it MINTS A REAL KEY from ` +
+      `a body it never validated, which is tracked as ISSUE #383 and is a defect, not a feature. ` +
+      `It is pinned here rather than fixed because tightening it is a request-shape change on a ` +
+      `grandfathered B.2 endpoint (ALIGNMENT.md:114) and needs its own ADR. If you are fixing #383, ` +
+      `this assertion is the one to change, in the same PR, with that ADR cited — ` +
+      `got ${keyScalar.status}: ${keyScalar.text.slice(0, 200)}`);
+
+    const quotaArr = await ltRawSend(port, { method: "PATCH", path: `/api/keys/${keyId}/quota`, bytes: Buffer.from("[]", "utf8"), timeoutMs: LT360_BUDGET });
+    assert.ok(!quotaArr.timedOut, "PATCH quota with [] must still answer");
+    assert.equal(quotaArr.status, 400, `quota [] expected 400, got ${quotaArr.status}`);
+    assert.match(quotaArr.text, /Provide at least one of/,
+      `an array body answered "Provide at least one of…" before this PR (typeof [] === "object", so ` +
+      `it reaches the loop). The new guard must not capture it and change that message: ${quotaArr.text.slice(0, 200)}`);
+
+    // ── The CONTROL for review F1's guard, and the reason it can be trusted to be narrow. A guard
+    // that rejected everything would satisfy every assertion above while breaking the product, so
+    // these must still reach the model and return 200. The `prompt` fallback is undocumented but it
+    // is existing behaviour, and F1 deliberately preserves it — only the empty-handed case is
+    // refused. Each is asserted to have SPAWNED, not merely to have returned 200, so a future
+    // change that answers 200 from cache without calling the model cannot pass this vacuously.
+    for (const [body, why] of LT360_STILL_VALID) {
+      _ltWrite(counter, "0");
+      const still = await ltRawSend(port, { path: "/v1/chat/completions", bytes: Buffer.from(body, "utf8"), timeoutMs: LT360_BUDGET });
+      assert.equal(still.status, 200,
+        `${why}: ${body} must still be served, got ${still.status}: ${still.text.slice(0, 200)}. ` +
+        `F1's guard must refuse only bodies with NO usable messages, not narrow the endpoint.`);
+      const n = Number(_ltRead(counter, "utf8").trim() || "0");
+      assert.equal(n, 1, `${why}: expected exactly one upstream spawn, got ${n}`);
+    }
+
+    // ── Not wedged, and nothing was logged as unhandled. The second half of #360 is that the
+    // process-level listener SWALLOWS these; if a guard is ever removed this is the other tell.
+    const ok = await ltRawSend(port, {
+      path: "/v1/chat/completions",
+      bytes: Buffer.from(JSON.stringify({ model: "haiku", messages: [{ role: "user", content: "probe-360" }] }), "utf8"),
+    });
+    assert.equal(ok.status, 200, `the server must still serve valid requests afterwards: ${ok.status} ${ok.text.slice(0, 200)}`);
+    assert.ok(!/"event":"unhandled_rejection"/.test(buf.err),
+      `no request in this test may produce an unhandled rejection; server stderr had: ${buf.err.slice(0, 400)}`);
+  } finally { child.kill("SIGKILL"); _ltRmRetry(dir); }
+});
+
 // ── #365: the CHILD's stdout/stderr must decode UTF-8 ACROSS chunk boundaries ───────────────
 //
 // The other half of #359. `lineBuffer += d.toString()` and `stderr += d` decoded each Buffer from
