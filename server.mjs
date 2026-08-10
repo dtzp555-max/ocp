@@ -2549,10 +2549,30 @@ const isLegalInOperand = (v) => typeof v === "object" && v !== null;
 //   `?limit=5abc` → 5 (parseInt prefix), `?limit=-1` → SQLite `LIMIT -1` = unbounded,
 //   `?limit=0` → 0 rows, `?hours=-1` → a window in the future.
 // Using it would change WHICH VALUE a currently-answered request gets, which is the contract
-// change ALIGNMENT.md:114 makes a new authorization request. So the guard is deliberately the
-// NARROWEST one that removes the hang: `Number.isFinite` only. Every input whose parse is
-// already a finite number keeps its value bit-for-bit; the substitution is reachable only for
-// inputs that today receive no response at all.
+// change ALIGNMENT.md:114 makes a new authorization request.
+//
+// THE GUARD RUNS *AFTER* `Math.min`, AND THAT ORDER IS THE WHOLE CORRECTNESS ARGUMENT.
+// `parseInt` returns NaN, ±Infinity, or a finite integer — and `Math.min(+Infinity, cap)` is
+// `cap`, an ordinary finite value that reaches the sink and IS ANSWERED at v3.16.4. A 400-digit
+// `?limit` overflows to `+Infinity` and therefore answers 500 rows today. Guarding BEFORE the
+// clamp would substitute the default instead, changing the value of a request that is answered
+// — a contract change, caught by independent review after the first version of this patch did
+// exactly that. Guarding after the clamp keeps `+Infinity → cap` intact and still catches NaN
+// (`Math.min(NaN, cap)` is NaN) and `-Infinity` (which is NOT answered today: it reaches the
+// bind and throws). Verified against the REAL sinks over 47 raw inputs × both parameters:
+// ZERO inputs that the old code answered change value, and 20 that it could not answer now do.
+//
+// WHAT THIS DOES NOT FIX, STATED SO THE NEXT READER DOES NOT TRUST IT TOO FAR. A FINITE value
+// can still reach both sinks and throw, and those requests still hang. Measured, on this tree,
+// after this fix:
+//   `?limit=-100000000000000000000` → SQLite bind rejects it        → "datatype mismatch"
+//   `?hours=-2400000000`            → Date range overflow           → "Invalid time value"
+// Both are PRE-EXISTING — they hang identically at v3.16.4 and on `main` — and both are a
+// different input class from the `parseInt`-yields-NaN defect issue #379 case 3 describes, with
+// their own contract questions (SQLite's int64 bind range; `Date`'s ±8.64e15 ms range, plus a
+// separate pre-existing `created_at` string-comparison bug in getUsageTimeline). Tracked as
+// ISSUE #400, which carries both sinks' measured acceptance sets. This guard closes the NaN
+// class only, and the ?hours=-1 test arm records the string-comparison defect it runs into.
 //
 // Authorized by ADR 0006 (grandfathered as of v3.16.4) — behaviour-preserving, route (a). The
 // v3.16.4 snapshot of both call sites is byte-identical to the pre-fix lines here
@@ -2562,8 +2582,8 @@ const isLegalInOperand = (v) => typeof v === "object" && v !== null;
 // `parsed === null` guard: a request that currently receives NO RESPONSE AT ALL is not a
 // behaviour anyone can be relying on.
 function usageQueryInt(raw, fallback, cap) {
-  const parsed = parseInt(raw || String(fallback), 10);
-  return Math.min(Number.isFinite(parsed) ? parsed : fallback, cap);
+  const clamped = Math.min(parseInt(raw || String(fallback), 10), cap);
+  return Number.isFinite(clamped) ? clamped : fallback;
 }
 
 // ── Response helpers ────────────────────────────────────────────────────
@@ -4034,7 +4054,8 @@ const server = createServer(async (req, res) => {
     const byKeyAll = getUsageByKey({ since, until });
     // #379: both were `Math.min(parseInt(<param> || "<default>", 10), <cap>)`, which yields NaN
     // for any non-numeric value and hands it to a sink that throws. usageQueryInt is that same
-    // expression with `Number.isFinite(parsed) ? parsed : fallback` inserted — see its comment.
+    // expression with a finiteness check appended AFTER the clamp — the order matters, see its
+    // comment.
     const recentAll = getRecentUsage(usageQueryInt(url.searchParams.get("limit"), 50, 500));
     const timeline = getUsageTimeline({
       keyName: scopeName || undefined,
