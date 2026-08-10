@@ -26,6 +26,16 @@ process.env.HOME = homedir(); // normalize HOME so homedir()-derived paths are s
 
 let passed = 0;
 let failed = 0;
+// Tests that did NOT run because a premise this platform cannot provide was absent. Counted and
+// named rather than folded into `passed`, because a skipped test and a passing one are the same
+// green tick otherwise — and #366's review found exactly that: its case-fold guard asserts a
+// property only reachable on a case-INSENSITIVE filesystem, CI is ubuntu-latest/ext4, and there
+// the test passed for a second reason while covering nothing. A green CI run must not be readable
+// as coverage the run did not provide.
+let skipped = 0;
+// Read the live counters. The #366 review's finding C was a MIScount, so its regression test has
+// to observe the same variables the summary prints rather than a copy.
+function _m366Counts() { return { passed, failed, skipped }; }
 
 // Pending promises from tests declared `async` but registered through the SYNC `test()` helper.
 // 44 tests in this file are written that way. Before this, `test()` called fn(), got a promise back,
@@ -39,6 +49,14 @@ let failed = 0;
 const pendingAsync = [];
 
 function test(name, fn) {
+  // #366 review, finding C: a body that skips must not ALSO be counted as passed.
+  //
+  // A SENTINEL, not a counter comparison. The first fix compared `skipped` across the body, which
+  // is race-free on the synchronous path but WRONG on the async one: that comparison is evaluated
+  // when the promise RESOLVES, and any unrelated test may have skipped in between, silently
+  // suppressing a passing async test's ✓ and under-counting `passed`. Reproduced in isolation
+  // before replacing it. A per-invocation sentinel compares nothing across time.
+  const skippedBefore = skipped;
   try {
     const r = fn();
     if (r && typeof r.then === "function") {
@@ -46,17 +64,61 @@ function test(name, fn) {
       pendingAsync.push(
         r.then(
           () => { passed++; console.log(`  ✓ ${name}`); },
-          (e) => { failed++; console.log(`  ✗ ${name}: ${e.message}`); },
+          (e) => {
+            if (e && e[TEST_SKIPPED]) return; // already counted by skipRemainingTest()
+            failed++; console.log(`  ✗ ${name}: ${e.message}`);
+          },
         ),
       );
+      return;
+    }
+    // Sync path only, where no other test can interleave: calling the TOP-LEVEL form from inside a
+    // body is misuse, and it is made LOUD rather than silently miscounted.
+    if (skipped > skippedBefore) {
+      failed++;
+      console.log(`  ✗ ${name}: called testSkipped() inside a test body — use skipRemainingTest(), ` +
+                  `which also aborts the body`);
       return;
     }
     passed++;
     console.log(`  ✓ ${name}`);
   } catch (e) {
+    if (e && e[TEST_SKIPPED]) return; // already counted by skipRemainingTest()
     failed++;
     console.log(`  ✗ ${name}: ${e.message}`);
   }
+}
+
+/**
+ * Register a test as NOT RUN, with the reason. Never counts as passed.
+ *
+ * For a premise the current platform cannot supply — not for a test that is inconvenient. The
+ * reason is mandatory and is printed, so `npm test`'s output says which coverage this run did not
+ * provide instead of implying it did.
+ *
+ * TOP-LEVEL FORM. Call it in the `else` of the condition that decides whether the premise holds,
+ * so `test()` is never invoked at all. From inside a test body use skipRemainingTest() instead —
+ * this one does not abort the body, and `test()` reports that misuse as a failure.
+ */
+function testSkipped(name, reason) {
+  skipped++;
+  console.log(`  ⊘ SKIP ${name} — ${reason}`);
+}
+
+// Marks the one Error that means "this test skipped" rather than "this test failed".
+const TEST_SKIPPED = Symbol("ocp.test.skipped");
+
+/**
+ * IN-BODY FORM: record the skip and abort the rest of the body. Works identically for sync and
+ * async bodies, because `test()` recognises the sentinel in both its catch and its rejection
+ * handler — and because nothing is compared across time, an unrelated skip elsewhere in the file
+ * cannot affect this test's outcome.
+ */
+function skipRemainingTest(name, reason) {
+  testSkipped(name, reason);
+  const e = new Error(`skipped: ${reason}`);
+  e[TEST_SKIPPED] = true;
+  throw e;
 }
 
 async function testAsync(name, fn) {
@@ -65,6 +127,10 @@ async function testAsync(name, fn) {
     passed++;
     console.log(`  ✓ ${name}`);
   } catch (e) {
+    // Same sentinel as test(): a body that called skipRemainingTest() is already counted as
+    // skipped and must not also be counted as failed. Both runners honour it, so a caller does
+    // not have to know which one it is under.
+    if (e && e[TEST_SKIPPED]) return;
     failed++;
     console.log(`  ✗ ${name}: ${e.message}`);
   }
@@ -1195,6 +1261,470 @@ test("#348 HIGH-2: the default (script-relative) resolution is always PASS — t
   const check = result.checks.find(c => c.id === "install_dir");
   assert.equal(check.level, "PASS", `default resolution must never FAIL; got ${check.level}: ${check.message}`);
   assert.equal(result.install_dir_safe_to_replace, true);
+});
+
+// ── Issue #366: the marker check was type-blind ──────────────────────────────────────────────
+//
+// `entries.includes("models.json")` reads as "this file exists" and did not mean that: a
+// DIRECTORY named `models.json/` scored identically to the file. Measured on the pre-fix tree,
+// two empty directories named `ocp/` and `models.json/` gave safeToReplace = true — the verdict
+// that licenses `rm -rf`. A `/opt`-shaped directory was refused only because it scores exactly
+// ONE marker, i.e. by the threshold of 2 and by nothing that looked at what those entries are.
+//
+// These tests assert on the classifier's own output and on doctor's emitted plan, never on the
+// source text of either. Each asserts POSITIVE evidence that the directory was inspected —
+// exists/empty/markers — rather than only safeToReplace === false, which an absent directory
+// would also satisfy: a refusal for the wrong reason is not this guard working.
+import { symlinkSync as _m366Symlink, mkdtempSync as _m366Mkdtemp, chmodSync as _m366Chmod } from "node:fs";
+
+console.log("\nInstall-marker type check (#366):");
+
+// #366 review, finding C — a harness self-check, because the defect was in the COUNTING and no
+// existing test could see it. The synthetic skip below is real (it shows in the ⊘ list and in the
+// skipped total on every platform), which is the price of proving the guard on every run rather
+// than only on a root host where the real in-callback path lives.
+{
+  const before = _m366Counts();
+  test("_harness self-check (#366 review C): this SYNC body skips, so its own ✓ must not print", () => {
+    skipRemainingTest("_harness self-check inner, sync (#366 review C)",
+      "synthetic: proves a skipping body is not ALSO counted as passed");
+    throw new Error("unreachable: skipRemainingTest must abort the body");
+  });
+  const after = _m366Counts();
+  test("#366 review C: a test whose body skips increments `skipped` and NOT `passed`", () => {
+    assert.equal(after.skipped - before.skipped, 1, "the skip must be counted exactly once");
+    assert.equal(after.passed - before.passed, 0,
+      "REGRESSION: the skipping test was ALSO counted as passed — the exact pair the skip facility exists to prevent");
+    assert.equal(after.failed - before.failed, 0, "a skip is not a failure either");
+  });
+
+  // The ASYNC case, which the first fix got wrong: it compared the global skip counter across the
+  // body, so an unrelated skip resolving in between suppressed a PASSING async test's ✓.
+  //
+  // MEASURE ONLY WHAT IS ATTRIBUTABLE. A first draft of this self-check awaited the WHOLE
+  // `pendingAsync` array and then read `passed` — contaminated by every other async test settling
+  // in the same window, and it went red for that reason rather than for a real defect. That is the
+  // same mistake as the race it was written to guard, one level up. `passed` is therefore NOT
+  // asserted here: it cannot be attributed. `skipped` and `failed` can — in a green run nothing
+  // else touches them — and `failed` is the discriminating one, because an unrecognised sentinel
+  // lands in the rejection handler and increments it. A skipping body can never reach the resolve
+  // handler at all, which is what makes "not counted as passed" structural rather than measured.
+  //
+  // TIMING IS THE WHOLE DIFFICULTY, and the first two drafts of this check both got it wrong.
+  // `skipped` is only attributable to this test SYNCHRONOUSLY: an async body with no `await`
+  // before the throw runs `skipRemainingTest()` during the `fn()` call itself, so the counter has
+  // moved by the time `test()` returns and before anything else can run. Read it any LATER — after
+  // `await` — and the rest of the module has executed, including the case-fold skip, so the delta
+  // is 2 on CI's ext4 and 1 here. That is exactly what CI caught on the previous push.
+  // `failed` stays attributable across the await, because in a green run nothing else touches it.
+  const asyncBefore = _m366Counts();
+  const asyncFrom = pendingAsync.length;
+  test("_harness self-check (#366 review C): this ASYNC body skips too", async () => {
+    skipRemainingTest("_harness self-check inner, async (#366 review C)",
+      "synthetic: the sentinel must work identically for an async body");
+  });
+  const asyncOwn = pendingAsync.slice(asyncFrom);          // this test's promise, and no other
+  const asyncSkippedSync = _m366Counts().skipped;          // read BEFORE any await — attributable
+  testAsync("#366 review C: an ASYNC body that skips is counted as skipped, never as failed", async () => {
+    assert.equal(asyncOwn.length, 1,
+      "premise: the async body must have registered exactly one pending promise");
+    assert.equal(asyncSkippedSync - asyncBefore.skipped, 1,
+      "the async skip must be counted exactly once, synchronously with the body's throw");
+    await Promise.all(asyncOwn);
+    assert.equal(_m366Counts().failed - asyncBefore.failed, 0,
+      "an async skip must not be counted as FAILED — the sentinel must be recognised in the rejection handler");
+  });
+}
+
+
+test("#366 severity: on the DOCUMENTED default layout, $HOME is ONE stray file away from rm -rf", () => {
+  // The finding that decides whether this is worth releasing, and both the issue and this PR's
+  // first draft under-sold it. README documents the install at `~/ocp`, so on a standard host
+  // $HOME already contains a DIRECTORY named `ocp` — which the pre-fix name-only check scored as
+  // a free marker. The threshold of 2 was therefore already half-spent before anything went
+  // wrong, and a SINGLE stray `models.json` / `server.mjs` / `setup.mjs` in $HOME reached it.
+  // `OCP_DIR=$HOME` with `--fresh-install --yes` would then have run `rm -rf $HOME`.
+  //
+  // That is one typo away, not the two contrived directories the issue described as "not a
+  // realistic accident". This test pins the post-fix half; the pre-fix numbers are in the PR body.
+  const root = _m366Mkdtemp(testJoin(tmpdir(), "ocp-366-home-"));
+  try {
+    for (const stray of ["models.json", "server.mjs", "setup.mjs"]) {
+      const home = testJoin(root, `home-${stray.replace(/\W/g, "_")}`);
+      tMkdirSync(testJoin(home, "ocp"), { recursive: true });   // the real install: a DIRECTORY
+      tMkdirSync(testJoin(home, "Documents"), { recursive: true });
+      testWriteFile(testJoin(home, stray), "stray");            // ONE stray marker-named file
+
+      const c = classifyInstallDir(home);
+      // Positive evidence the directory was inspected and the stray really did score, so this
+      // cannot pass because nothing was found. The stray IS a marker; `ocp/` must not be.
+      assert.deepEqual(c.markers, [stray],
+        `the stray file must score and the ocp/ DIRECTORY must not; got [${c.markers}] — ${c.why}`);
+      assert.equal(c.isInstall, false,
+        `one marker file plus an ocp/ directory must not reach the threshold; ${c.why}`);
+      assert.equal(c.safeToReplace, false, `$HOME must never be rm -rf-able here: ${c.why}`);
+    }
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+// The EACCES premise cannot be CREATED as root: with DAC override the mode bits deny nothing, so
+// statSync would succeed and every assertion below would pass while testing nothing. Decided at
+// TOP LEVEL, in the else of the condition, so `test()` is never invoked — the shape #366's review
+// (finding C) established is the correct one. Reachable in practice: `sudo npm test`, root-by-
+// default containers, and this fleet's Pi and Oracle hosts run system-level units.
+const _m366IsRoot = typeof process.getuid === "function" && process.getuid() === 0;
+
+if (_m366IsRoot) {
+  testSkipped("#366 review F1: a marker that cannot be STAT'D is diagnosed as unreadable, never as 'not an OCP install'",
+    "running as root — DAC override makes a mode-444 directory readable, so the EACCES premise cannot be created");
+} else {
+test("#366 review F1: a marker that cannot be STAT'D is diagnosed as unreadable, never as 'not an OCP install'", () => {
+  // The flag value was already right; the MESSAGE was catastrophically wrong. On a directory that
+  // is readable but not executable, readdirSync lists all four markers while statSync on each
+  // throws EACCES — so a real install was reported as "exists and is NOT an OCP install ... it is
+  // not something this tool may delete", and doctor's advice line then tells the operator to
+  // "remove it yourself first". That is the one action that loses the install.
+  const root = _m366Mkdtemp(testJoin(tmpdir(), "ocp-366-eacces-"));
+  const install = testJoin(root, "install");
+  try {
+    tMkdirSync(install, { recursive: true });
+    for (const f of ["server.mjs", "setup.mjs", "ocp", "models.json"]) testWriteFile(testJoin(install, f), "");
+    testWriteFile(testJoin(install, "package.json"), JSON.stringify({ name: OCP_PACKAGE_NAME }));
+    _m366Chmod(install, 0o444); // r, no x: readdir works, stat on any child does not
+
+    const c = classifyInstallDir(install);
+
+    // PREMISE, measured rather than assumed: readdir really did see all four marker names. If the
+    // chmod silently failed (some filesystems, or root), markers would be empty for an unrelated
+    // reason and every assertion below would pass while testing nothing.
+    assert.deepEqual(c.unreadableMarkers.slice().sort(), ["models.json", "ocp", "server.mjs", "setup.mjs"],
+      `premise: all four marker NAMES must be present-but-unstattable; got ${JSON.stringify(c.unreadableMarkers)} — ${c.why}`);
+    assert.deepEqual(c.markers, [], "nothing may score as a confirmed file when every stat failed");
+
+    // The verdict is UNCHANGED — still refused. Only the diagnosis differs.
+    assert.equal(c.safeToReplace, false, "an uninspectable directory must still never be deleted");
+
+    // The actual finding: what the operator is told.
+    assert.ok(c.why.includes("could not be inspected"),
+      `the refusal must name the real cause; got: ${c.why}`);
+    assert.ok(c.why.includes("permission"),
+      `the refusal must point at permissions, the true cause; got: ${c.why}`);
+    assert.ok(!/is NOT an OCP install/.test(c.why),
+      `a permission-locked install must NOT be reported as "not an OCP install"; got: ${c.why}`);
+    assert.ok(/do NOT delete it/i.test(c.why),
+      `the advice must not be "remove it yourself"; got: ${c.why}`);
+
+    // CONTROL: the same directory with permissions restored is a normal, recognised install.
+    // Without this, "says could-not-inspect" would be satisfiable by a classifier that says it
+    // about everything.
+    _m366Chmod(install, 0o755);
+    const ok = classifyInstallDir(install);
+    assert.deepEqual(ok.unreadableMarkers, [], `no marker is unreadable at mode 755; ${ok.why}`);
+    assert.equal(ok.isInstall, true, ok.why);
+    assert.equal(ok.safeToReplace, true, ok.why);
+  } finally {
+    try { _m366Chmod(install, 0o755); } catch { /* best effort */ }
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+}
+
+// #366 review, finding B: the CONSUMERS, not just the classifier. Fixing `why` alone left both
+// production consumers still telling the operator to delete a permission-locked install, in the
+// line printed AFTER the corrected one — arguably worse than before, because the wrong advice now
+// comes last. Both branch on `unreadableMarkers`, which until this round had no production
+// consumer at all.
+if (_m366IsRoot) {
+  testSkipped("#366 review F1/B: doctor and runFreshInstall must not tell an operator to delete an install they merely cannot read",
+    "running as root — DAC override makes a mode-444 directory readable, so the EACCES premise cannot be created");
+} else {
+test("#366 review F1/B: doctor and runFreshInstall must not tell an operator to delete an install they merely cannot read", async () => {
+  const root = _m366Mkdtemp(testJoin(tmpdir(), "ocp-366-consumer-"));
+  const install = testJoin(root, "install");
+  try {
+    tMkdirSync(install, { recursive: true });
+    for (const f of ["server.mjs", "setup.mjs", "ocp", "models.json"]) testWriteFile(testJoin(install, f), "");
+    testWriteFile(testJoin(install, "package.json"), JSON.stringify({ name: OCP_PACKAGE_NAME, version: "3.29.2" }));
+    _m366Chmod(install, 0o444);
+
+    // ---- consumer 1: doctor's emitted plan ----
+    const result = await runDoctor({ skipNetwork: true, mockLatest: "v9.9.9", ocpDir: install });
+    assert.equal(result.next_action.kind, "fresh_install",
+      "premise: this input must still reach the destructive kind, or the guard is untested");
+    assert.deepStrictEqual(result.next_action.ai_executable, [], "no destructive step may be offered");
+
+    const advice = result.next_action.human_required.join("\n");
+    // The defect was the CONTRADICTION: `why` says do-not-delete, the tail said delete-it-yourself.
+    assert.ok(!/remove it yourself first/.test(advice),
+      `no line may tell the operator to delete a directory we merely could not read:\n${advice}`);
+    assert.ok(/do NOT delete/i.test(advice), `the operator must be told not to delete it:\n${advice}`);
+    assert.ok(/permission/i.test(advice), `the real cause must be named:\n${advice}`);
+    // The LAST line is what an operator acts on, so assert on that specifically and not just on
+    // the joined text — the pre-fix output contained the right sentence too, in position [0].
+    const last = result.next_action.human_required[result.next_action.human_required.length - 1];
+    assert.ok(/do NOT delete/i.test(last) && !/remove it yourself/.test(last),
+      `the LAST instruction is the one that gets followed; got: ${last}`);
+    assert.ok(!/remove it yourself/.test(result.next_action.verify), `verify: ${result.next_action.verify}`);
+
+    // ---- consumer 2: runFreshInstall's own refusal (defence in depth, its own re-classification) ----
+    let thrown = null;
+    try {
+      await runUpgrade({ mockExec: true, yes: true, freshInstall: true, ocpDir: install,
+                         mockDoctor: result, skipNetwork: true });
+    } catch (e) { thrown = e; }
+    assert.ok(thrown, "runFreshInstall must refuse an uninspectable target");
+    assert.ok(!/remove it yourself first/.test(thrown.message),
+      `the upgrade path must not tell the operator to delete it either:\n${thrown.message}`);
+    assert.ok(/Do NOT delete this directory/i.test(thrown.message), thrown.message);
+
+    // ---- CONTROL: a genuinely foreign directory still gets the ordinary advice ----
+    // Without this, "never says remove it yourself" is satisfiable by deleting the sentence.
+    const foreign = testJoin(root, "foreign");
+    tMkdirSync(foreign, { recursive: true });
+    testWriteFile(testJoin(foreign, "passwd"), "root:x:0:0");
+    const fr = await runDoctor({ skipNetwork: true, mockLatest: "v9.9.9", ocpDir: foreign });
+    const fAdvice = fr.next_action.human_required.join("\n");
+    assert.ok(/remove it yourself first/.test(fAdvice),
+      `a directory we CAN inspect and that is not an install keeps the ordinary advice:\n${fAdvice}`);
+    assert.ok(!/do NOT delete/i.test(fAdvice), `and must not borrow the permission wording:\n${fAdvice}`);
+  } finally {
+    try { _m366Chmod(install, 0o755); } catch { /* best effort */ }
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+}
+
+test("#366 review F1: a DIRECTORY-shaped marker is still 'not an install', not 'unreadable'", () => {
+  // The other side of the distinction. The tri-state must not turn every refusal into
+  // "could not be inspected" — that would trade one misleading message for another, and would
+  // make the test above pass for the wrong reason.
+  const root = _m366Mkdtemp(testJoin(tmpdir(), "ocp-366-notafile-"));
+  try {
+    const d = testJoin(root, "marker-dirs");
+    tMkdirSync(testJoin(d, "ocp"), { recursive: true });
+    tMkdirSync(testJoin(d, "models.json"), { recursive: true });
+    const c = classifyInstallDir(d);
+    assert.deepEqual(c.unreadableMarkers, [],
+      `a directory is a LOOKED-AT answer, not an unreadable one; got ${JSON.stringify(c.unreadableMarkers)}`);
+    assert.ok(c.why.includes("is NOT an OCP install"),
+      `this one really is not an install and must say so; got: ${c.why}`);
+    assert.ok(!c.why.includes("could not be inspected"), `got: ${c.why}`);
+
+    // A DANGLING symlink is also a looked-at answer (ENOENT), not a permission problem.
+    const dang = testJoin(root, "dangling");
+    tMkdirSync(dang, { recursive: true });
+    _m366Symlink(testJoin(root, "no-such-target"), testJoin(dang, "server.mjs"));
+    _m366Symlink(testJoin(root, "no-such-target-2"), testJoin(dang, "setup.mjs"));
+    const cd = classifyInstallDir(dang);
+    assert.deepEqual(cd.unreadableMarkers, [],
+      `ENOENT is an answer, not a failure to look; got ${JSON.stringify(cd.unreadableMarkers)} — ${cd.why}`);
+    assert.ok(!cd.why.includes("could not be inspected"), `got: ${cd.why}`);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("#366: a DIRECTORY named after a marker does not score as one — two of them are not an OCP install", () => {
+  const root = _m366Mkdtemp(testJoin(tmpdir(), "ocp-366-"));
+  try {
+    // The exact shape the issue measured: two entries with marker NAMES, both directories.
+    const dirs = testJoin(root, "marker-dirs");
+    tMkdirSync(testJoin(dirs, "ocp"), { recursive: true });
+    tMkdirSync(testJoin(dirs, "models.json"), { recursive: true });
+
+    const c = classifyInstallDir(dirs);
+    // Positive evidence the directory was looked at, so this cannot pass for an absent path.
+    assert.equal(c.exists, true, "premise: the directory must exist, or the refusal proves nothing");
+    assert.equal(c.empty, false, "premise: it must be non-empty, or `empty` would carry the verdict");
+    assert.deepEqual(c.markers, [],
+      `a directory named after a marker must not score as one; got markers=[${c.markers}]`);
+    assert.equal(c.isInstall, false);
+    assert.equal(c.safeToReplace, false, `directories must not license rm -rf; why: ${c.why}`);
+
+    // THE CONTROL that makes the assertion above about TYPE and not about names: the same two
+    // names, as regular files, in a sibling directory. If this stops passing, the test above is
+    // green for the wrong reason.
+    const files = testJoin(root, "marker-files");
+    tMkdirSync(files, { recursive: true });
+    testWriteFile(testJoin(files, "ocp"), "");
+    testWriteFile(testJoin(files, "models.json"), "");
+
+    const f = classifyInstallDir(files);
+    assert.deepEqual(f.markers, ["ocp", "models.json"],
+      `same names as regular files must still score; got markers=[${f.markers}] — ${f.why}`);
+    assert.equal(f.safeToReplace, true, `the legitimate half-broken-install case must keep working: ${f.why}`);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("#366: symlinked markers follow the link — to a file counts, to a directory or to nothing does not", () => {
+  const root = _m366Mkdtemp(testJoin(tmpdir(), "ocp-366-sym-"));
+  try {
+    // Real files to point at, kept OUTSIDE every candidate directory so they cannot be counted
+    // directly by any candidate's own readdir.
+    const store = testJoin(root, "store");
+    tMkdirSync(store, { recursive: true });
+    testWriteFile(testJoin(store, "a"), "x");
+    testWriteFile(testJoin(store, "b"), "y");
+
+    const mk = (name, build) => { const d = testJoin(root, name); tMkdirSync(d, { recursive: true }); build(d); return d; };
+
+    // Symlink → regular file: MUST still count, because statSync follows and that is the same
+    // question the package.json arm asks with readFileSync. NOT because a symlinked marker is a
+    // shape real installs have — review found no support for that claim and it is withdrawn:
+    // `git ls-files -s` has zero mode-120000 entries and installs come from `git clone`. This
+    // pins the CHOICE, so a later switch to lstatSync is a visible decision rather than a silent
+    // narrowing (mutation M4).
+    const toFile = mk("to-file", d => {
+      _m366Symlink(testJoin(store, "a"), testJoin(d, "server.mjs"));
+      _m366Symlink(testJoin(store, "b"), testJoin(d, "setup.mjs"));
+    });
+    const cFile = classifyInstallDir(toFile);
+    assert.deepEqual(cFile.markers, ["server.mjs", "setup.mjs"],
+      `symlinks to regular files must count; got [${cFile.markers}] — ${cFile.why}`);
+    assert.equal(cFile.safeToReplace, true, cFile.why);
+
+    // Dangling symlink: scored as a marker before this change (measured). statSync throws
+    // ENOENT, so it now scores zero.
+    const dangling = mk("dangling", d => {
+      _m366Symlink(testJoin(root, "no-such-target-1"), testJoin(d, "server.mjs"));
+      _m366Symlink(testJoin(root, "no-such-target-2"), testJoin(d, "setup.mjs"));
+    });
+    const cDang = classifyInstallDir(dangling);
+    assert.equal(cDang.exists, true, "premise: the directory itself exists");
+    assert.equal(cDang.empty, false, "premise: the dangling links ARE entries — readdir sees them");
+    assert.deepEqual(cDang.markers, [], `a dangling symlink is not a file; got [${cDang.markers}]`);
+    assert.equal(cDang.safeToReplace, false, cDang.why);
+
+    // Symlink → directory: the #366 defect wearing a link.
+    const toDir = mk("to-dir", d => {
+      _m366Symlink(store, testJoin(d, "server.mjs"));
+      _m366Symlink(store, testJoin(d, "setup.mjs"));
+    });
+    const cDir = classifyInstallDir(toDir);
+    assert.equal(cDir.empty, false, "premise: the links ARE entries");
+    assert.deepEqual(cDir.markers, [], `a symlink to a directory is not a file; got [${cDir.markers}]`);
+    assert.equal(cDir.safeToReplace, false, cDir.why);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+// The premise this test needs — statSync resolving through the filesystem's own case folding —
+// exists only on a case-INSENSITIVE filesystem. Probed once, here, so the decision to run or skip
+// is made from a measurement of the actual volume rather than from process.platform (a Linux host
+// can mount a case-insensitive volume, and macOS can format a case-sensitive one; #366's review
+// measured both).
+const _m366CaseInsensitive = (() => {
+  const probeRoot = _m366Mkdtemp(testJoin(tmpdir(), "ocp-366-caseprobe-"));
+  try {
+    testWriteFile(testJoin(probeRoot, "CASEPROBE"), "");
+    return testExistsSync(testJoin(probeRoot, "caseprobe"));
+  } catch { return false; } finally { rmSync(probeRoot, { recursive: true, force: true }); }
+})();
+
+if (!_m366CaseInsensitive) {
+  // NOT a pass. On a case-sensitive filesystem `entries.includes("server.mjs")` and
+  // `statSync(dir + "/server.mjs")` AGREE — both miss `SERVER.MJS` — so the assertions below hold
+  // for a second reason and mutation M3 (which deletes the entries test) reddens NOTHING. CI is
+  // ubuntu-latest on ext4, so this is the CI case: the conjunct is real, load-bearing, and
+  // unprotected by the only automated gate. Saying so out loud is the whole point — a silent ✓
+  // here is what let the mutation table claim a kill that CI cannot reproduce.
+  testSkipped("#366: the readdir entry test is kept alongside the stat — on a case-insensitive filesystem they disagree",
+    "this filesystem is case-SENSITIVE, where entries.includes() and statSync() agree; the test " +
+    "would pass for the wrong reason and mutation M3 survives here. Run it on APFS/HFS+/NTFS to " +
+    "exercise the conjunct.");
+} else {
+  test("#366: the readdir entry test is kept alongside the stat — on a case-insensitive filesystem they disagree", () => {
+    // WHY THIS EXISTS: the obvious simplification after adding the stat is to drop
+    // `entries.includes(m)` as redundant. It is not. statSync resolves through the filesystem's
+    // own case folding, so on APFS/HFS+/NTFS `statSync(dir + "/server.mjs")` succeeds for an entry
+    // actually named `SERVER.MJS` — dropping the entries test would WIDEN what scores as an OCP
+    // install, on the guard whose false positive is an `rm -rf` argument.
+    const root = _m366Mkdtemp(testJoin(tmpdir(), "ocp-366-case-"));
+    try {
+      const upper = testJoin(root, "upper");
+      tMkdirSync(upper, { recursive: true });
+      testWriteFile(testJoin(upper, "SERVER.MJS"), "");
+      testWriteFile(testJoin(upper, "SETUP.MJS"), "");
+
+      // Premise, asserted rather than assumed: on THIS volume the two conditions really do
+      // disagree. If statSync stopped case-folding, the assertion below would still pass and
+      // would again be proving nothing.
+      assert.equal(_ltExists(testJoin(upper, "server.mjs")), true,
+        "premise: this volume must case-fold, or the conjunct under test is not exercised");
+
+      const c = classifyInstallDir(upper);
+      assert.deepEqual(c.markers, [],
+        `uppercase entries must not score as lowercase markers; got [${c.markers}] — ${c.why}`);
+      assert.equal(c.safeToReplace, false, c.why);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+}
+
+test("#366: `package.json` as a DIRECTORY cannot satisfy the named-package arm either", () => {
+  // The other half of "this name exists" not meaning "this file exists". This arm was already
+  // type-safe by construction — readFileSync on a directory throws EISDIR (measured) and the
+  // catch falls through to the marker count — but nothing pinned it, so a future rewrite to
+  // existsSync + readdir would silently make a `package.json/` directory an identifying signal.
+  const root = _m366Mkdtemp(testJoin(tmpdir(), "ocp-366-pkgdir-"));
+  try {
+    const d = testJoin(root, "pkg-as-dir");
+    tMkdirSync(testJoin(d, "package.json"), { recursive: true });
+    testWriteFile(testJoin(d, "server.mjs"), ""); // exactly ONE real marker: under the threshold
+
+    const c = classifyInstallDir(d);
+    assert.equal(c.exists, true);
+    assert.deepEqual(c.markers, ["server.mjs"],
+      `premise: the one real marker must still score, or this proves nothing about package.json; got [${c.markers}]`);
+    assert.equal(c.isInstall, false,
+      `a directory named package.json must not identify the install; why: ${c.why}`);
+    assert.equal(c.safeToReplace, false, c.why);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("#366 end to end: doctor withholds every destructive step for a directory whose markers are directories", async () => {
+  // The consumer-visible half. classifyInstallDir's verdict reaches an operator through exactly
+  // two paths — doctor's emitted ai_executable[] and runFreshInstall's own re-classification —
+  // and this pins the first: the same input that reaches kind="fresh_install" must produce no
+  // `rm -rf` at all.
+  const root = _m366Mkdtemp(testJoin(tmpdir(), "ocp-366-doctor-"));
+  try {
+    const target = testJoin(root, "marker-dirs");
+    tMkdirSync(testJoin(target, "ocp"), { recursive: true });
+    tMkdirSync(testJoin(target, "models.json"), { recursive: true });
+
+    const result = await runDoctor({ skipNetwork: true, mockLatest: "v9.9.9", ocpDir: target });
+    assert.equal(result.next_action.kind, "fresh_install",
+      "premise: this input must still reach the destructive kind, or the guard is untested");
+    assert.equal(result.install_dir_safe_to_replace, false);
+    assert.deepEqual(result.next_action.ai_executable, [],
+      `no automated step may be offered for a target that is not an OCP install; got ${JSON.stringify(result.next_action.ai_executable)}`);
+    const check = result.checks.find(c => c.id === "install_dir");
+    assert.equal(check.level, "FAIL");
+
+    // CONTROL: the identical directory shape with the markers as FILES still gets the full
+    // plan, `rm -rf` included. Without this, "emits no rm -rf" is satisfiable by a guard that
+    // refuses everything.
+    const ok = testJoin(root, "marker-files");
+    tMkdirSync(ok, { recursive: true });
+    testWriteFile(testJoin(ok, "ocp"), "");
+    testWriteFile(testJoin(ok, "models.json"), "");
+    const okResult = await runDoctor({ skipNetwork: true, mockLatest: "v9.9.9", ocpDir: ok });
+    assert.equal(okResult.next_action.kind, "fresh_install");
+    assert.equal(okResult.install_dir_safe_to_replace, true);
+    assert.ok(okResult.next_action.ai_executable.some(c => c.includes(`rm -rf ${ok}`)),
+      `a verifiable install is a legitimate rm target; got ${JSON.stringify(okResult.next_action.ai_executable)}`);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
 });
 
 test("#348: resolveInstallDir is a distinct name from keys.mjs's resolveOcpDir (data dir), and returns a structured source", () => {
@@ -4755,7 +5285,7 @@ ltTest("integration: ltTest serialization keeps peak concurrent server.mjs child
 });
 
 // ── Upgrade Tests ──
-import { runUpgrade, postFlightOk, runPostFlightCheck, parseFlagValue, classifyPostFlightProbeFailure, postFlightFailureSuffix, probeLaunchdDomains, execRestartRetry, RESTART_ATTEMPTS, recoveryPlanCommands, postFlightOnlyCommand, classifyPostFlightBodyRejection, postFlightWant, postFlightRecheckClause, restartOwnerRecoveryNote } from "./scripts/upgrade.mjs";
+import { runUpgrade, postFlightOk, runPostFlightCheck, parseFlagValue, classifyPostFlightProbeFailure, postFlightFailureSuffix, probeLaunchdDomains, execRestartRetry, RESTART_ATTEMPTS, recoveryPlanCommands, postFlightOnlyCommand, classifyPostFlightBodyRejection, postFlightWant, postFlightRecheckClause, classifyRestartOutcome, RESTART_VERDICT, restartOwnerRecoveryNote } from "./scripts/upgrade.mjs";
 
 console.log("\nUpgrade:");
 
@@ -8080,6 +8610,364 @@ test("#381 F5: `--post-flight-only v` must fail CLOSED, not report success again
   assert.ok(!/requires a target version argument/.test(real.err),
     `a well-formed target must not be refused by the guard; got stderr=${JSON.stringify(real.err)}`);
   assert.match(real.err, /did not reach v3\.14\.0/, `got stderr=${JSON.stringify(real.err)}`);
+});
+
+// ── #373: the post-restart verdict is ONE decision, shared by both `ocp update` paths ──────────
+//
+// `runFullUpgrade` and `runRollback` each carried their own copy of an eight-arm verdict ladder,
+// and the duplication had already produced one real divergence (#372).
+//
+// THE ORDERING JUSTIFICATION HAS BEEN CORRECTED (#385 review F1). #351's body said "Ordering is
+// load-bearing. The local-probe-fault arm is checked first, because it is also a non-ok probe."
+// That was exact while the DOWN cell was `restartFailure && !postFlight.ok` — an `else` that
+// OVERLAPPED the local-fault arm. #372/#381 re-keyed it to `didNotReach`, making every
+// restart-failure arm disjoint, so their relative order is now FREE — measured exhaustively over
+// the classifier's complete 80-input domain: swapping any adjacent pair, and even reversing all
+// four, are NO-OPS. The earlier version of this section cited a mutation as proof of an ordering
+// constraint; that mutation had also WIDENED the DOWN predicate, and the widening is what reddened
+// tests. What survives is narrower and is what these tests now pin.
+//
+// The classification moved to `classifyRestartOutcome`; the WORDING stayed at the call sites,
+// because it genuinely differs and must keep differing (the rollback path cannot tell an operator
+// to run the rollback). Callers now `switch` on a single verdict, so neither path states an
+// ordering and neither can state one differently from its sibling.
+//
+// WHAT THESE TESTS PIN, in the order the tests appear:
+//   1. the ordering itself, in the one place it now exists;
+//   2. the full input -> verdict table, so an arm cannot be quietly widened;
+//   3. that the two PATHS still agree, measured end to end — the anti-drift guard, and the only one
+//      of the three that would have caught #372's divergence.
+console.log("\n#373 — the post-restart verdict is one shared classification:");
+
+test("#373: the two CATCH-ALLS come last, and PROBE_LOCAL_FAULT stays after its restart-failure sibling", () => {
+  // NAME AND COMMENT BOTH CORRECTED (#385 F1). This test used to be called "the local-probe-fault
+  // arm outranks every other probe failure — the ordering #351 named", and its comment claimed to
+  // be "the whole guard" for that ordering. It cannot be: since #372/#381 made the restart-failure
+  // arms disjoint, reordering them is a no-op, so there is nothing there to guard. A test carrying
+  // that incident's name, guarding nothing, is worse than no test — the next reader trusts it,
+  // reorders freely, and nothing fails.
+  //
+  // What genuinely still order-depends, and is what this test pins:
+  //   - UNMEASURED before everything;
+  //   - the two CATCH-ALLS (`UNCONFIRMED`, `WARNED_SUCCESS`) after every specific arm — they are
+  //     bare tests, so they swallow anything reaching them;
+  //   - PROBE_LOCAL_FAULT after RESTART_FAILED_PROBE_LOCAL_FAULT — THE ONE overlapping pair left,
+  //     and the only surviving descendant of #351's incident.
+  const restartFailure = { cmd: "launchctl bootstrap …", detail: "EIO", attempts: 3 };
+  const localFault = { ok: false, lastSeen: null, target: "3.14.0",
+                       lastFailure: { kind: "probe-could-not-run", detail: "curl: not found" } };
+  assert.equal(
+    classifyRestartOutcome({ restartFailure, postFlight: localFault, postFlightMeasured: true }),
+    RESTART_VERDICT.RESTART_FAILED_PROBE_LOCAL_FAULT,
+    "a local probe fault must never be classified as the proxy being down");
+
+  // And with no restart failure it still wins over the neutral verdict.
+  assert.equal(
+    classifyRestartOutcome({ restartFailure: null, postFlight: localFault, postFlightMeasured: true }),
+    RESTART_VERDICT.PROBE_LOCAL_FAULT);
+
+  // Nothing-measured outranks even the local fault: it is the only state in which no probe result
+  // exists to reason about at all.
+  assert.equal(
+    classifyRestartOutcome({ restartFailure, postFlight: { ok: true, lastFailure: null }, postFlightMeasured: false }),
+    RESTART_VERDICT.UNMEASURED);
+
+  // THE ONE OVERLAPPING PAIR, asserted as an overlap rather than as an ordering: the same input
+  // satisfies BOTH `probeFailed && probeCouldNotRun` (the general arm) and the restart-failure arm
+  // above it, so which one wins is decided by position alone. This is the only place in the ladder
+  // where that is still true, and hoisting the general arm changes 4 of 108 end-to-end cases on
+  // BOTH lanes from a single edit (mutation P1).
+  assert.equal(
+    classifyRestartOutcome({ restartFailure, postFlight: localFault, postFlightMeasured: true }),
+    RESTART_VERDICT.RESTART_FAILED_PROBE_LOCAL_FAULT,
+    "with a restart failure the SPECIFIC arm must win over the general local-fault arm");
+
+  // The two catch-alls must not swallow a specific verdict. Bare tests, so position is all that
+  // stops them.
+  assert.equal(
+    classifyRestartOutcome({ restartFailure: null, postFlight: { ok: false, lastFailure: { kind: "not-ok-status", detail: "d" } }, postFlightMeasured: true }),
+    RESTART_VERDICT.NOT_OK_STATUS,
+    "`UNCONFIRMED` is a bare `probeFailed` test and must not precede the specific arms");
+  assert.equal(
+    classifyRestartOutcome({ restartFailure, postFlight: { ok: false, lastFailure: { kind: "a-future-kind", detail: "d" } }, postFlightMeasured: true }),
+    RESTART_VERDICT.UNCONFIRMED,
+    "`WARNED_SUCCESS` is a bare `restartFailure` test and must not precede the catch-all above it");
+
+  // And the freedom is asserted too, so a future reader does not reintroduce a constraint that is
+  // not there: the restart-failure arms are disjoint, so no input satisfies two of them.
+  const RF_KINDS = { "probe-could-not-run": RESTART_VERDICT.RESTART_FAILED_PROBE_LOCAL_FAULT,
+                     "unparseable": RESTART_VERDICT.RESTART_FAILED_ANSWERED_NOT_OCP,
+                     "http-error": RESTART_VERDICT.RESTART_FAILED_ANSWERED_NOT_OCP,
+                     "body-not-ocp": RESTART_VERDICT.RESTART_FAILED_ANSWERED_NOT_OCP,
+                     "version-mismatch": RESTART_VERDICT.RESTART_FAILED_WRONG_VERSION,
+                     "unreachable": RESTART_VERDICT.RESTART_FAILED_DOWN,
+                     "timeout": RESTART_VERDICT.RESTART_FAILED_DOWN };
+  for (const [kind, expected] of Object.entries(RF_KINDS)) {
+    assert.equal(
+      classifyRestartOutcome({ restartFailure, postFlight: { ok: false, lastFailure: { kind, detail: "d" } }, postFlightMeasured: true }),
+      expected,
+      `kind=${kind} must map to exactly one restart-failure arm — if two ever match, their order ` +
+      `stops being free and this ladder needs a precedence comment again`);
+  }
+});
+
+test("#373 (#385 F3): the EXPORTED classifier is fail-CLOSED on malformed input", () => {
+  // The pre-#373 code was `!postFlight.ok`, which threw on `undefined` and treated `{}` as a
+  // failure. #373 replaced it with `=== false`, which is fail-OPEN: measured before the fix,
+  // `undefined`, `null`, `{}`, `{ok:0}` and `{ok:undefined}` all returned `warned-success`, and
+  // `classifyRestartOutcome({})` returned `ok`.
+  //
+  // Not reachable from either in-module caller — both initialise `postFlight` with `ok: true` and
+  // only ever replace it with `runPostFlightCheck`'s return — but this is EXPORTED surface whose
+  // selling point is that an unhandled verdict is refused by default. Returning a SUCCESS verdict
+  // for input it cannot interpret contradicts that in the one direction that matters.
+  const rf = { cmd: "c", detail: "d", attempts: 3 };
+  const successVerdicts = new Set([RESTART_VERDICT.OK, RESTART_VERDICT.WARNED_SUCCESS]);
+  for (const [label, postFlight] of [["undefined", undefined], ["null", null], ["{}", {}],
+                                     ["{ok:0}", { ok: 0 }], ["{ok:'false'}", { ok: "false" }],
+                                     ["{ok:undefined}", { ok: undefined }]]) {
+    const v = classifyRestartOutcome({ restartFailure: rf, postFlight, postFlightMeasured: true });
+    assert.ok(!successVerdicts.has(v),
+      `postFlight=${label} is not something this function can interpret, so it must not answer with ` +
+      `a SUCCESS verdict; got ${v}`);
+  }
+  assert.ok(!successVerdicts.has(classifyRestartOutcome({})),
+    "and a call with no arguments at all must not report success");
+
+  // CONTROL: a well-formed probe result is unaffected — `ok` is a boolean there, so `!== true` and
+  // `=== false` agree, which is why this change is behaviour-preserving for every real caller.
+  assert.equal(classifyRestartOutcome({ restartFailure: null, postFlight: { ok: true, lastFailure: null }, postFlightMeasured: true }),
+    RESTART_VERDICT.OK);
+  assert.equal(classifyRestartOutcome({ restartFailure: rf, postFlight: { ok: true, lastFailure: null }, postFlightMeasured: true }),
+    RESTART_VERDICT.WARNED_SUCCESS);
+});
+
+test("#373: the full input -> verdict table, so no arm can be quietly widened", () => {
+  const rf = { cmd: "launchctl bootstrap …", detail: "EIO", attempts: 3 };
+  // `ok` and `lastFailure` move together, exactly as `runPostFlightCheck` maintains them: a
+  // classified failure means the probe did NOT succeed. (Written the other way round first, and the
+  // suite caught it — the table is only meaningful if its fixture is the shape the real probe emits.)
+  const pf = (kind) => ({ ok: kind === null, lastSeen: null, target: "3.14.0",
+                          lastFailure: kind === null ? null : { kind, detail: "d" } });
+  const cases = [
+    // [restartFailure, lastFailure.kind, measured, expected]
+    [rf,   "probe-could-not-run", true, RESTART_VERDICT.RESTART_FAILED_PROBE_LOCAL_FAULT],
+    [rf,   "unparseable",         true, RESTART_VERDICT.RESTART_FAILED_ANSWERED_NOT_OCP],
+    [rf,   "http-error",          true, RESTART_VERDICT.RESTART_FAILED_ANSWERED_NOT_OCP],
+    [rf,   "body-not-ocp",        true, RESTART_VERDICT.RESTART_FAILED_ANSWERED_NOT_OCP],
+    [rf,   "version-mismatch",    true, RESTART_VERDICT.RESTART_FAILED_WRONG_VERSION],
+    [rf,   "unreachable",         true, RESTART_VERDICT.RESTART_FAILED_DOWN],
+    [rf,   "timeout",             true, RESTART_VERDICT.RESTART_FAILED_DOWN],
+    // #381 F2: a degraded proxy already serving the target has its OWN verdict. It got none in
+    // #372, fell to UNCONFIRMED, and the forward path's neutral hint told the operator to roll
+    // back a proxy running exactly the right code.
+    [rf,   "not-ok-status",       true, RESTART_VERDICT.NOT_OK_STATUS],
+    [null, "not-ok-status",       true, RESTART_VERDICT.NOT_OK_STATUS],
+    // #381 F1: the probe classifier's own default arm. It must NOT reach DOWN, and it gets no cell
+    // of its own either, because the whole point is that nothing is known.
+    [rf,   "probe-failed-unclassified", true, RESTART_VERDICT.UNCONFIRMED],
+    [rf,   "some-future-kind",    true, RESTART_VERDICT.UNCONFIRMED],
+    [null, "probe-could-not-run", true, RESTART_VERDICT.PROBE_LOCAL_FAULT],
+    [null, "unreachable",         true, RESTART_VERDICT.UNCONFIRMED],
+    [null, "version-mismatch",    true, RESTART_VERDICT.UNCONFIRMED],
+    [rf,   null,                  true, RESTART_VERDICT.WARNED_SUCCESS],
+    [null, null,                  true, RESTART_VERDICT.OK],
+  ];
+  for (const [restartFailure, kind, postFlightMeasured, expected] of cases) {
+    assert.equal(
+      classifyRestartOutcome({ restartFailure, postFlight: pf(kind), postFlightMeasured }),
+      expected,
+      `restartFailure=${!!restartFailure} kind=${JSON.stringify(kind)} must classify as ${expected}`);
+  }
+  // Premise for the whole table: DOWN must be reachable at all, or every "must not be DOWN" row
+  // above would pass against a classifier that simply never returns it.
+  assert.ok(cases.some(([, , , e]) => e === RESTART_VERDICT.RESTART_FAILED_DOWN),
+    "harness premise: the table must exercise the DOWN verdict");
+});
+
+// The anti-drift guard. Both paths are driven end to end over every probe outcome and their
+// operator-facing HEADLINES are reduced to a verdict category; the two must agree for every input.
+// This is the test that would have caught #372 — where the answering-but-wrong-version arm existed
+// on one path and not the other for four days.
+//
+// Deliberately reduced from the hint rather than from the classifier's return value: reading the
+// classifier back would only prove the classifier agrees with itself. This measures what each path
+// actually emits, which is where the divergence lived.
+const _u373Category = (o) => {
+  if (o.ok) {
+    const warn = (o.result.phases || []).find(p => p.name === "restart" && p.status === "warn");
+    return warn ? "WARNED_SUCCESS" : "OK";
+  }
+  const h = o.err.hint || "";
+  if (/^THE SERVICE STATE IS UNKNOWN\. A restart command failed and nothing probed/.test(h)) return "UNMEASURED";
+  if (/^THE SERVICE STATE IS UNKNOWN, and it may be DOWN/.test(h)) return "RESTART_FAILED_PROBE_LOCAL_FAULT";
+  if (/^SOMETHING ELSE IS ANSWERING/.test(h)) return "RESTART_FAILED_ANSWERED_NOT_OCP";
+  if (/^THE PROXY IS UP BUT SERVING THE WRONG VERSION/.test(h)) return "RESTART_FAILED_WRONG_VERSION";
+  if (/^THE PROXY IS DOWN/.test(h)) return "RESTART_FAILED_DOWN";
+  if (/^THE (UPGRADE|ROLLBACK) MAY HAVE SUCCEEDED/.test(h)) return "PROBE_LOCAL_FAULT";
+  if (/^THE PROXY IS ANSWERING AND SERVING .* BUT REPORTS ITSELF UNHEALTHY/.test(h)) return "NOT_OK_STATUS";
+  return "UNCONFIRMED";
+};
+
+// The ONE deliberate divergence, pinned rather than skipped. `not-ok-status` is a SHARED verdict —
+// `classifyRestartOutcome` returns `NOT_OK_STATUS` for both paths, and the table test above proves
+// it — but only `runFullUpgrade` renders it as its own sentence. `runRollback` deliberately lets it
+// fall to its neutral verdict, because that verdict already says "run `ocp doctor`", while the
+// forward path's said "run `ocp update --rollback`", which cannot clear a degraded status (#381 F2).
+//
+// Encoded as an expected PAIR rather than as an exemption: if either side changes — the forward
+// path losing its cell, or the rollback path gaining one — this fires. Skipping the case would have
+// made the guard blind to exactly the state that produced the finding.
+const _u373ExpectedDivergence = {
+  "degraded, right ver": ["NOT_OK_STATUS", "UNCONFIRMED"],
+};
+
+test("#373 (the anti-drift guard): both `ocp update` paths reach the SAME verdict for the same input", async () => {
+  // Each lane is given a probe whose relationship to ITS OWN target is identical — the upgrade lane
+  // targets 3.14.0 and the rollback lane 3.10.0 — so any difference in outcome is a difference in
+  // the ladders, not in the fixture.
+  const probes = {
+    "wrong version":       [() => ({ status: "ok", auth: { ok: true }, version: "9.9.9" }),
+                            () => ({ status: "ok", auth: { ok: true }, version: "9.9.9" })],
+    "degraded, right ver": [() => ({ status: "degraded", auth: { ok: true }, version: "3.14.0" }),
+                            () => ({ status: "degraded", auth: { ok: true }, version: "3.10.0" })],
+    "no version field":    [() => ({ status: "ok", auth: { ok: true } }),
+                            () => ({ status: "ok", auth: { ok: true } })],
+    "json null":           [() => null, () => null],
+    "unparseable":         [() => { throw new SyntaxError("nope"); }, () => { throw new SyntaxError("nope"); }],
+    "http error":          [() => { throw Object.assign(new Error("curl: (22) 503"), { status: 22 }); },
+                            () => { throw Object.assign(new Error("curl: (22) 503"), { status: 22 }); }],
+    "timeout":             [() => { throw Object.assign(new Error("curl: (28) timed out"), { status: 28 }); },
+                            () => { throw Object.assign(new Error("curl: (28) timed out"), { status: 28 }); }],
+    "unreachable":         [_u347Unreachable, _u352Unreachable],
+    "no curl":             [() => { throw Object.assign(new Error("sh: curl: command not found"), { status: 127 }); },
+                            _u352NoCurl],
+    "serving its target":  [_u347Healthy, _u352Restored],
+  };
+
+  const seen = new Set();
+  for (const restartFails of [true, false]) {
+    for (const [name, [upProbe, rbProbe]] of Object.entries(probes)) {
+      const spec = restartFails ? { "launchctl bootstrap": Infinity } : {};
+      const drive = async (opts) => {
+        try { return { ok: true, result: await runUpgrade(opts) }; }
+        catch (e) { return { ok: false, err: e }; }
+      };
+      const up = await drive(_u347Opts({ execFn: _u347Runner(spec), mockProbe: upProbe }));
+      const rb = await drive(_u352Opts({ execFn: _u347Runner(spec), mockProbe: rbProbe }));
+      const [a, b] = [_u373Category(up), _u373Category(rb)];
+      const expected = _u373ExpectedDivergence[name];
+      if (expected) {
+        assert.deepEqual([a, b], expected,
+          `restartFails=${restartFails} probe="${name}": this is the ONE documented divergence and ` +
+          `both halves of it are pinned — expected ${JSON.stringify(expected)}, got ${JSON.stringify([a, b])}. ` +
+          `upgradeHint=${JSON.stringify(up.ok ? "(returned)" : up.err.hint)} ` +
+          `rollbackHint=${JSON.stringify(rb.ok ? "(returned)" : rb.err.hint)}`);
+        // And the property that makes the divergence acceptable: both still send the operator to
+        // the same place. This is what would break if the forward path's cell were deleted again.
+        const upText = `${up.ok ? "" : up.err.hint || ""}${up.ok ? "" : up.err.message || ""}`;
+        const rbText = `${rb.ok ? "" : rb.err.hint || ""}${rb.ok ? "" : rb.err.message || ""}`;
+        assert.match(upText, /ocp doctor/, `upgrade must name the right next step; got ${JSON.stringify(upText)}`);
+        assert.match(rbText, /ocp doctor/, `rollback must name the right next step; got ${JSON.stringify(rbText)}`);
+        assert.ok(!/ocp update --rollback` to restore/.test(upText),
+          `and the forward path must not recommend a rollback here; got ${JSON.stringify(upText)}`);
+      } else {
+        assert.equal(a, b,
+          `restartFails=${restartFails} probe="${name}": the two paths must classify identically — ` +
+          `upgrade=${a} rollback=${b}. upgradeHint=${JSON.stringify(up.ok ? "(returned)" : up.err.hint)} ` +
+          `rollbackHint=${JSON.stringify(rb.ok ? "(returned)" : rb.err.hint)}`);
+      }
+      seen.add(a); seen.add(b);
+    }
+  }
+
+  // Non-vacuity, DERIVED FROM THE ENUM rather than from a hand-written list (#385 F5). The earlier
+  // version listed the verdicts its author remembered — which is the same "only as complete as its
+  // author's list" critique this PR correctly makes of the ladder, reproduced one level up inside
+  // the test meant to guard it. Reading `RESTART_VERDICT` means a verdict added later is covered
+  // by construction, and the sweep goes red until a probe that reaches it is added here.
+  //
+  // UNMEASURED is the one exclusion, and it is excluded by CONSTRUCTION rather than by preference:
+  // it requires `postFlightMeasured === false`, which needs a run with no `mockProbe` at all, and
+  // every case in this sweep supplies one. It has its own test (`#352 LOW-4`, and `#356 F7` for the
+  // forward path).
+  //
+  // #385 re-review (a): this was `Object.values(...).map(v => Object.keys(...).find(...))`, a
+  // round-trip through the VALUES — which silently drops any verdict whose value string duplicates
+  // an existing one. Measured: adding `SHADOWED: "unconfirmed"` to the enum leaves the round-trip at
+  // 6 entries and the guard GREEN, while `Object.keys` reports 7 and goes red. So the guard added to
+  // catch a forgotten verdict had its own way of adding one that it could not catch — the same
+  // defect class, inside the fix for it. `Object.keys` is otherwise exactly equivalent.
+  const expectedVerdicts = new Set(Object.keys(RESTART_VERDICT));
+  expectedVerdicts.delete("UNMEASURED");
+  for (const v of expectedVerdicts) {
+    assert.ok(seen.has(v),
+      `harness premise: the sweep must reach ${v} — it is in RESTART_VERDICT, so either add a probe ` +
+      `that produces it or this guard is blind to it; reached ${JSON.stringify([...seen].sort())}`);
+  }
+});
+
+test("#373 (fail closed): a probe that did NOT confirm can never produce a successful return, on either path", async () => {
+  // THE REGRESSION THIS REFACTOR ACTUALLY CAUSED, caught by the 108-case behavioural sweep and
+  // pinned here so it cannot come back.
+  //
+  // Before #373 the last arm of each ladder was `if (!postFlight.ok)` — an `else`, which caught
+  // every non-ok probe BY CONSTRUCTION. Keying the arms on a verdict makes the ladder
+  // exhaustive-by-enumeration instead, and a verdict no arm names falls past every cell into the
+  // function's `return`: a SUCCESSFUL upgrade or rollback on a host whose probe failed. It happened
+  // for real — #372's remediation added `NOT_OK_STATUS`, the rollback path deliberately gives it no
+  // cell, and keying its neutral arm on `UNCONFIRMED` alone made a degraded proxy report a clean
+  // rollback. Both arms now read "not a success verdict", so a new verdict is refused by default.
+  //
+  // Note what kind of defect this is: it lives in which states are UNREACHABLE, not in what any
+  // reachable state does. That is why it needs a sweep over every probe outcome rather than a case
+  // per cell — a per-cell test only ever visits states that already have a cell.
+  const probes = {
+    "wrong version":        [() => ({ status: "ok", auth: { ok: true }, version: "9.9.9" }),
+                             () => ({ status: "ok", auth: { ok: true }, version: "9.9.9" })],
+    "degraded, right ver":  [() => ({ status: "degraded", auth: { ok: true }, version: "3.14.0" }),
+                             () => ({ status: "degraded", auth: { ok: true }, version: "3.10.0" })],
+    "no version field":     [() => ({ status: "ok" }), () => ({ status: "ok" })],
+    "version not a string": [() => ({ status: "ok", version: [] }), () => ({ status: "ok", version: [] })],
+    "json null":            [() => null, () => null],
+    "unparseable":          [() => { throw new SyntaxError("nope"); }, () => { throw new SyntaxError("nope"); }],
+    "http error":           [() => { throw Object.assign(new Error("curl: (22) 503"), { status: 22 }); },
+                             () => { throw Object.assign(new Error("curl: (22) 503"), { status: 22 }); }],
+    "timeout":              [() => { throw Object.assign(new Error("curl: (28) t/o"), { status: 28 }); },
+                             () => { throw Object.assign(new Error("curl: (28) t/o"), { status: 28 }); }],
+    "unreachable":          [_u347Unreachable, _u352Unreachable],
+    "no curl":              [_u352NoCurl, _u352NoCurl],
+    // #381 F1's kinds: the probe classifier's own default arm, which must not reach DOWN and must
+    // not reach success either.
+    "empty reply (curl 52)": [() => { throw Object.assign(new Error("curl: (52) Empty reply"), { status: 52 }); },
+                              () => { throw Object.assign(new Error("curl: (52) Empty reply"), { status: 52 }); }],
+    "spawn EAGAIN":          [() => { throw Object.assign(new Error("spawnSync /bin/sh EAGAIN"), { code: "EAGAIN" }); },
+                              () => { throw Object.assign(new Error("spawnSync /bin/sh EAGAIN"), { code: "EAGAIN" }); }],
+  };
+
+  let checked = 0;
+  for (const restartFails of [true, false]) {
+    for (const [name, [upProbe, rbProbe]] of Object.entries(probes)) {
+      const spec = restartFails ? { "launchctl bootstrap": Infinity } : {};
+      for (const [lane, opts, probe] of [["upgrade", _u347Opts, upProbe], ["rollback", _u352Opts, rbProbe]]) {
+        let returned = null, threw = null;
+        try { returned = await runUpgrade(opts({ execFn: _u347Runner(spec), mockProbe: probe })); }
+        catch (e) { threw = e; }
+        // Premise: the probe really did fail to confirm, or this row proves nothing.
+        const phases = (returned || threw)?.phases || [];
+        const pf = phases.find(p => p.name === "post-flight");
+        assert.ok(pf && pf.status === "fail",
+          `${lane}/${name}/restartFails=${restartFails} premise: post-flight must have FAILED; got ${JSON.stringify(pf)}`);
+        assert.equal(returned, null,
+          `${lane}/${name}/restartFails=${restartFails}: an unconfirmed post-flight must never return ` +
+          `success — this is the fall-through the verdict enumeration makes possible; got ${JSON.stringify(returned)}`);
+        assert.ok(threw, `${lane}/${name}/restartFails=${restartFails}: it must throw`);
+        checked++;
+      }
+    }
+  }
+  assert.equal(checked, Object.keys(probes).length * 4,
+    `harness premise: every probe x lane x restart-state combination must have been exercised; got ${checked}`);
 });
 
 // ── #262 SECURITY (same shape as #257's injection, on the rollback path) ───────────────────────
@@ -20150,7 +21038,31 @@ test("replay → dashboard.html Status card DECIDES tag-ok (the green card) on t
 
 runAsyncTests().then(() => Promise.all(pendingAsync)).then(() => {
   closeDb();
+  // THE RESULTS LINE IS A CONSUMED INTERFACE — keep it byte-identical (#366 review, finding A).
+  //
+  // A first cut appended `, N skipped` INSIDE this line, reasoning that "the line a green run
+  // prints is unchanged on a platform that skips nothing". True, and irrelevant: CI is
+  // ubuntu-latest/ext4, which is precisely a platform that skips something (the case-fold test),
+  // so on CI every line gained the suffix. `.github/workflows/flake-hunt.yml` greps this line at
+  // three sites, TWO of them anchored on the SUFFIX `', 0 failed ==='`:
+  //
+  //   :130  clean=      grep -l ', 0 failed ==='   -> stopped matching a clean run
+  //   :134  completed=  grep -l '=== Results:'     -> still matched (prefix; the one I checked)
+  //   :188  first=      grep -L ', 0 failed ==='   -> started selecting CLEAN logs as failures
+  //
+  // Measured on real logs: a three-run hunt in which every run is clean reported
+  // `clean (0 failed) | 0 / 3` and attached a spurious log section with an empty ✗ body — the
+  // workflow that exists to measure flakiness reporting 100% flake on a clean run.
+  //
+  // The skip count goes on its OWN line. That restores the invariant those greps were written
+  // against instead of teaching three call sites a new format, and it is why this must not be
+  // "fixed" by editing flake-hunt.yml.
   console.log(`\n=== Results: ${passed} passed, ${failed} failed ===\n`);
+  if (skipped) {
+    console.log(`=== Skipped: ${skipped} ===`);
+    console.log(`${skipped} test(s) did not run on this platform — search the output for "⊘ SKIP" ` +
+                `to see which coverage this run did NOT provide.\n`);
+  }
   process.exit(failed > 0 ? 1 : 0);
 }).catch((e) => {
   console.error("async test runner crashed:", e);
