@@ -1309,22 +1309,29 @@ console.log("\nInstall-marker type check (#366):");
   // else touches them — and `failed` is the discriminating one, because an unrecognised sentinel
   // lands in the rejection handler and increments it. A skipping body can never reach the resolve
   // handler at all, which is what makes "not counted as passed" structural rather than measured.
+  //
+  // TIMING IS THE WHOLE DIFFICULTY, and the first two drafts of this check both got it wrong.
+  // `skipped` is only attributable to this test SYNCHRONOUSLY: an async body with no `await`
+  // before the throw runs `skipRemainingTest()` during the `fn()` call itself, so the counter has
+  // moved by the time `test()` returns and before anything else can run. Read it any LATER — after
+  // `await` — and the rest of the module has executed, including the case-fold skip, so the delta
+  // is 2 on CI's ext4 and 1 here. That is exactly what CI caught on the previous push.
+  // `failed` stays attributable across the await, because in a green run nothing else touches it.
   const asyncBefore = _m366Counts();
-  const asyncOwn = (() => {
-    const from = pendingAsync.length;
-    test("_harness self-check (#366 review C): this ASYNC body skips too", async () => {
-      skipRemainingTest("_harness self-check inner, async (#366 review C)",
-        "synthetic: the sentinel must work identically for an async body");
-    });
-    assert.equal(pendingAsync.length, from + 1,
-      "premise: the async body must have registered exactly one pending promise");
-    return pendingAsync.slice(from);           // this test's promise, and no other
-  })();
+  const asyncFrom = pendingAsync.length;
+  test("_harness self-check (#366 review C): this ASYNC body skips too", async () => {
+    skipRemainingTest("_harness self-check inner, async (#366 review C)",
+      "synthetic: the sentinel must work identically for an async body");
+  });
+  const asyncOwn = pendingAsync.slice(asyncFrom);          // this test's promise, and no other
+  const asyncSkippedSync = _m366Counts().skipped;          // read BEFORE any await — attributable
   testAsync("#366 review C: an ASYNC body that skips is counted as skipped, never as failed", async () => {
+    assert.equal(asyncOwn.length, 1,
+      "premise: the async body must have registered exactly one pending promise");
+    assert.equal(asyncSkippedSync - asyncBefore.skipped, 1,
+      "the async skip must be counted exactly once, synchronously with the body's throw");
     await Promise.all(asyncOwn);
-    const a = _m366Counts();
-    assert.equal(a.skipped - asyncBefore.skipped, 1, "the async skip must be counted exactly once");
-    assert.equal(a.failed - asyncBefore.failed, 0,
+    assert.equal(_m366Counts().failed - asyncBefore.failed, 0,
       "an async skip must not be counted as FAILED — the sentinel must be recognised in the rejection handler");
   });
 }
