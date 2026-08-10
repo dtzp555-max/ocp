@@ -26,6 +26,22 @@ process.env.HOME = homedir(); // normalize HOME so homedir()-derived paths are s
 
 let passed = 0;
 let failed = 0;
+// The NAME of every test that incremented `failed`, pushed at the same moment the counter moves.
+//
+// `failed` is one global counter, so `after.failed - before.failed` attributes every failure that
+// landed in the window to whoever happens to be reading it. Across an `await` that window is the
+// rest of the run, and #394 measured the cost: ONE unrelated failing synchronous test made the
+// #366-review-C async self-check go red as collateral — the one test guaranteed to fire in a red
+// run while carrying no information about what broke. Worse, it is POSITIONAL: a failure landing
+// after the reader's post-await resume (the first top-level `await` past the self-check) escapes
+// entirely, so whether a given mutation pays the tax depends on where its failure happens to land.
+//
+// A self-check that needs to know whether IT failed asks this ledger by name instead of
+// subtracting counters. Every `failed++` in this file goes through recordFailure() so the ledger
+// stays complete; `failedNames.length === failed` is the invariant, and it is asserted at the one
+// place the ledger is read rather than merely assumed.
+const failedNames = [];
+function recordFailure(name) { failed++; failedNames.push(name); }
 // Tests that did NOT run because a premise this platform cannot provide was absent. Counted and
 // named rather than folded into `passed`, because a skipped test and a passing one are the same
 // green tick otherwise — and #366's review found exactly that: its case-fold guard asserts a
@@ -66,7 +82,7 @@ function test(name, fn) {
           () => { passed++; console.log(`  ✓ ${name}`); },
           (e) => {
             if (e && e[TEST_SKIPPED]) return; // already counted by skipRemainingTest()
-            failed++; console.log(`  ✗ ${name}: ${e.message}`);
+            recordFailure(name); console.log(`  ✗ ${name}: ${e.message}`);
           },
         ),
       );
@@ -75,7 +91,7 @@ function test(name, fn) {
     // Sync path only, where no other test can interleave: calling the TOP-LEVEL form from inside a
     // body is misuse, and it is made LOUD rather than silently miscounted.
     if (skipped > skippedBefore) {
-      failed++;
+      recordFailure(name);
       console.log(`  ✗ ${name}: called testSkipped() inside a test body — use skipRemainingTest(), ` +
                   `which also aborts the body`);
       return;
@@ -84,7 +100,7 @@ function test(name, fn) {
     console.log(`  ✓ ${name}`);
   } catch (e) {
     if (e && e[TEST_SKIPPED]) return; // already counted by skipRemainingTest()
-    failed++;
+    recordFailure(name);
     console.log(`  ✗ ${name}: ${e.message}`);
   }
 }
@@ -131,7 +147,7 @@ async function testAsync(name, fn) {
     // skipped and must not also be counted as failed. Both runners honour it, so a caller does
     // not have to know which one it is under.
     if (e && e[TEST_SKIPPED]) return;
-    failed++;
+    recordFailure(name);
     console.log(`  ✗ ${name}: ${e.message}`);
   }
 }
@@ -518,7 +534,7 @@ async function asyncTest(name, fn) {
     passed++;
     console.log(`  ✓ ${name}`);
   } catch (e) {
-    failed++;
+    recordFailure(name);
     console.log(`  ✗ ${name}: ${e.message}`);
   }
 }
@@ -1305,21 +1321,48 @@ console.log("\nInstall-marker type check (#366):");
   // `pendingAsync` array and then read `passed` — contaminated by every other async test settling
   // in the same window, and it went red for that reason rather than for a real defect. That is the
   // same mistake as the race it was written to guard, one level up. `passed` is therefore NOT
-  // asserted here: it cannot be attributed. `skipped` and `failed` can — in a green run nothing
-  // else touches them — and `failed` is the discriminating one, because an unrecognised sentinel
-  // lands in the rejection handler and increments it. A skipping body can never reach the resolve
-  // handler at all, which is what makes "not counted as passed" structural rather than measured.
+  // asserted here: it cannot be attributed. `skipped` can, by construction (below), and `failed`
+  // can once it is asked BY NAME rather than by subtraction (#394) — and `failed` is the
+  // discriminating one, because an unrecognised sentinel lands in the rejection handler and
+  // increments it. A skipping body can never reach the resolve handler at all, which is what makes
+  // "not counted as passed" structural rather than measured.
   //
-  // TIMING IS THE WHOLE DIFFICULTY, and the first two drafts of this check both got it wrong.
+  // TIMING IS THE WHOLE DIFFICULTY, and the first three drafts of this check all got it wrong.
   // `skipped` is only attributable to this test SYNCHRONOUSLY: an async body with no `await`
   // before the throw runs `skipRemainingTest()` during the `fn()` call itself, so the counter has
   // moved by the time `test()` returns and before anything else can run. Read it any LATER — after
   // `await` — and the rest of the module has executed, including the case-fold skip, so the delta
-  // is 2 on CI's ext4 and 1 here. That is exactly what CI caught on the previous push.
-  // `failed` stays attributable across the await, because in a green run nothing else touches it.
+  // is 2 on CI's ext4 and 1 here. That is exactly what CI caught on an earlier push.
+  //
+  // THE TWO HALVES ARE DELIBERATELY ASYMMETRIC, and #394 is why.
+  //
+  //   `skipped` stays a COUNTER DELTA, because its window contains no interleaving point: both
+  //   reads are plain statements of this block's synchronous module evaluation, with only a
+  //   `.length` read, the `test()` call itself and a `.slice()` between them. Nothing can run in
+  //   that window that this block did not run, so the delta is this test's own contribution by
+  //   construction. #378's review established this; re-derived here rather than inherited.
+  //
+  //   `failed` CANNOT be a counter delta, because its second read is after an `await`. The old
+  //   version claimed "`failed` stays attributable across the await, because in a green run
+  //   nothing else touches it" — and conceded its own premise in the same breath: a MUTATION run
+  //   is not a green run. Measured on this file at af7c416: injecting ONE unrelated failing
+  //   synchronous test made this row go red as collateral, so the single test guaranteed to fire
+  //   in a red run was the one carrying no information about what broke. And the tax is
+  //   POSITIONAL, not constant: this body resumes at the first top-level `await` past this block,
+  //   so a failure landing before that resume is charged here and one landing after is not —
+  //   which is why #393's and #399's mutation runs saw no collateral and #388's saw it twice.
+  //   Scoped to this test's OWN NAME via the `failedNames` ledger instead. See #394.
+  //
+  // THE SCOPED CHECK IS A NEGATIVE, so the assertions above it are load-bearing and ordered: the
+  // `asyncOwn.length` premise proves the body registered, the `skipped` delta proves it ran and
+  // skipped, and the `await` proves its settle handler has finished — so "no failure recorded
+  // under this name" cannot be satisfied by a run in which the self-check never executed.
   const asyncBefore = _m366Counts();
   const asyncFrom = pendingAsync.length;
-  test("_harness self-check (#366 review C): this ASYNC body skips too", async () => {
+  // ONE string, used both to register the test and to interrogate the ledger, so the two cannot
+  // drift into asking about a name nothing was ever recorded under.
+  const asyncOwnName = "_harness self-check (#366 review C): this ASYNC body skips too";
+  test(asyncOwnName, async () => {
     skipRemainingTest("_harness self-check inner, async (#366 review C)",
       "synthetic: the sentinel must work identically for an async body");
   });
@@ -1331,8 +1374,13 @@ console.log("\nInstall-marker type check (#366):");
     assert.equal(asyncSkippedSync - asyncBefore.skipped, 1,
       "the async skip must be counted exactly once, synchronously with the body's throw");
     await Promise.all(asyncOwn);
-    assert.equal(_m366Counts().failed - asyncBefore.failed, 0,
-      "an async skip must not be counted as FAILED — the sentinel must be recognised in the rejection handler");
+    assert.equal(failedNames.length, failed,
+      "premise: the failure ledger must account for EVERY counted failure — a `failed++` written " +
+      "without a matching recordFailure() would turn the check below into a negative over an " +
+      "incomplete list, which passes for the wrong reason");
+    assert.deepEqual(failedNames.filter(n => n === asyncOwnName), [],
+      "REGRESSION: an async skip was counted as FAILED — the TEST_SKIPPED sentinel is not being " +
+      "recognised in test()'s rejection handler");
   });
 }
 
