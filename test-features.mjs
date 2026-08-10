@@ -7781,6 +7781,138 @@ test("#373 (fail closed): a probe that did NOT confirm can never produce a succe
     `harness premise: every probe x lane x restart-state combination must have been exercised; got ${checked}`);
 });
 
+// ── #356: the four judgement calls from #347's review (F3, F4, F6, F7) ─────────────────────────
+//
+// Two are fixes and two are decisions. A judgement call resolved by writing down WHY is resolved,
+// so the two decisions carry their argument in `scripts/upgrade.mjs` and their evidence here.
+console.log("\n#356 — #347's four judgement calls, decided:");
+
+test("#356 F6: execRestartRetry must REFUSE a missing runner, not spend its budget on a TypeError", async () => {
+  // Without a default, `run(cmd)` threw `TypeError: run is not a function` on every attempt, and the
+  // `catch` treated that exactly like a command failure: three attempts, rising backoff, then
+  // `{ok:false}` with the TypeError's text as the operator-facing detail — a programming error
+  // laundered into an operational verdict, and on this path that verdict is "THE PROXY IS DOWN".
+  //
+  // It throws rather than defaulting to a real shell: defaulting would let a test that forgot to
+  // inject run REAL `launchctl`/`systemctl`, which is how #217's review took production down.
+  let slept = 0, logged = 0;
+  await assert.rejects(
+    () => execRestartRetry("launchctl bootstrap gui/501 …", {
+      backoffMs: 0, log: () => { logged++; }, sleep: async () => { slept++; },
+    }),
+    (e) => {
+      assert.ok(e instanceof TypeError, `must be a programming error, not a verdict; got ${e?.constructor?.name}`);
+      assert.match(e.message, /requires an explicit `run` function/);
+      assert.match(e.message, /would then execute launchctl\/systemctl for real/,
+        `and must say WHY it does not simply default; got ${JSON.stringify(e.message)}`);
+      return true;
+    });
+  // It must refuse BEFORE spending the budget — otherwise the fix is cosmetic and the caller still
+  // waits out three attempts before learning it made a mistake.
+  assert.equal(slept, 0, "it must not sleep a backoff over a missing runner");
+  assert.equal(logged, 0, "nor log attempt failures for a call that could never have worked");
+
+  // CONTROL: a real runner still works, so the guard did not become a blanket refusal.
+  const ok = await execRestartRetry("cmd", { attempts: 1, backoffMs: 0, log: () => {}, run: () => "" });
+  assert.deepEqual({ ok: ok.ok, attempts: ok.attempts }, { ok: true, attempts: 1 });
+});
+
+test("#356 F4: the restoration pass runs EVERY command, and does not abandon the one that starts the service", async () => {
+  // The forward RESTART loop breaks on failure for a good reason — continuing past a failed
+  // tear-down is meaningless. The RESTORE loop is trying to get the service back up, so stopping at
+  // the first failure abandons the command that would have started it. Wrong direction.
+  //
+  // REACHABILITY, stated because it decides what this test is worth. In production the `break`
+  // could not skip anything on any current plan shape: launchd's tear-down carries `|| true` and
+  // cannot exit non-zero under a real shell, and every systemd shape is a single command. This
+  // harness reaches the state because `_u347Runner` is a plain JS function, so `|| true` is inert
+  // text to it — the same gap #371's MED-3 hit when it relied on that suffix in the executor. So
+  // what this pins is the LOOP'S FAILURE DIRECTION, which is a real property of the loop, and not a
+  // production defect that exists today.
+  const run = _u347Runner({ "launchctl bootout": Infinity, "launchctl bootstrap": Infinity });
+  let caught = null;
+  try { await runUpgrade(_u347Opts({ execFn: run, mockProbe: _u347Unreachable })); }
+  catch (e) { caught = e; }
+  assert.ok(caught);
+
+  const restore = caught.phases.filter(p => p.name === "restart-restore").map(p => p.cmd);
+  // Premise: the FIRST restore command really did fail, or there is nothing for a `break` to skip
+  // and this test measures nothing.
+  const firstRestore = caught.phases.filter(p => p.name === "restart-restore")[0];
+  assert.ok(firstRestore && firstRestore.status === "fail" && /bootout/.test(firstRestore.cmd),
+    `premise: the first restore command must have FAILED; got ${JSON.stringify(firstRestore)}`);
+
+  assert.equal(restore.length, 2,
+    `the restore must attempt the whole plan even after a failure — a break here skips the command ` +
+    `that starts the service; got ${JSON.stringify(restore)}`);
+  assert.ok(/bootstrap/.test(restore[1]),
+    `and the skipped one is precisely the set-up half; got ${JSON.stringify(restore)}`);
+  // The aggregate is still reported as a failure — the direction changed, not the verdict.
+  assert.ok(/the restoration attempt also failed/.test(caught.hint),
+    `got hint=${JSON.stringify(caught.hint)}`);
+
+  // THE SIBLING LOOP, same direction fix. #356 filed F4 against `runFullUpgrade`, but `runRollback`
+  // had the identical `break` (guarded by #371's `bestEffort` marking, which only covers the
+  // prepended `reset-failed` — a genuine failure still abandoned the rest). Both are covered here so
+  // that a one-sided revert cannot pass, which is the shape #372 was filed for.
+  const rbRun = _u347Runner({ "launchctl bootout": Infinity, "launchctl bootstrap": Infinity });
+  let rbCaught = null;
+  try { await runUpgrade(_u352Opts({ execFn: rbRun, mockProbe: _u352Unreachable })); }
+  catch (e) { rbCaught = e; }
+  assert.ok(rbCaught);
+  const rbRestore = rbCaught.phases.filter(p => p.name === "restart-restore");
+  assert.ok(rbRestore[0] && rbRestore[0].status === "fail" && /bootout/.test(rbRestore[0].cmd),
+    `rollback premise: the first restore command must have FAILED; got ${JSON.stringify(rbRestore[0])}`);
+  assert.equal(rbRestore.length, 2,
+    `the rollback restore must also attempt the whole plan; got ${JSON.stringify(rbRestore.map(p => p.cmd))}`);
+  assert.ok(/bootstrap/.test(rbRestore[1].cmd),
+    `and reach the set-up half; got ${JSON.stringify(rbRestore.map(p => p.cmd))}`);
+});
+
+test("#356 F3: the restoration pass gets exactly ONE attempt per command — decided, not inherited", async () => {
+  // The forward loop gets RESTART_ATTEMPTS because the observed production fault was transient. This
+  // pass gets one, and the argument is in scripts/upgrade.mjs: retrying here would make our own
+  // invocations six inside systemd's default 5-starts-per-10s window, and once that limit trips the
+  // unit latches `failed` and a plain `systemctl restart` keeps failing — so the printed recovery
+  // hint's own command stops working, which is a worse end state than the bug this pass fixes.
+  //
+  // Pinned as arithmetic rather than as prose: retries + restore must be exactly RESTART_ATTEMPTS + 1.
+  const run = _u347Runner({ "launchctl bootstrap": Infinity });
+  try { await runUpgrade(_u347Opts({ execFn: run, mockProbe: _u347Unreachable })); } catch { /* expected */ }
+  assert.equal(run.count("launchctl bootstrap"), RESTART_ATTEMPTS + 1,
+    `${RESTART_ATTEMPTS} retries + exactly 1 restoration attempt; more means the restore started ` +
+    `retrying and F5's start-limit arithmetic no longer holds; got calls=${JSON.stringify(run.calls)}`);
+  const restoreOfBootstrap = run.calls.length - RESTART_ATTEMPTS;
+  assert.ok(restoreOfBootstrap >= 1, "harness premise: a restoration pass must actually have run");
+});
+
+test("#356 F7: `success with no measurement` is expressible ONLY for the all-mock lane, and the dangerous half throws", async () => {
+  // Decided: yes, for the bookkeeping lane only. It is unreachable in production (the post-flight
+  // gate is `opts.mockProbe || !opts.mockExec`, and `mockExec` is test-only), the absence of a
+  // measurement is VISIBLE in the result rather than implied, and ~40 existing tests use that lane
+  // to assert phase lists and target resolution rather than a service verdict.
+  const clean = await runUpgrade(_u347Opts({ execFn: _u347Runner({}) }));   // no mockProbe
+  assert.equal(clean.path, "upgrade", "the clean all-mock lane still returns success");
+  const pf = clean.phases.find(p => p.name === "post-flight");
+  assert.ok(pf && pf.status === "skipped-mock",
+    `and the absence of a measurement must be visible in the result, not implied by silence; ` +
+    `got ${JSON.stringify(pf)}`);
+
+  // THE DANGEROUS HALF. This arm had NO test on the forward path — #352's LOW-4 covers the rollback
+  // one only — which is exactly the shape F7 warns about: an untested throw is one refactor away
+  // from returning success on a host nobody looked at.
+  const run = _u347Runner({ "launchctl bootstrap": Infinity });
+  let caught = null;
+  try { await runUpgrade(_u347Opts({ execFn: run })); }   // restart FAILS, still no probe
+  catch (e) { caught = e; }
+  assert.ok(caught, "a restart failure with nothing measured must never return success");
+  assert.equal(caught.phases.find(p => p.name === "post-flight").status, "skipped-mock",
+    "premise: the post-flight really was not measured");
+  assert.match(caught.message, /service state is UNKNOWN/);
+  assert.ok(caught.hint.startsWith("THE SERVICE STATE IS UNKNOWN"),
+    `got hint=${JSON.stringify(caught.hint)}`);
+});
+
 // ── #262 SECURITY (same shape as #257's injection, on the rollback path) ───────────────────────
 // meta.fromCommit is read back from from-commit.txt inside the snapshot directory and was
 // interpolated into an `exec()` shell template string for `git -C ${ocpDir} checkout

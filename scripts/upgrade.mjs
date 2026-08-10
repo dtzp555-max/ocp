@@ -892,6 +892,27 @@ export async function execRestartRetry(cmd, {
   log = (m) => console.error(m),
   sleep = (ms) => new Promise(r => setTimeout(r, ms)),
 } = {}) {
+  // #356 finding F6. `attempts`, `backoffMs`, `log` and `sleep` all have defaults; `run` did not.
+  // Calling without one made `run(cmd)` throw `TypeError: run is not a function` on every attempt,
+  // which the `catch` below treats EXACTLY like a command failure: three attempts, rising backoff,
+  // then `{ok:false}` with the TypeError's message as the operator-facing failure detail. A
+  // programming error laundered into an operational verdict — and on this path that verdict is
+  // "THE PROXY IS DOWN".
+  //
+  // THROW rather than default to `execRun`, which is the other option the issue offered. Defaulting
+  // would mean a test that forgot to inject silently runs REAL `launchctl`/`systemctl` against the
+  // developer's machine. That is not a hypothetical failure mode in this repo: #217's review took
+  // production down exactly that way — a `cmd_restart` stub defined before `source`-ing the real
+  // script was silently overwritten, the real restart chain ran against a live host, and the proxy
+  // stayed down until someone noticed. AGENTS.md's rule from that incident is that a constraint
+  // must be unreachable by CONSTRUCTION; a function whose whole purpose is running service-manager
+  // commands must not acquire the ability to do so by omission.
+  if (typeof run !== "function") {
+    throw new TypeError(
+      "execRestartRetry requires an explicit `run` function — it is deliberately NOT defaulted to a "
+      + "real shell, because a caller that forgot to inject one would then execute launchctl/systemctl "
+      + "for real. Pass `{ run: execRun }` to mean it.");
+  }
   let detail = null;
   for (let i = 1; i <= attempts; i++) {
     try {
@@ -1628,7 +1649,49 @@ async function runFullUpgrade({ doctor, opts }) {
       //
       // Every other plan shape is a single `systemctl … restart --` command, for which
       // `.slice(0)` and `.slice(index)` are identical.
+      // #356 finding F3, DECIDED AND RECORDED: the restoration pass gets ONE attempt, deliberately,
+      // and the transience premise that justifies three on the forward loop does NOT carry here.
+      //
+      // The finding is fair — this pass runs when the service is already known to be down, which is
+      // when a transient fault matters most — so the asymmetry needs an argument rather than an
+      // inheritance. Two, and the first is decisive:
+      //
+      //  1. THIS FEATURE'S OWN ARITHMETIC FORBIDS IT. `recoveryPlanCommands`' comment works it out:
+      //     `install-autostart.mjs` writes `Restart=always`/`RestartSec=5` and no StartLimit
+      //     override, so systemd's default 5-starts-per-10s applies, and the retries (t≈0,1,3) plus
+      //     this pass (t≈5) already put FOUR of our own invocations inside one 10s window, stacked
+      //     with systemd's own restarts. Retrying here makes it six. Once the limit trips, the unit
+      //     latches `failed` and a plain `systemctl restart` KEEPS FAILING — so the printed recovery
+      //     hint's own command stops working. That end state is worse than the bug this pass exists
+      //     to fix, and it is the same argument #371's MED-3 accepted for the executed pass.
+      //  2. THIS IS NOT THE LAST CHANCE. The post-flight probe runs afterwards with a 10 x 1s budget,
+      //     and on the systemd shape `Restart=always` can land inside it — the warned-success cell
+      //     exists precisely for that outcome. Retrying here would spend part of that window while
+      //     adding start-limit pressure to the mechanism most likely to succeed in it.
+      //
+      // If this is ever revisited, F5's arithmetic moves with it: four invocations becomes six, and
+      // the `reset-failed` hint stops being sufficient. Pinned by the #347 money test, which asserts
+      // exactly four `launchctl bootstrap` invocations (3 retries + 1 restore) — mutation R-F3
+      // raises this to 3 and turns it red at 6.
       const restoreCmds = restartCmds.slice(0);
+      // #356 finding F4: the restore runs EVERY command and reports the aggregate; it does not stop
+      // at the first failure.
+      //
+      // The direction was wrong for a restore, which is what the finding is about. The forward
+      // RESTART loop breaks on failure for a good reason — continuing past a failed tear-down is
+      // meaningless. This loop is trying to get the service back UP, so abandoning the remaining
+      // commands on a failure abandons the one that would have started it.
+      //
+      // REACHABILITY, stated rather than implied. On every plan shape that exists today the `break`
+      // could not actually skip anything, so this is a latent direction fix and not a live defect:
+      // launchd's plan is `bootout … 2>/dev/null || true` then `bootstrap`, and the first cannot
+      // exit non-zero under a real shell; every systemd shape is a single command. It stops being
+      // latent the moment a plan gains a third command or that `|| true` is removed — and #371
+      // already had to add a `bestEffort` concept to the sibling loop because the `|| true` is inert
+      // text to a runner that is not a shell, which is the same lesson one layer down.
+      //
+      // `restoreOutcome.ok` keeps its meaning — "every restore command exited 0" — so the two hint
+      // branches that read it are unchanged. What changes is that a later command still runs.
       restoreOutcome = { ok: true, cmds: [] };
       for (const c of restoreCmds) {
         const r = await execRestartRetry(c.cmd, { attempts: 1, backoffMs: 0, run: runShell });
@@ -1637,7 +1700,7 @@ async function runFullUpgrade({ doctor, opts }) {
           ...(r.ok ? {} : { stderr: r.detail }),
         });
         restoreOutcome.cmds.push(c.cmd);
-        if (!r.ok) { restoreOutcome.ok = false; break; }
+        if (!r.ok) restoreOutcome.ok = false;
       }
       console.error(restoreOutcome.ok
         ? `[restart] restoration commands ran without error — the probe below decides whether that worked.`
@@ -1739,6 +1802,28 @@ async function runFullUpgrade({ doctor, opts }) {
     // F5: single source for "what to run by hand", shared by every hint below.
     const recoveryCmds = recoveryPlanCommands(restartPlan).join(" && ");
 
+    // #356 finding F7, DECIDED AND RECORDED: "success with no measurement" IS expressible, for the
+    // all-mock bookkeeping lane ONLY, and that is deliberate.
+    //
+    // The state: `mockExec && execFn && !mockProbe`, every restart command exits 0, `postFlightMeasured`
+    // is false, and this function returns `{path:"upgrade", executed:true}` with `post-flight:
+    // skipped-mock`. The finding asks whether that should exist at all, given this file's entire
+    // #214 -> #274 -> #291 arc is about not reporting success without confirming what is serving.
+    //
+    // Yes, and here is the whole argument:
+    //  - IT IS UNREACHABLE IN PRODUCTION. The post-flight gate is `opts.mockProbe || !opts.mockExec`,
+    //    and `mockExec` is a test-only option — a real `ocp update` always measures. The lane cannot
+    //    be entered by any invocation a user can make.
+    //  - THE DANGEROUS HALF ALREADY THROWS. `restartFailure && !postFlightMeasured` is the arm
+    //    directly below, and it refuses to claim anything. What remains is the clean half: nothing
+    //    failed, nothing was measured, and the caller asked for exactly that.
+    //  - IT IS THE BOOKKEEPING CONTRACT ~40 EXISTING TESTS DEPEND ON. Those tests use the all-mock
+    //    lane to assert phase lists, target resolution and plan shapes — they are not asserting a
+    //    service verdict, and the absence of one is visible in the result as `post-flight:
+    //    skipped-mock` rather than being silently implied.
+    //
+    // So the rule is: this function may return success without a measurement only when the caller
+    // disabled measurement AND nothing failed. Written down so the next reader does not re-derive it.
     if (verdict === RESTART_VERDICT.UNMEASURED) {
       // Only reachable from a test that injects execFn but no probe. Never claim success when a
       // restart command failed and nothing measured the result.
@@ -2455,7 +2540,12 @@ async function runRollback(opts) {
         ...(r.ok ? {} : { stderr: r.detail }),
       });
       restoreOutcome.cmds.push(c.cmd);
-      if (!r.ok && !c.bestEffort) { restoreOutcome.ok = false; break; }
+      // #356 F4, same direction fix as the sibling loop: a failed command marks the pass failed but
+      // does not abandon the commands after it. On this path the `bestEffort` marking already kept a
+      // non-zero `reset-failed` from suppressing the restart behind it (#371's MED-3/G2); this
+      // extends the same reasoning to a genuine failure, because "stop trying to bring the service
+      // back as soon as bringing it back goes wrong" is the wrong direction for a restore either way.
+      if (!r.ok && !c.bestEffort) restoreOutcome.ok = false;
     }
     console.error(restoreOutcome.ok
       ? `[rollback] restoration commands ran without error — the probe below decides whether that worked.`
