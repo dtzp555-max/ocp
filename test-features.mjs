@@ -33,6 +33,9 @@ let failed = 0;
 // the test passed for a second reason while covering nothing. A green CI run must not be readable
 // as coverage the run did not provide.
 let skipped = 0;
+// Read the live counters. The #366 review's finding C was a MIScount, so its regression test has
+// to observe the same variables the summary prints rather than a copy.
+function _m366Counts() { return { passed, failed, skipped }; }
 
 // Pending promises from tests declared `async` but registered through the SYNC `test()` helper.
 // 44 tests in this file are written that way. Before this, `test()` called fn(), got a promise back,
@@ -46,6 +49,14 @@ let skipped = 0;
 const pendingAsync = [];
 
 function test(name, fn) {
+  // #366 review, finding C: a body that skips must not ALSO be counted as passed.
+  //
+  // A SENTINEL, not a counter comparison. The first fix compared `skipped` across the body, which
+  // is race-free on the synchronous path but WRONG on the async one: that comparison is evaluated
+  // when the promise RESOLVES, and any unrelated test may have skipped in between, silently
+  // suppressing a passing async test's ✓ and under-counting `passed`. Reproduced in isolation
+  // before replacing it. A per-invocation sentinel compares nothing across time.
+  const skippedBefore = skipped;
   try {
     const r = fn();
     if (r && typeof r.then === "function") {
@@ -53,14 +64,26 @@ function test(name, fn) {
       pendingAsync.push(
         r.then(
           () => { passed++; console.log(`  ✓ ${name}`); },
-          (e) => { failed++; console.log(`  ✗ ${name}: ${e.message}`); },
+          (e) => {
+            if (e && e[TEST_SKIPPED]) return; // already counted by skipRemainingTest()
+            failed++; console.log(`  ✗ ${name}: ${e.message}`);
+          },
         ),
       );
+      return;
+    }
+    // Sync path only, where no other test can interleave: calling the TOP-LEVEL form from inside a
+    // body is misuse, and it is made LOUD rather than silently miscounted.
+    if (skipped > skippedBefore) {
+      failed++;
+      console.log(`  ✗ ${name}: called testSkipped() inside a test body — use skipRemainingTest(), ` +
+                  `which also aborts the body`);
       return;
     }
     passed++;
     console.log(`  ✓ ${name}`);
   } catch (e) {
+    if (e && e[TEST_SKIPPED]) return; // already counted by skipRemainingTest()
     failed++;
     console.log(`  ✗ ${name}: ${e.message}`);
   }
@@ -72,10 +95,30 @@ function test(name, fn) {
  * For a premise the current platform cannot supply — not for a test that is inconvenient. The
  * reason is mandatory and is printed, so `npm test`'s output says which coverage this run did not
  * provide instead of implying it did.
+ *
+ * TOP-LEVEL FORM. Call it in the `else` of the condition that decides whether the premise holds,
+ * so `test()` is never invoked at all. From inside a test body use skipRemainingTest() instead —
+ * this one does not abort the body, and `test()` reports that misuse as a failure.
  */
 function testSkipped(name, reason) {
   skipped++;
   console.log(`  ⊘ SKIP ${name} — ${reason}`);
+}
+
+// Marks the one Error that means "this test skipped" rather than "this test failed".
+const TEST_SKIPPED = Symbol("ocp.test.skipped");
+
+/**
+ * IN-BODY FORM: record the skip and abort the rest of the body. Works identically for sync and
+ * async bodies, because `test()` recognises the sentinel in both its catch and its rejection
+ * handler — and because nothing is compared across time, an unrelated skip elsewhere in the file
+ * cannot affect this test's outcome.
+ */
+function skipRemainingTest(name, reason) {
+  testSkipped(name, reason);
+  const e = new Error(`skipped: ${reason}`);
+  e[TEST_SKIPPED] = true;
+  throw e;
 }
 
 async function testAsync(name, fn) {
@@ -84,6 +127,10 @@ async function testAsync(name, fn) {
     passed++;
     console.log(`  ✓ ${name}`);
   } catch (e) {
+    // Same sentinel as test(): a body that called skipRemainingTest() is already counted as
+    // skipped and must not also be counted as failed. Both runners honour it, so a caller does
+    // not have to know which one it is under.
+    if (e && e[TEST_SKIPPED]) return;
     failed++;
     console.log(`  ✗ ${name}: ${e.message}`);
   }
@@ -1232,6 +1279,50 @@ import { symlinkSync as _m366Symlink, mkdtempSync as _m366Mkdtemp, chmodSync as 
 
 console.log("\nInstall-marker type check (#366):");
 
+// #366 review, finding C — a harness self-check, because the defect was in the COUNTING and no
+// existing test could see it. The synthetic skip below is real (it shows in the ⊘ list and in the
+// skipped total on every platform), which is the price of proving the guard on every run rather
+// than only on a root host where the real in-callback path lives.
+{
+  const before = _m366Counts();
+  test("_harness self-check (#366 review C): this SYNC body skips, so its own ✓ must not print", () => {
+    skipRemainingTest("_harness self-check inner, sync (#366 review C)",
+      "synthetic: proves a skipping body is not ALSO counted as passed");
+    throw new Error("unreachable: skipRemainingTest must abort the body");
+  });
+  const after = _m366Counts();
+  test("#366 review C: a test whose body skips increments `skipped` and NOT `passed`", () => {
+    assert.equal(after.skipped - before.skipped, 1, "the skip must be counted exactly once");
+    assert.equal(after.passed - before.passed, 0,
+      "REGRESSION: the skipping test was ALSO counted as passed — the exact pair the skip facility exists to prevent");
+    assert.equal(after.failed - before.failed, 0, "a skip is not a failure either");
+  });
+
+  // The ASYNC case, which the first fix got wrong: it compared the global skip counter across the
+  // body, so an unrelated skip resolving in between suppressed a PASSING async test's ✓. Asserted
+  // by settling this test's own promise before reading the counters.
+  const asyncBefore = _m366Counts();
+  const asyncProbe = (async () => {
+    let settled = false;
+    test("_harness self-check (#366 review C): this ASYNC body skips too", async () => {
+      skipRemainingTest("_harness self-check inner, async (#366 review C)",
+        "synthetic: the sentinel must work identically for an async body");
+    });
+    await Promise.all(pendingAsync);
+    settled = true;
+    return { settled, after: _m366Counts() };
+  })();
+  testAsync("#366 review C: an ASYNC body that skips is not counted as passed OR failed", async () => {
+    const { settled, after: a } = await asyncProbe;
+    assert.ok(settled, "premise: the async body must have settled before the counters are read");
+    assert.equal(a.skipped - asyncBefore.skipped, 1, "the async skip must be counted exactly once");
+    assert.equal(a.passed - asyncBefore.passed, 0, "an async skip must not be counted as passed");
+    assert.equal(a.failed - asyncBefore.failed, 0,
+      "an async skip must not be counted as FAILED either — the sentinel must be recognised in the rejection handler");
+  });
+}
+
+
 test("#366 severity: on the DOCUMENTED default layout, $HOME is ONE stray file away from rm -rf", () => {
   // The finding that decides whether this is worth releasing, and both the issue and this PR's
   // first draft under-sold it. README documents the install at `~/ocp`, so on a standard host
@@ -1264,19 +1355,23 @@ test("#366 severity: on the DOCUMENTED default layout, $HOME is ONE stray file a
   }
 });
 
+// The EACCES premise cannot be CREATED as root: with DAC override the mode bits deny nothing, so
+// statSync would succeed and every assertion below would pass while testing nothing. Decided at
+// TOP LEVEL, in the else of the condition, so `test()` is never invoked — the shape #366's review
+// (finding C) established is the correct one. Reachable in practice: `sudo npm test`, root-by-
+// default containers, and this fleet's Pi and Oracle hosts run system-level units.
+const _m366IsRoot = typeof process.getuid === "function" && process.getuid() === 0;
+
+if (_m366IsRoot) {
+  testSkipped("#366 review F1: a marker that cannot be STAT'D is diagnosed as unreadable, never as 'not an OCP install'",
+    "running as root — DAC override makes a mode-444 directory readable, so the EACCES premise cannot be created");
+} else {
 test("#366 review F1: a marker that cannot be STAT'D is diagnosed as unreadable, never as 'not an OCP install'", () => {
   // The flag value was already right; the MESSAGE was catastrophically wrong. On a directory that
   // is readable but not executable, readdirSync lists all four markers while statSync on each
   // throws EACCES — so a real install was reported as "exists and is NOT an OCP install ... it is
   // not something this tool may delete", and doctor's advice line then tells the operator to
   // "remove it yourself first". That is the one action that loses the install.
-  //
-  // Skipped as root: with CAP_DAC_OVERRIDE the mode bits do not deny anything, so statSync would
-  // succeed and the premise would silently not hold — the vacuity this suite keeps being bitten by.
-  if (typeof process.getuid === "function" && process.getuid() === 0) {
-    return testSkipped("#366 review F1: a marker that cannot be STAT'D is diagnosed as unreadable",
-      "running as root — DAC override makes a mode-444 directory readable, so the EACCES premise cannot be created");
-  }
   const root = _m366Mkdtemp(testJoin(tmpdir(), "ocp-366-eacces-"));
   const install = testJoin(root, "install");
   try {
@@ -1320,6 +1415,72 @@ test("#366 review F1: a marker that cannot be STAT'D is diagnosed as unreadable,
     rmSync(root, { recursive: true, force: true });
   }
 });
+}
+
+// #366 review, finding B: the CONSUMERS, not just the classifier. Fixing `why` alone left both
+// production consumers still telling the operator to delete a permission-locked install, in the
+// line printed AFTER the corrected one — arguably worse than before, because the wrong advice now
+// comes last. Both branch on `unreadableMarkers`, which until this round had no production
+// consumer at all.
+if (_m366IsRoot) {
+  testSkipped("#366 review F1/B: doctor and runFreshInstall must not tell an operator to delete an install they merely cannot read",
+    "running as root — DAC override makes a mode-444 directory readable, so the EACCES premise cannot be created");
+} else {
+test("#366 review F1/B: doctor and runFreshInstall must not tell an operator to delete an install they merely cannot read", async () => {
+  const root = _m366Mkdtemp(testJoin(tmpdir(), "ocp-366-consumer-"));
+  const install = testJoin(root, "install");
+  try {
+    tMkdirSync(install, { recursive: true });
+    for (const f of ["server.mjs", "setup.mjs", "ocp", "models.json"]) testWriteFile(testJoin(install, f), "");
+    testWriteFile(testJoin(install, "package.json"), JSON.stringify({ name: OCP_PACKAGE_NAME, version: "3.29.2" }));
+    _m366Chmod(install, 0o444);
+
+    // ---- consumer 1: doctor's emitted plan ----
+    const result = await runDoctor({ skipNetwork: true, mockLatest: "v9.9.9", ocpDir: install });
+    assert.equal(result.next_action.kind, "fresh_install",
+      "premise: this input must still reach the destructive kind, or the guard is untested");
+    assert.deepStrictEqual(result.next_action.ai_executable, [], "no destructive step may be offered");
+
+    const advice = result.next_action.human_required.join("\n");
+    // The defect was the CONTRADICTION: `why` says do-not-delete, the tail said delete-it-yourself.
+    assert.ok(!/remove it yourself first/.test(advice),
+      `no line may tell the operator to delete a directory we merely could not read:\n${advice}`);
+    assert.ok(/do NOT delete/i.test(advice), `the operator must be told not to delete it:\n${advice}`);
+    assert.ok(/permission/i.test(advice), `the real cause must be named:\n${advice}`);
+    // The LAST line is what an operator acts on, so assert on that specifically and not just on
+    // the joined text — the pre-fix output contained the right sentence too, in position [0].
+    const last = result.next_action.human_required[result.next_action.human_required.length - 1];
+    assert.ok(/do NOT delete/i.test(last) && !/remove it yourself/.test(last),
+      `the LAST instruction is the one that gets followed; got: ${last}`);
+    assert.ok(!/remove it yourself/.test(result.next_action.verify), `verify: ${result.next_action.verify}`);
+
+    // ---- consumer 2: runFreshInstall's own refusal (defence in depth, its own re-classification) ----
+    let thrown = null;
+    try {
+      await runUpgrade({ mockExec: true, yes: true, freshInstall: true, ocpDir: install,
+                         mockDoctor: result, skipNetwork: true });
+    } catch (e) { thrown = e; }
+    assert.ok(thrown, "runFreshInstall must refuse an uninspectable target");
+    assert.ok(!/remove it yourself first/.test(thrown.message),
+      `the upgrade path must not tell the operator to delete it either:\n${thrown.message}`);
+    assert.ok(/Do NOT delete this directory/i.test(thrown.message), thrown.message);
+
+    // ---- CONTROL: a genuinely foreign directory still gets the ordinary advice ----
+    // Without this, "never says remove it yourself" is satisfiable by deleting the sentence.
+    const foreign = testJoin(root, "foreign");
+    tMkdirSync(foreign, { recursive: true });
+    testWriteFile(testJoin(foreign, "passwd"), "root:x:0:0");
+    const fr = await runDoctor({ skipNetwork: true, mockLatest: "v9.9.9", ocpDir: foreign });
+    const fAdvice = fr.next_action.human_required.join("\n");
+    assert.ok(/remove it yourself first/.test(fAdvice),
+      `a directory we CAN inspect and that is not an install keeps the ordinary advice:\n${fAdvice}`);
+    assert.ok(!/do NOT delete/i.test(fAdvice), `and must not borrow the permission wording:\n${fAdvice}`);
+  } finally {
+    try { _m366Chmod(install, 0o755); } catch { /* best effort */ }
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+}
 
 test("#366 review F1: a DIRECTORY-shaped marker is still 'not an install', not 'unreadable'", () => {
   // The other side of the distinction. The tri-state must not turn every refusal into
@@ -19948,10 +20109,28 @@ test("replay → dashboard.html Status card DECIDES tag-ok (the green card) on t
 
 runAsyncTests().then(() => Promise.all(pendingAsync)).then(() => {
   closeDb();
-  // `skipped` is appended only when non-zero, so the line a green run prints is unchanged on a
-  // platform that skips nothing, and a run that DID skip cannot be mistaken for one that did not.
-  console.log(`\n=== Results: ${passed} passed, ${failed} failed${skipped ? `, ${skipped} skipped` : ""} ===\n`);
+  // THE RESULTS LINE IS A CONSUMED INTERFACE — keep it byte-identical (#366 review, finding A).
+  //
+  // A first cut appended `, N skipped` INSIDE this line, reasoning that "the line a green run
+  // prints is unchanged on a platform that skips nothing". True, and irrelevant: CI is
+  // ubuntu-latest/ext4, which is precisely a platform that skips something (the case-fold test),
+  // so on CI every line gained the suffix. `.github/workflows/flake-hunt.yml` greps this line at
+  // three sites, TWO of them anchored on the SUFFIX `', 0 failed ==='`:
+  //
+  //   :130  clean=      grep -l ', 0 failed ==='   -> stopped matching a clean run
+  //   :134  completed=  grep -l '=== Results:'     -> still matched (prefix; the one I checked)
+  //   :188  first=      grep -L ', 0 failed ==='   -> started selecting CLEAN logs as failures
+  //
+  // Measured on real logs: a three-run hunt in which every run is clean reported
+  // `clean (0 failed) | 0 / 3` and attached a spurious log section with an empty ✗ body — the
+  // workflow that exists to measure flakiness reporting 100% flake on a clean run.
+  //
+  // The skip count goes on its OWN line. That restores the invariant those greps were written
+  // against instead of teaching three call sites a new format, and it is why this must not be
+  // "fixed" by editing flake-hunt.yml.
+  console.log(`\n=== Results: ${passed} passed, ${failed} failed ===\n`);
   if (skipped) {
+    console.log(`=== Skipped: ${skipped} ===`);
     console.log(`${skipped} test(s) did not run on this platform — search the output for "⊘ SKIP" ` +
                 `to see which coverage this run did NOT provide.\n`);
   }
