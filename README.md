@@ -301,7 +301,11 @@ The canonical list lives in [`models.json`](./models.json) — the single source
 
 **A `null` is not a failure.** It means no conclusive verdict, `ocp doctor` reports it as WARN rather than FAIL, and it does not block `ocp update`. On such a host the first successful request moves it to `true`.
 
-**`status` is unaffected by any of this.** The proxy's `ok` / `degraded` verdict is driven by consecutive conclusive probe *rejections* (ADR 0010), never by `auth.ok`.
+**`auth.ok` never moves `status`.** `proxyHealthStatus` reads `consecutiveFailures` and never `ok`, so no verdict in the table above can flip a host to `degraded`.
+
+**The tally it reads is a different matter, and this is the part worth knowing.** Conclusive probe *rejections* raise `consecutiveFailures` (ADR 0010), and **any successful request clears it** — a deliberate restoration of ADR 0010's self-heal, unqualified by which lane served the request (see [ADR 0014](docs/adr/0014-auth-verdict-measures-what-it-measured.md) § Consequences). So a host reporting `degraded` can return to `ok` on the first request that succeeds, with no probe having run in between. If you are debugging `status` — `ocp update`'s post-flight check and the dashboard's status card both read it, and the dashboard has no other auth signal — do not assume it is probe-driven only.
+
+*(This paragraph said "**`status` is unaffected by any of this** … never by `auth.ok`" until #361. The second clause was true and the bolded headline was not: it read as though nothing in this section could touch `status`, while a successful request has always cleared the tally that decides it.)*
 ### Running more than one instance on a host
 
 `DEFAULT_PORT` (3456) is the primary and never changes — it is the single source of truth in `lib/constants.mjs`, and CI hard-fails any other port literal in source. A host that needs a **second** instance takes `DEFAULT_PORT + n` in allocation order, and **must declare itself**:
