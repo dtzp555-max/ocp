@@ -2668,6 +2668,85 @@ printf '%s\\n' '{"type":"result"}'
 exit 0
 `;
 function ltAuthFake(dir) { const p = join(dir, "claude-auth"); _ltWrite(p, LT_AUTH_FAKE); _ltChmod(p, 0o755); return p; }
+
+// ── TUI live-boot fixture: a STUB tmux that can drive one COMPLETE interactive turn ──────
+//
+// The existing stub (scripts/b2-key-snapshot.mjs's FIXTURE_TMUX) is `exit 1` — enough to prove
+// nothing spawns, not enough to reach any code past `tui_spawn_failed`. This one succeeds, so a
+// live `server.mjs` under CLAUDE_TUI_MODE=true runs callClaudeTui end to end and returns 200.
+//
+// IT MUST NEVER TOUCH A REAL TMUX. Two independent reasons, both already paid for in this repo:
+// server.mjs's TUI boot reap issues `kill-server` (server.mjs's listen callback →
+// reapStaleTuiSessions), which against the operator's real tmux would destroy their sessions; and
+// AGENTS.md records a review that took production down through exactly this class of test. The
+// mechanism is the same one #357's review settled for the B.2 snapshot: pin OCP_TUI_TMUX_BIN
+// rather than rely on PATH order, because lib/tui/session.mjs:54 resolves
+// `process.env.OCP_TUI_TMUX_BIN || "tmux"` at module load and that variable is the only thing
+// that can win against a tmux on PATH. Callers get the pin from `env` below; they must spread it.
+//
+// HOW THE TURN COMPLETES, i.e. which of the driver's positive checks this stub has to satisfy:
+//   - `new-session` must exit 0, or bootTuiPane throws tui_spawn_failed before any wait.
+//   - `capture-pane` must render BOTH an input bar and the landed prompt, because the driver
+//     polls tuiInputReady() at boot and then tuiPromptLanded() after the paste, and each is a
+//     POSITIVE check that fast-fails. The two-line payload below satisfies both at once — it is
+//     copied from makeTmuxRecorder (the in-process fake), so the two harnesses agree.
+//   - a TERMINAL transcript must exist at <pane HOME>/.claude/projects/*/<session-id>.jsonl, or
+//     readTuiTranscript spins to the 120s wallclock and the turn is rejected as truncated.
+//     MEASURED, not assumed: with `stop_reason` omitted the first cut of this fixture produced
+//     `tui_wallclock_truncated` with chars:4 — the text was found and the line was simply not
+//     terminal (isTerminalLine requires message.stop_reason ∈ TERMINAL_STOP_REASONS,
+//     lib/tui/transcript.mjs:57). `entrypoint` (NOT `cc_entrypoint`) is what verifyEntrypoint
+//     reads (:117), and omitting it logs a tui_entrypoint_mismatch that is harmless but noisy.
+//
+// The session-id is minted inside `server.mjs` (randomUUID, per pane) so the harness cannot know
+// it in advance. The stub recovers it from the pane command's own `--session-id` (session.mjs:537)
+// and writes the transcript under $HOME — which is the PANE's home, because bootTuiPane sets
+// env.HOME = ehome on the spawnSync. That is why this needs no knowledge of resolveTuiHome().
+const LT_TUI_TMUX = (logPath, replyText) => `#!/bin/sh
+printf '%s\\n' "$*" >> ${JSON.stringify(logPath)}
+case "$1" in
+  new-session)
+    sid=\`printf '%s' "$*" | sed -n 's/.*--session-id \\([0-9a-fA-F-]*\\).*/\\1/p'\`
+    if [ -n "$sid" ]; then
+      mkdir -p "$HOME/.claude/projects/x"
+      printf '%s\\n' '{"type":"assistant","message":{"role":"assistant","stop_reason":"end_turn","content":[{"type":"text","text":${JSON.stringify(replyText)}}]},"entrypoint":"cli"}' > "$HOME/.claude/projects/x/$sid.jsonl"
+    fi
+    exit 0 ;;
+  capture-pane)
+    printf '%s\\n' '[Pasted text #1 +2 lines]'
+    printf '%s\\n' ' ? for shortcuts'
+    exit 0 ;;
+  *) exit 0 ;;
+esac
+`;
+// Returns { bin, log, env, calls() }. `env` carries the pin AND the shape-deciding TUI settings a
+// caller would otherwise have to remember; spread it into ltBootFresh's env.
+// `calls()` is every stub invocation, one argv string per line — the positive evidence that the
+// stub really was the binary server.mjs resolved. An EMPTY log is equally consistent with "the
+// stub was never reached", so tests assert on what IS in it, never only on what is not.
+function ltTuiTmux(dir, replyText = "PONG") {
+  const log = join(dir, "tmux-calls.log");
+  _ltWrite(log, "");
+  const bin = join(dir, "tmux-stub");
+  _ltWrite(bin, LT_TUI_TMUX(log, replyText));
+  _ltChmod(bin, 0o755);
+  return {
+    bin, log,
+    env: {
+      CLAUDE_TUI_MODE: "true",
+      OCP_TUI_TMUX_BIN: bin,
+      // Pool OFF — the DEFAULT, and the state #362 is about: a cold pane was never in the pool.
+      OCP_TUI_POOL_SIZE: "0",
+      // Empty, not deleted: resolveTuiHome() tests truthiness, so "" takes the same branch as
+      // absent (→ TUI_HOME === HOME) while still overriding a token inherited from the operator's
+      // real environment. Without it, whether this fixture runs in a scratch home or a
+      // <HOME>/.ocp-tui/home scratch depends on the machine the suite happens to run on.
+      CLAUDE_CODE_OAUTH_TOKEN: "",
+    },
+    calls: () => (_ltExists(log) ? _ltRead(log, "utf8").split("\n").filter(Boolean) : []),
+  };
+}
+
 function ltProbeCount(logPath) {
   if (!_ltExists(logPath)) return 0;
   return _ltRead(logPath, "utf8").split("\n").filter(Boolean).length;
@@ -2970,6 +3049,64 @@ ltTest("integration (#308): a completed REQUEST raises the verdict the probe cou
     assert.equal(after.auth.okSource, "request", "and the verdict must record that a REQUEST established it, not a probe");
     assert.equal(after.auth.ok, true, "a request that reached the model proves the credential works");
   } finally { child.kill("SIGKILL"); _ltRmRetry(dir); }
+});
+
+// The same claim as the test directly above, ONE LANE OVER. That is the whole point: the
+// mechanism above is correct, tested, and — until #361 — not wired into the TUI lane, which is
+// #339's shape and the reason a green suite proved nothing here. ADR 0014 § C states the rule for
+// "a request that reaches the model and succeeds", unqualified by lane; ADR 0015's table records
+// the consequence as an IMPLEMENTATION OMISSION (route (a)) rather than a contract change, which
+// is why this ships as a behaviour-preserving fix and not with an ADR.
+//
+// Why the failure survived so long, and why the precondition below is built the way it is: the
+// broken direction is the SAFE one. A TUI host that serves every request sits at auth.ok:null,
+// never at a false true, so nothing alarms. Starting from `null` would therefore make a weak test
+// — `null → true` and `null → null` are both quiet. This starts from a CONCLUSIVE ok:false
+// (AUTH_PROBE_MODE=reject), so the pre-state is unambiguous and positively asserted.
+ltTest("integration (#361): a completed TUI-lane request raises the verdict too — ADR 0014 was inapplicable in TUI mode", async () => {
+  if (!LT_POSIX) return;
+  const dir = ltMkdir(); const home = ltMkdir(); const fake = ltAuthFake(dir);
+  const tmux = ltTuiTmux(dir);
+  const { child, buf, port } = await ltBootFresh({
+    ...tmux.env, CLAUDE_BIN: fake, HOME: home, AUTH_PROBE_MODE: "reject",
+  }, dir);
+  try {
+    // Precondition, positively asserted: the PROBE has concluded and it concluded REJECTED.
+    const before = await ltWaitHealth(port, b => b.auth && b.auth.lastOutcome === "rejected", 15000);
+    assert.ok(before, `precondition: the probe must conclude rejected first — ${ltDiag(buf)}`);
+    assert.equal(before.auth.ok, false, "precondition: a conclusive rejection, not an inconclusive null");
+    assert.equal(before.auth.okSource, "probe", "precondition: the verdict is the PROBE's at this point");
+
+    // The turn must genuinely COMPLETE. Asserting the body — not merely that a request was sent —
+    // is what stops this passing vacuously: a turn rejected by either honesty gate is a 500, and
+    // a 500 would leave auth.ok:false for a reason that has nothing to do with the code under test.
+    const r = await ltPostStatus(port, { model: "sonnet", messages: [{ role: "user", content: "ping" }] });
+    assert.equal(r.status, 200, `the TUI turn must complete — ${r.text.slice(0, 300)} ${ltDiag(buf)}`);
+    assert.match(r.text, /"content":"PONG"/, `and it must be the stub's transcript text — got ${r.text.slice(0, 300)}`);
+
+    // Harness premise: server.mjs really resolved OUR stub. An empty log would be equally
+    // consistent with the real tmux having run instead, which is a predicate passing on a missing
+    // operand (AGENTS.md). `new-session` is the positive form — it is the pane this turn booted.
+    assert.ok(tmux.calls().some(c => c.startsWith("new-session ")),
+      `premise: the stub tmux must be the binary that booted the pane; got ${JSON.stringify(tmux.calls())}`);
+
+    const after = await ltWaitHealth(port, b => b.auth && b.auth.okSource === "request", 15000);
+    assert.ok(after, `a completed TUI request must raise the verdict — ${ltDiag(buf)}`);
+    assert.equal(after.auth.ok, true, "a TUI request that reached the model proves the credential works");
+    assert.equal(after.auth.okSource, "request", "and the verdict records that a REQUEST established it");
+    // ADR 0014's separation, which this fix must not breach: okSource/okAt are the VERDICT's
+    // provenance, lastOutcome/lastCheck stay the PROBE's business. noteAuthVerifiedByRequest
+    // deliberately leaves lastOutcome alone so /health never claims a probe ran when none did —
+    // and the probe here really did conclude "rejected", so that value is still the honest one.
+    assert.equal(after.auth.lastOutcome, "rejected",
+      "the request verdict must NOT overwrite the probe's outcome — that conflation is what ADR 0014 § C separated");
+    // Named consequence, pinned rather than left implicit: noteAuthVerifiedByRequest also clears
+    // consecutiveFailures (server.mjs:1220), so reaching it from the TUI lane now clears a tally
+    // that ADR 0010's degraded verdict reads. The RULE is untouched — >= AUTH_DEGRADE_AFTER is
+    // still what degrades — but the input becomes truthful on a lane where it never moved.
+    assert.equal(after.auth.consecutiveFailures, 0,
+      "a completed request is direct evidence the credential is not being refused, so the rejection tally clears");
+  } finally { child.kill("SIGKILL"); _ltRmRetry(dir); _ltRmRetry(home); }
 });
 
 ltTest("integration (#327): a declared instance reports its name on /health", async () => {

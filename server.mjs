@@ -2067,6 +2067,26 @@ async function callClaudeTui(model, messages, _conversationId, _keyName, res, st
     }
 
     recordModelSuccess(cliModel, 0); // elapsed not measurable here; wallclock at reader level
+    // #361: a completed request is conclusive evidence the credential works — ADR 0014 § C states
+    // that rule for "a request that reaches the model and succeeds", unqualified by lane, and the
+    // TUI lanes simply never called it. That made ADR 0014's whole premise inapplicable in TUI
+    // mode: a host serving every request could sit at auth.ok:null indefinitely, and the failure
+    // direction is the SAFE one (null, not a false true), which is why nobody noticed.
+    //
+    // PLACEMENT IS LOAD-BEARING, and it is why this is not simply mirrored next to
+    // recordModelRequest at the top. It must run AFTER the honesty gates above, because the
+    // default gate is LITERALLY an auth-failure-banner detector: with CLAUDE_TUI_ERROR_PATTERNS
+    // unset, detectTuiUpstreamError delegates to `isDefaultAuthFailureBanner`
+    // (lib/tui/transcript.mjs — grep the name, not a line number), whose four signals include a
+    // 4xx "API Error:" core and an /authenticat|\/login|credential/ keyword. So the interactive
+    // CLI renders an EXPIRED CREDENTIAL as ordinary assistant text, and calling this before the
+    // gate would raise auth.ok:true on exactly the turn whose text says the credential was
+    // refused — the #308 lie rebuilt on the other lane. Both gates throw, so the catch below
+    // runs and this does not.
+    //
+    // One call site covers BOTH TUI lanes: `callClaudeTuiStreaming` does not spawn, it awaits
+    // `callClaudeTui`, so the streaming lane reaches this same line.
+    noteAuthVerifiedByRequest(); // #308: a completed request is conclusive evidence the credential works
     // Entrypoint/billing-pool observation was already recorded above, right after runTuiTurn
     // returned — see the A3-fix comment there (it must cover failed turns too, so it cannot live
     // on this success-only path).
