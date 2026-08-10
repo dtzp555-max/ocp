@@ -3232,19 +3232,36 @@ function ltAuthFake(dir) { const p = join(dir, "claude-auth"); _ltWrite(p, LT_AU
 // it in advance. The stub recovers it from the pane command's own `--session-id` (session.mjs:537)
 // and writes the transcript under $HOME — which is the PANE's home, because bootTuiPane sets
 // env.HOME = ehome on the spawnSync. That is why this needs no knowledge of resolveTuiHome().
-const LT_TUI_TMUX = (logPath, replyText) => `#!/bin/sh
+//
+// `hang` (#362) inverts exactly one thing: the transcript is NEVER written, so
+// readTuiTranscript's poll loop never sees a terminal marker and the turn stays IN FLIGHT until
+// the 120 s wallclock. That is the state #362 is about, and it is reached by OMITTING work rather
+// than by adding a delay — no sleep to race, and the pane is genuinely held the whole time.
+// MEASURED rather than assumed: with the file absent, `findTranscriptPath` returns null and the
+// loop keeps polling (it throws `tui_transcript_timeout` only at the cap), so a test that signals
+// well before 120 s always finds the turn live.
+//
+// `neverReady` (#362 review) stalls the turn one stage EARLIER than `hang`, and the distinction is
+// the whole point of having both. `hang` holds the turn at the TRANSCRIPT wait, which is after
+// `bootTuiPane` has resolved. `neverReady` makes `capture-pane` render a boot splash with no input
+// bar, so `tuiInputReady` stays false and the turn is held INSIDE `bootTuiPane`'s readiness
+// `await` — the window in which the tmux session already exists (new-session is synchronous) but
+// `runTuiTurn` has not yet been handed a pane. BOOT_MS is 4 s by default, which is the size of
+// that window and far longer than a test needs.
+const LT_TUI_TMUX = (logPath, replyText, hang, neverReady) => `#!/bin/sh
 printf '%s\\n' "$*" >> ${JSON.stringify(logPath)}
 case "$1" in
   new-session)
     sid=\`printf '%s' "$*" | sed -n 's/.*--session-id \\([0-9a-fA-F-]*\\).*/\\1/p'\`
-    if [ -n "$sid" ]; then
+    if [ -n "$sid" ] && [ ${hang || neverReady ? "0" : "1"} -eq 1 ]; then
       mkdir -p "$HOME/.claude/projects/x"
       printf '%s\\n' '{"type":"assistant","message":{"role":"assistant","stop_reason":"end_turn","content":[{"type":"text","text":${JSON.stringify(replyText)}}]},"entrypoint":"cli"}' > "$HOME/.claude/projects/x/$sid.jsonl"
     fi
     exit 0 ;;
   capture-pane)
-    printf '%s\\n' '[Pasted text #1 +2 lines]'
-    printf '%s\\n' ' ? for shortcuts'
+${neverReady
+  ? `    printf '%s\\n' ' ✻ Welcome to Claude Code!'\n    printf '%s\\n' ''`
+  : `    printf '%s\\n' '[Pasted text #1 +2 lines]'\n    printf '%s\\n' ' ? for shortcuts'`}
     exit 0 ;;
   *) exit 0 ;;
 esac
@@ -3254,14 +3271,23 @@ esac
 // `calls()` is every stub invocation, one argv string per line — the positive evidence that the
 // stub really was the binary server.mjs resolved. An EMPTY log is equally consistent with "the
 // stub was never reached", so tests assert on what IS in it, never only on what is not.
-function ltTuiTmux(dir, replyText = "PONG") {
+function ltTuiTmux(dir, replyText = "PONG", { hang = false, neverReady = false } = {}) {
   const log = join(dir, "tmux-calls.log");
   _ltWrite(log, "");
   const bin = join(dir, "tmux-stub");
-  _ltWrite(bin, LT_TUI_TMUX(log, replyText));
+  _ltWrite(bin, LT_TUI_TMUX(log, replyText, hang, neverReady));
   _ltChmod(bin, 0o755);
   return {
     bin, log,
+    // The tmux session name this turn's pane was booted under, read back off the stub's own log
+    // (`new-session -d -s <name> …`). Returns null before any pane has booted, so a caller must
+    // assert on it rather than interpolate it blindly — an undefined name would turn the
+    // kill-session assertion below into a comparison against the string "undefined".
+    paneName: () => {
+      const line = (_ltExists(log) ? _ltRead(log, "utf8").split("\n") : []).find(c => c.startsWith("new-session "));
+      const m = line && /(?:^| )-s (\S+)/.exec(line);
+      return m ? m[1] : null;
+    },
     env: {
       CLAUDE_TUI_MODE: "true",
       OCP_TUI_TMUX_BIN: bin,
@@ -3642,6 +3668,129 @@ ltTest("integration (#361): a completed TUI-lane request raises the verdict too 
     // still what degrades — but the input becomes truthful on a lane where it never moved.
     assert.equal(after.auth.consecutiveFailures, 0,
       "a completed request is direct evidence the credential is not being refused, so the rejection tally clears");
+  } finally { child.kill("SIGKILL"); _ltRmRetry(dir); _ltRmRetry(home); }
+});
+
+// #362. The pool has two green tests either side of this state and none on it:
+// "M1b: shutdown drain kills the booting pane SYNCHRONOUSLY" proves cleanup for a pane the pool
+// still owns, and "a pane handed out for a turn leaves the spare set immediately" proves an
+// acquired pane leaves the pool. Both pass, both are correct, and their CONJUNCTION — handed out
+// AND shutdown — is the only state where the defect lives. Both are named above rather than cited
+// by line: the issue pointed at :6899 / :6972, and an earlier revision of THIS comment "fixed"
+// that by substituting the line numbers they held at the time — which were stale again within one
+// merge, landing on an unrelated `assert.equal(pool.warm, 3, …)`. Grep the name, not a number;
+// that is the rule the #361 comment in server.mjs states, and this is the paragraph that proved
+// it by breaking the same way twice.
+//
+// This is deliberately an END-TO-END test against a real `server.mjs` child rather than another
+// pool unit test, because the defect is not IN the pool: it is in the gap between the pool,
+// `activeProcesses`, and `gracefulShutdown`, and only a real shutdown of a real process exercises
+// that gap. The pool fakes cannot reach it by construction.
+//
+// It never touches a real tmux server — `ltTuiTmux` pins OCP_TUI_TMUX_BIN at a scratch stub, and
+// `HOME` is a scratch dir. AGENTS.md records a review that took production OCP down through
+// exactly this class of test, and `server.mjs`'s TUI boot reap issues `kill-server`.
+ltTest("integration (#362): a shutdown landing MID-TURN kills the pane that turn is holding", async () => {
+  if (!LT_POSIX) return;
+  const dir = ltMkdir(); const home = ltMkdir(); const fake = ltFake(dir);
+  // hang: the stub writes no transcript, so the turn blocks in readTuiTranscript and the pane is
+  // genuinely held when the signal arrives.
+  const tmux = ltTuiTmux(dir, "PONG", { hang: true });
+  const { child, buf, port } = await ltBootFresh({ ...tmux.env, CLAUDE_BIN: fake, HOME: home }, dir);
+  try {
+    assert.ok(await ltWait(() => buf.out.includes("listening on")), `did not start: ${ltDiag(buf)}`);
+
+    // Start a turn and do NOT await it — the pane must still be held when the signal lands.
+    // ltPostStatus swallows the transport error the shutdown causes, so this never rejects.
+    const inflight = ltPostStatus(port, { model: "sonnet", messages: [{ role: "user", content: "ping" }] });
+
+    // Two independent positive premises that the turn really is in flight, because "the pane was
+    // never booted" would satisfy the kill-session assertion below vacuously — by leaving nothing
+    // to kill, not by killing it.
+    assert.ok(await ltWait(() => tmux.calls().some(c => c.startsWith("send-keys ")), 20000),
+      `premise: the prompt must have been submitted, i.e. the pane booted and the turn began; ` +
+      `got ${JSON.stringify(tmux.calls())} ${ltDiag(buf)}`);
+    const live = await ltWaitHealth(port, b => b.tui && b.tui.inflight === 1, 20000);
+    assert.ok(live, `premise: /health must report exactly one TUI turn in flight — ${ltDiag(buf)}`);
+
+    const pane = tmux.paneName();
+    assert.ok(pane, `premise: a pane name must be readable from the stub log; got ${JSON.stringify(tmux.calls())}`);
+    const killLine = `kill-session -t ${pane}`;
+    // The discriminating premise. If the pane were ALREADY dead here, the assertion after the
+    // signal would pass without shutdown having done anything — so establish that the only
+    // kill-session that can appear from now on is the one shutdown issues.
+    assert.ok(!tmux.calls().includes(killLine),
+      `premise: the pane must still be alive before the signal, or this test proves nothing; ` +
+      `got ${JSON.stringify(tmux.calls())}`);
+
+    child.kill("SIGTERM");
+    // 'close', not 'exit': a terminated child's stdio may still hold unread data (#203).
+    assert.ok(await ltWait(() => buf.closed, 20000), `the server must exit on SIGTERM — ${ltDiag(buf)}`);
+
+    assert.ok(tmux.calls().includes(killLine),
+      `the pane held by the in-flight turn must be killed BY SHUTDOWN. runTuiTurn's own finally ` +
+      `cannot do it: gracefulShutdown calls process.exit(0) in the same tick whenever ` +
+      `activeProcesses is empty, which on a TUI host it always is — so an unkilled pane here is a ` +
+      `live, interactive, AUTHENTICATED claude outliving OCP. Expected ${JSON.stringify(killLine)} ` +
+      `in ${JSON.stringify(tmux.calls())}`);
+    await inflight;
+  } finally { child.kill("SIGKILL"); _ltRmRetry(dir); _ltRmRetry(home); }
+});
+
+// #362, second window — found by this PR's own independent review, and it is the SAME defect the
+// first fix left one stage earlier. `bootTuiPane` creates the tmux session SYNCHRONOUSLY and then
+// awaits readiness for up to BOOT_MS (4 s default); the first cut registered the pane only after
+// that await returned, so for the whole boot window the session was live, never in the pool (a
+// cold boot never is), and absent from `activeProcesses`. Owned by nothing, exactly as before.
+//
+// Worth its own test rather than folding into the one above, because the two stall the turn at
+// different stages and only this one exercises the pre-boot registration: the test above holds the
+// turn at the TRANSCRIPT wait, which is reached only after the boot has already resolved. A fix
+// that registered late would still pass it — as the shipped first cut did.
+//
+// Cold boot is the DEFAULT (`OCP_TUI_POOL_SIZE=0`), so this window is the common case, not a
+// corner. lib/tui/pool.mjs already solved the identical ordering for a booting POOL pane ("Mint
+// the identity BEFORE booting"); this is the request path finally doing the same.
+ltTest("integration (#362): a shutdown landing INSIDE the boot window kills the pane too — the session exists before bootTuiPane resolves", async () => {
+  if (!LT_POSIX) return;
+  const dir = ltMkdir(); const home = ltMkdir(); const fake = ltFake(dir);
+  // neverReady: capture-pane renders a boot splash, so the turn is held inside bootTuiPane's
+  // readiness await rather than after it.
+  const tmux = ltTuiTmux(dir, "PONG", { neverReady: true });
+  const { child, buf, port } = await ltBootFresh({ ...tmux.env, CLAUDE_BIN: fake, HOME: home }, dir);
+  try {
+    assert.ok(await ltWait(() => buf.out.includes("listening on")), `did not start: ${ltDiag(buf)}`);
+
+    const inflight = ltPostStatus(port, { model: "sonnet", messages: [{ role: "user", content: "ping" }] });
+
+    // Premise 1: the pane EXISTS — new-session is synchronous, so this is true the moment the
+    // boot begins, which is precisely why the window is dangerous.
+    assert.ok(await ltWait(() => tmux.calls().some(c => c.startsWith("capture-pane ")), 20000),
+      `premise: the readiness poll must have started; got ${JSON.stringify(tmux.calls())} ${ltDiag(buf)}`);
+    const pane = tmux.paneName();
+    assert.ok(pane, `premise: a pane must have been created; got ${JSON.stringify(tmux.calls())}`);
+
+    // Premise 2 — THE control that makes this a different test from the one above. Being inside
+    // the BOOT poll means the turn has not progressed to pasting or submitting, both of which
+    // happen only after bootTuiPane resolves. Without this the test could be measuring the
+    // post-boot window and would pass against the very code it exists to reject.
+    const calls = tmux.calls();
+    assert.ok(!calls.some(c => c.startsWith("paste-buffer ")) && !calls.some(c => c.startsWith("send-keys ")),
+      `premise: the turn must still be INSIDE the boot readiness poll, not past it; got ${JSON.stringify(calls)}`);
+
+    const killLine = `kill-session -t ${pane}`;
+    assert.ok(!calls.includes(killLine),
+      `premise: the pane must still be alive before the signal; got ${JSON.stringify(calls)}`);
+
+    child.kill("SIGTERM");
+    assert.ok(await ltWait(() => buf.closed, 20000), `the server must exit on SIGTERM — ${ltDiag(buf)}`);
+
+    assert.ok(tmux.calls().includes(killLine),
+      `a pane whose BOOT was in flight must still be killed by shutdown. bootTuiPane creates the ` +
+      `tmux session synchronously and only then awaits readiness (BOOT_MS, 4s default), so a fix ` +
+      `that registers the pane after that await leaves it owned by nothing for the whole window — ` +
+      `on the DEFAULT cold-boot path. Expected ${JSON.stringify(killLine)} in ${JSON.stringify(tmux.calls())}`);
+    await inflight;
   } finally { child.kill("SIGKILL"); _ltRmRetry(dir); _ltRmRetry(home); }
 });
 
