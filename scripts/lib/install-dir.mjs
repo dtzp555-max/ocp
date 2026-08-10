@@ -66,7 +66,7 @@
 import { dirname, join, isAbsolute } from "node:path";
 import { fileURLToPath } from "node:url";
 import { homedir } from "node:os";
-import { readdirSync, readFileSync } from "node:fs";
+import { readdirSync, readFileSync, statSync } from "node:fs";
 
 // This repo's own package.json `name`. Hardcoded rather than read at runtime because the whole
 // point is to identify a FOREIGN directory, where reading "its" package.json is the question,
@@ -80,12 +80,61 @@ export const OCP_PACKAGE_NAME = "open-claude-proxy";
 // the legitimate case. One alone is not enough: a stray `ocp` or `server.mjs` in a home
 // directory should not license `rm -rf $HOME`.
 //
-// Name-only, deliberately stated: this matches directory ENTRIES and does not stat them, so a
-// directory named `ocp/` counts the same as a file named `ocp`. Two such entries would have to
-// coincide for that to matter, and the threshold of 2 — not any type check — is what refuses a
-// `/opt`-shaped directory (which scores exactly one). Tightening this to a type check is filed
-// as follow-up rather than done here; the comment says what the code does in the meantime.
+// A marker must be a REGULAR FILE (issue #366). It used to be a name match against readdir's
+// entry list with no stat, so a *directory* named `models.json/` scored the same as the file —
+// measured before the fix: two empty directories named `ocp/` and `models.json/` produced
+// safeToReplace=true. `/opt` itself was refused only because it scores exactly one marker, i.e.
+// by the threshold of 2 rather than by anything checking what those entries are.
+//
+// The threshold is still load-bearing and this does not replace it — but note the two guard
+// DIFFERENT cases, and it is easy to blur them. The threshold's case is a directory holding
+// exactly one REAL marker file (a stray `server.mjs` in a home directory); mutation M2
+// (>= 2 → >= 1) reddens exactly that, in the #348 test. The type check's case is an entry with a
+// marker NAME that is not a file at all. `/opt` happens to be refused by both now — it scores 0
+// after this change rather than the 1 it scored before — which is why the M2 row is worth
+// keeping: without it, a later "simplification" of the threshold would look free.
 const INSTALL_MARKERS = ["server.mjs", "setup.mjs", "ocp", "models.json"];
+
+/**
+ * What is `<dir>/<name>`? Returns one of three states, NOT a boolean (issue #366 review, F1).
+ *
+ *   "file"       — a regular file. The only state that counts as a marker.
+ *   "not-a-file" — we looked, and it is not one: a directory, a socket, a DANGLING symlink
+ *                  (statSync throws ENOENT, measured — it scored as a marker before this change).
+ *   "unreadable" — we could NOT look. EACCES, EIO, ELOOP.
+ *
+ * A boolean was the first cut and it was wrong — not in the verdict, which is `false` either way,
+ * but in what the caller can then SAY. Collapsing "this is not a file" into "I could not tell"
+ * makes classifyInstallDir report a real install as "NOT an OCP install" and advise deleting it
+ * by hand, which is the one action that loses it. This module's own header draws exactly that
+ * distinction ("I could not confirm what this is must not license deleting it"); the boolean
+ * collapsed it on the one path this change adds.
+ *
+ * `statSync` FOLLOWS symlinks, and that is a choice rather than an inherited default. It asks the
+ * same question the package.json arm below already asks with readFileSync — "does reading this
+ * name give me a file?" — so the two arms of the same function agree. (An earlier draft justified
+ * it by claiming a symlinked marker is "a real shape that must keep working"; nothing supports
+ * that. `git ls-files -s` has ZERO mode-120000 entries, all four markers are 100644/100755, and
+ * installs come from `git clone`, which cannot produce one. The consistency argument is the real
+ * one and stands alone.)
+ *
+ * NOT readdirSync(..., { withFileTypes: true }): measured on macOS APFS, a symlink's Dirent
+ * reports isSymbolicLink() and isFile() === false, so it would answer a different question from
+ * the package.json arm. NOT existsSync: it returns true for a directory, so it does not answer
+ * this question at all.
+ *
+ * Never throws.
+ */
+function classifyMarkerEntry(dir, name) {
+  try {
+    return statSync(join(dir, name)).isFile() ? "file" : "not-a-file";
+  } catch (e) {
+    // ENOENT is a real answer, not a failure to look: the name is there in readdir but resolves
+    // to nothing, i.e. a dangling symlink. Reporting that as "unreadable" would send an operator
+    // hunting for a permission problem that does not exist.
+    return e.code === "ENOENT" ? "not-a-file" : "unreadable";
+  }
+}
 
 /**
  * Resolve the OCP install directory, in precedence order:
@@ -141,6 +190,11 @@ export function resolveInstallDir(opts = {}) {
  * directory, or a path that is a file (ENOTDIR). Fail closed — "I could not confirm what this
  * is" must not license deleting it.
  *
+ * `why` distinguishes those two reasons, and `unreadableMarkers` carries the same fact in a form
+ * a caller can branch on. The verdict is identical either way; what differs is what an operator
+ * is told to do next, and "this is not an OCP install, remove it yourself" is catastrophic advice
+ * when the truth is that a permission bit stopped us reading a real install (#366 review, F1).
+ *
  * Never throws.
  */
 export function classifyInstallDir(dir) {
@@ -149,15 +203,15 @@ export function classifyInstallDir(dir) {
     entries = readdirSync(dir);
   } catch (e) {
     if (e.code === "ENOENT") {
-      return { exists: false, empty: false, isInstall: false, markers: [], safeToReplace: true,
+      return { exists: false, empty: false, isInstall: false, markers: [], unreadableMarkers: [], safeToReplace: true,
                why: `${dir} does not exist yet` };
     }
-    return { exists: true, empty: false, isInstall: false, markers: [], safeToReplace: false,
+    return { exists: true, empty: false, isInstall: false, markers: [], unreadableMarkers: [], safeToReplace: false,
              why: `${dir} could not be inspected (${e.code || e.message}) — refusing to treat it as an OCP install` };
   }
 
   if (entries.length === 0) {
-    return { exists: true, empty: true, isInstall: false, markers: [], safeToReplace: true,
+    return { exists: true, empty: true, isInstall: false, markers: [], unreadableMarkers: [], safeToReplace: true,
              why: `${dir} exists but is empty` };
   }
 
@@ -167,7 +221,26 @@ export function classifyInstallDir(dir) {
     namedPackage = !!pkg && pkg.name === OCP_PACKAGE_NAME;
   } catch { /* absent, unreadable, or not JSON — fall through to the marker count */ }
 
-  const markers = INSTALL_MARKERS.filter(m => entries.includes(m));
+  // BOTH conditions, and the readdir one stays FIRST rather than being made redundant by the
+  // stat (#366). They are not equivalent on a case-insensitive filesystem: measured on macOS
+  // APFS, a directory holding `SERVER.MJS` + `SETUP.MJS` gives entries.includes("server.mjs")
+  // === false while statSync(join(dir, "server.mjs")) succeeds with isFile() === true. Dropping
+  // the entries test would therefore WIDEN what counts as an OCP install, on a guard whose
+  // failure mode is `rm -rf` — the opposite of this fix's direction. The stat may only ever
+  // narrow.
+  //
+  // Mutation M3 removes the entries test. READ ITS ROW BEFORE TRUSTING THIS: M3 is killed only on
+  // a case-INSENSITIVE filesystem, and CI is ubuntu-latest/ext4, where `entries.includes` and
+  // `statSync` agree and M3 SURVIVES. This conjunct is therefore unprotected by the only
+  // automated gate, which is exactly why the case-fold test below reports itself as a SKIP on
+  // ext4 rather than passing quietly.
+  const markerStates = INSTALL_MARKERS
+    .filter(m => entries.includes(m))
+    .map(m => [m, classifyMarkerEntry(dir, m)]);
+  const markers = markerStates.filter(([, s]) => s === "file").map(([m]) => m);
+  // Marker names that ARE present but could not be stat'd. Kept separate from `markers` so the
+  // verdict is unchanged and only the DIAGNOSIS improves (#366 review, F1).
+  const unreadableMarkers = markerStates.filter(([, s]) => s === "unreadable").map(([m]) => m);
   const isInstall = namedPackage || markers.length >= 2;
 
   return {
@@ -175,11 +248,30 @@ export function classifyInstallDir(dir) {
     empty: false,
     isInstall,
     markers,
+    unreadableMarkers,
     safeToReplace: isInstall,
     why: isInstall
       ? `${dir} is an OCP install (${namedPackage ? `package.json name="${OCP_PACKAGE_NAME}"` : `markers: ${markers.join(", ")}`})`
-      : `${dir} exists and is NOT an OCP install (no package.json named "${OCP_PACKAGE_NAME}"` +
-        `${markers.length ? `, only ${markers.length} of the marker files: ${markers.join(", ")}` : ", none of the marker files"}` +
-        `) — it is not something this tool may delete`,
+      // "I could not look" is a DIFFERENT sentence from "I looked and it is not one", and this
+      // branch exists because collapsing them told an operator with a permission-locked install
+      // that it "is NOT an OCP install" and advised removing it by hand (#366 review, F1).
+      //
+      // The two are structurally exclusive, not merely observed to differ: statSync on a child
+      // and readFileSync on package.json BOTH require search (x) permission on the directory, so
+      // no permission state can fail the marker stats while leaving the package.json arm working.
+      // Measured across modes 755/744/644/544/444/311/111: `stat=EACCES` never co-occurs with
+      // `readFile(package.json)=ok`. Dropping x (644, 444) fails both; dropping r (311, 111)
+      // fails readdirSync instead and is caught by the ENOTDIR/EACCES branch far above, which
+      // already says "could not be inspected". The gap this fills is exactly r-without-x.
+      : unreadableMarkers.length
+        ? `${dir} could not be inspected: ${unreadableMarkers.length} marker name(s) are present ` +
+          `but could not be read (${unreadableMarkers.join(", ")}) — this is a permission problem ` +
+          `on the directory itself, not evidence about what it contains (stat needs SEARCH ` +
+          `permission, which readdir does not). This may well BE an OCP install; this process ` +
+          `cannot confirm it, so it is not something this tool may delete. Fix the permissions or ` +
+          `re-run as the owner — do NOT delete it`
+        : `${dir} exists and is NOT an OCP install (no package.json named "${OCP_PACKAGE_NAME}"` +
+          `${markers.length ? `, only ${markers.length} of the marker files: ${markers.join(", ")}` : ", none of the marker files"}` +
+          `) — it is not something this tool may delete`,
   };
 }
