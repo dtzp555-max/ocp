@@ -194,11 +194,45 @@ release_kit:
         recorded, so uptime, timestamps and counters cannot make it flap; the suite
         proves that by probing two fresh boots and requiring identical output.
 
+        TWO CONFIGURATION PROFILES since #357, one snapshot block each, defined in
+        scripts/b2-key-snapshot.mjs § B2_PROFILES:
+
+          probes           the default configuration — TUI mode, the warm pane pool and
+                           skip-permissions all OFF. What every production instance in
+                           the reference fleet runs.
+          probesTuiPool    the config-variant corner — CLAUDE_TUI_MODE=true,
+                           OCP_TUI_POOL_SIZE=1, CLAUDE_SKIP_PERMISSIONS=true.
+
+        BOTH blocks get all 16 pairs, two fresh boots, and their own ALIGNMENT.md
+        coverage check, so a second profile is not a place an endpoint can hide. Read
+        the diff of both; a key path that appears in only one is surface only that
+        configuration reaches, not a discrepancy.
+
         To read the release's surface change:
 
           git diff v<previous-tag>..HEAD -- docs/governance/b2-response-keys.json
 
-        Added lines are new B.2 surface. Removed lines are removed or renamed surface.
+        READ IT PER BLOCK, and the distinction is not cosmetic:
+
+          - a key path added INSIDE an existing block  -> NEW B.2 SURFACE. This is the
+            thing this audit exists to find; it needs an ADR 0012 citation, or its own ADR.
+          - a WHOLE NEW PROFILE BLOCK appearing        -> NEW COVERAGE, not new surface.
+            Every one of its key paths is a response this server already returned and
+            this mechanism had never looked at. Nothing was added to any endpoint.
+          - a key path REMOVED from an existing block  -> removed or renamed surface, which
+            ADR 0012 does not cover at all.
+
+        A new block therefore lands as one large one-time addition. #357 added
+        `probesTuiPool`: 331 added lines carrying 221 key paths, and NONE of them is new
+        B.2 surface. Counting those as additions would have produced 221 phantom ADR 0012
+        condition-5 failures at the next release — and `report:` below rests entirely on
+        "silence is a result", so a 221-item false alarm is exactly what teaches a releaser
+        to stop believing this mechanism. That is the failure mode ADR 0012 names by hand.
+
+        A new block is a rare, deliberate event: it appears only in the PR that adds a
+        profile to B2_PROFILES, and that PR says so. If you see one you did not expect,
+        that is a finding.
+
         The whole history is the per-release record:
 
           git log -p docs/governance/b2-response-keys.json
@@ -216,11 +250,18 @@ release_kit:
         still has to say under what.
       report: |
         For the section being dated, list every added and removed key path with its
-        endpoint, taken from the snapshot diff rather than from the CHANGELOG, and for
-        each ADDITION state whether the PR that introduced it carries its ADR 0012
-        citation. Write "no B.2 key-set change this cycle" when the diff is empty, so
-        silence is a result rather than an omission — and note that this silence is now
-        evidence, which the marker grep's silence never was.
+        endpoint AND ITS BLOCK, taken from the snapshot diff rather than from the
+        CHANGELOG, and for each ADDITION INSIDE AN EXISTING BLOCK state whether the PR
+        that introduced it carries its ADR 0012 citation.
+
+        A whole new profile block is reported as ONE line naming the block and the PR that
+        added it — not as N additions. Its key paths are coverage, not surface, and demanding
+        a condition-5 citation for each is a false alarm that costs this audit its
+        credibility (see how: above).
+
+        Write "no B.2 key-set change this cycle" when the diff is empty, so silence is a
+        result rather than an omission — and note that this silence is now evidence, which
+        the marker grep's silence never was.
 
         The cumulative count ADR 0012 names as load-bearing ("a monotonically rising
         integer is what makes the accumulation visible at all") is still reported, but
@@ -231,6 +272,13 @@ release_kit:
         As of v3.29.1 the cumulative ADR 0012 count is 2, both on /health:
           instanceName                  (#327)   added in v3.29.0
           auth.consecutiveInconclusive  (#324)   added in v3.29.0
+
+        UNRELEASED (#357): the `probesTuiPool` block was added — 221 key paths, **0 new
+        B.2 surface**, cumulative ADR 0012 count UNCHANGED at 2. New coverage of responses
+        the server already returned under a configuration this mechanism had never probed.
+        The `probes` block is byte-identical across that PR, which is the evidence; the one
+        removed line in its diff is a superseded `notCovered` prose entry, not a key path.
+        Recorded here so the next releaser reading a large diff does not recount it.
 
         v3.29.1: NONE THIS CYCLE. Recorded rather than omitted, per the report:
         clause above — a releaser reading only the count cannot otherwise tell a
@@ -258,12 +306,25 @@ release_kit:
             changes ARE caught (object <-> scalar, array <-> object).
           - RENAMES, as renames. A rename fails the test as one removal plus one
             addition; the mechanism cannot tell it apart from two unrelated changes.
-          - Shapes that exist only under a NON-DEFAULT configuration, MEASURED at 12
-            key paths total: CLAUDE_TUI_MODE=true alone is -1 (spawn.reason) and leaves
-            tui.pool NULL; tui.pool becomes an object only with OCP_TUI_POOL_SIZE>=1,
-            adding 10 paths; CLAUDE_SKIP_PERMISSIONS=true is -1 (config.allowedTools[]).
-            10 of the 12 are inside tui.pool, which is where the next field is most
-            likely to land. A second fixture profile is tracked as issue #357.
+          - Shapes that exist only under a configuration NEITHER PROFILE PINS. The 12
+            key paths this bullet used to name are now GUARDED (#357): probesTuiPool
+            covers the 10 tui.pool.* members and probes covers spawn.reason and
+            config.allowedTools[]. The two profiles bracket rather than sample, because
+            the three settings are independent — MEASURED by booting the five reachable
+            variants (TUI alone; TUI+pool=1; skip-permissions alone; all three at
+            pool=1; all three at pool=4) and probing all 16 pairs: no key path appeared
+            that is absent from both blocks. What is still blind is the NEXT
+            shape-deciding setting, if both profiles happen to pin it to one value.
+          - The TUI REQUEST path, in either profile. OCP_TUI_TMUX_BIN points at a stub
+            tmux that logs its argv and exits 1, so no pane boots and no `claude` runs;
+            the suite asserts from that log that the only invocation is list-sessions.
+            Deliberate: MEASURED, warm-up traffic under CLAUDE_TUI_MODE=true issued four
+            `tmux new-session` commands each launching a `claude`, and with the REAL
+            tmux server.mjs's boot-time reapStaleTuiSessions({includeLegacy:true}) would
+            `tmux kill-server` on a workstation with no foreign session. The cost of that
+            bound is that probesTuiPool records no element keys for /api/usage's
+            byKey[]/recent[]/timeline[] or for recentErrors[] — probes records all of
+            them, so a field added there is still caught.
           - REQUEST-SHAPED responses, where the recorded keys come from the probe's own
             body rather than from the server. PATCH /settings echoes one results.<key>
             per setting sent; the probe pins {timeout}. Ask this of every new probe —
