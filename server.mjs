@@ -47,7 +47,7 @@ import { DEFAULT_PORT } from "./lib/constants.mjs";
 import { StructuredOutputError, detectStructuredOutput, validateJsonSchemaSafe, extractJsonPayload, structuredSystemInstruction, resolveMaxAttempts } from "./lib/structured-output.mjs";
 import { isLoopbackBind } from "./lib/net.mjs";
 import { classifyToolRequest } from "./lib/tool-support.mjs";
-import { runTuiTurn, reapStaleTuiSessions, resolveTuiHome, bootTuiPane, tuiPaneHealthy, poolPaneName, POOL_BOOT_MS } from "./lib/tui/session.mjs";
+import { runTuiTurn, reapStaleTuiSessions, resolveTuiHome, bootTuiPane, tuiPaneHealthy, poolPaneName, killLiveTurnPanes, POOL_BOOT_MS } from "./lib/tui/session.mjs";
 import { detectTuiUpstreamError } from "./lib/tui/transcript.mjs";
 import { TuiSemaphore, SemaphoreAbortError, recordTuiEntrypoint, buildTuiHealthBlock } from "./lib/tui/semaphore.mjs";
 import { TuiPanePool, resolvePoolSize, POOL_MAX_SIZE } from "./lib/tui/pool.mjs";
@@ -1207,16 +1207,41 @@ let authStatus = {
 // every request and never decays; only one that has stopped succeeding does.
 const AUTH_REQUEST_VERDICT_TTL_MS = 900000; // 15 min
 
-// #308: a completed request proves the credential is valid. Called from both claude_ok sites.
-// Deliberately does NOT touch consecutiveFailures: that tally counts CONCLUSIVE PROBE rejections
-// and drives ADR 0010's degraded verdict, which this change does not alter.
+// #308: a completed request proves the credential is valid. Called from THREE success paths, not
+// two: callClaude's and callClaudeStreaming's `claude_ok` branches (the default -p lanes), and
+// callClaudeTui's post-honesty-gate success (#361 — the TUI lane, which logs no `claude_ok` of its
+// own, so "both claude_ok sites" no longer locates the callers). `grep -n 'noteAuthVerifiedByRequest()'`
+// is the durable form of this list; the count in prose is not.
+//
+// WHAT THIS FUNCTION WRITES IS DOCUMENTED IN THE BODY, NOT HERE — deliberately, and this is the
+// second time that decision has had to be made. This header used to assert "deliberately does NOT
+// touch consecutiveFailures", three lines above the code that clears it. The correction was
+// written into the body and THIS HEADER WAS LEFT STANDING, so the comment recording the fix sat
+// *below* the sentence that was still wrong, and the pair shipped together until #361's review
+// opened the file. The rule is immediately below, stated once in this file.
+//
+// THERE IS EXACTLY ONE OTHER LIVE STATEMENT OF IT, AND IT IS NAMED HERE ON PURPOSE:
+// README § "What `auth.ok` means" carries the operator-facing version. That copy exists because
+// its audience is different — operators debugging `status` never read this file — but a second
+// copy is still a second thing that can drift, and it did: an earlier revision of this comment
+// claimed "one copy is the only version that cannot drift again" while the README simultaneously
+// said "`status` is unaffected by any of this", which the tally clear makes false. Both were
+// corrected in #361. Change one, change the other, and check both against ADR 0014 § Consequences,
+// which is the authority they each restate rather than a third copy.
 function noteAuthVerifiedByRequest() {
   const now = Date.now();
   // Does NOT touch lastOutcome/lastCheck: those belong to the probe, and overwriting them would
   // make /health claim a probe ran when none did. It DOES clear consecutiveFailures — a completed
-  // request is direct evidence the credential is not being refused. An earlier revision of this
-  // header said "deliberately does NOT touch consecutiveFailures" three lines above the code that
-  // writes it; the reviewer who caught that was reading the comment, which is what comments are for.
+  // request is direct evidence the credential is not being refused, and ADR 0014 § Consequences
+  // names that clear as "a deliberate restoration of ADR 0010's self-heal", unqualified by which
+  // lane served the request. Note what that does and does not license: proxyHealthStatus reads
+  // consecutiveFailures and never `ok`, so the VERDICT cannot move /health.status, but clearing
+  // the TALLY can. That distinction is the whole finding — it is easy to state as either "status
+  // is untouchable here" or "requests move status", and both are wrong.
+  // An earlier revision of the header above said "deliberately does NOT touch consecutiveFailures"
+  // three lines above the code that writes it; the reviewer who caught that was reading the
+  // comment, which is what comments are for. (The header itself was only corrected in #361 — the
+  // fix had been applied here and nowhere else, which is the drift this note now guards.)
   authStatus = { ...authStatus, ok: true, okSource: "request", okAt: now,
                  message: "verified by a completed request", consecutiveFailures: 0 };
 }
@@ -2067,6 +2092,26 @@ async function callClaudeTui(model, messages, _conversationId, _keyName, res, st
     }
 
     recordModelSuccess(cliModel, 0); // elapsed not measurable here; wallclock at reader level
+    // #361: a completed request is conclusive evidence the credential works — ADR 0014 § C states
+    // that rule for "a request that reaches the model and succeeds", unqualified by lane, and the
+    // TUI lanes simply never called it. That made ADR 0014's whole premise inapplicable in TUI
+    // mode: a host serving every request could sit at auth.ok:null indefinitely, and the failure
+    // direction is the SAFE one (null, not a false true), which is why nobody noticed.
+    //
+    // PLACEMENT IS LOAD-BEARING, and it is why this is not simply mirrored next to
+    // recordModelRequest at the top. It must run AFTER the honesty gates above, because the
+    // default gate is LITERALLY an auth-failure-banner detector: with CLAUDE_TUI_ERROR_PATTERNS
+    // unset, detectTuiUpstreamError delegates to `isDefaultAuthFailureBanner`
+    // (lib/tui/transcript.mjs — grep the name, not a line number), whose four signals include a
+    // 4xx "API Error:" core and an /authenticat|\/login|credential/ keyword. So the interactive
+    // CLI renders an EXPIRED CREDENTIAL as ordinary assistant text, and calling this before the
+    // gate would raise auth.ok:true on exactly the turn whose text says the credential was
+    // refused — the #308 lie rebuilt on the other lane. All THREE gates above throw — truncation,
+    // banner, and the streaming-divergence refusal — so the catch below runs and this does not.
+    //
+    // One call site covers BOTH TUI lanes: `callClaudeTuiStreaming` does not spawn, it awaits
+    // `callClaudeTui`, so the streaming lane reaches this same line.
+    noteAuthVerifiedByRequest(); // #308: a completed request is conclusive evidence the credential works
     // Entrypoint/billing-pool observation was already recorded above, right after runTuiTurn
     // returned — see the A3-fix comment there (it must cover failed turns too, so it cannot live
     // on this success-only path).
@@ -4087,6 +4132,28 @@ function gracefulShutdown(signal) {
       if (drained) logEvent("info", "tui_pool_drained", { count: drained, trigger: "shutdown" });
     } catch (e) { logEvent("error", "tui_pool_drain_failed", { error: e.message }); }
   }
+
+  // 2c. Kill the pane an IN-FLIGHT TURN is holding (#362). Step 2b above reaches only panes the
+  // POOL owns: an acquired pane has LEFT the pool (that is by design — see POOL/REAPER INVARIANT
+  // property 2) and a cold-booted pane was never in it, so drain() cannot see either. Neither is
+  // in activeProcesses, for the same reason the pool needs 2b at all — a pane's `claude` is a
+  // child of the tmux SERVER, not of node. That pane was therefore owned by nothing here, and
+  // step 4's process.exit(0) — which fires in THIS SAME TICK on a TUI host — meant runTuiTurn's
+  // own finally never ran. The result was a live, interactive, AUTHENTICATED `claude` outliving
+  // the process that was supposed to own it, for any shutdown that landed mid-turn.
+  //
+  // Same tick, same reason as 2b: killLiveTurnPanes() is synchronous by construction, and its
+  // header says why a deferred version would silently do nothing.
+  //
+  // The two sets are DISJOINT — a pane is either in the pool or held by a turn, never both — so
+  // the order of 2b and 2c is not load-bearing.
+  //
+  // Unconditional, deliberately: with TUI mode off the registry is empty and this issues no tmux
+  // command at all, which is a stronger guarantee than a TUI_MODE gate that could be wrong.
+  try {
+    const orphans = killLiveTurnPanes();
+    if (orphans) logEvent("info", "tui_turn_panes_killed", { count: orphans, trigger: "shutdown" });
+  } catch (e) { logEvent("error", "tui_turn_pane_kill_failed", { error: e.message }); }
 
   // 3. Kill all active child processes
   for (const proc of activeProcesses) {
