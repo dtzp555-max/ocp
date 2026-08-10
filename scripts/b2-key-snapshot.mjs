@@ -173,10 +173,20 @@ const FIXTURE_LOG_LINE = "ocp b2 key-set fixture line (deliberately not JSON)\n"
 // WHY IT IS NOT OPTIONAL. In TUI mode server.mjs's listen callback calls
 // reapStaleTuiSessions({ port, includeLegacy: true }) (server.mjs § "F7 fix"). That lists the
 // real tmux server's sessions and kill-sessions every name matching this instance's port
-// prefix OR the legacy `ocp-tui-<8hex>` shape — and if no FOREIGN session remains it runs
-// `tmux kill-server`, which destroys the operator's entire tmux server. `npm test` must not be
-// able to do that on a developer workstation. Exiting non-zero makes reapStaleTuiSessions
-// return at its first guard (`if (!r || r.status !== 0) return 0`) before any kill is issued.
+// prefix OR the legacy `ocp-tui-<8hex>` shape. It also runs `tmux kill-server` — but ONLY when no
+// FOREIGN session remains, per the `!othersRemain && sparedLive === 0` gate in
+// lib/tui/session.mjs, so an operator with any ordinary session open never reaches it. Measured by
+// feeding a fake tmux to the real function, since the stub means a real one never runs here.
+//
+// The reachable harm is therefore the kill-session, not the kill-server: a live legacy-named
+// session IS killed even with foreign sessions present, and that is someone's running pane.
+//
+// SCOPE, stated because the first draft of this PR claimed more: this pins the tmux binary for
+// the SNAPSHOT MECHANISM. It does not make `npm test` as a whole unable to touch a real tmux —
+// two other live-server tests boot server.mjs in TUI mode with no such pin (issue #384,
+// pre-existing and deliberately not folded in here).
+// Exiting non-zero makes reapStaleTuiSessions return at its first guard
+// (`if (!r || r.status !== 0) return 0`) before any kill is issued.
 //
 // It exits 1 for EVERY subcommand, not just list-sessions: a stub that can mutate a running
 // service is the shape AGENTS.md § "Constraints must be unreachable by construction" was
@@ -251,6 +261,16 @@ export function makeB2Fixture(profileId = "default") {
   if (!profile) {
     throw new Error(`makeB2Fixture: unknown profile ${JSON.stringify(profileId)} — known: ${B2_PROFILES.map(p => p.id).join(", ")}`);
   }
+  // A profile may override any shape-deciding pin; it may NOT choose the tmux binary (#357
+  // review, F4). Silently ignoring the key would be worse than refusing it — the author would
+  // believe the override took effect. The pin itself is applied AFTER the profile spread below,
+  // so even without this throw the real tmux is unreachable; this makes the attempt loud.
+  if (Object.prototype.hasOwnProperty.call(profile.env, "OCP_TUI_TMUX_BIN")) {
+    throw new Error(
+      `makeB2Fixture: profile ${profile.id} sets OCP_TUI_TMUX_BIN. That is refused: every profile ` +
+      `must run against the stub tmux, or this audit can boot real \`claude\` panes and — with the ` +
+      `real tmux — reach reapStaleTuiSessions' kill-session/kill-server on the operator's machine.`);
+  }
   const dir = mkdtempSync(join(tmpdir(), "ocp-b2-"));
   const home = mkdtempSync(join(tmpdir(), "ocp-b2-home-"));
   const bin = join(dir, "bin");
@@ -309,12 +329,21 @@ export function makeB2Fixture(profileId = "default") {
       // Value-only, but pinned so an ambient export cannot make one machine's run differ.
       OCP_INSTANCE_NAME: "",
       PROXY_ADVERTISE_ANON_KEY: "0",
-      // Never the real tmux — see FIXTURE_TMUX. Set explicitly rather than relying on PATH
-      // order, because lib/tui/session.mjs resolves `process.env.OCP_TUI_TMUX_BIN || "tmux"`
-      // at module load and that env var is the only thing that can win against a tmux on PATH.
-      OCP_TUI_TMUX_BIN: tmux,
-      // The profile's overrides come LAST so a profile can override any pin above.
+      // The profile's overrides come LAST so a profile can override any pin above — EXCEPT the
+      // tmux pin, which is applied after this spread and is refused above.
       ...profile.env,
+      // Never the real tmux — see FIXTURE_TMUX. Set explicitly rather than relying on PATH order,
+      // because lib/tui/session.mjs resolves `process.env.OCP_TUI_TMUX_BIN || "tmux"` at module
+      // load and that env var is the only thing that can win against a tmux on PATH.
+      //
+      // AFTER the spread, not before (#357 review, F4). Before it, a future profile could set
+      // OCP_TUI_TMUX_BIN to the real tmux and — since expectTmuxCalls is also author-chosen per
+      // profile — pick a matching count, and every guard in the suite would still pass. The
+      // comment advertising that profiles may override "any pin above" made that an invitation.
+      // Last-write-wins is the half that makes it unreachable; the throw above is the half that
+      // makes the attempt loud instead of silently ignored. Constraints unreachable by
+      // construction, not stated as prohibitions (AGENTS.md).
+      OCP_TUI_TMUX_BIN: tmux,
     },
     cleanup() {
       // Never throw from cleanup: in a test this runs in a `finally`, where a throw would REPLACE

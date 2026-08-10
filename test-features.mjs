@@ -3296,6 +3296,46 @@ test("diffB2KeySets: status and content-type changes fail even when the key set 
                           { p: { status: 200, contentType: "application/json", keys: ["a"] } }));
 });
 
+test("#357 review F4: a profile cannot choose the tmux binary — the pin wins, and the attempt throws", () => {
+  // Review finding: the pin used to be applied BEFORE `...profile.env`, under a comment inviting
+  // profiles to override "any pin above". Since `expectTmuxCalls` is author-chosen per profile
+  // too, a future profile could have pointed at the real tmux AND set a matching count, and every
+  // guard in the suite would still have passed. Two halves: last-write-wins makes it UNREACHABLE,
+  // the throw makes it LOUD.
+  //
+  // ONLY THE THROW IS ENFORCED BY THIS TEST, and that is measured rather than assumed. Mutation
+  // N6 (pin moved back before the spread, throw kept) SURVIVES the whole suite, because with the
+  // throw in place no profile can reach the spread carrying that key; N8 (both removed) dies at
+  // the assert.throws below, not at anything about ordering. The ordering is kept as the
+  // by-construction half — it is what would still hold if someone later deleted the throw as
+  // "unreachable" — but this comment does not claim the suite pins it.
+  for (const profile of B2_PROFILES) {
+    const fx = makeB2Fixture(profile.id);
+    try {
+      // The pin must point INTO this fixture's own scratch bin, i.e. at the stub — not at
+      // whatever a profile or the ambient environment might prefer.
+      assert.equal(fx.env.OCP_TUI_TMUX_BIN, testJoin(fx.dir, "bin", "tmux"),
+        `profile ${profile.id}: the tmux pin must resolve to this fixture's stub`);
+      assert.ok(testExistsSync(fx.env.OCP_TUI_TMUX_BIN),
+        `profile ${profile.id}: premise — the stub must actually exist, or the pin points at nothing`);
+    } finally { fx.cleanup(); }
+  }
+
+  // The loud half. Uses a synthetic profile rather than mutating a real one, and restores the
+  // list in a finally so a failure here cannot leave B2_PROFILES corrupted for later tests.
+  const evil = { id: "_test-evil", snapshotKey: "_x", warmUp: false, expectTmuxCalls: 0,
+                 env: { OCP_TUI_TMUX_BIN: "/usr/bin/tmux" }, why: "review F4 regression" };
+  B2_PROFILES.push(evil);
+  try {
+    assert.throws(() => makeB2Fixture("_test-evil"), /OCP_TUI_TMUX_BIN/,
+      "a profile that sets the tmux binary must be refused, not silently ignored");
+  } finally {
+    const i = B2_PROFILES.indexOf(evil);
+    if (i !== -1) B2_PROFILES.splice(i, 1);
+    assert.ok(!B2_PROFILES.some(p => p.id === "_test-evil"), "the synthetic profile must be removed");
+  }
+});
+
 test("diffB2KeySets control: identical records — including key ORDER — compare equal and return null", () => {
   const a = { p: { status: 200, contentType: "application/json", keys: ["x", "y"] } };
   const b = { p: { status: 200, contentType: "application/json", keys: ["x", "y"] } };

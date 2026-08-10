@@ -212,7 +212,27 @@ release_kit:
 
           git diff v<previous-tag>..HEAD -- docs/governance/b2-response-keys.json
 
-        Added lines are new B.2 surface. Removed lines are removed or renamed surface.
+        READ IT PER BLOCK, and the distinction is not cosmetic:
+
+          - a key path added INSIDE an existing block  -> NEW B.2 SURFACE. This is the
+            thing this audit exists to find; it needs an ADR 0012 citation, or its own ADR.
+          - a WHOLE NEW PROFILE BLOCK appearing        -> NEW COVERAGE, not new surface.
+            Every one of its key paths is a response this server already returned and
+            this mechanism had never looked at. Nothing was added to any endpoint.
+          - a key path REMOVED from an existing block  -> removed or renamed surface, which
+            ADR 0012 does not cover at all.
+
+        A new block therefore lands as one large one-time addition. #357 added
+        `probesTuiPool`: 328 added lines carrying 221 key paths, and NONE of them is new
+        B.2 surface. Counting those as additions would have produced 221 phantom ADR 0012
+        condition-5 failures at the next release — and `report:` below rests entirely on
+        "silence is a result", so a 221-item false alarm is exactly what teaches a releaser
+        to stop believing this mechanism. That is the failure mode ADR 0012 names by hand.
+
+        A new block is a rare, deliberate event: it appears only in the PR that adds a
+        profile to B2_PROFILES, and that PR says so. If you see one you did not expect,
+        that is a finding.
+
         The whole history is the per-release record:
 
           git log -p docs/governance/b2-response-keys.json
@@ -230,11 +250,18 @@ release_kit:
         still has to say under what.
       report: |
         For the section being dated, list every added and removed key path with its
-        endpoint, taken from the snapshot diff rather than from the CHANGELOG, and for
-        each ADDITION state whether the PR that introduced it carries its ADR 0012
-        citation. Write "no B.2 key-set change this cycle" when the diff is empty, so
-        silence is a result rather than an omission — and note that this silence is now
-        evidence, which the marker grep's silence never was.
+        endpoint AND ITS BLOCK, taken from the snapshot diff rather than from the
+        CHANGELOG, and for each ADDITION INSIDE AN EXISTING BLOCK state whether the PR
+        that introduced it carries its ADR 0012 citation.
+
+        A whole new profile block is reported as ONE line naming the block and the PR that
+        added it — not as N additions. Its key paths are coverage, not surface, and demanding
+        a condition-5 citation for each is a false alarm that costs this audit its
+        credibility (see how: above).
+
+        Write "no B.2 key-set change this cycle" when the diff is empty, so silence is a
+        result rather than an omission — and note that this silence is now evidence, which
+        the marker grep's silence never was.
 
         The cumulative count ADR 0012 names as load-bearing ("a monotonically rising
         integer is what makes the accumulation visible at all") is still reported, but
@@ -245,6 +272,13 @@ release_kit:
         As of v3.29.1 the cumulative ADR 0012 count is 2, both on /health:
           instanceName                  (#327)   added in v3.29.0
           auth.consecutiveInconclusive  (#324)   added in v3.29.0
+
+        UNRELEASED (#357): the `probesTuiPool` block was added — 221 key paths, **0 new
+        B.2 surface**, cumulative ADR 0012 count UNCHANGED at 2. New coverage of responses
+        the server already returned under a configuration this mechanism had never probed.
+        The `probes` block is byte-identical across that PR, which is the evidence; the one
+        removed line in its diff is a superseded `notCovered` prose entry, not a key path.
+        Recorded here so the next releaser reading a large diff does not recount it.
 
         v3.29.1: NONE THIS CYCLE. Recorded rather than omitted, per the report:
         clause above — a releaser reading only the count cannot otherwise tell a
