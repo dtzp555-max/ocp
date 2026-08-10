@@ -176,6 +176,12 @@ Decision); an unparseable value **disables** the pool rather than guessing.
 Panes carry a 10-minute TTL and are health-checked at hand-out; a dead or degraded pane becomes
 a **miss** (cold path), never a hung turn.
 
+Because refills are **serial**, a full pool takes `OCP_TUI_POOL_SIZE` boots to reach target, so
+in principle the earliest pane can age out before the last one boots. Stated as a **trigger
+rather than a number**, so it survives either constant moving: this becomes reachable only if a
+single pane boot ever takes longer than `POOL_MAX_AGE_MS / POOL_MAX_SIZE`. At measured boot times
+(~1.2 s) it cannot occur, and a boot that genuinely fails does not re-kick the chain.
+
 ### Benefit
 
 Measured end-to-end through a real OCP instance (Sonnet 4.6, `--effort low`):
