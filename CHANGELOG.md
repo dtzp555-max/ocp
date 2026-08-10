@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## v3.29.2 — 2026-08-10
+
 ### Fixed
 
 - **The COMPLETION text was silently corrupted whenever a character straddled a chunk boundary on the child's pipe (#365, the other half of #359).** `lineBuffer += d.toString()` and `stderr += d` in `callClaude` and `callClaudeStreaming` decoded each `Buffer` from the spawned `claude` **independently**, so a multi-byte character whose bytes arrive in two `'data'` events became replacement characters before the pieces were joined — and joining cannot repair it. #359 fixed the request side, which corrupts the prompt; this is the answer side, which corrupts what the model said on its way to the client. Just as silent: the NDJSON line stays syntactically valid, nothing throws, nothing logs.
