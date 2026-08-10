@@ -4198,7 +4198,7 @@ ltTest("integration: ltTest serialization keeps peak concurrent server.mjs child
 });
 
 // ── Upgrade Tests ──
-import { runUpgrade, postFlightOk, runPostFlightCheck, parseFlagValue, classifyPostFlightProbeFailure, postFlightFailureSuffix, probeLaunchdDomains, execRestartRetry, RESTART_ATTEMPTS, recoveryPlanCommands, postFlightOnlyCommand, classifyPostFlightBodyRejection, postFlightWant, postFlightRecheckClause, classifyRestartOutcome, RESTART_VERDICT } from "./scripts/upgrade.mjs";
+import { runUpgrade, postFlightOk, runPostFlightCheck, parseFlagValue, classifyPostFlightProbeFailure, postFlightFailureSuffix, probeLaunchdDomains, execRestartRetry, RESTART_ATTEMPTS, recoveryPlanCommands, postFlightOnlyCommand, classifyPostFlightBodyRejection, postFlightWant, postFlightRecheckClause, classifyRestartOutcome, RESTART_VERDICT, restartOwnerRecoveryNote } from "./scripts/upgrade.mjs";
 
 console.log("\nUpgrade:");
 
@@ -7170,11 +7170,14 @@ test("#372: `ocp update` on a DEGRADED proxy already serving the target must cla
     `the version matched — nothing may call it wrong; got hint=${JSON.stringify(caught.hint)}`);
   assert.ok(!/3\.14\.0, expected 3\.14\.0/.test(caught.hint || ""),
     `and nothing may name one version as both wrong and expected; got hint=${JSON.stringify(caught.hint)}`);
-  // It falls to the neutral post-flight failure, whose tree-state hint is the pre-#347 one.
-  assert.equal(caught.message, "post-flight failed");
-  assert.ok(/^Working tree may be at new version/.test(caught.hint),
-    `got hint=${JSON.stringify(caught.hint)}`);
-  // And the phase message — which is where the diagnosis survives — must name what was observed.
+  // The VERDICT for this state is pinned by the `#381 F2` test below, not here. It used to be
+  // asserted here as the neutral post-flight failure — which #381's review showed was the wrong
+  // remedy, because that arm's hint recommends `ocp update --rollback` and a rollback cannot clear
+  // a degraded status. This test keeps what it was written to pin: that nothing claims the proxy is
+  // down or on the wrong version.
+  //
+  // And the phase message — where the diagnosis survives whichever cell fires — must name what was
+  // observed.
   assert.match(pf.message, /status=degraded/);
   assert.ok(!/unreachable/.test(pf.message), `it answered; got ${JSON.stringify(pf.message)}`);
 });
@@ -7311,6 +7314,217 @@ test("#372 (rollback) control: with `from-version.txt` READABLE the same fixture
     `and the re-check command must name the version the comparison used; got hint=${JSON.stringify(caught.hint)}`);
 });
 
+// ── #372 remediation round 1: the findings of #381's independent review ────────────────────────
+//
+// The review's headline is worth keeping verbatim, because it is a lesson about the fix and not
+// only about the code: **the DOWN cell still fired on an `else`; it had moved one function down.**
+// #372 applied "a name is a claim — read what ASSIGNS the kind, never what it is called" to
+// `version-mismatch`, and did not apply it to `unreachable` — which is `classifyPostFlightProbeFailure`'s
+// own default arm, two lines above the `catch` that #372 edited. The rule was in hand and did not
+// transfer one branch over.
+console.log("\n#372 remediation (#381 review): a name is a claim — including the ones I did not look at:");
+
+test("#381 F1 (the money test for this round): `unreachable` must mean curl said it could not connect — not `else`", () => {
+  // Measured at the pre-remediation SHA: ALL of these classified `unreachable`, and `didNotReach`
+  // routes that name straight to "THE PROXY IS DOWN … /health is not answering".
+  const cls = (props) => classifyPostFlightProbeFailure(Object.assign(new Error(props.message || "x"), props));
+
+  // Spawn failures: `execSync` could not start the child at all, so there is NO exit status and an
+  // errno instead. That absence is positive evidence the fault is LOCAL — nothing came back from
+  // curl, because curl never ran. On a low-memory host (the fleet includes Pis) this used to print
+  // THE PROXY IS DOWN about a proxy nothing had probed.
+  for (const code of ["EAGAIN", "ENOMEM", "EMFILE"]) {
+    const k = cls({ message: `spawnSync /bin/sh ${code}`, code, errno: -35 });
+    assert.equal(k.kind, "probe-could-not-run",
+      `a spawn ${code} is a local fault, not a statement about the service; got ${JSON.stringify(k)}`);
+  }
+
+  // Exit codes that are NOT evidence of non-reach. 52 and 56 mean the peer ACCEPTED the connection.
+  for (const [status, what] of [[52, "empty reply from server"], [56, "connection reset by peer"], [35, "TLS error"]]) {
+    const k = cls({ status, message: `curl: (${status}) ${what}` });
+    assert.notEqual(k.kind, "unreachable",
+      `curl ${status} (${what}) is not curl saying it could not connect; got ${JSON.stringify(k)}`);
+    assert.notEqual(k.kind, "timeout", `nor a timeout; got ${JSON.stringify(k)}`);
+    assert.equal(k.kind, "probe-failed-unclassified",
+      `it must get a kind that claims nothing; got ${JSON.stringify(k)}`);
+  }
+
+  // CONTROL, in the same test so the pair cannot drift: curl 7 is the one positive piece of
+  // evidence that the service did not answer, and it must still say so. Without this the fix could
+  // have been "never say unreachable".
+  assert.equal(cls({ status: 7, message: "curl: (7) Failed to connect" }).kind, "unreachable",
+    "curl exit 7 IS the evidence, and must keep its name");
+  assert.equal(cls({ status: 28, message: "curl: (28) Operation timed out" }).kind, "timeout");
+  assert.equal(cls({ status: 127, message: "sh: curl: not found" }).kind, "probe-could-not-run");
+});
+
+test("#381 F1: an unclassifiable probe failure must not reach THE PROXY IS DOWN on either path", async () => {
+  // End to end, because the kind only matters through the cell it selects. Both `ocp update` legs,
+  // both with a restart command failing — the state in which the DOWN cell is reachable at all.
+  for (const [lane, opts, probe] of [
+    ["upgrade",  _u347Opts, () => { throw Object.assign(new Error("curl: (52) Empty reply from server"), { status: 52 }); }],
+    ["rollback", _u352Opts, () => { throw Object.assign(new Error("curl: (52) Empty reply from server"), { status: 52 }); }],
+  ]) {
+    const run = _u347Runner({ "launchctl bootstrap": Infinity });
+    let caught = null;
+    try { await runUpgrade(opts({ execFn: run, mockProbe: probe })); }
+    catch (e) { caught = e; }
+    assert.ok(caught, `${lane}: still not a success`);
+    // Premise: the restart really did fail, so the DOWN cell was genuinely in reach.
+    assert.equal(run.calls.filter(c => c.includes("launchctl bootstrap")).length, 4,
+      `${lane} premise: the restart must have exhausted its budget; got ${JSON.stringify(run.calls)}`);
+    assert.ok(!/THE PROXY IS DOWN/.test(caught.hint || ""),
+      `${lane}: the peer ACCEPTED the connection — nothing here says the proxy is down; got hint=${JSON.stringify(caught.hint)}`);
+    assert.ok(!/is not answering/.test(caught.hint || ""),
+      `${lane}: got hint=${JSON.stringify(caught.hint)}`);
+  }
+
+  // And a LOCAL spawn fault must reach the UNKNOWN cell, not DOWN.
+  const run = _u347Runner({ "launchctl bootstrap": Infinity });
+  let caught = null;
+  try {
+    await runUpgrade(_u347Opts({ execFn: run,
+      mockProbe: () => { throw Object.assign(new Error("spawnSync /bin/sh EAGAIN"), { code: "EAGAIN", errno: -35 }); } }));
+  } catch (e) { caught = e; }
+  assert.ok(caught);
+  assert.ok(!/THE PROXY IS DOWN/.test(caught.hint), `got hint=${JSON.stringify(caught.hint)}`);
+  assert.ok(/UNKNOWN/.test(caught.hint),
+    `a machine that could not start the probe knows nothing about the proxy; got hint=${JSON.stringify(caught.hint)}`);
+});
+
+test("#381 F3: the classifier's version comparison must be the SAME operator postFlightOk rejects on", () => {
+  // #372's `postFlightWant` note claimed the shared helper made the kind mean the same comparison.
+  // It unified the target EXPRESSION and not the OPERATOR: `postFlightOk` used `===` on the raw
+  // value while the classifier used `String(...) !==`. Measured against target 3.29.2 before the fix:
+  //   version:["3.29.2"] -> coerced EQUAL -> fell to `not-ok-status` -> "…reported status=ok, not status=ok."
+  //   version:[]         -> coerced ""    -> "SERVING THE WRONG VERSION (, expected 3.29.2)"
+  //   version:{}         -> "(…[object Object], expected 3.29.2)"
+  // The second is #372's own rendering defect, on the other operand.
+  for (const v of [["3.29.2"], [], {}, 3, true]) {
+    const k = classifyPostFlightBodyRejection({ status: "ok", version: v }, "v3.29.2");
+    assert.equal(k.kind, "body-not-ocp",
+      `version=${JSON.stringify(v)}: /health answers with a version STRING, so this is not this ` +
+      `proxy — and it must never be coerced into a comparison; got ${JSON.stringify(k)}`);
+    assert.ok(!/\[object Object\]/.test(k.detail) && !/^serving $/.test(k.detail),
+      `nor may the detail render a coerced value; got ${JSON.stringify(k)}`);
+  }
+  // The property, stated as a property: whenever the classifier says `version-mismatch`, both
+  // operands are present strings that genuinely differ — which is exactly when `postFlightOk`'s own
+  // `body?.version === want` is false FOR A VERSION REASON.
+  const bodies = [
+    { status: "ok", version: "3.29.2" }, { status: "ok", version: "3.10.0" },
+    { status: "degraded", version: "3.29.2" }, { status: "ok", version: [] },
+    { status: "ok" }, { status: "ok", version: 3 }, null, 42,
+  ];
+  let sawMismatch = false;
+  for (const body of bodies) {
+    for (const target of ["v3.29.2", "", null]) {
+      if (postFlightOk(body, target)) continue;
+      const k = classifyPostFlightBodyRejection(body, target);
+      if (k.kind !== "version-mismatch") continue;
+      sawMismatch = true;
+      assert.equal(typeof body.version, "string", `version-mismatch requires a string version; body=${JSON.stringify(body)}`);
+      assert.ok(postFlightWant(target), `version-mismatch requires a present target; target=${JSON.stringify(target)}`);
+      assert.notEqual(body.version, postFlightWant(target),
+        `version-mismatch requires the two to actually DIFFER; body=${JSON.stringify(body)} target=${JSON.stringify(target)}`);
+    }
+  }
+  assert.ok(sawMismatch, "harness premise: the sweep must actually reach version-mismatch");
+});
+
+test("#381 F2: a DEGRADED proxy already serving the target must not be told to roll back", async () => {
+  // Measured before the fix: /health answers 200 `{status:"degraded", version:"<the version this
+  // upgrade just installed>"}`, and the hint was "Working tree may be at new version. Run
+  // `ocp update --rollback` to restore from snapshot." The code IS what is running, and a rollback
+  // cannot clear a degraded status — that comes from the `claude` binary or from auth rejections.
+  //
+  // #372 stated this cell's cost as "the hint no longer names the restart failure". It also newly
+  // recommended a rollback, because it imported #371's disposition without its premise: the
+  // rollback path's neutral verdict says `ocp doctor`, this path's said roll back.
+  const run = _u347Runner({ "launchctl bootstrap": Infinity });
+  let caught = null;
+  try {
+    await runUpgrade(_u347Opts({ execFn: run,
+      mockProbe: () => ({ status: "degraded", auth: { ok: true }, version: "3.14.0" }) }));
+  } catch (e) { caught = e; }
+
+  assert.ok(caught, "a degraded proxy is still not a confirmed-good upgrade");
+  const pf = caught.phases.find(p => p.name === "post-flight");
+  assert.ok(pf && /status=degraded/.test(pf.message || ""),
+    `premise: this really is the status-only rejection; got ${JSON.stringify(pf)}`);
+
+  assert.ok(!/ocp update --rollback` to restore/.test(caught.hint || ""),
+    `a rollback cannot clear a degraded status; got hint=${JSON.stringify(caught.hint)}`);
+  assert.ok(!/^Working tree may be at new version/.test(caught.hint || ""),
+    `and the tree is not the subject here; got hint=${JSON.stringify(caught.hint)}`);
+  assert.match(caught.hint, /ocp doctor/, `it must name the step that can find out; got hint=${JSON.stringify(caught.hint)}`);
+  assert.ok(caught.hint.includes("3.14.0"),
+    `and say which version IS serving; got hint=${JSON.stringify(caught.hint)}`);
+  assert.ok(/restart command also failed/.test(caught.hint),
+    `the restart failure must survive into the hint, which #372's version lost; got hint=${JSON.stringify(caught.hint)}`);
+});
+
+test("#381 F4: the `will anything restart it?` note is per plan shape over all THREE shapes", () => {
+  // A two-way ternary over a three-value domain. `planRestart` returns launchd | user-unit |
+  // system-unit; the `else` asserted `Restart=always` for BOTH non-launchd shapes. The cited
+  // authority (`install-autostart.mjs`) writes only the USER unit — a `system-unit` comes from
+  // `resolveOwningUnit`, an arbitrary unit whose Restart= directive OCP never reads.
+  const user = restartOwnerRecoveryNote("user-unit");
+  const system = restartOwnerRecoveryNote("system-unit");
+  const launchd = restartOwnerRecoveryNote("launchd");
+
+  assert.notEqual(user, system,
+    "the two systemd shapes must not render the same sentence — that is the defect");
+  assert.match(user, /Restart=always/, "OCP installs this one and knows its policy");
+  assert.ok(!/Restart=always/.test(system),
+    `OCP never reads a discovered unit's Restart= directive; got ${JSON.stringify(system)}`);
+  assert.match(system, /not\s+known|discovered/i, `it must say so; got ${JSON.stringify(system)}`);
+  assert.ok(!/Restart=always/.test(launchd), `launchd has no such directive; got ${JSON.stringify(launchd)}`);
+  // The launchd claim is hedged because the resolved bootout's exit status is discarded (`|| true`)
+  // and this note only renders when a restart command already failed.
+  assert.match(launchd, /If the bootout succeeded/, `got ${JSON.stringify(launchd)}`);
+  // An unrecognised shape must fall to the "not known" answer, never to a claim.
+  assert.equal(restartOwnerRecoveryNote("some-future-shape"), system,
+    "an unknown shape must claim no more than a discovered one does");
+});
+
+test("#381 F5: `--post-flight-only v` must fail CLOSED, not report success against any version", async () => {
+  // Measured against the live proxy before the fix: `--post-flight-only v` printed
+  // `✓ service now serving v`. "v" is non-empty and does not start with `--`, so the guard did not
+  // fire; `postFlightWant("v")` is `""`; and `postFlightOk` degrades an empty target to the serving
+  // check alone. That is precisely the "hand-invoked or future misuse" the guard exists for.
+  //
+  // Driven through the REAL CLI entrypoint as a subprocess — the guard lives in the argv handler,
+  // not in an exported function, so nothing else reaches it. CLAUDE_PROXY_PORT is pinned to a port
+  // nothing listens on, so if the guard ever stops firing this probes a dead port rather than the
+  // developer's live proxy.
+  const port = String(await ltFreePort());
+  const selfPath = _ltF2P(new URL("./scripts/upgrade.mjs", import.meta.url));
+  const run = (target) => {
+    try {
+      const stdout = execFileSync(process.execPath, [selfPath, "--post-flight-only", target],
+        { env: { ...process.env, CLAUDE_PROXY_PORT: port }, stdio: ["ignore", "pipe", "pipe"], timeout: 30000 });
+      return { status: 0, out: stdout.toString(), err: "" };
+    } catch (e) {
+      return { status: e.status, out: (e.stdout || "").toString(), err: (e.stderr || "").toString() };
+    }
+  };
+
+  const v = run("v");
+  assert.equal(v.status, 1, `it must exit non-zero; got ${JSON.stringify(v)}`);
+  assert.ok(!/✓/.test(v.out), `and must never report success; got stdout=${JSON.stringify(v.out)}`);
+  assert.match(v.err, /requires a target version argument/,
+    `it must fail with the guard's own message; got stderr=${JSON.stringify(v.err)}`);
+
+  // CONTROL: a real target must still get PAST the guard and be reported as a genuine post-flight
+  // failure against the dead port — proving the guard was narrowed, not turned into a blanket refusal.
+  const real = run("v3.14.0");
+  assert.equal(real.status, 1);
+  assert.ok(!/requires a target version argument/.test(real.err),
+    `a well-formed target must not be refused by the guard; got stderr=${JSON.stringify(real.err)}`);
+  assert.match(real.err, /did not reach v3\.14\.0/, `got stderr=${JSON.stringify(real.err)}`);
+});
+
 // ── #373: the post-restart verdict is ONE decision, shared by both `ocp update` paths ──────────
 //
 // `runFullUpgrade` and `runRollback` each carried their own copy of an eight-arm verdict ladder,
@@ -7372,9 +7586,14 @@ test("#373: the full input -> verdict table, so no arm can be quietly widened", 
     [rf,   "version-mismatch",    true, RESTART_VERDICT.RESTART_FAILED_WRONG_VERSION],
     [rf,   "unreachable",         true, RESTART_VERDICT.RESTART_FAILED_DOWN],
     [rf,   "timeout",             true, RESTART_VERDICT.RESTART_FAILED_DOWN],
-    // #372's deliberate hole: a degraded proxy already serving the target gets NO cell and claims
-    // nothing about reach. Same for any kind a future classifier adds without one.
-    [rf,   "not-ok-status",       true, RESTART_VERDICT.UNCONFIRMED],
+    // #381 F2: a degraded proxy already serving the target has its OWN verdict. It got none in
+    // #372, fell to UNCONFIRMED, and the forward path's neutral hint told the operator to roll
+    // back a proxy running exactly the right code.
+    [rf,   "not-ok-status",       true, RESTART_VERDICT.NOT_OK_STATUS],
+    [null, "not-ok-status",       true, RESTART_VERDICT.NOT_OK_STATUS],
+    // #381 F1: the probe classifier's own default arm. It must NOT reach DOWN, and it gets no cell
+    // of its own either, because the whole point is that nothing is known.
+    [rf,   "probe-failed-unclassified", true, RESTART_VERDICT.UNCONFIRMED],
     [rf,   "some-future-kind",    true, RESTART_VERDICT.UNCONFIRMED],
     [null, "probe-could-not-run", true, RESTART_VERDICT.PROBE_LOCAL_FAULT],
     [null, "unreachable",         true, RESTART_VERDICT.UNCONFIRMED],
@@ -7414,7 +7633,21 @@ const _u373Category = (o) => {
   if (/^THE PROXY IS UP BUT SERVING THE WRONG VERSION/.test(h)) return "RESTART_FAILED_WRONG_VERSION";
   if (/^THE PROXY IS DOWN/.test(h)) return "RESTART_FAILED_DOWN";
   if (/^THE (UPGRADE|ROLLBACK) MAY HAVE SUCCEEDED/.test(h)) return "PROBE_LOCAL_FAULT";
+  if (/^THE PROXY IS ANSWERING AND SERVING .* BUT REPORTS ITSELF UNHEALTHY/.test(h)) return "NOT_OK_STATUS";
   return "UNCONFIRMED";
+};
+
+// The ONE deliberate divergence, pinned rather than skipped. `not-ok-status` is a SHARED verdict —
+// `classifyRestartOutcome` returns `NOT_OK_STATUS` for both paths, and the table test above proves
+// it — but only `runFullUpgrade` renders it as its own sentence. `runRollback` deliberately lets it
+// fall to its neutral verdict, because that verdict already says "run `ocp doctor`", while the
+// forward path's said "run `ocp update --rollback`", which cannot clear a degraded status (#381 F2).
+//
+// Encoded as an expected PAIR rather than as an exemption: if either side changes — the forward
+// path losing its cell, or the rollback path gaining one — this fires. Skipping the case would have
+// made the guard blind to exactly the state that produced the finding.
+const _u373ExpectedDivergence = {
+  "degraded, right ver": ["NOT_OK_STATUS", "UNCONFIRMED"],
 };
 
 test("#373 (the anti-drift guard): both `ocp update` paths reach the SAME verdict for the same input", async () => {
@@ -7451,11 +7684,28 @@ test("#373 (the anti-drift guard): both `ocp update` paths reach the SAME verdic
       const up = await drive(_u347Opts({ execFn: _u347Runner(spec), mockProbe: upProbe }));
       const rb = await drive(_u352Opts({ execFn: _u347Runner(spec), mockProbe: rbProbe }));
       const [a, b] = [_u373Category(up), _u373Category(rb)];
-      assert.equal(a, b,
-        `restartFails=${restartFails} probe="${name}": the two paths must classify identically — ` +
-        `upgrade=${a} rollback=${b}. upgradeHint=${JSON.stringify(up.ok ? "(returned)" : up.err.hint)} ` +
-        `rollbackHint=${JSON.stringify(rb.ok ? "(returned)" : rb.err.hint)}`);
-      seen.add(a);
+      const expected = _u373ExpectedDivergence[name];
+      if (expected) {
+        assert.deepEqual([a, b], expected,
+          `restartFails=${restartFails} probe="${name}": this is the ONE documented divergence and ` +
+          `both halves of it are pinned — expected ${JSON.stringify(expected)}, got ${JSON.stringify([a, b])}. ` +
+          `upgradeHint=${JSON.stringify(up.ok ? "(returned)" : up.err.hint)} ` +
+          `rollbackHint=${JSON.stringify(rb.ok ? "(returned)" : rb.err.hint)}`);
+        // And the property that makes the divergence acceptable: both still send the operator to
+        // the same place. This is what would break if the forward path's cell were deleted again.
+        const upText = `${up.ok ? "" : up.err.hint || ""}${up.ok ? "" : up.err.message || ""}`;
+        const rbText = `${rb.ok ? "" : rb.err.hint || ""}${rb.ok ? "" : rb.err.message || ""}`;
+        assert.match(upText, /ocp doctor/, `upgrade must name the right next step; got ${JSON.stringify(upText)}`);
+        assert.match(rbText, /ocp doctor/, `rollback must name the right next step; got ${JSON.stringify(rbText)}`);
+        assert.ok(!/ocp update --rollback` to restore/.test(upText),
+          `and the forward path must not recommend a rollback here; got ${JSON.stringify(upText)}`);
+      } else {
+        assert.equal(a, b,
+          `restartFails=${restartFails} probe="${name}": the two paths must classify identically — ` +
+          `upgrade=${a} rollback=${b}. upgradeHint=${JSON.stringify(up.ok ? "(returned)" : up.err.hint)} ` +
+          `rollbackHint=${JSON.stringify(rb.ok ? "(returned)" : rb.err.hint)}`);
+      }
+      seen.add(a); seen.add(b);
     }
   }
 
@@ -7463,9 +7713,72 @@ test("#373 (the anti-drift guard): both `ocp update` paths reach the SAME verdic
   // the arms that actually differ from each other, including the two #372 added.
   for (const v of ["RESTART_FAILED_WRONG_VERSION", "RESTART_FAILED_ANSWERED_NOT_OCP",
                    "RESTART_FAILED_DOWN", "RESTART_FAILED_PROBE_LOCAL_FAULT",
-                   "PROBE_LOCAL_FAULT", "UNCONFIRMED", "WARNED_SUCCESS", "OK"]) {
+                   "PROBE_LOCAL_FAULT", "UNCONFIRMED", "NOT_OK_STATUS", "WARNED_SUCCESS", "OK"]) {
     assert.ok(seen.has(v), `harness premise: the sweep must reach ${v}; reached ${JSON.stringify([...seen])}`);
   }
+});
+
+test("#373 (fail closed): a probe that did NOT confirm can never produce a successful return, on either path", async () => {
+  // THE REGRESSION THIS REFACTOR ACTUALLY CAUSED, caught by the 108-case behavioural sweep and
+  // pinned here so it cannot come back.
+  //
+  // Before #373 the last arm of each ladder was `if (!postFlight.ok)` — an `else`, which caught
+  // every non-ok probe BY CONSTRUCTION. Keying the arms on a verdict makes the ladder
+  // exhaustive-by-enumeration instead, and a verdict no arm names falls past every cell into the
+  // function's `return`: a SUCCESSFUL upgrade or rollback on a host whose probe failed. It happened
+  // for real — #372's remediation added `NOT_OK_STATUS`, the rollback path deliberately gives it no
+  // cell, and keying its neutral arm on `UNCONFIRMED` alone made a degraded proxy report a clean
+  // rollback. Both arms now read "not a success verdict", so a new verdict is refused by default.
+  //
+  // Note what kind of defect this is: it lives in which states are UNREACHABLE, not in what any
+  // reachable state does. That is why it needs a sweep over every probe outcome rather than a case
+  // per cell — a per-cell test only ever visits states that already have a cell.
+  const probes = {
+    "wrong version":        [() => ({ status: "ok", auth: { ok: true }, version: "9.9.9" }),
+                             () => ({ status: "ok", auth: { ok: true }, version: "9.9.9" })],
+    "degraded, right ver":  [() => ({ status: "degraded", auth: { ok: true }, version: "3.14.0" }),
+                             () => ({ status: "degraded", auth: { ok: true }, version: "3.10.0" })],
+    "no version field":     [() => ({ status: "ok" }), () => ({ status: "ok" })],
+    "version not a string": [() => ({ status: "ok", version: [] }), () => ({ status: "ok", version: [] })],
+    "json null":            [() => null, () => null],
+    "unparseable":          [() => { throw new SyntaxError("nope"); }, () => { throw new SyntaxError("nope"); }],
+    "http error":           [() => { throw Object.assign(new Error("curl: (22) 503"), { status: 22 }); },
+                             () => { throw Object.assign(new Error("curl: (22) 503"), { status: 22 }); }],
+    "timeout":              [() => { throw Object.assign(new Error("curl: (28) t/o"), { status: 28 }); },
+                             () => { throw Object.assign(new Error("curl: (28) t/o"), { status: 28 }); }],
+    "unreachable":          [_u347Unreachable, _u352Unreachable],
+    "no curl":              [_u352NoCurl, _u352NoCurl],
+    // #381 F1's kinds: the probe classifier's own default arm, which must not reach DOWN and must
+    // not reach success either.
+    "empty reply (curl 52)": [() => { throw Object.assign(new Error("curl: (52) Empty reply"), { status: 52 }); },
+                              () => { throw Object.assign(new Error("curl: (52) Empty reply"), { status: 52 }); }],
+    "spawn EAGAIN":          [() => { throw Object.assign(new Error("spawnSync /bin/sh EAGAIN"), { code: "EAGAIN" }); },
+                              () => { throw Object.assign(new Error("spawnSync /bin/sh EAGAIN"), { code: "EAGAIN" }); }],
+  };
+
+  let checked = 0;
+  for (const restartFails of [true, false]) {
+    for (const [name, [upProbe, rbProbe]] of Object.entries(probes)) {
+      const spec = restartFails ? { "launchctl bootstrap": Infinity } : {};
+      for (const [lane, opts, probe] of [["upgrade", _u347Opts, upProbe], ["rollback", _u352Opts, rbProbe]]) {
+        let returned = null, threw = null;
+        try { returned = await runUpgrade(opts({ execFn: _u347Runner(spec), mockProbe: probe })); }
+        catch (e) { threw = e; }
+        // Premise: the probe really did fail to confirm, or this row proves nothing.
+        const phases = (returned || threw)?.phases || [];
+        const pf = phases.find(p => p.name === "post-flight");
+        assert.ok(pf && pf.status === "fail",
+          `${lane}/${name}/restartFails=${restartFails} premise: post-flight must have FAILED; got ${JSON.stringify(pf)}`);
+        assert.equal(returned, null,
+          `${lane}/${name}/restartFails=${restartFails}: an unconfirmed post-flight must never return ` +
+          `success — this is the fall-through the verdict enumeration makes possible; got ${JSON.stringify(returned)}`);
+        assert.ok(threw, `${lane}/${name}/restartFails=${restartFails}: it must throw`);
+        checked++;
+      }
+    }
+  }
+  assert.equal(checked, Object.keys(probes).length * 4,
+    `harness premise: every probe x lane x restart-state combination must have been exercised; got ${checked}`);
 });
 
 // ── #262 SECURITY (same shape as #257's injection, on the rollback path) ───────────────────────
