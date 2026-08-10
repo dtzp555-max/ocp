@@ -2087,9 +2087,10 @@ function ltFake(dir) { const p = join(dir, "claude"); _ltWrite(p, LT_FAKE); _ltC
 //
 //   :2066 (boot only) — 1 invocation, `list-sessions`, in 12 of 15 runs (3/5 on a loaded
 //     host, 9/10 on a quiet one — the FREQUENCY tracks load, the reachability does not).
-//     That test asserts on the inert-flag warning (server.mjs:4018), printed BEFORE the boot
-//     reap at :4036, so whether the reap beats the test's SIGKILL is a race — and an exec'd
-//     tmux outlives its parent's SIGKILL, so losing the race does not undo the call.
+//     That test asserts on the inert-flag warning (`ignored in TUI mode`, server.mjs:4210),
+//     printed BEFORE the boot reap (`reapStaleTuiSessions({ port: PORT, includeLegacy:
+//     true })`, :4242), so whether the reap beats the test's SIGKILL is a race — and an
+//     exec'd tmux outlives its parent's SIGKILL, so losing the race does not undo the call.
 //   :2521 (boots and POSTs) — 3 invocations EVERY run: the boot reap's `list-sessions`, then
 //     one `tmux new-session -d` per request, each launching `claude` in a pane rooted at the
 //     operator's real `$HOME/.ocp-tui/work`. Three is the count the OBSERVING stub saw
@@ -2151,12 +2152,22 @@ function ltTmuxCalls(dir, name = "tmux-stub") {
 // Resolve the `tmux` binary ltBoot hands the child. Split out from ltBoot so the refusal
 // below is reachable from a test without spawning a server.
 //
-// A caller MAY supply its own — a future test of the TUI REQUEST path needs a stub that
-// succeeds — but only one it created inside its OWN scratch dir. That is a bound on
-// capability rather than a prohibition: the operator's `/opt/homebrew/bin/tmux` cannot be
-// inside a directory ltMkdir() made this run, and realpath closes the symlink route.
-// Anything else THROWS rather than being quietly overridden: silently ignoring an override
-// the author believes took effect is worse than refusing it (#382's F4).
+// A caller MAY supply its own, but only one it created inside its OWN scratch dir. That is a
+// bound on capability rather than a prohibition: the operator's `/opt/homebrew/bin/tmux`
+// cannot be inside a directory ltMkdir() made this run, and realpath closes the symlink
+// route. Anything else THROWS rather than being quietly overridden: silently ignoring an
+// override the author believes took effect is worse than refusing it (#382's F4).
+//
+// THIS LANE IS NOT SPECULATIVE — it has a live consumer, and #393's review corrected the PR
+// body for claiming otherwise. The #346 B.2 key-set integration test does
+// `ltBootFresh(fx.env, fx.dir)` with a fixture whose env already carries
+// `OCP_TUI_TMUX_BIN = <fx.dir>/bin/tmux` (set at scripts/b2-key-snapshot.mjs:351, asserted by
+// the suite itself). So this check runs on #382's code on EVERY suite run, once per profile,
+// and accepts it — measured on the real fixtures, both profiles contained in `fx.dir`.
+//
+// That coupling is the thing to know before changing either side: if `makeB2Fixture` ever
+// moves its `bin/` outside `fx.dir`, or a caller passes `fx.home` as the dir, the B.2
+// snapshot test starts throwing FROM HERE rather than from anything that looks related.
 function ltResolveTmuxBin(env, dir) {
   const supplied = env && env.OCP_TUI_TMUX_BIN;
   if (supplied === undefined || supplied === null) return ltTmuxStub(dir);
@@ -2236,8 +2247,12 @@ function ltBoot(env, dir, nodeArgs = []) {
   // it isn't. AGENTS.md: constraints must be unreachable by construction, not stated as
   // prohibitions. It is applied UNCONDITIONALLY (not gated on CLAUDE_TUI_MODE) for the same
   // reason — a conditional pin is the same hole one level down, and ltBoot cannot see which
-  // caller will later turn TUI on. Measured no-op for every non-TUI test: all four tmux call
-  // sites (server.mjs:571, :572, :1045, :4036) are inside `if (TUI_MODE)`.
+  // caller will later turn TUI on. Measured no-op for every non-TUI test: all SIX tmux call
+  // sites are gated — server.mjs:538 (TUI_POOL_SIZE, which makes tuiPool null so :571/:572
+  // are unreachable), :571, :572, :1045 (the periodic sweep), :1974/:2151 (runTuiTurn, behind
+  // `TUI_MODE ?` dispatch) and :4242 (the boot reap). An earlier revision of this comment said
+  // "four" and listed the wrong last line; the conclusion was right and the enumeration was
+  // short, which is its own kind of wrong in a comment a reader is meant to re-derive from.
   //
   // After the spread, so a per-test env cannot take it back by accident — last write wins,
   // which is #382's F4 finding applied to this harness. A DELIBERATE override still works, and
@@ -2744,10 +2759,22 @@ ltTest("integration (#384): ltBoot pins tmux at a refusing stub, so no live-serv
   const { child, buf } = await ltBootFresh(
     { CLAUDE_TUI_MODE: "true", CLAUDE_BIN: fake, PATH: `${decoyDir}:${process.env.PATH}` }, dir);
   try {
-    // Wait for the boot reap to have RUN, not for a proxy that only implies it will: the reap
-    // is server.mjs:4036 and "Coexistence:" is :4041, in the same synchronous listen callback,
-    // so this marker is strictly AFTER it. Gating on "listening on" instead would be the #199
-    // race — that line is printed at :3990, before the reap.
+    // Wait for the boot reap to have RUN, not for a proxy that only implies it will. What
+    // this depends on is the ORDER of three markers inside server.mjs's single synchronous
+    // listen callback, so they are named by their greppable text first and by line second:
+    //
+    //     `listening on ${bindMsg}`                     :4196   <- do NOT gate on this
+    //     `ignored in TUI mode`                         :4210
+    //     reapStaleTuiSessions({ ..., includeLegacy })  :4242   <- the thing being waited for
+    //     `Coexistence: This proxy`                     :4247   <- so this marker is AFTER it
+    //
+    // Gating on "listening on" would be the #199 race: it is printed BEFORE the reap.
+    //
+    // LINE NUMBERS ARE AS OF ab3f28f AND WILL DRIFT; the marker strings are the contract.
+    // #393's review caught all four of these stale by ~139 lines after a merge-forward, and
+    // named the reason worth remembering: this comment did not change, and byte-identity of
+    // a region is EXACTLY the condition under which its citations into another file go stale
+    // silently — nothing in the file you are editing prompts the re-check.
     assert.ok(await ltWait(() => buf.out.includes("Coexistence:") || buf.closed || buf.spawnErr),
       `TUI boot never completed, so the reap was never reached and the assertions below would be ` +
       `vacuous — ${ltDiag(buf)}`);
@@ -2764,8 +2791,12 @@ ltTest("integration (#384): ltBoot pins tmux at a refusing stub, so no live-serv
     //
     //    Ordering cannot make this test pass vacuously — every assertion must hold for it to
     //    pass at all — so ordering is purely about which mutation attributes to which
-    //    assertion, and it is chosen for that. Each of the three now has a mutation that
-    //    trips ONLY it: A2 <- pin removed, A3 <- stub made permissive, A1 <- this test's own
+    //    assertion, and it is chosen for that. Each of the three now has a DISTINCT
+    //    ATTRIBUTING mutation — which is weaker than "trips only it", and the weaker claim is
+    //    the true one (#393's review): removing the pin also empties the pinned log, and the
+    //    permissive stub also makes the count 2, so A1 would fail in both if it were reached.
+    //    ORDER is what resolves attribution. The three are: A2 <- pin removed, A3 <- stub
+    //    made permissive, A1 <- this test's own
     //    CLAUDE_TUI_MODE dropped (which empties BOTH logs, so A2 and A3 pass vacuously and
     //    only A1 can catch it — the operand guard doing exactly its job).
 
@@ -2790,6 +2821,11 @@ ltTest("integration (#384): ltBoot pins tmux at a refusing stub, so no live-serv
     //     would have caught `kill-session -t <name>` and silently missed the WORSE of the two
     //     outcomes — the one this line exists for. Found by mutation M3, and only because the
     //     reorder above put A3 within reach of it; the masking defect was hiding this one.
+    //     ANCHORED AT `^`, so it covers the call shapes this codebase actually issues and
+    //     says so rather than implying more: `kill-pane` and `kill-window` are real tmux
+    //     subcommands it would not catch (neither is issued anywhere in lib/tui/), and a
+    //     future `tmux -L <socket> kill-server` would put a flag before the subcommand and
+    //     evade the anchor. Widen it when one of those becomes reachable, not before.
     assert.ok(!calls.some(c => /^kill-(server|session)\b/.test(c)),
       `the boot reap issued a kill against the stub: ${JSON.stringify(calls)}. Against a real ` +
       `tmux, kill-session takes a matching session — including a live legacy-named ` +
@@ -2807,6 +2843,11 @@ ltTest("integration (#384): ltBoot pins tmux at a refusing stub, so no live-serv
       `${JSON.stringify(decoyCalls)}. A count of 0 with an empty decoy means the boot never ` +
       `reached the reap at all, so the two assertions above just passed on nothing. ` +
       `${ltDiag(buf)}`);
+    // NO MUTATION ROW, stated rather than silently omitted (#393 F4). Every mutation that
+    // changes which subcommand the reap issues also changes the COUNT, so A1 above fires
+    // first; making this line independently attributable would mean mutating production code
+    // in lib/tui/session.mjs, which is out of scope for a test-harness PR. It is a cheap
+    // shape guard on an assertion that is otherwise about arithmetic, and it is unproven.
     assert.match(calls[0], /^list-sessions\b/,
       `the only boot-time tmux call must be the reap's read-only list-sessions. Got: ${calls[0]}`);
   } finally { child.kill("SIGKILL"); _ltRmRetry(dir); }
