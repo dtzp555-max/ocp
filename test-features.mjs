@@ -2720,7 +2720,7 @@ ltTest("integration: boot gate REFUSES each unsafe config (multi / non-loopback 
 });
 
 // ── #370: the TUI LAN gate's call site (server.mjs:829) ────────────────────────────────────────
-// The #339 shape, one gate over: isLoopbackBind has 18 unit blocks and is correct; what nothing
+// The #339 shape, one gate over: isLoopbackBind has 8 unit blocks and is correct; what nothing
 // asserted is that :829 still CONSULTS it. The question is not "is the predicate tested" but "does
 // anything go red if the call site stops consulting it" (#343).
 //
