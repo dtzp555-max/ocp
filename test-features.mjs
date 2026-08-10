@@ -6213,10 +6213,19 @@ test("#347 F1: commands OK but the probe could not RUN must never headline `ocp 
     `and must say why rolling back is wrong here; got hint=${JSON.stringify(caught.hint)}`);
 });
 
-test("#347 F1 control: a probe that genuinely RAN and said no keeps the original tree-state hint", async () => {
+test("#347 F1 control: a probe that genuinely RAN and said no reaches the NEUTRAL verdict, not F1's cell", async () => {
   // Proves F1's new arm is scoped to the could-not-RUN classification and did not rewrite the
   // hint for every post-flight failure. Here curl runs fine and reports a connection refusal —
-  // a real statement about the service, for which rollback advice is correct.
+  // a real statement about the service, and a different verdict.
+  //
+  // RE-KEYED BY #386, and the reason is worth stating rather than silently editing. This used to
+  // assert `/^Working tree may be at new version/` — F1's control was "the OTHER states keep the
+  // generic tree-state hint". #386 established that hint was wrong for those states too (it
+  // recommends a rollback on a host where nothing measured says the tree is the problem), so the
+  // control can no longer be "it still says roll back". What the control is actually FOR survives
+  // unchanged: F1's cell must not swallow a probe that ran. That is now asserted directly —
+  // different headline, different disposition — and it is a strictly stronger check than matching
+  // one string, because it fails if F1's arm widens in either direction.
   const run = _u347Runner({});
   let caught = null;
   try { await runUpgrade(_u347Opts({ execFn: run, mockProbe: _u347Unreachable })); }
@@ -6224,8 +6233,15 @@ test("#347 F1 control: a probe that genuinely RAN and said no keeps the original
 
   assert.ok(caught);
   assert.match(caught.message, /post-flight failed/);
-  assert.ok(/^Working tree may be at new version/.test(caught.hint),
-    `a genuine remote failure keeps the pre-#347 hint; got hint=${JSON.stringify(caught.hint)}`);
+  assert.ok(!/^THE UPGRADE MAY HAVE SUCCEEDED/.test(caught.hint),
+    `a probe that RAN must not get F1's local-fault headline; got hint=${JSON.stringify(caught.hint)}`);
+  assert.ok(/^THE UPGRADE IS NOT CONFIRMED/.test(caught.hint),
+    `it must get the neutral verdict's own headline; got hint=${JSON.stringify(caught.hint)}`);
+  // And the tree state is still reported — demoted, not deleted. #386's remedy was to stop
+  // LEADING with it, and a control that only checked the headline would pass just as well if the
+  // rollback option had been dropped entirely, which is not what was asked for.
+  assert.ok(/ocp update --rollback/.test(caught.hint),
+    `the rollback is demoted, not removed; got hint=${JSON.stringify(caught.hint)}`);
 });
 
 test("#347 F5: on systemd the recovery hint leads with `reset-failed`, because this PR's own retries can trip the start limit", async () => {
@@ -8863,6 +8879,13 @@ const _u373Category = (o) => {
 // fall to its neutral verdict, because that verdict already says "run `ocp doctor`", while the
 // forward path's said "run `ocp update --rollback`", which cannot clear a degraded status (#381 F2).
 //
+// #386 removed that REASON without removing the divergence: the forward path's neutral verdict now
+// says `ocp doctor` too, so the cell is no longer load-bearing for the reason it was added. It is
+// kept (it explains why a rollback cannot clear a degraded status, which a catch-all cannot), so
+// this pin still describes the code — but a reviewer reading it should know the justification
+// moved from "the neutral arm is wrong for this state" to "the cell says more than the neutral arm
+// can", and that deleting the cell is now a defensible change rather than a regression.
+//
 // Encoded as an expected PAIR rather than as an exemption: if either side changes — the forward
 // path losing its cell, or the rollback path gaining one — this fires. Skipping the case would have
 // made the guard blind to exactly the state that produced the finding.
@@ -9016,6 +9039,169 @@ test("#373 (fail closed): a probe that did NOT confirm can never produce a succe
   }
   assert.equal(checked, Object.keys(probes).length * 4,
     `harness premise: every probe x lane x restart-state combination must have been exercised; got ${checked}`);
+});
+
+// ── #386: `ocp update`'s NEUTRAL post-restart verdict must not recommend a rollback ────────────
+//
+// #381 F1 added `probe-failed-unclassified` so the probe classifier's own `else` would stop
+// driving an assertive verdict. It did — but the new kind then fell through every cell into
+// runFullUpgrade's neutral verdict, which threw a BARE `new Error("post-flight failed")` and let
+// the function's `catch` attach the generic TREE-state hint: "Working tree may be at new version.
+// Run `ocp update --rollback` to restore from snapshot." One thrown error, two contradictory
+// dispositions about one measurement — and the hint is the half the operator reads.
+//
+// WHY THE FIX IS AT THE DESTINATION AND NOT AT THE KIND. #386 offered two remedies and preferred
+// (b), fixing the neutral verdict, over (a), giving `probe-failed-unclassified` a cell of its own.
+// The measurement is what settles it: driven end to end through `runUpgrade`, the neutral arm is
+// the destination for SEVEN probe outcomes, not one. Since #372/#381 re-keyed DOWN onto positive
+// evidence, every restart-failure arm also requires `restartFailure` — so with the restart
+// commands all exiting 0, `unreachable`, `timeout`, `http-error`, `unparseable`, `body-not-ocp`,
+// `version-mismatch` and `probe-failed-unclassified` all land here, and all seven printed the
+// identical two lines recommending a rollback. Remedy (a) would have fixed one of them.
+//
+// The tests below are therefore keyed on the CLASS: the invariant is that no post-flight failure
+// inherits the tree-state hint, on any probe outcome, in either restart state.
+console.log("\n#386 — the neutral post-restart verdict (fix the destination, not the kind):");
+
+// Keyed by what the probe DOES, never by which arm it lands in — a table written from the ladder
+// would shrink silently the next time the ladder is re-keyed, which is the exact way #386's state
+// went unnoticed twice.
+const _u386Probes = {
+  "empty reply (curl 52)": () => { throw Object.assign(new Error("curl: (52) Empty reply from server"), { status: 52 }); },
+  "unreachable (curl 7)":  _u347Unreachable,
+  "timeout (curl 28)":     () => { throw Object.assign(new Error("curl: (28) timed out"), { status: 28 }); },
+  "http error (curl 22)":  () => { throw Object.assign(new Error("curl: (22) 503"), { status: 22 }); },
+  "no curl (127)":         () => { throw Object.assign(new Error("sh: curl: command not found"), { status: 127 }); },
+  "unparseable body":      () => { throw new SyntaxError("nope"); },
+  "no version field":      () => ({ status: "ok", auth: { ok: true } }),
+  "wrong version":         () => ({ status: "ok", auth: { ok: true }, version: "9.9.9" }),
+  "degraded, right ver":   () => ({ status: "degraded", auth: { ok: true }, version: "3.14.0" }),
+};
+// The hint the `catch` attaches when a throw site set none. Anchored: the point is which sentence
+// LEADS, and an unanchored match would also fire on the demoted mention at the end of the fix.
+const _U386_TREE_HINT = /^Working tree may be at new version/;
+const _u386Drive = async (probe, restartFails) => {
+  const spec = restartFails ? { "launchctl bootstrap": Infinity } : {};
+  try { return { ok: true, result: await runUpgrade(_u347Opts({ execFn: _u347Runner(spec), mockProbe: probe })) }; }
+  catch (e) { return { ok: false, err: e }; }
+};
+
+test("#386 (the money test): the state #386 measured — unclassifiable probe + restart FAILED — must not headline a rollback", async () => {
+  const o = await _u386Drive(_u386Probes["empty reply (curl 52)"], true);
+  assert.ok(!o.ok, "an unconfirmed post-flight is never a success");
+  const caught = o.err;
+
+  // PREMISE, asserted rather than assumed: this is only #386's row if the probe really was
+  // classified as unclassifiable AND a restart command really failed. Without both, everything
+  // below would be measuring some other cell and passing for the wrong reason.
+  const pf = (caught.phases || []).find(p => p.name === "post-flight");
+  assert.ok(pf && pf.status === "fail" && /cannot classify/.test(pf.message || ""),
+    `premise: the probe must land in #381 F1's unclassified kind; got ${JSON.stringify(pf)}`);
+  assert.ok((caught.phases || []).some(p => p.name === "restart" && p.status === "fail"),
+    `premise: a restart command must have failed; got ${JSON.stringify((caught.phases || []).map(p => [p.name, p.status]))}`);
+
+  assert.ok(!_U386_TREE_HINT.test(caught.hint || ""),
+    `#386: an unclassifiable probe must not headline "run \`ocp update --rollback\`" — that is not ` +
+    `evidence the tree is what is wrong; got hint=${JSON.stringify(caught.hint)}`);
+  assert.match(caught.hint || "", /ocp doctor/,
+    `it must name the step that can actually answer the question; got hint=${JSON.stringify(caught.hint)}`);
+  // The CLI prints `e.message` and never a phase's `message`, so the message has to carry the
+  // disposition too — this is the line an operator sees first.
+  assert.match(caught.message, /run `ocp doctor` before assuming the upgrade landed/,
+    `the message the CLI prints must say what to do; got message=${JSON.stringify(caught.message)}`);
+
+  // "Demoted" is an ORDERING, so it is asserted as one rather than as the presence of a word.
+  const doctorAt = caught.hint.indexOf("ocp doctor");
+  const rollbackAt = caught.hint.indexOf("ocp update --rollback");
+  assert.ok(rollbackAt > doctorAt && doctorAt !== -1,
+    `the rollback must come AFTER the diagnosis, not before it; doctorAt=${doctorAt} ` +
+    `rollbackAt=${rollbackAt} hint=${JSON.stringify(caught.hint)}`);
+  assert.ok(rollbackAt !== -1,
+    `and it must still be OFFERED — demoted, not deleted; got hint=${JSON.stringify(caught.hint)}`);
+
+  // #372 recorded "the hint no longer names the restart failure" as the accepted cost of NOT
+  // giving this state a cell. Fixing the destination removes that cost as well, so it is pinned.
+  assert.match(caught.hint, /restart command also failed after 3 attempts/,
+    `the restart failure must be named here; got hint=${JSON.stringify(caught.hint)}`);
+});
+
+test("#386 (the class, not the kind): NO post-flight failure inherits the tree-state hint — every probe outcome, both restart states", async () => {
+  // This is the test that distinguishes remedy (b) from remedy (a). Under (a) — a cell for
+  // `probe-failed-unclassified` — exactly one row of this sweep would pass.
+  const neutral = new Set();
+  let rows = 0;
+  for (const restartFails of [true, false]) {
+    for (const [name, probe] of Object.entries(_u386Probes)) {
+      const label = `${name}/restartFails=${restartFails}`;
+      const o = await _u386Drive(probe, restartFails);
+      // Premise per row: the post-flight really did fail, or the row proves nothing.
+      const phases = (o.ok ? o.result : o.err).phases || [];
+      const pf = phases.find(p => p.name === "post-flight");
+      assert.ok(pf && pf.status === "fail", `${label} premise: post-flight must have FAILED; got ${JSON.stringify(pf)}`);
+      assert.ok(!o.ok, `${label}: an unconfirmed post-flight must throw`);
+      const hint = o.err.hint || "";
+      assert.ok(!_U386_TREE_HINT.test(hint),
+        `${label}: a post-flight failure must never inherit the generic tree-state hint — every arm ` +
+        `of the ladder sets its own; got hint=${JSON.stringify(hint)}`);
+      if (/^THE UPGRADE IS NOT CONFIRMED/.test(hint)) {
+        neutral.add(label);
+        const doctorAt = hint.indexOf("ocp doctor");
+        const rollbackAt = hint.indexOf("ocp update --rollback");
+        assert.ok(doctorAt !== -1 && rollbackAt > doctorAt,
+          `${label}: the neutral verdict must diagnose before it offers a rollback; got hint=${JSON.stringify(hint)}`);
+      }
+      rows++;
+    }
+  }
+  assert.equal(rows, Object.keys(_u386Probes).length * 2, `harness premise: every row must have run; got ${rows}`);
+
+  // NON-VACUITY, and the pin that makes ladder movement visible. Written as the exact measured set
+  // rather than as a count: if a future cell claims one of these, or a re-keying sends a new state
+  // here, this list changes and the change has to be looked at — which is precisely what did NOT
+  // happen the two times a state fell through into this arm unnoticed (#372, then #381).
+  const expected = [
+    "empty reply (curl 52)/restartFails=true",
+    "empty reply (curl 52)/restartFails=false",
+    "unreachable (curl 7)/restartFails=false",
+    "timeout (curl 28)/restartFails=false",
+    "http error (curl 22)/restartFails=false",
+    "unparseable body/restartFails=false",
+    "no version field/restartFails=false",
+    "wrong version/restartFails=false",
+  ].sort();
+  assert.deepEqual([...neutral].sort(), expected,
+    `the set of states reaching the NEUTRAL verdict changed. That is not automatically wrong — a ` +
+    `new cell legitimately removes one, and a re-keyed arm legitimately adds one — but it is never ` +
+    `to be updated without reading the new arm's hint, because #386 exists twice over for exactly ` +
+    `this going unread. Also: it is SEVEN probe outcomes, not one, which is why the fix is at the ` +
+    `destination rather than at the kind.`);
+});
+
+test("#386 control: a failure BEFORE the service was touched still gets the tree-state hint", async () => {
+  // Without this the sweep above is satisfiable by deleting the generic hint outright, which would
+  // "pass" while removing the correct advice from the case it was written for. `setup.mjs
+  // --reconfigure-only` is the LAST step before the restart phase, so it is the tightest boundary
+  // available for "the tree changed and the service was never disturbed".
+  //
+  // #347's own `npm install` test asserts the same property one phase earlier; both are kept —
+  // that one guards the retry's scope, this one guards this hint's remaining domain.
+  const run = _u347Runner({ "setup.mjs": Infinity });
+  let caught = null;
+  try { await runUpgrade(_u347Opts({ execFn: run, mockProbe: _u347Healthy })); }
+  catch (e) { caught = e; }
+
+  assert.ok(caught, "a failed reconfigure must abort the upgrade");
+  assert.match(caught.message, /phase reconfigure failed/);
+  // Premise: the service really was never touched, or "before the service was touched" is not what
+  // this row measures.
+  assert.equal(run.calls.filter(c => c.includes("launchctl")).length, 0,
+    `premise: no restart command may have run; got calls=${JSON.stringify(run.calls)}`);
+  assert.ok(!(caught.phases || []).some(p => p.name === "post-flight"),
+    `premise: the post-flight must never have run; got ${JSON.stringify((caught.phases || []).map(p => p.name))}`);
+
+  assert.ok(_U386_TREE_HINT.test(caught.hint || ""),
+    `a pre-service failure keeps the tree-state hint — #386 narrowed this hint's domain, it did not ` +
+    `delete it; got hint=${JSON.stringify(caught.hint)}`);
 });
 
 // ── #262 SECURITY (same shape as #257's injection, on the rollback path) ───────────────────────

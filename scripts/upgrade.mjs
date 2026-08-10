@@ -1146,10 +1146,13 @@ export const RESTART_VERDICT = {
   // Every restart command exited 0 and the probe could not RUN here.
   PROBE_LOCAL_FAULT: "probe-local-fault",
   // The probe reached the proxy, it is serving the expected version, and it rejected itself on
-  // `status`. #381 F2: this needed its own verdict because the two paths' NEUTRAL verdicts differ in
-  // a way that matters here — the rollback path's says `ocp doctor`, the forward path's says roll
-  // back, and a rollback cannot clear a degraded status. Both callers receive this verdict; only
-  // `runFullUpgrade` gives it its own sentence, because only its neutral arm was wrong for it.
+  // `status`. #381 F2: this needed its own verdict because the two paths' NEUTRAL verdicts differed
+  // in a way that mattered here — the rollback path's said `ocp doctor`, the forward path's said
+  // roll back, and a rollback cannot clear a degraded status. PAST TENSE since #386: both neutral
+  // verdicts now say `ocp doctor`, so this verdict is no longer LOAD-BEARING for that reason. It is
+  // kept because the forward path's cell still says more than a catch-all can (why a rollback
+  // cannot clear a degraded status at all); the asymmetry is unchanged and #373's anti-drift guard
+  // pins both halves of it.
   NOT_OK_STATUS: "not-ok-status",
   // The probe ran and did not confirm, and nothing above claims to know why. Claims NOTHING about
   // reach — this is where `probe-failed-unclassified` lands (#381 F1: the probe classifier's own
@@ -1790,13 +1793,12 @@ async function runFullUpgrade({ doctor, opts }) {
     // rollback path cannot say). #373 extracts the shared ordering.
     //
     // DOWN now requires POSITIVE evidence of non-reach. Anything the classifier did not produce one
-    // of these kinds for — notably `not-ok-status`, a degraded proxy already serving the target —
-    // falls through to the neutral post-flight failure below, which claims nothing about reach and
-    // carries the pre-#347 tree-state hint. That is deliberate and it costs one thing, stated so a
-    // reviewer can weigh it: in that state the HINT no longer names the restart failure. The fact
-    // survives where it always was — the `restart` phase carries `status: "fail"` with the command
-    // and its stderr, and the `[restart]` lines are already on stderr — and inventing a sixth cell
-    // to restate it would put wording ahead of the measurement, which is what #372 is about.
+    // of these kinds for falls through to the neutral post-flight failure below, which claims
+    // nothing about reach. #372 stated the cost of that as "the HINT no longer names the restart
+    // failure", and #386 measured a second, larger one it had not: the neutral arm inherited the
+    // generic TREE-state hint from the `catch`, so every one of those states recommended a
+    // rollback. The neutral arm now carries its own hint, which does name the restart failure when
+    // there was one — so neither cost stands, and neither needed a per-kind cell to remove.
     //
     // ISSUE #373. The classification and its ORDERING now live in `classifyRestartOutcome`, shared
     // with `runRollback`. What stays here is the wording, which genuinely differs between the two
@@ -1931,8 +1933,12 @@ async function runFullUpgrade({ doctor, opts }) {
 
     if (verdict === RESTART_VERDICT.NOT_OK_STATUS) {
       // #381 review finding F2. WITHOUT this cell the state fell to the neutral arm below, whose
-      // hint is "Working tree may be at new version. Run `ocp update --rollback` to restore from
-      // snapshot." Measured state when it fired: /health answers 200 with
+      // hint WAS "Working tree may be at new version. Run `ocp update --rollback` to restore from
+      // snapshot." — past tense since #386 fixed that arm's hint, and the cell is KEPT rather than
+      // reverted: it says more than the neutral arm can (why a rollback cannot clear a degraded
+      // status at all), and removing a cell is a separate change with its own risk. What #386 did
+      // remove is the NEED for it; #373's anti-drift guard pins the resulting divergence either
+      // way. Measured state when it fired: /health answers 200 with
       // `{status:"degraded", version:"<the version this upgrade just installed>"}`.
       //
       // So the operator was told to roll back a proxy that is serving exactly the right code, and
@@ -1971,12 +1977,61 @@ async function runFullUpgrade({ doctor, opts }) {
     // rather than left as an unreported green, per AGENTS.md/#376 — an unreported green mutation is
     // indistinguishable from one nobody ran.
     if (verdict !== RESTART_VERDICT.OK && verdict !== RESTART_VERDICT.WARNED_SUCCESS) {
-      // Restart commands all succeeded and the probe genuinely ran and said no (orphan holding the
-      // port, wrong version serving, ...). Unchanged pre-#347 behaviour, including the generic
-      // tree-state hint from the catch below, which is correct for this cell — it is reached only
-      // when nothing above could say what happened, and "the tree may be at the new version" is
-      // then the one thing still true.
-      throw new Error("post-flight failed");
+      // ISSUE #386. This arm used to throw a BARE `new Error("post-flight failed")` and let the
+      // `catch` below attach the generic TREE-state hint: "Working tree may be at new version. Run
+      // `ocp update --rollback` to restore from snapshot." That hint is written for a failure
+      // BEFORE the service was touched — a failed `git checkout`, a failed `npm install` — where
+      // the tree really is the only thing in doubt. Inheriting it here is what #386 measured, and
+      // the destination is what #386 asks to be fixed rather than the one kind that reached it:
+      // patching the kind (remedy (a)) leaves this arm wrong for whatever kind is added next, which
+      // has now happened twice (#372's `not-ok-status`, then #381's `probe-failed-unclassified`).
+      //
+      // HOW BIG THE FALL-THROUGH ACTUALLY IS, measured end to end through `runUpgrade` rather than
+      // reasoned from the ladder — and it is six kinds, not one. Since #372/#381 re-keyed DOWN onto
+      // POSITIVE evidence, every restart-failure arm above also requires `restartFailure`, so with
+      // the restart commands all exiting 0 this arm is the destination for `unreachable`, `timeout`,
+      // `http-error`, `unparseable`, `body-not-ocp`, `version-mismatch` AND
+      // `probe-failed-unclassified`. All seven printed, verbatim and identically:
+      //
+      //     ✗ post-flight failed
+      //        hint: Working tree may be at new version. Run `ocp update --rollback` to restore …
+      //
+      // A rollback is the wrong move in most of them (it cannot free a port a foreign process
+      // holds, and it cannot clear an unclassifiable probe fault), and the CLI prints `e.message`,
+      // `snapshot`, `target` and `hint` — never a phase's `message` — so the classification the
+      // post-flight phase carries never reaches the operator at all. Seven measurements, one
+      // sentence, and that sentence recommends a rollback.
+      //
+      // WHAT THIS ARM MAY SAY, and why it is worded from the population rather than from the kind:
+      // a catch-all may only assert what is true of every member. Three things are:
+      //   - the probe did not confirm the service is serving the new version;
+      //   - the tree IS at the new version (phases 3–4 completed, or we would not be here);
+      //   - NOTHING measured here establishes that the tree is what is wrong, so nothing here
+      //     warrants a rollback.
+      // So the disposition mirrors `runRollback`'s neutral verdict — `ocp doctor` first — and the
+      // rollback is DEMOTED to a trailing sentence, the same demotion the DOWN cell above already
+      // performs with "Then, and only then, consider the working tree".
+      //
+      // The measurement is named with the classifier's RAW `detail`, deliberately NOT with
+      // `postFlightFailureSuffix`: that helper's `default:` arm narrates an unrecognised kind as
+      // " (unreachable — …)", a claim about REACH. Rendering it here would re-import #386's own
+      // shape into the one arm whose entire job is to claim nothing — the next unnamed kind would
+      // arrive pre-narrated as a dead proxy. `detail` carries no disposition, so it cannot.
+      const measured = postFlight?.lastFailure?.detail ? ` — ${postFlight.lastFailure.detail}` : "";
+      throw Object.assign(
+        new Error(`post-flight failed: the upgraded tree may not be what's running — run \`ocp doctor\` before assuming the upgrade landed`),
+        { phases, snapshotPath,
+          hint: `THE UPGRADE IS NOT CONFIRMED${measured}. `
+            + `${restartFailure ? `A restart command also failed after ${restartFailure.attempts} attempts, so the service may be DOWN; if it is, bring it back with: ${recoveryCmds}  ` : ""}`
+            + `Run \`ocp doctor\` before assuming the upgrade landed, and check what is actually `
+            + `answering (\`curl -sf http://127.0.0.1:${port}/health\`).`
+            // Guarded by construction against an absent target (#372): returns "" rather than
+            // rendering `--post-flight-only v`, which degrades to a check that passes against ANY
+            // version — the precise hazard #381 F5 closed at the CLI, arriving through a hint.
+            + postFlightRecheckClause(postFlight.target, { prefix: " Re-check with" })
+            + ` Only then is the working tree worth considering: it is at the new version, and `
+            + `\`ocp update --rollback\` restores the previous one from the snapshot.` }
+      );
     }
 
     if (verdict === RESTART_VERDICT.WARNED_SUCCESS) {
@@ -2028,10 +2083,20 @@ async function runFullUpgrade({ doctor, opts }) {
     return { path: "upgrade", executed: true, changed: true, snapshotPath, phases, target: upgradeTarget };
   } catch (err) {
     // Issue #347: `hint` is now set at the throw site for the restart-failure cells, and that
-    // hint leads with SERVICE state. This generic one is about TREE state — correct for a failed
-    // checkout or a failed post-flight, and exactly the wrong headline when the proxy is down.
+    // hint leads with SERVICE state. This generic one is about TREE state.
     // `err.hint ||` is what stops it overwriting the specific one; the `!err.snapshotPath` guard
     // above cannot be relied on for that, since a caller could set one without the other.
+    //
+    // ISSUE #386 narrowed what "correct for" means here, and the previous wording ("correct for a
+    // failed checkout or a failed post-flight") is exactly the claim that turned out to be false.
+    // EVERY arm of the post-restart verdict ladder above now sets its own hint, so this one is
+    // reached only by a failure BEFORE the service was touched — a failed `git fetch`/`checkout`,
+    // a failed `npm install`, a failed `setup.mjs --reconfigure-only`, or a restart plan that
+    // could not be resolved. In all of those the tree genuinely is the thing in doubt and the
+    // service was never disturbed, which is what makes "run `ocp update --rollback`" the right
+    // headline. It stopped being right the moment a POST-FLIGHT failure inherited it, because by
+    // then the tree is known-good and the service is the unknown. That invariant — no post-flight
+    // failure reaches this hint — has its own test; #347's `npm install` test is its control.
     if (snapshotPath && !err.snapshotPath) {
       Object.assign(err, {
         snapshotPath,
