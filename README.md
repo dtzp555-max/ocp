@@ -264,7 +264,7 @@ The canonical list lives in [`models.json`](./models.json) — the single source
 | `OCP_TUI_ENTRYPOINT` | `cli` | (TUI-mode) Billing-classifier labeling: `cli` pins `cc_entrypoint=cli`; `auto` self-classifies via TTY; `off` leaves inherited env untouched. See [docs/tui-mode.md](docs/tui-mode.md#tui-entrypoint). |
 | `OCP_TUI_EFFORT` | `low` | (TUI-mode) `--effort` level for the interactive spawn (`low`/`medium`/`high`/`xhigh`/`max`/`inherit`). Explicit `low` cuts TTFT p50 ~40% vs an inherited `xhigh`; invalid values fall back to `low`. See [docs/tui-mode.md](docs/tui-mode.md#tui-other-vars). |
 | `OCP_TUI_STREAM` | `0` (off) | (TUI-mode) `=1` emits real SSE `delta.content` chunks (block-level) from claude's `MessageDisplay` hook instead of buffering; transcript stays authoritative and divergent turns are refused. Caveats (tool-using turns, zero-delta detection) in [docs/tui-mode.md § `OCP_TUI_STREAM`](docs/tui-mode.md#ocp-tui-stream). |
-| `OCP_INSTANCE_NAME` | *(empty)* | Operator label for a NON-primary instance, reported on `/health` as `instanceName`. Empty means the primary. Nothing in OCP branches on the value — it exists so a second instance on the same host is discoverable rather than indistinguishable from a leftover duplicate. |
+| `OCP_INSTANCE_NAME` | *(empty)* | Operator label for a NON-primary instance, reported on `/health` as `instanceName`. Empty means the primary. The **server** never branches on the value; `ocp doctor` reads the declaration off the unit file to tell a deliberate second instance from a leftover duplicate — see § "Running more than one instance on a host". |
 | `OCP_TUI_STREAM_HOLDBACK` | `100` | (TUI-mode, streaming) Characters withheld before the first chunk — keeps the auth-banner gate alive and is the knob for tool-using turns. See [docs/tui-mode.md § `OCP_TUI_STREAM_HOLDBACK`](docs/tui-mode.md#ocp-tui-stream-holdback). |
 | `OCP_TUI_STREAM_DIR` | `$HOME/.ocp-tui/stream` | (TUI-mode, streaming) Directory for the hook script/settings + per-session delta sink (one sink per session-id, so concurrent turns never interleave). See [docs/tui-mode.md](docs/tui-mode.md#ocp-tui-stream). |
 | `OCP_TUI_STREAM_POLL_MS` | `100` | (TUI-mode, streaming) Interval at which OCP drains the delta sink; the hook fires at block granularity so a finer poll buys nothing. See [docs/tui-mode.md](docs/tui-mode.md#ocp-tui-stream). |
@@ -323,7 +323,17 @@ The name appears on `/health` as `instanceName` (empty string on the primary), s
 **Two things this convention exists to prevent**, both of which happened:
 
 - A version sweep that probes only `:3456` reports the fleet clean while a second instance sits a release behind. Enumerate declared instances, not hosts.
-- `ocp doctor`'s multi-unit check cannot tell a deliberate second instance from a leftover duplicate, so it warns on a correct configuration every run — and a warning that always fires is one people learn to skip. (Teaching `doctor` to read the declaration is not done yet; see issue #327.)
+- `ocp doctor`'s multi-unit check could not tell a deliberate second instance from a leftover duplicate, so it warned on a correct configuration every run — and a warning that always fires is one people learn to skip. On the host that reported this, a genuine leftover duplicate was sitting next to the intended instance and the permanent false alarm is what buried it.
+
+**What `ocp doctor` does with the declaration.** The multi-unit check reads `OCP_INSTANCE_NAME` **from each unit file** — `Environment=` on systemd, the `EnvironmentVariables` dict in a launchd plist — never from `/health`. That is deliberate: `doctor` runs before and around a restart, and a leftover duplicate is typically *enabled but not running*, so the live endpoint cannot see the one thing the check exists to find. A host's enabled OCP units are **resolved** when every unit is distinguishable from every other by both the port it binds and the identity it claims. On a host with **more than one** enabled OCP unit, `doctor` then reports one of three things (a host with one unit, or none, says nothing — the question never arises):
+
+| What it finds | What it says |
+|---|---|
+| Two or more units on the **same port** | WARN — a boot race, exactly as before. A declaration never silences this: two processes cannot share a port however well they are labelled. |
+| Two or more units claiming the **same identity** on different ports | WARN — undeclared multiplicity. Both can start, so nothing breaks loudly; the host simply cannot say which is intended. An absent `OCP_INSTANCE_NAME` **is** a claim to be the primary, so two undeclared units collide here. |
+| Every unit distinct on both | INFO — a one-line inventory (`"ocp.service" :3456 (primary), "ocp-wifibot.service" :3457 ("wifibot")`), so "verified correct" and "nothing looked" are not the same silence. |
+
+Declaring the extra instance is therefore the cheaper of the two remedies — it costs one `Environment=` line and loses nothing — and disabling the unit you did not want is the other. `doctor` nominates neither: which one is intended is not something it can know.
 
 ### Streaming heartbeat
 

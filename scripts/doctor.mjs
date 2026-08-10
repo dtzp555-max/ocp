@@ -112,6 +112,92 @@ function semverCompare(a, b) {
 // outside the process, not just internally. See classifyMultiUnitRisk's
 // null-vs-"" discipline below, which mirrors restart-unit.mjs's own "ss
 // returned nothing we could parse" vs "ss never ran" distinction.
+//
+// ─── Issue #327: telling a DECLARED second instance from a leftover duplicate ───
+//
+// The check above was written before OCP had any way for an instance to say who
+// it is, so multiplicity and duplication were the same observation. `OCP_INSTANCE_NAME`
+// (server.mjs's INSTANCE_NAME, surfaced on /health as `instanceName`, shipped v3.29.0) is the
+// discriminator that was missing. This section reads it.
+//
+// WHERE THE DECLARATION IS READ FROM, and why the other source was rejected.
+// Two sources exist and they answer different questions:
+//
+//   - `/health`.instanceName is the RUNTIME truth, and it is the wrong one here for
+//     three independent reasons, any one of which is disqualifying. (a) This check's
+//     stated question is STATIC — "which units WOULD start at boot" (see the module
+//     comment above: "reading unit-file config ... never a live PID"). (b) doctor runs
+//     before and around a restart, so an instance may legitimately not be answering;
+//     an answer that changes depending on whether the host is mid-upgrade is not an
+//     answer. (c) Decisively: a leftover duplicate unit is typically ENABLED BUT NOT
+//     RUNNING — it lost the last boot race, or was superseded and never started. It
+//     has no /health to read. So the one source that can see the defect this check
+//     exists to find is the unit file, and the one that cannot is /health. Probing it
+//     would also cost one extra subprocess per candidate port.
+//   - The unit's own `Environment=` / the plist's `EnvironmentVariables` is the
+//     operator's declared INTENT, is present whether the instance is up or down, and
+//     — because `systemctl show -p Environment` is ALREADY in this check's single
+//     batched call — costs zero additional spawns. It is also the same property the
+//     port and bind address are already read from, so the declaration is established
+//     at exactly the authority level of the thing it qualifies.
+//
+// So: unit config, exclusively. There is deliberately NO precedence rule and no
+// /health fallback — a rule of the form "read the unit, else ask /health" would make
+// the verdict depend on whether the host happened to be mid-restart, which is the
+// static-vs-live confusion the module comment above already guards against.
+//
+// WHAT COUNTS AS "DECLARED". A set of enabled OCP units is RESOLVED when every unit
+// is distinguishable from every other by BOTH the identity it claims AND the port it
+// will bind. Anything else is undeclared multiplicity:
+//
+//   - two units on the SAME PORT are never resolved, whatever they declare — only one
+//     process can hold a port, so this stays exactly the warning it was before #327.
+//     A declaration must never be able to silence it, and by construction it cannot:
+//     the port grouping below is computed before, and independently of, any name.
+//   - two units claiming the SAME IDENTITY are not resolved either, even on different
+//     ports. This is the case #327 reports and the case this check previously could
+//     not see at all: a leftover duplicate sitting next to the intended instance, on
+//     its own port, invisible because "different ports are never a boot race" was true
+//     and complete only while there was nothing else to say about them.
+//
+// ABSENT vs EXPLICITLY EMPTY. `instanceName` is `string | null`: `null` means the unit
+// declares no OCP_INSTANCE_NAME at all, `""` means it declares one and it is empty.
+// The two are collapsed in some places and kept apart in others, and the asymmetry is
+// the point. The places that collapse them are ENUMERATED below rather than bounded by
+// a "nowhere else" — an earlier revision of this comment claimed the fold happened in
+// exactly ONE place, independent review found the second, and no mutation can prove a
+// universal negative anyway, which is what AGENTS.md's 4022be4 asks of a claim like it:
+//
+//   COLLAPSED (2 places, both deliberate):
+//   1. claimedInstance(), the identity key for the DISTINCTNESS TEST — the only fold in
+//      the conflict analysis, and the only one that can change a verdict. Pinned by M2.
+//      Collapsed because README § "Running more than one instance on a host" defines an
+//      empty value as the primary and requires only the SECOND instance to declare
+//      itself. Absence and "" are therefore the same CLAIM — "I am the primary" — and
+//      two units making it is unresolved regardless of which spelling each used. A
+//      branch that treated absence as "nothing to compare" would be a predicate
+//      satisfied by a missing operand, the defect shape this repo keeps shipping
+//      (AGENTS.md, PR #371).
+//   2. describeDeclaredInstances()'s `(primary)` rendering. Not a verdict and not an
+//      exception to the rationale below: it renders the CLAIM, never an
+//      `OCP_INSTANCE_NAME=""` directive nobody wrote, and it is reachable ONLY in the
+//      `declared` state, where identityGroups is empty and therefore AT MOST ONE unit
+//      can claim the primary — so there are never two `(primary)` entries to tell apart
+//      and nothing is lost by not distinguishing them.
+//
+//   KEPT APART: the parsed model (`string | null`), describeDeclaration()'s three
+//   renderings, and both WARN messages — because there the operator's next move differs
+//   ("declare the one you meant to be extra" vs "you already edited this file — one of
+//   these two edits is wrong"), and because rendering an absence as
+//   `OCP_INSTANCE_NAME=""` would assert a directive nobody wrote.
+//
+// The value is `.trim()`ed to mirror server.mjs's INSTANCE_NAME exactly, so this check models what
+// the server will actually do with the string rather than what the file literally says.
+// That citation names the SYMBOL, not a line: it was written as `server.mjs:429`, which was
+// right at v3.29.0 and wrong by two lines before this PR merged, because #395 removed the dead
+// session surface above it. `grep -n INSTANCE_NAME server.mjs` survives the next shift; a
+// corrected number only survives until the one after that. Same lesson as PR #391's, applied
+// to a line number instead of a count.
 // ═══════════════════════════════════════════════════════════════════════════
 
 const UNIT_NAME_RE = /^[A-Za-z0-9:_.@-]+\.service$/;
@@ -236,7 +322,25 @@ function fingerprintSystemdUnit(props, scope) {
   const bindMatch = env.match(/CLAUDE_BIND=(\S+)/);
   const bind = bindMatch ? bindMatch[1].replace(/^"|"$/g, "") : "(default bind)";
 
-  return { name: props.Id, scope, platform: "linux", port, workingTree, bind };
+  return { name: props.Id, scope, platform: "linux", port, workingTree, bind, instanceName: parseSystemdInstanceName(env) };
+}
+
+// #327. `null` when the unit declares no OCP_INSTANCE_NAME at all; a (trimmed) string
+// when it declares one, INCLUDING the empty string. See the "ABSENT vs EXPLICITLY
+// EMPTY" paragraph in the module comment for why the two must stay distinct here even
+// though the distinctness test below folds them together.
+//
+// Two shapes, because `systemctl show -p Environment` quotes an assignment whose VALUE
+// contains whitespace by wrapping the WHOLE `KEY=VALUE` pair: `Environment="A=b c" D=e`.
+// The quoted form is tried first so a name with a space is read whole rather than
+// truncated at the space by the bare form's `\S*`. `\S*` (not `\S+`) is what lets the
+// explicitly-empty declaration match at all — `+` would read `OCP_INSTANCE_NAME=` as
+// "absent", collapsing exactly the distinction this function exists to preserve.
+// Anchored on start-of-string-or-whitespace so a longer key ending in the same letters
+// (`MY_OCP_INSTANCE_NAME=x`) can never be mistaken for this one.
+function parseSystemdInstanceName(env) {
+  const m = env.match(/(?:^|\s)"OCP_INSTANCE_NAME=([^"]*)"/) || env.match(/(?:^|\s)OCP_INSTANCE_NAME=(\S*)/);
+  return m ? m[1].trim() : null;
 }
 
 // macOS equivalent. setup.mjs only EVER writes one LaunchAgent
@@ -300,6 +404,15 @@ function parsePlistCandidates(plistBlob) {
       port: portMatch ? portMatch[1] : String(DEFAULT_PORT),
       workingTree,
       bind: bindMatch ? bindMatch[1] : "(default bind)",
+      // #327, launchd side of parseSystemdInstanceName. `<string></string>` and a
+      // self-closing `<string/>` are BOTH a declaration whose value is empty (plutil
+      // writes the former, a hand-written plist may carry the latter) — matching only
+      // the first would report a declared primary as undeclared. The alternation makes
+      // capture group 1 `undefined` for the self-closing form, hence the `?? ""`.
+      instanceName: (() => {
+        const m = content.match(/<key>OCP_INSTANCE_NAME<\/key>\s*(?:<string>([^<]*)<\/string>|<string\s*\/>)/);
+        return m ? (m[1] ?? "").trim() : null;
+      })(),
     });
   }
   return units;
@@ -346,18 +459,152 @@ function unionDisabledLabels(...blobs) {
   return union;
 }
 
-// Two-or-more units sharing the same PORT are the hazard (see the "Grouping
-// key" discussion in the module comment above — port alone, not port+tree).
-function groupAndAssessConflicts(units) {
-  if (units.length < 2) return { state: "clear" };
+function groupBy(units, keyFn) {
   const groups = new Map();
   for (const u of units) {
-    if (!groups.has(u.port)) groups.set(u.port, []);
-    groups.get(u.port).push(u);
+    const k = keyFn(u);
+    if (!groups.has(k)) groups.set(k, []);
+    groups.get(k).push(u);
   }
-  const conflicting = [...groups.values()].filter(g => g.length >= 2);
-  if (conflicting.length === 0) return { state: "clear" };
-  return { state: "warn", groups: conflicting };
+  return [...groups.values()];
+}
+
+// #327. The identity a unit CLAIMS, which is what the distinctness test compares.
+// An absent declaration and an explicitly-empty one are the same claim — "I am the
+// primary" — per README § "Running more than one instance on a host". See the module
+// comment's "ABSENT vs EXPLICITLY EMPTY" paragraph, which ENUMERATES the two places that
+// fold them: this one, and describeDeclaredInstances()'s `(primary)` rendering. This is the
+// only fold in the CONFLICT ANALYSIS — the only one that can change a verdict — which is a
+// narrower claim than the one that stood here through the first review round ("the ONLY
+// place the two values are treated alike"). That was simply false, and the way it was false
+// is the instructive part: it is a guaranteed-behaviour claim of the form 4022be4 says must
+// name the mutation proving it, and a universal negative has no such mutation. An
+// enumeration a reader can check beats a guarantee nobody can.
+//
+// The fold is pinned by M2, which is the mutation a careless implementation would actually
+// ship: `units.filter(u => u.instanceName !== null)` — a predicate satisfied by a missing
+// operand. Read it against M1 (identity analysis deleted outright): M2's red set is a strict
+// SUBSET of M1's, and the tests M2 SPARES are exactly those whose two units BOTH carry a
+// declaration, so M2's filter keeps them — "two units declaring the SAME name on different
+// ports", the classifier and runDoctor trust-boundary tests (both units share one hostile
+// name), and the runDoctor space-name test (both share "wifi bot"). That difference is the
+// evidence; either red set alone would only say "identity analysis is broken".
+//
+// The membership is the claim; the SIZE of that set is not, and the difference between those
+// two is why this sentence no longer says "the three". It said exactly that until review round
+// 2 added one test, at which point the set became four while the PROPERTY it expresses did not
+// move at all. A drifting count inside a claim that is otherwise stable is the same failure as
+// the citation two paragraphs down. No absolute totals here on purpose: the suite grows every release, and a bare
+// count with no base named cannot tell a later reader drift from a defect — the review finding
+// on PR #391, which landed recording the IDENTITY of every test that reddens plus a delta
+// against a named baseline, and recording the drift it measured rather than re-pinning past it.
+// Identities and a subset relation survive a growing suite; totals do not. This branch's own
+// base moved nine commits between the first measurement and the merge, which is the
+// demonstration rather than the hypothesis. The totals live in the PR body, next to the SHA.
+function claimedInstance(u) {
+  return u.instanceName ?? "";
+}
+
+// #327. Names outside this set are never echoed into a message. Same trust boundary as
+// UNIT_NAME_RE / LAUNCHD_LABEL_RE — an OCP_INSTANCE_NAME is writable by anyone who can
+// write a unit file, and README's own guidance is to hand `ocp doctor` output to an AI
+// agent. Note the difference from those two validators, and it is load-bearing: they
+// REJECT the whole candidate, which is safe there because a malformed Id/Label cannot
+// be used to address the unit anyway. Rejecting a candidate over its instance NAME
+// would DROP a unit out of the conflict analysis — i.e. silence a hazard by writing a
+// weird string into a file — so this sanitizes the RENDERING only. The raw value is
+// still what claimedInstance() compares, so a hostile name cannot hide a duplicate.
+// Both halves are pinned, by two different mutations: M10 (sanitizer removed) reddens the
+// runDoctor trust-boundary test — the name reaches the terminal; M6 (quoted parse form
+// dropped) reddens the classifier trust-boundary test through its premise assertion — the
+// name stops reaching the grouping logic at all. Neither test can pass for the other's
+// reason.
+//
+// THE SET EXCLUDES THE SPACE, and that is a deliberate consequence worth naming because it
+// looks like an inconsistency: parseSystemdInstanceName goes out of its way to read a name
+// containing a space WHOLE (systemd's quoted `Environment="K=v w"` form), and then this
+// refuses to echo it. Both are right, and they are answering different questions. Parsing
+// whole is a CORRECTNESS requirement — truncating "wifi bot" to "wifi" would invent a
+// collision between two units that do not collide. Echoing is a TRUST question, and the set
+// is an allowlist, so anything not positively known safe is withheld; a space is the cheapest
+// separator to smuggle an extra argument past a reader skimming a shell-looking line. The
+// operator still gets the finding, the unit name, the port and the length — everything except
+// the untrusted bytes. The message says "safe label set" and not "printable" because a space
+// IS printable; naming the set makes the message actionable rather than mysterious.
+const SAFE_INSTANCE_NAME_RE = /^[A-Za-z0-9._@:+-]{1,64}$/;
+
+function renderInstanceName(name) {
+  return SAFE_INSTANCE_NAME_RE.test(name)
+    ? `"${name}"`
+    : `<not echoed: ${name.length} chars outside the safe label set [A-Za-z0-9._@:+-], max 64>`;
+}
+
+// How one unit's declaration reads in a message. Three renderings for three distinct
+// observations — never two for three, because "no directive present" and "a directive
+// whose value is empty" are different things an operator did.
+function describeDeclaration(u) {
+  if (u.instanceName === null) return "no OCP_INSTANCE_NAME declared";
+  if (u.instanceName === "") return 'OCP_INSTANCE_NAME="" (the primary)';
+  return `OCP_INSTANCE_NAME=${renderInstanceName(u.instanceName)}`;
+}
+
+// How a shared CLAIM reads — the thing two units are colliding over.
+function describeClaim(identity) {
+  return identity === "" ? "the PRIMARY instance" : `instance ${renderInstanceName(identity)}`;
+}
+
+// Two-or-more units sharing the same PORT are the original hazard (see the "Grouping
+// key" discussion in the module comment above — port alone, not port+tree). Since #327
+// two-or-more units sharing the same claimed IDENTITY are a second, distinct one.
+//
+// The port analysis is computed FIRST and is untouched by any declaration, so this
+// function's warn set is a strict superset of its pre-#327 warn set: every input that
+// warned before still warns. That is a claim about behaviour, so it cites the mutations
+// that kill it (AGENTS.md): M3 lets a distinct declaration suppress a port collision, and
+// reddens exactly the two NO-SILENCING tests and nothing else; M4 collapses the port grouping
+// key to a constant so every unit lands in one group, and its whole red set is the pre-existing
+// different-ports test — which has asserted since #230 that distinct ports never form a group —
+// plus #327's own, with NO other pre-existing test reddening, which is what says that one test
+// is the only guard for the port axis. Named tests rather than totals, for the reason given
+// above claimedInstance.
+//
+// `groups` still means exactly "the port-collision groups" for scripts/upgrade.mjs's
+// describeSecondUnit, which reads it. Established BEHAVIOURALLY, not by grepping for
+// callers (ADR 0015 correction 3): test-features.mjs's #253 test drives the real gather
+// layer through runUpgrade and asserts the rollback phase names the second enabled unit.
+//
+// NEW SHAPE SINCE #327, spelled out so the next reader does not have to re-derive it:
+// `state: "warn"` can now carry an EMPTY `groups`, when the only finding is an identity
+// collision. That combination was unreachable before — a warn implied at least one port
+// group. describeSecondUnit is safe under it and is unchanged: `[].find(...)` is
+// `undefined`, its `if (!group) return null` arm takes over, and `null` there already
+// means "nothing more specific to say", never "confirmed no second unit". The behaviour
+// is also identical to before #327 for that input, because the same input returned
+// `"clear"` then, which describeSecondUnit's `state !== "warn"` guard also mapped to null.
+//
+// An identity group that is entirely CONTAINED in one port group is dropped rather
+// than reported twice: the field-incident shape (two undeclared units on one port) is
+// one hazard with two descriptions, and the port collision is the more urgent and more
+// specific of them. A partial overlap is NOT dropped — three units where two collide on
+// a port and all three claim the primary is genuinely two findings, and the operator
+// who fixes only the port collision still has an ambiguous host.
+function groupAndAssessConflicts(units) {
+  if (units.length < 2) return { state: "clear" };
+
+  const portGroups = groupBy(units, u => u.port).filter(g => g.length >= 2);
+  const identityGroups = groupBy(units, claimedInstance)
+    .filter(g => g.length >= 2)
+    .filter(g => !portGroups.some(p => g.every(u => p.includes(u))));
+
+  if (portGroups.length === 0 && identityGroups.length === 0) {
+    // #327: ≥2 enabled OCP units, every one distinguishable from every other by both
+    // port and declared identity. Distinct from "clear" (which now means "fewer than
+    // two units — the question never arose") so runDoctor can say so out loud: the
+    // whole point of the declaration is that a correct multi-instance host stops being
+    // indistinguishable from a broken one, and silence cannot carry that.
+    return { state: "declared", units };
+  }
+  return { state: "warn", groups: portGroups, identityGroups, units };
 }
 
 // Pure classifier: parses already-gathered raw command/file output into a
@@ -566,18 +813,57 @@ function buildNeutralDisableHint(group) {
 // hazard — plus whether the units share one working tree or point at
 // different ones, see the "Grouping key" discussion above), and a
 // platform-correct, reversible remediation command.
-function describeMultiUnitConflict(groups) {
-  return groups.map(group => {
+function describeMultiUnitConflict(groups, identityGroups = []) {
+  const portMessages = groups.map(group => {
     const port = group[0].port;
     const trees = [...new Set(group.map(u => u.workingTree))];
-    const names = group.map(u => `${u.scope}-scope "${u.name}" (bind ${u.bind})`).join(" and ");
+    const names = group.map(u => `${u.scope}-scope "${u.name}" (bind ${u.bind}, ${describeDeclaration(u)})`).join(" and ");
     if (trees.length === 1) {
       const treeNote = ` (same working tree: ${trees[0] || "(unresolved)"})`;
       return `${group.length} enabled units target OCP port ${port}${treeNote}: ${names} — boot race: whichever starts first wins the port and the other silently orphans (issue #215). Pick one and ${buildDisableHint(group)}.`;
     }
     const treeNote = ` — DIFFERENT working trees (${trees.map(t => t || "(unresolved)").join(" vs ")}): these are two SEPARATE OCP installs racing for the same port, not just drifted config on one install`;
     return `${group.length} enabled units target OCP port ${port}${treeNote}: ${names} — boot race: whichever starts first wins the port and the other silently orphans (issue #215). ${buildNeutralDisableHint(group)}.`;
-  }).join(" | ");
+  });
+  return [...portMessages, ...identityGroups.map(describeUndeclaredMultiplicity)].join(" | ");
+}
+
+// #327. The second hazard: units that do NOT contend for a port, but that nothing on
+// this host distinguishes from one another. Deliberately worded so it cannot be
+// mistaken for the boot-race message above — these units can all start and all bind,
+// which is precisely why the failure is quiet: a leftover duplicate serving stale code
+// on its own port looks exactly like a deliberate second instance, and the operator has
+// no way to tell which they are looking at. That ambiguity is what buried a real
+// duplicate on the host in issue #327.
+//
+// Nominates no unit to disable. Which one is intended is a judgement this check has no
+// basis for making — the same principle MED-7 (#230) established for the
+// different-working-trees case — so it offers the declaration as the first remedy
+// (nothing is lost, the ambiguity goes away) and every unit's disable command second.
+function describeUndeclaredMultiplicity(group) {
+  const identity = claimedInstance(group[0]);
+  const names = group
+    .map(u => `${u.scope}-scope "${u.name}" (port ${u.port}, tree ${u.workingTree || "(unresolved)"}, ${describeDeclaration(u)})`)
+    .join(" and ");
+  const options = group.map(u => `"${buildDisableCommand(u)}"`).join(" or ");
+  return `${group.length} enabled units all claim ${describeClaim(identity)} on different ports: ${names} — they do not race for a port, so both can start; nothing on this host says which is intended, which is exactly how a leftover duplicate hides next to a deliberate second instance (issue #327). Either declare the extra one (${group[0].platform === "darwin" ? "an OCP_INSTANCE_NAME entry in the plist's EnvironmentVariables dict" : "Environment=OCP_INSTANCE_NAME=<name> on its unit"}) or disable the one you do not want: ${options} (reversible either way — the losing unit's file/plist is preserved).`;
+}
+
+// #327. The positive report the issue asks for by name: "2 instances, both declared:
+// primary :<DEFAULT_PORT>, `wifibot` :<DEFAULT_PORT+1>". The issue writes those as bare
+// numbers; this comment does not, because `alignment.yml`'s port-literal SPOT job hard-fails
+// any port literal in source and it does not read comments differently from code — and that
+// gate exists for the 2026-05-08 incident this very file was half of. Pushed at INFO, and
+// only ever on a host that has more than one enabled OCP unit, so it is not a line every
+// host carries forever (the
+// LOW-3 lesson on #230). It exists because "verified resolved" and "nothing looked" are
+// otherwise the same silence from outside the process — the same argument MED-3.5 made
+// for surfacing "unknown", applied to the state that replaced the false alarm.
+function describeDeclaredInstances(units) {
+  const list = units
+    .map(u => `"${u.name}" :${u.port} (${u.instanceName === null || u.instanceName === "" ? "primary" : renderInstanceName(u.instanceName)})`)
+    .join(", ");
+  return `${units.length} enabled OCP units, all declared and distinct — no port collision and no repeated OCP_INSTANCE_NAME, so this is a deliberate multi-instance host rather than a leftover duplicate (issue #327): ${list}.`;
 }
 
 // Issue #289. ADR 0010 split the auth probe's outcomes into CONCLUSIVE (clean exit / non-zero
@@ -846,7 +1132,14 @@ export async function runDoctor(opts = {}) {
   if (!opts.skipNetwork) {
     const multiUnit = detectMultiUnitBootRace(opts);
     if (multiUnit.state === "warn") {
-      push("multi_unit_boot_race", "WARN", describeMultiUnitConflict(multiUnit.groups));
+      push("multi_unit_boot_race", "WARN", describeMultiUnitConflict(multiUnit.groups, multiUnit.identityGroups));
+    } else if (multiUnit.state === "declared") {
+      // #327. Kept under the SAME check id deliberately: this is the same check reaching
+      // a verdict, and the id is a stable machine-readable handle an operator or agent may
+      // already key on. INFO does not touch warn_count/fail_count, so a correctly-declared
+      // multi-instance host is no longer warned at — while every undeclared shape above
+      // still is, which is the whole acceptance condition of #327.
+      push("multi_unit_boot_race", "INFO", describeDeclaredInstances(multiUnit.units));
     } else if (multiUnit.state === "unknown") {
       push("multi_unit_boot_race", "INFO", `could not verify: ${multiUnit.reason}`);
     }
