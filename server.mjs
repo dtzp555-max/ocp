@@ -47,7 +47,7 @@ import { DEFAULT_PORT } from "./lib/constants.mjs";
 import { StructuredOutputError, detectStructuredOutput, validateJsonSchemaSafe, extractJsonPayload, structuredSystemInstruction, resolveMaxAttempts } from "./lib/structured-output.mjs";
 import { isLoopbackBind } from "./lib/net.mjs";
 import { classifyToolRequest } from "./lib/tool-support.mjs";
-import { runTuiTurn, reapStaleTuiSessions, resolveTuiHome, bootTuiPane, tuiPaneHealthy, poolPaneName, POOL_BOOT_MS } from "./lib/tui/session.mjs";
+import { runTuiTurn, reapStaleTuiSessions, resolveTuiHome, bootTuiPane, tuiPaneHealthy, poolPaneName, killLiveTurnPanes, POOL_BOOT_MS } from "./lib/tui/session.mjs";
 import { detectTuiUpstreamError } from "./lib/tui/transcript.mjs";
 import { TuiSemaphore, SemaphoreAbortError, recordTuiEntrypoint, buildTuiHealthBlock } from "./lib/tui/semaphore.mjs";
 import { TuiPanePool, resolvePoolSize, POOL_MAX_SIZE } from "./lib/tui/pool.mjs";
@@ -4107,6 +4107,28 @@ function gracefulShutdown(signal) {
       if (drained) logEvent("info", "tui_pool_drained", { count: drained, trigger: "shutdown" });
     } catch (e) { logEvent("error", "tui_pool_drain_failed", { error: e.message }); }
   }
+
+  // 2c. Kill the pane an IN-FLIGHT TURN is holding (#362). Step 2b above reaches only panes the
+  // POOL owns: an acquired pane has LEFT the pool (that is by design — see POOL/REAPER INVARIANT
+  // property 2) and a cold-booted pane was never in it, so drain() cannot see either. Neither is
+  // in activeProcesses, for the same reason the pool needs 2b at all — a pane's `claude` is a
+  // child of the tmux SERVER, not of node. That pane was therefore owned by nothing here, and
+  // step 4's process.exit(0) — which fires in THIS SAME TICK on a TUI host — meant runTuiTurn's
+  // own finally never ran. The result was a live, interactive, AUTHENTICATED `claude` outliving
+  // the process that was supposed to own it, for any shutdown that landed mid-turn.
+  //
+  // Same tick, same reason as 2b: killLiveTurnPanes() is synchronous by construction, and its
+  // header says why a deferred version would silently do nothing.
+  //
+  // The two sets are DISJOINT — a pane is either in the pool or held by a turn, never both — so
+  // the order of 2b and 2c is not load-bearing.
+  //
+  // Unconditional, deliberately: with TUI mode off the registry is empty and this issues no tmux
+  // command at all, which is a stronger guarantee than a TUI_MODE gate that could be wrong.
+  try {
+    const orphans = killLiveTurnPanes();
+    if (orphans) logEvent("info", "tui_turn_panes_killed", { count: orphans, trigger: "shutdown" });
+  } catch (e) { logEvent("error", "tui_turn_pane_kill_failed", { error: e.message }); }
 
   // 3. Kill all active child processes
   for (const proc of activeProcesses) {
