@@ -892,6 +892,28 @@ export async function execRestartRetry(cmd, {
   log = (m) => console.error(m),
   sleep = (ms) => new Promise(r => setTimeout(r, ms)),
 } = {}) {
+  // #356 finding F6. `attempts`, `backoffMs`, `log` and `sleep` all have defaults; `run` did not.
+  // Calling without one made `run(cmd)` throw `TypeError: run is not a function` on every attempt,
+  // which the `catch` below treats EXACTLY like a command failure: three attempts, rising backoff,
+  // then `{ok:false}` with the TypeError's message as the operator-facing failure detail. A
+  // programming error laundered into an operational verdict — and on this path that verdict is
+  // "THE PROXY IS DOWN".
+  //
+  // THROW rather than default to `execRun`, which is the other option the issue offered. Defaulting
+  // would mean a test that forgot to inject silently runs REAL `launchctl`/`systemctl` against the
+  // developer's machine. That is not a hypothetical failure mode in this repo: #217's review took
+  // production down exactly that way — a `cmd_restart` stub defined before `source`-ing the real
+  // script was silently overwritten, the real restart chain ran against a live host, and the proxy
+  // stayed down until someone noticed. AGENTS.md's rule from that incident is that a constraint
+  // must be unreachable by CONSTRUCTION; a function whose whole purpose is running service-manager
+  // commands must not acquire the ability to do so by omission.
+  if (typeof run !== "function") {
+    throw new TypeError(
+      "execRestartRetry requires an explicit `run` function — it is deliberately NOT defaulted to a "
+      + "real shell, because a caller that forgot to inject one would then execute launchctl/systemctl "
+      + "for real. Pass `{ run }` explicitly: the callers in this module pass their own `runShell`, "
+      + "which is `opts.execFn` when injected and an execSync wrapper otherwise.");
+  }
   let detail = null;
   for (let i = 1; i <= attempts; i++) {
     try {
@@ -967,6 +989,77 @@ export function recoveryPlanCommands(restartPlan) {
   // `(A || true) && B`, and `(A || true)` always succeeds, so B always runs. Same `|| true` idiom
   // the repo already uses on the resolved bootout (scripts/lib/restart-unit.mjs:865).
   return [`${restartCmd.replace(" restart -- ", " reset-failed -- ")} || true`, ...cmds];
+}
+
+// Issue #356 F3, DECIDED — and the decision REVERSED for launchd in round 3 of #388's review, on
+// evidence rather than on wording. The restoration pass's retry budget, per plan shape.
+//
+// WHY THIS IS NOT ONE NUMBER. The forward restart loop gets `RESTART_ATTEMPTS` because the observed
+// production fault was transient. The restore pass inherited `attempts: 1`, and the first two
+// attempts to justify that asymmetry were both wrong:
+//
+//   1. "The arithmetic forbids it." TRUE, and systemd-only. `install-autostart.mjs` writes
+//      `Restart=always`/`RestartSec=5` with no StartLimit override, so systemd's documented defaults
+//      apply (5 starts / 10s); retries at t≈0,1,3 plus the restore at t≈5 are already four, and
+//      retrying makes six. A tripped limit latches the unit `failed` and makes a plain
+//      `systemctl restart` KEEP FAILING — so the printed recovery command itself stops working.
+//      Sound, and it says nothing about launchd, which has no start limit at all.
+//
+//   2. "Retrying would re-run the TEAR-DOWN against a service that may have come up in between."
+//      MEASURED FALSE. `execRestartRetry` retries ONE command; on the incident's own shape the
+//      restore's `bootout` succeeds on its first attempt and returns, so raising the budget repeats
+//      only `bootstrap`:
+//                                        attempts:1   attempts:3
+//          launchctl bootout   total          2            2      <- unchanged
+//          launchctl bootstrap total          4            6
+//      The one state where the tear-down IS multiplied is a restore whose `bootout` itself fails
+//      (4 -> 6) — and there the tear-down FAILED, so the service was never unloaded and by
+//      construction did not come up in between. Wrong in the state it named, inapplicable in the
+//      state where the multiplication happens.
+//
+// WHAT THE EVIDENCE ACTUALLY SUPPORTS, per shape:
+//
+//   launchd — RETRY. There is no start limit, so reason 1 does not exist here. A SUCCEEDED `bootout`
+//     unloads the job and `KeepAlive` does not apply to an unloaded job, so nothing will bring the
+//     service back on its own: this pass is the LAST AUTOMATED CHANCE, and the probe budget after it
+//     is dead time. And the command the retries would repeat is `bootstrap` — the exact command
+//     whose failure was transient in the 2026-08-03 incident this whole feature exists for, which
+//     `execRestartRetry`'s own header records as having "succeeded by hand on the first attempt".
+//     The asymmetry decides it: retrying and being wrong costs ~3s of wall clock before the same
+//     DOWN verdict; NOT retrying and being wrong leaves the proxy down until a human runs the
+//     printed command. A spurious retry cannot even produce a wrong verdict — and that holds, but
+//     for a NARROWER reason than the first draft of this line gave.
+//
+//     #388 review finding F2. That draft read "the verdict comes from the post-flight probe and
+//     never from a command's exit status (#325's rule)", and both halves are false. `restartFailure`
+//     IS a command exit status, and it gates five of `classifyRestartOutcome`'s ten arms
+//     (:1279-1283 — UNMEASURED and the four RESTART_FAILED_* verdicts all lead with it). And #325
+//     does not say that. `ocp:983-985` bans the exit status from SUBSTITUTING for the probe —
+//     "a failing command does not prove the proxy is down ... So fall through and measure" — and
+//     then `ocp:1021-1026` keeps it as an explicit CO-INPUT: `if [[ $probe_rc -ne 0 &&
+//     $restart_failed -ne 0 ]]`, under the note that "the probe and the command outcome are two
+//     independent facts, and the message has to name the combination". The cited authority contains
+//     the counterexample to the sentence that cited it. (Both passages are quoted here rather than
+//     only pointed at, because `ocp` line numbers move: these two were :1032-1034 and :1070-1075
+//     before #395 shifted them by 49. Grep the quoted text if the numbers no longer land.)
+//
+//     The true premise is specific to THIS pass rather than to exit statuses in general: the
+//     RESTORE's exit statuses are not classifier inputs at all, and `restartFailure` is already
+//     fixed before the restore runs. It is assigned only inside the forward restart loop (:1755 on
+//     this path, :2627 on the rollback one) and never reassigned; `restoreOutcome` is not among
+//     `classifyRestartOutcome`'s parameters, which are `{ restartFailure, postFlight,
+//     postFlightMeasured }` at both call sites (:1927, :2792). So a retry inside the restore can
+//     reach the verdict only by delaying the probe — which is the ~3s the asymmetry already prices.
+//
+//   user-unit / system-unit — DO NOT RETRY. Reason 1 is decisive on `user-unit`, and on a
+//     `system-unit` OCP never reads the unit's `Restart=` or `StartLimit*` at all, so one attempt is
+//     the conservative choice when the constraint cannot be evaluated.
+//
+// The honest summary is that the earlier note had the platforms backwards: launchd is not the corner
+// case, it is the shape every piece of evidence for this feature was measured on.
+export function restoreRetryBudget(action, { attempts, backoffMs }) {
+  if (action === "launchd") return { attempts, backoffMs };
+  return { attempts: 1, backoffMs: 0 };
 }
 
 // #381 review finding F4. "Will anything start the service on its own?" — answered per plan shape,
@@ -1698,16 +1791,43 @@ async function runFullUpgrade({ doctor, opts }) {
       //
       // Every other plan shape is a single `systemctl … restart --` command, for which
       // `.slice(0)` and `.slice(index)` are identical.
+      // #356 finding F3 — the reasoning now lives with the budget it decides, in
+      // `restoreRetryBudget` above, because this note twice stated a mechanism that did not hold and
+      // the second one was only caught by measuring it. Short version: launchd RETRIES (no start
+      // limit, nothing auto-restarts, and the repeated command is the one that fails transiently);
+      // the systemd shapes do not (the start-limit arithmetic, which is real and platform-specific).
       const restoreCmds = restartCmds.slice(0);
+      // #356 finding F4: the restore runs EVERY command and reports the aggregate; it does not stop
+      // at the first failure.
+      //
+      // The direction was wrong for a restore, which is what the finding is about. The forward
+      // RESTART loop breaks on failure for a good reason — continuing past a failed tear-down is
+      // meaningless. This loop is trying to get the service back UP, so abandoning the remaining
+      // commands on a failure abandons the one that would have started it.
+      //
+      // REACHABILITY, stated rather than implied. On every plan shape that exists today the `break`
+      // could not actually skip anything, so this is a latent direction fix and not a live defect:
+      // launchd's plan is `bootout … 2>/dev/null || true` then `bootstrap`, and the first cannot
+      // exit non-zero under a real shell; every systemd shape is a single command. It stops being
+      // latent the moment a plan gains a third command or that `|| true` is removed — and #371
+      // already had to add a `bestEffort` concept to the sibling loop because the `|| true` is inert
+      // text to a runner that is not a shell, which is the same lesson one layer down.
+      //
+      // `restoreOutcome.ok` keeps its meaning — "every restore command exited 0" — so the two hint
+      // branches that read it are unchanged. What changes is that a later command still runs.
       restoreOutcome = { ok: true, cmds: [] };
+      // #356 F3 / #388 round 3: per shape. The backoff moves with the budget deliberately — three
+      // INSTANT retries would be the "low-yield fourth immediate attempt" this decision rejects;
+      // the point of the rising delay is to give a transient time to clear.
+      const restoreBudget = restoreRetryBudget(restartPlan.plan.action, { attempts: restartAttempts, backoffMs: restartBackoffMs });
       for (const c of restoreCmds) {
-        const r = await execRestartRetry(c.cmd, { attempts: 1, backoffMs: 0, run: runShell });
+        const r = await execRestartRetry(c.cmd, { ...restoreBudget, run: runShell });
         phases.push({
           name: "restart-restore", cmd: c.cmd, status: r.ok ? "ok" : "fail",
           ...(r.ok ? {} : { stderr: r.detail }),
         });
         restoreOutcome.cmds.push(c.cmd);
-        if (!r.ok) { restoreOutcome.ok = false; break; }
+        if (!r.ok) restoreOutcome.ok = false;
       }
       console.error(restoreOutcome.ok
         ? `[restart] restoration commands ran without error — the probe below decides whether that worked.`
@@ -1810,6 +1930,28 @@ async function runFullUpgrade({ doctor, opts }) {
     // F5: single source for "what to run by hand", shared by every hint below.
     const recoveryCmds = recoveryPlanCommands(restartPlan).join(" && ");
 
+    // #356 finding F7, DECIDED AND RECORDED: "success with no measurement" IS expressible, for the
+    // all-mock bookkeeping lane ONLY, and that is deliberate.
+    //
+    // The state: `mockExec && execFn && !mockProbe`, every restart command exits 0, `postFlightMeasured`
+    // is false, and this function returns `{path:"upgrade", executed:true}` with `post-flight:
+    // skipped-mock`. The finding asks whether that should exist at all, given this file's entire
+    // #214 -> #274 -> #291 arc is about not reporting success without confirming what is serving.
+    //
+    // Yes, and here is the whole argument:
+    //  - IT IS UNREACHABLE IN PRODUCTION. The post-flight gate is `opts.mockProbe || !opts.mockExec`,
+    //    and `mockExec` is a test-only option — a real `ocp update` always measures. The lane cannot
+    //    be entered by any invocation a user can make.
+    //  - THE DANGEROUS HALF ALREADY THROWS. `restartFailure && !postFlightMeasured` is the arm
+    //    directly below, and it refuses to claim anything. What remains is the clean half: nothing
+    //    failed, nothing was measured, and the caller asked for exactly that.
+    //  - IT IS THE BOOKKEEPING CONTRACT ~40 EXISTING TESTS DEPEND ON. Those tests use the all-mock
+    //    lane to assert phase lists, target resolution and plan shapes — they are not asserting a
+    //    service verdict, and the absence of one is visible in the result as `post-flight:
+    //    skipped-mock` rather than being silently implied.
+    //
+    // So the rule is: this function may return success without a measurement only when the caller
+    // disabled measurement AND nothing failed. Written down so the next reader does not re-derive it.
     if (verdict === RESTART_VERDICT.UNMEASURED) {
       // Only reachable from a test that injects execFn but no probe. Never claim success when a
       // restart command failed and nothing measured the result.
@@ -2613,15 +2755,23 @@ async function runRollback(opts) {
       : restartCmds.map(c => c.cmd)
     ).map(cmd => ({ cmd, bestEffort: !planCmdSet.has(cmd) }));
     restoreOutcome = { ok: true, cmds: [] };
+    // #356 F3 / #388 round 3: same per-shape budget as the forward path, from the same helper, so
+    // the two cannot drift — which is the whole lesson of #372/#373.
+    const restoreBudget = restoreRetryBudget(restartPlan.plan.action, { attempts: restartAttempts, backoffMs: restartBackoffMs });
     for (const c of restoreCmds) {
-      const r = await execRestartRetry(c.cmd, { attempts: 1, backoffMs: 0, run: runShell });
+      const r = await execRestartRetry(c.cmd, { ...restoreBudget, run: runShell });
       phases.push({
         name: "restart-restore", cmd: c.cmd,
         status: r.ok ? "ok" : (c.bestEffort ? "warn" : "fail"),
         ...(r.ok ? {} : { stderr: r.detail }),
       });
       restoreOutcome.cmds.push(c.cmd);
-      if (!r.ok && !c.bestEffort) { restoreOutcome.ok = false; break; }
+      // #356 F4, same direction fix as the sibling loop: a failed command marks the pass failed but
+      // does not abandon the commands after it. On this path the `bestEffort` marking already kept a
+      // non-zero `reset-failed` from suppressing the restart behind it (#371's MED-3/G2); this
+      // extends the same reasoning to a genuine failure, because "stop trying to bring the service
+      // back as soon as bringing it back goes wrong" is the wrong direction for a restore either way.
+      if (!r.ok && !c.bestEffort) restoreOutcome.ok = false;
     }
     console.error(restoreOutcome.ok
       ? `[rollback] restoration commands ran without error — the probe below decides whether that worked.`
