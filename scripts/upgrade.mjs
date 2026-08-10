@@ -967,6 +967,56 @@ export async function execRestartRetry(cmd, {
 // (restart-unit.mjs:993, :1094, :1106, :1113), so this inherits all three exactly. Launchd plans
 // carry no such substring and are additionally excluded by the `action` guard — `launchctl` has no
 // start limit and no equivalent command.
+// Issue #356 F3, DECIDED — and the decision REVERSED for launchd in round 3 of #388's review, on
+// evidence rather than on wording. The restoration pass's retry budget, per plan shape.
+//
+// WHY THIS IS NOT ONE NUMBER. The forward restart loop gets `RESTART_ATTEMPTS` because the observed
+// production fault was transient. The restore pass inherited `attempts: 1`, and the first two
+// attempts to justify that asymmetry were both wrong:
+//
+//   1. "The arithmetic forbids it." TRUE, and systemd-only. `install-autostart.mjs` writes
+//      `Restart=always`/`RestartSec=5` with no StartLimit override, so systemd's documented defaults
+//      apply (5 starts / 10s); retries at t≈0,1,3 plus the restore at t≈5 are already four, and
+//      retrying makes six. A tripped limit latches the unit `failed` and makes a plain
+//      `systemctl restart` KEEP FAILING — so the printed recovery command itself stops working.
+//      Sound, and it says nothing about launchd, which has no start limit at all.
+//
+//   2. "Retrying would re-run the TEAR-DOWN against a service that may have come up in between."
+//      MEASURED FALSE. `execRestartRetry` retries ONE command; on the incident's own shape the
+//      restore's `bootout` succeeds on its first attempt and returns, so raising the budget repeats
+//      only `bootstrap`:
+//                                        attempts:1   attempts:3
+//          launchctl bootout   total          2            2      <- unchanged
+//          launchctl bootstrap total          4            6
+//      The one state where the tear-down IS multiplied is a restore whose `bootout` itself fails
+//      (4 -> 6) — and there the tear-down FAILED, so the service was never unloaded and by
+//      construction did not come up in between. Wrong in the state it named, inapplicable in the
+//      state where the multiplication happens.
+//
+// WHAT THE EVIDENCE ACTUALLY SUPPORTS, per shape:
+//
+//   launchd — RETRY. There is no start limit, so reason 1 does not exist here. A SUCCEEDED `bootout`
+//     unloads the job and `KeepAlive` does not apply to an unloaded job, so nothing will bring the
+//     service back on its own: this pass is the LAST AUTOMATED CHANCE, and the probe budget after it
+//     is dead time. And the command the retries would repeat is `bootstrap` — the exact command
+//     whose failure was transient in the 2026-08-03 incident this whole feature exists for, which
+//     `execRestartRetry`'s own header records as having "succeeded by hand on the first attempt".
+//     The asymmetry decides it: retrying and being wrong costs ~3s of wall clock before the same
+//     DOWN verdict; NOT retrying and being wrong leaves the proxy down until a human runs the
+//     printed command. A spurious retry cannot even produce a wrong verdict, because the verdict
+//     comes from the post-flight probe and never from a command's exit status (#325's rule).
+//
+//   user-unit / system-unit — DO NOT RETRY. Reason 1 is decisive on `user-unit`, and on a
+//     `system-unit` OCP never reads the unit's `Restart=` or `StartLimit*` at all, so one attempt is
+//     the conservative choice when the constraint cannot be evaluated.
+//
+// The honest summary is that the earlier note had the platforms backwards: launchd is not the corner
+// case, it is the shape every piece of evidence for this feature was measured on.
+export function restoreRetryBudget(action, { attempts, backoffMs }) {
+  if (action === "launchd") return { attempts, backoffMs };
+  return { attempts: 1, backoffMs: 0 };
+}
+
 export function recoveryPlanCommands(restartPlan) {
   const cmds = (restartPlan?.plan?.cmds || []).map(c => c.cmd);
   const action = restartPlan?.plan?.action;
@@ -1717,55 +1767,11 @@ async function runFullUpgrade({ doctor, opts }) {
       //
       // Every other plan shape is a single `systemctl … restart --` command, for which
       // `.slice(0)` and `.slice(index)` are identical.
-      // #356 finding F3, DECIDED AND RECORDED PER PLAN SHAPE: the restoration pass gets ONE attempt
-      // on all three shapes, and the reason differs by shape. The first version of this note gave
-      // two reasons and presented them as universal ("THIS FEATURE'S OWN ARITHMETIC FORBIDS IT");
-      // #388's review showed BOTH are systemd-only, which left the decision unsupported on launchd
-      // — the shape of the incident this whole feature exists for. Enumerating the three shapes
-      // rather than the two reasons is what surfaces that, so it is enumerated.
-      //
-      //  * user-unit — THE ARITHMETIC FORBIDS IT, and this is the decisive case.
-      //    `recoveryPlanCommands`' comment works it out: `install-autostart.mjs` writes
-      //    `Restart=always`/`RestartSec=5` with no StartLimit override, so systemd's documented
-      //    defaults apply (`DefaultStartLimitIntervalSec=10s`, `DefaultStartLimitBurst=5`,
-      //    systemd-system.conf(5)), and the retries (t≈0,1,3) plus this pass (t≈5) already put FOUR
-      //    of our own invocations inside one 10s window, stacked with systemd's own restarts.
-      //    Retrying makes it six — mutation S4 produced exactly that. Once the limit trips the unit
-      //    latches `failed` and a plain `systemctl restart` KEEPS FAILING, so the printed recovery
-      //    hint's own command stops working: an end state worse than the bug this pass fixes. Same
-      //    argument #371's MED-3 accepted. Nor is this the last chance here — the post-flight probe
-      //    follows with a 10 x 1s budget and `Restart=always` can land inside it, which is what the
-      //    warned-success cell exists for.
-      //
-      //  * system-unit — BOTH PREMISES ARE UNKNOWN. OCP did not write this unit and never reads its
-      //    `Restart=` or `StartLimit*` directives (see `restartOwnerRecoveryNote`). It could have a
-      //    tighter burst limit than the default, or none. One attempt is the conservative choice
-      //    when the constraint cannot be evaluated, not a derived one.
-      //
-      //  * launchd — NEITHER PREMISE HOLDS, AND THIS IS THE INCIDENT'S OWN SHAPE. `launchctl` has no
-      //    start limit and no `reset-failed` equivalent (this file says so at the recovery-commands
-      //    guard), and a SUCCEEDED `bootout` unloads the job, so nothing will bring it back on its
-      //    own — the restore pass really is the last automated chance, and the probe budget after it
-      //    is dead time. The production incident was exactly here: bootout succeeded, bootstrap
-      //    returned EIO, and the identical bootstrap succeeded by hand moments later.
-      //
-      //    One attempt is kept anyway, for a reason specific to THIS shape rather than inherited
-      //    from systemd's: on launchd the restore re-runs the WHOLE plan — `bootout … || true` then
-      //    `bootstrap` — so it is already a different action from the three in-loop retries, which
-      //    only re-ran the failing command. Repeating it would re-run a TEAR-DOWN against a service
-      //    that may have come up in between; the `.slice(0)` note above accepts that hazard exactly
-      //    once and deliberately, and looping it multiplies the one thing that comment says it is
-      //    trading away. The operator is not left without a remedy: the DOWN cell names that same
-      //    `bootout && bootstrap` pair, which is what actually ended the real incident.
-      //
-      //    Stated plainly because #356 exists to end decisions supported by nothing: on launchd this
-      //    is a judgement about a bounded downside, NOT a derivation — and if it is revisited, this
-      //    is the shape with the strongest case for change.
-      //
-      // If the count is ever raised, F5's arithmetic moves with it: four invocations becomes six and
-      // the `reset-failed` hint stops being sufficient. Pinned by the #347 money test and by the
-      // #356 F3 test, which assert exactly four `launchctl bootstrap` invocations (3 retries + 1
-      // restore) — mutation S4 raises the restore to RESTART_ATTEMPTS and turns them red at 6.
+      // #356 finding F3 — the reasoning now lives with the budget it decides, in
+      // `restoreRetryBudget` above, because this note twice stated a mechanism that did not hold and
+      // the second one was only caught by measuring it. Short version: launchd RETRIES (no start
+      // limit, nothing auto-restarts, and the repeated command is the one that fails transiently);
+      // the systemd shapes do not (the start-limit arithmetic, which is real and platform-specific).
       const restoreCmds = restartCmds.slice(0);
       // #356 finding F4: the restore runs EVERY command and reports the aggregate; it does not stop
       // at the first failure.
@@ -1786,8 +1792,12 @@ async function runFullUpgrade({ doctor, opts }) {
       // `restoreOutcome.ok` keeps its meaning — "every restore command exited 0" — so the two hint
       // branches that read it are unchanged. What changes is that a later command still runs.
       restoreOutcome = { ok: true, cmds: [] };
+      // #356 F3 / #388 round 3: per shape. The backoff moves with the budget deliberately — three
+      // INSTANT retries would be the "low-yield fourth immediate attempt" this decision rejects;
+      // the point of the rising delay is to give a transient time to clear.
+      const restoreBudget = restoreRetryBudget(restartPlan.plan.action, { attempts: restartAttempts, backoffMs: restartBackoffMs });
       for (const c of restoreCmds) {
-        const r = await execRestartRetry(c.cmd, { attempts: 1, backoffMs: 0, run: runShell });
+        const r = await execRestartRetry(c.cmd, { ...restoreBudget, run: runShell });
         phases.push({
           name: "restart-restore", cmd: c.cmd, status: r.ok ? "ok" : "fail",
           ...(r.ok ? {} : { stderr: r.detail }),
@@ -2627,8 +2637,11 @@ async function runRollback(opts) {
       : restartCmds.map(c => c.cmd)
     ).map(cmd => ({ cmd, bestEffort: !planCmdSet.has(cmd) }));
     restoreOutcome = { ok: true, cmds: [] };
+    // #356 F3 / #388 round 3: same per-shape budget as the forward path, from the same helper, so
+    // the two cannot drift — which is the whole lesson of #372/#373.
+    const restoreBudget = restoreRetryBudget(restartPlan.plan.action, { attempts: restartAttempts, backoffMs: restartBackoffMs });
     for (const c of restoreCmds) {
-      const r = await execRestartRetry(c.cmd, { attempts: 1, backoffMs: 0, run: runShell });
+      const r = await execRestartRetry(c.cmd, { ...restoreBudget, run: runShell });
       phases.push({
         name: "restart-restore", cmd: c.cmd,
         status: r.ok ? "ok" : (c.bestEffort ? "warn" : "fail"),

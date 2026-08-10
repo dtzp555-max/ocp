@@ -4511,7 +4511,7 @@ ltTest("integration: ltTest serialization keeps peak concurrent server.mjs child
 });
 
 // ── Upgrade Tests ──
-import { runUpgrade, postFlightOk, runPostFlightCheck, parseFlagValue, classifyPostFlightProbeFailure, postFlightFailureSuffix, probeLaunchdDomains, execRestartRetry, RESTART_ATTEMPTS, recoveryPlanCommands, postFlightOnlyCommand, classifyPostFlightBodyRejection, postFlightWant, postFlightRecheckClause, classifyRestartOutcome, RESTART_VERDICT, restartOwnerRecoveryNote } from "./scripts/upgrade.mjs";
+import { runUpgrade, postFlightOk, runPostFlightCheck, parseFlagValue, classifyPostFlightProbeFailure, postFlightFailureSuffix, probeLaunchdDomains, execRestartRetry, RESTART_ATTEMPTS, recoveryPlanCommands, postFlightOnlyCommand, classifyPostFlightBodyRejection, postFlightWant, postFlightRecheckClause, classifyRestartOutcome, RESTART_VERDICT, restartOwnerRecoveryNote, restoreRetryBudget } from "./scripts/upgrade.mjs";
 
 console.log("\nUpgrade:");
 
@@ -5311,9 +5311,10 @@ test("#347: a restart command that fails ALWAYS reports the SERVICE as down (not
 
   assert.ok(caught, "an unrecoverable restart with a dead /health must not return success");
 
-  // 1. Retried to the budget, then 2. restoration attempted — 3 + 1 invocations.
-  assert.equal(run.count("launchctl bootstrap"), 4,
-    `expected 3 retry attempts + 1 restoration attempt; got calls=${JSON.stringify(run.calls)}`);
+  // 1. Retried to the budget, then 2. restoration attempted — and the restoration RETRIES too on
+  // launchd, so 3 + 3. 2 * RESTART_ATTEMPTS (#356 F3 / #388 round 3): on launchd the restoration pass RETRIES, because there is no start limit, nothing brings the job back on its own, and the repeated command is `bootstrap` — the one that failed transiently in the incident. The systemd shapes still get one restore attempt; the `#347 F5` linux test's count of 4 is the control.
+  assert.equal(run.count("launchctl bootstrap"), 2 * RESTART_ATTEMPTS,
+    `expected ${RESTART_ATTEMPTS} retry attempts + ${RESTART_ATTEMPTS} restoration attempts; got calls=${JSON.stringify(run.calls)}`);
   const restore = caught.phases.filter(p => p.name === "restart-restore");
   assert.ok(restore.length >= 1 && restore.some(p => p.cmd.includes("launchctl bootstrap")),
     `the restoration attempt must be recorded as its own phase so the operator can see it happened; ` +
@@ -6698,9 +6699,9 @@ test("#352: a rollback restart that fails ALWAYS reports the SERVICE as down, at
   catch (e) { caught = e; }
   assert.ok(caught);
 
-  // Retried to the budget, then restoration attempted — 3 + 1 invocations.
-  assert.equal(run.count("launchctl bootstrap"), 4,
-    `expected 3 retry attempts + 1 restoration attempt; got calls=${JSON.stringify(run.calls)}`);
+  // Retried to the budget, then restoration attempted — 3 + 3 on launchd. 2 * RESTART_ATTEMPTS (#356 F3 / #388 round 3): on launchd the restoration pass RETRIES, because there is no start limit, nothing brings the job back on its own, and the repeated command is `bootstrap` — the one that failed transiently in the incident. The systemd shapes still get one restore attempt; the `#347 F5` linux test's count of 4 is the control.
+  assert.equal(run.count("launchctl bootstrap"), 2 * RESTART_ATTEMPTS,
+    `expected ${RESTART_ATTEMPTS} retry attempts + ${RESTART_ATTEMPTS} restoration attempts; got calls=${JSON.stringify(run.calls)}`);
   const restore = caught.phases.filter(p => p.name === "restart-restore");
   assert.ok(restore.length >= 1 && restore.some(p => p.cmd.includes("launchctl bootstrap")),
     `the restoration attempt must be recorded as its own phase; ` +
@@ -7220,7 +7221,7 @@ test("#352 MED-1: a restart failure with something ANSWERING on the port must no
 
   assert.ok(caught, "a restart failure plus the wrong version serving is still not a success");
   // Premise: this really is the restart-failed-AND-probe-answered state, not one of the neighbours.
-  assert.equal(run.count("launchctl bootstrap"), 4, `premise: the restart really did exhaust its budget; got calls=${JSON.stringify(run.calls)}`);
+  assert.equal(run.count("launchctl bootstrap"), 2 * RESTART_ATTEMPTS, `premise: the restart really did exhaust its budget (retries + the launchd restore's own retries, #356 F3); got calls=${JSON.stringify(run.calls)}`);
   const pf = caught.phases.find(p => p.name === "post-flight");
   assert.ok(pf && /last saw version=3\.14\.0/.test(pf.message || ""),
     `premise: the probe really did read a body; got ${JSON.stringify(pf)}`);
@@ -7443,8 +7444,8 @@ test("#372 (the money test): `ocp update`'s DOWN cell must not fire for a servic
   assert.ok(caught, "a restart failure plus the wrong version serving is still not a success");
   // Premises, both asserted: the restart really exhausted its budget, and the probe really read a
   // body. Without them "DOWN was wrong" would be a claim about a state that never occurred.
-  assert.equal(run.count("launchctl bootstrap"), 4,
-    `premise: 3 retries + 1 restoration; got calls=${JSON.stringify(run.calls)}`);
+  assert.equal(run.count("launchctl bootstrap"), 2 * RESTART_ATTEMPTS,
+    `premise: ${RESTART_ATTEMPTS} retries + ${RESTART_ATTEMPTS} restoration attempts on launchd (#356 F3); got calls=${JSON.stringify(run.calls)}`);
   const pf = caught.phases.find(p => p.name === "post-flight");
   assert.ok(pf && /last saw version=3\.10\.0/.test(pf.message || ""),
     `premise: the probe really did read a body; got ${JSON.stringify(pf)}`);
@@ -7684,8 +7685,9 @@ test("#381 F1: an unclassifiable probe failure must not reach THE PROXY IS DOWN 
     catch (e) { caught = e; }
     assert.ok(caught, `${lane}: still not a success`);
     // Premise: the restart really did fail, so the DOWN cell was genuinely in reach.
-    assert.equal(run.calls.filter(c => c.includes("launchctl bootstrap")).length, 4,
-      `${lane} premise: the restart must have exhausted its budget; got ${JSON.stringify(run.calls)}`);
+    assert.equal(run.calls.filter(c => c.includes("launchctl bootstrap")).length, 2 * RESTART_ATTEMPTS,
+      `${lane} premise: the restart must have exhausted its budget — ${RESTART_ATTEMPTS} in-loop plus ` +
+      `the launchd restore's own ${RESTART_ATTEMPTS} (#356 F3); got ${JSON.stringify(run.calls)}`);
     assert.ok(!/THE PROXY IS DOWN/.test(caught.hint || ""),
       `${lane}: the peer ACCEPTED the connection — nothing here says the proxy is down; got hint=${JSON.stringify(caught.hint)}`);
     assert.ok(!/is not answering/.test(caught.hint || ""),
@@ -8284,22 +8286,29 @@ test("#356 F4: the restoration pass runs EVERY command, and does not abandon the
     `and reach the set-up half; got ${JSON.stringify(rbRestore.map(p => p.cmd))}`);
 });
 
-test("#356 F3: the restoration pass gets exactly ONE attempt per command — decided, not inherited", async () => {
-  // The forward loop gets RESTART_ATTEMPTS because the observed production fault was transient. This
-  // pass gets one, and the argument is in scripts/upgrade.mjs: retrying here would make our own
-  // invocations six inside systemd's default 5-starts-per-10s window, and once that limit trips the
-  // unit latches `failed` and a plain `systemctl restart` keeps failing — so the printed recovery
-  // hint's own command stops working, which is a worse end state than the bug this pass fixes.
+test("#356 F3: the restoration pass's retry budget is PER PLAN SHAPE — launchd retries, systemd does not", async () => {
+  // DECISION REVERSED FOR LAUNCHD in #388's round-3 review, on measurement rather than wording. The
+  // first two justifications for a flat `attempts: 1` were (1) systemd's start-limit arithmetic —
+  // sound, and systemd-ONLY — and (2) "retrying would re-run the tear-down against a service that
+  // may have come up in between", which was measured FALSE: `execRestartRetry` retries one command,
+  // the restore's `bootout` succeeds on its first attempt, and raising the budget repeats only
+  // `bootstrap` (bootout stays at 2 either way).
   //
-  // Pinned as arithmetic rather than as prose: retries + restore must be exactly RESTART_ATTEMPTS + 1.
+  // On launchd there is no start limit, a succeeded `bootout` means nothing brings the job back, so
+  // this pass is the LAST automated chance — and the command the retries repeat is `bootstrap`, the
+  // one that failed transiently in the incident this feature exists for. So launchd retries and the
+  // systemd shapes do not. Full reasoning at `restoreRetryBudget`.
+  //
+  // Pinned as arithmetic per shape: launchd is RESTART_ATTEMPTS in-loop + RESTART_ATTEMPTS restore;
+  // the `#347 F5` linux test's count of 4 is the control that proves the split is real.
   const run = _u347Runner({ "launchctl bootstrap": Infinity });
   let caught = null;
   try { await runUpgrade(_u347Opts({ execFn: run, mockProbe: _u347Unreachable })); }
   catch (e) { caught = e; }
   assert.ok(caught, "premise: an unrecoverable restart with a dead probe must throw");
-  assert.equal(run.count("launchctl bootstrap"), RESTART_ATTEMPTS + 1,
-    `${RESTART_ATTEMPTS} retries + exactly 1 restoration attempt; more means the restore started ` +
-    `retrying and F5's start-limit arithmetic no longer holds; got calls=${JSON.stringify(run.calls)}`);
+  assert.equal(run.count("launchctl bootstrap"), 2 * RESTART_ATTEMPTS,
+    `on launchd the restore RETRIES: ${RESTART_ATTEMPTS} in-loop + ${RESTART_ATTEMPTS} restoration; ` +
+    `got calls=${JSON.stringify(run.calls)}`);
 
   // PREMISE: a restoration pass really ran, so the count above is "retries + restore" and not
   // "retries alone happening to equal the expected total".
@@ -8321,8 +8330,44 @@ test("#356 F3: the restoration pass gets exactly ONE attempt per command — dec
   assert.ok(restorePhases.some(p => /launchctl bootstrap/.test(p.cmd)),
     `and it must have re-run the set-up half — that is the invocation the count above attributes ` +
     `to it; got ${JSON.stringify(restorePhases.map(p => p.cmd))}`);
-  assert.equal(run.count("launchctl bootstrap") - RESTART_ATTEMPTS, 1,
-    `and exactly one of the ${RESTART_ATTEMPTS + 1} bootstrap calls must be the restore's`);
+  assert.equal(run.count("launchctl bootstrap") - RESTART_ATTEMPTS, RESTART_ATTEMPTS,
+    `and ${RESTART_ATTEMPTS} of the ${2 * RESTART_ATTEMPTS} bootstrap calls must be the restore's own retries`);
+});
+
+test("#356 F3 (#388 round 3): the restore budget is per shape, and the systemd side is the control", async () => {
+  // THE SPLIT ITSELF, both halves in one test so a one-sided revert cannot pass — which is the shape
+  // #372 was filed for and the reason `restoreRetryBudget` is one shared helper rather than two
+  // inline ternaries.
+  assert.deepEqual(restoreRetryBudget("launchd", { attempts: 3, backoffMs: 1000 }), { attempts: 3, backoffMs: 1000 },
+    "launchd inherits the full budget AND its rising backoff — three instant retries would be the " +
+    "low-yield fourth immediate attempt this decision rejects; the delay is what lets a transient clear");
+  assert.deepEqual(restoreRetryBudget("user-unit", { attempts: 3, backoffMs: 1000 }), { attempts: 1, backoffMs: 0 },
+    "a user unit must not retry: six invocations inside systemd's 5-per-10s default trips the start limit");
+  assert.deepEqual(restoreRetryBudget("system-unit", { attempts: 3, backoffMs: 1000 }), { attempts: 1, backoffMs: 0 },
+    "and a discovered unit's Restart=/StartLimit* are unknown to OCP, so it takes the conservative side");
+  assert.deepEqual(restoreRetryBudget("a-future-shape", { attempts: 3, backoffMs: 1000 }), { attempts: 1, backoffMs: 0 },
+    "an unrecognised shape must NOT inherit launchd's retry — the exemption is opt-in by name");
+
+  // End to end on the systemd shape: the control that proves the split is real rather than a
+  // helper nobody consults. `#347 F5` already asserts 4 here; this states why 4 and not 6.
+  const linux = _u347Runner({ "systemctl": Infinity });
+  try { await runUpgrade(_u347Opts({ mockPlatform: "linux", execFn: linux, mockProbe: _u347Unreachable })); }
+  catch { /* expected */ }
+  assert.equal(linux.count("systemctl --user restart -- ocp-proxy.service"), RESTART_ATTEMPTS + 1,
+    `the systemd restore must still get exactly ONE attempt — ${RESTART_ATTEMPTS} retries + 1; more ` +
+    `means the launchd exemption leaked and F5's start-limit arithmetic no longer holds; ` +
+    `got calls=${JSON.stringify(linux.calls)}`);
+
+  // And the tear-down is NOT what gets repeated on launchd — the measurement that killed the
+  // previous justification, kept as a test so the false mechanism cannot be written back.
+  const mac = _u347Runner({ "launchctl bootstrap": Infinity });
+  try { await runUpgrade(_u347Opts({ execFn: mac, mockProbe: _u347Unreachable })); }
+  catch { /* expected */ }
+  assert.equal(mac.count("launchctl bootout"), 2,
+    `raising the restore's budget repeats only the FAILING command: bootout stays at 2 (one per ` +
+    `pass), not 2 * RESTART_ATTEMPTS; got calls=${JSON.stringify(mac.calls)}`);
+  assert.equal(mac.count("launchctl bootstrap"), 2 * RESTART_ATTEMPTS,
+    `while bootstrap — the transiently-failing one — is retried in both passes; got calls=${JSON.stringify(mac.calls)}`);
 });
 
 test("#356 F7: `success with no measurement` is expressible ONLY for the all-mock lane, and the dangerous half throws", async () => {
