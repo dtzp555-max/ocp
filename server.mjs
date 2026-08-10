@@ -994,8 +994,10 @@ const cacheCleanupInterval = setInterval(() => {
 //   (a) DRAIN the pool BEFORE the sweep. Zombie reaping is possible ONLY via kill-server,
 //       and a live pooled pane suppresses kill-server (it is a live child of the tmux
 //       server). A permanently-full pool would otherwise permanently disable the very
-//       thing this tick exists to do. Draining costs one pane re-boot per tick (~1.2 s of
-//       background work every 15 min) and is invisible to callers: a request landing in the
+//       thing this tick exists to do. Draining costs a FULL POOL re-boot per tick — drain()
+//       drops every warm pane and resume() refills serially back to OCP_TUI_POOL_SIZE, so it
+//       is that many boots (~1.2 s each), not one, every 15 min — and is invisible to
+//       callers: a request landing in the
 //       drain→refill gap simply MISSES the pool and takes today's cold path.
 //   (b) Pass the pool's live registry as `spare` anyway. After (a) it is empty, so this is
 //       belt-and-braces — it makes it impossible for THIS call site (or a future one) to

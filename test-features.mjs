@@ -12525,12 +12525,17 @@ test("resolvePoolSize: default/garbage/negative disable the pool; size is clampe
 // Its own test(), NOT another line in the block above, and that is load-bearing: assert.equal
 // throws, so an assertion appended after the symbolic one would never execute under a mutation
 // that reddens the symbolic one first, and could not be shown to fire on its own. Separated,
-// the two are provably non-redundant — removing the clamp reddens both, while moving the
-// constant reddens only this one (the symbolic assertion cannot see that at all).
+// this test is not redundant with the symbolic one: moving the constant reddens ONLY this one
+// (the symbolic assertion cannot see that at all), while removing the clamp reddens both. The
+// evidence is one-directional — it does not show the symbolic test catching anything this one
+// misses — so the claim is stated that way rather than as mutual independence. Both are kept
+// because the symbolic block also covers default/garbage/negative, and it states "a clamp
+// exists" in a form deliberately meant to SURVIVE an intentional cap change.
 test("resolvePoolSize: the DOCUMENTED ceiling is 32 — a fat-fingered value clamps to exactly it", () => {
   assert.equal(
     resolvePoolSize("99999999"), 32,
-    "docs promise `max 32`; if you moved the cap, move it in README.md, docs/tui-mode.md and ADR 0008 too",
+    "docs promise `max 32`; if you moved the cap, move it in README.md, docs/tui-mode.md, "
+      + "server.mjs's env-var header comment and ADR 0008 too",
   );
 });
 
