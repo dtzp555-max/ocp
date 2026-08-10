@@ -26,6 +26,13 @@ process.env.HOME = homedir(); // normalize HOME so homedir()-derived paths are s
 
 let passed = 0;
 let failed = 0;
+// Tests that did NOT run because a premise this platform cannot provide was absent. Counted and
+// named rather than folded into `passed`, because a skipped test and a passing one are the same
+// green tick otherwise — and #366's review found exactly that: its case-fold guard asserts a
+// property only reachable on a case-INSENSITIVE filesystem, CI is ubuntu-latest/ext4, and there
+// the test passed for a second reason while covering nothing. A green CI run must not be readable
+// as coverage the run did not provide.
+let skipped = 0;
 
 // Pending promises from tests declared `async` but registered through the SYNC `test()` helper.
 // 44 tests in this file are written that way. Before this, `test()` called fn(), got a promise back,
@@ -57,6 +64,18 @@ function test(name, fn) {
     failed++;
     console.log(`  ✗ ${name}: ${e.message}`);
   }
+}
+
+/**
+ * Register a test as NOT RUN, with the reason. Never counts as passed.
+ *
+ * For a premise the current platform cannot supply — not for a test that is inconvenient. The
+ * reason is mandatory and is printed, so `npm test`'s output says which coverage this run did not
+ * provide instead of implying it did.
+ */
+function testSkipped(name, reason) {
+  skipped++;
+  console.log(`  ⊘ SKIP ${name} — ${reason}`);
 }
 
 async function testAsync(name, fn) {
@@ -1209,9 +1228,128 @@ test("#348 HIGH-2: the default (script-relative) resolution is always PASS — t
 // source text of either. Each asserts POSITIVE evidence that the directory was inspected —
 // exists/empty/markers — rather than only safeToReplace === false, which an absent directory
 // would also satisfy: a refusal for the wrong reason is not this guard working.
-import { symlinkSync as _m366Symlink, mkdtempSync as _m366Mkdtemp } from "node:fs";
+import { symlinkSync as _m366Symlink, mkdtempSync as _m366Mkdtemp, chmodSync as _m366Chmod } from "node:fs";
 
 console.log("\nInstall-marker type check (#366):");
+
+test("#366 severity: on the DOCUMENTED default layout, $HOME is ONE stray file away from rm -rf", () => {
+  // The finding that decides whether this is worth releasing, and both the issue and this PR's
+  // first draft under-sold it. README documents the install at `~/ocp`, so on a standard host
+  // $HOME already contains a DIRECTORY named `ocp` — which the pre-fix name-only check scored as
+  // a free marker. The threshold of 2 was therefore already half-spent before anything went
+  // wrong, and a SINGLE stray `models.json` / `server.mjs` / `setup.mjs` in $HOME reached it.
+  // `OCP_DIR=$HOME` with `--fresh-install --yes` would then have run `rm -rf $HOME`.
+  //
+  // That is one typo away, not the two contrived directories the issue described as "not a
+  // realistic accident". This test pins the post-fix half; the pre-fix numbers are in the PR body.
+  const root = _m366Mkdtemp(testJoin(tmpdir(), "ocp-366-home-"));
+  try {
+    for (const stray of ["models.json", "server.mjs", "setup.mjs"]) {
+      const home = testJoin(root, `home-${stray.replace(/\W/g, "_")}`);
+      tMkdirSync(testJoin(home, "ocp"), { recursive: true });   // the real install: a DIRECTORY
+      tMkdirSync(testJoin(home, "Documents"), { recursive: true });
+      testWriteFile(testJoin(home, stray), "stray");            // ONE stray marker-named file
+
+      const c = classifyInstallDir(home);
+      // Positive evidence the directory was inspected and the stray really did score, so this
+      // cannot pass because nothing was found. The stray IS a marker; `ocp/` must not be.
+      assert.deepEqual(c.markers, [stray],
+        `the stray file must score and the ocp/ DIRECTORY must not; got [${c.markers}] — ${c.why}`);
+      assert.equal(c.isInstall, false,
+        `one marker file plus an ocp/ directory must not reach the threshold; ${c.why}`);
+      assert.equal(c.safeToReplace, false, `$HOME must never be rm -rf-able here: ${c.why}`);
+    }
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("#366 review F1: a marker that cannot be STAT'D is diagnosed as unreadable, never as 'not an OCP install'", () => {
+  // The flag value was already right; the MESSAGE was catastrophically wrong. On a directory that
+  // is readable but not executable, readdirSync lists all four markers while statSync on each
+  // throws EACCES — so a real install was reported as "exists and is NOT an OCP install ... it is
+  // not something this tool may delete", and doctor's advice line then tells the operator to
+  // "remove it yourself first". That is the one action that loses the install.
+  //
+  // Skipped as root: with CAP_DAC_OVERRIDE the mode bits do not deny anything, so statSync would
+  // succeed and the premise would silently not hold — the vacuity this suite keeps being bitten by.
+  if (typeof process.getuid === "function" && process.getuid() === 0) {
+    return testSkipped("#366 review F1: a marker that cannot be STAT'D is diagnosed as unreadable",
+      "running as root — DAC override makes a mode-444 directory readable, so the EACCES premise cannot be created");
+  }
+  const root = _m366Mkdtemp(testJoin(tmpdir(), "ocp-366-eacces-"));
+  const install = testJoin(root, "install");
+  try {
+    tMkdirSync(install, { recursive: true });
+    for (const f of ["server.mjs", "setup.mjs", "ocp", "models.json"]) testWriteFile(testJoin(install, f), "");
+    testWriteFile(testJoin(install, "package.json"), JSON.stringify({ name: OCP_PACKAGE_NAME }));
+    _m366Chmod(install, 0o444); // r, no x: readdir works, stat on any child does not
+
+    const c = classifyInstallDir(install);
+
+    // PREMISE, measured rather than assumed: readdir really did see all four marker names. If the
+    // chmod silently failed (some filesystems, or root), markers would be empty for an unrelated
+    // reason and every assertion below would pass while testing nothing.
+    assert.deepEqual(c.unreadableMarkers.slice().sort(), ["models.json", "ocp", "server.mjs", "setup.mjs"],
+      `premise: all four marker NAMES must be present-but-unstattable; got ${JSON.stringify(c.unreadableMarkers)} — ${c.why}`);
+    assert.deepEqual(c.markers, [], "nothing may score as a confirmed file when every stat failed");
+
+    // The verdict is UNCHANGED — still refused. Only the diagnosis differs.
+    assert.equal(c.safeToReplace, false, "an uninspectable directory must still never be deleted");
+
+    // The actual finding: what the operator is told.
+    assert.ok(c.why.includes("could not be inspected"),
+      `the refusal must name the real cause; got: ${c.why}`);
+    assert.ok(c.why.includes("permission"),
+      `the refusal must point at permissions, the true cause; got: ${c.why}`);
+    assert.ok(!/is NOT an OCP install/.test(c.why),
+      `a permission-locked install must NOT be reported as "not an OCP install"; got: ${c.why}`);
+    assert.ok(/do NOT delete it/i.test(c.why),
+      `the advice must not be "remove it yourself"; got: ${c.why}`);
+
+    // CONTROL: the same directory with permissions restored is a normal, recognised install.
+    // Without this, "says could-not-inspect" would be satisfiable by a classifier that says it
+    // about everything.
+    _m366Chmod(install, 0o755);
+    const ok = classifyInstallDir(install);
+    assert.deepEqual(ok.unreadableMarkers, [], `no marker is unreadable at mode 755; ${ok.why}`);
+    assert.equal(ok.isInstall, true, ok.why);
+    assert.equal(ok.safeToReplace, true, ok.why);
+  } finally {
+    try { _m366Chmod(install, 0o755); } catch { /* best effort */ }
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("#366 review F1: a DIRECTORY-shaped marker is still 'not an install', not 'unreadable'", () => {
+  // The other side of the distinction. The tri-state must not turn every refusal into
+  // "could not be inspected" — that would trade one misleading message for another, and would
+  // make the test above pass for the wrong reason.
+  const root = _m366Mkdtemp(testJoin(tmpdir(), "ocp-366-notafile-"));
+  try {
+    const d = testJoin(root, "marker-dirs");
+    tMkdirSync(testJoin(d, "ocp"), { recursive: true });
+    tMkdirSync(testJoin(d, "models.json"), { recursive: true });
+    const c = classifyInstallDir(d);
+    assert.deepEqual(c.unreadableMarkers, [],
+      `a directory is a LOOKED-AT answer, not an unreadable one; got ${JSON.stringify(c.unreadableMarkers)}`);
+    assert.ok(c.why.includes("is NOT an OCP install"),
+      `this one really is not an install and must say so; got: ${c.why}`);
+    assert.ok(!c.why.includes("could not be inspected"), `got: ${c.why}`);
+
+    // A DANGLING symlink is also a looked-at answer (ENOENT), not a permission problem.
+    const dang = testJoin(root, "dangling");
+    tMkdirSync(dang, { recursive: true });
+    _m366Symlink(testJoin(root, "no-such-target"), testJoin(dang, "server.mjs"));
+    _m366Symlink(testJoin(root, "no-such-target-2"), testJoin(dang, "setup.mjs"));
+    const cd = classifyInstallDir(dang);
+    assert.deepEqual(cd.unreadableMarkers, [],
+      `ENOENT is an answer, not a failure to look; got ${JSON.stringify(cd.unreadableMarkers)} — ${cd.why}`);
+    assert.ok(!cd.why.includes("could not be inspected"), `got: ${cd.why}`);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
 
 test("#366: a DIRECTORY named after a marker does not score as one — two of them are not an OCP install", () => {
   const root = _m366Mkdtemp(testJoin(tmpdir(), "ocp-366-"));
@@ -1259,8 +1397,12 @@ test("#366: symlinked markers follow the link — to a file counts, to a directo
 
     const mk = (name, build) => { const d = testJoin(root, name); tMkdirSync(d, { recursive: true }); build(d); return d; };
 
-    // Symlink → regular file: MUST still count. An install whose `ocp` is symlinked into place
-    // is a real shape, and refusing it would break the legitimate path in the name of a fix.
+    // Symlink → regular file: MUST still count, because statSync follows and that is the same
+    // question the package.json arm asks with readFileSync. NOT because a symlinked marker is a
+    // shape real installs have — review found no support for that claim and it is withdrawn:
+    // `git ls-files -s` has zero mode-120000 entries and installs come from `git clone`. This
+    // pins the CHOICE, so a later switch to lstatSync is a visible decision rather than a silent
+    // narrowing (mutation M4).
     const toFile = mk("to-file", d => {
       _m366Symlink(testJoin(store, "a"), testJoin(d, "server.mjs"));
       _m366Symlink(testJoin(store, "b"), testJoin(d, "setup.mjs"));
@@ -1296,40 +1438,59 @@ test("#366: symlinked markers follow the link — to a file counts, to a directo
   }
 });
 
-test("#366: the readdir entry test is kept alongside the stat — on a case-insensitive filesystem they disagree", () => {
-  // WHY THIS EXISTS: the obvious simplification after adding the stat is to drop
-  // `entries.includes(m)` as redundant. It is not. statSync resolves through the filesystem's
-  // own case folding, so on APFS/HFS+/NTFS `statSync(dir + "/server.mjs")` succeeds for an entry
-  // actually named `SERVER.MJS` — dropping the entries test would WIDEN what scores as an OCP
-  // install, on the guard whose false positive is an `rm -rf` argument.
-  //
-  // The premise is MEASURED here, not assumed, because it is false on a case-sensitive
-  // filesystem (Linux CI): there statSync throws ENOENT and the two conditions agree, so this
-  // test can only have teeth where the premise holds. It says which case it ran.
-  const root = _m366Mkdtemp(testJoin(tmpdir(), "ocp-366-case-"));
+// The premise this test needs — statSync resolving through the filesystem's own case folding —
+// exists only on a case-INSENSITIVE filesystem. Probed once, here, so the decision to run or skip
+// is made from a measurement of the actual volume rather than from process.platform (a Linux host
+// can mount a case-insensitive volume, and macOS can format a case-sensitive one; #366's review
+// measured both).
+const _m366CaseInsensitive = (() => {
+  const probeRoot = _m366Mkdtemp(testJoin(tmpdir(), "ocp-366-caseprobe-"));
   try {
-    const probe = testJoin(root, "probe");
-    tMkdirSync(probe, { recursive: true });
-    testWriteFile(testJoin(probe, "CASEPROBE"), "");
-    let caseInsensitive = false;
-    try { caseInsensitive = testExistsSync(testJoin(probe, "caseprobe")); } catch { caseInsensitive = false; }
+    testWriteFile(testJoin(probeRoot, "CASEPROBE"), "");
+    return testExistsSync(testJoin(probeRoot, "caseprobe"));
+  } catch { return false; } finally { rmSync(probeRoot, { recursive: true, force: true }); }
+})();
 
-    const upper = testJoin(root, "upper");
-    tMkdirSync(upper, { recursive: true });
-    testWriteFile(testJoin(upper, "SERVER.MJS"), "");
-    testWriteFile(testJoin(upper, "SETUP.MJS"), "");
-    const c = classifyInstallDir(upper);
+if (!_m366CaseInsensitive) {
+  // NOT a pass. On a case-sensitive filesystem `entries.includes("server.mjs")` and
+  // `statSync(dir + "/server.mjs")` AGREE — both miss `SERVER.MJS` — so the assertions below hold
+  // for a second reason and mutation M3 (which deletes the entries test) reddens NOTHING. CI is
+  // ubuntu-latest on ext4, so this is the CI case: the conjunct is real, load-bearing, and
+  // unprotected by the only automated gate. Saying so out loud is the whole point — a silent ✓
+  // here is what let the mutation table claim a kill that CI cannot reproduce.
+  testSkipped("#366: the readdir entry test is kept alongside the stat — on a case-insensitive filesystem they disagree",
+    "this filesystem is case-SENSITIVE, where entries.includes() and statSync() agree; the test " +
+    "would pass for the wrong reason and mutation M3 survives here. Run it on APFS/HFS+/NTFS to " +
+    "exercise the conjunct.");
+} else {
+  test("#366: the readdir entry test is kept alongside the stat — on a case-insensitive filesystem they disagree", () => {
+    // WHY THIS EXISTS: the obvious simplification after adding the stat is to drop
+    // `entries.includes(m)` as redundant. It is not. statSync resolves through the filesystem's
+    // own case folding, so on APFS/HFS+/NTFS `statSync(dir + "/server.mjs")` succeeds for an entry
+    // actually named `SERVER.MJS` — dropping the entries test would WIDEN what scores as an OCP
+    // install, on the guard whose false positive is an `rm -rf` argument.
+    const root = _m366Mkdtemp(testJoin(tmpdir(), "ocp-366-case-"));
+    try {
+      const upper = testJoin(root, "upper");
+      tMkdirSync(upper, { recursive: true });
+      testWriteFile(testJoin(upper, "SERVER.MJS"), "");
+      testWriteFile(testJoin(upper, "SETUP.MJS"), "");
 
-    // The assertion is correct on BOTH kinds of filesystem — the marker names are lowercase and
-    // these entries are not those names — but only mutation-provable on a case-insensitive one.
-    assert.deepEqual(c.markers, [],
-      `uppercase entries must not score as lowercase markers; got [${c.markers}] — ${c.why}`);
-    assert.equal(c.safeToReplace, false, c.why);
-    console.log(`    (filesystem is case-${caseInsensitive ? "INsensitive — this case has teeth here" : "sensitive — statSync would also miss, assertion holds for a second reason"})`);
-  } finally {
-    rmSync(root, { recursive: true, force: true });
-  }
-});
+      // Premise, asserted rather than assumed: on THIS volume the two conditions really do
+      // disagree. If statSync stopped case-folding, the assertion below would still pass and
+      // would again be proving nothing.
+      assert.equal(_ltExists(testJoin(upper, "server.mjs")), true,
+        "premise: this volume must case-fold, or the conjunct under test is not exercised");
+
+      const c = classifyInstallDir(upper);
+      assert.deepEqual(c.markers, [],
+        `uppercase entries must not score as lowercase markers; got [${c.markers}] — ${c.why}`);
+      assert.equal(c.safeToReplace, false, c.why);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+}
 
 test("#366: `package.json` as a DIRECTORY cannot satisfy the named-package arm either", () => {
   // The other half of "this name exists" not meaning "this file exists". This arm was already
@@ -19237,7 +19398,13 @@ test("replay → dashboard.html Status card DECIDES tag-ok (the green card) on t
 
 runAsyncTests().then(() => Promise.all(pendingAsync)).then(() => {
   closeDb();
-  console.log(`\n=== Results: ${passed} passed, ${failed} failed ===\n`);
+  // `skipped` is appended only when non-zero, so the line a green run prints is unchanged on a
+  // platform that skips nothing, and a run that DID skip cannot be mistaken for one that did not.
+  console.log(`\n=== Results: ${passed} passed, ${failed} failed${skipped ? `, ${skipped} skipped` : ""} ===\n`);
+  if (skipped) {
+    console.log(`${skipped} test(s) did not run on this platform — search the output for "⊘ SKIP" ` +
+                `to see which coverage this run did NOT provide.\n`);
+  }
   process.exit(failed > 0 ? 1 : 0);
 }).catch((e) => {
   console.error("async test runner crashed:", e);
