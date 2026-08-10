@@ -1887,11 +1887,17 @@ async function runRollback(opts) {
   // (restart-unit.mjs:1106). If a `system-unit` plan ever reached this function, `sudo` would be
   // executed regardless of the scoping below.
   //
-  // The property actually rests on ONE upstream refusal: `resolveRestartPlan` throws for
-  // `isRollback && owner.kind === "system-unit"` (this file, ~:399) before any command runs. That is
-  // the load-bearing line, so THAT is what carries a test with teeth — one asserting the refusal
-  // fires with ZERO commands executed. Testing the `system-unit` branch of the scoping below would
-  // mean testing a state the code refuses to enter.
+  // The property rests on TWO upstream refusals, not one — corrected in round 3 (finding R2-2b),
+  // where the earlier "ONE upstream refusal" was materially true but imprecise:
+  //   1. `resolveRestartPlan` throws for `isRollback && owner.kind === "system-unit"` (this file,
+  //      ~:399), before any command runs; and
+  //   2. `planRestart` itself throws for a system unit whose `sudo systemctl restart --` could NOT
+  //      be verified non-interactively (restart-unit.mjs, the `sudo -n -l` arm).
+  // Refusal 2 does not cover the case that matters: when sudo IS authorized, `planRestart` happily
+  // returns `sudo systemctl restart -- <unit>` (restart-unit.mjs:1106) and only refusal 1 is left
+  // standing. So refusal 1 is the load-bearing line and THAT is what carries a test — one asserting
+  // it fires with zero commands executed. Testing the `system-unit` branch of the scoping below
+  // would mean testing a state the code refuses to enter.
   //
   // What the exclusion below buys is therefore narrower and worth stating honestly: the step this
   // pass ADDS never carries `sudo`, independent of that refusal. Belt to the upstream braces, and
@@ -2056,8 +2062,8 @@ async function runRollback(opts) {
   // keyed on the #291 CLASSIFICATION of the last attempt, so no operator-facing sentence asserts
   // more than was measured.
   //
-  //   version-mismatch  -> reached, read a body, wrong version  -> the port is held by something
-  //                        else, most likely the pre-rollback process (#274's whole subject)
+  //   version-mismatch  -> reached, read a body, body REJECTED   -> see the misnomer note below;
+  //                        this kind does NOT mean "wrong version"
   //   unparseable       -> reached, got bytes that are not JSON -> something answers, but it is
   //                        NOT this proxy
   //   http-error        -> reached, got a non-2xx               -> same: something answers
@@ -2089,8 +2095,46 @@ async function runRollback(opts) {
   //  3. It was NEW surface. Before this PR the `exec` throw meant no DOWN claim existed on this
   //     path at all, so this is a false statement this PR would have introduced.
   const failureKind = postFlight.lastFailure?.kind ?? null;
-  const servedWrongVersion = failureKind === "version-mismatch";
-  const answeredNotOcp = failureKind === "unparseable" || failureKind === "http-error";
+
+  // #352 review round 3, findings R2-1 and R2-4. THE KIND NAME `version-mismatch` IS A MISNOMER,
+  // and the previous round took it on trust — which is the one input the "assert only what was
+  // measured" rework did not apply itself to.
+  //
+  // `runPostFlightCheck` stamps `kind: "version-mismatch"` on EVERY post-body acceptance failure
+  // (this file, in the loop). The acceptance predicate is `postFlightOk`, which fails on **status**
+  // as well as version:  `if (body?.status !== "ok") return false;`  And `/health`'s status domain
+  // is exactly {"ok","degraded"} (server.mjs — degraded when the CLI binary is not OK, or after
+  // AUTH_DEGRADE_AFTER consecutive auth rejections), **always over HTTP 200**.
+  //
+  // So a rollback that lands PERFECTLY on a degraded proxy produced, verbatim:
+  //     THE PROXY IS UP BUT SERVING THE WRONG VERSION (3.10.0, expected 3.10.0)
+  //     … the process holding …:PORT is most likely the pre-rollback one that was never replaced
+  //     … Replace the running process with: launchctl bootout … && launchctl bootstrap …
+  // Every clause false: one version named as both wrong and expected; the process IS the correctly
+  // rolled-back one; the remedy replaces a process running the right code; and the closing "run
+  // `ocp doctor` if it still reports X" rule fires unconditionally, sending the operator after a
+  // port conflict that does not exist. Not exotic either — `!binaryOk` is persistent, and a
+  // rollback is precisely when the tree under the `claude` path just changed.
+  //
+  // Two guards, both on facts this function can see without touching the shared classifier:
+  //   - R2-1: only claim a version is wrong when it DIFFERS from the target. `postFlight.target` is
+  //     already v-stripped by runPostFlightCheck and `lastSeen` is the raw `body.version`, which is
+  //     exactly the pair `postFlightOk` compares — so this is the same comparison, not a new rule.
+  //     The equal case (status-only rejection: degraded, correct version) falls through to the
+  //     neutral #274 verdict below, which says "may not be what's running — run `ocp doctor`". That
+  //     is true and it is the right next step for a degraded proxy.
+  //   - R2-4: a body that parsed but carries NO `version` field leaves `lastSeen` nullish, and
+  //     round 2 newly routed it here (round 1 sent it to DOWN), producing "(undefined, expected
+  //     3.10.0)". A JSON responder with no `version` is not this proxy, so it belongs in the
+  //     answering-but-not-OCP cell. `== null` deliberately, to catch `undefined` as well as `null`.
+  //
+  // NOT FIXED HERE, deliberately: splitting the classifier into `version-mismatch` vs
+  // `not-ok-status` would change `runPostFlightCheck`, which `runFullUpgrade` shares — so it goes
+  // with the extraction work in the follow-up issue rather than being smuggled in on this path.
+  const bodyRejected = failureKind === "version-mismatch";
+  const noVersionField = bodyRejected && postFlight.lastSeen == null;
+  const servedWrongVersion = bodyRejected && !noVersionField && postFlight.lastSeen !== postFlight.target;
+  const answeredNotOcp = failureKind === "unparseable" || failureKind === "http-error" || noVersionField;
   // DOWN requires POSITIVE evidence of non-reach rather than being the `else`. Anything the
   // classifier did not produce one of these five kinds for falls through to the neutral #274
   // verdict below, which claims nothing about the service beyond "this is not confirmed".
@@ -2124,10 +2168,16 @@ async function runRollback(opts) {
     // no version to name, and the thing answering may not be OCP at all. The remedy differs too,
     // which is why this is a cell rather than a reworded sentence: the recovery commands cannot
     // bind a port somebody else holds.
+    // R2-4: for the no-`version`-field case the classifier's own detail is the unhelpful "serving
+    // unknown" (it renders `body.version ?? "unknown"`), which reads as a version statement about a
+    // body that has no version. Say what was actually observed instead.
+    const answeredDetail = noVersionField
+      ? "it answered with JSON that carries no `version` field"
+      : postFlight.lastFailure.detail;
     throw Object.assign(
-      new Error(`rollback post-flight failed: ${postFlight.lastFailure.detail} — something is answering on 127.0.0.1:${rollbackPort}, but it is not this proxy`),
+      new Error(`rollback post-flight failed: ${answeredDetail} — something is answering on 127.0.0.1:${rollbackPort}, but it is not this proxy`),
       { phases, target: target.path,
-        hint: `SOMETHING ELSE IS ANSWERING ON 127.0.0.1:${rollbackPort} — ${postFlight.lastFailure.detail}. `
+        hint: `SOMETHING ELSE IS ANSWERING ON 127.0.0.1:${rollbackPort} — ${answeredDetail}. `
           + `A restart command also failed after ${restartFailure.attempts} attempts. Do NOT simply re-run the restart: `
           + `if another process owns the port, the start command cannot bind it and will keep failing. `
           + `Find out what owns it first — \`ocp doctor\`, then \`lsof -i :${rollbackPort}\` / \`ss -ltnp\`. `

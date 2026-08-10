@@ -6574,10 +6574,23 @@ test("#352 F2: the upstream `system-unit` refusal is what keeps `sudo` out of th
   // "system-unit"` BEFORE any command runs — so that refusal is what deserves a test with teeth,
   // and this is it.
   //
-  // The teeth are the `run.calls` assertion, not the rejection: a test that only checked the
-  // message would still pass if the refusal moved to AFTER the restart loop, which is precisely the
-  // regression that would let a `sudo` through. Neutering the refusal makes the plan resolve to a
-  // system unit and `sudo systemctl restart -- ocp.service` gets executed — this goes red.
+  // WHAT WAS MEASURED, and what is only reasoned — corrected in round 3 (finding R2-2a), because
+  // the previous version of this comment stated the second as if it were the first:
+  //
+  //   [measured] Neutering refusal 1 (`upgrade.mjs`'s `isRollback && owner.kind === "system-unit"`)
+  //     turns this test RED — on the `assert.match` of the message, which evaluates before the
+  //     `run.calls` assertions below. NOTHING is executed and no `sudo` runs: `planRestart` has its
+  //     own refusal for a system unit whose sudo could not be verified non-interactively, and it
+  //     catches this fixture. Confirmed on the mutated tree (mutation N3), which also takes four
+  //     pre-existing system-unit tests with it.
+  //   [reasoned, NOT exercised by any mutation here] The `run.calls` assertions are a FORWARD guard,
+  //     for the regression where refusal 1 moves to after the restart loop. No mutation in this PR
+  //     produces that shape, so they have never been the assertion that fired. Labelled rather than
+  //     dropped: a guard nobody has seen fail is worth keeping and worth not overselling.
+  //
+  // The earlier claim — "neutering the refusal makes the plan resolve to a system unit and `sudo
+  // systemctl restart -- ocp.service` gets executed" — was a reasoned claim written in a measured
+  // voice, the exact shape `docs/governance/b2-response-keys.json`'s `notCovered` block warns about.
   const run = _u347Runner({});
   let caught = null;
   try {
@@ -6660,6 +6673,93 @@ test("#352 F1: an HTTP-error post-flight is classified the same way — answerin
     `a non-2xx IS an answer; got hint=${JSON.stringify(caught.hint)}`);
   assert.ok(caught.hint.startsWith("SOMETHING ELSE IS ANSWERING"),
     `got hint=${JSON.stringify(caught.hint)}`);
+});
+
+test("#352 R2-1 (the money test for round 3): a rollback that lands CORRECTLY on a DEGRADED proxy must not be told it is serving the wrong version", async () => {
+  // Review round 3, finding R2-1. `runPostFlightCheck` stamps `kind: "version-mismatch"` on every
+  // post-body acceptance failure, but `postFlightOk` fails on STATUS as well as version, and
+  // /health's status domain is {"ok","degraded"} — always over HTTP 200. So a rollback that lands
+  // perfectly on a degraded proxy produced "SERVING THE WRONG VERSION (3.10.0, expected 3.10.0)":
+  // one version named as both wrong and expected, a remedy that replaces a process running the
+  // right code, and a closing "run `ocp doctor` if it still reports 3.10.0" that can never not fire.
+  //
+  // Not exotic: `degraded` is persistent when the CLI binary is not OK, and a rollback is exactly
+  // when the tree under the `claude` path just changed.
+  //
+  // The previous round re-keyed every cell on the #291 classification so that no sentence asserts
+  // more than was measured — and then took THIS kind's NAME on trust. The method was right; it was
+  // not applied to the one input it inherited.
+  const run = _u347Runner({ "launchctl bootstrap": Infinity });
+  let caught = null;
+  try {
+    await runUpgrade(_u352Opts({
+      execFn: run,
+      // Correct version, degraded status — the shape server.mjs emits when !binaryOk.
+      mockProbe: () => ({ status: "degraded", auth: { ok: true }, version: "3.10.0" }),
+    }));
+  } catch (e) { caught = e; }
+
+  assert.ok(caught, "a degraded proxy is still not a confirmed-good rollback");
+  // Premise: this really is the status-only rejection — same version in and out, so any claim that
+  // the version is wrong is self-refuting by construction.
+  const pf = caught.phases.find(p => p.name === "post-flight");
+  assert.ok(pf && /last saw version=3\.10\.0/.test(pf.message || ""),
+    `harness premise: the probe read a body carrying the CORRECT version; got ${JSON.stringify(pf)}`);
+
+  assert.ok(!/WRONG VERSION/.test(caught.hint || ""),
+    `the version matched — nothing may call it wrong; got hint=${JSON.stringify(caught.hint)}`);
+  assert.ok(!/3\.10\.0, expected 3\.10\.0/.test(caught.hint || ""),
+    `and nothing may name one version as both wrong and expected; got hint=${JSON.stringify(caught.hint)}`);
+  assert.ok(!/pre-rollback one that was never replaced/.test(caught.hint || ""),
+    `the process holding the port IS the correctly rolled-back one; got hint=${JSON.stringify(caught.hint)}`);
+  // It falls to the neutral #274 verdict, which is true here and points at the right next step.
+  assert.match(caught.message, /rollback post-flight failed: restored tree may not be what's running/);
+  assert.match(caught.message, /ocp doctor/);
+});
+
+test("#352 R2-4: a JSON body with no `version` field is SOMETHING ELSE ANSWERING, not 'serving undefined'", async () => {
+  // Review round 3, finding R2-4. `lastSeen = body.version` is `undefined` for such a body, and
+  // round 2 newly routed it into the wrong-version cell (round 1 sent it to DOWN), producing
+  // "SERVING THE WRONG VERSION (undefined, expected 3.10.0)". A JSON responder with no `version`
+  // is not this proxy, so it belongs with the other answering-but-not-OCP shapes — and the
+  // classifier's own detail ("serving unknown") reads as a version statement about a body that has
+  // no version, so the cell substitutes what was actually observed.
+  const run = _u347Runner({ "launchctl bootstrap": Infinity });
+  let caught = null;
+  try {
+    await runUpgrade(_u352Opts({
+      execFn: run,
+      mockProbe: () => ({ status: "ok", auth: { ok: true } }),   // valid JSON, no `version`
+    }));
+  } catch (e) { caught = e; }
+
+  assert.ok(caught);
+  assert.ok(!/undefined/.test(caught.hint || ""),
+    `no operator-facing text may contain "undefined"; got hint=${JSON.stringify(caught.hint)}`);
+  assert.ok(!/WRONG VERSION/.test(caught.hint || ""),
+    `there is no version to call wrong; got hint=${JSON.stringify(caught.hint)}`);
+  assert.ok((caught.hint || "").startsWith("SOMETHING ELSE IS ANSWERING"),
+    `got hint=${JSON.stringify(caught.hint)}`);
+  assert.ok(/no .?version.? field/.test(caught.hint),
+    `and it must say what was actually observed, not "serving unknown"; got hint=${JSON.stringify(caught.hint)}`);
+});
+
+test("#352 R2-1 control: a genuinely WRONG version still gets the wrong-version cell (the guard is scoped, not a blanket disable)", async () => {
+  // Proves the R2-1 guard did not simply switch the wrong-version cell off. Same degraded-adjacent
+  // path, but the version genuinely differs, so every clause of that hint is true and must survive.
+  const run = _u347Runner({ "launchctl bootstrap": Infinity });
+  let caught = null;
+  try {
+    await runUpgrade(_u352Opts({
+      execFn: run,
+      mockProbe: () => ({ status: "ok", auth: { ok: true }, version: "3.14.0" }),
+    }));
+  } catch (e) { caught = e; }
+  assert.ok(caught);
+  assert.ok((caught.hint || "").startsWith("THE PROXY IS UP BUT SERVING THE WRONG VERSION"),
+    `a real mismatch must still reach this cell; got hint=${JSON.stringify(caught.hint)}`);
+  assert.ok(caught.hint.includes("3.14.0") && caught.hint.includes("3.10.0"),
+    `naming both versions; got hint=${JSON.stringify(caught.hint)}`);
 });
 
 test("#352 LOW-D: `lastSeen` is STICKY — a probe that answers once and then dies must be reported DOWN, not as serving the wrong version", async () => {
