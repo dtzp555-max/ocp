@@ -1197,6 +1197,200 @@ test("#348 HIGH-2: the default (script-relative) resolution is always PASS — t
   assert.equal(result.install_dir_safe_to_replace, true);
 });
 
+// ── Issue #366: the marker check was type-blind ──────────────────────────────────────────────
+//
+// `entries.includes("models.json")` reads as "this file exists" and did not mean that: a
+// DIRECTORY named `models.json/` scored identically to the file. Measured on the pre-fix tree,
+// two empty directories named `ocp/` and `models.json/` gave safeToReplace = true — the verdict
+// that licenses `rm -rf`. A `/opt`-shaped directory was refused only because it scores exactly
+// ONE marker, i.e. by the threshold of 2 and by nothing that looked at what those entries are.
+//
+// These tests assert on the classifier's own output and on doctor's emitted plan, never on the
+// source text of either. Each asserts POSITIVE evidence that the directory was inspected —
+// exists/empty/markers — rather than only safeToReplace === false, which an absent directory
+// would also satisfy: a refusal for the wrong reason is not this guard working.
+import { symlinkSync as _m366Symlink, mkdtempSync as _m366Mkdtemp } from "node:fs";
+
+console.log("\nInstall-marker type check (#366):");
+
+test("#366: a DIRECTORY named after a marker does not score as one — two of them are not an OCP install", () => {
+  const root = _m366Mkdtemp(testJoin(tmpdir(), "ocp-366-"));
+  try {
+    // The exact shape the issue measured: two entries with marker NAMES, both directories.
+    const dirs = testJoin(root, "marker-dirs");
+    tMkdirSync(testJoin(dirs, "ocp"), { recursive: true });
+    tMkdirSync(testJoin(dirs, "models.json"), { recursive: true });
+
+    const c = classifyInstallDir(dirs);
+    // Positive evidence the directory was looked at, so this cannot pass for an absent path.
+    assert.equal(c.exists, true, "premise: the directory must exist, or the refusal proves nothing");
+    assert.equal(c.empty, false, "premise: it must be non-empty, or `empty` would carry the verdict");
+    assert.deepEqual(c.markers, [],
+      `a directory named after a marker must not score as one; got markers=[${c.markers}]`);
+    assert.equal(c.isInstall, false);
+    assert.equal(c.safeToReplace, false, `directories must not license rm -rf; why: ${c.why}`);
+
+    // THE CONTROL that makes the assertion above about TYPE and not about names: the same two
+    // names, as regular files, in a sibling directory. If this stops passing, the test above is
+    // green for the wrong reason.
+    const files = testJoin(root, "marker-files");
+    tMkdirSync(files, { recursive: true });
+    testWriteFile(testJoin(files, "ocp"), "");
+    testWriteFile(testJoin(files, "models.json"), "");
+
+    const f = classifyInstallDir(files);
+    assert.deepEqual(f.markers, ["ocp", "models.json"],
+      `same names as regular files must still score; got markers=[${f.markers}] — ${f.why}`);
+    assert.equal(f.safeToReplace, true, `the legitimate half-broken-install case must keep working: ${f.why}`);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("#366: symlinked markers follow the link — to a file counts, to a directory or to nothing does not", () => {
+  const root = _m366Mkdtemp(testJoin(tmpdir(), "ocp-366-sym-"));
+  try {
+    // Real files to point at, kept OUTSIDE every candidate directory so they cannot be counted
+    // directly by any candidate's own readdir.
+    const store = testJoin(root, "store");
+    tMkdirSync(store, { recursive: true });
+    testWriteFile(testJoin(store, "a"), "x");
+    testWriteFile(testJoin(store, "b"), "y");
+
+    const mk = (name, build) => { const d = testJoin(root, name); tMkdirSync(d, { recursive: true }); build(d); return d; };
+
+    // Symlink → regular file: MUST still count. An install whose `ocp` is symlinked into place
+    // is a real shape, and refusing it would break the legitimate path in the name of a fix.
+    const toFile = mk("to-file", d => {
+      _m366Symlink(testJoin(store, "a"), testJoin(d, "server.mjs"));
+      _m366Symlink(testJoin(store, "b"), testJoin(d, "setup.mjs"));
+    });
+    const cFile = classifyInstallDir(toFile);
+    assert.deepEqual(cFile.markers, ["server.mjs", "setup.mjs"],
+      `symlinks to regular files must count; got [${cFile.markers}] — ${cFile.why}`);
+    assert.equal(cFile.safeToReplace, true, cFile.why);
+
+    // Dangling symlink: scored as a marker before this change (measured). statSync throws
+    // ENOENT, so it now scores zero.
+    const dangling = mk("dangling", d => {
+      _m366Symlink(testJoin(root, "no-such-target-1"), testJoin(d, "server.mjs"));
+      _m366Symlink(testJoin(root, "no-such-target-2"), testJoin(d, "setup.mjs"));
+    });
+    const cDang = classifyInstallDir(dangling);
+    assert.equal(cDang.exists, true, "premise: the directory itself exists");
+    assert.equal(cDang.empty, false, "premise: the dangling links ARE entries — readdir sees them");
+    assert.deepEqual(cDang.markers, [], `a dangling symlink is not a file; got [${cDang.markers}]`);
+    assert.equal(cDang.safeToReplace, false, cDang.why);
+
+    // Symlink → directory: the #366 defect wearing a link.
+    const toDir = mk("to-dir", d => {
+      _m366Symlink(store, testJoin(d, "server.mjs"));
+      _m366Symlink(store, testJoin(d, "setup.mjs"));
+    });
+    const cDir = classifyInstallDir(toDir);
+    assert.equal(cDir.empty, false, "premise: the links ARE entries");
+    assert.deepEqual(cDir.markers, [], `a symlink to a directory is not a file; got [${cDir.markers}]`);
+    assert.equal(cDir.safeToReplace, false, cDir.why);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("#366: the readdir entry test is kept alongside the stat — on a case-insensitive filesystem they disagree", () => {
+  // WHY THIS EXISTS: the obvious simplification after adding the stat is to drop
+  // `entries.includes(m)` as redundant. It is not. statSync resolves through the filesystem's
+  // own case folding, so on APFS/HFS+/NTFS `statSync(dir + "/server.mjs")` succeeds for an entry
+  // actually named `SERVER.MJS` — dropping the entries test would WIDEN what scores as an OCP
+  // install, on the guard whose false positive is an `rm -rf` argument.
+  //
+  // The premise is MEASURED here, not assumed, because it is false on a case-sensitive
+  // filesystem (Linux CI): there statSync throws ENOENT and the two conditions agree, so this
+  // test can only have teeth where the premise holds. It says which case it ran.
+  const root = _m366Mkdtemp(testJoin(tmpdir(), "ocp-366-case-"));
+  try {
+    const probe = testJoin(root, "probe");
+    tMkdirSync(probe, { recursive: true });
+    testWriteFile(testJoin(probe, "CASEPROBE"), "");
+    let caseInsensitive = false;
+    try { caseInsensitive = testExistsSync(testJoin(probe, "caseprobe")); } catch { caseInsensitive = false; }
+
+    const upper = testJoin(root, "upper");
+    tMkdirSync(upper, { recursive: true });
+    testWriteFile(testJoin(upper, "SERVER.MJS"), "");
+    testWriteFile(testJoin(upper, "SETUP.MJS"), "");
+    const c = classifyInstallDir(upper);
+
+    // The assertion is correct on BOTH kinds of filesystem — the marker names are lowercase and
+    // these entries are not those names — but only mutation-provable on a case-insensitive one.
+    assert.deepEqual(c.markers, [],
+      `uppercase entries must not score as lowercase markers; got [${c.markers}] — ${c.why}`);
+    assert.equal(c.safeToReplace, false, c.why);
+    console.log(`    (filesystem is case-${caseInsensitive ? "INsensitive — this case has teeth here" : "sensitive — statSync would also miss, assertion holds for a second reason"})`);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("#366: `package.json` as a DIRECTORY cannot satisfy the named-package arm either", () => {
+  // The other half of "this name exists" not meaning "this file exists". This arm was already
+  // type-safe by construction — readFileSync on a directory throws EISDIR (measured) and the
+  // catch falls through to the marker count — but nothing pinned it, so a future rewrite to
+  // existsSync + readdir would silently make a `package.json/` directory an identifying signal.
+  const root = _m366Mkdtemp(testJoin(tmpdir(), "ocp-366-pkgdir-"));
+  try {
+    const d = testJoin(root, "pkg-as-dir");
+    tMkdirSync(testJoin(d, "package.json"), { recursive: true });
+    testWriteFile(testJoin(d, "server.mjs"), ""); // exactly ONE real marker: under the threshold
+
+    const c = classifyInstallDir(d);
+    assert.equal(c.exists, true);
+    assert.deepEqual(c.markers, ["server.mjs"],
+      `premise: the one real marker must still score, or this proves nothing about package.json; got [${c.markers}]`);
+    assert.equal(c.isInstall, false,
+      `a directory named package.json must not identify the install; why: ${c.why}`);
+    assert.equal(c.safeToReplace, false, c.why);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("#366 end to end: doctor withholds every destructive step for a directory whose markers are directories", async () => {
+  // The consumer-visible half. classifyInstallDir's verdict reaches an operator through exactly
+  // two paths — doctor's emitted ai_executable[] and runFreshInstall's own re-classification —
+  // and this pins the first: the same input that reaches kind="fresh_install" must produce no
+  // `rm -rf` at all.
+  const root = _m366Mkdtemp(testJoin(tmpdir(), "ocp-366-doctor-"));
+  try {
+    const target = testJoin(root, "marker-dirs");
+    tMkdirSync(testJoin(target, "ocp"), { recursive: true });
+    tMkdirSync(testJoin(target, "models.json"), { recursive: true });
+
+    const result = await runDoctor({ skipNetwork: true, mockLatest: "v9.9.9", ocpDir: target });
+    assert.equal(result.next_action.kind, "fresh_install",
+      "premise: this input must still reach the destructive kind, or the guard is untested");
+    assert.equal(result.install_dir_safe_to_replace, false);
+    assert.deepEqual(result.next_action.ai_executable, [],
+      `no automated step may be offered for a target that is not an OCP install; got ${JSON.stringify(result.next_action.ai_executable)}`);
+    const check = result.checks.find(c => c.id === "install_dir");
+    assert.equal(check.level, "FAIL");
+
+    // CONTROL: the identical directory shape with the markers as FILES still gets the full
+    // plan, `rm -rf` included. Without this, "emits no rm -rf" is satisfiable by a guard that
+    // refuses everything.
+    const ok = testJoin(root, "marker-files");
+    tMkdirSync(ok, { recursive: true });
+    testWriteFile(testJoin(ok, "ocp"), "");
+    testWriteFile(testJoin(ok, "models.json"), "");
+    const okResult = await runDoctor({ skipNetwork: true, mockLatest: "v9.9.9", ocpDir: ok });
+    assert.equal(okResult.next_action.kind, "fresh_install");
+    assert.equal(okResult.install_dir_safe_to_replace, true);
+    assert.ok(okResult.next_action.ai_executable.some(c => c.includes(`rm -rf ${ok}`)),
+      `a verifiable install is a legitimate rm target; got ${JSON.stringify(okResult.next_action.ai_executable)}`);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test("#348: resolveInstallDir is a distinct name from keys.mjs's resolveOcpDir (data dir), and returns a structured source", () => {
   // Follow-up from the review: keys.mjs already exports a `resolveOcpDir()` meaning the ~/.ocp
   // DATA directory. Two same-named functions about "the OCP directory" with different meanings

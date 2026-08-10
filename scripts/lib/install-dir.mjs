@@ -66,7 +66,7 @@
 import { dirname, join, isAbsolute } from "node:path";
 import { fileURLToPath } from "node:url";
 import { homedir } from "node:os";
-import { readdirSync, readFileSync } from "node:fs";
+import { readdirSync, readFileSync, statSync } from "node:fs";
 
 // This repo's own package.json `name`. Hardcoded rather than read at runtime because the whole
 // point is to identify a FOREIGN directory, where reading "its" package.json is the question,
@@ -80,12 +80,57 @@ export const OCP_PACKAGE_NAME = "open-claude-proxy";
 // the legitimate case. One alone is not enough: a stray `ocp` or `server.mjs` in a home
 // directory should not license `rm -rf $HOME`.
 //
-// Name-only, deliberately stated: this matches directory ENTRIES and does not stat them, so a
-// directory named `ocp/` counts the same as a file named `ocp`. Two such entries would have to
-// coincide for that to matter, and the threshold of 2 — not any type check — is what refuses a
-// `/opt`-shaped directory (which scores exactly one). Tightening this to a type check is filed
-// as follow-up rather than done here; the comment says what the code does in the meantime.
+// A marker must be a REGULAR FILE (issue #366). It used to be a name match against readdir's
+// entry list with no stat, so a *directory* named `models.json/` scored the same as the file —
+// measured before the fix: two empty directories named `ocp/` and `models.json/` produced
+// safeToReplace=true. `/opt` itself was refused only because it scores exactly one marker, i.e.
+// by the threshold of 2 rather than by anything checking what those entries are.
+//
+// The threshold is still load-bearing and this does not replace it — but note the two guard
+// DIFFERENT cases, and it is easy to blur them. The threshold's case is a directory holding
+// exactly one REAL marker file (a stray `server.mjs` in a home directory); mutation M2
+// (>= 2 → >= 1) reddens exactly that, in the #348 test. The type check's case is an entry with a
+// marker NAME that is not a file at all. `/opt` happens to be refused by both now — it scores 0
+// after this change rather than the 1 it scored before — which is why the M2 row is worth
+// keeping: without it, a later "simplification" of the threshold would look free.
 const INSTALL_MARKERS = ["server.mjs", "setup.mjs", "ocp", "models.json"];
+
+/**
+ * Does `<dir>/<name>` resolve to a regular file?
+ *
+ * `statSync`, which FOLLOWS symlinks, and each of the four outcomes is a decision:
+ *
+ *   - regular file → true. The case that matters.
+ *   - directory → false. The #366 defect.
+ *   - symlink → whatever it points AT. A symlink to a regular file counts; a symlink to a
+ *     directory does not; a DANGLING symlink does not (statSync throws ENOENT — measured; it
+ *     scored as a marker before this change). Following is the same question the package.json
+ *     arm below already asks with readFileSync, and an install whose `ocp` is symlinked into
+ *     place is a real shape that must keep working.
+ *   - any error at all → false. Fail closed, in the only direction this guard has: a marker we
+ *     could not confirm is a file must not count TOWARD "yes, this may be deleted". Measured
+ *     consequence, stated because it is a behaviour change and not only a bug fix: on a
+ *     directory that is readable but not executable (mode 444), readdirSync succeeds while
+ *     statSync on every child throws EACCES — so a genuine install in that state scored two
+ *     markers before and scores zero now, moving from safeToReplace=true to false. Refusing to
+ *     `rm -rf` a directory we cannot inspect is the outcome this module's header already asks
+ *     for ("I could not confirm what this is must not license deleting it"), and the same
+ *     directory already failed the package.json arm for the same EACCES.
+ *
+ * NOT readdirSync(..., { withFileTypes: true }): measured on macOS APFS, a symlink's Dirent
+ * reports isSymbolicLink() and isFile() === false, which would refuse the symlinked-marker
+ * shape above. NOT existsSync: it returns true for a directory, so it does not answer this
+ * question at all.
+ *
+ * Never throws.
+ */
+function markerIsRegularFile(dir, name) {
+  try {
+    return statSync(join(dir, name)).isFile();
+  } catch {
+    return false;
+  }
+}
 
 /**
  * Resolve the OCP install directory, in precedence order:
@@ -167,7 +212,14 @@ export function classifyInstallDir(dir) {
     namedPackage = !!pkg && pkg.name === OCP_PACKAGE_NAME;
   } catch { /* absent, unreadable, or not JSON — fall through to the marker count */ }
 
-  const markers = INSTALL_MARKERS.filter(m => entries.includes(m));
+  // BOTH conditions, and the readdir one stays FIRST rather than being made redundant by the
+  // stat (#366). They are not equivalent on a case-insensitive filesystem: measured on macOS
+  // APFS, a directory holding `SERVER.MJS` + `SETUP.MJS` gives entries.includes("server.mjs")
+  // === false while statSync(join(dir, "server.mjs")) succeeds with isFile() === true. Dropping
+  // the entries test would therefore WIDEN what counts as an OCP install, on a guard whose
+  // failure mode is `rm -rf` — the opposite of this fix's direction. The stat may only ever
+  // narrow. Mutation M3 removes the entries test and reddens the case-fold test below.
+  const markers = INSTALL_MARKERS.filter(m => entries.includes(m) && markerIsRegularFile(dir, m));
   const isInstall = namedPackage || markers.length >= 2;
 
   return {
