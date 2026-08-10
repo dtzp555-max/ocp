@@ -77,6 +77,9 @@ Reviewers: if "user-visible" is checked but README diff is empty, block merge (p
 ### Privacy self-check (for PUBLIC repos) — Iron Rule adjacent
 
 - [ ] This PR does not introduce real names, nicknames, or handles that identify specific individuals. All references use role-based terms (`project maintainer`, `contributor`, `user`, `reviewer`).
+
+  **Exception — external contributor attribution.** An external contributor's own public handle, used to credit their work (a `Co-Authored-By` trailer, a CHANGELOG credit, a PR comment addressed to them), is exempt. This clause exists to keep the maintainer's identity out of a public repo, which is what `AGENTS.md`'s public-repo hygiene section governs; it was never aimed at contributor credit, and stripping that credit to satisfy it would be the wrong reading of both documents.
+
 - [ ] This PR does not introduce literal personal paths (`/Users/<username>/`, `/home/<username>/`). Uses `$HOME/` or `~/` instead.
 - [ ] This PR does not introduce personal machine hostnames. Uses role-based names or generic descriptors.
 - [ ] This PR does not introduce personal email addresses beyond automated placeholders like `noreply@<vendor>.com`.
