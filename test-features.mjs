@@ -5712,6 +5712,191 @@ ltTest("integration (#379 case 3): GET /api/usage answers a non-numeric limit/ho
   } finally { child.kill("SIGKILL"); _ltRmRetry(dir); }
 });
 
+// ── #379 cases 1 & 2: a malformed percent-escape in the URL must be ANSWERED, not walked into ──
+//
+// The same mechanism as #360 and #379 case 3, reached from the URL instead of the body and BEFORE
+// any body is read. `decodeURIComponent("%")` throws `URIError: URI malformed`; three routes called
+// it unguarded on a client-controlled path segment, the throw escaped the `async` request callback,
+// and nothing answered or closed the socket. Measured on `main` before the fix, loopback, default
+// CLAUDE_AUTH_MODE=none, 4 s deadline — 0 bytes, socket still open, one `unhandled_rejection` each:
+//
+//   DELETE /api/keys/%E0%A4%A   ← #379 case 1
+//   PATCH  /api/keys/%/quota    ← #379 case 2   (identical with AND without a request body)
+//   GET    /api/keys/%/quota    ← the SIBLING #379 does not list, found by probing
+//
+// The GET is folded in under Iron Rule 11 §11.1: same mechanism, same route family, same citation
+// class, same severity, cheaper than its own PR — and fixing two of three would have left an
+// identical credential-free hang on the very next route of the same handler block (measured on
+// main, the three calls are at server.mjs:3979, :3988 and :4037 — the sibling is 49 lines below
+// the PATCH, not the "eight" an earlier revision of this comment claimed).
+//
+// WHY THE EXPECTED STATUS IS 404 AND NOT 400, since #379 flags that this choice may itself move a
+// rule. [measured] Of the 18 probed paths that carry a malformed escape and do NOT reach one of
+// these three calls, 16 already answer 404; the two that do not (`GET /api/usage/%`, `GET /logs/%`)
+// match their routes by PREFIX and so RESOLVE the URL rather than failing to — stated rather than
+// dropped, because an enumeration that omits its exceptions is not evidence. And every `jsonResponse(res,
+// 400, …)` site in server.mjs is triggered by the BODY or a body-derived field, never by the URL, so
+// a URL-triggered 400 would invent a rejection kind this surface does not have. The body
+// `{"error":"Key not found"}` is byte-identical to the 404 the two quota routes already return for a
+// segment that names no key. Full derivation in server.mjs's decodeKeySegment comment.
+//
+// WHY EVERY ANSWERED VALUE IS ASSERTED, not just the three defect statuses. The fix is authorized
+// under ADR 0006's grandfather clause, route (a) — no input that is ANSWERED today may change its
+// answer. The preservation arms below are what make that a measured property rather than a claim,
+// and each names the specific wrong implementation it exists to reject.
+//
+// ── What these arms do NOT pin, stated so a green run is not mistaken for coverage ─────────────
+//   - THE ADMIN GATE'S PRECEDENCE. [reasoned, NOT measured] All three guards sit textually BELOW
+//     their route's `if (!isAdmin) return jsonResponse(res, 403, …)`, so an unauthenticated remote
+//     caller in AUTH_MODE=multi still gets 403 rather than this 404. That cannot be measured from
+//     this fixture: `isAdmin` is `AUTH_MODE !== "multi" || authKeyName === "admin" || isLocalhost`,
+//     and every probe here is loopback, so `isLocalhost` makes `isAdmin` true in EVERY auth mode.
+//     Reaching the 403 needs a non-loopback source address, and 127.0.0.2 is not bound on macOS —
+//     the same limit docs/governance/b2-response-keys.json records for the case-3 arms. Verify it
+//     by reading the diff: the guard must stay below the isAdmin line at all three sites.
+//   - WHICH MALFORMED INPUTS EXIST. Deliberately not enumerated, and the argument does not need
+//     them: decodeKeySegment's `catch` is UNFILTERED, so it captures exactly the inputs that throw,
+//     which is exactly the set that was previously unanswered. `%` and `%E0%A4%A` are two samples
+//     of that set, not a claim to cover it.
+//   - WHERE IN THE HANDLER THE PATCH GUARD SITS, beyond "before `JSON.parse`". [measured] Moving it
+//     below the body READ but still above `JSON.parse` is invisible to every arm here — mutation
+//     M8a, GREEN, 1192/0 — and correctly so: the response is byte-identical, and the only thing that
+//     changed is that a body was consumed before the refusal, which is a resource property no
+//     assertion here observes. An earlier version of the comment below claimed this arm caught
+//     "moving the guard below the body reader"; that was measured false and is now stated as the
+//     narrower true thing. What the arm DOES catch is a move below `JSON.parse` (mutation M8b, RED).
+const LT379B_BUDGET = 15000;  // a hang is unbounded, so a generous budget costs no detection power
+
+// One probe. Asserts, IN THIS ORDER: the server answered at all, then the status, then the body.
+// The order is load-bearing — a hang is SILENCE, and reporting it as a status mismatch would name
+// a different and lesser bug. Removing any of the three guards makes the FIRST assertion fire.
+async function lt379bProbe(port, { method, path, body = "", status, what, bodyRe }) {
+  const r = await ltRawSend(port, {
+    method, path, bytes: Buffer.from(body, "utf8"), contentLength: Buffer.byteLength(body),
+    timeoutMs: LT379B_BUDGET,
+  });
+  assert.ok(!r.timedOut,
+    `${method} ${path}: NO RESPONSE within ${LT379B_BUDGET}ms and the socket was never closed. ` +
+    `This is #379 cases 1/2 themselves — decodeURIComponent threw URIError on the path segment, ` +
+    `the throw escaped the async request callback into unhandledRejection, and the client is left ` +
+    `holding a connection the server will never release. No request body is needed to do this. ` +
+    `A status mismatch would be a different (lesser) bug.`);
+  assert.equal(r.status, status, `${method} ${path} (${what}): expected ${status}, got ${r.status}: ${r.text.slice(0, 200)}`);
+  assert.match(r.text, bodyRe, `${method} ${path} (${what}): unexpected body: ${r.text.slice(0, 200)}`);
+  return r;
+}
+
+ltTest("integration (#379 cases 1+2): a malformed percent-escape in a /api/keys path is answered within a bounded time, and every already-answered request is unchanged", async () => {
+  if (!LT_POSIX) return;
+  const dir = ltMkdir(); const fake = ltFake(dir);
+  const { child, buf, port } = await ltBootFresh({ CLAUDE_BIN: fake, SP_CAPTURE: join(dir, "sp.txt") }, dir);
+  try {
+    assert.ok(await ltWait(() => buf.out.includes("listening on") || buf.spawnErr, 20000) && !buf.spawnErr,
+      `did not start: ${buf.spawnErr ? buf.spawnErr.message : buf.err.slice(0, 300)}`);
+
+    // TWO keys, so the revoke arm cannot disturb the quota arms by running first. A single shared
+    // key would make this block order-dependent, which is the kind of coupling that later reads as
+    // a flake. Both names contain a SPACE, so their URLs must be percent-escaped to be used at all
+    // — that is what makes the "valid escapes still decode" arms real rather than decorative.
+    const keptName = "lt379b kept", revokedName = "lt379b doomed";
+    const mk = async (name) => {
+      const r = await ltRawSend(port, { path: "/api/keys", bytes: Buffer.from(JSON.stringify({ name }), "utf8") });
+      assert.equal(r.status, 201, `could not create the fixture key ${name}: ${r.status} ${r.text.slice(0, 200)}`);
+      return JSON.parse(r.text).id;
+    };
+    const keptId = await mk(keptName);
+    await mk(revokedName);
+
+    // ── PREMISE, on the wire, and deliberately through a DIFFERENT probe than any arm below.
+    // Using `GET /api/keys/:id/quota` here would re-assert the same path and expectation as a
+    // preservation arm, and an arm whose premise already checked it can never be the first to
+    // fail — the exact defect #398's M6 recorded. `GET /api/keys` (the list) shares no path with
+    // anything asserted below.
+    const listed = await ltRawSend(port, { method: "GET", path: "/api/keys", bytes: Buffer.alloc(0), contentLength: 0, timeoutMs: LT379B_BUDGET });
+    assert.equal(listed.status, 200, `PREMISE FAILED: cannot list keys: ${listed.status} ${listed.text.slice(0, 200)}`);
+    const names = JSON.parse(listed.text).keys.map(k => k.name);
+    assert.ok(names.includes(keptName) && names.includes(revokedName),
+      `PREMISE FAILED: both fixture keys must exist before anything below depends on them; ` +
+      `listed names were ${JSON.stringify(names)}. Every arm asserting a decoded name would be vacuous.`);
+
+    // ── THE DEFECT. Each of these sent zero bytes and held the socket open before the fix.
+    // The PATCH is probed with AND without a body: case 2's defining property is that it throws
+    // BEFORE the body is read, and the no-body arm is what pins that the guard still runs early.
+    // Precisely: moving the guard below `JSON.parse` turns this arm into 400 "Invalid JSON" — a
+    // diagnosis about the body for a request whose problem is the URL (mutation M8b, RED). Moving
+    // it below only the body READ is NOT caught, and is not a behaviour change; see the notCovered
+    // block above, which records that measurement rather than the stronger claim it first made.
+    await lt379bProbe(port, { method: "DELETE", path: "/api/keys/%E0%A4%A", status: 404,
+      what: "#379 case 1", bodyRe: /Key not found/ });
+    await lt379bProbe(port, { method: "DELETE", path: "/api/keys/%", status: 404,
+      what: "#379 case 1, bare percent", bodyRe: /Key not found/ });
+    await lt379bProbe(port, { method: "PATCH", path: "/api/keys/%/quota", status: 404,
+      what: "#379 case 2, NO body — the guard must run before the body reader", bodyRe: /Key not found/ });
+    await lt379bProbe(port, { method: "PATCH", path: "/api/keys/%/quota", body: '{"daily":1}', status: 404,
+      what: "#379 case 2, with a valid body", bodyRe: /Key not found/ });
+    await lt379bProbe(port, { method: "GET", path: "/api/keys/%E0%A4%A/quota", status: 404,
+      what: "the sibling #379 does not list", bodyRe: /Key not found/ });
+
+    // ── PRESERVATION. Every one of these is ANSWERED today, byte-for-byte, and the fix must not
+    // have moved any of them. Each names the wrong implementation it rejects.
+    //
+    // THE EMPTY SEGMENT IS THE ARM THAT MATTERS MOST. `decodeURIComponent("")` is `""`, which is
+    // FALSY — so `if (!idOrName) return 404` reads as a correct guard and silently converts an
+    // answered 200 into a 404. That is `?limit=0` from #379 case 3, one route over. It is why
+    // decodeKeySegment returns `null` and the call sites test `=== null`.
+    const empty = await lt379bProbe(port, { method: "DELETE", path: "/api/keys/", status: 200,
+      what: "the empty segment: `\"\"` is a LEGITIMATE decode and is answered today; a falsy guard would 404 it",
+      bodyRe: /"revoked":false/ });
+    assert.equal(JSON.parse(empty.text).idOrName, "",
+      `DELETE /api/keys/ must still report idOrName="" exactly. A guard testing falsiness rather ` +
+      `than \`=== null\` captures this answered request and changes it — a contract change on a ` +
+      `grandfathered B.2 endpoint (ALIGNMENT.md:114) in a PR authorized as behaviour-preserving.`);
+
+    // A VALID escape must still DECODE. These are the arms that reject "delete the decode entirely",
+    // which would make every malformed input harmless and pass all five defect arms above.
+    const pct = await lt379bProbe(port, { method: "DELETE", path: "/api/keys/%25", status: 200,
+      what: "%25 is a VALID escape for a literal `%` and must still decode", bodyRe: /"revoked":false/ });
+    assert.equal(JSON.parse(pct.text).idOrName, "%",
+      `DELETE /api/keys/%25 must still decode to "%". If this reports "%25", the decode was removed ` +
+      `rather than guarded — which silences the defect arms above without preserving behaviour.`);
+
+    const revoked = await lt379bProbe(port, { method: "DELETE", path: `/api/keys/${encodeURIComponent(revokedName)}`,
+      status: 200, what: "an escaped space must still resolve to a real key", bodyRe: /"revoked":true/ });
+    assert.equal(JSON.parse(revoked.text).idOrName, revokedName,
+      `DELETE of a percent-escaped key NAME must still decode and revoke it. revoked:true is the ` +
+      `assertion that cannot pass without a working decode — an undecoded "lt379b%20doomed" matches ` +
+      `no key and would report revoked:false.`);
+
+    const q = await lt379bProbe(port, { method: "GET", path: `/api/keys/${encodeURIComponent(keptName)}/quota`,
+      status: 200, what: "the quota GET must still resolve an escaped key name", bodyRe: /"quota"/ });
+    assert.equal(JSON.parse(q.text).keyId, keptId,
+      `GET /api/keys/<escaped name>/quota must still resolve to the key created above (id ${keptId}).`);
+
+    await lt379bProbe(port, { method: "PATCH", path: `/api/keys/${keptId}/quota`, body: '{"daily":7}',
+      status: 200, what: "an ordinary quota PATCH by numeric id still succeeds — the narrowness control for the quota route",
+      bodyRe: /"ok":true/ });
+
+    // A WELL-FORMED segment naming no key must still get its OWN answers, not the new one. These
+    // pin that the guard captures only inputs that threw: the PATCH-without-a-body still reaches
+    // the body reader and still answers "Invalid JSON", and `GET /api/keys/%` — which never
+    // reached a decode call and so never hung — still falls through to the router's catch-all
+    // rather than picking up this route's "Key not found".
+    await lt379bProbe(port, { method: "PATCH", path: "/api/keys/no-such-key/quota", status: 400,
+      what: "a decodable segment with no body still reaches the body reader", bodyRe: /Invalid JSON/ });
+    await lt379bProbe(port, { method: "GET", path: "/api/keys/%", status: 404,
+      what: "GET /api/keys/% never reached a decode call and answers the router catch-all today",
+      bodyRe: /Not found\. Endpoints:/ });
+
+    // ── Not wedged, and — the other tell for this whole family — nothing was swallowed. Before the
+    // fix each of the five defect probes left exactly one of these lines behind, and that log line
+    // was the ONLY place the defect surfaced at all.
+    const health = await ltRawSend(port, { method: "GET", path: "/health", bytes: Buffer.alloc(0), contentLength: 0, timeoutMs: LT379B_BUDGET });
+    assert.equal(health.status, 200, `the server must still serve requests afterwards: ${health.status} ${health.text.slice(0, 200)}`);
+    assert.ok(!/"event":"unhandled_rejection"/.test(buf.err),
+      `no request in this test may produce an unhandled rejection; server stderr had: ${buf.err.slice(0, 400)}`);
+  } finally { child.kill("SIGKILL"); _ltRmRetry(dir); }
+});
+
 // ── #365: the CHILD's stdout/stderr must decode UTF-8 ACROSS chunk boundaries ───────────────
 //
 // The other half of #359. `lineBuffer += d.toString()` and `stderr += d` decoded each Buffer from
