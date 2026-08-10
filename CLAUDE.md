@@ -223,7 +223,7 @@ release_kit:
             ADR 0012 does not cover at all.
 
         A new block therefore lands as one large one-time addition. #357 added
-        `probesTuiPool`: 328 added lines carrying 221 key paths, and NONE of them is new
+        `probesTuiPool`: 331 added lines carrying 221 key paths, and NONE of them is new
         B.2 surface. Counting those as additions would have produced 221 phantom ADR 0012
         condition-5 failures at the next release — and `report:` below rests entirely on
         "silence is a result", so a 221-item false alarm is exactly what teaches a releaser
