@@ -5333,7 +5333,7 @@ ltTest("integration: ltTest serialization keeps peak concurrent server.mjs child
 });
 
 // ── Upgrade Tests ──
-import { runUpgrade, postFlightOk, runPostFlightCheck, parseFlagValue, classifyPostFlightProbeFailure, postFlightFailureSuffix, probeLaunchdDomains, execRestartRetry, RESTART_ATTEMPTS, recoveryPlanCommands, postFlightOnlyCommand, classifyPostFlightBodyRejection, postFlightWant, postFlightRecheckClause, restartOwnerRecoveryNote } from "./scripts/upgrade.mjs";
+import { runUpgrade, postFlightOk, runPostFlightCheck, parseFlagValue, classifyPostFlightProbeFailure, postFlightFailureSuffix, probeLaunchdDomains, execRestartRetry, RESTART_ATTEMPTS, recoveryPlanCommands, postFlightOnlyCommand, classifyPostFlightBodyRejection, postFlightWant, postFlightRecheckClause, classifyRestartOutcome, RESTART_VERDICT, restartOwnerRecoveryNote } from "./scripts/upgrade.mjs";
 
 console.log("\nUpgrade:");
 
@@ -8658,6 +8658,364 @@ test("#381 F5: `--post-flight-only v` must fail CLOSED, not report success again
   assert.ok(!/requires a target version argument/.test(real.err),
     `a well-formed target must not be refused by the guard; got stderr=${JSON.stringify(real.err)}`);
   assert.match(real.err, /did not reach v3\.14\.0/, `got stderr=${JSON.stringify(real.err)}`);
+});
+
+// ── #373: the post-restart verdict is ONE decision, shared by both `ocp update` paths ──────────
+//
+// `runFullUpgrade` and `runRollback` each carried their own copy of an eight-arm verdict ladder,
+// and the duplication had already produced one real divergence (#372).
+//
+// THE ORDERING JUSTIFICATION HAS BEEN CORRECTED (#385 review F1). #351's body said "Ordering is
+// load-bearing. The local-probe-fault arm is checked first, because it is also a non-ok probe."
+// That was exact while the DOWN cell was `restartFailure && !postFlight.ok` — an `else` that
+// OVERLAPPED the local-fault arm. #372/#381 re-keyed it to `didNotReach`, making every
+// restart-failure arm disjoint, so their relative order is now FREE — measured exhaustively over
+// the classifier's complete 80-input domain: swapping any adjacent pair, and even reversing all
+// four, are NO-OPS. The earlier version of this section cited a mutation as proof of an ordering
+// constraint; that mutation had also WIDENED the DOWN predicate, and the widening is what reddened
+// tests. What survives is narrower and is what these tests now pin.
+//
+// The classification moved to `classifyRestartOutcome`; the WORDING stayed at the call sites,
+// because it genuinely differs and must keep differing (the rollback path cannot tell an operator
+// to run the rollback). Callers now `switch` on a single verdict, so neither path states an
+// ordering and neither can state one differently from its sibling.
+//
+// WHAT THESE TESTS PIN, in the order the tests appear:
+//   1. the ordering itself, in the one place it now exists;
+//   2. the full input -> verdict table, so an arm cannot be quietly widened;
+//   3. that the two PATHS still agree, measured end to end — the anti-drift guard, and the only one
+//      of the three that would have caught #372's divergence.
+console.log("\n#373 — the post-restart verdict is one shared classification:");
+
+test("#373: the two CATCH-ALLS come last, and PROBE_LOCAL_FAULT stays after its restart-failure sibling", () => {
+  // NAME AND COMMENT BOTH CORRECTED (#385 F1). This test used to be called "the local-probe-fault
+  // arm outranks every other probe failure — the ordering #351 named", and its comment claimed to
+  // be "the whole guard" for that ordering. It cannot be: since #372/#381 made the restart-failure
+  // arms disjoint, reordering them is a no-op, so there is nothing there to guard. A test carrying
+  // that incident's name, guarding nothing, is worse than no test — the next reader trusts it,
+  // reorders freely, and nothing fails.
+  //
+  // What genuinely still order-depends, and is what this test pins:
+  //   - UNMEASURED before everything;
+  //   - the two CATCH-ALLS (`UNCONFIRMED`, `WARNED_SUCCESS`) after every specific arm — they are
+  //     bare tests, so they swallow anything reaching them;
+  //   - PROBE_LOCAL_FAULT after RESTART_FAILED_PROBE_LOCAL_FAULT — THE ONE overlapping pair left,
+  //     and the only surviving descendant of #351's incident.
+  const restartFailure = { cmd: "launchctl bootstrap …", detail: "EIO", attempts: 3 };
+  const localFault = { ok: false, lastSeen: null, target: "3.14.0",
+                       lastFailure: { kind: "probe-could-not-run", detail: "curl: not found" } };
+  assert.equal(
+    classifyRestartOutcome({ restartFailure, postFlight: localFault, postFlightMeasured: true }),
+    RESTART_VERDICT.RESTART_FAILED_PROBE_LOCAL_FAULT,
+    "a local probe fault must never be classified as the proxy being down");
+
+  // And with no restart failure it still wins over the neutral verdict.
+  assert.equal(
+    classifyRestartOutcome({ restartFailure: null, postFlight: localFault, postFlightMeasured: true }),
+    RESTART_VERDICT.PROBE_LOCAL_FAULT);
+
+  // Nothing-measured outranks even the local fault: it is the only state in which no probe result
+  // exists to reason about at all.
+  assert.equal(
+    classifyRestartOutcome({ restartFailure, postFlight: { ok: true, lastFailure: null }, postFlightMeasured: false }),
+    RESTART_VERDICT.UNMEASURED);
+
+  // THE ONE OVERLAPPING PAIR, asserted as an overlap rather than as an ordering: the same input
+  // satisfies BOTH `probeFailed && probeCouldNotRun` (the general arm) and the restart-failure arm
+  // above it, so which one wins is decided by position alone. This is the only place in the ladder
+  // where that is still true, and hoisting the general arm changes 4 of 108 end-to-end cases on
+  // BOTH lanes from a single edit (mutation P1).
+  assert.equal(
+    classifyRestartOutcome({ restartFailure, postFlight: localFault, postFlightMeasured: true }),
+    RESTART_VERDICT.RESTART_FAILED_PROBE_LOCAL_FAULT,
+    "with a restart failure the SPECIFIC arm must win over the general local-fault arm");
+
+  // The two catch-alls must not swallow a specific verdict. Bare tests, so position is all that
+  // stops them.
+  assert.equal(
+    classifyRestartOutcome({ restartFailure: null, postFlight: { ok: false, lastFailure: { kind: "not-ok-status", detail: "d" } }, postFlightMeasured: true }),
+    RESTART_VERDICT.NOT_OK_STATUS,
+    "`UNCONFIRMED` is a bare `probeFailed` test and must not precede the specific arms");
+  assert.equal(
+    classifyRestartOutcome({ restartFailure, postFlight: { ok: false, lastFailure: { kind: "a-future-kind", detail: "d" } }, postFlightMeasured: true }),
+    RESTART_VERDICT.UNCONFIRMED,
+    "`WARNED_SUCCESS` is a bare `restartFailure` test and must not precede the catch-all above it");
+
+  // And the freedom is asserted too, so a future reader does not reintroduce a constraint that is
+  // not there: the restart-failure arms are disjoint, so no input satisfies two of them.
+  const RF_KINDS = { "probe-could-not-run": RESTART_VERDICT.RESTART_FAILED_PROBE_LOCAL_FAULT,
+                     "unparseable": RESTART_VERDICT.RESTART_FAILED_ANSWERED_NOT_OCP,
+                     "http-error": RESTART_VERDICT.RESTART_FAILED_ANSWERED_NOT_OCP,
+                     "body-not-ocp": RESTART_VERDICT.RESTART_FAILED_ANSWERED_NOT_OCP,
+                     "version-mismatch": RESTART_VERDICT.RESTART_FAILED_WRONG_VERSION,
+                     "unreachable": RESTART_VERDICT.RESTART_FAILED_DOWN,
+                     "timeout": RESTART_VERDICT.RESTART_FAILED_DOWN };
+  for (const [kind, expected] of Object.entries(RF_KINDS)) {
+    assert.equal(
+      classifyRestartOutcome({ restartFailure, postFlight: { ok: false, lastFailure: { kind, detail: "d" } }, postFlightMeasured: true }),
+      expected,
+      `kind=${kind} must map to exactly one restart-failure arm — if two ever match, their order ` +
+      `stops being free and this ladder needs a precedence comment again`);
+  }
+});
+
+test("#373 (#385 F3): the EXPORTED classifier is fail-CLOSED on malformed input", () => {
+  // The pre-#373 code was `!postFlight.ok`, which threw on `undefined` and treated `{}` as a
+  // failure. #373 replaced it with `=== false`, which is fail-OPEN: measured before the fix,
+  // `undefined`, `null`, `{}`, `{ok:0}` and `{ok:undefined}` all returned `warned-success`, and
+  // `classifyRestartOutcome({})` returned `ok`.
+  //
+  // Not reachable from either in-module caller — both initialise `postFlight` with `ok: true` and
+  // only ever replace it with `runPostFlightCheck`'s return — but this is EXPORTED surface whose
+  // selling point is that an unhandled verdict is refused by default. Returning a SUCCESS verdict
+  // for input it cannot interpret contradicts that in the one direction that matters.
+  const rf = { cmd: "c", detail: "d", attempts: 3 };
+  const successVerdicts = new Set([RESTART_VERDICT.OK, RESTART_VERDICT.WARNED_SUCCESS]);
+  for (const [label, postFlight] of [["undefined", undefined], ["null", null], ["{}", {}],
+                                     ["{ok:0}", { ok: 0 }], ["{ok:'false'}", { ok: "false" }],
+                                     ["{ok:undefined}", { ok: undefined }]]) {
+    const v = classifyRestartOutcome({ restartFailure: rf, postFlight, postFlightMeasured: true });
+    assert.ok(!successVerdicts.has(v),
+      `postFlight=${label} is not something this function can interpret, so it must not answer with ` +
+      `a SUCCESS verdict; got ${v}`);
+  }
+  assert.ok(!successVerdicts.has(classifyRestartOutcome({})),
+    "and a call with no arguments at all must not report success");
+
+  // CONTROL: a well-formed probe result is unaffected — `ok` is a boolean there, so `!== true` and
+  // `=== false` agree, which is why this change is behaviour-preserving for every real caller.
+  assert.equal(classifyRestartOutcome({ restartFailure: null, postFlight: { ok: true, lastFailure: null }, postFlightMeasured: true }),
+    RESTART_VERDICT.OK);
+  assert.equal(classifyRestartOutcome({ restartFailure: rf, postFlight: { ok: true, lastFailure: null }, postFlightMeasured: true }),
+    RESTART_VERDICT.WARNED_SUCCESS);
+});
+
+test("#373: the full input -> verdict table, so no arm can be quietly widened", () => {
+  const rf = { cmd: "launchctl bootstrap …", detail: "EIO", attempts: 3 };
+  // `ok` and `lastFailure` move together, exactly as `runPostFlightCheck` maintains them: a
+  // classified failure means the probe did NOT succeed. (Written the other way round first, and the
+  // suite caught it — the table is only meaningful if its fixture is the shape the real probe emits.)
+  const pf = (kind) => ({ ok: kind === null, lastSeen: null, target: "3.14.0",
+                          lastFailure: kind === null ? null : { kind, detail: "d" } });
+  const cases = [
+    // [restartFailure, lastFailure.kind, measured, expected]
+    [rf,   "probe-could-not-run", true, RESTART_VERDICT.RESTART_FAILED_PROBE_LOCAL_FAULT],
+    [rf,   "unparseable",         true, RESTART_VERDICT.RESTART_FAILED_ANSWERED_NOT_OCP],
+    [rf,   "http-error",          true, RESTART_VERDICT.RESTART_FAILED_ANSWERED_NOT_OCP],
+    [rf,   "body-not-ocp",        true, RESTART_VERDICT.RESTART_FAILED_ANSWERED_NOT_OCP],
+    [rf,   "version-mismatch",    true, RESTART_VERDICT.RESTART_FAILED_WRONG_VERSION],
+    [rf,   "unreachable",         true, RESTART_VERDICT.RESTART_FAILED_DOWN],
+    [rf,   "timeout",             true, RESTART_VERDICT.RESTART_FAILED_DOWN],
+    // #381 F2: a degraded proxy already serving the target has its OWN verdict. It got none in
+    // #372, fell to UNCONFIRMED, and the forward path's neutral hint told the operator to roll
+    // back a proxy running exactly the right code.
+    [rf,   "not-ok-status",       true, RESTART_VERDICT.NOT_OK_STATUS],
+    [null, "not-ok-status",       true, RESTART_VERDICT.NOT_OK_STATUS],
+    // #381 F1: the probe classifier's own default arm. It must NOT reach DOWN, and it gets no cell
+    // of its own either, because the whole point is that nothing is known.
+    [rf,   "probe-failed-unclassified", true, RESTART_VERDICT.UNCONFIRMED],
+    [rf,   "some-future-kind",    true, RESTART_VERDICT.UNCONFIRMED],
+    [null, "probe-could-not-run", true, RESTART_VERDICT.PROBE_LOCAL_FAULT],
+    [null, "unreachable",         true, RESTART_VERDICT.UNCONFIRMED],
+    [null, "version-mismatch",    true, RESTART_VERDICT.UNCONFIRMED],
+    [rf,   null,                  true, RESTART_VERDICT.WARNED_SUCCESS],
+    [null, null,                  true, RESTART_VERDICT.OK],
+  ];
+  for (const [restartFailure, kind, postFlightMeasured, expected] of cases) {
+    assert.equal(
+      classifyRestartOutcome({ restartFailure, postFlight: pf(kind), postFlightMeasured }),
+      expected,
+      `restartFailure=${!!restartFailure} kind=${JSON.stringify(kind)} must classify as ${expected}`);
+  }
+  // Premise for the whole table: DOWN must be reachable at all, or every "must not be DOWN" row
+  // above would pass against a classifier that simply never returns it.
+  assert.ok(cases.some(([, , , e]) => e === RESTART_VERDICT.RESTART_FAILED_DOWN),
+    "harness premise: the table must exercise the DOWN verdict");
+});
+
+// The anti-drift guard. Both paths are driven end to end over every probe outcome and their
+// operator-facing HEADLINES are reduced to a verdict category; the two must agree for every input.
+// This is the test that would have caught #372 — where the answering-but-wrong-version arm existed
+// on one path and not the other for four days.
+//
+// Deliberately reduced from the hint rather than from the classifier's return value: reading the
+// classifier back would only prove the classifier agrees with itself. This measures what each path
+// actually emits, which is where the divergence lived.
+const _u373Category = (o) => {
+  if (o.ok) {
+    const warn = (o.result.phases || []).find(p => p.name === "restart" && p.status === "warn");
+    return warn ? "WARNED_SUCCESS" : "OK";
+  }
+  const h = o.err.hint || "";
+  if (/^THE SERVICE STATE IS UNKNOWN\. A restart command failed and nothing probed/.test(h)) return "UNMEASURED";
+  if (/^THE SERVICE STATE IS UNKNOWN, and it may be DOWN/.test(h)) return "RESTART_FAILED_PROBE_LOCAL_FAULT";
+  if (/^SOMETHING ELSE IS ANSWERING/.test(h)) return "RESTART_FAILED_ANSWERED_NOT_OCP";
+  if (/^THE PROXY IS UP BUT SERVING THE WRONG VERSION/.test(h)) return "RESTART_FAILED_WRONG_VERSION";
+  if (/^THE PROXY IS DOWN/.test(h)) return "RESTART_FAILED_DOWN";
+  if (/^THE (UPGRADE|ROLLBACK) MAY HAVE SUCCEEDED/.test(h)) return "PROBE_LOCAL_FAULT";
+  if (/^THE PROXY IS ANSWERING AND SERVING .* BUT REPORTS ITSELF UNHEALTHY/.test(h)) return "NOT_OK_STATUS";
+  return "UNCONFIRMED";
+};
+
+// The ONE deliberate divergence, pinned rather than skipped. `not-ok-status` is a SHARED verdict —
+// `classifyRestartOutcome` returns `NOT_OK_STATUS` for both paths, and the table test above proves
+// it — but only `runFullUpgrade` renders it as its own sentence. `runRollback` deliberately lets it
+// fall to its neutral verdict, because that verdict already says "run `ocp doctor`", while the
+// forward path's said "run `ocp update --rollback`", which cannot clear a degraded status (#381 F2).
+//
+// Encoded as an expected PAIR rather than as an exemption: if either side changes — the forward
+// path losing its cell, or the rollback path gaining one — this fires. Skipping the case would have
+// made the guard blind to exactly the state that produced the finding.
+const _u373ExpectedDivergence = {
+  "degraded, right ver": ["NOT_OK_STATUS", "UNCONFIRMED"],
+};
+
+test("#373 (the anti-drift guard): both `ocp update` paths reach the SAME verdict for the same input", async () => {
+  // Each lane is given a probe whose relationship to ITS OWN target is identical — the upgrade lane
+  // targets 3.14.0 and the rollback lane 3.10.0 — so any difference in outcome is a difference in
+  // the ladders, not in the fixture.
+  const probes = {
+    "wrong version":       [() => ({ status: "ok", auth: { ok: true }, version: "9.9.9" }),
+                            () => ({ status: "ok", auth: { ok: true }, version: "9.9.9" })],
+    "degraded, right ver": [() => ({ status: "degraded", auth: { ok: true }, version: "3.14.0" }),
+                            () => ({ status: "degraded", auth: { ok: true }, version: "3.10.0" })],
+    "no version field":    [() => ({ status: "ok", auth: { ok: true } }),
+                            () => ({ status: "ok", auth: { ok: true } })],
+    "json null":           [() => null, () => null],
+    "unparseable":         [() => { throw new SyntaxError("nope"); }, () => { throw new SyntaxError("nope"); }],
+    "http error":          [() => { throw Object.assign(new Error("curl: (22) 503"), { status: 22 }); },
+                            () => { throw Object.assign(new Error("curl: (22) 503"), { status: 22 }); }],
+    "timeout":             [() => { throw Object.assign(new Error("curl: (28) timed out"), { status: 28 }); },
+                            () => { throw Object.assign(new Error("curl: (28) timed out"), { status: 28 }); }],
+    "unreachable":         [_u347Unreachable, _u352Unreachable],
+    "no curl":             [() => { throw Object.assign(new Error("sh: curl: command not found"), { status: 127 }); },
+                            _u352NoCurl],
+    "serving its target":  [_u347Healthy, _u352Restored],
+  };
+
+  const seen = new Set();
+  for (const restartFails of [true, false]) {
+    for (const [name, [upProbe, rbProbe]] of Object.entries(probes)) {
+      const spec = restartFails ? { "launchctl bootstrap": Infinity } : {};
+      const drive = async (opts) => {
+        try { return { ok: true, result: await runUpgrade(opts) }; }
+        catch (e) { return { ok: false, err: e }; }
+      };
+      const up = await drive(_u347Opts({ execFn: _u347Runner(spec), mockProbe: upProbe }));
+      const rb = await drive(_u352Opts({ execFn: _u347Runner(spec), mockProbe: rbProbe }));
+      const [a, b] = [_u373Category(up), _u373Category(rb)];
+      const expected = _u373ExpectedDivergence[name];
+      if (expected) {
+        assert.deepEqual([a, b], expected,
+          `restartFails=${restartFails} probe="${name}": this is the ONE documented divergence and ` +
+          `both halves of it are pinned — expected ${JSON.stringify(expected)}, got ${JSON.stringify([a, b])}. ` +
+          `upgradeHint=${JSON.stringify(up.ok ? "(returned)" : up.err.hint)} ` +
+          `rollbackHint=${JSON.stringify(rb.ok ? "(returned)" : rb.err.hint)}`);
+        // And the property that makes the divergence acceptable: both still send the operator to
+        // the same place. This is what would break if the forward path's cell were deleted again.
+        const upText = `${up.ok ? "" : up.err.hint || ""}${up.ok ? "" : up.err.message || ""}`;
+        const rbText = `${rb.ok ? "" : rb.err.hint || ""}${rb.ok ? "" : rb.err.message || ""}`;
+        assert.match(upText, /ocp doctor/, `upgrade must name the right next step; got ${JSON.stringify(upText)}`);
+        assert.match(rbText, /ocp doctor/, `rollback must name the right next step; got ${JSON.stringify(rbText)}`);
+        assert.ok(!/ocp update --rollback` to restore/.test(upText),
+          `and the forward path must not recommend a rollback here; got ${JSON.stringify(upText)}`);
+      } else {
+        assert.equal(a, b,
+          `restartFails=${restartFails} probe="${name}": the two paths must classify identically — ` +
+          `upgrade=${a} rollback=${b}. upgradeHint=${JSON.stringify(up.ok ? "(returned)" : up.err.hint)} ` +
+          `rollbackHint=${JSON.stringify(rb.ok ? "(returned)" : rb.err.hint)}`);
+      }
+      seen.add(a); seen.add(b);
+    }
+  }
+
+  // Non-vacuity, DERIVED FROM THE ENUM rather than from a hand-written list (#385 F5). The earlier
+  // version listed the verdicts its author remembered — which is the same "only as complete as its
+  // author's list" critique this PR correctly makes of the ladder, reproduced one level up inside
+  // the test meant to guard it. Reading `RESTART_VERDICT` means a verdict added later is covered
+  // by construction, and the sweep goes red until a probe that reaches it is added here.
+  //
+  // UNMEASURED is the one exclusion, and it is excluded by CONSTRUCTION rather than by preference:
+  // it requires `postFlightMeasured === false`, which needs a run with no `mockProbe` at all, and
+  // every case in this sweep supplies one. It has its own test (`#352 LOW-4`, and `#356 F7` for the
+  // forward path).
+  //
+  // #385 re-review (a): this was `Object.values(...).map(v => Object.keys(...).find(...))`, a
+  // round-trip through the VALUES — which silently drops any verdict whose value string duplicates
+  // an existing one. Measured: adding `SHADOWED: "unconfirmed"` to the enum leaves the round-trip at
+  // 6 entries and the guard GREEN, while `Object.keys` reports 7 and goes red. So the guard added to
+  // catch a forgotten verdict had its own way of adding one that it could not catch — the same
+  // defect class, inside the fix for it. `Object.keys` is otherwise exactly equivalent.
+  const expectedVerdicts = new Set(Object.keys(RESTART_VERDICT));
+  expectedVerdicts.delete("UNMEASURED");
+  for (const v of expectedVerdicts) {
+    assert.ok(seen.has(v),
+      `harness premise: the sweep must reach ${v} — it is in RESTART_VERDICT, so either add a probe ` +
+      `that produces it or this guard is blind to it; reached ${JSON.stringify([...seen].sort())}`);
+  }
+});
+
+test("#373 (fail closed): a probe that did NOT confirm can never produce a successful return, on either path", async () => {
+  // THE REGRESSION THIS REFACTOR ACTUALLY CAUSED, caught by the 108-case behavioural sweep and
+  // pinned here so it cannot come back.
+  //
+  // Before #373 the last arm of each ladder was `if (!postFlight.ok)` — an `else`, which caught
+  // every non-ok probe BY CONSTRUCTION. Keying the arms on a verdict makes the ladder
+  // exhaustive-by-enumeration instead, and a verdict no arm names falls past every cell into the
+  // function's `return`: a SUCCESSFUL upgrade or rollback on a host whose probe failed. It happened
+  // for real — #372's remediation added `NOT_OK_STATUS`, the rollback path deliberately gives it no
+  // cell, and keying its neutral arm on `UNCONFIRMED` alone made a degraded proxy report a clean
+  // rollback. Both arms now read "not a success verdict", so a new verdict is refused by default.
+  //
+  // Note what kind of defect this is: it lives in which states are UNREACHABLE, not in what any
+  // reachable state does. That is why it needs a sweep over every probe outcome rather than a case
+  // per cell — a per-cell test only ever visits states that already have a cell.
+  const probes = {
+    "wrong version":        [() => ({ status: "ok", auth: { ok: true }, version: "9.9.9" }),
+                             () => ({ status: "ok", auth: { ok: true }, version: "9.9.9" })],
+    "degraded, right ver":  [() => ({ status: "degraded", auth: { ok: true }, version: "3.14.0" }),
+                             () => ({ status: "degraded", auth: { ok: true }, version: "3.10.0" })],
+    "no version field":     [() => ({ status: "ok" }), () => ({ status: "ok" })],
+    "version not a string": [() => ({ status: "ok", version: [] }), () => ({ status: "ok", version: [] })],
+    "json null":            [() => null, () => null],
+    "unparseable":          [() => { throw new SyntaxError("nope"); }, () => { throw new SyntaxError("nope"); }],
+    "http error":           [() => { throw Object.assign(new Error("curl: (22) 503"), { status: 22 }); },
+                             () => { throw Object.assign(new Error("curl: (22) 503"), { status: 22 }); }],
+    "timeout":              [() => { throw Object.assign(new Error("curl: (28) t/o"), { status: 28 }); },
+                             () => { throw Object.assign(new Error("curl: (28) t/o"), { status: 28 }); }],
+    "unreachable":          [_u347Unreachable, _u352Unreachable],
+    "no curl":              [_u352NoCurl, _u352NoCurl],
+    // #381 F1's kinds: the probe classifier's own default arm, which must not reach DOWN and must
+    // not reach success either.
+    "empty reply (curl 52)": [() => { throw Object.assign(new Error("curl: (52) Empty reply"), { status: 52 }); },
+                              () => { throw Object.assign(new Error("curl: (52) Empty reply"), { status: 52 }); }],
+    "spawn EAGAIN":          [() => { throw Object.assign(new Error("spawnSync /bin/sh EAGAIN"), { code: "EAGAIN" }); },
+                              () => { throw Object.assign(new Error("spawnSync /bin/sh EAGAIN"), { code: "EAGAIN" }); }],
+  };
+
+  let checked = 0;
+  for (const restartFails of [true, false]) {
+    for (const [name, [upProbe, rbProbe]] of Object.entries(probes)) {
+      const spec = restartFails ? { "launchctl bootstrap": Infinity } : {};
+      for (const [lane, opts, probe] of [["upgrade", _u347Opts, upProbe], ["rollback", _u352Opts, rbProbe]]) {
+        let returned = null, threw = null;
+        try { returned = await runUpgrade(opts({ execFn: _u347Runner(spec), mockProbe: probe })); }
+        catch (e) { threw = e; }
+        // Premise: the probe really did fail to confirm, or this row proves nothing.
+        const phases = (returned || threw)?.phases || [];
+        const pf = phases.find(p => p.name === "post-flight");
+        assert.ok(pf && pf.status === "fail",
+          `${lane}/${name}/restartFails=${restartFails} premise: post-flight must have FAILED; got ${JSON.stringify(pf)}`);
+        assert.equal(returned, null,
+          `${lane}/${name}/restartFails=${restartFails}: an unconfirmed post-flight must never return ` +
+          `success — this is the fall-through the verdict enumeration makes possible; got ${JSON.stringify(returned)}`);
+        assert.ok(threw, `${lane}/${name}/restartFails=${restartFails}: it must throw`);
+        checked++;
+      }
+    }
+  }
+  assert.equal(checked, Object.keys(probes).length * 4,
+    `harness premise: every probe x lane x restart-state combination must have been exercised; got ${checked}`);
 });
 
 // ── #262 SECURITY (same shape as #257's injection, on the rollback path) ───────────────────────

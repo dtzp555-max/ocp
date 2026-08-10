@@ -1218,8 +1218,16 @@ const AUTH_REQUEST_VERDICT_TTL_MS = 900000; // 15 min
 // touch consecutiveFailures", three lines above the code that clears it. The correction was
 // written into the body and THIS HEADER WAS LEFT STANDING, so the comment recording the fix sat
 // *below* the sentence that was still wrong, and the pair shipped together until #361's review
-// opened the file. Two copies of one rule is what produced that; one copy is the only version
-// that cannot drift again. The rule is immediately below.
+// opened the file. The rule is immediately below, stated once in this file.
+//
+// THERE IS EXACTLY ONE OTHER LIVE STATEMENT OF IT, AND IT IS NAMED HERE ON PURPOSE:
+// README § "What `auth.ok` means" carries the operator-facing version. That copy exists because
+// its audience is different — operators debugging `status` never read this file — but a second
+// copy is still a second thing that can drift, and it did: an earlier revision of this comment
+// claimed "one copy is the only version that cannot drift again" while the README simultaneously
+// said "`status` is unaffected by any of this", which the tally clear makes false. Both were
+// corrected in #361. Change one, change the other, and check both against ADR 0014 § Consequences,
+// which is the authority they each restate rather than a third copy.
 function noteAuthVerifiedByRequest() {
   const now = Date.now();
   // Does NOT touch lastOutcome/lastCheck: those belong to the probe, and overwriting them would
@@ -1228,7 +1236,8 @@ function noteAuthVerifiedByRequest() {
   // names that clear as "a deliberate restoration of ADR 0010's self-heal", unqualified by which
   // lane served the request. Note what that does and does not license: proxyHealthStatus reads
   // consecutiveFailures and never `ok`, so the VERDICT cannot move /health.status, but clearing
-  // the TALLY can — which is exactly why the rule lives in one place with its authority attached.
+  // the TALLY can. That distinction is the whole finding — it is easy to state as either "status
+  // is untouchable here" or "requests move status", and both are wrong.
   // An earlier revision of the header above said "deliberately does NOT touch consecutiveFailures"
   // three lines above the code that writes it; the reviewer who caught that was reading the
   // comment, which is what comments are for. (The header itself was only corrected in #361 — the
