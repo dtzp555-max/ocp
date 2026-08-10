@@ -2539,7 +2539,7 @@ ltTest("integration: flag OFF → the -p spawn receives the EXACT negative wrapp
 // That distinction is not theoretical, and it is not about the passing run — both gates fire before
 // listen(), so nothing binds either way while they work. It is about the mutation proof, which is
 // the one run where the gate is deliberately broken. Measured on this tree: booting with
-// `loopbackBind: true` hardcoded at server.mjs:858 and CLAUDE_BIND=0.0.0.0 prints
+// `loopbackBind: true` hardcoded at server.mjs:856 and CLAUDE_BIND=0.0.0.0 prints
 // `listening on http://0.0.0.0:<port> (LAN mode)` — i.e. mutation-proving a gate test with 0.0.0.0
 // performs the exact exposure the gate exists to prevent. With this address the same mutation
 // prints `listen EADDRNOTAVAIL: address not available 192.0.2.1` and no socket is ever opened.
@@ -2588,34 +2588,43 @@ ltTest("integration: boot gate REFUSES each unsafe config (multi / non-loopback 
   } finally { _ltRmRetry(dir); }
 });
 
-// ── #370: the TUI LAN gate's call site (server.mjs:831) ────────────────────────────────────────
+// ── #370: the TUI LAN gate's call site (server.mjs:829) ────────────────────────────────────────
 // The #339 shape, one gate over: isLoopbackBind has 18 unit blocks and is correct; what nothing
-// asserted is that :831 still CONSULTS it. The question is not "is the predicate tested" but "does
+// asserted is that :829 still CONSULTS it. The question is not "is the predicate tested" but "does
 // anything go red if the call site stops consulting it" (#343).
 //
-// :831 is `if (TUI_MODE && !isLoopbackBind(BIND_ADDRESS) && process.env.OCP_TUI_ALLOW_LAN !== "1")`,
+// :829 is `if (TUI_MODE && !isLoopbackBind(BIND_ADDRESS) && process.env.OCP_TUI_ALLOW_LAN !== "1")`,
 // which is three operands and therefore three separate pins. Which arm a mutation kills is the part
 // #343 asks to be stated explicitly, because the obvious mutation kills the wrong one:
 //
 // Recorded as a DELTA in failures plus the IDENTITY of every test that reddens, against a baseline
-// of 0 failures on the same tree in the same run. Absolute pass counts are deliberately not written
-// down: this comment's first draft carried them, and they read +5 stale within two unrelated merges
-// (#389, #390), at which point a reader re-running a row cannot tell suite drift from a defect.
-// Pinning a base SHA beside them would only date the staleness — which test dies is the invariant,
-// so that is what is recorded.
+// of 0 failures on the same tree in the same run. Absolute pass counts are deliberately NOT written
+// down: this comment's first draft carried them, and three unrelated merges (#389, #390, #395) made
+// them stale before this PR could land — at which point a reader re-running a row cannot tell suite
+// drift from a defect. Pinning a base SHA beside them would only date the staleness. Which test
+// dies is the invariant, so that is what is recorded.
 //
 //   operand                        mutate to  MEASURED (delta vs. a 0-failure baseline)
 //   -----------------------------  ---------  ----------------------------------------------------
 //   !isLoopbackBind(BIND_ADDRESS)  false      +1 failure:  THIS test, alone    <- the #339 defect
-//   !isLoopbackBind(BIND_ADDRESS)  true       +3 failures: loopback boots; this test SURVIVES
+//   !isLoopbackBind(BIND_ADDRESS)  true       +6 failures: TUI boots; BOTH #370 tests SURVIVE
 //   OCP_TUI_ALLOW_LAN !== "1"      true       +1 failure:  the escape-hatch test below, alone
 //
 // Deleting `isLoopbackBind(...)` outright is ambiguous between rows 1 and 2, and only row 1 is the
 // "call site quietly stopped consulting the helper" shape this issue is about — row 2 makes the gate
-// refuse EVERY TUI boot, which existing tests already catch. Row 2's three are worth naming, because
-// "the TUI loopback boots" is a count and counts are claims: the OCP_LOCAL_TOOLS-inert TUI boot just
-// below, `integration (#213)`'s TUI prompt-budget boot, and — the one a reader would not predict —
-// `integration (#346)`'s B.2 key-set snapshot, whose `tui-pool` profile (#382) boots TUI mode too.
+// refuse EVERY TUI boot, which existing tests already catch.
+//
+// Row 2's number is the one to distrust, and the reason is worth stating rather than leaving to be
+// rediscovered. It is not a property of this gate at all: it is a CENSUS of the suite's live TUI
+// boots, so it rises whenever anyone adds a TUI test. Measured, it went 3 -> 6 across two merges
+// while this PR was open (#390 added `integration (#361)` and both `integration (#362)` boots), and
+// #395 changed the sixth one's fixture without changing the count. Re-measure it rather than trust
+// it. What row 2 actually pins — and what does NOT drift — is that BOTH #370 tests survive: the gate
+// widening into refusing everything must not be mistaken for the gate being consulted. The six as
+// measured: the OCP_LOCAL_TOOLS-inert TUI boot just below, `integration (#213)`'s prompt-budget
+// boot, `integration (#361)`'s TUI-lane auth verdict, both `integration (#362)` shutdown boots, and
+// — the one a reader would not predict — `integration (#346)`'s B.2 key-set snapshot, whose
+// `tui-pool` profile (#382) boots TUI mode too.
 //
 // Row 1 is also where the choice of bind address pays off. Its recorded failure is `process never
 // closed … listen EADDRNOTAVAIL: address not available 192.0.2.1:55616 … stdout(0B)=""` — so with
@@ -2630,7 +2639,7 @@ ltTest("integration (#370): TUI + non-loopback bind → the isLoopbackBind gate 
     // Wait for `closed`, not `exit`: everything below reads buf.err, and stderr is only guaranteed
     // drained at 'close' (#203).
     assert.ok(await ltWait(() => buf.closed || buf.spawnErr), `process never closed — ${ltDiag(buf)}`);
-    // Laddered the way ltAssertNoInboundSecrets is (:1925): non-emptiness, then "it looks like the
+    // Laddered the way ltAssertNoInboundSecrets is (:2455): non-emptiness, then "it looks like the
     // right kind of output", then the actual claim. Without rung 1 an unspawned child fails rung 3
     // and reports "no FATAL" when the truth is "never ran".
     assert.ok(buf.err.length > 0, `child wrote nothing to stderr at all — ${ltDiag(buf)}`);
@@ -2686,7 +2695,7 @@ ltTest("integration (#370): OCP_TUI_ALLOW_LAN=1 is consulted — the documented 
       `and the address must be changed — this boot deliberately passes the LAN gate, so a bindable ` +
       `address means a TUI-mode CLAUDE_AUTH_MODE=none server just listened off-loopback — ${ltDiag(buf)}`);
     // POSITIVE evidence that the gate was passed, not the absence of its message. `!/is unsafe/`
-    // on its own is satisfied by a child that died before ever reaching :831 — a cell firing on a
+    // on its own is satisfied by a child that died before ever reaching :829 — a cell firing on a
     // missing operand, which is what 4022be4 was written for. Reaching listen() at all is the
     // observation that proves the override was honoured. Past the guard above, a run with no
     // EADDRNOTAVAIL is one that closed or failed to spawn without ever attempting a bind.
