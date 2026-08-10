@@ -2531,12 +2531,37 @@ ltTest("integration: flag OFF → the -p spawn receives the EXACT negative wrapp
   } finally { child.kill("SIGKILL"); _ltRmRetry(dir); }
 });
 
+// The bind address every "non-loopback" boot-gate test hands the server. 192.0.2.1 is RFC 5737
+// TEST-NET-1: non-loopback under isLoopbackBind (so it exercises the LAN arm of both boot gates),
+// assigned to no interface, and unroutable, so a gate REGRESSION dies at listen() with
+// EADDRNOTAVAIL instead of putting a real listener on this machine's network.
+//
+// That distinction is not theoretical, and it is not about the passing run — both gates fire before
+// listen(), so nothing binds either way while they work. It is about the mutation proof, which is
+// the one run where the gate is deliberately broken. Measured on this tree: booting with
+// `loopbackBind: true` hardcoded at server.mjs:858 and CLAUDE_BIND=0.0.0.0 prints
+// `listening on http://0.0.0.0:<port> (LAN mode)` — i.e. mutation-proving a gate test with 0.0.0.0
+// performs the exact exposure the gate exists to prevent. With this address the same mutation
+// prints `listen EADDRNOTAVAIL: address not available 192.0.2.1` and no socket is ever opened.
+//
+// No predicate coverage is lost by not using 0.0.0.0 here: isLoopbackBind("0.0.0.0") === false is
+// pinned as a unit test at the isLoopbackBind block below, and this file's job at this level is the
+// CALL SITE, not the predicate (#343).
+//
+// Two claims of different strength, kept apart on purpose. [measured] on this tree: the bind fails
+// with EADDRNOTAVAIL, so no socket opens. [reasoned], and the part that travels to other hosts:
+// TEST-NET-1 is reserved for documentation and is not routed, so even a host that DOES let the bind
+// succeed (an interface holding the address, or Linux's `ip_nonlocal_bind`) is not reachable at it.
+// The escape-hatch test asserts the absence of "listening on" precisely so that a host where the
+// first claim stops holding says so, loudly, instead of quietly weakening these tests.
+const LT_NONLOOPBACK_BIND = "192.0.2.1";
+
 ltTest("integration: boot gate REFUSES each unsafe config (multi / non-loopback / anon key)", async () => {
   if (!LT_POSIX) return;
   const dir = ltMkdir(); const fake = ltFake(dir);
   const cases = [
     { label: "multi", env: { CLAUDE_AUTH_MODE: "multi" } },
-    { label: "non-loopback", env: { CLAUDE_BIND: "0.0.0.0" } },
+    { label: "non-loopback", env: { CLAUDE_BIND: LT_NONLOOPBACK_BIND } },
     { label: "anon", env: { PROXY_ANONYMOUS_KEY: "pub" } },
   ];
   try {
@@ -2558,6 +2583,94 @@ ltTest("integration: boot gate REFUSES each unsafe config (multi / non-loopback 
       }
     }
   } finally { _ltRmRetry(dir); }
+});
+
+// ── #370: the TUI LAN gate's call site (server.mjs:831) ────────────────────────────────────────
+// The #339 shape, one gate over: isLoopbackBind has 18 unit blocks and is correct; what nothing
+// asserted is that :831 still CONSULTS it. The question is not "is the predicate tested" but "does
+// anything go red if the call site stops consulting it" (#343).
+//
+// :831 is `if (TUI_MODE && !isLoopbackBind(BIND_ADDRESS) && process.env.OCP_TUI_ALLOW_LAN !== "1")`,
+// which is three operands and therefore three separate pins. Which arm a mutation kills is the part
+// #343 asks to be stated explicitly, because the obvious mutation kills the wrong one:
+//
+//   operand                        mutate to  MEASURED (baseline: 1157 passed, 0 failed, 2 skipped)
+//   -----------------------------  ---------  ----------------------------------------------------
+//   !isLoopbackBind(BIND_ADDRESS)  false      1156/1 failed: THIS test, alone  <- the #339 defect
+//   !isLoopbackBind(BIND_ADDRESS)  true       1154/3 failed: loopback boots; this test SURVIVES
+//   OCP_TUI_ALLOW_LAN !== "1"      true       1156/1 failed: the escape-hatch test below, alone
+//
+// Deleting `isLoopbackBind(...)` outright is ambiguous between rows 1 and 2, and only row 1 is the
+// "call site quietly stopped consulting the helper" shape this issue is about — row 2 makes the gate
+// refuse EVERY TUI boot, which existing tests already catch. Row 2's three are worth naming, because
+// "the TUI loopback boots" is a count and counts are claims: the OCP_LOCAL_TOOLS-inert TUI boot just
+// below, `integration (#213)`'s TUI prompt-budget boot, and — the one a reader would not predict —
+// `integration (#346)`'s B.2 key-set snapshot, whose `tui-pool` profile (#382) boots TUI mode too.
+//
+// Row 1 is also where the choice of bind address pays off. Its recorded failure is `process never
+// closed … listen EADDRNOTAVAIL: address not available 192.0.2.1:55616 … stdout(0B)=""` — so with
+// the gate defeated the server still never bound anything. Under `0.0.0.0` that same run reaches
+// `listening on http://0.0.0.0:<port> (LAN mode)`.
+ltTest("integration (#370): TUI + non-loopback bind → the isLoopbackBind gate REFUSES the boot, before listen()", async () => {
+  if (!LT_POSIX) return;
+  const dir = ltMkdir(); const fake = ltFake(dir);
+  const { child, buf } = await ltBootFresh(
+    { CLAUDE_TUI_MODE: "true", CLAUDE_BIND: LT_NONLOOPBACK_BIND, CLAUDE_BIN: fake }, dir);
+  try {
+    // Wait for `closed`, not `exit`: everything below reads buf.err, and stderr is only guaranteed
+    // drained at 'close' (#203).
+    assert.ok(await ltWait(() => buf.closed || buf.spawnErr), `process never closed — ${ltDiag(buf)}`);
+    // Laddered the way ltAssertNoInboundSecrets is (:1925): non-emptiness, then "it looks like the
+    // right kind of output", then the actual claim. Without rung 1 an unspawned child fails rung 3
+    // and reports "no FATAL" when the truth is "never ran".
+    assert.ok(buf.err.length > 0, `child wrote nothing to stderr at all — ${ltDiag(buf)}`);
+    assert.notEqual(buf.exit, 0, `an unsafe config must exit non-zero — ${ltDiag(buf)}`);
+    assert.ok(/^FATAL: /m.test(buf.err), `stderr must carry a FATAL boot refusal — ${ltDiag(buf)}`);
+    // The actual claim, and it names the bind it was handed. `/FATAL/` alone would be satisfied by
+    // the AUTH_MODE=multi gate above it, the PROXY_ANONYMOUS_KEY gate below it, or the local-tools
+    // gate — an alternation that cannot fail, which is the defect ltAssertNoInboundSecrets' own
+    // `/^CLAUDE_CODE_OAUTH_TOKEN=|^HOME=/m` was fixed for.
+    assert.ok(buf.err.includes(`non-loopback CLAUDE_BIND (${LT_NONLOOPBACK_BIND}) is unsafe`),
+      `expected the TUI LAN gate's FATAL, naming the address it refused — ${ltDiag(buf)}`);
+    // ...and it fired BEFORE listen(), which is the property that makes the gate worth anything.
+    // This is discriminating rather than decorative: a gate moved after listen() would attempt to
+    // bind LT_NONLOOPBACK_BIND and stderr would carry EADDRNOTAVAIL instead — measured, that is
+    // exactly what the escape-hatch test below observes when the gate is legitimately skipped.
+    assert.ok(!/EADDRNOTAVAIL/.test(buf.err),
+      `the gate must refuse before binding, but a bind was attempted — ${ltDiag(buf)}`);
+  } finally { child.kill("SIGKILL"); _ltRmRetry(dir); }
+});
+
+ltTest("integration (#370): OCP_TUI_ALLOW_LAN=1 is consulted — the documented escape hatch actually opens", async () => {
+  if (!LT_POSIX) return;
+  const dir = ltMkdir(); const fake = ltFake(dir);
+  // ltBoot directly, not ltBootFresh: this is the one boot in the suite that deliberately never
+  // reaches "listening on" and never exits, so ltBootFresh's liveness probe has no condition to
+  // satisfy and would burn its full LT_COLLISION_PROBE_MS (45s) before returning. Its other job —
+  // retrying an EADDRINUSE port collision — cannot apply here, because the bind fails on the
+  // ADDRESS regardless of which port it is given.
+  const port = await ltFreePort();
+  const { child, buf } = ltBoot({
+    CLAUDE_TUI_MODE: "true", CLAUDE_BIND: LT_NONLOOPBACK_BIND, OCP_TUI_ALLOW_LAN: "1",
+    CLAUDE_BIN: fake, CLAUDE_PROXY_PORT: String(port),
+  }, dir);
+  try {
+    // POSITIVE evidence that the gate was passed, not the absence of its message. `!/is unsafe/`
+    // on its own is satisfied by a child that died before ever reaching :831 — a cell firing on a
+    // missing operand, which is what 4022be4 was written for. Reaching listen() at all is the
+    // observation that proves the override was honoured.
+    assert.ok(await ltWait(() => /EADDRNOTAVAIL/.test(buf.err) || buf.closed || buf.spawnErr),
+      `boot produced neither a bind attempt nor an exit — ${ltDiag(buf)}`);
+    assert.ok(/EADDRNOTAVAIL/.test(buf.err),
+      `with the override set the boot must get PAST the gate and reach listen() — ${ltDiag(buf)}`);
+    assert.ok(!/is unsafe/.test(buf.err),
+      `OCP_TUI_ALLOW_LAN=1 must suppress the LAN gate — ${ltDiag(buf)}`);
+    // The safety property this whole pair rests on: TEST-NET-1 is unroutable and unassigned, so
+    // "past the gate" never becomes a real listener on this machine.
+    assert.ok(!buf.out.includes("listening on"),
+      `${LT_NONLOOPBACK_BIND} must never actually bind — this host has it on an interface, so the ` +
+      `gate tests are no longer exposure-free and the address must be changed — ${ltDiag(buf)}`);
+  } finally { child.kill("SIGKILL"); _ltRmRetry(dir); }
 });
 
 ltTest("integration: safe single-user config BOOTS past the gate and announces local tools", async () => {
