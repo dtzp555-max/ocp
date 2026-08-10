@@ -24,16 +24,25 @@
  * adds a field must update the snapshot, and the snapshot's git history is the per-release record
  * of how B.2 surface actually grew — independent of whether anyone wrote a marker.
  *
- * WHAT IT DOES NOT SEE is enumerated in TWO places, and deliberately not here: the snapshot
- * file's own `notCovered` block (13 entries, each tagged [measured] or [reasoned]) and
- * `CLAUDE.md`'s `governance_audits.blind_spots` (7 headline items). This header keeps no third
- * copy — a third would be the one that goes stale. Read one of those two before treating a green
- * run as coverage.
+ * TWO CONFIGURATION PROFILES (#357), one snapshot block each — see B2_PROFILES. The original
+ * single profile left 12 key paths of config-variant surface unrecorded, 10 of them inside
+ * /health's `tui.pool`, which is a `TuiPanePool.stats()` counter bag and therefore where the next
+ * field is most likely to land. The second profile turns on the three settings that decide shape,
+ * so a field added to that counter bag now reddens `npm test` like any other.
  *
- * USAGE
- *   node scripts/b2-key-snapshot.mjs            # probe a fresh server, print the diff, exit 1 on drift
- *   node scripts/b2-key-snapshot.mjs --write    # probe a fresh server and rewrite the snapshot
- *   node scripts/b2-key-snapshot.mjs --print    # probe and dump the records as JSON
+ * WHAT IT DOES NOT SEE is enumerated in TWO places, and deliberately not here: the snapshot
+ * file's own `notCovered` block (each entry tagged [measured] or [reasoned]) and `CLAUDE.md`'s
+ * `governance_audits.blind_spots`. This header keeps no third copy — a third would be the one
+ * that goes stale. Read one of those two before treating a green run as coverage.
+ *
+ * USAGE — every command covers every profile; there is deliberately no single-profile flag, or
+ * `--write` could refresh one block and leave the other describing an older build.
+ *   node scripts/b2-key-snapshot.mjs            # probe fresh servers, print the diff, exit 1 on drift
+ *   node scripts/b2-key-snapshot.mjs --write    # probe fresh servers and rewrite the snapshot
+ *   node scripts/b2-key-snapshot.mjs --print    # probe and dump the records as JSON, keyed by
+ *                                              # SNAPSHOT BLOCK NAME (probes / probesTuiPool),
+ *                                              # not by profile id — so the output can be diffed
+ *                                              # against the checked-in file directly
  *
  * The test suite imports `makeB2Fixture` / `probeB2KeySets` / `diffB2KeySets` and drives them
  * through its own live-server harness, so the FIXTURE (which is what determines the key sets)
@@ -157,11 +166,111 @@ const FIXTURE_SECURITY = "#!/bin/sh\nexit 1\n";
 // seeding one would record non-surface as surface.
 const FIXTURE_LOG_LINE = "ocp b2 key-set fixture line (deliberately not JSON)\n";
 
+// A `tmux` that runs nothing and records what it was asked to do. Load-bearing for the
+// `tui-pool` profile and inert but present for `default`, so the property holds by
+// construction rather than by which profile happens to be running.
+//
+// WHY IT IS NOT OPTIONAL. In TUI mode server.mjs's listen callback calls
+// reapStaleTuiSessions({ port, includeLegacy: true }) (server.mjs § "F7 fix"). That lists the
+// real tmux server's sessions and kill-sessions every name matching this instance's port
+// prefix OR the legacy `ocp-tui-<8hex>` shape. It also runs `tmux kill-server` — but ONLY when no
+// FOREIGN session remains, per the `!othersRemain && sparedLive === 0` gate in
+// lib/tui/session.mjs, so an operator with any ordinary session open never reaches it. Measured by
+// feeding a fake tmux to the real function, since the stub means a real one never runs here.
+//
+// The reachable harm is therefore the kill-session, not the kill-server: a live legacy-named
+// session IS killed even with foreign sessions present, and that is someone's running pane.
+//
+// SCOPE, stated because the first draft of this PR claimed more: this pins the tmux binary for
+// the SNAPSHOT MECHANISM. It does not make `npm test` as a whole unable to touch a real tmux —
+// two other live-server tests boot server.mjs in TUI mode with no such pin (issue #384,
+// pre-existing and deliberately not folded in here).
+// Exiting non-zero makes reapStaleTuiSessions return at its first guard
+// (`if (!r || r.status !== 0) return 0`) before any kill is issued.
+//
+// It exits 1 for EVERY subcommand, not just list-sessions: a stub that can mutate a running
+// service is the shape AGENTS.md § "Constraints must be unreachable by construction" was
+// written about, so this one can only ever refuse and report.
+const FIXTURE_TMUX = (logPath) => `#!/bin/sh
+printf '%s\\n' "tmux $*" >> ${JSON.stringify(logPath)}
+exit 1
+`;
+
+/**
+ * The configuration profiles this snapshot records, one block in the snapshot file each.
+ *
+ * TWO profiles, not one and not eight (#357). The three settings that decide /health's shape are
+ * independent — TUI_MODE decides `spawn.reason`, SKIP_PERMISSIONS decides `config.allowedTools[]`,
+ * and `tui.pool` needs TUI_MODE && OCP_TUI_POOL_SIZE >= 1 — so the all-off and all-on corners
+ * BRACKET every combination rather than sampling it. That is measured, not argued: booting the
+ * five reachable variants (TUI alone; TUI+pool=1; skip-permissions alone; all three at pool=1;
+ * all three at pool=4) and probing all 16 pairs produced NO key path that is absent from both of
+ * the two profiles below. pool=4 records the same key set as pool=1 — the size is a value.
+ */
+export const B2_PROFILES = [
+  {
+    id: "default",
+    snapshotKey: "probes",
+    warmUp: true,
+    env: {},
+    // Exact number of stub-tmux invocations a boot+probe of this profile must produce. Asserted
+    // as an EQUALITY, not as "nothing that spawns a pane": an empty log is satisfied by the stub
+    // never having been the binary server.mjs used at all, which is a predicate passing on a
+    // missing operand. Zero is right here because reapStaleTuiSessions only runs under TUI mode.
+    expectTmuxCalls: 0,
+    why: "the configuration every production instance in the reference fleet runs",
+  },
+  {
+    id: "tui-pool",
+    snapshotKey: "probesTuiPool",
+    warmUp: false,
+    env: { CLAUDE_TUI_MODE: "true", OCP_TUI_POOL_SIZE: "1", CLAUDE_SKIP_PERMISSIONS: "true" },
+    // EXACTLY ONE, and the "one" is doing as much work as the "list-sessions". TUI mode's listen
+    // callback calls reapStaleTuiSessions once, so a log with one line is POSITIVE evidence that
+    // the stub is the tmux server.mjs actually resolved — which asserting only "no new-session"
+    // would not give, since a log left empty by the real tmux running instead would also pass.
+    // MEASURED at 1 across the five config variants probed while settling #357.
+    expectTmuxCalls: 1,
+    // NO WARM-UP, and this is the whole safety argument rather than an optimisation.
+    // MEASURED: under CLAUDE_TUI_MODE=true a POST /v1/chat/completions takes the TUI path, and
+    // the two warm-up requests issued FOUR `tmux new-session` commands, each one launching the
+    // configured `claude` binary inside a real pane (a cold-boot pane per turn plus pool
+    // refills). Against the stub above nothing actually runs, but then "this audit spawns no
+    // CLI" would rest entirely on the stub. Not asking is the stronger guarantee, and it is
+    // also far cheaper: with no warm-up this profile's whole boot invokes tmux EXACTLY ONCE,
+    // with `list-sessions` — asserted by the suite from the stub's own log, not assumed.
+    //
+    // The cost, measured and stated so nobody reads this block as equivalent to `probes`:
+    // without traffic, /api/usage's byKey[]/recent[]/timeline[] and /health's + /status's
+    // recentErrors[] are EMPTY arrays here, so their ELEMENT keys are absent from this block.
+    // The default profile records all of them; this profile exists for the 12 config-variant
+    // paths, and `notCovered` in the snapshot says so.
+    why: "the config-variant corner: TUI mode, a warm pane pool, and skip-permissions all on",
+  },
+];
+
 /**
  * Create the scratch dirs, fake binaries and environment that pin every response's SHAPE.
- * Returns { env, dir, home, cleanup }. `env` is merged over the caller's own base environment.
+ * Returns { env, dir, home, tmuxLog, profile, cleanup }. `env` is merged over the caller's own
+ * base environment. `profileId` selects a row of B2_PROFILES; an unknown id throws rather than
+ * silently falling back to the default, because a typo'd profile would otherwise record the
+ * DEFAULT shape under the variant's snapshot key and look like coverage.
  */
-export function makeB2Fixture() {
+export function makeB2Fixture(profileId = "default") {
+  const profile = B2_PROFILES.find(p => p.id === profileId);
+  if (!profile) {
+    throw new Error(`makeB2Fixture: unknown profile ${JSON.stringify(profileId)} — known: ${B2_PROFILES.map(p => p.id).join(", ")}`);
+  }
+  // A profile may override any shape-deciding pin; it may NOT choose the tmux binary (#357
+  // review, F4). Silently ignoring the key would be worse than refusing it — the author would
+  // believe the override took effect. The pin itself is applied AFTER the profile spread below,
+  // so even without this throw the real tmux is unreachable; this makes the attempt loud.
+  if (Object.prototype.hasOwnProperty.call(profile.env, "OCP_TUI_TMUX_BIN")) {
+    throw new Error(
+      `makeB2Fixture: profile ${profile.id} sets OCP_TUI_TMUX_BIN. That is refused: every profile ` +
+      `must run against the stub tmux, or this audit can boot real \`claude\` panes and — with the ` +
+      `real tmux — reach reapStaleTuiSessions' kill-session/kill-server on the operator's machine.`);
+  }
   const dir = mkdtempSync(join(tmpdir(), "ocp-b2-"));
   const home = mkdtempSync(join(tmpdir(), "ocp-b2-home-"));
   const bin = join(dir, "bin");
@@ -175,6 +284,12 @@ export function makeB2Fixture() {
   writeFileSync(security, FIXTURE_SECURITY);
   chmodSync(security, 0o755);
 
+  const tmuxLog = join(dir, "tmux-invocations.log");
+  writeFileSync(tmuxLog, "");
+  const tmux = join(bin, "tmux");
+  writeFileSync(tmux, FIXTURE_TMUX(tmuxLog));
+  chmodSync(tmux, 0o755);
+
   mkdirSync(join(home, ".openclaw", "logs"), { recursive: true });
   writeFileSync(join(home, ".openclaw", "logs", "proxy.log"), FIXTURE_LOG_LINE);
 
@@ -182,6 +297,8 @@ export function makeB2Fixture() {
     dir,
     home,
     claude,
+    tmuxLog,
+    profile,
     env: {
       // Store isolation. keys.mjs honours OCP_DIR_OVERRIDE only when NODE_ENV=test, so both are
       // load-bearing: without the pair, POST /api/keys writes to the operator's real key store.
@@ -205,9 +322,33 @@ export function makeB2Fixture() {
       CLAUDE_SKIP_PERMISSIONS: "false",
       // TUI mode replaces /health's `spawn` block with a 3-key variant that has no `reason`.
       CLAUDE_TUI_MODE: "false",
+      // /health's `tui.pool` is null unless TUI mode is on AND this is >= 1, in which case it
+      // becomes a 10-key TuiPanePool.stats() object. Pinned to "0" for the same reason as the
+      // two above rather than left to the ambient environment (#357).
+      OCP_TUI_POOL_SIZE: "0",
       // Value-only, but pinned so an ambient export cannot make one machine's run differ.
       OCP_INSTANCE_NAME: "",
       PROXY_ADVERTISE_ANON_KEY: "0",
+      // The profile's overrides come LAST so a profile can override any pin above — EXCEPT the
+      // tmux pin, which is applied after this spread and is refused above.
+      ...profile.env,
+      // Never the real tmux — see FIXTURE_TMUX. Set explicitly rather than relying on PATH order,
+      // because lib/tui/session.mjs resolves `process.env.OCP_TUI_TMUX_BIN || "tmux"` at module
+      // load and that env var is the only thing that can win against a tmux on PATH.
+      //
+      // AFTER the spread, not before (#357 review, F4). Before it, a future profile could set
+      // OCP_TUI_TMUX_BIN to the real tmux and — since expectTmuxCalls is also author-chosen per
+      // profile — pick a matching count, and every guard in the suite would still pass. The
+      // comment advertising that profiles may override "any pin above" made that an invitation.
+      //
+      // WHICH HALF DOES WHAT, stated precisely because the two are easy to swap: with the throw
+      // above present, the THROW is what makes the real tmux unreachable — it fires before this
+      // object is built. Last-write-wins is the COUNTERFACTUAL half: it is what would still hold
+      // if someone later deleted the throw as "unreachable". Measured: mutation N6 restores the
+      // pre-review ordering with the throw kept and SURVIVES the whole suite, so the suite pins
+      // the throw and not the ordering. Both are kept anyway — ordering is the by-construction
+      // form AGENTS.md prefers over a runtime prohibition.
+      OCP_TUI_TMUX_BIN: tmux,
     },
     cleanup() {
       // Never throw from cleanup: in a test this runs in a `finally`, where a throw would REPLACE
@@ -277,15 +418,20 @@ async function request(port, method, path, body) {
  * keyed by probe name. Deterministic by construction: two runs against two fresh boots must
  * produce identical output, and the suite asserts exactly that.
  */
-export async function probeB2KeySets(port) {
+export async function probeB2KeySets(port, { warmUp = true } = {}) {
   // Warm-up. Not decoration: without traffic, /api/usage's byKey/recent/timeline are empty arrays
   // and their element shapes go unrecorded, and without a FAILED request recentErrors[] does too.
-  await request(port, "POST", "/v1/chat/completions", {
-    model: "sonnet", messages: [{ role: "user", content: "b2 key-set warm-up" }],
-  });
-  await request(port, "POST", "/v1/chat/completions", {
-    model: "sonnet", messages: [{ role: "user", content: "OCP_B2_FORCE_ERROR" }],
-  });
+  //
+  // OFF for the `tui-pool` profile, and that is a safety decision rather than a speed one — see
+  // B2_PROFILES. In TUI mode these two requests take the TUI path and spawn panes.
+  if (warmUp) {
+    await request(port, "POST", "/v1/chat/completions", {
+      model: "sonnet", messages: [{ role: "user", content: "b2 key-set warm-up" }],
+    });
+    await request(port, "POST", "/v1/chat/completions", {
+      model: "sonnet", messages: [{ role: "user", content: "OCP_B2_FORCE_ERROR" }],
+    });
+  }
 
   const records = {};
   let keyId = null;
@@ -367,8 +513,8 @@ async function freePort() {
   return port;
 }
 
-async function cliBootAndProbe() {
-  const fixture = makeB2Fixture();
+async function cliBootAndProbe(profile) {
+  const fixture = makeB2Fixture(profile.id);
   const port = await freePort();
   const child = spawn(process.execPath, [SERVER_PATH], {
     env: { ...process.env, ...fixture.env, CLAUDE_PROXY_PORT: String(port) },
@@ -383,9 +529,9 @@ async function cliBootAndProbe() {
       await new Promise(r => setTimeout(r, 50));
     }
     if (!out.includes("listening on")) {
-      throw new Error(`server.mjs did not start\nstdout: ${out.slice(0, 800)}\nstderr: ${err.slice(0, 800)}`);
+      throw new Error(`server.mjs did not start under profile ${profile.id}\nstdout: ${out.slice(0, 800)}\nstderr: ${err.slice(0, 800)}`);
     }
-    return await probeB2KeySets(port);
+    return await probeB2KeySets(port, { warmUp: profile.warmUp });
   } finally {
     child.kill("SIGKILL");
     await new Promise(r => setTimeout(r, 250));
@@ -396,21 +542,36 @@ async function cliBootAndProbe() {
 if (process.argv[1] && fileURLToPath(import.meta.url) === process.argv[1]) {
   const write = process.argv.includes("--write");
   const print = process.argv.includes("--print");
-  const records = await cliBootAndProbe();
+  // Every profile, always. A flag to probe just one would let `--write` rewrite one block from a
+  // fresh probe while leaving the other at whatever was on disk, which is how the two blocks
+  // would come to describe two different builds.
+  const byProfile = {};
+  for (const profile of B2_PROFILES) byProfile[profile.snapshotKey] = await cliBootAndProbe(profile);
+
   if (print) {
-    console.log(JSON.stringify(records, null, 2));
+    console.log(JSON.stringify(byProfile, null, 2));
     process.exit(0);
   }
   const snapshot = readB2Snapshot();
   if (write) {
-    snapshot.probes = records;
+    for (const [key, records] of Object.entries(byProfile)) snapshot[key] = records;
     mkdirSync(dirname(SNAPSHOT_PATH), { recursive: true });
     writeFileSync(SNAPSHOT_PATH, `${JSON.stringify(snapshot, null, 2)}\n`);
-    console.log(`wrote ${SNAPSHOT_PATH}`);
+    console.log(`wrote ${SNAPSHOT_PATH} (${B2_PROFILES.map(p => p.snapshotKey).join(", ")})`);
     console.log("Now state the added field names in the PR body AND the CHANGELOG (ADR 0012 condition 5).");
     process.exit(0);
   }
-  const drift = diffB2KeySets(snapshot.probes, records);
-  if (drift) { console.error(drift); process.exit(1); }
-  console.log("B.2 response key sets match the snapshot.");
+  let drifted = false;
+  for (const profile of B2_PROFILES) {
+    const drift = diffB2KeySets(snapshot[profile.snapshotKey] ?? {}, byProfile[profile.snapshotKey]);
+    if (drift) {
+      // Name the profile. Without it a reader sees a key path and cannot tell whether the field
+      // is new surface or merely surface that only this configuration reaches.
+      console.error(`── profile ${profile.id} (snapshot.${profile.snapshotKey}) ──`);
+      console.error(drift);
+      drifted = true;
+    }
+  }
+  if (drifted) process.exit(1);
+  console.log(`B.2 response key sets match the snapshot (${B2_PROFILES.length} profiles).`);
 }

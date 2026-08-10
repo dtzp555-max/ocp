@@ -1566,9 +1566,22 @@ function ltFake(dir) { const p = join(dir, "claude"); _ltWrite(p, LT_FAKE); _ltC
 //     because it refuses; a real tmux answers `new-session` with a live pane and the turn
 //     goes on to capture/paste/kill it (38 invocations, measured against a permissive stub).
 //
-// What the real binary would then do is `reapStaleTuiSessions`' business: `kill-session` on
-// every session matching this port's prefix OR the legacy `ocp-tui-<8hex>` shape, and then
-// `tmux kill-server` when no foreign session remains (lib/tui/session.mjs:154).
+// What the real binary would then do is `reapStaleTuiSessions`' business, and the gate is
+// stated verbatim rather than summarised, because overstating this hazard is the same defect
+// class as understating it. `kill-session` is issued for every session matching this port's
+// prefix OR — at the boot reap only, which passes `includeLegacy: true` — the legacy
+// `ocp-tui-<8hex>` shape. `tmux kill-server` then runs under exactly one condition:
+//
+//     if (!othersRemain && sparedLive === 0)      lib/tui/session.mjs:154
+//
+// `othersRemain` is set by any session that is neither ours nor legacy-ours, so ANY ordinary
+// foreign session suppresses kill-server. It therefore fires when the operator has ONLY
+// legacy-shaped sessions, when they have NO sessions at all, and on this instance's own
+// port-scoped ones — and never alongside an ordinary foreign session.
+//
+// The pin is justified by the reachable `kill-session`, NOT by the stronger claim: a live
+// legacy-named session is killed even with foreign sessions present, and that is someone's
+// running pane. kill-server is the worse outcome but the narrower one.
 //
 // THIS STUB REFUSES EVERY SUBCOMMAND, and that is a decision with two measured legs, not a
 // default. Refusing puts `reapStaleTuiSessions` out at its FIRST guard — `if (!r || r.status
@@ -2211,30 +2224,53 @@ ltTest("integration (#384): ltBoot pins tmux at a refusing stub, so no live-serv
     const calls = ltTmuxCalls(dir);
     const decoyCalls = ltTmuxCalls(decoyDir, "tmux");
 
-    // 1. EQUALITY, not ">= 0". Under CLAUDE_TUI_MODE=true the boot reap issues exactly one
-    //    `list-sessions`, so a count of 0 can only mean the pinned stub was not the binary
-    //    server.mjs resolved — the predicate-satisfied-by-a-missing-operand shape (#382 N3).
-    assert.equal(calls.length, 1,
-      `expected exactly 1 tmux invocation (the boot reap's list-sessions) against the PINNED stub, ` +
-      `saw ${calls.length}: ${JSON.stringify(calls)}. The PATH decoy saw ${JSON.stringify(decoyCalls)} — ` +
-      `if that is non-empty, ltBoot's OCP_TUI_TMUX_BIN pin is gone and a TUI-mode boot is resolving ` +
-      `tmux off PATH, i.e. running the operator's real one. ${ltDiag(buf)}`);
-    assert.match(calls[0], /^list-sessions /,
-      `the only boot-time tmux call must be the reap's read-only list-sessions. Got: ${calls[0]}`);
+    // ── ASSERTION ORDER IS LOAD-BEARING, and it is this way because the mutation table said
+    //    so, not because it reads better. `assert` throws on the FIRST failure, so an earlier
+    //    assertion masks every mutation aimed at a later one. The first revision of this test
+    //    ordered these count-first, and the table exposed the cost: BOTH the PATH assertion
+    //    and the kill assertion were UNPROVEN WHILE LOOKING PROVEN — M1 (pin removed) and M3
+    //    (stub made permissive) each died on the count, so neither of the other two ever
+    //    executed under any mutation. That is #382's N4 shape, one PR later.
+    //
+    //    Ordering cannot make this test pass vacuously — every assertion must hold for it to
+    //    pass at all — so ordering is purely about which mutation attributes to which
+    //    assertion, and it is chosen for that. Each of the three now has a mutation that
+    //    trips ONLY it: A2 <- pin removed, A3 <- stub made permissive, A1 <- this test's own
+    //    CLAUDE_TUI_MODE dropped (which empties BOTH logs, so A2 and A3 pass vacuously and
+    //    only A1 can catch it — the operand guard doing exactly its job).
 
-    // 2. Nothing reached PATH at all. This is the assertion the decoy exists for.
+    // A2. Nothing was resolved off PATH. This is the property the whole pin exists to give,
+    //     and the decoy is the operand that makes it falsifiable: with no decoy this line
+    //     passes whether or not the pin works (measured — see the table's M4 row).
     assert.deepEqual(decoyCalls, [],
       `a tmux was resolved off PATH despite the pin — on a developer workstation that is the ` +
-      `operator's own binary. Decoy log: ${JSON.stringify(decoyCalls)}`);
+      `operator's own binary. Decoy log: ${JSON.stringify(decoyCalls)}. Pinned-stub log: ` +
+      `${JSON.stringify(calls)}. ${ltDiag(buf)}`);
 
-    // 3. The REFUSAL is what stops the harm, so assert the harm did not happen rather than
-    //    trusting the exit status. reapStaleTuiSessions returns at its first guard when
-    //    list-sessions fails (lib/tui/session.mjs:125), so neither kill ever issues. A
-    //    permissive stub fails exactly here: list-sessions exiting 0 with no output reads as
-    //    "server up, zero sessions" and fires kill-server (session.mjs:154) — measured.
+    // A3. The REFUSAL is what stops the harm, so assert the harm did not happen rather than
+    //     trusting an exit status. With list-sessions failing, reapStaleTuiSessions returns at
+    //     its first guard (lib/tui/session.mjs:125) and neither kill is reached. A PERMISSIVE
+    //     stub fails exactly here, measured: list-sessions exiting 0 with no output makes
+    //     `!othersRemain && sparedLive === 0` true (session.mjs:154) and kill-server fires.
     assert.ok(!calls.some(c => /^kill-(server|session) /.test(c)),
-      `the boot reap issued a kill against the stub: ${JSON.stringify(calls)}. Against a real tmux ` +
-      `that is the operator's session (kill-session) or their whole server (kill-server).`);
+      `the boot reap issued a kill against the stub: ${JSON.stringify(calls)}. Against a real ` +
+      `tmux, kill-session takes a matching session — including a live legacy-named ` +
+      `ocp-tui-<8hex> one, which is reached even with foreign sessions present — and ` +
+      `kill-server takes the operator's whole server.`);
+
+    // A1. The operand guard: EQUALITY, not ">= 0". Under CLAUDE_TUI_MODE=true the boot reap
+    //     issues exactly one `list-sessions`, so 0 can only mean the pinned stub was not the
+    //     binary server.mjs resolved — and both assertions above are satisfied by a missing
+    //     operand in exactly that case (#382 N3). Last, so a mutation that empties both logs
+    //     lands HERE and nowhere else.
+    assert.equal(calls.length, 1,
+      `expected exactly 1 tmux invocation (the boot reap's list-sessions) against the PINNED ` +
+      `stub, saw ${calls.length}: ${JSON.stringify(calls)}. The PATH decoy saw ` +
+      `${JSON.stringify(decoyCalls)}. A count of 0 with an empty decoy means the boot never ` +
+      `reached the reap at all, so the two assertions above just passed on nothing. ` +
+      `${ltDiag(buf)}`);
+    assert.match(calls[0], /^list-sessions /,
+      `the only boot-time tmux call must be the reap's read-only list-sessions. Got: ${calls[0]}`);
   } finally { child.kill("SIGKILL"); _ltRmRetry(dir); }
 });
 
@@ -3409,7 +3445,7 @@ ltTest("replay premise (LIVE): a real server.mjs whose FIRST probe dies on a sig
 // drift apart — a fixture difference would silently change what "the snapshot" means.
 import {
   makeB2Fixture, probeB2KeySets, responseKeyPaths, parseB2Inventory, diffB2KeySets,
-  readB2Snapshot, ALIGNMENT_PATH,
+  readB2Snapshot, ALIGNMENT_PATH, B2_PROFILES,
 } from "./scripts/b2-key-snapshot.mjs";
 
 console.log("\nClass B.2 response key-set snapshot (#346):");
@@ -3496,6 +3532,46 @@ test("diffB2KeySets: status and content-type changes fail even when the key set 
                           { p: { status: 200, contentType: "application/json", keys: ["a"] } }));
 });
 
+test("#357 review F4: a profile cannot choose the tmux binary — the pin wins, and the attempt throws", () => {
+  // Review finding: the pin used to be applied BEFORE `...profile.env`, under a comment inviting
+  // profiles to override "any pin above". Since `expectTmuxCalls` is author-chosen per profile
+  // too, a future profile could have pointed at the real tmux AND set a matching count, and every
+  // guard in the suite would still have passed. Two halves: last-write-wins makes it UNREACHABLE,
+  // the throw makes it LOUD.
+  //
+  // ONLY THE THROW IS ENFORCED BY THIS TEST, and that is measured rather than assumed. Mutation
+  // N6 (pin moved back before the spread, throw kept) SURVIVES the whole suite, because with the
+  // throw in place no profile can reach the spread carrying that key; N8 (both removed) dies at
+  // the assert.throws below, not at anything about ordering. The ordering is kept as the
+  // by-construction half — it is what would still hold if someone later deleted the throw as
+  // "unreachable" — but this comment does not claim the suite pins it.
+  for (const profile of B2_PROFILES) {
+    const fx = makeB2Fixture(profile.id);
+    try {
+      // The pin must point INTO this fixture's own scratch bin, i.e. at the stub — not at
+      // whatever a profile or the ambient environment might prefer.
+      assert.equal(fx.env.OCP_TUI_TMUX_BIN, testJoin(fx.dir, "bin", "tmux"),
+        `profile ${profile.id}: the tmux pin must resolve to this fixture's stub`);
+      assert.ok(testExistsSync(fx.env.OCP_TUI_TMUX_BIN),
+        `profile ${profile.id}: premise — the stub must actually exist, or the pin points at nothing`);
+    } finally { fx.cleanup(); }
+  }
+
+  // The loud half. Uses a synthetic profile rather than mutating a real one, and restores the
+  // list in a finally so a failure here cannot leave B2_PROFILES corrupted for later tests.
+  const evil = { id: "_test-evil", snapshotKey: "_x", warmUp: false, expectTmuxCalls: 0,
+                 env: { OCP_TUI_TMUX_BIN: "/usr/bin/tmux" }, why: "review F4 regression" };
+  B2_PROFILES.push(evil);
+  try {
+    assert.throws(() => makeB2Fixture("_test-evil"), /OCP_TUI_TMUX_BIN/,
+      "a profile that sets the tmux binary must be refused, not silently ignored");
+  } finally {
+    const i = B2_PROFILES.indexOf(evil);
+    if (i !== -1) B2_PROFILES.splice(i, 1);
+    assert.ok(!B2_PROFILES.some(p => p.id === "_test-evil"), "the synthetic profile must be removed");
+  }
+});
+
 test("diffB2KeySets control: identical records — including key ORDER — compare equal and return null", () => {
   const a = { p: { status: 200, contentType: "application/json", keys: ["x", "y"] } };
   const b = { p: { status: 200, contentType: "application/json", keys: ["x", "y"] } };
@@ -3509,58 +3585,135 @@ test("diffB2KeySets control: identical records — including key ORDER — compa
 ltTest("integration (#346): every grandfathered B.2 endpoint's response key set matches the checked-in snapshot", async () => {
   if (!LT_POSIX) return;
 
-  async function collect() {
-    const fx = makeB2Fixture();
+  async function collect(profile) {
+    const fx = makeB2Fixture(profile.id);
     const { child, buf, port } = await ltBootFresh(fx.env, fx.dir);
     try {
       assert.ok(await ltWait(() => buf.out.includes("listening on"), 45000),
-        `the B.2 key-set probe could not boot server.mjs — ${ltDiag(buf)}`);
-      return await probeB2KeySets(port);
+        `the B.2 key-set probe could not boot server.mjs under profile ${profile.id} — ${ltDiag(buf)}`);
+      const records = await probeB2KeySets(port, { warmUp: profile.warmUp });
+      // The stub tmux appends one line per invocation. Read it BEFORE cleanup(), which deletes
+      // the directory it lives in.
+      const tmuxCalls = _ltExists(fx.tmuxLog)
+        ? _ltRead(fx.tmuxLog, "utf8").split("\n").filter(Boolean)
+        : null;
+      return { records, tmuxCalls };
     } finally {
       child.kill("SIGKILL");
-      await ltDrain(() => buf.closed, "b2-snapshot-in-body", 5000);
+      await ltDrain(() => buf.closed, `b2-snapshot-${profile.id}-in-body`, 5000);
       fx.cleanup();
     }
   }
 
-  const first = await collect();
-  const second = await collect();
-
-  // 1. Stability. Any difference between two fresh boots means a value reached the key set.
-  //    Reported per-probe rather than as one deepStrictEqual, because assert's own diff on two
-  //    71-key records says which BYTES differ and not which endpoint is unstable — and the whole
-  //    point of failing here is to send the reader to the right response.
-  const allProbes = [...new Set([...Object.keys(first), ...Object.keys(second)])].sort();
-  const unstable = allProbes.filter(k => JSON.stringify(first[k]) !== JSON.stringify(second[k]));
-  assert.deepStrictEqual(unstable, [],
-    "two fresh boots produced DIFFERENT key sets — a VALUE has leaked into the key set, or a " +
-    "probe is order-dependent. A snapshot that flaps is worse than none: it trains every releaser " +
-    "to regenerate without reading the diff, which is exactly how a real field addition would " +
-    "then slip through.\n" +
-    unstable.map(k =>
-      `  ${k}\n    boot1: ${JSON.stringify(first[k]).slice(0, 400)}\n    boot2: ${JSON.stringify(second[k]).slice(0, 400)}`,
-    ).join("\n"));
-
-  // 2. Coverage. The constitution decides what the B.2 inventory IS, so the probe plan is checked
-  //    against ALIGNMENT.md rather than against a hand-kept list that can fall behind silently.
+  const snapshot = readB2Snapshot();
+  // The constitution decides what the B.2 inventory IS, so the probe plan is checked against
+  // ALIGNMENT.md rather than against a hand-kept list that can fall behind silently. Parsed once
+  // and applied to EVERY profile: a second profile must not become a place an endpoint can hide.
   const inventory = parseB2Inventory(_ltRead(ALIGNMENT_PATH, "utf8"));
   assert.ok(inventory.length >= 12,
     `anchor drift: only ${inventory.length} B.2 pairs parsed from ALIGNMENT.md — the coverage ` +
     `check below would pass vacuously, so it is refused instead`);
-  const probed = Object.keys(first);
-  const unprobed = inventory.filter(p => !probed.includes(p));
-  assert.deepStrictEqual(unprobed, [],
-    `ALIGNMENT.md lists Class B.2 endpoint+method pairs that this snapshot never probes: ` +
-    `${JSON.stringify(unprobed)}. Add them to B2_PROBE_PLAN in scripts/b2-key-snapshot.mjs — ` +
-    `an unprobed endpoint is surface this mechanism reports nothing about.`);
-  const notInInventory = probed.filter(p => !inventory.includes(p));
-  assert.deepStrictEqual(notInInventory, [],
-    `the probe plan probes pairs that are not Class B.2 rows in ALIGNMENT.md: ${JSON.stringify(notInInventory)}`);
 
-  // 3. The snapshot itself. `drift` is the actionable message; it names every added and removed
-  //    key path and tells the author which authorization each kind needs.
-  const drift = diffB2KeySets(readB2Snapshot().probes, first);
-  assert.equal(drift, null, drift || "");
+  // Premise for everything below: there really is more than one profile, and each has its own
+  // snapshot block. Without this, a B2_PROFILES that silently lost its second row would leave
+  // the whole loop passing over one profile and reporting nothing (#357's own vacuity guard).
+  assert.ok(B2_PROFILES.length >= 2,
+    `expected at least two configuration profiles; got ${JSON.stringify(B2_PROFILES.map(p => p.id))}`);
+  assert.equal(new Set(B2_PROFILES.map(p => p.snapshotKey)).size, B2_PROFILES.length,
+    "two profiles sharing one snapshotKey would have the second silently overwrite the first");
+
+  const byProfile = {};
+  for (const profile of B2_PROFILES) {
+    const first = await collect(profile);
+    const second = await collect(profile);
+    byProfile[profile.id] = first.records;
+
+    // 1. Stability, PER PROFILE — not inherited from the default. Any difference between two
+    //    fresh boots means a value reached the key set. Reported per-probe rather than as one
+    //    deepStrictEqual, because assert's own diff on two 71-key records says which BYTES
+    //    differ and not which endpoint is unstable — and the whole point of failing here is to
+    //    send the reader to the right response.
+    const allProbes = [...new Set([...Object.keys(first.records), ...Object.keys(second.records)])].sort();
+    const unstable = allProbes.filter(k => JSON.stringify(first.records[k]) !== JSON.stringify(second.records[k]));
+    assert.deepStrictEqual(unstable, [],
+      `profile ${profile.id}: two fresh boots produced DIFFERENT key sets — a VALUE has leaked ` +
+      "into the key set, or a probe is order-dependent. A snapshot that flaps is worse than none: " +
+      "it trains every releaser to regenerate without reading the diff, which is exactly how a " +
+      "real field addition would then slip through.\n" +
+      unstable.map(k =>
+        `  ${k}\n    boot1: ${JSON.stringify(first.records[k]).slice(0, 400)}\n    boot2: ${JSON.stringify(second.records[k]).slice(0, 400)}`,
+      ).join("\n"));
+
+    // 2. Coverage, PER PROFILE.
+    const probed = Object.keys(first.records);
+    const unprobed = inventory.filter(p => !probed.includes(p));
+    assert.deepStrictEqual(unprobed, [],
+      `profile ${profile.id}: ALIGNMENT.md lists Class B.2 endpoint+method pairs that this ` +
+      `snapshot never probes: ${JSON.stringify(unprobed)}. Add them to B2_PROBE_PLAN in ` +
+      `scripts/b2-key-snapshot.mjs — an unprobed endpoint is surface this mechanism reports ` +
+      `nothing about.`);
+    const notInInventory = probed.filter(p => !inventory.includes(p));
+    assert.deepStrictEqual(notInInventory, [],
+      `profile ${profile.id}: the probe plan probes pairs that are not Class B.2 rows in ALIGNMENT.md: ${JSON.stringify(notInInventory)}`);
+
+    // 3. THE COST GUARANTEE, measured from the stub tmux's own log rather than asserted in prose
+    //    (#357). A governance audit that spawns real `claude` panes on every `npm test` is not
+    //    shippable, and "it doesn't" is a claim about a code path, so it is measured here.
+    //    `tmux new-session` is what launches a pane; its absence is what makes this free.
+    //
+    //    ORDER IS LOAD-BEARING: this runs BEFORE the snapshot comparison. It was written after it
+    //    at first, and mutation N4 (which forces the variant's warm-up back on, so the TUI path
+    //    runs and four `tmux new-session` calls appear) was caught by the KEY-SET DIFF instead —
+    //    the assertion below never executed, so it was unproven while looking proven. These two
+    //    facts are also about different things: how the record was OBTAINED, then what it says.
+    assert.ok(Array.isArray(first.tmuxCalls),
+      `profile ${profile.id}: the fixture's tmux log was unreadable, so the no-spawn guarantee ` +
+      `below would pass vacuously`);
+    const spawning = first.tmuxCalls.filter(c => !c.startsWith("tmux list-sessions"));
+    assert.deepStrictEqual(spawning, [],
+      `profile ${profile.id}: this probe asked tmux to do something other than list sessions. ` +
+      `Every one of these would boot a real \`claude\` pane against a real tmux, which is real ` +
+      `quota and a real process on every npm test:\n${first.tmuxCalls.map(c => `  ${c.slice(0, 200)}`).join("\n")}`);
+    // POSITIVE EVIDENCE, and it is the half that stops the assertion above from passing on a
+    // missing operand: an EMPTY log satisfies "nothing spawned a pane" whether the stub refused
+    // or the REAL tmux ran instead and never wrote to it. An exact count under TUI mode (where
+    // reapStaleTuiSessions runs exactly once at boot) can only be produced by the stub being the
+    // binary server.mjs resolved.
+    assert.equal(first.tmuxCalls.length, profile.expectTmuxCalls,
+      `profile ${profile.id}: expected exactly ${profile.expectTmuxCalls} tmux invocation(s) and ` +
+      `saw ${first.tmuxCalls.length}. Under TUI mode a count of 0 means the stub was NOT the tmux ` +
+      `server.mjs resolved (check OCP_TUI_TMUX_BIN), which would make the no-spawn assertion above ` +
+      `vacuous and put the operator's real tmux server in reach of reapStaleTuiSessions' ` +
+      `kill-server.\n${first.tmuxCalls.map(c => `  ${c.slice(0, 200)}`).join("\n")}`);
+
+    // 4. The snapshot block itself. `drift` is the actionable message; it names every added and
+    //    removed key path and tells the author which authorization each kind needs.
+    assert.ok(snapshot[profile.snapshotKey],
+      `the snapshot has no "${profile.snapshotKey}" block for profile ${profile.id}. Regenerate ` +
+      `with: node scripts/b2-key-snapshot.mjs --write`);
+    const drift = diffB2KeySets(snapshot[profile.snapshotKey], first.records);
+    assert.equal(drift, null, drift ? `profile ${profile.id}:\n${drift}` : "");
+
+  }
+
+  // 5. The two profiles must actually DIFFER, and differ where #357 says they do. Without this,
+  //    a variant profile whose env stopped being applied — the exact failure that makes a second
+  //    profile theatre — would sail through every assertion above by recording the default shape
+  //    a second time. Keyed on the 12 measured paths rather than on "not equal", so a diff that
+  //    silently shrank to one path is a failure too.
+  const dflt = byProfile["default"]["GET /health"].keys;
+  const variant = byProfile["tui-pool"]["GET /health"].keys;
+  const POOL_KEYS = ["size", "warm", "booting", "model", "hits", "misses", "boots", "bootFailures", "cancelled", "dropped"]
+    .map(k => `tui.pool.${k}`).sort();
+  assert.deepStrictEqual(POOL_KEYS.filter(k => !variant.includes(k)), [],
+    `the tui-pool profile must expose every TuiPanePool.stats() key on /health; missing: ` +
+    `${JSON.stringify(POOL_KEYS.filter(k => !variant.includes(k)))}`);
+  assert.deepStrictEqual(POOL_KEYS.filter(k => dflt.includes(k)), [],
+    "the default profile must expose NO tui.pool.* key — if it does, the two profiles no longer bracket anything");
+  assert.ok(dflt.includes("spawn.reason") && !variant.includes("spawn.reason"),
+    "spawn.reason is the TUI-mode delta: present under the default profile, absent under tui-pool");
+  assert.ok(dflt.includes("config.allowedTools[]") && !variant.includes("config.allowedTools[]"),
+    "config.allowedTools[] is the skip-permissions delta: an array by default, a string under tui-pool");
 });
 
 // ── #359: request bodies must decode UTF-8 ACROSS chunk boundaries ──────────────────────────
@@ -3922,6 +4075,202 @@ ltTest("integration (#359): a prompt cut mid-character on the wire reaches the s
     assert.match(tooBig.text, /counts characters, not bytes/,
       "the 413 must still name its unit (#310) — the message is part of the contract");
   } finally { await ctl.close(); child.kill("SIGKILL"); _ltRmRetry(dir); }
+});
+
+// ── #360: a parsed body that is not an object must be ANSWERED, not walked into ──────────────
+//
+// `JSON.parse` verifies SYNTAX, not that the result is a non-null object. `JSON.parse("null")`
+// succeeds, and the four body-reading handlers then indexed the result — `parsed.messages`,
+// `Object.entries(updates)`, `parsed.name`, `k in quotaBody`. Each throws, and the throw escapes
+// an `async` request callback: Node never observes the promise a request handler returns, so
+// `unhandledRejection` logs the error and NOTHING answers or closes the socket.
+//
+// That failure mode is why every assertion below is on the CLOCK as well as the status. A test
+// that only checked for 4xx would pass against a handler that answers by luck and, worse, would
+// report the defect as a status mismatch when it is really silence — so `ltRawSend`'s `timedOut`
+// is asserted FIRST and with its own message. Removing any guard under test makes these fail on
+// the timeout arm, not the status arm; that is the recorded mutation result, not a prediction.
+//
+// The set of bodies is measured, not assumed. Before the fix, on this tree:
+//   POST /v1/chat/completions  null -> HUNG.  42 / "str" / true / [] -> HTTP 200 with a REAL
+//                              spawn each, i.e. a billed upstream call built from a body that
+//                              carried no messages. Both halves are covered below, and the spawn
+//                              counter is what makes the second half non-vacuous.
+//   PATCH /settings            null -> HUNG (its `typeof updates !== "object"` guard reads as
+//                              complete; `typeof null === "object"` defeats it). Everything else
+//                              already answered 400.
+//   POST /api/keys             null -> HUNG. Every other scalar answered 201 and CREATED A KEY.
+//   PATCH /api/keys/:id/quota  null / 42 / "str" / true -> ALL FOUR HUNG (`in` needs an object on
+//                              its right), where the issue reported one. `[]` answered 400.
+//
+// The two "unchanged" arms are deliberate scope, pinned by assertion so the narrowness cannot be
+// mistaken for an oversight and cannot silently widen later: POST /api/keys still answers 201 to a
+// non-null scalar, and the quota route still answers its own "Provide at least one of" message to
+// an array. Both are ANSWERED inputs today, so tightening them would change which requests a
+// grandfathered B.2 endpoint accepts — a contract change needing its own ADR, reported rather than
+// folded in here.
+const LT360_BUDGET = 15000;   // a hang is unbounded, so a generous budget costs no detection power
+
+// Every scalar body the issue names, plus the array forms. The literal IS the label, so there is no
+// second tuple element to carry one (review F6: the previous `[label, body]` shape had every label
+// discarded at the destructuring site, which is a claim the code was not using).
+const LT360_SCALARS = ["null", "42", '"a string"', "true", "[]"];
+
+// Review F1. The scalar guard closes the scalar door only. These are all OBJECTS — they pass the
+// shape guard — and every one of them still reached the `||` chain that manufactures
+// `[{role:"user",content:""}]` and pays for a real spawn. Measured before the F1 guard: each of
+// these returned 200 with spawns=1. `{"model":"haiku"}` is the one that matters: it is a far more
+// plausible accidental client body than `42`, and it is the reason fixing only the scalars left an
+// unbounded family of billed no-op requests rather than closing the door.
+const LT360_EMPTY_HANDED = ['{}', '{"messages":null}', '{"messages":0}', '{"model":"haiku"}', '{"prompt":""}'];
+
+// The control for F1's guard: these must STILL reach the model, so the guard is proven to be
+// narrow. A guard that 400s everything would pass every assertion above and break the product.
+const LT360_STILL_VALID = [
+  ['{"prompt":"probe-360-prompt"}', "the undocumented `prompt` fallback still works"],
+  ['{"messages":[{"role":"user","content":"probe-360-messages"}]}', "an ordinary request still works"],
+];
+
+// One probe. Asserts, in order: the server ANSWERED at all, the answer was 4xx, and it arrived
+// inside the budget. The first assertion is the one #360 is about.
+async function lt360Expect(port, { method, path, body, status, what, bodyRe = null }) {
+  const r = await ltRawSend(port, {
+    method, path, bytes: Buffer.from(body, "utf8"), timeoutMs: LT360_BUDGET,
+  });
+  assert.ok(!r.timedOut,
+    `${what} with body ${body}: NO RESPONSE within ${LT360_BUDGET}ms and the socket was never ` +
+    `closed. This is #360 itself — the handler threw, the throw escaped the async request ` +
+    `callback into unhandledRejection, and the client is left waiting on a connection the server ` +
+    `will never release. A status mismatch would be a different (lesser) bug.`);
+  assert.equal(r.status, status,
+    `${what} with body ${body}: expected ${status}, got ${r.status}: ${r.text.slice(0, 200)}`);
+  if (bodyRe) assert.match(r.text, bodyRe, `${what} with body ${body}: unexpected error body`);
+  return r;
+}
+
+ltTest("integration (#360, the money test): every scalar JSON body is answered within a bounded time, never left hanging", async () => {
+  if (!LT_POSIX) return;
+  const dir = ltMkdir(); const fake = ltFake(dir);
+  const counter = join(dir, "spawns.txt");
+  // SP_CAPTURE is set even though nothing reads it: LT_FAKE redirects to it unconditionally once it
+  // sees --system-prompt, which server.mjs passes on the default path (the negative local-tools
+  // wrapper), and an unset variable there is a redirection to an empty filename.
+  const { child, buf, port } = await ltBootFresh(
+    { CLAUDE_BIN: fake, SP_COUNTER: counter, SP_CAPTURE: join(dir, "sp.txt") }, dir);
+  try {
+    assert.ok(await ltWait(() => buf.out.includes("listening on") || buf.spawnErr, 20000) && !buf.spawnErr,
+      `did not start: ${buf.spawnErr ? buf.spawnErr.message : buf.err.slice(0, 300)}`);
+
+    // A real key, so the quota route exercises its body guard rather than 404-ing on the id.
+    const made = await ltRawSend(port, { path: "/api/keys", bytes: Buffer.from(JSON.stringify({ name: "lt-360" }), "utf8") });
+    assert.equal(made.status, 201, `could not create the key the quota route needs: ${made.status} ${made.text.slice(0, 200)}`);
+    const keyId = JSON.parse(made.text).id;
+    assert.ok(keyId, "created key has no id");
+
+    // The counter must mean "spawns caused by the scalar probes", so zero it AFTER the setup above
+    // (which spawns nothing) and read it only at the end.
+    _ltWrite(counter, "0");
+
+    // ── B.1: OpenAI's spec defines the body as an object with a required `messages`. Every scalar
+    // and array form is therefore a 400, and — the half that costs money — none may reach a spawn.
+    for (const body of LT360_SCALARS) {
+      await lt360Expect(port, {
+        method: "POST", path: "/v1/chat/completions", body, status: 400,
+        what: "POST /v1/chat/completions", bodyRe: /invalid_request_error/,
+      });
+    }
+
+    // ── B.1, review F1: an OBJECT body carrying no usable messages must not buy a spawn either.
+    // These pass the shape guard, so only the F1 guard can stop them. Class B.1: OpenAI's spec makes
+    // `messages` required, and ADR 0006's grandfather provision explicitly does not extend to B.1.
+    for (const body of LT360_EMPTY_HANDED) {
+      await lt360Expect(port, {
+        method: "POST", path: "/v1/chat/completions", body, status: 400,
+        what: "POST /v1/chat/completions (empty-handed object)", bodyRe: /'messages' is required/,
+      });
+    }
+
+    // ── B.2 /settings: `null` must land on the SAME 400 the other non-objects already got. Asserting
+    // the shared message is the point — a separate message would mean a new error body was invented.
+    for (const body of LT360_SCALARS) {
+      await lt360Expect(port, {
+        method: "PATCH", path: "/settings", body, status: 400,
+        what: "PATCH /settings", bodyRe: /Expected JSON object with key-value pairs/,
+      });
+    }
+
+    // ── B.2 /api/keys: `null` only. See the block comment — the other scalars are ANSWERED today.
+    await lt360Expect(port, {
+      method: "POST", path: "/api/keys", body: "null", status: 400,
+      what: "POST /api/keys", bodyRe: /Expected JSON object with key-value pairs/,
+    });
+
+    // ── B.2 quota: all four primitives hung before the fix, not just null. Arrays are excluded on
+    // purpose and asserted separately below (review F6: this list was a re-inlined duplicate of
+    // LT360_SCALARS with the array dropped; derive it instead so the two cannot drift).
+    for (const body of LT360_SCALARS.filter(b => b !== "[]")) {
+      await lt360Expect(port, {
+        method: "PATCH", path: `/api/keys/${keyId}/quota`, body, status: 400,
+        what: "PATCH /api/keys/:id/quota", bodyRe: /Expected JSON object with key-value pairs/,
+      });
+    }
+
+    // ── The money assertion for the SECOND failure mode. Before the fix each of `42`, `"a string"`,
+    // `true` and `[]` produced a real `claude` spawn from a body with no messages. A guard that
+    // returned 400 but still spawned would pass every assertion above and still bill the operator.
+    const spawns = Number(_ltRead(counter, "utf8").trim() || "0");
+    assert.equal(spawns, 0,
+      `no body carrying zero usable messages may reach the upstream: ${spawns} spawn(s) happened. ` +
+      `Before this PR every non-null scalar AND every empty-handed object ({}, {"messages":null}, ` +
+      `{"messages":0}, {"model":"haiku"}) became [{role:"user",content:""}] and was forwarded as a ` +
+      `real, billed call. Both families are probed above, so a non-zero count here names the ` +
+      `quota-burn defect and not merely a status regression.`);
+
+    // ── Deliberate scope, pinned. These are ANSWERED inputs today; changing them is a contract
+    // change on a grandfathered B.2 endpoint, so this PR must NOT have changed them.
+    const keyScalar = await ltRawSend(port, { path: "/api/keys", bytes: Buffer.from("42", "utf8"), timeoutMs: LT360_BUDGET });
+    assert.ok(!keyScalar.timedOut, "POST /api/keys with 42 must still answer");
+    assert.equal(keyScalar.status, 201,
+      `POST /api/keys with a non-null scalar answered 201 before this PR — it MINTS A REAL KEY from ` +
+      `a body it never validated, which is tracked as ISSUE #383 and is a defect, not a feature. ` +
+      `It is pinned here rather than fixed because tightening it is a request-shape change on a ` +
+      `grandfathered B.2 endpoint (ALIGNMENT.md:114) and needs its own ADR. If you are fixing #383, ` +
+      `this assertion is the one to change, in the same PR, with that ADR cited — ` +
+      `got ${keyScalar.status}: ${keyScalar.text.slice(0, 200)}`);
+
+    const quotaArr = await ltRawSend(port, { method: "PATCH", path: `/api/keys/${keyId}/quota`, bytes: Buffer.from("[]", "utf8"), timeoutMs: LT360_BUDGET });
+    assert.ok(!quotaArr.timedOut, "PATCH quota with [] must still answer");
+    assert.equal(quotaArr.status, 400, `quota [] expected 400, got ${quotaArr.status}`);
+    assert.match(quotaArr.text, /Provide at least one of/,
+      `an array body answered "Provide at least one of…" before this PR (typeof [] === "object", so ` +
+      `it reaches the loop). The new guard must not capture it and change that message: ${quotaArr.text.slice(0, 200)}`);
+
+    // ── The CONTROL for review F1's guard, and the reason it can be trusted to be narrow. A guard
+    // that rejected everything would satisfy every assertion above while breaking the product, so
+    // these must still reach the model and return 200. The `prompt` fallback is undocumented but it
+    // is existing behaviour, and F1 deliberately preserves it — only the empty-handed case is
+    // refused. Each is asserted to have SPAWNED, not merely to have returned 200, so a future
+    // change that answers 200 from cache without calling the model cannot pass this vacuously.
+    for (const [body, why] of LT360_STILL_VALID) {
+      _ltWrite(counter, "0");
+      const still = await ltRawSend(port, { path: "/v1/chat/completions", bytes: Buffer.from(body, "utf8"), timeoutMs: LT360_BUDGET });
+      assert.equal(still.status, 200,
+        `${why}: ${body} must still be served, got ${still.status}: ${still.text.slice(0, 200)}. ` +
+        `F1's guard must refuse only bodies with NO usable messages, not narrow the endpoint.`);
+      const n = Number(_ltRead(counter, "utf8").trim() || "0");
+      assert.equal(n, 1, `${why}: expected exactly one upstream spawn, got ${n}`);
+    }
+
+    // ── Not wedged, and nothing was logged as unhandled. The second half of #360 is that the
+    // process-level listener SWALLOWS these; if a guard is ever removed this is the other tell.
+    const ok = await ltRawSend(port, {
+      path: "/v1/chat/completions",
+      bytes: Buffer.from(JSON.stringify({ model: "haiku", messages: [{ role: "user", content: "probe-360" }] }), "utf8"),
+    });
+    assert.equal(ok.status, 200, `the server must still serve valid requests afterwards: ${ok.status} ${ok.text.slice(0, 200)}`);
+    assert.ok(!/"event":"unhandled_rejection"/.test(buf.err),
+      `no request in this test may produce an unhandled rejection; server stderr had: ${buf.err.slice(0, 400)}`);
+  } finally { child.kill("SIGKILL"); _ltRmRetry(dir); }
 });
 
 // ── #365: the CHILD's stdout/stderr must decode UTF-8 ACROSS chunk boundaries ───────────────

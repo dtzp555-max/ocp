@@ -2466,6 +2466,35 @@ function sanitizeError(msg) {
   return String(msg || "Internal error").replace(/\/[\w/.\-]+/g, "[path]");
 }
 
+// ── Parsed-body shape predicates (#360) ─────────────────────────────────
+// STATED POSITIVELY, as what the code downstream needs, rather than as "not a non-object".
+// That framing is the whole lesson of #360: the guard this replaced was
+// `typeof updates !== "object"`, which tests for the ABSENCE of the object tag — and
+// `typeof null === "object"`, so `null` is not absent from it. A negation of a property that is
+// nearly-but-not-quite the requirement reads as complete and is not. Both predicates below name
+// the capability the caller is about to use, so a reader checks them against the NEXT line
+// instead of against a mental list of JavaScript's type-tag exceptions.
+//
+// Two predicates, not one, because the four body handlers require different things and collapsing
+// them would silently widen two of them:
+//
+//   isJsonObject     — safe to enumerate as a name/value map: `Object.entries(v)`, or a read of a
+//                      named field that decides the request. Arrays are excluded: an array has no
+//                      meaningful named fields at these call sites.
+//   isLegalInOperand — the WEAKER one, and named for exactly what it certifies and nothing more:
+//                      `k in v` requires an object on its right-hand side, and an array satisfies
+//                      that. It does NOT claim the value is a sensible property bag — an array
+//                      passes. `PATCH /api/keys/:id/quota` uses it deliberately so an array body
+//                      keeps the answer it already gives instead of being captured by a wider
+//                      guard (see the comment there). Renamed from `isPropertyBag` in review: a
+//                      NAME IS A CLAIM, and that one claimed more than the call site needs.
+//
+// Neither is exported or reused beyond the four call sites; they exist so the null case is decided
+// ONCE rather than re-remembered at each site, which is how the fifth reader would otherwise
+// arrive carrying this bug again.
+const isJsonObject  = (v) => typeof v === "object" && v !== null && !Array.isArray(v);
+const isLegalInOperand = (v) => typeof v === "object" && v !== null;
+
 // ── Response helpers ────────────────────────────────────────────────────
 function jsonResponse(res, status, data, extraHeaders = null) {
   if (res.headersSent || res.writableEnded || res.destroyed) return;
@@ -3025,7 +3054,21 @@ async function handleSettings(req, res) {
   let updates;
   try { updates = JSON.parse(body); } catch { return jsonResponse(res, 400, { error: "Invalid JSON" }); }
 
-  if (typeof updates !== "object" || Array.isArray(updates)) {
+  // #360: this guard was `typeof updates !== "object" || Array.isArray(updates)` — it READ as
+  // complete and was not, because `typeof null === "object"` walked `null` straight past it into
+  // `Object.entries(null)`, which throws. The throw then escapes this `async` handler (Node does
+  // not observe the promise a request callback returns), so `unhandledRejection` logs it and
+  // NOTHING answers or closes the socket. Measured before the fix: PATCH /settings with body
+  // `null` held the connection open with zero bytes sent until the client gave up.
+  //
+  // `isJsonObject` states the requirement of the LINE BELOW — "safe to Object.entries" — instead
+  // of negating a type tag that happens to include null. Every other non-object (42, "str", true,
+  // []) already landed on this exact 400, so `null` now joins them with the SAME status and the
+  // SAME message: the rule that decides this response ("the body must be a JSON object") is
+  // unchanged and always meant this, and only the enforcement becomes truthful. Request shape,
+  // response shape and semantics all unchanged → ADR 0006 grandfather route (a), the same shape as
+  // the `stats.activeRequests` worked example in CLAUDE.md.
+  if (!isJsonObject(updates)) {
     return jsonResponse(res, 400, { error: "Expected JSON object with key-value pairs" });
   }
 
@@ -3136,6 +3179,60 @@ async function handleChatCompletions(req, res) {
 
   let parsed;
   try { parsed = JSON.parse(body); } catch { return jsonResponse(res, 400, { error: "Invalid JSON" }); }
+
+  // #360: JSON.parse verifies SYNTAX, not that the result is an object. `JSON.parse("null")`
+  // succeeds, and the two failure modes below are opposite and both wrong:
+  //
+  //   null  -> `parsed.messages` throws. The throw escapes this `async` handler (Node does not
+  //            observe the promise a request callback returns), `unhandledRejection` logs it, and
+  //            nothing answers or closes the socket. Measured before the fix: zero bytes, socket
+  //            still open, client hangs until it gives up.
+  //   42 / "str" / true / [] -> NO throw. Property access on a primitive boxes rather than
+  //            throwing, so all three lookups on the next line are `undefined`, the `||` chain
+  //            manufactures `[{ role: "user", content: "" }]`, and the request proceeds to a real,
+  //            BILLED upstream spawn that returns 200. Measured: one `claude` spawn per request.
+  //            That is the worse half — a nonsense body answered too successfully rather than not
+  //            at all.
+  //
+  // Class B.1. The authority is OpenAI's `/v1/chat/completions` specification, which defines the
+  // request body as an object with a REQUIRED `messages` array
+  // (https://platform.openai.com/docs/api-reference/chat/create), authorized by ADR 0006. A scalar
+  // or array body carries no `messages`, so 400 is the specified answer and the 200 was not. This
+  // is also what OCP already does for the semantically identical `{"messages": 42}` — the guard
+  // further down returns exactly this shape. Error shape is byte-identical to that existing guard,
+  // deliberately: no new error body is invented here.
+  if (!isJsonObject(parsed)) {
+    return jsonResponse(res, 400, { error: { message: "Request body must be a JSON object", type: "invalid_request_error" } });
+  }
+
+  // #360 review F1: the guard above closes the SCALAR door, not the door. An earlier version of
+  // this comment claimed it closed "the one door through which a body with no `messages` reached
+  // the model"; that was false, and measured false — `{}`, `{"messages":null}`, `{"messages":0}`
+  // and `{"model":"haiku"}` are all objects, all pass the shape guard, and all still reached the
+  // `||` chain below, which manufactures `[{ role: "user", content: "" }]` and pays for a real
+  // BILLED spawn. `{"model":"haiku"}` is a far more plausible accidental client body than `42`, so
+  // fixing only the scalars removed six bodies and left an unbounded family of them.
+  //
+  // The condition is the one the `||` chain actually turns on: if none of the three sources yields
+  // anything truthy, the only thing left to send upstream is an empty prompt, and an empty prompt is
+  // never a request worth spending quota on. Falsy rather than `=== undefined` on purpose — `null`
+  // and `0` are exactly the values measured above, and they reach the fallback identically.
+  //
+  // Deliberately NOT a wider check. `{"messages":[]}` and `{"messages":42}` stay on the existing
+  // `'messages' must be a non-empty array` guard further down (arrays and numbers are truthy, so
+  // they pass this one untouched) — their answers are unchanged, status and message both.
+  //
+  // Class B.1, and the grandfather route is unavailable here by construction: ADR 0006's
+  // grandfather provision, 4th bullet — "It does **not** extend to B.1 (OpenAI-compat) endpoints.
+  // B.1 endpoints are bounded by OpenAI's published specification, not by a behaviour snapshot —
+  // there is no grandfather equivalent for them." OpenAI's spec makes `messages` REQUIRED
+  // (https://platform.openai.com/docs/api-reference/chat/create), which covers `{}` exactly as it
+  // covers `42`. The `input`/`prompt` fallback is undocumented in both README.md and ADR 0006, so
+  // no documented OCP behaviour is being changed either — but it is PRESERVED here regardless: a
+  // real `prompt` or `input` still works, and only the empty-handed case is refused.
+  if (!parsed.messages && !parsed.input && !parsed.prompt) {
+    return jsonResponse(res, 400, { error: { message: "'messages' is required", type: "invalid_request_error" } });
+  }
 
   const messages = parsed.messages || parsed.input || [{ role: "user", content: parsed.prompt || "" }];
   const model = parsed.model || modelsConfig.aliases.sonnet;
@@ -3756,6 +3853,33 @@ const server = createServer(async (req, res) => {
     }
     let parsed;
     try { parsed = JSON.parse(body); } catch { return jsonResponse(res, 400, { error: "Invalid JSON" }); }
+    // #360: `null` ONLY, and the narrowness is the point. `JSON.parse("null")` succeeds, then
+    // `parsed.name` throws, the throw escapes this `async` handler unobserved by Node, and the
+    // socket is never answered or closed — measured before the fix.
+    //
+    // Deliberately NOT `isJsonObject`/`isLegalInOperand`. This is an equality test against the exact
+    // value that was OBSERVED to break, which is the strongest form available here: it asserts a
+    // specific thing is present rather than that a category is absent, so there is no type-tag
+    // edge for it to be wrong about. A predicate would be the weaker choice at this site, because
+    // every predicate wide enough to be worth naming also captures inputs this PR must not change.
+    //
+    // Those inputs, measured on this tree: `42`, `"str"`, `true`, `[]` all return 201 and CREATE A
+    // KEY, because property access on a primitive boxes instead of throwing, so `parsed.name` is
+    // `undefined` and the `||` falls to the auto-name — behaviourally identical to the documented
+    // `{}` request. Minting a credential from an unvalidated body is a defect in its own right and
+    // is tracked as ISSUE #383, which also records why it is not fixed here: it is ANSWERED, so it
+    // is part of this grandfathered endpoint's v3.16.4 behaviour snapshot, and tightening it
+    // changes WHICH REQUESTS ARE ACCEPTED — a request-shape change that ALIGNMENT.md:114 makes a
+    // new authorization request needing its own ADR. Contrast the chat route above, where the same
+    // underlying bug IS fixed because B.1 has no grandfather (ADR 0006, grandfather provision,
+    // 4th bullet) and OpenAI's spec compels the 400. Same bug, two authorities, two answers.
+    //
+    // Authorized by ADR 0006 (grandfathered as of v3.16.4): only the input that received NO
+    // response changes behaviour, and it joins the `{ error: "<string>" }` shape this handler
+    // already returns for a malformed body.
+    if (parsed === null) {
+      return jsonResponse(res, 400, { error: "Expected JSON object with key-value pairs" });
+    }
     const name = parsed.name || `key-${Date.now()}`;
     if (!/^[A-Za-z0-9 ._-]{1,64}$/.test(name)) {
       return jsonResponse(res, 400, { error: { message: "Invalid key name: 1-64 chars of letters, digits, space, dot, underscore, hyphen", type: "invalid_request_error" } });
@@ -3793,6 +3917,21 @@ const server = createServer(async (req, res) => {
     }
     let quotaBody;
     try { quotaBody = JSON.parse(body); } catch { return jsonResponse(res, 400, { error: "Invalid JSON" }); }
+    // #360: `k in quotaBody` throws on EVERY non-object, not just on `null` — the `in` operator
+    // requires an object on its right-hand side. Measured before the fix: `null`, `42`, `"str"`
+    // and `true` each left the socket unanswered and open (four hangs on this route, where the
+    // issue reported one), the throw escaping this `async` handler into `unhandledRejection`.
+    //
+    // Arrays are NOT caught here, deliberately: `typeof [] === "object"`, so `[]` and `[1,2]`
+    // reach the loop below and already answer 400 "Provide at least one of: daily, weekly,
+    // monthly" (measured). Adding `Array.isArray` would change that answered input's message for
+    // no defect. The rule is that only inputs which today receive NO response change behaviour.
+    // Authorized by ADR 0006 (grandfathered as of v3.16.4); contract unchanged — request shape,
+    // response shape and semantics all as documented, and the `{ error: "<string>" }` shape is the
+    // one this handler already uses for its other rejections.
+    if (!isLegalInOperand(quotaBody)) {
+      return jsonResponse(res, 400, { error: "Expected JSON object with key-value pairs" });
+    }
     // Validate quota values: must be positive integers or null
     const quotaFields = {};
     for (const k of ["daily", "weekly", "monthly"]) {
