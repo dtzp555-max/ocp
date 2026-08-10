@@ -5766,6 +5766,456 @@ test("#274: rollback post-flight is skipped-mock under plain mockExec with no in
   assert.equal(pf.status, "skipped-mock");
 });
 
+// ── #352: runRollback's restart phase must retry, restore, and reach its OWN post-flight ───────
+//
+// The same defect #347 fixed in runFullUpgrade, one function further down the same file, on the
+// path you reach BECAUSE the forward one failed: `for (const c of restartPlan.plan.cmds)
+// exec(c.cmd, c.label)` with an `exec` that THROWS. Three consequences, each covered below:
+// a transient bootstrap EIO got one attempt instead of three; nothing attempted restoration; and
+// the throw jumped past runRollback's own `runPostFlightCheck` call — the #274 measurement that
+// exists so a rollback cannot report on the service without probing it — making it unreachable in
+// exactly the case it was written for.
+//
+// WHY THESE TESTS CANNOT TOUCH A REAL SERVICE — AGENTS.md § "unreachable by construction",
+// discharged rather than asserted, and inherited verbatim from #347's harness:
+//   - `opts.execFn` is a plain JavaScript function, covering `npm install` and every restart
+//     command. No `launchctl`/`systemctl` RESTART string is ever handed to a shell, a child
+//     process, or an exec* call — there is no shell in that call path to intercept, which is
+//     strictly stronger than a stub that fails loudly.
+//   - `mockExec: true` holds the three lanes `execFn` does NOT cover, enumerated rather than waved
+//     at: the argv-form `git checkout` (gated on plain `opts.mockExec`), the `tryCopy` block that
+//     would write a real `~/Library/LaunchAgents/dev.ocp.proxy.plist` / `~/.config/systemd/user/
+//     ocp-proxy.service` / `~/.ocp/ocp.db` / `~/.ocp/admin-key`, and the MED-E `systemctl --user
+//     daemon-reload` (gated on `opts.mockExec && !opts.run`, and no test here passes `opts.run`).
+//     It also skips the 3s pre-restart sleep. `_u352Opts` pins `mockExec: true` AFTER the caller's
+//     spread precisely so this cannot be turned off by a future test passing `mockExec: false`
+//     alongside an `execFn` — that combination would re-enable all three at once, including a
+//     `tryCopy` that overwrites the developer's own live plist from `/tmp/snap-x`. Unreachable by
+//     construction, not by convention (AGENTS.md, and #217's own incident).
+//   - `opts.mockProbe` replaces the post-flight curl the same way, so no network probe runs.
+//   - `mockSnapshots`/`mockSnapshotMeta` keep `listSnapshots`/`readSnapshot` off the real
+//     `~/.ocp/upgrade-snapshot-*` entirely.
+console.log("\n#352 — rollback's restart phase (retry / restore / reach the #274 post-flight):");
+
+// Shared opts for the rollback lane. Backoff and settle delays are zeroed: the retry COUNT, not the
+// wall time, is under test. `_u347Runner` (defined with the #347 block above) is reused rather than
+// cloned — the two paths must fail the same way for the comparison to mean anything.
+function _u352Opts(extra = {}) {
+  return {
+    rollback: true, yes: true, mockPlatform: "darwin",
+    restartBackoffMs: 0, restartRestoreDelayMs: 0,
+    postFlightAttempts: 1, postFlightIntervalMs: 0,
+    mockSnapshots: [{ name: "upgrade-snapshot-2026-05-11T08:30:00Z", path: "/tmp/snap-x" }],
+    mockSnapshotMeta: { fromCommit: "abc1234", fromVersion: "v3.10.0", toVersion: "v3.14.0", path: "/tmp/snap-x" },
+    ...extra,
+    // AFTER the spread, deliberately, and this is the whole point: `mockExec` is what holds the
+    // three lanes `execFn` does not cover (argv `git checkout`, the `tryCopy` file restore, the
+    // MED-E `systemctl --user daemon-reload`). Spread last, a future test writing
+    // `_u352Opts({ execFn: run, mockExec: false })` would re-enable all three against the
+    // developer's real `$HOME` while looking entirely reasonable. Pinned here so that option does
+    // not exist, rather than documented as a rule someone has to remember.
+    mockExec: true,
+  };
+}
+// The snapshot's fromVersion — what a correct rollback must end up serving.
+const _u352Restored = () => ({ status: "ok", auth: { ok: true }, version: "3.10.0" });
+const _u352Unreachable = () => {
+  throw Object.assign(new Error("curl: (7) Failed to connect to 127.0.0.1"), { status: 7 });
+};
+const _u352NoCurl = () => {
+  throw Object.assign(new Error("sh: curl: command not found"), { status: 127 });
+};
+
+test("#352 (the money test): a rollback restart command that fails TWICE then succeeds is retried, and the rollback succeeds with no manual intervention", async () => {
+  const run = _u347Runner({ "launchctl bootstrap": 2 });
+  const result = await runUpgrade(_u352Opts({ execFn: run, mockProbe: _u352Restored }));
+
+  // Harness premise, asserted not assumed: the incident shape needs a plan with a SEPARATE
+  // tear-down and set-up command, or "the bootout already ran" is not a real state and this test
+  // measures nothing.
+  assert.equal(run.count("launchctl bootout"), 1,
+    `harness premise: the darwin rollback plan must emit exactly one bootout; got calls=${JSON.stringify(run.calls)}`);
+
+  assert.equal(run.count("launchctl bootstrap"), 3,
+    `expected 3 attempts (two transient failures, then success) — 1 means the retry is gone, which ` +
+    `is the mutation this test exists to catch; got calls=${JSON.stringify(run.calls)}`);
+  assert.equal(result.path, "rollback");
+  assert.equal(result.phases.find(p => p.name === "post-flight").status, "ok");
+  assert.ok(!result.phases.some(p => p.name === "restart-restore"),
+    "a transient failure that recovered inside the retry budget needs no restoration pass");
+});
+
+test("#352: a rollback restart command that fails ALWAYS still REACHES the #274 post-flight — the throw used to make it unreachable", async () => {
+  // The issue's second bullet, and the one that distinguishes this from a pure retry fix. Before
+  // #352 the `exec` throw left runRollback with no post-flight phase at all on this input, so
+  // nothing measured whether the service came back. Assert the phase EXISTS and carries a verdict.
+  const run = _u347Runner({ "launchctl bootstrap": Infinity });
+  let caught = null;
+  try { await runUpgrade(_u352Opts({ execFn: run, mockProbe: _u352Unreachable })); }
+  catch (e) { caught = e; }
+
+  assert.ok(caught, "an unrecoverable restart with a dead /health must not return success");
+  const pf = caught.phases.find(p => p.name === "post-flight");
+  assert.ok(pf, `the #274 post-flight must run even after a failed restart command; ` +
+    `got phases=${JSON.stringify(caught.phases.map(p => `${p.name}:${p.status}`))}`);
+  assert.equal(pf.status, "fail", `and must report what it actually measured; got ${JSON.stringify(pf)}`);
+});
+
+test("#352: a rollback restart that fails ALWAYS reports the SERVICE as down, attempts restoration, and does NOT send the operator back into --rollback", async () => {
+  const run = _u347Runner({ "launchctl bootstrap": Infinity });
+  let caught = null;
+  try { await runUpgrade(_u352Opts({ execFn: run, mockProbe: _u352Unreachable })); }
+  catch (e) { caught = e; }
+  assert.ok(caught);
+
+  // Retried to the budget, then restoration attempted — 3 + 1 invocations.
+  assert.equal(run.count("launchctl bootstrap"), 4,
+    `expected 3 retry attempts + 1 restoration attempt; got calls=${JSON.stringify(run.calls)}`);
+  const restore = caught.phases.filter(p => p.name === "restart-restore");
+  assert.ok(restore.length >= 1 && restore.some(p => p.cmd.includes("launchctl bootstrap")),
+    `the restoration attempt must be recorded as its own phase; ` +
+    `got phases=${JSON.stringify(caught.phases.map(p => `${p.name}:${p.status}`))}`);
+
+  assert.ok(caught.hint && caught.hint.startsWith("THE PROXY IS DOWN"),
+    `the hint must LEAD with service state — the pre-#352 message was "rollback phase restart ` +
+    `failed", a statement about a command; got hint=${JSON.stringify(caught.hint)}`);
+  assert.ok(caught.hint.includes("launchctl bootstrap"),
+    `and must name the command that brings it back; got hint=${JSON.stringify(caught.hint)}`);
+  // The wording that is NOT inherited from runFullUpgrade: its hint ends by pointing at
+  // `ocp update --rollback`, which on this path is the command already running.
+  assert.ok(!/Run `ocp update --rollback`/.test(caught.hint),
+    `the recovery path must not recommend itself; got hint=${JSON.stringify(caught.hint)}`);
+  assert.ok(/ALREADY rolled back/.test(caught.hint),
+    `it must say the tree half already succeeded, so only the service is outstanding; ` +
+    `got hint=${JSON.stringify(caught.hint)}`);
+});
+
+test("#352: the rollback restoration pass re-runs the WHOLE plan, in plan order, not just the command that failed", async () => {
+  // #347's F2 finding applied here: `.slice(restartFailure.index)` would re-run `bootstrap` alone
+  // while the hint prescribes `bootout && bootstrap`, making the restore weaker than the recovery
+  // it recommends.
+  const run = _u347Runner({ "launchctl bootstrap": Infinity });
+  let caught = null;
+  try { await runUpgrade(_u352Opts({ execFn: run, mockProbe: _u352Unreachable })); }
+  catch (e) { caught = e; }
+  assert.ok(caught);
+
+  const restore = caught.phases.filter(p => p.name === "restart-restore").map(p => p.cmd);
+  assert.equal(restore.length, 2,
+    `the restore must re-run the full tear-down + set-up pair; got ${JSON.stringify(restore)}`);
+  assert.ok(restore[0].includes("launchctl bootout") && restore[1].includes("launchctl bootstrap"),
+    `and in plan order (bootout then bootstrap); got ${JSON.stringify(restore)}`);
+  assert.equal(run.count("launchctl bootout"), 2,
+    `expected the tear-down to run in both passes; got calls=${JSON.stringify(run.calls)}`);
+});
+
+test("#352: the retry is scoped to the restart commands — a failing `npm install` still fails FAST, on the first attempt", async () => {
+  // Fails exactly ONCE, then would succeed. Had the retry been applied to `exec` generally instead
+  // of to the restart commands, this rollback would silently SUCCEED on attempt 2 — so the fixture
+  // distinguishes "not retried" from "retried and still failed", which a fail-always one could not.
+  const run = _u347Runner({ "npm --prefix": 1 });
+  let caught = null;
+  try { await runUpgrade(_u352Opts({ execFn: run, mockProbe: _u352Restored })); }
+  catch (e) { caught = e; }
+
+  assert.ok(caught, "a failing npm install must abort the rollback, not be retried into success");
+  assert.equal(run.count("npm --prefix"), 1,
+    `npm install must be attempted exactly once; got calls=${JSON.stringify(run.calls)}`);
+  assert.match(caught.message, /rollback phase npm-install failed/);
+  assert.equal(run.count("launchctl"), 0,
+    "and a failed install must never reach the restart phase at all");
+  assert.equal(caught.hint, undefined,
+    `a non-restart failure keeps the pre-#352 shape — this proves #352 did not simply attach a ` +
+    `service-state hint to every rollback failure; got hint=${JSON.stringify(caught.hint)}`);
+});
+
+test("#352 (precedence): a LOCAL probe fault on the rollback path must stay UNKNOWN and never be reported as the proxy being DOWN", async () => {
+  // The dangerous interaction inherited from #299/#325/#347: the DOWN branch keys on "probe not
+  // ok", and a machine that cannot RUN curl also produces "probe not ok". Ordering decides whether
+  // a broken local curl is told its proxy is dead — a state nobody measured.
+  const run = _u347Runner({ "launchctl bootstrap": Infinity });
+  let caught = null;
+  try { await runUpgrade(_u352Opts({ execFn: run, mockProbe: _u352NoCurl })); }
+  catch (e) { caught = e; }
+
+  assert.ok(caught);
+  assert.ok(!/THE PROXY IS DOWN/.test(caught.hint),
+    `a local fault is not evidence about the proxy; got hint=${JSON.stringify(caught.hint)}`);
+  assert.ok(/UNKNOWN/.test(caught.hint), `it must still say UNKNOWN; got hint=${JSON.stringify(caught.hint)}`);
+  assert.ok(/may be DOWN/.test(caught.hint) && /launchctl bootstrap/.test(caught.hint),
+    `and must still offer the start command, because the stop half already ran; got hint=${JSON.stringify(caught.hint)}`);
+});
+
+test("#352: restart commands OK but the probe could not RUN must not headline `the restored tree may not be what's running`", async () => {
+  // #347's F1 cell restated for this path. Every restart command exited 0 and curl is missing — a
+  // local environment fault. The pre-#352 message asserted something about the restored tree, which
+  // on the recovery path invites re-running the rollback or reinstalling on no evidence at all.
+  const run = _u347Runner({});           // every restart command succeeds
+  let caught = null;
+  try { await runUpgrade(_u352Opts({ execFn: run, mockProbe: _u352NoCurl })); }
+  catch (e) { caught = e; }
+
+  assert.ok(caught, "an unverifiable post-flight is still not a success");
+  assert.equal(run.count("launchctl bootstrap"), 1, "premise: the restart itself was clean, one attempt");
+  assert.ok(!/restored tree may not be what's running/.test(caught.message),
+    `a local probe fault must not be phrased as a claim about the tree; got message=${JSON.stringify(caught.message)}`);
+  assert.ok(caught.hint && caught.hint.startsWith("THE ROLLBACK MAY HAVE SUCCEEDED"),
+    `it must lead with what is actually known; got hint=${JSON.stringify(caught.hint)}`);
+  assert.ok(/do NOT re-run it/.test(caught.hint) && /local environment fault/.test(caught.hint),
+    `and must say why re-running is wrong here; got hint=${JSON.stringify(caught.hint)}`);
+  assert.ok(caught.hint.includes("scripts/upgrade.mjs --post-flight-only"),
+    `and must name an invocation that actually accepts the flag (#347 G1); got hint=${JSON.stringify(caught.hint)}`);
+});
+
+test("#352 control: a probe that genuinely RAN and said no keeps the pre-#352 `rollback post-flight failed` verdict", async () => {
+  // Proves the arm above is scoped to the could-not-RUN classification and did not rewrite the
+  // verdict for every post-flight failure. Here curl runs fine and a stale process answers with the
+  // version rollback was trying to LEAVE — a real statement about the service, for which #274's
+  // original message is correct and must survive untouched.
+  const run = _u347Runner({});
+  let caught = null;
+  try {
+    await runUpgrade(_u352Opts({
+      execFn: run,
+      mockProbe: () => ({ status: "ok", auth: { ok: true }, version: "3.14.0" }),
+    }));
+  } catch (e) { caught = e; }
+
+  assert.ok(caught);
+  assert.match(caught.message, /rollback post-flight failed: restored tree may not be what's running/);
+  assert.equal(caught.hint, undefined,
+    `the #274 cell gains no service-state hint; got hint=${JSON.stringify(caught.hint)}`);
+});
+
+test("#352: a rollback restart command that failed but a proxy that IS serving the restored version is a WARNED success, not a failure", async () => {
+  // Mirrors ocp:1092 and runFullUpgrade's fourth cell. The verdict belongs to the probe, not to a
+  // subcommand's exit status — the service manager may have started it anyway. Not a silent success
+  // either: a bare "✓" trains operators to ignore the retry warnings that are the early signal for
+  // the DOWN cell.
+  const run = _u347Runner({ "launchctl bootstrap": Infinity });
+  const result = await runUpgrade(_u352Opts({ execFn: run, mockProbe: _u352Restored }));
+
+  assert.equal(result.path, "rollback", "post-flight confirms the restored version is serving");
+  const warn = result.phases.find(p => p.name === "restart" && p.status === "warn");
+  assert.ok(warn, `it must not be a silent success; got phases=${JSON.stringify(result.phases.map(p => `${p.name}:${p.status}`))}`);
+  assert.match(warn.note, /ocp doctor/);
+});
+
+test("#352: the systemd recovery hint works on the ROLLBACK-ONLY plan shape (allowNotListeningFallback), which is where the ` restart -- ` rewrite had never been exercised", async () => {
+  // `recoveryPlanCommands` derives `reset-failed` by rewriting ` restart -- ` inside the plan's own
+  // command. #347 verified that against the four planRestart returns the FORWARD path can reach.
+  // This path can reach a fifth: restart-unit.mjs:993, the `allowNotListeningFallback` branch that
+  // exists only for rollback (`allowNotListeningFallback: isRollback`) and is the branch a
+  // down-service rollback actually takes. Absence of the substring there would silently degrade the
+  // hint to a plain restart that keeps failing against a latched start limit — so it is verified
+  // behaviourally, end to end, rather than read off the source.
+  const run = _u347Runner({ "systemctl": Infinity });
+  let caught = null;
+  try {
+    await runUpgrade(_u352Opts({
+      mockPlatform: "linux", execFn: run, mockProbe: _u352Unreachable,
+      mockOwnerProbe: { ssOutput: "" },   // ran cleanly, nothing listening — the down-service rollback case
+    }));
+  } catch (e) { caught = e; }
+  assert.ok(caught);
+
+  // Premise: this really is the rollback-only fallback branch, not one of the shapes #347 covered.
+  assert.ok(caught.phases.some(p => p.name === "restart-resolve" && p.note && p.note.includes("nothing was listening")),
+    `harness premise: the test must be exercising the allowNotListeningFallback branch; ` +
+    `got phases=${JSON.stringify(caught.phases.map(p => `${p.name}:${p.status}`))}`);
+  assert.equal(run.count("systemctl --user restart -- ocp-proxy.service"), 4,
+    `premise: 3 retries + 1 restoration is what creates the start-limit exposure; got calls=${JSON.stringify(run.calls)}`);
+
+  assert.ok(caught.hint.includes("systemctl --user reset-failed -- ocp-proxy.service"),
+    `the hint must unwedge a tripped start limit, inheriting the plan's own --user scope and unit; ` +
+    `got hint=${JSON.stringify(caught.hint)}`);
+  // Assert BOTH anchors by index before slicing. AGENTS.md's anchor-drift trap with the sign
+  // inverted (#347 G2): a missing end marker makes `indexOf` return -1 and `slice(start, -1)` yield
+  // a LONGER slice, which passes any "length > N" guard written for the documented empty-slice form.
+  const chainStart = caught.hint.indexOf("systemctl --user reset-failed");
+  const chainEnd = caught.hint.indexOf("The working tree is ALREADY rolled back");
+  assert.ok(chainStart > -1 && chainEnd > chainStart,
+    `harness premise: both slice anchors must be found and ordered — a missing one makes the slice ` +
+    `longer, not empty; start=${chainStart} end=${chainEnd} hint=${JSON.stringify(caught.hint)}`);
+  const chain = caught.hint.slice(chainStart, chainEnd);
+  assert.ok(/reset-failed -- ocp-proxy\.service \|\| true/.test(chain),
+    `reset-failed must be best-effort, or it suppresses the restart behind it in the " && " chain; got ${JSON.stringify(chain)}`);
+  assert.ok(chain.indexOf("|| true") < chain.indexOf("systemctl --user restart"),
+    `the guard must sit between reset-failed and the restart; got ${JSON.stringify(chain)}`);
+});
+
+test("#352 MED-3: on a user unit the EXECUTED restoration pass clears the start limit first — the printed repair and the attempted one are the same commands", async () => {
+  // Review finding MED-3. The first cut ran the plan's raw commands here, which by this PR's own
+  // arithmetic (recoveryPlanCommands' comment: 3 retries + this pass + systemd's own
+  // Restart=always restarts inside one 10s window) makes the restoration pass the FOURTH
+  // `systemctl restart` — i.e. the one expected to hit the latched start limit and no-op. The
+  // repair would then have existed only in the printed hint. Scoped to `user-unit`, which planRestart
+  // never emits with `sudo`; `system-unit` stays excluded (see the next test).
+  const run = _u347Runner({ "systemctl --user restart": Infinity });
+  let caught = null;
+  try {
+    await runUpgrade(_u352Opts({
+      mockPlatform: "linux", execFn: run, mockProbe: _u352Unreachable,
+      mockOwnerProbe: { ssOutput: "" },
+    }));
+  } catch (e) { caught = e; }
+  assert.ok(caught);
+
+  const restore = caught.phases.filter(p => p.name === "restart-restore").map(p => p.cmd);
+  assert.deepEqual(restore,
+    ["systemctl --user reset-failed -- ocp-proxy.service || true", "systemctl --user restart -- ocp-proxy.service"],
+    `the executed pass must clear the latch before retrying the restart; got ${JSON.stringify(restore)}`);
+  assert.ok(run.calls.some(c => c.includes("reset-failed")),
+    `and it must actually be RUN, not merely recorded; got calls=${JSON.stringify(run.calls)}`);
+  // The executed pass and the printed hint must be the same list — that is the property the
+  // divergence buys, and the reason `recoveryPlanCommands` is called rather than re-derived. A
+  // future edit to either side that does not touch the other turns this red.
+  assert.ok(caught.hint.includes(restore.join(" && ")),
+    `the hint must prescribe exactly what was attempted; got hint=${JSON.stringify(caught.hint)}`);
+});
+
+test("#352 MED-3 (G2, in the EXECUTED lane): a reset-failed that exits non-zero must not suppress the restart behind it", async () => {
+  // #347's finding G2 was about the HINT: joined with " && ", a failing reset-failed short-circuits
+  // the restart, so the un-wedge step prevents the recovery. Executing that list brings the same
+  // failure mode into the executor, where the `|| true` suffix protects only because `execSync`
+  // happens to route through `/bin/sh` — a shell dependency, not a property of the pass.
+  //
+  // This fixture makes reset-failed fail with NO shell anywhere in the call path (`_u347Runner` is
+  // a plain function, so `|| true` is inert text), which is precisely the condition the suffix
+  // cannot cover. The restart behind it must still be attempted. Found by the suite, not by
+  // reasoning: the first cut of this fix broke on exactly this input.
+  const run = _u347Runner({ "systemctl": Infinity });   // matches reset-failed AND restart
+  let caught = null;
+  try {
+    await runUpgrade(_u352Opts({
+      mockPlatform: "linux", execFn: run, mockProbe: _u352Unreachable,
+      mockOwnerProbe: { ssOutput: "" },
+    }));
+  } catch (e) { caught = e; }
+  assert.ok(caught);
+
+  const resetCalls = run.calls.filter(c => c.includes("reset-failed"));
+  assert.equal(resetCalls.length, 1, `harness premise: reset-failed must have been attempted; got calls=${JSON.stringify(run.calls)}`);
+  assert.equal(run.count("systemctl --user restart -- ocp-proxy.service"), 4,
+    `3 retries + the restoration restart — a failing reset-failed must not eat the 4th; got calls=${JSON.stringify(run.calls)}`);
+  const resetPhase = caught.phases.find(p => p.name === "restart-restore" && p.cmd.includes("reset-failed"));
+  assert.ok(resetPhase && resetPhase.status === "warn",
+    `a failed best-effort step is a WARNING, not a restore failure; got ${JSON.stringify(resetPhase)}`);
+});
+
+test("#352 MED-3 boundary: no command this function EXECUTES may ever carry `sudo`, on any reachable plan shape", async () => {
+  // The half of MED-3 that is a safety property rather than an improvement. `recoveryPlanCommands`'s
+  // `system-unit` shape emits `sudo systemctl reset-failed -- <unit>` — a DIFFERENT sudo command
+  // from the `sudo systemctl restart -- <unit>` planRestart verified with `sudo -n -l`, so a
+  // sudoers rule authorizing only the latter leaves this one prompting for a password: a hang, in a
+  // recovery path. Excluding `system-unit` from the executed pass makes that unreachable by
+  // construction (planRestart emits no sudo on `user-unit`) rather than by relying on
+  // resolveRestartPlan's own system-unit refusal, which lives in another function and has been
+  // revised three times.
+  //
+  // Driven across BOTH shapes rollback can actually reach, since a single-shape assertion would not
+  // establish "on any reachable plan shape".
+  for (const [label, extra] of [
+    ["launchd", { mockPlatform: "darwin" }],
+    ["user-unit", { mockPlatform: "linux", mockOwnerProbe: { ssOutput: "" } }],
+  ]) {
+    const run = _u347Runner({ "launchctl bootstrap": Infinity, "systemctl --user restart": Infinity });
+    try {
+      await runUpgrade(_u352Opts({ ...extra, execFn: run, mockProbe: _u352Unreachable }));
+    } catch { /* the failure is the point; the calls are what is under test */ }
+    assert.ok(run.calls.length > 0, `harness premise (${label}): some command must have been executed`);
+    assert.equal(run.calls.filter(c => /\bsudo\b/.test(c)).length, 0,
+      `no executed command may carry sudo on the ${label} shape; got calls=${JSON.stringify(run.calls)}`);
+  }
+});
+
+test("#352 MED-1: a restart failure with something ANSWERING on the port must not be reported as the proxy being DOWN", async () => {
+  // Review finding MED-1, and the most likely non-fatal rollback outcome there is: the pre-rollback
+  // process survived and still holds the port, so /health answers — with the version rollback was
+  // trying to LEAVE. `postFlight.ok === false` covers that state as readily as an unreachable one,
+  // so keying the DOWN cell on `!postFlight.ok` alone printed "THE PROXY IS DOWN … /health is not
+  // answering" about a service that had just answered, in the same throw whose post-flight phase
+  // said `last saw version=3.14.0`. `ocp`'s own cmd_restart keys its DOWN cell on the curl exit
+  // code, not on a version predicate — so this is the faithful port, not an embellishment.
+  const run = _u347Runner({ "launchctl bootstrap": Infinity });
+  let caught = null;
+  try {
+    await runUpgrade(_u352Opts({
+      execFn: run,
+      mockProbe: () => ({ status: "ok", auth: { ok: true }, version: "3.14.0" }),
+    }));
+  } catch (e) { caught = e; }
+
+  assert.ok(caught, "a restart failure plus the wrong version serving is still not a success");
+  // Premise: this really is the restart-failed-AND-probe-answered state, not one of the neighbours.
+  assert.equal(run.count("launchctl bootstrap"), 4, `premise: the restart really did exhaust its budget; got calls=${JSON.stringify(run.calls)}`);
+  const pf = caught.phases.find(p => p.name === "post-flight");
+  assert.ok(pf && /last saw version=3\.14\.0/.test(pf.message || ""),
+    `premise: the probe really did read a body; got ${JSON.stringify(pf)}`);
+
+  assert.ok(!/THE PROXY IS DOWN/.test(caught.hint),
+    `a service that answered is not down; got hint=${JSON.stringify(caught.hint)}`);
+  assert.ok(!/is not answering/.test(caught.hint),
+    `and the hint must not deny the measurement its own phase recorded; got hint=${JSON.stringify(caught.hint)}`);
+  assert.ok(caught.hint.startsWith("THE PROXY IS UP BUT SERVING THE WRONG VERSION"),
+    `it must say what was actually observed; got hint=${JSON.stringify(caught.hint)}`);
+  assert.ok(caught.hint.includes("3.14.0") && caught.hint.includes("3.10.0"),
+    `naming both the version seen and the one expected; got hint=${JSON.stringify(caught.hint)}`);
+  assert.match(caught.message, /rollback post-flight failed: restored tree may not be what's running/,
+    `and #274's verdict is the right one for this state, so it must survive; got message=${JSON.stringify(caught.message)}`);
+});
+
+test("#352 LOW-4: a restart failure with NO post-flight measurement must report the service state as UNKNOWN, never as success", async () => {
+  // The `!postFlightMeasured` arm. Reachable only from a test that injects execFn without a probe
+  // (in production mockExec is false, so the post-flight always measures) — which is exactly why it
+  // needs a test: nothing else can reach it, and an untested throw is one refactor from returning
+  // success on a host whose state nobody looked at.
+  const run = _u347Runner({ "launchctl bootstrap": Infinity });
+  let caught = null;
+  try { await runUpgrade(_u352Opts({ execFn: run })); }   // no mockProbe
+  catch (e) { caught = e; }
+
+  assert.ok(caught, "a restart failure with nothing measured must never return success");
+  assert.equal(caught.phases.find(p => p.name === "post-flight").status, "skipped-mock",
+    "premise: the post-flight really was not measured");
+  assert.match(caught.message, /service state is UNKNOWN/);
+  assert.ok(caught.hint.startsWith("THE SERVICE STATE IS UNKNOWN"),
+    `got hint=${JSON.stringify(caught.hint)}`);
+});
+
+test("#352 F5 control: launchd rollback hints carry NO reset-failed (launchctl has no start limit)", async () => {
+  const run = _u347Runner({ "launchctl bootstrap": Infinity });
+  let caught = null;
+  try { await runUpgrade(_u352Opts({ execFn: run, mockProbe: _u352Unreachable })); }
+  catch (e) { caught = e; }
+  assert.ok(caught);
+  assert.ok(!/reset-failed/.test(caught.hint),
+    `the systemd-only remedy must not leak onto macOS hints; got hint=${JSON.stringify(caught.hint)}`);
+  assert.ok(caught.hint.includes("launchctl bootstrap"),
+    `but the launchd recovery command must still be there; got hint=${JSON.stringify(caught.hint)}`);
+  // And the EXECUTED pass agrees: MED-3's `user-unit` scoping of the reset-failed step must not
+  // spill onto launchd, where launchctl has no start limit and no equivalent command at all.
+  const restore = caught.phases.filter(p => p.name === "restart-restore").map(p => p.cmd);
+  assert.ok(restore.length === 2 && restore.every(c => !/reset-failed/.test(c)),
+    `the launchd restore pass runs the plan's own pair, unrewritten; got ${JSON.stringify(restore)}`);
+});
+
+test("#352 control: the pre-existing all-mock rollback lane is untouched — no execFn, no probe, restart still skipped-mock", async () => {
+  // Proves the seam is opt-in: without opts.execFn nothing executes and the restart phases record
+  // exactly what they recorded before this change, which is what every other rollback test relies
+  // on (`assert.deepEqual(restartCmds, [...])` on the `restart` phases).
+  const result = await runUpgrade(_u352Opts());
+  assert.equal(result.path, "rollback");
+  const restart = result.phases.filter(p => p.name === "restart");
+  assert.ok(restart.length === 2 && restart.every(p => p.status === "skipped-mock"),
+    `the darwin pair must stay skipped-mock in the all-mock lane; got ${JSON.stringify(restart)}`);
+  assert.ok(restart.every(p => typeof p.cmd === "string" && p.cmd.includes("launchctl")),
+    `and must keep carrying .cmd, which existing tests assert on; got ${JSON.stringify(restart)}`);
+  assert.equal(result.phases.find(p => p.name === "post-flight").status, "skipped-mock");
+  assert.ok(!result.phases.some(p => p.name === "restart-restore"),
+    "and no restoration pass may appear when nothing failed");
+});
+
 // ── #262 SECURITY (same shape as #257's injection, on the rollback path) ───────────────────────
 // meta.fromCommit is read back from from-commit.txt inside the snapshot directory and was
 // interpolated into an `exec()` shell template string for `git -C ${ocpDir} checkout
