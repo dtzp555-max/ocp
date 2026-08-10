@@ -1207,16 +1207,32 @@ let authStatus = {
 // every request and never decays; only one that has stopped succeeding does.
 const AUTH_REQUEST_VERDICT_TTL_MS = 900000; // 15 min
 
-// #308: a completed request proves the credential is valid. Called from both claude_ok sites.
-// Deliberately does NOT touch consecutiveFailures: that tally counts CONCLUSIVE PROBE rejections
-// and drives ADR 0010's degraded verdict, which this change does not alter.
+// #308: a completed request proves the credential is valid. Called from THREE success paths, not
+// two: callClaude's and callClaudeStreaming's `claude_ok` branches (the default -p lanes), and
+// callClaudeTui's post-honesty-gate success (#361 — the TUI lane, which logs no `claude_ok` of its
+// own, so "both claude_ok sites" no longer locates the callers). `grep -n 'noteAuthVerifiedByRequest()'`
+// is the durable form of this list; the count in prose is not.
+//
+// WHAT THIS FUNCTION WRITES IS DOCUMENTED IN THE BODY, NOT HERE — deliberately, and this is the
+// second time that decision has had to be made. This header used to assert "deliberately does NOT
+// touch consecutiveFailures", three lines above the code that clears it. The correction was
+// written into the body and THIS HEADER WAS LEFT STANDING, so the comment recording the fix sat
+// *below* the sentence that was still wrong, and the pair shipped together until #361's review
+// opened the file. Two copies of one rule is what produced that; one copy is the only version
+// that cannot drift again. The rule is immediately below.
 function noteAuthVerifiedByRequest() {
   const now = Date.now();
   // Does NOT touch lastOutcome/lastCheck: those belong to the probe, and overwriting them would
   // make /health claim a probe ran when none did. It DOES clear consecutiveFailures — a completed
-  // request is direct evidence the credential is not being refused. An earlier revision of this
-  // header said "deliberately does NOT touch consecutiveFailures" three lines above the code that
-  // writes it; the reviewer who caught that was reading the comment, which is what comments are for.
+  // request is direct evidence the credential is not being refused, and ADR 0014 § Consequences
+  // names that clear as "a deliberate restoration of ADR 0010's self-heal", unqualified by which
+  // lane served the request. Note what that does and does not license: proxyHealthStatus reads
+  // consecutiveFailures and never `ok`, so the VERDICT cannot move /health.status, but clearing
+  // the TALLY can — which is exactly why the rule lives in one place with its authority attached.
+  // An earlier revision of the header above said "deliberately does NOT touch consecutiveFailures"
+  // three lines above the code that writes it; the reviewer who caught that was reading the
+  // comment, which is what comments are for. (The header itself was only corrected in #361 — the
+  // fix had been applied here and nowhere else, which is the drift this note now guards.)
   authStatus = { ...authStatus, ok: true, okSource: "request", okAt: now,
                  message: "verified by a completed request", consecutiveFailures: 0 };
 }
@@ -2081,8 +2097,8 @@ async function callClaudeTui(model, messages, _conversationId, _keyName, res, st
     // 4xx "API Error:" core and an /authenticat|\/login|credential/ keyword. So the interactive
     // CLI renders an EXPIRED CREDENTIAL as ordinary assistant text, and calling this before the
     // gate would raise auth.ok:true on exactly the turn whose text says the credential was
-    // refused — the #308 lie rebuilt on the other lane. Both gates throw, so the catch below
-    // runs and this does not.
+    // refused — the #308 lie rebuilt on the other lane. All THREE gates above throw — truncation,
+    // banner, and the streaming-divergence refusal — so the catch below runs and this does not.
     //
     // One call site covers BOTH TUI lanes: `callClaudeTuiStreaming` does not spawn, it awaits
     // `callClaudeTui`, so the streaming lane reaches this same line.

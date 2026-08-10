@@ -3606,6 +3606,12 @@ ltTest("integration (#361): a completed TUI-lane request raises the verdict too 
     assert.ok(before, `precondition: the probe must conclude rejected first — ${ltDiag(buf)}`);
     assert.equal(before.auth.ok, false, "precondition: a conclusive rejection, not an inconclusive null");
     assert.equal(before.auth.okSource, "probe", "precondition: the verdict is the PROBE's at this point");
+    // Pin the pre-state NON-ZERO, so the post-state assertion below measures a transition rather
+    // than a value that was already 0. Structurally implied by lastOutcome === "rejected" (the
+    // rejection branch increments it), but asserting the implication is what makes the later
+    // `=== 0` a claim about this fix instead of a claim about the fixture.
+    assert.ok(before.auth.consecutiveFailures > 0,
+      `precondition: the rejection tally must have climbed before the request; got ${before.auth.consecutiveFailures}`);
 
     // The turn must genuinely COMPLETE. Asserting the body — not merely that a request was sent —
     // is what stops this passing vacuously: a turn rejected by either honesty gate is a 500, and
