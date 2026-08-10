@@ -53,7 +53,7 @@
     "[measured] /status's plan sub-shape. The fixture has no OAuth credentials by construction (otherwise npm test would make a real billed call to api.anthropic.com), and /status returns plan: 'No OAuth token found (keychain / ~/.claude/.credentials.json / CLAUDE_CODE_OAUTH_TOKEN)' — a scalar. With live credentials it is an object, and that object's keys are not recorded here.",
     "[measured] /dashboard's body. It is HTML — recorded below as contentType 'text/html' with keys: null, because a key set is not defined for it. RECORDED rather than skipped: status and content-type are still asserted, so if it ever starts returning JSON the test fires.",
     "[reasoned] /usage. It is the Hybrid endpoint (ALIGNMENT.md § Hybrid note), not a row in the B.2 inventory table, and its synthesis layer wraps a live Anthropic wire call that the fixture deliberately cannot make.",
-    "[measured] Element keys of sessions[] on /health and /sessions. They are empty in every run because nothing in server.mjs ever writes the sessions Map — declared by 'const sessions = new Map()' (line 965 as of v3.29.0), with 0 occurrences of sessions.set( and 0 of sessions.get(, only .delete and .clear. The array is unreachable, not under-probed. Tracked as issue #355, whose blast radius is wider than this array: /status.activeSessions and stats.sessionHits/sessionMisses are permanently constant too. This snapshot recording sessions[] as an empty key set is the first mechanism that would catch a writer being added.",
+    "[measured] RESOLVED, and kept as a record rather than deleted. This entry used to describe the element keys of sessions[] on /health and /sessions as permanently unrecordable, because nothing in server.mjs ever wrote the sessions Map. Issue #355 / ADR 0016 removed that whole surface instead of leaving it blind: /health.sessions, /health.config.sessionTTL, /status.proxy.activeSessions, /settings.sessionTTL* and both /sessions endpoint records are GONE from the blocks below, so there is no longer an unreachable array here to under-report. The blind spot this entry named was never a gap in the mechanism — the mechanism reported the array accurately; the array was the defect. Recorded because a future reader diffing this file across v3.29.2 will see a large removal and should find its authorization named here as well as in the CHANGELOG.",
     "[measured] Keys of JSON-parseable /logs entries. The fixture seeds one deliberately non-JSON line and the probe records entries[].raw, which is the one part of an entry server.mjs constructs (handleLogs's { raw: line } fallback). A JSON line passes through verbatim, so its keys belong to whatever wrote the log, not to the endpoint, and seeding one would record non-surface as surface.",
     "[measured] REQUEST-SHAPED responses, where the recorded keys are decided by the probe's request body rather than by the server. PATCH /settings echoes one results.<key> sub-object per setting in the body: measured, {timeout} yields results.timeout{,.ok,.value} and {cacheTTL} yields results.cacheTTL{,.ok,.value} — 3 paths swap. The probe therefore pins {timeout} and a change to that body would show as drift with no server change behind it. This is a CATEGORY, not a one-off: B2_PROBE_PLAN already sends all three quota dimensions to PATCH /api/keys/:id/quota for exactly this reason, and the rule was simply not carried across to the adjacent probe until #354's review found it. Anyone adding a probe must ask whether the response echoes the request before choosing a body.",
     "[reasoned] Response HEADERS beyond the content-type family. Only status and content-type are extracted from the response; nothing else is read.",
@@ -101,7 +101,6 @@
         "config.circuitBreaker",
         "config.maxConcurrent",
         "config.mcpConfig",
-        "config.sessionTTL",
         "config.systemPrompt",
         "config.timeout",
         "instanceName",
@@ -109,8 +108,6 @@
         "recentErrors[]",
         "recentErrors[].message",
         "recentErrors[].time",
-        "sessions",
-        "sessions[]",
         "spawn",
         "spawn.home",
         "spawn.isolated",
@@ -153,7 +150,6 @@
       "keys": [
         "plan",
         "proxy",
-        "proxy.activeSessions",
         "proxy.auth",
         "proxy.status",
         "proxy.uptime",
@@ -167,14 +163,6 @@
         "requests.errors",
         "requests.timeouts",
         "requests.total"
-      ]
-    },
-    "GET /sessions": {
-      "status": 200,
-      "contentType": "application/json",
-      "keys": [
-        "sessions",
-        "sessions[]"
       ]
     },
     "GET /settings": {
@@ -202,13 +190,6 @@
         "maxPromptChars.type",
         "maxPromptChars.unit",
         "maxPromptChars.value",
-        "sessionTTL",
-        "sessionTTL.desc",
-        "sessionTTL.max",
-        "sessionTTL.min",
-        "sessionTTL.type",
-        "sessionTTL.unit",
-        "sessionTTL.value",
         "timeout",
         "timeout.desc",
         "timeout.max",
@@ -353,13 +334,6 @@
         "current.maxPromptChars.type",
         "current.maxPromptChars.unit",
         "current.maxPromptChars.value",
-        "current.sessionTTL",
-        "current.sessionTTL.desc",
-        "current.sessionTTL.max",
-        "current.sessionTTL.min",
-        "current.sessionTTL.type",
-        "current.sessionTTL.unit",
-        "current.sessionTTL.value",
         "current.timeout",
         "current.timeout.desc",
         "current.timeout.max",
@@ -379,13 +353,6 @@
       "keys": [
         "idOrName",
         "revoked"
-      ]
-    },
-    "DELETE /sessions": {
-      "status": 200,
-      "contentType": "application/json",
-      "keys": [
-        "cleared"
       ]
     },
     "DELETE /cache": {
@@ -436,14 +403,11 @@
         "config.circuitBreaker",
         "config.maxConcurrent",
         "config.mcpConfig",
-        "config.sessionTTL",
         "config.systemPrompt",
         "config.timeout",
         "instanceName",
         "recentErrors",
         "recentErrors[]",
-        "sessions",
-        "sessions[]",
         "spawn",
         "spawn.home",
         "spawn.isolated",
@@ -495,7 +459,6 @@
       "keys": [
         "plan",
         "proxy",
-        "proxy.activeSessions",
         "proxy.auth",
         "proxy.status",
         "proxy.uptime",
@@ -507,14 +470,6 @@
         "requests.errors",
         "requests.timeouts",
         "requests.total"
-      ]
-    },
-    "GET /sessions": {
-      "status": 200,
-      "contentType": "application/json",
-      "keys": [
-        "sessions",
-        "sessions[]"
       ]
     },
     "GET /settings": {
@@ -542,13 +497,6 @@
         "maxPromptChars.type",
         "maxPromptChars.unit",
         "maxPromptChars.value",
-        "sessionTTL",
-        "sessionTTL.desc",
-        "sessionTTL.max",
-        "sessionTTL.min",
-        "sessionTTL.type",
-        "sessionTTL.unit",
-        "sessionTTL.value",
         "timeout",
         "timeout.desc",
         "timeout.max",
@@ -671,13 +619,6 @@
         "current.maxPromptChars.type",
         "current.maxPromptChars.unit",
         "current.maxPromptChars.value",
-        "current.sessionTTL",
-        "current.sessionTTL.desc",
-        "current.sessionTTL.max",
-        "current.sessionTTL.min",
-        "current.sessionTTL.type",
-        "current.sessionTTL.unit",
-        "current.sessionTTL.value",
         "current.timeout",
         "current.timeout.desc",
         "current.timeout.max",
@@ -697,13 +638,6 @@
       "keys": [
         "idOrName",
         "revoked"
-      ]
-    },
-    "DELETE /sessions": {
-      "status": 200,
-      "contentType": "application/json",
-      "keys": [
-        "cleared"
       ]
     },
     "DELETE /cache": {

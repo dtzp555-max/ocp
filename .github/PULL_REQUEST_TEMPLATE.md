@@ -11,7 +11,7 @@ Per `ALIGNMENT.md` and ADR 0006, every PR that touches a network-facing endpoint
 - [ ] **Class A** — forwards a `cli.js` operation (e.g., `/v1/messages`, `/api/oauth/*`, or the Anthropic-side wire call inside `/usage`)
 - [ ] **Class B** — extends an OCP-owned compatibility endpoint (per ADR 0006). Sub-bucket:
   - [ ] B.1 — OpenAI-compatibility surface (`/v1/chat/completions`, `/v1/models`)
-  - [ ] B.2 — OCP-administrative surface (`/health`, `/dashboard`, `/sessions`, `/logs`, `/status`, `/settings`, `/api/keys*`, `/api/usage`, `/cache*`)
+  - [ ] B.2 — OCP-administrative surface (`/health`, `/dashboard`, `/logs`, `/status`, `/settings`, `/api/keys*`, `/api/usage`, `/cache*`)
 - [ ] **Hybrid** — touches both classes (e.g., `/usage` if the PR modifies both the Anthropic wire call AND the local synthesis layer). Both evidence sections below must be filled.
 - [ ] **Not endpoint-touching** — refactor / docs / tooling that does not modify any request handler. Skip both evidence sections; explain in Summary.
 
