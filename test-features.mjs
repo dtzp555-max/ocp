@@ -8091,12 +8091,36 @@ test("#356 F3: the restoration pass gets exactly ONE attempt per command — dec
   //
   // Pinned as arithmetic rather than as prose: retries + restore must be exactly RESTART_ATTEMPTS + 1.
   const run = _u347Runner({ "launchctl bootstrap": Infinity });
-  try { await runUpgrade(_u347Opts({ execFn: run, mockProbe: _u347Unreachable })); } catch { /* expected */ }
+  let caught = null;
+  try { await runUpgrade(_u347Opts({ execFn: run, mockProbe: _u347Unreachable })); }
+  catch (e) { caught = e; }
+  assert.ok(caught, "premise: an unrecoverable restart with a dead probe must throw");
   assert.equal(run.count("launchctl bootstrap"), RESTART_ATTEMPTS + 1,
     `${RESTART_ATTEMPTS} retries + exactly 1 restoration attempt; more means the restore started ` +
     `retrying and F5's start-limit arithmetic no longer holds; got calls=${JSON.stringify(run.calls)}`);
-  const restoreOfBootstrap = run.calls.length - RESTART_ATTEMPTS;
-  assert.ok(restoreOfBootstrap >= 1, "harness premise: a restoration pass must actually have run");
+
+  // PREMISE: a restoration pass really ran, so the count above is "retries + restore" and not
+  // "retries alone happening to equal the expected total".
+  //
+  // #388 review finding F2: this guard was `run.calls.length - RESTART_ATTEMPTS >= 1`, and
+  // `run.calls` is EVERY command the runner saw — `git fetch`, `npm install`, `node setup.mjs`
+  // included. Measured on the unmutated tree: `run.calls.length` is 9, so it computed 6 while the
+  // true restore-bootstrap count is 1; with the restoration pass deleted entirely it computes 4 and
+  // STILL PASSES. An assertion whose message is "a restoration pass must actually have run"
+  // returned true in exactly the state it names — a guard that reads as protection and gives none,
+  // on the test carrying this PR's F3 decision.
+  //
+  // Asserted now on the phases the pass actually emits, which is the direct evidence rather than a
+  // derived count, plus the bootstrap tally the arithmetic above depends on.
+  const restorePhases = caught.phases.filter(p => p.name === "restart-restore");
+  assert.ok(restorePhases.length >= 1,
+    `harness premise: a restoration pass must actually have run; got phases=` +
+    `${JSON.stringify(caught.phases.map(p => `${p.name}:${p.status}`))}`);
+  assert.ok(restorePhases.some(p => /launchctl bootstrap/.test(p.cmd)),
+    `and it must have re-run the set-up half — that is the invocation the count above attributes ` +
+    `to it; got ${JSON.stringify(restorePhases.map(p => p.cmd))}`);
+  assert.equal(run.count("launchctl bootstrap") - RESTART_ATTEMPTS, 1,
+    `and exactly one of the ${RESTART_ATTEMPTS + 1} bootstrap calls must be the restore's`);
 });
 
 test("#356 F7: `success with no measurement` is expressible ONLY for the all-mock lane, and the dangerous half throws", async () => {
@@ -8114,6 +8138,14 @@ test("#356 F7: `success with no measurement` is expressible ONLY for the all-moc
   // THE DANGEROUS HALF. This arm had NO test on the forward path — #352's LOW-4 covers the rollback
   // one only — which is exactly the shape F7 warns about: an untested throw is one refactor away
   // from returning success on a host nobody looked at.
+  //
+  // #388's review measured what "one refactor away" actually costs, and the answer differs by tree,
+  // so it is stated rather than left as a flourish. Deleting this arm on `origin/main` falls through
+  // to `if (restartFailure)` and genuinely RETURNS SUCCESS. On this branch it degrades to a generic
+  // `post-flight failed` instead, because #373/#385's fail-closed catch-all intercepts it first. So
+  // the claim is accurate about main and conservative about the branch — and the arm is still the
+  // only thing that produces the honest UNKNOWN verdict rather than a verdict about a probe that
+  // never ran.
   const run = _u347Runner({ "launchctl bootstrap": Infinity });
   let caught = null;
   try { await runUpgrade(_u347Opts({ execFn: run })); }   // restart FAILS, still no probe
