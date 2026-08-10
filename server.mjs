@@ -2601,6 +2601,78 @@ function usageQueryInt(raw, fallback, cap) {
   return Number.isFinite(clamped) ? clamped : fallback;
 }
 
+// ── #379 cases 1 and 2: a malformed percent-escape in a /api/keys/… path ─────────────────────
+//
+// `decodeURIComponent` throws `URIError: URI malformed` on any input that is not a valid
+// percent-encoding of a UTF-8 sequence. Three routes called it UNGUARDED on a path segment the
+// client controls, and the throw escaped the `async` request callback — Node never observes the
+// promise a request handler returns — so nothing wrote a response and nothing closed the socket.
+// Measured on `main` before this fix, loopback, default `CLAUDE_AUTH_MODE=none`, 4 s deadline:
+//   DELETE /api/keys/%E0%A4%A     → 0 bytes, socket still open, 1 unhandled_rejection
+//   PATCH  /api/keys/%/quota      → 0 bytes, socket still open, 1 unhandled_rejection
+//   GET    /api/keys/%/quota      → 0 bytes, socket still open, 1 unhandled_rejection
+// The DELETE and the PATCH are #379's cases 1 and 2. The GET is the SAME call on the ADJACENT
+// route of the same handler block, found by probing rather than reported, and folded in under
+// Iron Rule 11 §11.1: cheaper than its own PR, found by this PR's stated job, and a reviewer can
+// still follow the diff. Fixing two of three would have left an identical hang eight lines down.
+//
+// RETURNS `null` — NEVER a falsy sentinel — AND CALLERS MUST TEST `=== null`. The empty string is
+// a LEGITIMATE decode result: `DELETE /api/keys/` yields `""` and is ANSWERED today (200,
+// `{"revoked":false,"idOrName":""}` — measured). A `if (!idOrName)` check would capture it and
+// change an answered request, which is the same trap `?limit=0` set for #379 case 3.
+//
+// THE SPLIT IS DELIBERATELY OUTSIDE THIS FUNCTION'S `try`, at every call site. The `catch` must be
+// reachable ONLY by `decodeURIComponent`, because that is what makes the exhaustion argument below
+// sound; wrapping the `.split(…)[1]` too would let an unrelated TypeError be absorbed into a 404.
+//
+// WHY 404, AND WHY NOT 400. Both were considered; the choice is evidence-led, because #379 flags
+// that it may itself move a rule.
+//   - 404 IS THIS SERVER'S EXISTING ANSWER TO A URL IT CANNOT RESOLVE. [measured] 18 of 18 probed
+//     paths carrying a malformed escape that do NOT reach one of these three calls answer 404 —
+//     `/%`, `/api/%`, `GET /api/keys/%`, `POST /api/keys/%`, `DELETE /cache/%`, `PATCH /settings/%`
+//     and so on. There is no exception. So a 404 here applies a rule the surface already has to
+//     the three inputs that never reached it.
+//   - A URL-TRIGGERED 400 EXISTS NOWHERE ON THIS SURFACE. [measured] All 21 `jsonResponse(res, 400,
+//     …)` sites in this file are triggered by the request BODY or a body-derived field. Answering
+//     400 here would invent a rejection KIND, which is the invention ALIGNMENT.md's anti-invention
+//     discipline exists to stop — and #379 names it as the choice that would NOT be route (a).
+//   - THE BODY IS THE ONE THE TWO QUOTA ROUTES ALREADY USE. `{ error: "Key not found" }` is
+//     byte-identical to their existing 404 (server.mjs, `updateKeyQuota`/`findKey` misses; present
+//     at v3.16.4 too), so those two routes gain no new response shape at all — only a new input
+//     reaches an answer they already give. It is also TRUE: a segment that cannot be decoded names
+//     no key.
+//   - THE DELETE IS THE ONE SITE WHERE 404 IS A STATUS THE ROUTE DOES NOT EMIT TODAY, and that is
+//     stated rather than glossed. Its authorization is route (a): the ONLY inputs whose behaviour
+//     changes are inputs that receive no response at all. The alternative of reusing its 200
+//     `{revoked:false}` was rejected on two grounds — it needs an invented "use the raw undecoded
+//     segment" rule, and it would REPORT A LOOKUP THAT NEVER HAPPENED. `DELETE /api/keys/no-such-key`
+//     answering `revoked:false` means "I looked and it was not there"; `%E0%A4%A` is not a key name
+//     at all, so there is nothing to look up. Refusing before the body is read also keeps case 2's
+//     property intact: an unreadable URL is answered without consuming a body, instead of falling
+//     through to `{"error":"Invalid JSON"}`, which would diagnose the body for a URL problem.
+//
+// ROUTE (a) IS SOUND BY EXHAUSTION, and here it needs no enumeration of the input domain at all —
+// the `catch` block IS the throw set. The catch is deliberately UNFILTERED (it does not test for
+// `URIError`), so the argument does not depend on `decodeURIComponent` having exactly one failure
+// mode, or on anyone enumerating which strings are malformed: the set of inputs whose behaviour
+// changes is precisely { inputs for which this call throws }, whatever it throws. Every such input
+// reached this line, threw, and — there is no enclosing `try` anywhere in the request callback —
+// was never answered. Changed-input set == previously-unanswered set, exactly.
+//
+// Authorized by ADR 0006 (grandfathered as of v3.16.4); contract unchanged. `git rev-list -n1
+// v3.16.4` → 9e25160, read with `git show` because v3.16.4 and `main` share NO ancestor (roots
+// 593d0dc vs c180987), so `git log -S` on `main` is not usable evidence. All THREE call sites are
+// byte-identical there (9e25160:server.mjs:1633, :1642, :1668), and the second layer is stronger
+// than byte-identity: [measured] booting v3.16.4 itself, each of these three requests sent the
+// client ZERO BYTES and then KILLED THE DAEMON (exit code 1, stack naming those exact lines) —
+// v3.16.4 has no `unhandledRejection` handler, so Node's default terminated the process. The
+// grandfathered snapshot's behaviour for these inputs is "no response, and the proxy dies", which
+// is emphatically not a behaviour anyone can be relying on. Contrast #383, where POST /api/keys'
+// name regex entered AFTER v3.16.4 and is therefore not grandfathered at all.
+function decodeKeySegment(raw) {
+  try { return decodeURIComponent(raw); } catch { return null; }
+}
+
 // ── Response helpers ────────────────────────────────────────────────────
 function jsonResponse(res, status, data, extraHeaders = null) {
   if (res.headersSent || res.writableEnded || res.destroyed) return;
@@ -3976,7 +4048,10 @@ const server = createServer(async (req, res) => {
 
   if (req.url?.startsWith("/api/keys/") && !req.url.includes("/quota") && req.method === "DELETE") {
     if (!isAdmin) return jsonResponse(res, 403, { error: "Admin access required" });
-    const idOrName = decodeURIComponent(req.url.split("/api/keys/")[1]);
+    // #379 case 1. `=== null`, never a falsy test: `""` is a legitimate decode and is answered
+    // today. See decodeKeySegment for the 404-vs-400 evidence and the ADR 0006 route (a) argument.
+    const idOrName = decodeKeySegment(req.url.split("/api/keys/")[1]);
+    if (idOrName === null) return jsonResponse(res, 404, { error: "Key not found" });
     const revoked = revokeKey(idOrName);
     return jsonResponse(res, 200, { revoked, idOrName });
   }
@@ -3985,7 +4060,12 @@ const server = createServer(async (req, res) => {
   // Body: { "daily": 100, "weekly": 500, "monthly": 2000 }  (null = unlimited)
   if (req.url?.match(/^\/api\/keys\/[^/]+\/quota$/) && req.method === "PATCH") {
     if (!isAdmin) return jsonResponse(res, 403, { error: "Admin access required" });
-    const idOrName = decodeURIComponent(req.url.split("/api/keys/")[1].replace("/quota", ""));
+    // #379 case 2. This runs BEFORE the body is read, which is the whole shape of case 2 — the
+    // request needs no body to hang. Answering here keeps that: a URL that cannot be decoded is
+    // refused without consuming a body, rather than falling through to "Invalid JSON" and
+    // diagnosing the body for a problem in the URL. See decodeKeySegment.
+    const idOrName = decodeKeySegment(req.url.split("/api/keys/")[1].replace("/quota", ""));
+    if (idOrName === null) return jsonResponse(res, 404, { error: "Key not found" });
     req.setEncoding("utf8"); // #359: decode UTF-8 across chunk boundaries (see handleSettings)
     let body = "";
     try {
@@ -4034,7 +4114,10 @@ const server = createServer(async (req, res) => {
   // GET /api/keys/:id/quota — get quota + current usage for a key
   if (req.url?.match(/^\/api\/keys\/[^/]+\/quota$/) && req.method === "GET") {
     if (!isAdmin) return jsonResponse(res, 403, { error: "Admin access required" });
-    const idOrName = decodeURIComponent(req.url.split("/api/keys/")[1].replace("/quota", ""));
+    // #379's SIBLING, not in its table: the same unguarded call on the adjacent route, measured to
+    // hang identically. Folded in under Iron Rule 11 §11.1 rather than deferred. See decodeKeySegment.
+    const idOrName = decodeKeySegment(req.url.split("/api/keys/")[1].replace("/quota", ""));
+    if (idOrName === null) return jsonResponse(res, 404, { error: "Key not found" });
     const keyRow = findKey(idOrName);
     if (!keyRow) return jsonResponse(res, 404, { error: "Key not found" });
     const quota = getKeyQuota(keyRow.id);
