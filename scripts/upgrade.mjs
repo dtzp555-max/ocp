@@ -2103,12 +2103,23 @@ async function runFreshInstall({ doctor, opts }) {
   // a refusal regardless of how much consent was given, and saying so first is more useful
   // than telling the operator to re-run with flags that will then also refuse.
   if (!freshTarget.safeToReplace) {
+    // #366 review, finding B. The tail used to be unconditional, so an install this process
+    // merely could not INSPECT (permission-locked: readdir works, stat does not) was told to
+    // "remove it yourself first" — the one action that loses it — immediately after a `why`
+    // that says "do NOT delete it". Same fix as doctor's `human_required[2]`, and it branches
+    // on the same classifier field rather than re-deriving the state here.
+    const cannotInspect = freshTarget.unreadableMarkers?.length;
     throw new Error(
       `Refusing the fresh_install path: ${freshTarget.why}. The first destructive step would ` +
       `be \`rm -rf ${freshDir}\` (install dir resolved from ${freshSource}), and this tool only ` +
       `does that to a directory that is absent, empty, or verifiably an OCP install. ` +
-      `If OCP is installed elsewhere, set an absolute OCP_DIR pointing at it; if you genuinely ` +
-      `want this directory replaced, remove it yourself first, then re-run.`
+      (cannotInspect
+        ? `Do NOT delete this directory: ${cannotInspect} marker file name(s) ` +
+          `(${freshTarget.unreadableMarkers.join(", ")}) are present but unreadable, which is what ` +
+          `an OCP install looks like from a process without permission to inspect it. Fix the ` +
+          `permissions (the directory needs SEARCH/execute, not just read) or re-run as its owner.`
+        : `If OCP is installed elsewhere, set an absolute OCP_DIR pointing at it; if you genuinely ` +
+          `want this directory replaced, remove it yourself first, then re-run.`)
     );
   }
 

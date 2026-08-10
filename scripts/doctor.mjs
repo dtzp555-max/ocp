@@ -946,10 +946,20 @@ export async function runDoctor(opts = {}) {
       human_required: [
         `Refusing to generate a fresh-install plan: ${install.why}.`,
         `A fresh install would begin with \`rm -rf ${ocpDir}\`, and this tool only does that to a directory that is absent, empty, or verifiably an OCP install.`,
-        `If OCP is installed somewhere else, set OCP_DIR to that path (absolute). If you genuinely want this directory replaced, remove it yourself first, then re-run.`,
+        // #366 review, finding B. This line used to be unconditional, so a directory we could not
+        // INSPECT — a genuine install whose permissions block stat — was told to "remove it
+        // yourself first". The `why` above had already been fixed to say "could not be inspected
+        // ... do NOT delete it", which made the tool contradict itself in adjacent lines and left
+        // the destructive instruction as the LAST thing the operator reads. Branch on the same
+        // fact the classifier already reports rather than restating a guess.
+        install.unreadableMarkers?.length
+          ? `Do NOT delete this directory. It carries ${install.unreadableMarkers.length} of the marker file name(s) (${install.unreadableMarkers.join(", ")}) that could not be read, which is what an OCP install looks like from a process that lacks permission to inspect it. Fix the permissions (the directory needs SEARCH/execute, not just read) or re-run as its owner, then re-run \`ocp doctor\`.`
+          : `If OCP is installed somewhere else, set OCP_DIR to that path (absolute). If you genuinely want this directory replaced, remove it yourself first, then re-run.`,
       ],
       ai_executable: [],
-      verify: "ocp doctor expects install_dir=PASS once OCP_DIR points at an OCP install (or is unset)"
+      verify: install.unreadableMarkers?.length
+        ? "ocp doctor expects install_dir=PASS once this directory is readable (fix permissions; do not delete it)"
+        : "ocp doctor expects install_dir=PASS once OCP_DIR points at an OCP install (or is unset)"
     };
   } else if (kind === "noop") {
     next_action = { kind, human_required: [], ai_executable: [], verify: "already at latest" };
