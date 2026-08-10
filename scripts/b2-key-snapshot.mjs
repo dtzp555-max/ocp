@@ -361,9 +361,11 @@ export function makeB2Fixture(profileId = "default") {
 }
 
 // ── Probe plan ──────────────────────────────────────────────────────────────
-// Ordered. Read-only probes run before the mutating ones that would invalidate them: GET /sessions
-// before DELETE /sessions, GET /cache/stats before DELETE /cache, the key probes before the key is
-// revoked. `:id` is substituted with the id of the key created by the POST /api/keys probe, and
+// Ordered. Read-only probes run before the mutating ones that would invalidate them: GET
+// /cache/stats before DELETE /cache, the key probes before the key is revoked. (The GET /sessions
+// before DELETE /sessions pair this comment used to lead with is gone — ADR 0016 removed both
+// endpoints; the ordering rule they illustrated still governs every remaining pair.)
+// `:id` is substituted with the id of the key created by the POST /api/keys probe, and
 // each record is filed under the INVENTORY's spelling of the path so the coverage check can match
 // it against ALIGNMENT.md directly.
 //
@@ -382,7 +384,6 @@ export const B2_PROBE_PLAN = [
   { name: "POST /api/keys", method: "POST", path: "/api/keys", body: { name: "b2-key-snapshot" } },
   { name: "GET /health", method: "GET", path: "/health" },
   { name: "GET /status", method: "GET", path: "/status" },
-  { name: "GET /sessions", method: "GET", path: "/sessions" },
   { name: "GET /settings", method: "GET", path: "/settings" },
   { name: "GET /logs", method: "GET", path: "/logs" },
   { name: "GET /dashboard", method: "GET", path: "/dashboard" },
@@ -395,7 +396,6 @@ export const B2_PROBE_PLAN = [
   { name: "PATCH /api/keys/:id/quota", method: "PATCH", path: "/api/keys/:id/quota", body: { daily: 10, weekly: 20, monthly: 30 } },
   { name: "PATCH /settings", method: "PATCH", path: "/settings", body: { timeout: 600000 } },
   { name: "DELETE /api/keys/:id", method: "DELETE", path: "/api/keys/:id" },
-  { name: "DELETE /sessions", method: "DELETE", path: "/sessions" },
   { name: "DELETE /cache", method: "DELETE", path: "/cache" },
 ];
 
