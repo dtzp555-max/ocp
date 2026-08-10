@@ -12816,7 +12816,9 @@ function makeFakePool(opts = {}) {
 }
 const tick = () => new Promise((r) => setImmediate(r));
 // Refills are SERIALIZED (one boot at a time, re-kicked on success), so settling the pool
-// takes a chain of microtask turns, not one. 40 is far more than POOL_MAX_SIZE needs.
+// takes a chain of microtask turns, not one. 40 is ample for the small pool sizes these
+// tests construct (they pass an explicit size, never near POOL_MAX_SIZE — the largest in
+// this file is 3, so the raise of the cap to 32 does not put this number in play).
 const settle = async () => { for (let i = 0; i < 40; i++) await tick(); };
 
 console.log("\nTUI warm pane pool (acquire / miss / refill / TTL / reaper exemption):");
@@ -12828,6 +12830,29 @@ test("resolvePoolSize: default/garbage/negative disable the pool; size is clampe
   assert.equal(resolvePoolSize("banana"), 0, "garbage disables rather than guessing a size");
   assert.equal(resolvePoolSize("2"), 2);
   assert.equal(resolvePoolSize("99"), POOL_MAX_SIZE, "clamped — never boot an unbounded number of idle claudes");
+});
+
+// The assertion above compares against the CONSTANT, so it proves a clamp EXISTS and is blind
+// to which number it clamps to: it stays green at 4, at 32, at 7. But the number itself is a
+// claim repeated in README.md, docs/tui-mode.md, ADR 0008 and server.mjs's env-var header, and
+// until this test nothing made the code half of that claim fail out loud — the cap's VALUE was
+// unpinned, which is how it could drift away from four documents at once.
+//
+// Its own test(), NOT another line in the block above, and that is load-bearing: assert.equal
+// throws, so an assertion appended after the symbolic one would never execute under a mutation
+// that reddens the symbolic one first, and could not be shown to fire on its own. Separated,
+// this test is not redundant with the symbolic one: moving the constant reddens ONLY this one
+// (the symbolic assertion cannot see that at all), while removing the clamp reddens both. The
+// evidence is one-directional — it does not show the symbolic test catching anything this one
+// misses — so the claim is stated that way rather than as mutual independence. Both are kept
+// because the symbolic block also covers default/garbage/negative, and it states "a clamp
+// exists" in a form deliberately meant to SURVIVE an intentional cap change.
+test("resolvePoolSize: the DOCUMENTED ceiling is 32 — a fat-fingered value clamps to exactly it", () => {
+  assert.equal(
+    resolvePoolSize("99999999"), 32,
+    "docs promise `max 32`; if you moved the cap, move it in README.md, docs/tui-mode.md, "
+      + "server.mjs's env-var header comment and ADR 0008 too",
+  );
 });
 
 test("pool size 0 is inert: acquire always misses and refill never boots", async () => {
