@@ -2614,7 +2614,8 @@ function usageQueryInt(raw, fallback, cap) {
 // The DELETE and the PATCH are #379's cases 1 and 2. The GET is the SAME call on the ADJACENT
 // route of the same handler block, found by probing rather than reported, and folded in under
 // Iron Rule 11 §11.1: cheaper than its own PR, found by this PR's stated job, and a reviewer can
-// still follow the diff. Fixing two of three would have left an identical hang eight lines down.
+// still follow the diff. Fixing two of three would have left an identical hang on the very next
+// route in this block (measured on main: the three calls are at :3979, :3988 and :4037).
 //
 // RETURNS `null` — NEVER a falsy sentinel — AND CALLERS MUST TEST `=== null`. The empty string is
 // a LEGITIMATE decode result: `DELETE /api/keys/` yields `""` and is ANSWERED today (200,
@@ -2627,15 +2628,28 @@ function usageQueryInt(raw, fallback, cap) {
 //
 // WHY 404, AND WHY NOT 400. Both were considered; the choice is evidence-led, because #379 flags
 // that it may itself move a rule.
-//   - 404 IS THIS SERVER'S EXISTING ANSWER TO A URL IT CANNOT RESOLVE. [measured] 18 of 18 probed
-//     paths carrying a malformed escape that do NOT reach one of these three calls answer 404 —
-//     `/%`, `/api/%`, `GET /api/keys/%`, `POST /api/keys/%`, `DELETE /cache/%`, `PATCH /settings/%`
-//     and so on. There is no exception. So a 404 here applies a rule the surface already has to
-//     the three inputs that never reached it.
-//   - A URL-TRIGGERED 400 EXISTS NOWHERE ON THIS SURFACE. [measured] All 21 `jsonResponse(res, 400,
-//     …)` sites in this file are triggered by the request BODY or a body-derived field. Answering
-//     400 here would invent a rejection KIND, which is the invention ALIGNMENT.md's anti-invention
-//     discipline exists to stop — and #379 names it as the choice that would NOT be route (a).
+//   - 404 IS THIS SERVER'S EXISTING ANSWER TO A URL IT CANNOT RESOLVE. [measured] 20 paths were
+//     probed. 18 of them carry a malformed percent-escape and do NOT reach one of these three
+//     calls; of those, 16 answer 404 — `/%`, `/api/%`, `GET /api/keys/%`, `POST /api/keys/%`,
+//     `DELETE /cache/%`, `PATCH /settings/%`, `GET /v1/%`, `GET /health/%`, `GET /status/%`,
+//     `GET /usage/%`, `GET /dashboard/%`, `GET /v1/models/%`, `GET /api/keys/%/quota/x` and so on.
+//     The remaining 2 are stated rather than dropped, because an enumeration that quietly omits its
+//     exceptions is not evidence: `GET /api/usage/%` and `GET /logs/%` answer 200, since both
+//     routes match by PREFIX (`startsWith("/api/usage")`, `startsWith("/logs")`) and therefore
+//     RESOLVE the URL rather than failing to. They are not counterexamples — nothing was
+//     unresolvable — but the honest arithmetic is 16 of 18, not 18 of 18. The last 2 of the 20
+//     (`GET /api/keys/a/b/quota`, `GET /no-such-endpoint`) carry NO escape at all and are controls
+//     for the rule itself; both answer 404. This is the THIRD numeric claim in this change that did
+//     not survive being recounted, which is why the count is now spelled out rather than summarised.
+//   - A URL-TRIGGERED 400 EXISTS NOWHERE ON THIS SURFACE. Every `jsonResponse(res, 400, …)` site in
+//     this file is triggered by the request BODY or a body-derived field — the body-read abort, the
+//     `JSON.parse` failure, the shape guards, the key-name regex, `model`, `messages`, the tool and
+//     image checks, and the empty-quota-fields check. NOT ONE is keyed on the URL. Deliberately
+//     stated by TRIGGER and not by count: grepping that pattern is unreliable here because it now
+//     also matches THIS COMMENT, which is the ADR 0012 marker-grep failure mode one level down —
+//     reading prose to learn what the code does. Answering 400 here would invent a rejection KIND,
+//     which is the invention ALIGNMENT.md's anti-invention discipline exists to stop — and #379
+//     names it as the choice that would NOT be route (a).
 //   - THE BODY IS THE ONE THE TWO QUOTA ROUTES ALREADY USE. `{ error: "Key not found" }` is
 //     byte-identical to their existing 404 (server.mjs, `updateKeyQuota`/`findKey` misses; present
 //     at v3.16.4 too), so those two routes gain no new response shape at all — only a new input

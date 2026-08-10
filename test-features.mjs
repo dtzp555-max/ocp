@@ -5726,14 +5726,19 @@ ltTest("integration (#379 case 3): GET /api/usage answers a non-numeric limit/ho
 //
 // The GET is folded in under Iron Rule 11 §11.1: same mechanism, same route family, same citation
 // class, same severity, cheaper than its own PR — and fixing two of three would have left an
-// identical credential-free hang eight lines further down the same handler block.
+// identical credential-free hang on the very next route of the same handler block (measured on
+// main, the three calls are at server.mjs:3979, :3988 and :4037 — the sibling is 49 lines below
+// the PATCH, not the "eight" an earlier revision of this comment claimed).
 //
 // WHY THE EXPECTED STATUS IS 404 AND NOT 400, since #379 flags that this choice may itself move a
-// rule. [measured] 18 of 18 probed paths carrying a malformed escape that do NOT reach one of these
-// three calls already answer 404, with no exception; and all 21 `jsonResponse(res, 400, …)` sites in
-// server.mjs are triggered by the BODY or a body-derived field, so a URL-triggered 400 would invent
-// a rejection kind this surface does not have. The body `{"error":"Key not found"}` is byte-identical
-// to the 404 the two quota routes already return for a segment that names no key.
+// rule. [measured] Of the 18 probed paths that carry a malformed escape and do NOT reach one of
+// these three calls, 16 already answer 404; the two that do not (`GET /api/usage/%`, `GET /logs/%`)
+// match their routes by PREFIX and so RESOLVE the URL rather than failing to — stated rather than
+// dropped, because an enumeration that omits its exceptions is not evidence. And every `jsonResponse(res,
+// 400, …)` site in server.mjs is triggered by the BODY or a body-derived field, never by the URL, so
+// a URL-triggered 400 would invent a rejection kind this surface does not have. The body
+// `{"error":"Key not found"}` is byte-identical to the 404 the two quota routes already return for a
+// segment that names no key. Full derivation in server.mjs's decodeKeySegment comment.
 //
 // WHY EVERY ANSWERED VALUE IS ASSERTED, not just the three defect statuses. The fix is authorized
 // under ADR 0006's grandfather clause, route (a) — no input that is ANSWERED today may change its
@@ -5868,7 +5873,7 @@ ltTest("integration (#379 cases 1+2): a malformed percent-escape in a /api/keys 
       `GET /api/keys/<escaped name>/quota must still resolve to the key created above (id ${keptId}).`);
 
     await lt379bProbe(port, { method: "PATCH", path: `/api/keys/${keptId}/quota`, body: '{"daily":7}',
-      status: 200, what: "an ordinary quota PATCH still works — a guard that 404'd everything would pass every defect arm",
+      status: 200, what: "an ordinary quota PATCH by numeric id still succeeds — the narrowness control for the quota route",
       bodyRe: /"ok":true/ });
 
     // A WELL-FORMED segment naming no key must still get its OWN answers, not the new one. These
