@@ -340,9 +340,14 @@ export function makeB2Fixture(profileId = "default") {
       // OCP_TUI_TMUX_BIN to the real tmux and — since expectTmuxCalls is also author-chosen per
       // profile — pick a matching count, and every guard in the suite would still pass. The
       // comment advertising that profiles may override "any pin above" made that an invitation.
-      // Last-write-wins is the half that makes it unreachable; the throw above is the half that
-      // makes the attempt loud instead of silently ignored. Constraints unreachable by
-      // construction, not stated as prohibitions (AGENTS.md).
+      //
+      // WHICH HALF DOES WHAT, stated precisely because the two are easy to swap: with the throw
+      // above present, the THROW is what makes the real tmux unreachable — it fires before this
+      // object is built. Last-write-wins is the COUNTERFACTUAL half: it is what would still hold
+      // if someone later deleted the throw as "unreachable". Measured: mutation N6 restores the
+      // pre-review ordering with the throw kept and SURVIVES the whole suite, so the suite pins
+      // the throw and not the ordering. Both are kept anyway — ordering is the by-construction
+      // form AGENTS.md prefers over a runtime prohibition.
       OCP_TUI_TMUX_BIN: tmux,
     },
     cleanup() {
