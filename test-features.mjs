@@ -2259,12 +2259,20 @@ test("#384: ltResolveTmuxBin accepts a stub the test owns and REFUSES one it doe
       "a stub inside the test's own scratch dir must be accepted");
 
     // The host's real tmux is refused. Not "an arbitrary path" — the actual binary this guard
-    // exists to keep server.mjs away from, when it is present.
-    for (const real of ["/opt/homebrew/bin/tmux", "/usr/bin/env", "/bin/sh"]) {
+    // exists to keep server.mjs away from, when it is present. Each candidate is skipped when
+    // absent (this must pass on CI too), so the loop is COUNTED: a set that happened to skip
+    // every entry would assert nothing while printing a green tick — the empty-slice shape
+    // AGENTS.md calls "anchor drift".
+    let refused = 0;
+    for (const real of ["/opt/homebrew/bin/tmux", "/usr/local/bin/tmux", "/usr/bin/tmux", "/usr/bin/env", "/bin/sh"]) {
       if (!_ltExists(real)) continue;
       assert.throws(() => ltResolveTmuxBin({ OCP_TUI_TMUX_BIN: real }, dir), /OUTSIDE/,
         `ltBoot must refuse a tmux outside the test's scratch dir (${real}), not silently ignore it`);
+      refused++;
     }
+    assert.ok(refused >= 1,
+      "none of the out-of-dir candidates existed, so the refusal above was never exercised — " +
+      "this test would have passed without testing anything");
     // A path that does not exist cannot be silently accepted either: server.mjs would fall back
     // to spawnSync failing, which looks like a refusing stub and would hide a typo'd override.
     assert.throws(() => ltResolveTmuxBin({ OCP_TUI_TMUX_BIN: join(dir, "nope") }, dir), /does not exist/,
