@@ -12312,6 +12312,126 @@ test("buildTuiCmd OCP_TUI_FULL_TOOLS=1 grants -p-equivalent tool surface (single
   }
 });
 
+// #190 (re-created from an external contributor's branch): OCP_TUI_TOOLS.
+// buildTuiCmd returns a SHELL STRING that tmux runs via `sh -c`, so "the value reaches claude
+// as ONE argv element" is a claim about what a real shell does with that string, not about
+// which substrings the string contains — `--tools 'a b'` and `--tools a b` both `include`
+// "--tools". This fixture therefore points claudeBin at a script that prints its own argv, runs
+// the WHOLE command through /bin/sh, and asserts on the argv the shell actually delivered.
+//
+// The two shq claims below live in SEPARATE tests on purpose. Both are broken by the same
+// mutation (dropping shq), and the metacharacter value makes `sh` fail to parse at all — so if
+// they shared a test, whichever ran first would abort the other and only one of them would ever
+// be proven able to fail. Separate tests both report.
+function mk190ArgvProbe() {
+  const save = { ...process.env };
+  const dir = _ltMkdtemp(join(_ltTmp(), "ocp-190-argv-"));
+  const argvDump = join(dir, "argvdump.sh");
+  _ltWrite(argvDump, "#!/bin/sh\nfor a in \"$@\"; do printf '%s\\n' \"$a\"; done\n");
+  _ltChmod(argvDump, 0o755);
+  for (const k of ["OCP_TUI_TOOLS", "OCP_TUI_FULL_TOOLS", "CLAUDE_ALLOWED_TOOLS", "CLAUDE_MCP_CONFIG"]) {
+    delete process.env[k];
+  }
+  // Run the pane command through a real shell and return claude's argv. Both liveness
+  // assertions run BEFORE any caller's absence check, so a probe that silently produced
+  // nothing (broken dump script, shell parse failure) fails HERE rather than making every
+  // `!argv.includes("--tools")` downstream pass vacuously.
+  const paneArgv = (sid) => {
+    const cmd = buildTuiCmd(argvDump, "m", sid, "/home/u", "cli");
+    const r = spawnSync("/bin/sh", ["-c", cmd], { encoding: "utf8" });
+    assert.equal(r.status, 0, `pane command must be a valid shell string; sh said: ${String(r.stderr).trim()}`);
+    const argv = String(r.stdout).split("\n").slice(0, -1); // drop the "" after the final printf newline
+    assert.ok(argv.length > 0 && argv.includes("--model") && argv.includes("--session-id"),
+      `argv probe must be live before anything is asserted absent; got ${JSON.stringify(argv)}`);
+    return argv;
+  };
+  const cleanup = () => {
+    for (const k of ["OCP_TUI_TOOLS", "OCP_TUI_FULL_TOOLS", "CLAUDE_ALLOWED_TOOLS", "CLAUDE_MCP_CONFIG"]) {
+      if (k in save) process.env[k] = save[k]; else delete process.env[k];
+    }
+    _ltRm(dir, { recursive: true, force: true });
+  };
+  return { paneArgv, cleanup };
+}
+
+test("buildTuiCmd OCP_TUI_TOOLS: unset or blank keeps today's argv, a value adds --tools once (#190)", () => {
+  const { paneArgv, cleanup } = mk190ArgvProbe();
+  try {
+    // unset => today's behaviour: no --tools at all, MCP wall intact.
+    const off = paneArgv("s-off");
+    assert.ok(!off.includes("--tools"),
+      `unset OCP_TUI_TOOLS => no --tools (all built-in tools available); got ${JSON.stringify(off)}`);
+    assert.ok(off.includes("--strict-mcp-config") && off.includes("--disallowedTools") && off.includes("mcp__*"),
+      "MCP wall intact on the default surface");
+
+    // whitespace-only is treated as unset (footgun guard): a stray-empty var must not silently
+    // disable EVERY built-in tool, which is what `--tools ''` means to claude.
+    process.env.OCP_TUI_TOOLS = "   ";
+    const blank = paneArgv("s-blank");
+    assert.ok(!blank.includes("--tools"),
+      `whitespace-only OCP_TUI_TOOLS => no --tools; got ${JSON.stringify(blank)}`);
+
+    // set => --tools exactly once, value verbatim in the very next argv element.
+    process.env.OCP_TUI_TOOLS = "Read,Glob,Grep,WebSearch,WebFetch";
+    const on = paneArgv("s-on");
+    const i = on.indexOf("--tools");
+    assert.ok(i > -1, `OCP_TUI_TOOLS set => --tools present; got ${JSON.stringify(on)}`);
+    assert.equal(on.filter((a) => a === "--tools").length, 1, "--tools appears exactly once");
+    assert.equal(on[i + 1], "Read,Glob,Grep,WebSearch,WebFetch", "value arrives verbatim as the next argv element");
+    assert.ok(on.includes("--strict-mcp-config"), "MCP wall still intact alongside --tools");
+  } finally {
+    cleanup();
+  }
+});
+
+test("buildTuiCmd OCP_TUI_TOOLS: a value containing SPACES stays ONE argv element, not word-split (#190)", () => {
+  const { paneArgv, cleanup } = mk190ArgvProbe();
+  try {
+    // The contract is that whatever the operator sets reaches claude UNMODIFIED as one argument,
+    // so claude — not the shell — decides how to parse it. Unquoted, the shell would hand claude
+    // three separate arguments instead of one, silently changing what was asked for.
+    process.env.OCP_TUI_TOOLS = "Read Glob Grep";
+    const spaced = paneArgv("s-spaced");
+    const j = spaced.indexOf("--tools");
+    assert.ok(j > -1, `OCP_TUI_TOOLS with spaces => --tools present; got ${JSON.stringify(spaced)}`);
+    assert.equal(spaced[j + 1], "Read Glob Grep", "a value with spaces reaches claude as ONE argv element (the shell must not word-split it)");
+  } finally {
+    cleanup();
+  }
+});
+
+test("buildTuiCmd OCP_TUI_TOOLS: a scoped/globby value cannot break the shell string (#190)", () => {
+  const { paneArgv, cleanup } = mk190ArgvProbe();
+  try {
+    // Scoped specifiers carry ( ) * ~ — unquoted those are a shell SYNTAX ERROR (caught by
+    // paneArgv's status assertion, which prints sh's own message) or a glob expansion.
+    process.env.OCP_TUI_TOOLS = "Read(~/**),Bash(npm run test:*)";
+    const meta = paneArgv("s-meta");
+    const k = meta.indexOf("--tools");
+    assert.ok(k > -1, `scoped/globby OCP_TUI_TOOLS => --tools present; got ${JSON.stringify(meta)}`);
+    assert.equal(meta[k + 1], "Read(~/**),Bash(npm run test:*)",
+      "scoped/globby value reaches claude verbatim — unexpanded and unsplit");
+  } finally {
+    cleanup();
+  }
+});
+
+test("buildTuiCmd OCP_TUI_TOOLS is scoped to the default surface — ignored under OCP_TUI_FULL_TOOLS (#190)", () => {
+  const { paneArgv, cleanup } = mk190ArgvProbe();
+  try {
+    // The full-tools surface is governed by CLAUDE_ALLOWED_TOOLS. The branch-liveness assertion
+    // comes FIRST, so the absence check cannot pass merely because the branch was never taken.
+    process.env.OCP_TUI_FULL_TOOLS = "1";
+    process.env.OCP_TUI_TOOLS = "Read,Glob";
+    const full = paneArgv("s-full");
+    assert.ok(full.includes("--allowedTools"), "full-tools branch is the one under test");
+    assert.ok(!full.includes("--tools"),
+      `OCP_TUI_TOOLS must not reach the full-tools surface; got ${JSON.stringify(full)}`);
+  } finally {
+    cleanup();
+  }
+});
+
 test("reaper kills ONLY this instance's own port-scoped sessions, never olp-tui-", () => {
   const killed = [];
   const fakeTmux = (args) => {

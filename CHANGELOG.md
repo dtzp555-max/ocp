@@ -2,6 +2,20 @@
 
 ## Unreleased
 
+### Added
+
+- **`OCP_TUI_TOOLS` — narrow the TUI pane's built-in tool set via `claude --tools` (opt-in, #190).** Design, code and the rationale comment are **@sumlin**'s, contributed on their `feat/tui-configurable-tools` branch (`fc71749`) and re-created here under `Co-Authored-By` because that branch **cannot be merged**: it was opened 2026-07-21 against `bdb6662` (v3.24.0), and this repository's public history was recreated as a squashed root on 2026-07-27, so `git merge-base origin/main fc71749` is **empty**. With no common ancestor GitHub cannot compute a merge at all — which is why #190 reports an indeterminate merge state rather than `BEHIND` or `DIRTY`. The delay was an artefact of that rewrite, not of the change.
+
+  Set it to a comma-separated list of built-in tool names (e.g. `Read,Glob,Grep,WebSearch,WebFetch`) and the value reaches the interactive pane's `claude --tools`. **Unset or whitespace-only leaves the argv byte-for-byte as it is today** — every built-in tool available, MCP walled off — so the default path does not move. (The original wording said "comma- **or space**-separated"; `claude --help`, verified on 2.1.220, documents only the comma form — `"Bash,Edit,Read"` — so the docs were narrowed to what it actually says. No behaviour change.)
+
+  **Why `--tools` and not `--disallowedTools`.** `--tools` is the tool-*availability* registry (which built-ins exist for the session), not a permission layer. A tool that is never offered can never raise an interactive permission prompt — and a headless tmux pane has nobody to answer one, so such a prompt hangs the turn to the wallclock cap and bricks the pane. That is the same failure that already rules out `--dangerously-skip-permissions` for TUI, which is what makes the availability registry the right lever rather than merely a convenient one.
+
+  Scoped to the default MCP-walled surface: it is **not** read under `OCP_TUI_FULL_TOOLS=1`, whose tool surface is `CLAUDE_ALLOWED_TOOLS`. Whitespace-only is treated as unset deliberately — `--tools ""` means *disable every tool* to `claude`, and a stray-empty env var must not silently do that.
+
+  **Not endpoint-touching.** `lib/tui/session.mjs` only assembles the argv for the locally spawned interactive `claude`; no request handler, no response shape, no `server.mjs`. `docs/governance/b2-response-keys.json` is unchanged and the in-suite key-set diff stayed green.
+
+  **Pinned behaviourally, not textually.** The four new tests point `claudeBin` at a script that prints its own argv, run the whole pane command through a real `/bin/sh`, and assert on the argv the shell actually delivered — the only way to tell `--tools 'a b'` from `--tools a b`, which a substring check on the command string cannot. The two `shq` claims ("one argv element", "cannot break the shell string") live in **separate** tests on purpose: one mutation breaks both, and the metacharacter value makes `sh` fail to parse, so had they shared a test whichever ran first would have aborted the other and only one would ever have been shown able to fail.
+
 ### Removed
 
 - **The dead session-tracking surface, in full — authorized by [ADR 0016](docs/adr/0016-removing-dead-session-surface.md), NOT by ADR 0012 (#355).** ADR 0012 authorizes *additions* only; a removed key path has never had an authorizing route, so ADR 0016 both authorizes this change and establishes how grandfathered Class B.2 surface may be removed at all: its own ADR, an inertness demonstration, every consumer enumerated from the wire and the repo, and all of them updated in the same change.

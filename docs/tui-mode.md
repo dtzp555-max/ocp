@@ -184,6 +184,23 @@ Two related streaming knobs:
 
 `OCP_TUI_FULL_TOOLS` default *(unset)*. (TUI-mode, **single-user only**) When `=1`, grant the interactive session the **same tool surface as the `-p` path** — `--allowedTools` (+ optional `--mcp-config`, read from `CLAUDE_ALLOWED_TOOLS` / `CLAUDE_MCP_CONFIG`) — instead of the default MCP-walled, built-in-tools-only set. Lets a trusted single-operator TUI deployment run a **tool-using / MCP agent** (e.g. an OpenClaw assistant) on the subscription pool. Safe because TUI **refuses to boot under `AUTH_MODE=multi`** (hard exit) — no guest key can ever reach the TUI path, so this gate cannot expose tools to an untrusted caller. (Under `AUTH_MODE=shared` + `OCP_TUI_ALLOW_LAN=1`, anyone holding the single shared key reaches it — that is the existing TUI trust model, unchanged.) Note: `--dangerously-skip-permissions` / `CLAUDE_SKIP_PERMISSIONS` is **not** supported for TUI — claude v2.1.x shows an interactive bypass-acceptance screen in headless tmux that cannot be answered, bricking the pane. Use scratch-home `settings.json` `additionalDirectories` instead. See ADR 0007.
 
+<a id="ocp-tui-tools"></a>
+### `OCP_TUI_TOOLS` — restrict the built-in tool set
+
+`OCP_TUI_TOOLS` default *(unset)*. (TUI-mode) Restrict **which built-in tools** the interactive pane may use, by passing the value straight through to `claude --tools`. This applies to the **default** MCP-walled surface — it is **not** read when `OCP_TUI_FULL_TOOLS=1` (that surface is controlled by `CLAUDE_ALLOWED_TOOLS`).
+
+Why `--tools` and not `--disallowedTools`: `--tools` is the tool-**availability** registry — it decides which built-in tools *exist* for the session — whereas `--allowedTools` / `--disallowedTools` are a **permission** layer. A tool that is simply not in the availability set can never trigger an interactive permission prompt, which matters in a headless tmux pane where nothing can answer such a prompt (an unanswerable prompt hangs the turn to the wallclock cap and bricks the pane — the same failure that rules out `--dangerously-skip-permissions` here).
+
+- **Value:** comma-separated built-in tool names, e.g. `Read,Glob,Grep,WebSearch,WebFetch`. Per `claude --help` (verified on 2.1.220), `"default"` enables all built-in tools and `""` disables all — but an **empty or whitespace-only** `OCP_TUI_TOOLS` is treated as *unset* (a footgun guard), so it keeps the default rather than silently disabling every tool. The value is shell-quoted as a **single argument**, so whatever you set reaches `claude` verbatim and `claude` — not the shell tmux runs the pane command under — decides how to parse it. That matters for values carrying spaces or shell metacharacters: unquoted, a space word-splits into separate arguments and a scoped name like `Bash(npm run test:*)` is a shell *syntax error*.
+- **Unset (default):** all built-in tools remain available, MCP stays walled off (`--strict-mcp-config` + `--disallowedTools mcp__*`) — byte-for-byte the prior behaviour. Fully opt-in; no backwards-compatibility break.
+- **Interaction with `--safe-mode`:** independent. `--safe-mode` (applied on the default surface) strips *customizations* — host `CLAUDE.md`, skills, plugins, hooks, MCP — and explicitly leaves built-in tools untouched; `OCP_TUI_TOOLS` is the knob that narrows those built-ins.
+
+Example — a read-only, network-capable pane with no shell or write access:
+
+```bash
+export OCP_TUI_TOOLS="Read,Glob,Grep,WebSearch,WebFetch"
+```
+
 <a id="tui-other-vars"></a>
 ### Other TUI-mode variables
 
