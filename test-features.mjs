@@ -1299,26 +1299,33 @@ console.log("\nInstall-marker type check (#366):");
   });
 
   // The ASYNC case, which the first fix got wrong: it compared the global skip counter across the
-  // body, so an unrelated skip resolving in between suppressed a PASSING async test's ✓. Asserted
-  // by settling this test's own promise before reading the counters.
+  // body, so an unrelated skip resolving in between suppressed a PASSING async test's ✓.
+  //
+  // MEASURE ONLY WHAT IS ATTRIBUTABLE. A first draft of this self-check awaited the WHOLE
+  // `pendingAsync` array and then read `passed` — contaminated by every other async test settling
+  // in the same window, and it went red for that reason rather than for a real defect. That is the
+  // same mistake as the race it was written to guard, one level up. `passed` is therefore NOT
+  // asserted here: it cannot be attributed. `skipped` and `failed` can — in a green run nothing
+  // else touches them — and `failed` is the discriminating one, because an unrecognised sentinel
+  // lands in the rejection handler and increments it. A skipping body can never reach the resolve
+  // handler at all, which is what makes "not counted as passed" structural rather than measured.
   const asyncBefore = _m366Counts();
-  const asyncProbe = (async () => {
-    let settled = false;
+  const asyncOwn = (() => {
+    const from = pendingAsync.length;
     test("_harness self-check (#366 review C): this ASYNC body skips too", async () => {
       skipRemainingTest("_harness self-check inner, async (#366 review C)",
         "synthetic: the sentinel must work identically for an async body");
     });
-    await Promise.all(pendingAsync);
-    settled = true;
-    return { settled, after: _m366Counts() };
+    assert.equal(pendingAsync.length, from + 1,
+      "premise: the async body must have registered exactly one pending promise");
+    return pendingAsync.slice(from);           // this test's promise, and no other
   })();
-  testAsync("#366 review C: an ASYNC body that skips is not counted as passed OR failed", async () => {
-    const { settled, after: a } = await asyncProbe;
-    assert.ok(settled, "premise: the async body must have settled before the counters are read");
+  testAsync("#366 review C: an ASYNC body that skips is counted as skipped, never as failed", async () => {
+    await Promise.all(asyncOwn);
+    const a = _m366Counts();
     assert.equal(a.skipped - asyncBefore.skipped, 1, "the async skip must be counted exactly once");
-    assert.equal(a.passed - asyncBefore.passed, 0, "an async skip must not be counted as passed");
     assert.equal(a.failed - asyncBefore.failed, 0,
-      "an async skip must not be counted as FAILED either — the sentinel must be recognised in the rejection handler");
+      "an async skip must not be counted as FAILED — the sentinel must be recognised in the rejection handler");
   });
 }
 
