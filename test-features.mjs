@@ -2252,7 +2252,15 @@ ltTest("integration (#384): ltBoot pins tmux at a refusing stub, so no live-serv
     //     its first guard (lib/tui/session.mjs:125) and neither kill is reached. A PERMISSIVE
     //     stub fails exactly here, measured: list-sessions exiting 0 with no output makes
     //     `!othersRemain && sparedLive === 0` true (session.mjs:154) and kill-server fires.
-    assert.ok(!calls.some(c => /^kill-(server|session) /.test(c)),
+    //
+    //     `\b`, NOT a trailing space. The first revision required a space after the
+    //     subcommand, which made this assertion UNABLE TO MATCH `kill-server` at all: the
+    //     stub logs one `printf '%s '` per argv element and ltTmuxCalls trims, so an
+    //     argument-less subcommand logs as exactly "kill-server" with nothing after it. It
+    //     would have caught `kill-session -t <name>` and silently missed the WORSE of the two
+    //     outcomes — the one this line exists for. Found by mutation M3, and only because the
+    //     reorder above put A3 within reach of it; the masking defect was hiding this one.
+    assert.ok(!calls.some(c => /^kill-(server|session)\b/.test(c)),
       `the boot reap issued a kill against the stub: ${JSON.stringify(calls)}. Against a real ` +
       `tmux, kill-session takes a matching session — including a live legacy-named ` +
       `ocp-tui-<8hex> one, which is reached even with foreign sessions present — and ` +
@@ -2269,7 +2277,7 @@ ltTest("integration (#384): ltBoot pins tmux at a refusing stub, so no live-serv
       `${JSON.stringify(decoyCalls)}. A count of 0 with an empty decoy means the boot never ` +
       `reached the reap at all, so the two assertions above just passed on nothing. ` +
       `${ltDiag(buf)}`);
-    assert.match(calls[0], /^list-sessions /,
+    assert.match(calls[0], /^list-sessions\b/,
       `the only boot-time tmux call must be the reap's read-only list-sessions. Got: ${calls[0]}`);
   } finally { child.kill("SIGKILL"); _ltRmRetry(dir); }
 });
