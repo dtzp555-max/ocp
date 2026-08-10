@@ -940,6 +940,85 @@ export async function runPostFlightCheck(target, opts = {}) {
   return { ok, lastSeen, target: postFlightWant(target), lastFailure };
 }
 
+// Issue #373. The post-restart verdict, as ONE decision shared by both `ocp update` paths.
+//
+// WHAT IS SHARED AND WHAT IS NOT. `runFullUpgrade` and `runRollback` each carried their own copy of
+// this ladder — ~60 lines, eight arms — and #351's own PR body named the property that made the
+// duplication dangerous:
+//
+//   > Ordering is load-bearing. The local-probe-fault arm is checked first, because it is also a
+//   > non-ok probe; getting it backwards tells a machine with a broken `curl` that its proxy is dead.
+//
+// Two copies of an ordering constraint is two places to get it wrong, and the failure is SILENT —
+// every arm still fires, just the wrong one first. The duplication had already produced one real
+// divergence (#372: the answering-but-wrong-version arm existed on one path and not the other).
+//
+// So the CLASSIFICATION moves here and the WORDING stays at the call sites, because the wording
+// genuinely differs and must keep differing: `runFullUpgrade`'s hints may end by pointing at
+// `ocp update --rollback`, and `runRollback` cannot say that — it IS the rollback, and repeating it
+// sends an operator round the same loop. Unifying the strings would be the wrong fix and would have
+// to be undone.
+//
+// WHY THIS MAKES THE ORDERING IMPOSSIBLE TO GET WRONG IN ONE PATH AND RIGHT IN THE OTHER, which is
+// what the issue actually asks for — the extraction alone would not do it. Callers receive a SINGLE
+// verdict and `switch` on it. The arms are mutually exclusive equality tests on one value, so a
+// caller has no ordering to state and therefore none to state differently. The precedence exists in
+// exactly one place: the sequence below.
+//
+// ADR 0015's method applied, since it landed the same day and rejected a refactor for counting text
+// rather than tracing behaviour: the claim that the two ladders were identical was established by
+// running BOTH paths over the cross-product of {restart failed} x {13 probe outcomes} x {launchd,
+// user-unit} — 108 cases — and comparing every message, hint and phase they emit. The refactor is
+// then proved by re-running that sweep and requiring a byte-identical dump. Not a text diff.
+//
+// The one thing this deliberately does NOT do is decide anything the callers used to decide
+// separately: `postFlight.ok`, `postFlightMeasured` and `restartFailure` go in, one tag comes out.
+export const RESTART_VERDICT = {
+  // A restart command failed and NOTHING probed /health. Never claim success on an unmeasured host.
+  UNMEASURED: "unmeasured",
+  // A restart command failed AND the probe could not RUN here. Checked before every other
+  // probe-failure arm: a machine with a broken curl must never be told its proxy is dead.
+  RESTART_FAILED_PROBE_LOCAL_FAULT: "restart-failed-probe-local-fault",
+  // A restart command failed and something answered that is not this proxy.
+  RESTART_FAILED_ANSWERED_NOT_OCP: "restart-failed-answered-not-ocp",
+  // A restart command failed and the proxy answered with a version that differs from a present target.
+  RESTART_FAILED_WRONG_VERSION: "restart-failed-wrong-version",
+  // A restart command failed and the probe measured a non-reach. The only state DOWN may be claimed in.
+  RESTART_FAILED_DOWN: "restart-failed-down",
+  // Every restart command exited 0 and the probe could not RUN here.
+  PROBE_LOCAL_FAULT: "probe-local-fault",
+  // The probe ran and did not confirm, and nothing above claims to know why. Claims NOTHING about
+  // reach — this is where `not-ok-status` (a degraded proxy already serving the target) lands, and
+  // where any kind a future classifier adds lands until someone gives it a cell.
+  UNCONFIRMED: "unconfirmed",
+  // A restart command failed and the proxy is nonetheless serving the target. Not a silent tick.
+  WARNED_SUCCESS: "warned-success",
+  OK: "ok",
+};
+
+export function classifyRestartOutcome({ restartFailure, postFlight, postFlightMeasured }) {
+  const kind = postFlight?.lastFailure?.kind ?? null;
+  const probeCouldNotRun = kind === "probe-could-not-run";
+  const answeredNotOcp = kind === "unparseable" || kind === "http-error" || kind === "body-not-ocp";
+  const servedWrongVersion = kind === "version-mismatch";
+  // DOWN requires POSITIVE evidence of non-reach rather than being the `else` (#372). Anything the
+  // classifier did not produce one of these kinds for falls to UNCONFIRMED.
+  const didNotReach = kind === "unreachable" || kind === "timeout";
+  const probeFailed = postFlight?.ok === false;
+
+  if (restartFailure && !postFlightMeasured) return RESTART_VERDICT.UNMEASURED;
+  if (restartFailure && probeFailed && probeCouldNotRun) return RESTART_VERDICT.RESTART_FAILED_PROBE_LOCAL_FAULT;
+  if (restartFailure && probeFailed && answeredNotOcp) return RESTART_VERDICT.RESTART_FAILED_ANSWERED_NOT_OCP;
+  if (restartFailure && probeFailed && servedWrongVersion) return RESTART_VERDICT.RESTART_FAILED_WRONG_VERSION;
+  if (restartFailure && probeFailed && didNotReach) return RESTART_VERDICT.RESTART_FAILED_DOWN;
+  // Ordered after the restart-failure arms deliberately: those describe a service that may be down,
+  // which outranks a broken probe. Reaching here means every restart command exited 0.
+  if (probeFailed && probeCouldNotRun) return RESTART_VERDICT.PROBE_LOCAL_FAULT;
+  if (probeFailed) return RESTART_VERDICT.UNCONFIRMED;
+  if (restartFailure) return RESTART_VERDICT.WARNED_SUCCESS;
+  return RESTART_VERDICT.OK;
+}
+
 // Issue #257: `--target` was parsed from argv (see `_isMain()` below) and threaded into
 // `runUpgrade(opts)`, but `opts.target` was never actually READ anywhere in `runUpgrade`,
 // `runFullUpgrade`, `runFreshInstall`, or `runRollback` — the full (cross-minor) upgrade path
@@ -1520,15 +1599,18 @@ async function runFullUpgrade({ doctor, opts }) {
     // survives where it always was — the `restart` phase carries `status: "fail"` with the command
     // and its stderr, and the `[restart]` lines are already on stderr — and inventing a sixth cell
     // to restate it would put wording ahead of the measurement, which is what #372 is about.
-    const probeCouldNotRun = postFlight.lastFailure?.kind === "probe-could-not-run";
-    const failureKind = postFlight.lastFailure?.kind ?? null;
-    const servedWrongVersion = failureKind === "version-mismatch";
-    const answeredNotOcp = failureKind === "unparseable" || failureKind === "http-error" || failureKind === "body-not-ocp";
-    const didNotReach = failureKind === "unreachable" || failureKind === "timeout";
+    //
+    // ISSUE #373. The classification and its ORDERING now live in `classifyRestartOutcome`, shared
+    // with `runRollback`. What stays here is the wording, which genuinely differs between the two
+    // paths and must keep differing. The arms below are mutually exclusive equality tests on one
+    // value, so this path has no ordering to state and therefore none to state differently from its
+    // sibling — which is the property #351's PR body named as load-bearing and which two copies
+    // could only ever preserve by coincidence.
+    const verdict = classifyRestartOutcome({ restartFailure, postFlight, postFlightMeasured });
     // F5: single source for "what to run by hand", shared by every hint below.
     const recoveryCmds = recoveryPlanCommands(restartPlan).join(" && ");
 
-    if (restartFailure && !postFlightMeasured) {
+    if (verdict === RESTART_VERDICT.UNMEASURED) {
       // Only reachable from a test that injects execFn but no probe. Never claim success when a
       // restart command failed and nothing measured the result.
       throw Object.assign(
@@ -1538,7 +1620,7 @@ async function runFullUpgrade({ doctor, opts }) {
       );
     }
 
-    if (restartFailure && !postFlight.ok && probeCouldNotRun) {
+    if (verdict === RESTART_VERDICT.RESTART_FAILED_PROBE_LOCAL_FAULT) {
       throw Object.assign(
         new Error(`phase restart failed: ${restartFailure.detail} — and this machine could not run the /health probe (${postFlight.lastFailure.detail})`),
         { phases, cmd: restartFailure.cmd, snapshotPath,
@@ -1549,7 +1631,7 @@ async function runFullUpgrade({ doctor, opts }) {
       );
     }
 
-    if (restartFailure && !postFlight.ok && answeredNotOcp) {
+    if (verdict === RESTART_VERDICT.RESTART_FAILED_ANSWERED_NOT_OCP) {
       // #372, ported from #371's F1 cell. Something answered on the port and it is not this proxy —
       // bytes that are not JSON, a non-2xx, or JSON that is not a shape `/health` emits. Neither
       // "THE PROXY IS DOWN" nor "SERVING THE WRONG VERSION" is true: there is no version to name,
@@ -1569,7 +1651,7 @@ async function runFullUpgrade({ doctor, opts }) {
       );
     }
 
-    if (restartFailure && !postFlight.ok && servedWrongVersion) {
+    if (verdict === RESTART_VERDICT.RESTART_FAILED_WRONG_VERSION) {
       // #372, ported from #371's MED-1 cell. A restart command failed AND something is answering on
       // the port with a version that differs from the one this upgrade installed — the
       // surviving-orphan shape #173 built the version comparison for, and the state whose existence
@@ -1587,7 +1669,7 @@ async function runFullUpgrade({ doctor, opts }) {
       );
     }
 
-    if (restartFailure && !postFlight.ok && didNotReach) {
+    if (verdict === RESTART_VERDICT.RESTART_FAILED_DOWN) {
       // The incident, named. Service state leads; tree state is demoted to the second sentence,
       // because "run `ocp update --rollback`" was the ONLY thing the old hint said and version
       // state was not what mattered at 2am with the port dead.
@@ -1623,7 +1705,7 @@ async function runFullUpgrade({ doctor, opts }) {
     //
     // Ordered after the restart-failure arms deliberately: those describe a service that may be
     // down, which outranks a broken probe. Reaching here means every restart command exited 0.
-    if (!postFlight.ok && probeCouldNotRun) {
+    if (verdict === RESTART_VERDICT.PROBE_LOCAL_FAULT) {
       throw Object.assign(
         new Error(`post-flight could not run on this machine (${postFlight.lastFailure.detail})`),
         { phases, snapshotPath, target: upgradeTarget,
@@ -1654,14 +1736,14 @@ async function runFullUpgrade({ doctor, opts }) {
       );
     }
 
-    if (!postFlight.ok) {
+    if (verdict === RESTART_VERDICT.UNCONFIRMED) {
       // Restart commands all succeeded and the probe genuinely ran and said no (orphan holding the
       // port, wrong version serving, ...). Unchanged pre-#347 behaviour, including the generic
       // tree-state hint from the catch below, which is correct for this cell.
       throw new Error("post-flight failed");
     }
 
-    if (restartFailure) {
+    if (verdict === RESTART_VERDICT.WARNED_SUCCESS) {
       // A restart command failed and the proxy is nonetheless serving the right version. Not a
       // silent success: reporting a bare "✓" here trains operators to ignore the retry warnings
       // that are the early signal for the DOWN case above (same reasoning as ocp:1092-1099).
@@ -2289,81 +2371,21 @@ async function runRollback(opts) {
   // --rollback`; here that is the command already running, and repeating it would send an operator
   // round the same loop a second time. What is true on this path instead: the tree IS restored, and
   // the only thing missing is a running service.
-  const probeCouldNotRun = postFlight.lastFailure?.kind === "probe-could-not-run";
-  // #352 review findings MED-1 and F1. `postFlight.ok === false` covers SEVEN distinct states
-  // (five before #372 split the body-rejection kind into three), and the DOWN wording ("/health is
-  // not answering") is only true in two of them. Each cell below is keyed on the #291
-  // CLASSIFICATION of the last attempt, so no operator-facing sentence asserts more than was
-  // measured.
   //
-  //   version-mismatch  -> reached, read a body carrying a version, and it DIFFERS from a target
-  //                        that was itself present -> UP BUT SERVING THE WRONG VERSION
-  //   not-ok-status     -> reached, read a body, version fine, `status` rejected it -> NO CELL;
-  //                        falls to the neutral #274 verdict, which claims nothing
-  //   body-not-ocp      -> reached, read JSON that is not a shape this proxy emits (a scalar,
-  //                        `null`, or an object with no `version`) -> something answers, but it
-  //                        is NOT this proxy
-  //   unparseable       -> reached, got bytes that are not JSON -> same: something answers
-  //   http-error        -> reached, got a non-2xx               -> same: something answers
-  //   unreachable       -> did NOT reach (curl 7)               -> DOWN
-  //   timeout           -> did not answer within the budget     -> DOWN
-  //   probe-could-not-run                                       -> local fault, handled ABOVE
+  // ISSUE #373. The classification and its ORDERING moved to `classifyRestartOutcome`, shared with
+  // `runFullUpgrade`. The long note this replaces recorded WHY the two kinds mean what they mean and
+  // why DOWN needs positive evidence of non-reach; that reasoning now lives with the code it
+  // governs, next to the classifier, rather than in one of the two copies that happened to carry it.
   //
-  // WHY THIS IS KEYED ON `lastFailure` AND NOT ON `lastSeen` (review finding LOW-D, and the reason
-  // MED-1's first fix was only half right). `runPostFlightCheck` assigns `lastSeen = body.version`
-  // and NEVER resets it, while `lastFailure` is overwritten every attempt. So `lastSeen != null`
-  // is STICKY: a probe that answers `3.14.0` on attempt 1 and then gets connection-refused for the
-  // rest of the budget ends with `lastSeen = "3.14.0"` and `lastFailure = unreachable`. Keyed on
-  // `lastSeen`, that service — which is now DOWN — would be reported "UP BUT SERVING THE WRONG
-  // VERSION". Keyed on `lastFailure.kind`, it reports DOWN, which is what the last measurement
-  // actually says. `lastSeen` is still READ inside the version-mismatch arm, where it is current by
-  // construction: it is assigned in the same iteration that sets that kind.
-  //
-  // WHY THE `unparseable` ARM IS NOT COSMETIC — three reasons, in the order they matter:
-  //
-  //  1. It broke the authority these cells cite. `ocp`'s `_curl_probe` (ocp:210-227) returns 0
-  //     whenever curl exits 0, and `curl -sf` exits 0 on a 200 with a non-JSON body — so bash lands
-  //     on the ANSWERING branch (ocp:1092, warned success), never on its DOWN cell (ocp:1073, which
-  //     requires `probe_rc -ne 0`). The "faithful port" claim held for version-mismatch and failed
-  //     here, because only this path parses the body at all.
-  //  2. The REMEDY was wrong, not just the wording. If a foreign process holds the port, the
-  //     recovery commands cannot bind and re-running them accomplishes nothing. The right advice
-  //     already exists one cell up — `ocp doctor`, and "something other than this unit owns the
-  //     port" — and this repo has hit exactly that shape twice (#237, #239).
-  //  3. It was NEW surface. Before this PR the `exec` throw meant no DOWN claim existed on this
-  //     path at all, so this is a false statement this PR would have introduced.
-  const failureKind = postFlight.lastFailure?.kind ?? null;
-
-  // #352 review round 3 (findings R2-1 and R2-4) discovered that the kind name `version-mismatch`
-  // was a misnomer covering three unrelated states, and reconstructed the missing distinctions
-  // HERE, from `lastSeen`, because fixing the classifier would have touched `runFullUpgrade` too.
-  // Issue #372 fixed the classifier, so those reconstructions are gone: each cell now keys on a
-  // kind that means what it says. `classifyPostFlightBodyRejection` carries the full argument.
-  //
-  // What moved, and why it is not merely tidier:
-  //   - `servedWrongVersion` was `lastSeen !== postFlight.target`, a `!==` **satisfied by a missing
-  //     operand**. `readSnapshot` returns `null` for `fromVersion` when `from-version.txt` is
-  //     unreadable (scripts/lib/snapshot.mjs's `catch { return null; }`), `target` is then `""`,
-  //     and this measurably printed `SERVING THE WRONG VERSION (3.10.0, expected )`. The classifier
-  //     now requires a non-empty target before it will call anything a version mismatch, so the
-  //     property holds for every caller instead of being re-established per cell.
-  //   - `noVersionField` was `bodyRejected && lastSeen == null`. Same conclusion, now stated by the
-  //     kind (`body-not-ocp`) together with the JSON-scalar shape that used to THROW.
-  //
-  // `not-ok-status` deliberately has NO cell: a proxy answering on the correct version with
-  // `status: "degraded"` falls through to the neutral #274 verdict below, which says "may not be
-  // what's running — run `ocp doctor`". That is true, and it is the right next step. This is the
-  // same disposition R2-1 chose; the difference is that it is now reached because no cell claims
-  // it, rather than because a guard subtracted it from a cell that would otherwise have lied.
-  const servedWrongVersion = failureKind === "version-mismatch";
-  const answeredNotOcp = failureKind === "unparseable" || failureKind === "http-error" || failureKind === "body-not-ocp";
-  // DOWN requires POSITIVE evidence of non-reach rather than being the `else`. Anything the
-  // classifier did not produce one of these five kinds for falls through to the neutral #274
-  // verdict below, which claims nothing about the service beyond "this is not confirmed".
-  const didNotReach = failureKind === "unreachable" || failureKind === "timeout";
+  // What remains here is this path's WORDING, which is not shared and must not become shared:
+  // `runFullUpgrade`'s hints may end by pointing at `ocp update --rollback`; here that is the command
+  // already running, and repeating it sends an operator round the same loop a second time. What is
+  // true on this path instead is that the tree IS restored and the only thing missing is a running
+  // service. The arms are equality tests on one value, so this path states no ordering at all.
+  const verdict = classifyRestartOutcome({ restartFailure, postFlight, postFlightMeasured });
   const recoveryCmds = recoveryPlanCommands(restartPlan).join(" && ");
 
-  if (restartFailure && !postFlightMeasured) {
+  if (verdict === RESTART_VERDICT.UNMEASURED) {
     // Only reachable from a test that injects execFn but no probe. Never claim success when a
     // restart command failed and nothing measured the result.
     throw Object.assign(
@@ -2373,7 +2395,7 @@ async function runRollback(opts) {
     );
   }
 
-  if (restartFailure && !postFlight.ok && probeCouldNotRun) {
+  if (verdict === RESTART_VERDICT.RESTART_FAILED_PROBE_LOCAL_FAULT) {
     throw Object.assign(
       new Error(`rollback phase restart failed: ${restartFailure.detail} — and this machine could not run the /health probe (${postFlight.lastFailure.detail})`),
       { phases, target: target.path,
@@ -2384,7 +2406,7 @@ async function runRollback(opts) {
     );
   }
 
-  if (restartFailure && !postFlight.ok && answeredNotOcp) {
+  if (verdict === RESTART_VERDICT.RESTART_FAILED_ANSWERED_NOT_OCP) {
     // F1's cell. Something answered on the port and it is not this proxy — a non-JSON body, or a
     // non-2xx status. Neither "THE PROXY IS DOWN" nor "SERVING THE WRONG VERSION" is true: there is
     // no version to name, and the thing answering may not be OCP at all. The remedy differs too,
@@ -2408,7 +2430,7 @@ async function runRollback(opts) {
     );
   }
 
-  if (restartFailure && !postFlight.ok && servedWrongVersion) {
+  if (verdict === RESTART_VERDICT.RESTART_FAILED_WRONG_VERSION) {
     // MED-1's cell. A restart command failed AND something is answering on the port with the wrong
     // version — the surviving-old-process shape. Saying "THE PROXY IS DOWN" here would be false, and
     // saying nothing about the restart failure would lose the reason. This is #274's verdict with
@@ -2430,7 +2452,7 @@ async function runRollback(opts) {
     );
   }
 
-  if (restartFailure && !postFlight.ok && didNotReach) {
+  if (verdict === RESTART_VERDICT.RESTART_FAILED_DOWN) {
     // The cell this issue exists for, on the path an operator only reaches because something else
     // already failed. Reaching here means the probe RAN, reached nothing, and the fault is not a
     // local one — so "not answering" is measured, not assumed. Service state leads; and unlike
@@ -2456,7 +2478,7 @@ async function runRollback(opts) {
     );
   }
 
-  if (!postFlight.ok && probeCouldNotRun) {
+  if (verdict === RESTART_VERDICT.PROBE_LOCAL_FAULT) {
     // #347's F1 cell, restated for this path. Every restart command exited 0 and the probe could
     // not RUN — a local environment fault that says nothing about the service. Without this arm the
     // generic throw below headlines "the restored tree may not be what's running" at a host whose
@@ -2476,7 +2498,7 @@ async function runRollback(opts) {
     );
   }
 
-  if (!postFlight.ok) {
+  if (verdict === RESTART_VERDICT.UNCONFIRMED) {
     // No further fallback to retry (#221's HIGH-A finding about permanent-refusal traps does
     // not apply here: the restart phase already ran, this only decides whether to REPORT
     // success truthfully) -- throw, matching runFullUpgrade's own post-flight-failure shape,
@@ -2487,7 +2509,7 @@ async function runRollback(opts) {
     );
   }
 
-  if (restartFailure) {
+  if (verdict === RESTART_VERDICT.WARNED_SUCCESS) {
     // Issue #352, mirroring runFullUpgrade's fourth cell and ocp:1092: a restart command failed and
     // the proxy is nonetheless serving the restored version. Not a silent success — reporting a
     // bare "✓" trains operators to ignore the retry warnings that are the early signal for the DOWN
