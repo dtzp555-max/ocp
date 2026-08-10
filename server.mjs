@@ -2589,8 +2589,10 @@ const isLegalInOperand = (v) => typeof v === "object" && v !== null;
 // class only, and the ?hours=-1 test arm records the string-comparison defect it runs into.
 //
 // Authorized by ADR 0006 (grandfathered as of v3.16.4) — behaviour-preserving, route (a). At
-// v3.16.4 (`git rev-list -n1 v3.16.4` → 9e25160; note v3.16.4 and main share NO ancestor, so
-// `git log -S` on main cannot see this) BOTH call sites here AND both sinks in keys.mjs
+// v3.16.4 (`git rev-list -n1 v3.16.4` → 9e25160, read with `git show`; the maintainer's checkout
+// is a SHALLOW clone, so `git log -S` on main THERE reports the shallow boundary rather than the
+// real introducing commit — corrected under ADR 0017, last Consequence) BOTH call sites here AND
+// both sinks in keys.mjs
 // (getRecentUsage, getUsageTimeline) are byte-identical to the pre-fix code. The grandfathered
 // snapshot therefore IS the defective behaviour — the hang is inside what ADR 0006 froze, not
 // something added after it. Contrast #383, where POST /api/keys' name regex entered between
@@ -2676,8 +2678,11 @@ function usageQueryInt(raw, fallback, cap) {
 // was never answered. Changed-input set == previously-unanswered set, exactly.
 //
 // Authorized by ADR 0006 (grandfathered as of v3.16.4); contract unchanged. `git rev-list -n1
-// v3.16.4` → 9e25160, read with `git show` because v3.16.4 and `main` share NO ancestor (roots
-// 593d0dc vs c180987), so `git log -S` on `main` is not usable evidence. All THREE call sites are
+// v3.16.4` → 9e25160, read with `git show` — the right method, though NOT for the reason this
+// comment used to give. It said v3.16.4 and `main` share no ancestor (roots 593d0dc vs c180987);
+// measured in a full clone, the repo has ONE root (593d0dc) and v3.16.4 IS an ancestor of `main`.
+// That reading was a SHALLOW-CLONE artifact of the maintainer's checkout (`.git/shallow` holds
+// c180987) — corrected under ADR 0017. All THREE call sites are
 // byte-identical there (9e25160:server.mjs:1633, :1642, :1668), and the second layer is stronger
 // than byte-identity: [measured] booting v3.16.4 itself, each of these three requests sent the
 // client ZERO BYTES and then KILLED THE DAEMON (exit code 1, stack naming those exact lines) —
@@ -4022,34 +4027,50 @@ const server = createServer(async (req, res) => {
     }
     let parsed;
     try { parsed = JSON.parse(body); } catch { return jsonResponse(res, 400, { error: "Invalid JSON" }); }
-    // #360: `null` ONLY, and the narrowness is the point. `JSON.parse("null")` succeeds, then
-    // `parsed.name` throws, the throw escapes this `async` handler unobserved by Node, and the
-    // socket is never answered or closed — measured before the fix.
+    // ── What this endpoint accepts, and under what authorization ────────────────────────────
+    // This is a RECORD of the accepted request shape, not an argument about whether to change it.
+    // An earlier revision of this comment argued #383 must NOT be fixed, on the grounds that the
+    // endpoint sat at its v3.16.4 snapshot. It did not — the name regex below has been narrowing
+    // this same request shape since v3.18.0 — so ADR 0017 retired that argument and authorized
+    // both halves. Do not re-derive the old one from the grandfather clause alone.
     //
-    // Deliberately NOT `isJsonObject`/`isLegalInOperand`. This is an equality test against the exact
-    // value that was OBSERVED to break, which is the strongest form available here: it asserts a
-    // specific thing is present rather than that a category is absent, so there is no type-tag
-    // edge for it to be wrong about. A predicate would be the weaker choice at this site, because
-    // every predicate wide enough to be worth naming also captures inputs this PR must not change.
+    //   {}                                   -> 201, auto-named `key-<epoch-ms>`   (unchanged)
+    //   {"name":"<1-64 of [A-Za-z0-9 ._-]>"}  -> 201                                (unchanged)
+    //   {"name":<anything else>}              -> 400 "Invalid key name"  (below; shipped since
+    //                                            v3.18.0 in 879b40f, retroactively authorized by
+    //                                            ADR 0017 § Decision 2 — NOT grandfathered)
+    //   anything that is not a JSON object    -> 400, here                (ADR 0017 § Decision 1)
     //
-    // Those inputs, measured on this tree: `42`, `"str"`, `true`, `[]` all return 201 and CREATE A
-    // KEY, because property access on a primitive boxes instead of throwing, so `parsed.name` is
-    // `undefined` and the `||` falls to the auto-name — behaviourally identical to the documented
-    // `{}` request. Minting a credential from an unvalidated body is a defect in its own right and
-    // is tracked as ISSUE #383, which also records why it is not fixed here: it is ANSWERED, so it
-    // is part of this grandfathered endpoint's v3.16.4 behaviour snapshot, and tightening it
-    // changes WHICH REQUESTS ARE ACCEPTED — a request-shape change that ALIGNMENT.md:114 makes a
-    // new authorization request needing its own ADR. Contrast the chat route above, where the same
-    // underlying bug IS fixed because B.1 has no grandfather (ADR 0006, grandfather provision,
-    // 4th bullet) and OpenAI's spec compels the 400. Same bug, two authorities, two answers.
+    // Class B.2, `/api/keys*` in ALIGNMENT.md's inventory. The guard below is a REQUEST-SHAPE
+    // change on a grandfathered endpoint, so it is ADR 0006 route (b) — its own ADR — and NOT the
+    // grandfather clause: `42`, `"str"`, `true` and `[]` were all ANSWERED 201 and each CREATED A
+    // REAL KEY (measured, key store asserted, not just the status), because property access on a
+    // primitive boxes instead of throwing, so `parsed.name` is `undefined` and the `||` falls to
+    // the auto-name. Authorized by ADR 0006 (Class B.2 inventory) AND ADR 0017 (this change).
     //
-    // Authorized by ADR 0006 (grandfathered as of v3.16.4): only the input that received NO
-    // response changes behaviour, and it joins the `{ error: "<string>" }` shape this handler
-    // already returns for a malformed body.
-    if (parsed === null) {
+    // The requirement is stated POSITIVELY and at the site, per ADR 0017 § "Alternatives rejected",
+    // which declines the shared `isJsonObject` predicate here: the body must be a non-null,
+    // non-array object.
+    //
+    // THE ENUMERATION IS CLOSED, not sampled. `JSON.parse` with no reviver returns exactly one of
+    // RFC 8259's six value productions — object, array, string, number, boolean, null. A body that
+    // does not parse is already answered by the `catch` above. So this guard's admitted set is the
+    // object case and its rejected set is the other five, with no residual input to have missed.
+    //
+    // `null` is one of those five and its behaviour is UNCHANGED: it received this exact status and
+    // this exact body from #360's `parsed === null` guard, which this supersedes. #360's finding is
+    // why the message exists — `JSON.parse("null")` succeeds, `parsed.name` then threw, the throw
+    // escaped this `async` handler unobserved by Node, and the socket was never answered or closed.
+    // The rejection body is the `{ error: "<string>" }` shape this handler already used for a
+    // malformed body; no new error shape is invented here.
+    if (!(typeof parsed === "object" && parsed !== null && !Array.isArray(parsed))) {
       return jsonResponse(res, 400, { error: "Expected JSON object with key-value pairs" });
     }
     const name = parsed.name || `key-${Date.now()}`;
+    // Authorized by ADR 0017 § Decision 2, retroactively and as of v3.18.0 — this line entered in
+    // 879b40f ("escape dashboard DB-sourced values + validate key names (#114)", 2026-05-31), after
+    // the v3.16.4 snapshot ADR 0006 grandfathers this endpoint at, so ADR 0006 alone never covered
+    // it. Not re-opened for redesign: widening or narrowing the charset needs its own ADR.
     if (!/^[A-Za-z0-9 ._-]{1,64}$/.test(name)) {
       return jsonResponse(res, 400, { error: { message: "Invalid key name: 1-64 chars of letters, digits, space, dot, underscore, hyphen", type: "invalid_request_error" } });
     }

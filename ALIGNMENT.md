@@ -126,7 +126,7 @@ ADR 0006 retroactively authorizes the B.2 endpoints listed in the inventory tabl
 | `/logs` | GET | B.2 (administrative) | ADR 0006 (grandfathered as of v3.16.4) |
 | `/status` | GET | B.2 (administrative) | ADR 0006 (grandfathered as of v3.16.4); status verdict per ADR 0010 |
 | `/settings` | GET, PATCH | B.2 (administrative) | ADR 0006 (grandfathered as of v3.16.4) |
-| `/api/keys` | GET, POST | B.2 (administrative) | ADR 0006 (grandfathered as of v3.16.4) |
+| `/api/keys` | GET, POST | B.2 (administrative) | ADR 0006 (grandfathered as of v3.16.4); POST request shape + key-name regex per ADR 0017 |
 | `/api/keys/:id` | DELETE | B.2 (administrative) | ADR 0006 (grandfathered as of v3.16.4) |
 | `/api/keys/:id/quota` | GET, PATCH | B.2 (administrative) | ADR 0006 (grandfathered as of v3.16.4) |
 | `/api/usage` | GET | B.2 (administrative) | ADR 0006 (grandfathered as of v3.16.4) |

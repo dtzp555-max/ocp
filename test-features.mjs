@@ -5285,12 +5285,18 @@ ltTest("integration (#359): a prompt cut mid-character on the wire reaches the s
 //   PATCH /api/keys/:id/quota  null / 42 / "str" / true -> ALL FOUR HUNG (`in` needs an object on
 //                              its right), where the issue reported one. `[]` answered 400.
 //
-// The two "unchanged" arms are deliberate scope, pinned by assertion so the narrowness cannot be
-// mistaken for an oversight and cannot silently widen later: POST /api/keys still answers 201 to a
-// non-null scalar, and the quota route still answers its own "Provide at least one of" message to
-// an array. Both are ANSWERED inputs today, so tightening them would change which requests a
-// grandfathered B.2 endpoint accepts — a contract change needing its own ADR, reported rather than
-// folded in here.
+// ONE "unchanged" arm is still deliberate scope, pinned by assertion so the narrowness cannot be
+// mistaken for an oversight and cannot silently widen later: the quota route still answers its own
+// "Provide at least one of" message to an array. That is an ANSWERED input today, so tightening it
+// would change which requests a grandfathered B.2 endpoint accepts — a contract change needing its
+// own ADR, reported rather than folded in here.
+//
+// The OTHER arm is GONE, and deliberately so. `POST /api/keys` answering 201 to a non-null scalar
+// was pinned here by #360 with a note saying the fix would need its own ADR. That ADR is **ADR
+// 0017** (#383), so the assertion below now reads 400 — and the arm it used to defend is covered
+// properly by the dedicated #383 test that follows this one, which asserts the KEY STORE and not
+// only the status. What survives of #360 at this site is the `null` case: same status, same
+// message, unchanged by ADR 0017, which is exactly the arm that ADR 0017 leaves alone.
 const LT360_BUDGET = 15000;   // a hang is unbounded, so a generous budget costs no detection power
 
 // Every scalar body the issue names, plus the array forms. The literal IS the label, so there is no
@@ -5412,13 +5418,12 @@ ltTest("integration (#360, the money test): every scalar JSON body is answered w
     // change on a grandfathered B.2 endpoint, so this PR must NOT have changed them.
     const keyScalar = await ltRawSend(port, { path: "/api/keys", bytes: Buffer.from("42", "utf8"), timeoutMs: LT360_BUDGET });
     assert.ok(!keyScalar.timedOut, "POST /api/keys with 42 must still answer");
-    assert.equal(keyScalar.status, 201,
-      `POST /api/keys with a non-null scalar answered 201 before this PR — it MINTS A REAL KEY from ` +
-      `a body it never validated, which is tracked as ISSUE #383 and is a defect, not a feature. ` +
-      `It is pinned here rather than fixed because tightening it is a request-shape change on a ` +
-      `grandfathered B.2 endpoint (ALIGNMENT.md:114) and needs its own ADR. If you are fixing #383, ` +
-      `this assertion is the one to change, in the same PR, with that ADR cited — ` +
-      `got ${keyScalar.status}: ${keyScalar.text.slice(0, 200)}`);
+    assert.equal(keyScalar.status, 400,
+      `POST /api/keys with a non-null scalar answered 201 and MINTED A REAL KEY until ADR 0017 ` +
+      `(#383). It is now 400, and this assertion was inverted in that same PR, with that ADR cited, ` +
+      `exactly as the note that used to live here asked. The store half of the claim — that no key ` +
+      `is created — is asserted by the dedicated #383 test below, not here, because this test owns ` +
+      `#360's "is it answered at all" question — got ${keyScalar.status}: ${keyScalar.text.slice(0, 200)}`);
 
     const quotaArr = await ltRawSend(port, { method: "PATCH", path: `/api/keys/${keyId}/quota`, bytes: Buffer.from("[]", "utf8"), timeoutMs: LT360_BUDGET });
     assert.ok(!quotaArr.timedOut, "PATCH quota with [] must still answer");
@@ -5450,6 +5455,138 @@ ltTest("integration (#360, the money test): every scalar JSON body is answered w
       bytes: Buffer.from(JSON.stringify({ model: "haiku", messages: [{ role: "user", content: "probe-360" }] }), "utf8"),
     });
     assert.equal(ok.status, 200, `the server must still serve valid requests afterwards: ${ok.status} ${ok.text.slice(0, 200)}`);
+    assert.ok(!/"event":"unhandled_rejection"/.test(buf.err),
+      `no request in this test may produce an unhandled rejection; server stderr had: ${buf.err.slice(0, 400)}`);
+  } finally { child.kill("SIGKILL"); _ltRmRetry(dir); }
+});
+
+// ── #383 / ADR 0017: POST /api/keys requires a JSON OBJECT ────────────────────────────────────
+//
+// The defect is CREDENTIAL MINTING, not a status code, so every rejected case asserts the KEY
+// STORE and not only the response. A guard that answers 400 *after* `createKey()` has already run
+// would satisfy a status-only test while still handing out a key it never wrote down — and that is
+// the shape a status-only test cannot see. Measured before the fix, at `eac7c39`, with the store
+// read after each request: `42`, `"str"`, `true`, `[]` each returned 201 and moved the key count
+// up by one, auto-named `key-<epoch-ms>` — indistinguishable on the wire from the documented `{}`.
+//
+// Class B.2 (`/api/keys*`, ALIGNMENT.md inventory). This is a REQUEST-SHAPE change on a
+// grandfathered endpoint — ADR 0006 route (b) — authorized by ADR 0017, not by the grandfather
+// clause. The previous test pinned this behaviour in place and said the fix would need its own
+// ADR; that ADR is 0017, and its pin above is inverted in the same change.
+//
+// THE REJECTED SET IS CLOSED BY THE GRAMMAR, NOT SAMPLED. `JSON.parse` with no reviver returns
+// exactly one of RFC 8259's six value productions: object, array, string, number, boolean, null. A
+// body that does not parse is answered by the handler's own `catch`. `null` is asserted in the
+// #360 test above and is UNCHANGED by ADR 0017 (same status, same message). `object` is the
+// admitted case, asserted below. That leaves array | string | number | boolean — the four probes
+// below are one per production, so this list is the complete changed-input set rather than a
+// selection from it, and a fifth entry could not be added without a change to JSON itself.
+const LT383_BUDGET = 15000;
+const LT383_REJECTED = [
+  ["42", "number"],
+  ['"str"', "string"],
+  ["true", "boolean"],
+  ["[]", "array"],
+];
+const LT383_REJECT_MSG = /Expected JSON object with key-value pairs/;
+
+// Reads the key store. Asserts its OWN premises before returning, so a broken or empty-by-accident
+// store read cannot make "no key was created" true for the wrong reason: a non-200, a non-JSON body
+// or a missing `keys` array fails here rather than downstream as a silently satisfied negative.
+async function lt383Keys(port, what) {
+  const r = await ltRawSend(port, { method: "GET", path: "/api/keys", bytes: Buffer.alloc(0), contentLength: 0, timeoutMs: LT383_BUDGET });
+  assert.ok(!r.timedOut, `${what}: the store read GET /api/keys did not answer within ${LT383_BUDGET}ms`);
+  assert.equal(r.status, 200, `${what}: the store read GET /api/keys must answer 200, got ${r.status}: ${r.text.slice(0, 200)}`);
+  let parsed;
+  try { parsed = JSON.parse(r.text); } catch { assert.fail(`${what}: the store read returned non-JSON: ${r.text.slice(0, 200)}`); }
+  assert.ok(Array.isArray(parsed.keys), `${what}: the store read must return {keys:[...]}, got: ${r.text.slice(0, 200)}`);
+  // The id list, not the count: a mutation that creates one key and revokes another leaves the
+  // count intact, and a revoked key is still a minted credential.
+  return parsed.keys.map(k => `${k.id}:${k.name}`).join("|");
+}
+
+ltTest("integration (#383 / ADR 0017, the money test): a non-object body is 400 and MINTS NO KEY, while every object body is unchanged", async () => {
+  if (!LT_POSIX) return;
+  const dir = ltMkdir(); const fake = ltFake(dir);
+  const { child, buf, port } = await ltBootFresh({ CLAUDE_BIN: fake, SP_CAPTURE: join(dir, "sp.txt") }, dir);
+  try {
+    assert.ok(await ltWait(() => buf.out.includes("listening on") || buf.spawnErr, 20000) && !buf.spawnErr,
+      `did not start: ${buf.spawnErr ? buf.spawnErr.message : buf.err.slice(0, 300)}`);
+
+    // ── LIVENESS FIRST. Every "no key was created" assertion below is a NEGATIVE over this store
+    // read, so the read is proven able to OBSERVE a creation before anything depends on its
+    // silence. Without this, a store read that always reported the same string would pass every
+    // rejected case vacuously — the exact way a negative test goes quietly dead.
+    const empty = await lt383Keys(port, "liveness baseline");
+    assert.equal(empty, "", `this test needs a fresh key store; GET /api/keys already had: ${empty}`);
+    const live = await ltRawSend(port, { path: "/api/keys", bytes: Buffer.from('{"name":"lt-383-live"}', "utf8"), timeoutMs: LT383_BUDGET });
+    assert.equal(live.status, 201, `a named object body must still mint a key: ${live.status} ${live.text.slice(0, 200)}`);
+    assert.equal(JSON.parse(live.text).name, "lt-383-live", `the supplied name must be echoed: ${live.text.slice(0, 200)}`);
+    const afterLive = await lt383Keys(port, "liveness");
+    assert.notEqual(afterLive, empty,
+      `the store read cannot see a creation, so every "no key was minted" assertion below would be ` +
+      `vacuous. Baseline was ${JSON.stringify(empty)} and it is still ${JSON.stringify(afterLive)} ` +
+      `after a 201.`);
+
+    // ── The four changed productions. Assertion order is deliberate: `timedOut` first (a hang is a
+    // different, worse bug than a wrong status and must not be reported as one), then the STORE,
+    // then the status, then the message. The store comes before the status because it names the
+    // actual harm — a reverted guard trips it with "a key was minted" rather than with "expected
+    // 400, got 201" — and because a guard that mints and *then* 400s passes the status assertion
+    // entirely, so the store assertion is the only one that can see it.
+    for (const [body, production] of LT383_REJECTED) {
+      const before = await lt383Keys(port, `before ${body}`);
+      const r = await ltRawSend(port, { path: "/api/keys", bytes: Buffer.from(body, "utf8"), timeoutMs: LT383_BUDGET });
+      assert.ok(!r.timedOut,
+        `POST /api/keys with ${body} (JSON ${production}): NO RESPONSE within ${LT383_BUDGET}ms. ` +
+        `That is #360's failure mode, not #383's, and is a worse bug than a wrong status.`);
+      const after = await lt383Keys(port, `after ${body}`);
+      assert.equal(after, before,
+        `POST /api/keys with ${body} (JSON ${production}) CREATED A KEY. This is #383 itself: the ` +
+        `body is not an object, so it can only have taken the auto-name path and minted a ` +
+        `credential the caller never named. Store went ${JSON.stringify(before)} -> ` +
+        `${JSON.stringify(after)}; the response was ${r.status} ${r.text.slice(0, 160)}`);
+      assert.equal(r.status, 400,
+        `POST /api/keys with ${body} (JSON ${production}) must be 400 under ADR 0017 § Decision 1, ` +
+        `got ${r.status}: ${r.text.slice(0, 200)}`);
+      assert.match(r.text, LT383_REJECT_MSG,
+        `POST /api/keys with ${body} (JSON ${production}) must reuse the "{ error: \"<string>\" }" ` +
+        `body this handler already returns for a malformed body — ADR 0017 invents no new error ` +
+        `shape, and #360's \`null\` case must keep landing on this same message: ${r.text.slice(0, 200)}`);
+    }
+
+    // ── THE CONTROL, and the reason the guard can be trusted to be narrow. A guard that rejected
+    // everything would satisfy every assertion above while breaking the documented endpoint. Both
+    // object forms must still mint, and each is asserted to have moved the STORE, so a future
+    // change that answers 201 without creating anything cannot pass this vacuously either.
+    const beforeEmptyObj = await lt383Keys(port, "before {}");
+    const auto = await ltRawSend(port, { path: "/api/keys", bytes: Buffer.from("{}", "utf8"), timeoutMs: LT383_BUDGET });
+    assert.equal(auto.status, 201,
+      `{} is the DOCUMENTED auto-name request and ADR 0017 leaves it untouched. A 400 here means ` +
+      `the guard is wider than the ADR authorized: ${auto.status} ${auto.text.slice(0, 200)}`);
+    assert.match(JSON.parse(auto.text).name, /^key-\d+$/,
+      `{} must still be auto-named \`key-<epoch-ms>\`: ${auto.text.slice(0, 200)}`);
+    const afterEmptyObj = await lt383Keys(port, "after {}");
+    assert.notEqual(afterEmptyObj, beforeEmptyObj, `{} answered 201 but created no key: ${afterEmptyObj}`);
+
+    const beforeNamed = await lt383Keys(port, "before named");
+    const named = await ltRawSend(port, { path: "/api/keys", bytes: Buffer.from('{"name":"lt-383 ok.name_1"}', "utf8"), timeoutMs: LT383_BUDGET });
+    assert.equal(named.status, 201,
+      `a name inside the ADR 0017 § Decision 2 charset must still be accepted: ${named.status} ${named.text.slice(0, 200)}`);
+    assert.equal(JSON.parse(named.text).name, "lt-383 ok.name_1", `the supplied name must be echoed: ${named.text.slice(0, 200)}`);
+    const afterNamed = await lt383Keys(port, "after named");
+    assert.notEqual(afterNamed, beforeNamed, `the named request answered 201 but created no key: ${afterNamed}`);
+
+    // ── The regex ADR 0017 § Decision 2 authorizes retroactively, pinned so its removal is a red
+    // test rather than a silent re-widening of the request shape back past v3.18.0.
+    const beforeBad = await lt383Keys(port, "before bad name");
+    const bad = await ltRawSend(port, { path: "/api/keys", bytes: Buffer.from('{"name":"bad/name"}', "utf8"), timeoutMs: LT383_BUDGET });
+    assert.equal(bad.status, 400,
+      `a name outside [A-Za-z0-9 ._-]{1,64} has been rejected since v3.18.0 (879b40f) and is ` +
+      `retroactively authorized by ADR 0017 § Decision 2: ${bad.status} ${bad.text.slice(0, 200)}`);
+    assert.match(bad.text, /Invalid key name/, `the name rejection keeps its own message: ${bad.text.slice(0, 200)}`);
+    assert.equal(await lt383Keys(port, "after bad name"), beforeBad, "a rejected name must mint no key");
+
     assert.ok(!/"event":"unhandled_rejection"/.test(buf.err),
       `no request in this test may produce an unhandled rejection; server stderr had: ${buf.err.slice(0, 400)}`);
   } finally { child.kill("SIGKILL"); _ltRmRetry(dir); }
