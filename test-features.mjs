@@ -5407,6 +5407,153 @@ ltTest("integration (#360, the money test): every scalar JSON body is answered w
   } finally { child.kill("SIGKILL"); _ltRmRetry(dir); }
 });
 
+// ── #379 case 3: a non-numeric ?limit / ?hours must be ANSWERED, not walked into ──────────────
+//
+// The same mechanism as #360 above, reached WITHOUT A BODY. `GET /api/usage?limit=%` is a bare
+// GET — no body, no Authorization header — and `parseInt("%", 10)` is NaN, `Math.min(NaN, 500)`
+// is NaN, and NaN went straight to a sink that throws:
+//
+//   ?limit=%  → getRecentUsage(NaN)              → SQLite bind → "datatype mismatch"
+//   ?hours=%  → new Date(NaN).toISOString()      → RangeError  → "Invalid time value"
+//
+// The throw escapes the `async` request callback, `unhandledRejection` logs it, and nothing
+// answers or closes the socket. Measured on this tree before the fix, from loopback in the
+// DEFAULT `CLAUDE_AUTH_MODE=none`: 0 bytes, socket still open at a 4 s deadline, one
+// `unhandled_rejection` per request. `?limit=abc` and `?hours=abc` behave identically — the
+// percent-escape is incidental, NaN is the defect.
+//
+// `hours` is covered here alongside `limit` deliberately. The issue names `?limit=%`, but `hours`
+// is the SAME cause on the ADJACENT LINE of the SAME handler at the same severity and citation
+// class, and fixing only `limit` would leave an identical credential-free hang one character
+// away. Iron Rule 11 §11.1 fold-in test: cheaper than its own PR, found by this PR's stated job,
+// and a reviewer can still follow the diff.
+//
+// WHY EVERY VALUE IS ASSERTED, not just the status. The fix must be behaviour-preserving under
+// ADR 0006's grandfather clause (route (a)), which means no input that is ANSWERED today may
+// change its answer. Two natural-but-wrong implementations are what these pin:
+//   - `parsed || fallback`            → turns `?limit=0` (0 rows today) into the default. The
+//                                       `?limit=0` assertion below is the one that catches it.
+//   - `parsePositiveInt` (lib/env.mjs) → rejects `<= 0` and partially-consumed values, so
+//                                       `?limit=1abc` (1 today) and `?limit=-1` (SQLite
+//                                       `LIMIT -1` = unbounded) would both change.
+// Hence the guard under test is `Number.isFinite` ONLY, and these arms are what make that
+// narrowness a measured property rather than a claim in a comment.
+const LT379_BUDGET = 15000;   // a hang is unbounded, so a generous budget costs no detection power
+const LT379_SEED_ROWS = 3;    // rows written through the REAL request path, not poked into SQLite
+
+// One probe. Asserts, IN THIS ORDER: the server answered at all, then the answer was 200, then
+// hands back the parsed body. The order is load-bearing — a hang must be reported as silence,
+// which is what the defect is, and never as a status mismatch, which is a different and lesser
+// bug. Removing the clamp makes the FIRST assertion fire; see the mutation table in the PR.
+async function lt379Get(port, path, what) {
+  const r = await ltRawSend(port, {
+    method: "GET", path, bytes: Buffer.alloc(0), contentLength: 0, timeoutMs: LT379_BUDGET,
+  });
+  assert.ok(!r.timedOut,
+    `${what} (${path}): NO RESPONSE within ${LT379_BUDGET}ms and the socket was never closed. ` +
+    `This is #379 case 3 itself — parseInt yielded NaN, the sink threw, the throw escaped the ` +
+    `async request callback into unhandledRejection, and the client is left holding a connection ` +
+    `the server will never release. A bare GET with no credentials can do this on the default ` +
+    `configuration, so it is a connection-exhaustion primitive, not only a correctness bug.`);
+  assert.equal(r.status, 200,
+    `${what} (${path}): expected 200, got ${r.status}: ${r.text.slice(0, 200)}`);
+  try { return JSON.parse(r.text); }
+  catch (e) { throw new assert.AssertionError({ message: `${what} (${path}): body is not JSON: ${e.message} — ${r.text.slice(0, 200)}` }); }
+}
+
+ltTest("integration (#379 case 3): GET /api/usage answers a non-numeric limit/hours within a bounded time, and every already-answered value is unchanged", async () => {
+  if (!LT_POSIX) return;
+  const dir = ltMkdir(); const fake = ltFake(dir);
+  const { child, buf, port } = await ltBootFresh(
+    { CLAUDE_BIN: fake, SP_CAPTURE: join(dir, "sp.txt") }, dir);
+  try {
+    assert.ok(await ltWait(() => buf.out.includes("listening on") || buf.spawnErr, 20000) && !buf.spawnErr,
+      `did not start: ${buf.spawnErr ? buf.spawnErr.message : buf.err.slice(0, 300)}`);
+
+    // ── Seed usage rows through the REAL path, so `recent.length` can discriminate between
+    // limit values at all. Without rows every arm below reads 0 and the whole test is vacuous,
+    // which is why the premise is asserted immediately after and before anything depends on it.
+    // The rows are attributed to key_name "local" (loopback, no token), which is exactly the
+    // scope `/api/usage` filters to for this caller — a mismatch here would silently empty
+    // `recent` and was hit for real while building this test.
+    for (let i = 0; i < LT379_SEED_ROWS; i++) {
+      const seed = await ltRawSend(port, {
+        path: "/v1/chat/completions", timeoutMs: LT379_BUDGET,
+        bytes: Buffer.from(JSON.stringify({ model: "haiku", messages: [{ role: "user", content: `seed-379-${i}` }] }), "utf8"),
+      });
+      assert.equal(seed.status, 200, `seeding request ${i} failed: ${seed.status} ${seed.text.slice(0, 200)}`);
+    }
+
+    // ── PREMISE, asserted before it is relied on. Every length assertion below is meaningless if
+    // the seeded rows are not visible to this caller's scope.
+    const base = await lt379Get(port, "/api/usage", "the unparameterised baseline");
+    assert.equal(base.recent.length, LT379_SEED_ROWS,
+      `PREMISE FAILED: expected ${LT379_SEED_ROWS} rows at /api/usage, saw ` +
+      `recent.length=${base.recent.length}. Every assertion below compares against this count, so ` +
+      `they would all be vacuous. TWO causes reach this line, and an earlier version of this ` +
+      `message named only the first — which a mutation then proved wrong, so both are named now: ` +
+      `(1) the seeded rows are not visible to this caller's scope (key_name must be "local" for a ` +
+      `loopback caller with no token); or (2) the DEFAULT itself moved — the unparameterised ` +
+      `request resolves through the SAME fallback the ?limit=% arm below uses, so a change to that ` +
+      `fallback lands HERE rather than on the arm it would seem to belong to.`);
+    assert.ok(base.timeline.length >= 1,
+      `PREMISE FAILED: the default 24h timeline window shows no buckets (timeline.length=` +
+      `${base.timeline.length}); the ?hours arms below compare against this.`);
+
+    // ── THE DEFECT. Each of these hung before the fix. They must answer, and answer with the
+    // DOCUMENTED DEFAULT — the same response the parameter's absence produces — because that is
+    // what makes the change behaviour-preserving rather than a new answer for a new input.
+    for (const path of ["/api/usage?limit=%", "/api/usage?limit=abc"]) {
+      const r = await lt379Get(port, path, "a non-numeric ?limit");
+      assert.equal(r.recent.length, LT379_SEED_ROWS,
+        `${path} must fall back to the documented default limit of 50 (so all ` +
+        `${LT379_SEED_ROWS} seeded rows are returned), got recent.length=${r.recent.length}. ` +
+        `Answering with some OTHER number would be a new behaviour for this input rather than ` +
+        `the documented default, and would need its own ADR instead of ADR 0006 route (a).`);
+    }
+    for (const path of ["/api/usage?hours=%", "/api/usage?hours=abc"]) {
+      const r = await lt379Get(port, path, "a non-numeric ?hours");
+      assert.equal(r.timeline.length, base.timeline.length,
+        `${path} must fall back to the documented default of 24 hours and produce the same ` +
+        `timeline as the unparameterised request (${base.timeline.length} bucket(s)), got ` +
+        `${r.timeline.length}.`);
+    }
+
+    // ── PRESERVATION. Every one of these is ANSWERED today; the fix must not have moved any of
+    // them. These are the arms that fail if the guard is widened past `Number.isFinite`.
+    const stillValid = [
+      ["/api/usage?limit=1", 1,
+        "an ordinary numeric limit must still be honoured — a guard that ignored `limit` entirely would pass every arm above"],
+      ["/api/usage?limit=1abc", 1,
+        "parseInt's PREFIX semantics are current behaviour: `parseInt('1abc', 10)` is 1. A stricter parse (parsePositiveInt rejects partially-consumed values) would return the default and change an answered request"],
+      ["/api/usage?limit=0", 0,
+        "`?limit=0` returns zero rows today. This is the arm that catches `parsed || fallback`, the natural wrong fix: 0 is falsy, so it would be replaced by the default"],
+      ["/api/usage?limit=-1", LT379_SEED_ROWS,
+        "`?limit=-1` reaches SQLite as `LIMIT -1`, which means UNBOUNDED, and returns every row today. parsePositiveInt would reject it as non-positive and change that"],
+    ];
+    for (const [path, expected, why] of stillValid) {
+      const r = await lt379Get(port, path, "an already-answered ?limit");
+      assert.equal(r.recent.length, expected,
+        `${path}: expected recent.length=${expected}, got ${r.recent.length}. ${why}. This PR is ` +
+        `authorized as behaviour-preserving under ADR 0006's grandfather clause (route (a)); if ` +
+        `this assertion fails, the change is a CONTRACT CHANGE and needs its own ADR.`);
+    }
+
+    // `?hours=-1` puts the window one hour in the FUTURE, so no row qualifies and the timeline is
+    // empty. Answered today, and a sign-losing or clamping guard would silently repopulate it.
+    const futureWindow = await lt379Get(port, "/api/usage?hours=-1", "an already-answered ?hours");
+    assert.equal(futureWindow.timeline.length, 0,
+      `?hours=-1 places the timeline window in the future, so it returns 0 buckets today; got ` +
+      `${futureWindow.timeline.length}. A guard that rejected negatives would change this answered request.`);
+
+    // ── Not wedged, and — the other tell for this whole family — nothing was swallowed. Before
+    // the fix each hung request left exactly one of these lines behind, which is the ONLY place
+    // the defect surfaced at all.
+    assert.ok(!/"event":"unhandled_rejection"/.test(buf.err),
+      `no request in this test may produce an unhandled rejection; server stderr had: ${buf.err.slice(0, 400)}`);
+  } finally { child.kill("SIGKILL"); _ltRmRetry(dir); }
+});
+
 // ── #365: the CHILD's stdout/stderr must decode UTF-8 ACROSS chunk boundaries ───────────────
 //
 // The other half of #359. `lineBuffer += d.toString()` and `stderr += d` decoded each Buffer from

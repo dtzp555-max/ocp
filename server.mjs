@@ -2515,6 +2515,57 @@ function sanitizeError(msg) {
 const isJsonObject  = (v) => typeof v === "object" && v !== null && !Array.isArray(v);
 const isLegalInOperand = (v) => typeof v === "object" && v !== null;
 
+// ── Query-integer parse for GET /api/usage (#379) ───────────────────────
+// GUARANTEE, and the only one: the return value is always a FINITE number. That is the whole
+// job. `parseInt("%", 10)` is NaN, `Math.min(NaN, 500)` is NaN, and the two call sites hand
+// that NaN straight to a sink that throws:
+//
+//   ?limit=%  → getRecentUsage(NaN)  → SQLite bind → "datatype mismatch"      (TypeError)
+//   ?hours=%  → getUsageTimeline({hours: NaN}) → new Date(NaN).toISOString()
+//                                             → "Invalid time value"          (RangeError)
+//
+// Both throws escape the `async` request callback, which Node does not observe, so nothing
+// answers and the socket is held open until the client gives up. Measured on this tree before
+// the fix: 0 bytes received, socket still open at a 4 s deadline, and one
+// `unhandled_rejection` line per request in the proxy log. That is a credential-free
+// connection-exhaustion primitive on the DEFAULT configuration (`CLAUDE_AUTH_MODE=none`), from
+// a bare GET with no body and no Authorization header.
+//
+// NOT modelled on `/logs`, and the difference is worth recording because issue #379 names
+// `/logs` as the precedent to copy and that is a MISREADING — checked on the wire rather than
+// taken on trust:
+//   - `GET /logs?limit=…` answers 200 because `/logs` HAS NO `limit` PARAMETER (it reads `n`
+//     and `level`, server.mjs handleLogs). The 200 is an unread query param, not a clamp.
+//   - `GET /logs?n=%` also answers 200, but NOT because anything clamps: NaN flows into
+//     `Array.prototype.slice`, which coerces NaN to 0, so `slice(-NaN*3)` returns EVERYTHING.
+//     Measured: `?n=%` → 173517 bytes vs `?n=5` → 776 bytes, i.e. the whole log file.
+// `/logs` survives by SINK TOLERANCE, not by a guard. Copying it would mean letting NaN through
+// and hoping the next sink is forgiving — which is precisely what fails here, because SQLite's
+// bind and `Date.prototype.toISOString` are not.
+//
+// NOT `parsePositiveInt` (lib/env.mjs) either, for a reason that is the crux of the class
+// analysis: it rejects `<= 0` and any value `parseInt` only partially consumed. Both of those
+// inputs are ANSWERED today and must keep their exact answers —
+//   `?limit=5abc` → 5 (parseInt prefix), `?limit=-1` → SQLite `LIMIT -1` = unbounded,
+//   `?limit=0` → 0 rows, `?hours=-1` → a window in the future.
+// Using it would change WHICH VALUE a currently-answered request gets, which is the contract
+// change ALIGNMENT.md:114 makes a new authorization request. So the guard is deliberately the
+// NARROWEST one that removes the hang: `Number.isFinite` only. Every input whose parse is
+// already a finite number keeps its value bit-for-bit; the substitution is reachable only for
+// inputs that today receive no response at all.
+//
+// Authorized by ADR 0006 (grandfathered as of v3.16.4) — behaviour-preserving, route (a). The
+// v3.16.4 snapshot of both call sites is byte-identical to the pre-fix lines here
+// (`git rev-list -n1 v3.16.4` → 9e25160; note v3.16.4 and main share NO ancestor), so the
+// defect is inside the grandfathered behaviour, and `limit`'s documented meaning — "how many
+// recent rows, default 50, capped at 500" — is unchanged. Same reasoning as #360's
+// `parsed === null` guard: a request that currently receives NO RESPONSE AT ALL is not a
+// behaviour anyone can be relying on.
+function usageQueryInt(raw, fallback, cap) {
+  const parsed = parseInt(raw || String(fallback), 10);
+  return Math.min(Number.isFinite(parsed) ? parsed : fallback, cap);
+}
+
 // ── Response helpers ────────────────────────────────────────────────────
 function jsonResponse(res, status, data, extraHeaders = null) {
   if (res.headersSent || res.writableEnded || res.destroyed) return;
@@ -3981,10 +4032,13 @@ const server = createServer(async (req, res) => {
     }
 
     const byKeyAll = getUsageByKey({ since, until });
-    const recentAll = getRecentUsage(Math.min(parseInt(url.searchParams.get("limit") || "50", 10), 500));
+    // #379: both were `Math.min(parseInt(<param> || "<default>", 10), <cap>)`, which yields NaN
+    // for any non-numeric value and hands it to a sink that throws. usageQueryInt is that same
+    // expression with `Number.isFinite(parsed) ? parsed : fallback` inserted — see its comment.
+    const recentAll = getRecentUsage(usageQueryInt(url.searchParams.get("limit"), 50, 500));
     const timeline = getUsageTimeline({
       keyName: scopeName || undefined,
-      hours: Math.min(parseInt(url.searchParams.get("hours") || "24", 10), 720),
+      hours: usageQueryInt(url.searchParams.get("hours"), 24, 720),
     });
 
     const byKey = scopeName ? byKeyAll.filter((row) => row.key_name === scopeName) : byKeyAll;
