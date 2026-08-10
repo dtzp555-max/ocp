@@ -3725,7 +3725,7 @@ ltTest("replay premise (LIVE): a real server.mjs whose FIRST probe dies on a sig
 // drift apart — a fixture difference would silently change what "the snapshot" means.
 import {
   makeB2Fixture, probeB2KeySets, responseKeyPaths, parseB2Inventory, diffB2KeySets,
-  readB2Snapshot, ALIGNMENT_PATH,
+  readB2Snapshot, ALIGNMENT_PATH, B2_PROFILES,
 } from "./scripts/b2-key-snapshot.mjs";
 
 console.log("\nClass B.2 response key-set snapshot (#346):");
@@ -3812,6 +3812,46 @@ test("diffB2KeySets: status and content-type changes fail even when the key set 
                           { p: { status: 200, contentType: "application/json", keys: ["a"] } }));
 });
 
+test("#357 review F4: a profile cannot choose the tmux binary — the pin wins, and the attempt throws", () => {
+  // Review finding: the pin used to be applied BEFORE `...profile.env`, under a comment inviting
+  // profiles to override "any pin above". Since `expectTmuxCalls` is author-chosen per profile
+  // too, a future profile could have pointed at the real tmux AND set a matching count, and every
+  // guard in the suite would still have passed. Two halves: last-write-wins makes it UNREACHABLE,
+  // the throw makes it LOUD.
+  //
+  // ONLY THE THROW IS ENFORCED BY THIS TEST, and that is measured rather than assumed. Mutation
+  // N6 (pin moved back before the spread, throw kept) SURVIVES the whole suite, because with the
+  // throw in place no profile can reach the spread carrying that key; N8 (both removed) dies at
+  // the assert.throws below, not at anything about ordering. The ordering is kept as the
+  // by-construction half — it is what would still hold if someone later deleted the throw as
+  // "unreachable" — but this comment does not claim the suite pins it.
+  for (const profile of B2_PROFILES) {
+    const fx = makeB2Fixture(profile.id);
+    try {
+      // The pin must point INTO this fixture's own scratch bin, i.e. at the stub — not at
+      // whatever a profile or the ambient environment might prefer.
+      assert.equal(fx.env.OCP_TUI_TMUX_BIN, testJoin(fx.dir, "bin", "tmux"),
+        `profile ${profile.id}: the tmux pin must resolve to this fixture's stub`);
+      assert.ok(testExistsSync(fx.env.OCP_TUI_TMUX_BIN),
+        `profile ${profile.id}: premise — the stub must actually exist, or the pin points at nothing`);
+    } finally { fx.cleanup(); }
+  }
+
+  // The loud half. Uses a synthetic profile rather than mutating a real one, and restores the
+  // list in a finally so a failure here cannot leave B2_PROFILES corrupted for later tests.
+  const evil = { id: "_test-evil", snapshotKey: "_x", warmUp: false, expectTmuxCalls: 0,
+                 env: { OCP_TUI_TMUX_BIN: "/usr/bin/tmux" }, why: "review F4 regression" };
+  B2_PROFILES.push(evil);
+  try {
+    assert.throws(() => makeB2Fixture("_test-evil"), /OCP_TUI_TMUX_BIN/,
+      "a profile that sets the tmux binary must be refused, not silently ignored");
+  } finally {
+    const i = B2_PROFILES.indexOf(evil);
+    if (i !== -1) B2_PROFILES.splice(i, 1);
+    assert.ok(!B2_PROFILES.some(p => p.id === "_test-evil"), "the synthetic profile must be removed");
+  }
+});
+
 test("diffB2KeySets control: identical records — including key ORDER — compare equal and return null", () => {
   const a = { p: { status: 200, contentType: "application/json", keys: ["x", "y"] } };
   const b = { p: { status: 200, contentType: "application/json", keys: ["x", "y"] } };
@@ -3825,58 +3865,135 @@ test("diffB2KeySets control: identical records — including key ORDER — compa
 ltTest("integration (#346): every grandfathered B.2 endpoint's response key set matches the checked-in snapshot", async () => {
   if (!LT_POSIX) return;
 
-  async function collect() {
-    const fx = makeB2Fixture();
+  async function collect(profile) {
+    const fx = makeB2Fixture(profile.id);
     const { child, buf, port } = await ltBootFresh(fx.env, fx.dir);
     try {
       assert.ok(await ltWait(() => buf.out.includes("listening on"), 45000),
-        `the B.2 key-set probe could not boot server.mjs — ${ltDiag(buf)}`);
-      return await probeB2KeySets(port);
+        `the B.2 key-set probe could not boot server.mjs under profile ${profile.id} — ${ltDiag(buf)}`);
+      const records = await probeB2KeySets(port, { warmUp: profile.warmUp });
+      // The stub tmux appends one line per invocation. Read it BEFORE cleanup(), which deletes
+      // the directory it lives in.
+      const tmuxCalls = _ltExists(fx.tmuxLog)
+        ? _ltRead(fx.tmuxLog, "utf8").split("\n").filter(Boolean)
+        : null;
+      return { records, tmuxCalls };
     } finally {
       child.kill("SIGKILL");
-      await ltDrain(() => buf.closed, "b2-snapshot-in-body", 5000);
+      await ltDrain(() => buf.closed, `b2-snapshot-${profile.id}-in-body`, 5000);
       fx.cleanup();
     }
   }
 
-  const first = await collect();
-  const second = await collect();
-
-  // 1. Stability. Any difference between two fresh boots means a value reached the key set.
-  //    Reported per-probe rather than as one deepStrictEqual, because assert's own diff on two
-  //    71-key records says which BYTES differ and not which endpoint is unstable — and the whole
-  //    point of failing here is to send the reader to the right response.
-  const allProbes = [...new Set([...Object.keys(first), ...Object.keys(second)])].sort();
-  const unstable = allProbes.filter(k => JSON.stringify(first[k]) !== JSON.stringify(second[k]));
-  assert.deepStrictEqual(unstable, [],
-    "two fresh boots produced DIFFERENT key sets — a VALUE has leaked into the key set, or a " +
-    "probe is order-dependent. A snapshot that flaps is worse than none: it trains every releaser " +
-    "to regenerate without reading the diff, which is exactly how a real field addition would " +
-    "then slip through.\n" +
-    unstable.map(k =>
-      `  ${k}\n    boot1: ${JSON.stringify(first[k]).slice(0, 400)}\n    boot2: ${JSON.stringify(second[k]).slice(0, 400)}`,
-    ).join("\n"));
-
-  // 2. Coverage. The constitution decides what the B.2 inventory IS, so the probe plan is checked
-  //    against ALIGNMENT.md rather than against a hand-kept list that can fall behind silently.
+  const snapshot = readB2Snapshot();
+  // The constitution decides what the B.2 inventory IS, so the probe plan is checked against
+  // ALIGNMENT.md rather than against a hand-kept list that can fall behind silently. Parsed once
+  // and applied to EVERY profile: a second profile must not become a place an endpoint can hide.
   const inventory = parseB2Inventory(_ltRead(ALIGNMENT_PATH, "utf8"));
   assert.ok(inventory.length >= 12,
     `anchor drift: only ${inventory.length} B.2 pairs parsed from ALIGNMENT.md — the coverage ` +
     `check below would pass vacuously, so it is refused instead`);
-  const probed = Object.keys(first);
-  const unprobed = inventory.filter(p => !probed.includes(p));
-  assert.deepStrictEqual(unprobed, [],
-    `ALIGNMENT.md lists Class B.2 endpoint+method pairs that this snapshot never probes: ` +
-    `${JSON.stringify(unprobed)}. Add them to B2_PROBE_PLAN in scripts/b2-key-snapshot.mjs — ` +
-    `an unprobed endpoint is surface this mechanism reports nothing about.`);
-  const notInInventory = probed.filter(p => !inventory.includes(p));
-  assert.deepStrictEqual(notInInventory, [],
-    `the probe plan probes pairs that are not Class B.2 rows in ALIGNMENT.md: ${JSON.stringify(notInInventory)}`);
 
-  // 3. The snapshot itself. `drift` is the actionable message; it names every added and removed
-  //    key path and tells the author which authorization each kind needs.
-  const drift = diffB2KeySets(readB2Snapshot().probes, first);
-  assert.equal(drift, null, drift || "");
+  // Premise for everything below: there really is more than one profile, and each has its own
+  // snapshot block. Without this, a B2_PROFILES that silently lost its second row would leave
+  // the whole loop passing over one profile and reporting nothing (#357's own vacuity guard).
+  assert.ok(B2_PROFILES.length >= 2,
+    `expected at least two configuration profiles; got ${JSON.stringify(B2_PROFILES.map(p => p.id))}`);
+  assert.equal(new Set(B2_PROFILES.map(p => p.snapshotKey)).size, B2_PROFILES.length,
+    "two profiles sharing one snapshotKey would have the second silently overwrite the first");
+
+  const byProfile = {};
+  for (const profile of B2_PROFILES) {
+    const first = await collect(profile);
+    const second = await collect(profile);
+    byProfile[profile.id] = first.records;
+
+    // 1. Stability, PER PROFILE — not inherited from the default. Any difference between two
+    //    fresh boots means a value reached the key set. Reported per-probe rather than as one
+    //    deepStrictEqual, because assert's own diff on two 71-key records says which BYTES
+    //    differ and not which endpoint is unstable — and the whole point of failing here is to
+    //    send the reader to the right response.
+    const allProbes = [...new Set([...Object.keys(first.records), ...Object.keys(second.records)])].sort();
+    const unstable = allProbes.filter(k => JSON.stringify(first.records[k]) !== JSON.stringify(second.records[k]));
+    assert.deepStrictEqual(unstable, [],
+      `profile ${profile.id}: two fresh boots produced DIFFERENT key sets — a VALUE has leaked ` +
+      "into the key set, or a probe is order-dependent. A snapshot that flaps is worse than none: " +
+      "it trains every releaser to regenerate without reading the diff, which is exactly how a " +
+      "real field addition would then slip through.\n" +
+      unstable.map(k =>
+        `  ${k}\n    boot1: ${JSON.stringify(first.records[k]).slice(0, 400)}\n    boot2: ${JSON.stringify(second.records[k]).slice(0, 400)}`,
+      ).join("\n"));
+
+    // 2. Coverage, PER PROFILE.
+    const probed = Object.keys(first.records);
+    const unprobed = inventory.filter(p => !probed.includes(p));
+    assert.deepStrictEqual(unprobed, [],
+      `profile ${profile.id}: ALIGNMENT.md lists Class B.2 endpoint+method pairs that this ` +
+      `snapshot never probes: ${JSON.stringify(unprobed)}. Add them to B2_PROBE_PLAN in ` +
+      `scripts/b2-key-snapshot.mjs — an unprobed endpoint is surface this mechanism reports ` +
+      `nothing about.`);
+    const notInInventory = probed.filter(p => !inventory.includes(p));
+    assert.deepStrictEqual(notInInventory, [],
+      `profile ${profile.id}: the probe plan probes pairs that are not Class B.2 rows in ALIGNMENT.md: ${JSON.stringify(notInInventory)}`);
+
+    // 3. THE COST GUARANTEE, measured from the stub tmux's own log rather than asserted in prose
+    //    (#357). A governance audit that spawns real `claude` panes on every `npm test` is not
+    //    shippable, and "it doesn't" is a claim about a code path, so it is measured here.
+    //    `tmux new-session` is what launches a pane; its absence is what makes this free.
+    //
+    //    ORDER IS LOAD-BEARING: this runs BEFORE the snapshot comparison. It was written after it
+    //    at first, and mutation N4 (which forces the variant's warm-up back on, so the TUI path
+    //    runs and four `tmux new-session` calls appear) was caught by the KEY-SET DIFF instead —
+    //    the assertion below never executed, so it was unproven while looking proven. These two
+    //    facts are also about different things: how the record was OBTAINED, then what it says.
+    assert.ok(Array.isArray(first.tmuxCalls),
+      `profile ${profile.id}: the fixture's tmux log was unreadable, so the no-spawn guarantee ` +
+      `below would pass vacuously`);
+    const spawning = first.tmuxCalls.filter(c => !c.startsWith("tmux list-sessions"));
+    assert.deepStrictEqual(spawning, [],
+      `profile ${profile.id}: this probe asked tmux to do something other than list sessions. ` +
+      `Every one of these would boot a real \`claude\` pane against a real tmux, which is real ` +
+      `quota and a real process on every npm test:\n${first.tmuxCalls.map(c => `  ${c.slice(0, 200)}`).join("\n")}`);
+    // POSITIVE EVIDENCE, and it is the half that stops the assertion above from passing on a
+    // missing operand: an EMPTY log satisfies "nothing spawned a pane" whether the stub refused
+    // or the REAL tmux ran instead and never wrote to it. An exact count under TUI mode (where
+    // reapStaleTuiSessions runs exactly once at boot) can only be produced by the stub being the
+    // binary server.mjs resolved.
+    assert.equal(first.tmuxCalls.length, profile.expectTmuxCalls,
+      `profile ${profile.id}: expected exactly ${profile.expectTmuxCalls} tmux invocation(s) and ` +
+      `saw ${first.tmuxCalls.length}. Under TUI mode a count of 0 means the stub was NOT the tmux ` +
+      `server.mjs resolved (check OCP_TUI_TMUX_BIN), which would make the no-spawn assertion above ` +
+      `vacuous and put the operator's real tmux server in reach of reapStaleTuiSessions' ` +
+      `kill-server.\n${first.tmuxCalls.map(c => `  ${c.slice(0, 200)}`).join("\n")}`);
+
+    // 4. The snapshot block itself. `drift` is the actionable message; it names every added and
+    //    removed key path and tells the author which authorization each kind needs.
+    assert.ok(snapshot[profile.snapshotKey],
+      `the snapshot has no "${profile.snapshotKey}" block for profile ${profile.id}. Regenerate ` +
+      `with: node scripts/b2-key-snapshot.mjs --write`);
+    const drift = diffB2KeySets(snapshot[profile.snapshotKey], first.records);
+    assert.equal(drift, null, drift ? `profile ${profile.id}:\n${drift}` : "");
+
+  }
+
+  // 5. The two profiles must actually DIFFER, and differ where #357 says they do. Without this,
+  //    a variant profile whose env stopped being applied — the exact failure that makes a second
+  //    profile theatre — would sail through every assertion above by recording the default shape
+  //    a second time. Keyed on the 12 measured paths rather than on "not equal", so a diff that
+  //    silently shrank to one path is a failure too.
+  const dflt = byProfile["default"]["GET /health"].keys;
+  const variant = byProfile["tui-pool"]["GET /health"].keys;
+  const POOL_KEYS = ["size", "warm", "booting", "model", "hits", "misses", "boots", "bootFailures", "cancelled", "dropped"]
+    .map(k => `tui.pool.${k}`).sort();
+  assert.deepStrictEqual(POOL_KEYS.filter(k => !variant.includes(k)), [],
+    `the tui-pool profile must expose every TuiPanePool.stats() key on /health; missing: ` +
+    `${JSON.stringify(POOL_KEYS.filter(k => !variant.includes(k)))}`);
+  assert.deepStrictEqual(POOL_KEYS.filter(k => dflt.includes(k)), [],
+    "the default profile must expose NO tui.pool.* key — if it does, the two profiles no longer bracket anything");
+  assert.ok(dflt.includes("spawn.reason") && !variant.includes("spawn.reason"),
+    "spawn.reason is the TUI-mode delta: present under the default profile, absent under tui-pool");
+  assert.ok(dflt.includes("config.allowedTools[]") && !variant.includes("config.allowedTools[]"),
+    "config.allowedTools[] is the skip-permissions delta: an array by default, a string under tui-pool");
 });
 
 // ── #359: request bodies must decode UTF-8 ACROSS chunk boundaries ──────────────────────────
