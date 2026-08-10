@@ -194,6 +194,20 @@ release_kit:
         recorded, so uptime, timestamps and counters cannot make it flap; the suite
         proves that by probing two fresh boots and requiring identical output.
 
+        TWO CONFIGURATION PROFILES since #357, one snapshot block each, defined in
+        scripts/b2-key-snapshot.mjs § B2_PROFILES:
+
+          probes           the default configuration — TUI mode, the warm pane pool and
+                           skip-permissions all OFF. What every production instance in
+                           the reference fleet runs.
+          probesTuiPool    the config-variant corner — CLAUDE_TUI_MODE=true,
+                           OCP_TUI_POOL_SIZE=1, CLAUDE_SKIP_PERMISSIONS=true.
+
+        BOTH blocks get all 16 pairs, two fresh boots, and their own ALIGNMENT.md
+        coverage check, so a second profile is not a place an endpoint can hide. Read
+        the diff of both; a key path that appears in only one is surface only that
+        configuration reaches, not a discrepancy.
+
         To read the release's surface change:
 
           git diff v<previous-tag>..HEAD -- docs/governance/b2-response-keys.json
@@ -258,12 +272,25 @@ release_kit:
             changes ARE caught (object <-> scalar, array <-> object).
           - RENAMES, as renames. A rename fails the test as one removal plus one
             addition; the mechanism cannot tell it apart from two unrelated changes.
-          - Shapes that exist only under a NON-DEFAULT configuration, MEASURED at 12
-            key paths total: CLAUDE_TUI_MODE=true alone is -1 (spawn.reason) and leaves
-            tui.pool NULL; tui.pool becomes an object only with OCP_TUI_POOL_SIZE>=1,
-            adding 10 paths; CLAUDE_SKIP_PERMISSIONS=true is -1 (config.allowedTools[]).
-            10 of the 12 are inside tui.pool, which is where the next field is most
-            likely to land. A second fixture profile is tracked as issue #357.
+          - Shapes that exist only under a configuration NEITHER PROFILE PINS. The 12
+            key paths this bullet used to name are now GUARDED (#357): probesTuiPool
+            covers the 10 tui.pool.* members and probes covers spawn.reason and
+            config.allowedTools[]. The two profiles bracket rather than sample, because
+            the three settings are independent — MEASURED by booting the five reachable
+            variants (TUI alone; TUI+pool=1; skip-permissions alone; all three at
+            pool=1; all three at pool=4) and probing all 16 pairs: no key path appeared
+            that is absent from both blocks. What is still blind is the NEXT
+            shape-deciding setting, if both profiles happen to pin it to one value.
+          - The TUI REQUEST path, in either profile. OCP_TUI_TMUX_BIN points at a stub
+            tmux that logs its argv and exits 1, so no pane boots and no `claude` runs;
+            the suite asserts from that log that the only invocation is list-sessions.
+            Deliberate: MEASURED, warm-up traffic under CLAUDE_TUI_MODE=true issued four
+            `tmux new-session` commands each launching a `claude`, and with the REAL
+            tmux server.mjs's boot-time reapStaleTuiSessions({includeLegacy:true}) would
+            `tmux kill-server` on a workstation with no foreign session. The cost of that
+            bound is that probesTuiPool records no element keys for /api/usage's
+            byKey[]/recent[]/timeline[] or for recentErrors[] — probes records all of
+            them, so a field added there is still caught.
           - REQUEST-SHAPED responses, where the recorded keys come from the probe's own
             body rather than from the server. PATCH /settings echoes one results.<key>
             per setting sent; the probe pins {timeout}. Ask this of every new probe —
