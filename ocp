@@ -37,8 +37,7 @@ _curl() {
 _json() { python3 -m json.tool 2>/dev/null || cat; }
 
 # Issue #242 (audit follow-up to #236): shared graceful-degradation fallback for the read-only
-# display commands' `<curl-or-var> | python3 -c "..."` pipelines (usage/logs/models/sessions/
-# clear/keys/settings). Under `set -euo pipefail` (ocp:7), a bare pipeline like this that is NOT
+# display commands' `<curl-or-var> | python3 -c "..."` pipelines (usage/logs/models/keys/settings). Under `set -euo pipefail` (ocp:7), a bare pipeline like this that is NOT
 # inside an if/while condition kills the WHOLE `ocp` invocation the instant python3 exits
 # non-zero — whether because python3 isn't on PATH (bash's own command-not-found, exit 127,
 # exactly #236's repro one level up) or because the formatter itself choked on the response body
@@ -359,7 +358,7 @@ cmd_health_help() {
   cat <<'EOF'
 ocp health — Proxy health and diagnostics
 
-Shows proxy status, version, uptime, auth, config, sessions, and recent errors.
+Shows proxy status, version, uptime, auth, config, and recent errors.
 
 Usage: ocp health
 EOF
@@ -448,58 +447,9 @@ for m in d.get('data', []):
 " || _pyfail "Could not format model list" "$data"
 }
 
-# ── sessions ─────────────────────────────────────────────────────────────
-cmd_sessions_help() {
-  cat <<'EOF'
-ocp sessions — List active CLI sessions
-
-Usage: ocp sessions
-EOF
-}
-
-cmd_sessions() {
-  local data
-  # Issue #278 (same shape as cmd_logs above, see its comment).
-  data=$(_curl_or_die "proxy unreachable" curl -sf --max-time 5 "$PROXY/sessions") || return 1
-  echo "$data" | python3 -c "
-import sys, json
-d = json.loads(sys.stdin.read())
-sessions = d.get('sessions', [])
-if not sessions:
-    print('No active sessions.')
-else:
-    for s in sessions:
-        print(f\"  {s['id'][:16]}...  model={s['model']}  msgs={s['messages']}  last={s['lastUsed']}\")
-" || _pyfail "Could not format session list" "$data"
-}
-
-# ── clear ────────────────────────────────────────────────────────────────
-cmd_clear_help() {
-  cat <<'EOF'
-ocp clear — Clear all active CLI sessions
-
-Usage: ocp clear
-EOF
-}
-
-cmd_clear() {
-  local result
-  # Issue #278 (same shape as cmd_logs above, see its comment).
-  result=$(_curl_or_die "proxy unreachable" curl -sf --max-time 5 -X DELETE "$PROXY/sessions") || return 1
-  # The DELETE above already ran (the clear itself, if the proxy answered, already happened) —
-  # only the count formatting can still fail python3-absent/malformed, so the fallback below
-  # says so explicitly rather than implying the clear itself didn't happen (issue #242).
-  # No `2>/dev/null` here (independent review, PR #252 round 1): the other eight `_pyfail` sites
-  # deliberately let python3's own traceback flow through to stderr alongside the `_pyfail`
-  # warning for maximum diagnostic information; this site used to suppress it inconsistently
-  # with no stated reason. Matched to the others rather than inventing an exception.
-  local count
-  if count=$(echo "$result" | python3 -c "import sys,json; print(json.loads(sys.stdin.read())['cleared'])"); then
-    echo "Cleared $count sessions."
-  else
-    _pyfail "Sessions were cleared, but the count could not be formatted" "$result"
-  fi
-}
+# `ocp sessions` and `ocp clear` were REMOVED under ADR 0016 with the GET|DELETE /sessions
+# endpoints they called. Both printed a constant: the proxy's sessions Map has had no writer
+# since PR #103, so the list was always empty and the clear always reported 0.
 
 # ── keys ────────────────────────────────────────────────────────────────
 cmd_keys_help() {
@@ -1141,7 +1091,6 @@ Tunable keys:
   timeout            Overall request timeout (ms)         [30000 - 600000]
   firstByteTimeout   Base first-byte timeout (ms)         [15000 - 300000]
   maxConcurrent      Max concurrent claude processes      [1 - 32]
-  sessionTTL         Session idle expiry (ms)             [60000 - 86400000]
   maxPromptChars     GLOBAL truncation override (chars)   [10000 - 1000000]
                      (unset = per-model, models.json contextWindow x 3)
   tiers.opus.base    Opus first-byte timeout base (ms)    [30000 - 600000]
@@ -1168,7 +1117,7 @@ import sys, json
 d = json.loads(sys.stdin.read())
 print('OCP Settings')
 print('─────────────────────────────────────')
-for k in ('timeout','firstByteTimeout','maxConcurrent','sessionTTL','maxPromptChars'):
+for k in ('timeout','firstByteTimeout','maxConcurrent','maxPromptChars'):
     v = d.get(k, {})
     val = v.get('value', '?')
     unit = v.get('unit', '')
@@ -1727,8 +1676,6 @@ Commands:
   settings           View or update tunable settings
   logs [N] [level]   Recent logs (default: 20, error)
   models             Available models
-  sessions           Active sessions
-  clear              Clear all sessions
   keys               Manage API keys (add/list/revoke)
   lan                LAN mode setup guide
   connect <ip>       Connect to a remote OCP (sets env vars in rc file)
@@ -1772,8 +1719,6 @@ case "$subcmd" in
   settings) cmd_settings "${1:-}" "${2:-}" ;;
   logs)     cmd_logs "${1:-20}" "${2:-error}" ;;
   models)   cmd_models ;;
-  sessions) cmd_sessions ;;
-  clear)    cmd_clear ;;
   keys)     cmd_keys "${1:-}" "${2:-}" ;;
   lan)      cmd_lan ;;
   connect)  cmd_connect "$@" ;;

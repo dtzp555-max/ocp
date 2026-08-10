@@ -18,7 +18,6 @@
  *   CLAUDE_SKIP_PERMISSIONS      — "true" to bypass all permission checks (default: false)
  *   CLAUDE_SYSTEM_PROMPT         — system prompt appended to all requests
  *   CLAUDE_MCP_CONFIG            — path to MCP server config JSON file
- *   CLAUDE_SESSION_TTL           — session TTL in ms (default: 3600000 = 1h)
  *   CLAUDE_AUTH_CHECK_INTERVAL_MS — how often the background `claude auth status` probe runs (default: 600000 = 10min)
  *   CLAUDE_AUTH_CHECK_TIMEOUT_MS  — per-probe timeout in ms (default: 10000)
  *   CLAUDE_MAX_CONCURRENT        — max concurrent claude processes, -p/stream-json path (default: 8)
@@ -368,7 +367,6 @@ const STRUCTURED_MAX_ATTEMPTS = resolveMaxAttempts(
   { fallback: 3, warn: (m) => console.warn(`[init] ${m}`) },
 );
 const MCP_CONFIG = process.env.CLAUDE_MCP_CONFIG || "";
-let SESSION_TTL = parseInt(process.env.CLAUDE_SESSION_TTL || "3600000", 10);
 let MAX_CONCURRENT = parseInt(process.env.CLAUDE_MAX_CONCURRENT || "8", 10);
 // FIX ⑥ (concurrency): bound on requests WAITING for a -p concurrency slot. Beyond
 // MAX_CONCURRENT, requests queue (up to CLAUDE_MAX_QUEUE) instead of being rejected; when the
@@ -956,40 +954,15 @@ const MODEL_MAP = Object.fromEntries([
 
 const MODELS = modelsConfig.models.map(m => ({ id: m.id, name: m.displayName }));
 
-// ── Session management ──────────────────────────────────────────────────
-// Maps namespaced session keys to Claude CLI session UUIDs.
-// Key format: "${keyName}|${conversationId}" — prevents cross-key collision
-// when two callers (different API keys or anon + authenticated) use the same
-// session_id string. Anonymous callers use "anon"; admin uses "admin".
-// Enables --resume for multi-turn conversations, reducing token waste.
-const sessions = new Map(); // `${keyName}|${conversationId}` → { uuid, messageCount, lastUsed, model }
-
-// Build the namespaced key used for all sessions Map operations.
-// Returns null when conversationId is falsy (one-off requests bypass session tracking).
-function _sessionKey(conversationId, keyName) {
-  return conversationId ? `${keyName || "anon"}|${conversationId}` : null;
-}
-
-const sessionCleanupInterval = setInterval(() => {
-  const now = Date.now();
-  for (const [id, s] of sessions) {
-    const idleMs = now - s.lastUsed;
-    const ageMs = s.firstSeen ? now - s.firstSeen : null;
-    // id is "${keyName}|${conversationId}"; strip prefix for log output
-    const convIdShort = id.includes("|") ? id.slice(id.indexOf("|") + 1, id.indexOf("|") + 13) : id.slice(0, 12);
-    if (idleMs > SESSION_TTL) {
-      sessions.delete(id);
-      console.log(`[session] expired ${convIdShort}... (idle ${Math.round(idleMs / 60000)}m)`);
-      logEvent("info", "session_expired", { conversationId: convIdShort + "...", idleMs, ageMs });
-    } else if (ageMs !== null && ageMs > 4 * SESSION_TTL) {
-      // #42 evidence-gathering: a session whose firstSeen is more than 4× TTL old
-      // but whose lastUsed keeps getting bumped (never idle long enough to expire)
-      // is the suspected bug. Log without action so the pattern can be confirmed
-      // in /logs. Do NOT enforce an absolute age cap here speculatively.
-      logEvent("warn", "session_long_lived", { conversationId: convIdShort + "...", idleMs, ageMs });
-    }
-  }
-}, 60000);
+// ── Session management: REMOVED (ADR 0016) ──────────────────────────────
+// The `sessions` Map, its TTL reaper and `_sessionKey()` were REMOVED here under ADR 0016.
+// PR #103 (merge commit 885f62a, 2026-05-30) deleted the only `sessions.set(...)` — 1 deletion,
+// 0 additions — because per-request spawning with messagesToPrompt made it unnecessary; see the
+// comment above spawnClaudeProcess. The Map survived twelve releases with no writer, so every
+// surface reading it reported a constant dressed as a measurement. Nothing replaces it: on the
+// `-p` path a "session" is not a thing OCP has, and TUI mode's warm pane pool reports itself
+// through `tui.pool` (ADR 0007). Do not re-add a counter here without wiring a writer in the
+// same change — that is the failure ADR 0016 exists to stop repeating.
 
 // Cache cleanup: remove expired entries every 10 minutes
 const cacheCleanupInterval = setInterval(() => {
@@ -1557,7 +1530,9 @@ function getModelTier(cliModel) {
 // dropped because it is incompatible with stream-json mode without -p.
 // OCP now always passes the full serialized conversation via stdin
 // (messagesToPrompt), so multi-turn correctness is preserved without sessions.
-// The sessions Map is retained for stats/logging but no longer drives --resume.
+// The sessions Map that this comment used to say was "retained for stats/logging" is GONE
+// (ADR 0016): retaining it kept every reader reporting a constant. conversationId is still
+// accepted and still logged per request — it just no longer indexes anything.
 // Reference: OLP ADR 0009 Amendment 1 + commit 97e7d16.
 // FIX ⑥: concurrency is now bounded by the claudeSemaphore via acquireClaudeSlot(), which the
 // caller MUST await before calling this, passing the resulting release fn as `releaseSlot`. The
@@ -2994,7 +2969,6 @@ async function handleStatus(_req, res) {
       version: VERSION,
       uptime: `${Math.floor(uptimeMs / 3600000)}h ${Math.floor((uptimeMs % 3600000) / 60000)}m`,
       auth: (() => { const a = effectiveAuthStatus(); return a.ok ? "ok" : a.message; })(),
-      activeSessions: sessions.size,
     },
     requests: {
       total: stats.totalRequests,
@@ -3015,7 +2989,13 @@ async function handleStatus(_req, res) {
 const SETTINGS_SCHEMA = {
   timeout:          { type: "number", min: 30000, max: 1800000, unit: "ms", desc: "Request timeout (default: 600s)" },
   maxConcurrent:    { type: "number", min: 1, max: 32, unit: "", desc: "Max concurrent claude processes" },
-  sessionTTL:       { type: "number", min: 60000, max: 86400000, unit: "ms", desc: "Session idle expiry" },
+  // `sessionTTL` was REMOVED from this schema under ADR 0016, and removing it from HERE is what
+  // performs the rejection the ADR asks for. A PATCH carrying it now falls through
+  // applySettingUpdate's `if (!schema) return "unknown setting: sessionTTL"`, i.e. HTTP 400
+  // (or 207 alongside a valid key) with a named error — the same answer any other unknown key
+  // has always got. That is deliberate: "reject explicitly rather than ignore silently" needs no
+  // new code path, only the absence of this line, and a bespoke 410-style branch would have been
+  // a second way to say no. Do not add `sessionTTL` back as a no-op accepted key.
   // ADR 0011: a GLOBAL override of the per-model budget. Setting it pins the truncation ceiling
   // to this one number for EVERY model; unset, each model gets contextWindow × 3 from models.json
   // and this reports the fallback (smallest known window × 3). Range unchanged — deliberately not
@@ -3029,7 +3009,6 @@ function getSettings() {
   return {
     timeout:          { value: TIMEOUT, ...SETTINGS_SCHEMA.timeout },
     maxConcurrent:    { value: MAX_CONCURRENT, ...SETTINGS_SCHEMA.maxConcurrent },
-    sessionTTL:       { value: SESSION_TTL, ...SETTINGS_SCHEMA.sessionTTL },
     // Stays a plain number: `ocp settings` formats this into a fixed-width column and PATCH
     // takes a single scalar, so a null or a per-model map would break both consumers. When no
     // override is set this is FALLBACK_PROMPT_CHARS (600,000 today) — the same number this
@@ -3053,7 +3032,6 @@ function applySettingUpdate(key, value) {
     // needs release() to stop over-granting until inflight drains under the new cap, and raising
     // needs queued waiters woken immediately to use the new headroom. See lib/tui/semaphore.mjs.
     case "maxConcurrent":    MAX_CONCURRENT = value; claudeSemaphore.setLimit(value); break;
-    case "sessionTTL":       SESSION_TTL = value; break;
     // ADR 0011: installs the GLOBAL override. There is deliberately no way to clear it back to
     // per-model derivation over PATCH — the schema's min is 10000, so no in-range value means
     // "unset", and accepting null would be a request-shape change. Restart without
@@ -3711,7 +3689,7 @@ const server = createServer(async (req, res) => {
   req._authKeyId = authKeyId;
 
   // isAdmin computed here (early, before any admin-gated handler) so that
-  // DELETE /sessions, GET /logs, GET /usage, GET /status, PATCH /settings
+  // GET /logs, GET /usage, GET /status, PATCH /settings
   // can all gate on it.  Localhost and explicit admin key are always admin;
   // in multi-tenant mode only the "admin" named key qualifies.
   const isAdmin = AUTH_MODE !== "multi" || authKeyName === "admin" || isLocalhost;
@@ -3738,17 +3716,6 @@ const server = createServer(async (req, res) => {
     try { accessSync(CLAUDE, constants.X_OK); binaryOk = true; } catch {}
 
     const uptimeMs = Date.now() - START_TIME;
-    const sessionList = [];
-    for (const [id, s] of sessions) {
-      // id is "${keyName}|${conversationId}"; expose only the public-facing conversationId
-      const convId = id.includes("|") ? id.slice(id.indexOf("|") + 1) : id;
-      sessionList.push({
-        id: convId.slice(0, 12) + "...",
-        model: s.model,
-        messages: s.messageCount,
-        idleMs: Date.now() - s.lastUsed,
-      });
-    }
 
     return jsonResponse(res, 200, {
       status: proxyHealthStatus(binaryOk),
@@ -3768,7 +3735,6 @@ const server = createServer(async (req, res) => {
       config: {
         timeout: TIMEOUT,
         maxConcurrent: MAX_CONCURRENT,
-        sessionTTL: SESSION_TTL,
         circuitBreaker: "disabled",
         allowedTools: SKIP_PERMISSIONS ? "all (skip-permissions)" : ALLOWED_TOOLS,
         systemPrompt: SYSTEM_PROMPT ? `${SYSTEM_PROMPT.slice(0, 50)}...` : "(none)",
@@ -3776,7 +3742,6 @@ const server = createServer(async (req, res) => {
       },
       stats,
       circuitBreaker: "disabled",
-      sessions: sessionList,
       recentErrors: recentErrors.slice(-5),
       // ── FIX ③ spawn-home isolation surface — ADDITIVE (default -p/stream-json path) ──
       // Lets the operator confirm the latency-fix isolation is active without inspecting logs.
@@ -3836,25 +3801,10 @@ const server = createServer(async (req, res) => {
     });
   }
 
-  // DELETE /sessions — clear all sessions (mutating; admin only)
-  if (req.url === "/sessions" && req.method === "DELETE") {
-    if (!isAdmin) return jsonResponse(res, 403, { error: { message: "admin only", type: "auth_error" } });
-    const count = sessions.size;
-    sessions.clear();
-    return jsonResponse(res, 200, { cleared: count });
-  }
-
-  // GET /sessions — list active sessions (operator data; admin only)
-  if (req.url === "/sessions" && req.method === "GET") {
-    if (!isAdmin) return jsonResponse(res, 403, { error: { message: "admin only", type: "auth_error" } });
-    const list = [];
-    for (const [id, s] of sessions) {
-      // id is "${keyName}|${conversationId}"; expose only the public-facing conversationId
-      const convId = id.includes("|") ? id.slice(id.indexOf("|") + 1) : id;
-      list.push({ id: convId, uuid: s.uuid, model: s.model, messages: s.messageCount, lastUsed: new Date(s.lastUsed).toISOString() });
-    }
-    return jsonResponse(res, 200, { sessions: list });
-  }
+  // GET /sessions and DELETE /sessions were REMOVED under ADR 0016. No replacement handler is
+  // registered, so both now fall through to the catch-all 404 below — the same answer any other
+  // unrouted path gets, and the same answer POST /sessions already gave. Verified on the wire
+  // rather than assumed.
 
   // GET /usage — fetches plan usage from Anthropic API with operator token; admin only
   if (req.url === "/usage" && req.method === "GET") {
@@ -4074,7 +4024,7 @@ const server = createServer(async (req, res) => {
     return;
   }
 
-  jsonResponse(res, 404, { error: "Not found. Endpoints: GET /v1/models, POST /v1/chat/completions, GET /health, GET /usage, GET /status, GET /logs, GET|PATCH /settings, GET|DELETE /sessions, GET /dashboard, GET|POST|DELETE /api/keys, GET|PATCH /api/keys/:id/quota, GET /api/usage, GET /cache/stats, DELETE /cache" });
+  jsonResponse(res, 404, { error: "Not found. Endpoints: GET /v1/models, POST /v1/chat/completions, GET /health, GET /usage, GET /status, GET /logs, GET|PATCH /settings, GET /dashboard, GET|POST|DELETE /api/keys, GET|PATCH /api/keys/:id/quota, GET /api/usage, GET /cache/stats, DELETE /cache" });
 });
 
 
@@ -4106,7 +4056,6 @@ function gracefulShutdown(signal) {
   });
 
   // 2. Clear intervals/timers
-  clearInterval(sessionCleanupInterval);
   clearInterval(authCheckInterval);
   clearInterval(cacheCleanupInterval);
   if (tuiReapInterval) clearInterval(tuiReapInterval);
@@ -4178,7 +4127,6 @@ server.listen(PORT, BIND_ADDRESS, () => {
   console.log(`Timeout: ${TIMEOUT / 1000}s | Max concurrent: ${MAX_CONCURRENT} | Queue: ${CLAUDE_MAX_QUEUE} (429 on overflow)`);
   console.log(`Circuit breaker: disabled`);
   console.log(`Tools: ${SKIP_PERMISSIONS ? "all (skip-permissions)" : ALLOWED_TOOLS.join(", ")}`);
-  console.log(`Sessions: TTL=${SESSION_TTL / 1000}s`);
   if (SYSTEM_PROMPT) console.log(`System prompt: "${SYSTEM_PROMPT.slice(0, 80)}..."`);
   if (MCP_CONFIG) console.log(`MCP config: ${MCP_CONFIG}`);
   console.log(`Auth: ${PROXY_API_KEY ? "enabled (PROXY_API_KEY set)" : "disabled (no PROXY_API_KEY)"}`);
