@@ -567,10 +567,118 @@ export function parseFlagValue(args, flag) {
   return { seen: false, value: undefined };
 }
 
+// The target a post-flight comparison is actually made against, v-stripped. Issue #372: this
+// expression existed in THREE places (postFlightOk, runPostFlightCheck's return, and — after
+// #372 — the body-rejection classifier), and the three had to agree for the classifier's
+// `version-mismatch` to mean the same comparison `postFlightOk` rejects on. Single source, so
+// they cannot drift into disagreeing about what "the target" is.
+//
+// Empty is a real value here, not a defect to be defended against: `readSnapshot` returns
+// `null` for `fromVersion` when `from-version.txt` is unreadable (scripts/lib/snapshot.mjs's
+// `catch { return null; }`), and `postFlightOk` deliberately degrades to the serving check alone
+// in that case so an unknown release target never blocks a good upgrade. What #372 fixes is the
+// callers that then compared against it anyway.
+export function postFlightWant(target) {
+  return String(target || "").replace(/^v/, "");
+}
+
 export function postFlightOk(body, target) {
   if (body?.status !== "ok") return false;
-  const want = String(target || "").replace(/^v/, "");
+  const want = postFlightWant(target);
   return !want || body?.version === want;
+}
+
+// Issue #372. A NAME IS A CLAIM, and `version-mismatch` was making one the code could not back.
+//
+// `runPostFlightCheck` used to stamp that kind on EVERY post-body acceptance failure, in one
+// unconditional line. But the acceptance predicate is `postFlightOk`, which rejects on **status**
+// as well as version — and `/health`'s status domain is exactly {"ok","degraded"} (server.mjs:1191;
+// degraded when the CLI binary is not OK, or after AUTH_DEGRADE_AFTER consecutive auth rejections),
+// **always over HTTP 200**. So three unrelated states arrived under one name:
+//
+//   right version + status "degraded"  -> "version-mismatch"   (nothing to do with version)
+//   wrong version + status "ok"        -> "version-mismatch"   (the only correct one)
+//   JSON body carrying no `version`    -> "version-mismatch"   (detail: "serving unknown")
+//
+// #371 worked around it locally, reconstructing the missing distinctions inside `runRollback`'s
+// cells from `lastSeen`. That left the misnomer in place for every other caller — `runFullUpgrade`,
+// and `postFlightFailureSuffix`, which is what bash's `ocp update` DELEGATES ITS FINAL VERDICT TO
+// (`_cmd_update_light` / `_cmd_update_restart` both report whatever `--post-flight-only` says).
+// Splitting it here means a caller can key on the kind and get what the kind says.
+//
+// A PREDICATE IS A CLAIM TOO, which is the second half of #372 and the reason this function does
+// the version comparison rather than leaving it to each cell. `lastSeen !== target` — the shape
+// every caller wrote — is **satisfied by a missing operand**: with `target === ""` it is true for
+// any version at all, and `runRollback` measurably printed
+//     THE PROXY IS UP BUT SERVING THE WRONG VERSION (3.10.0, expected )
+// on a host whose `from-version.txt` could not be read. Requiring `want` to be non-empty *here*
+// makes `version-mismatch` mean "two present versions were compared and differed" for every
+// caller at once, instead of being a property each cell has to remember to re-establish.
+//
+// Ordering, decided rather than inherited: a body that is BOTH degraded and on the wrong version
+// is reported as `version-mismatch`, not `not-ok-status`. The wrong version is the more actionable
+// fact — it is the surviving-orphan shape (#173) whose remedy is to replace the process holding
+// the port — and calling it a status rejection would route it to a verdict that claims nothing.
+// The follow-up issue's sketch says "version-mismatch (version differs, status ok)"; this is a
+// deliberate departure from that parenthetical, for the reason just given.
+export function classifyPostFlightBodyRejection(body, target) {
+  // Not a shape this proxy emits at all. `/health` always answers with an object carrying
+  // `version` (server.mjs), so a JSON scalar, `null`, or an object without the field is something
+  // else answering on the port — the same conclusion the `unparseable` arm reaches for bytes that
+  // are not JSON, which is why both route to the same cell. `null` is called out separately
+  // because it is the shape that used to THROW: `lastSeen = body.version` had no optional
+  // chaining, the TypeError fell to `classifyPostFlightProbeFailure`'s default arm, and a service
+  // that answered was reported DOWN with a JS error message as the operator-facing detail (#360 is
+  // the same JSON-scalar shape on a different surface).
+  if (body === null || typeof body !== "object" || Array.isArray(body)) {
+    return {
+      kind: "body-not-ocp",
+      detail: `it answered with JSON that is not an object (${body === null ? "null" : Array.isArray(body) ? "array" : typeof body})`,
+    };
+  }
+  // #381 review finding F3. This was `body.version == null`, which let every NON-STRING `version`
+  // through to a comparison that coerced it. `postFlightOk` compares `body?.version === want`
+  // (strict, no coercion) while this compared `String(body.version) !== want`, so the two disagreed
+  // about what "the same version" means — and #372's own `postFlightWant` note claimed the single
+  // source made the kind mean the same comparison `postFlightOk` rejects on. It unified the target
+  // EXPRESSION, not the OPERATOR. Measured against target 3.29.2:
+  //
+  //   version: ["3.29.2"]  -> String() == "3.29.2" == want -> fell through to `not-ok-status`,
+  //                           rendering "…reported status=ok, not status=ok."
+  //   version: []          -> String() == ""       != want -> "SERVING THE WRONG VERSION (, expected 3.29.2)"
+  //   version: {}          -> "(…[object Object], expected 3.29.2)"
+  //
+  // The second is #372's own rendering defect on the other operand, which is why it is fixed here
+  // rather than filed. `/health` answers with a `version` STRING (server.mjs) — this arm's own
+  // comment already said so — so anything else is not a shape this proxy emits.
+  //
+  // WHICH HALF OF THIS FIX IS LOAD-BEARING, measured rather than assumed (AGENTS.md / #376: a claim
+  // of guaranteed behaviour cites the mutation that proves it, and this one cites a mutation that
+  // came back GREEN). The type check below is the fix: reverting it to `body.version == null`
+  // (mutation R3) turns the F3 test red at 1141/1. Dropping the old `String()` from the comparison
+  // is NOT independently detectable — restoring it alone (mutation R4) leaves the suite at 1142/0,
+  // because with the type check in place `body.version` is always a string and `String(s) === s`.
+  //
+  // So the honest claim is narrower than "the operators were unified and that fixed it": the type
+  // check fixed it, and the strict comparison is defence in depth BEHIND it, kept so that loosening
+  // the type check does not silently reinstate a coercing comparison. R4 is reported as green
+  // rather than omitted, because an unreported green mutation is indistinguishable from one nobody
+  // ran — and this one is a statement about the code, not a gap in the test.
+  if (typeof body.version !== "string") {
+    return {
+      kind: "body-not-ocp",
+      detail: body.version == null
+        ? "it answered with JSON that carries no `version` field"
+        : `it answered with JSON whose \`version\` is not a string (${Array.isArray(body.version) ? "array" : typeof body.version})`,
+    };
+  }
+  const want = postFlightWant(target);
+  if (want && body.version !== want) {
+    return { kind: "version-mismatch", detail: `serving ${body.version}` };
+  }
+  // Everything else reaching here was rejected by `postFlightOk` for the only remaining reason:
+  // `status !== "ok"`. Named for what was observed rather than for what it is not.
+  return { kind: "not-ok-status", detail: `status=${body.status ?? "absent"}` };
 }
 
 // Issue #214 remediation (kind="restart"): bash's cmd_restart() already performs the actual
@@ -611,14 +719,42 @@ export function classifyPostFlightProbeFailure(e) {
   // Same predicate as `ocp`'s `_curl_is_local_fault` and classifyBindCheck's could-not-run arm:
   // 127/126 are bash's own reserved codes (curl never produces them), and dash phrases a missing
   // command as "not found" without the word "command" at all.
+  //
+  // #381 review finding F1, first half. That regex is a TEXT match, and the local faults that do
+  // not produce text matching it were landing in the default arm below and being narrated as the
+  // service being unreachable. The decisive one is the SPAWN failure: when `execSync` cannot start
+  // the child at all — `EAGAIN` (cannot fork), `ENOMEM`, `EMFILE` — Node throws with **no exit
+  // status** and an errno instead, because no process ever ran to produce one. That absence is
+  // positive evidence that the fault is local: an error carrying an errno and no `status` did not
+  // come back from curl, it came back from trying to start curl. Measured before the fix: both
+  // EAGAIN and ENOMEM classified `unreachable`, and a low-memory host — the fleet includes Pis —
+  // therefore read "THE PROXY IS DOWN" about a proxy nothing had probed. That is verbatim what the
+  // `#291` money test exists to prevent, on the branch it did not cover.
   if (status === 127 || status === 126
       || /\bnot found\b|no such file or directory|permission denied|enoent/i.test(text)) {
     return { kind: "probe-could-not-run", detail: first || `exit ${status ?? "unknown"}` };
   }
+  if (status == null && (e?.code != null || e?.errno != null)) {
+    return { kind: "probe-could-not-run", detail: first || `the probe process could not be started (${e?.code ?? e?.errno})` };
+  }
   if (status === 22) return { kind: "http-error", detail: first || "curl exit 22 (server returned a non-2xx status)" };
   if (status === 28) return { kind: "timeout", detail: first || "curl exit 28 (operation timed out)" };
   if (status === 7) return { kind: "unreachable", detail: first || "curl exit 7 (failed to connect)" };
-  return { kind: "unreachable", detail: first || (status != null ? `curl exit ${status}` : "unknown probe failure") };
+  // #381 review finding F1, second half — AND THE FINDING WORTH READING TWICE. `unreachable` used to
+  // be this function's DEFAULT arm as well as curl 7's, so the name was a claim nothing established:
+  // every unrecognised exit code inherited it, and the DOWN cell keys on that name. Measured, all
+  // reported DOWN: curl 52 (empty reply from server) and curl 56 (connection reset by peer) — both
+  // of which mean the peer ACCEPTED the connection — plus every spawn failure, before the arm above.
+  //
+  // This is the same defect #372 fixed for `version-mismatch`, in this same function, one branch
+  // over: THE RULE WAS APPLIED TO THE KIND I WAS LOOKING AT AND NOT TO THE ONE BESIDE IT. `unreachable`
+  // now means exactly "curl said it could not connect", and everything else gets a kind that claims
+  // nothing. Callers must not route this to DOWN — see the ladders' `didNotReach`, which deliberately
+  // does not list it, so an unrecognised failure falls to the neutral verdict instead.
+  return {
+    kind: "probe-failed-unclassified",
+    detail: first || (status != null ? `curl exit ${status}` : "unknown probe failure"),
+  };
 }
 
 // The operator-facing rendering of a post-flight failure. Exported and kept separate from the
@@ -651,18 +787,73 @@ export function postFlightOnlyCommand(target) {
   return `node ${self} --post-flight-only ${target}`;
 }
 
+// Issue #372, the same negation class as the cells: every "re-check with …" sentence in this file
+// interpolates a version that CAN BE ABSENT, and none of them checked.
+//
+//   - `postFlightOnlyCommand(meta.fromVersion)` with an unreadable `from-version.txt` rendered
+//     `--post-flight-only null` — measured.
+//   - `postFlightOnlyCommand(\`v${result.target}\`)` with an empty target rendered
+//     `--post-flight-only v`.
+//
+// Neither is caught downstream. The CLI's own guard fails CLOSED only on a missing or `--`-prefixed
+// value (see `--post-flight-only`'s parse below), and both of these are non-empty ordinary strings:
+// `"null"` is compared against literally and can never match, while `"v"` v-strips to `""`, which
+// `postFlightOk` deliberately degrades to the serving check alone — so the advice an operator is
+// given at their least-informed moment would report SUCCESS against any version at all. That is the
+// precise hazard the CLI guard's own comment describes, arriving through a hint rather than a typo.
+//
+// So the sentence is only offered when there is a version to name. Returns "" otherwise, and the
+// callers append it, so an absent target removes the clause instead of corrupting it.
+export function postFlightRecheckClause(target, { prefix = " Fix the local curl, then re-check with" } = {}) {
+  const want = postFlightWant(target);
+  if (!want) return "";
+  return `${prefix} \`${postFlightOnlyCommand(`v${want}`)}\`.`;
+}
+
+// Issue #372: keyed on the CLASSIFICATION, not on `lastSeen`'s presence.
+//
+// `if (result?.lastSeen)` used to run first, ahead of the switch, and that is the same
+// negation-shaped defect one layer out: it fires on the presence of a value that is never reset
+// (see `runPostFlightCheck`'s own sticky-`lastSeen` note), and the sentence it returns —
+// "a stale process may still hold the port" — is a claim about the CURRENT state. Measured
+// consequences, both on the lane `ocp update`'s bash half reports verbatim:
+//
+//   - a body carrying no `version` field rendered `" (unreachable — serving unknown)"`: the
+//     `default:` arm, i.e. the else, narrating something that ANSWERED as unreachable;
+//   - the new `not-ok-status` kind would land in that same default arm and say "unreachable"
+//     about a proxy that answered on the right version — R2-1's defect, reintroduced here.
+//
+// The `version-mismatch` branch keeps the pre-#291 text BYTE-FOR-BYTE (pinned by test): it was
+// already correct and specific, and `lastSeen` is current by construction there, assigned in the
+// same iteration that set the kind. The no-classification fallbacks are preserved unchanged too,
+// so a caller that hands this a result from before there was a classifier gets what it always got.
 export function postFlightFailureSuffix(result) {
-  if (result?.lastSeen) {
-    return ` (last saw version=${result.lastSeen} — a stale process may still hold the port; check \`ss -ltnp\` / \`lsof -i\`)`;
-  }
   const f = result?.lastFailure;
-  if (!f) return " (unreachable)";
+  if (!f) {
+    return result?.lastSeen
+      ? ` (last saw version=${result.lastSeen} — a stale process may still hold the port; check \`ss -ltnp\` / \`lsof -i\`)`
+      : " (unreachable)";
+  }
   switch (f.kind) {
     case "probe-could-not-run":
       return ` — the post-flight probe could not run on THIS machine (${f.detail}).`
         + ` That is a local environment fault and says nothing about the service:`
-        + ` the upgrade may well have succeeded. Fix the local curl, then re-check with`
-        + ` \`${postFlightOnlyCommand(`v${result.target}`)}\`.`;
+        + ` the upgrade may well have succeeded.`
+        + postFlightRecheckClause(result?.target);
+    case "version-mismatch":
+      return ` (last saw version=${result.lastSeen} — a stale process may still hold the port; check \`ss -ltnp\` / \`lsof -i\`)`;
+    case "not-ok-status":
+      return ` — the service ANSWERED on the port with version=${result.lastSeen} and reported ${f.detail},`
+        + ` not status=ok. That is the proxy's own health verdict, not a version problem —`
+        + ` nothing here says a stale process holds the port. Run \`ocp doctor\`.`;
+    case "body-not-ocp":
+      return ` — ${f.detail}. Something is answering on the port, but it is not this proxy.`;
+    case "probe-failed-unclassified":
+      // #381 F1: this is what the `default:` arm below used to swallow while calling it
+      // "unreachable". It claims nothing about the service, because nothing here establishes
+      // anything about the service.
+      return ` — the probe failed in a way this tool cannot classify (${f.detail}).`
+        + ` That is not evidence the service is down, and not evidence it is up. Check by hand.`;
     case "unparseable":
       return ` — ${f.detail}. Something is answering on the port, but it is not this proxy.`;
     case "http-error":
@@ -778,6 +969,38 @@ export function recoveryPlanCommands(restartPlan) {
   return [`${restartCmd.replace(" restart -- ", " reset-failed -- ")} || true`, ...cmds];
 }
 
+// #381 review finding F4. "Will anything start the service on its own?" — answered per plan shape,
+// because the honest answer differs by shape and in one shape OCP does not know it.
+//
+// This replaces a TWO-WAY ternary over a THREE-VALUE domain. `planRestart` returns `launchd`,
+// `user-unit` or `system-unit`, and the `else` branch asserted `Restart=always` for both non-launchd
+// shapes. The cited authority — `scripts/lib/install-autostart.mjs` — writes only the USER unit
+// (`:243-244`, enabled at `:264`). A `system-unit` plan comes from `resolveOwningUnit` /
+// `parseCgroupUnit`: an arbitrary unit that happens to own the port, whose `Restart=` directive OCP
+// never reads. On a host with a hand-written `/etc/systemd/system/ocp.service` carrying
+// `Restart=on-failure`, the old sentence told the operator systemd might recover it. It might not.
+//
+// The launchd sentence is hedged for a reason the review also caught: the resolved tear-down is
+// `launchctl bootout … 2>/dev/null || true` (`scripts/lib/restart-unit.mjs:865`), so its exit status
+// is DISCARDED — and this note is only ever rendered when a restart command has already failed. "The
+// job has been unloaded" was therefore an assumption about the very step that may not have worked.
+//
+// Extracted rather than fixed twice: both ladders render this sentence, and a two-copy fix is how
+// #352's LOW-1 came to be fixed on one path and left asserted on the other for four days.
+export function restartOwnerRecoveryNote(action) {
+  if (action === "launchd") {
+    return `If the bootout succeeded the job is unloaded and nothing will start it on its own — `
+      + `the bootout's exit status is discarded (\`|| true\`), so that is not confirmed here.`;
+  }
+  if (action === "user-unit") {
+    return `This is the unit OCP installs, configured Restart=always, so systemd may bring it back `
+      + `by itself — but it has not within the probe budget.`;
+  }
+  // `system-unit`, and any shape a future planRestart adds. Named as unknown rather than assumed.
+  return `This unit was discovered rather than installed by OCP, so its Restart= policy is not `
+    + `known here; it may or may not come back on its own.`;
+}
+
 export async function runPostFlightCheck(target, opts = {}) {
   const port = process.env.CLAUDE_PROXY_PORT || String(DEFAULT_PORT);
   const attempts = opts.attempts ?? 10;
@@ -796,17 +1019,28 @@ export async function runPostFlightCheck(target, opts = {}) {
   for (let i = 0; i < attempts; i++) {
     try {
       const body = probe();
-      lastSeen = body.version;
+      // Issue #372: `body.version`, with no optional chaining, THREW on a valid JSON `null` body.
+      // The TypeError was then caught two lines down by `classifyPostFlightProbeFailure`, whose
+      // default arm produced `{kind:"unreachable"}` — so a service that answered was reported
+      // DOWN, with "Cannot read properties of null (reading 'version')" as the operator-facing
+      // detail. `?? null` also normalises the no-`version`-field case from `undefined` to `null`,
+      // so the one nullish check callers make covers both.
+      // #381 review finding F3: `?? null` normalised the ABSENT case but not the wrong-TYPE case, so
+      // an array or object `version` reached every consumer that renders `lastSeen` as a version —
+      // producing "last saw version=[object Object]". `lastSeen` means "the version string this
+      // proxy reported", so it now holds only that.
+      lastSeen = typeof body?.version === "string" ? body.version : null;
       if (postFlightOk(body, target)) { ok = true; lastFailure = null; break; }
-      // Reached the service and read a version, it is just not the one we are waiting for. That
-      // is a different thing from not reaching it, and the caller can now say which.
-      lastFailure = { kind: "version-mismatch", detail: `serving ${body?.version ?? "unknown"}` };
+      // Reached the service and read a body, and the body was REJECTED. Which of the three
+      // reasons it was is decided by the classifier, not asserted by this line's choice of name —
+      // see `classifyPostFlightBodyRejection` for why that distinction is the whole of #372.
+      lastFailure = classifyPostFlightBodyRejection(body, target);
     } catch (e) {
       lastFailure = classifyPostFlightProbeFailure(e);
     }
     if (i < attempts - 1) await new Promise(r => setTimeout(r, intervalMs));
   }
-  return { ok, lastSeen, target: String(target || "").replace(/^v/, ""), lastFailure };
+  return { ok, lastSeen, target: postFlightWant(target), lastFailure };
 }
 
 // Issue #257: `--target` was parsed from argv (see `_isMain()` below) and threaded into
@@ -1333,7 +1567,7 @@ async function runFullUpgrade({ doctor, opts }) {
     //
     // Gate matches runRollback's own post-flight (#274): `opts.mockProbe || !opts.mockExec` — a
     // plain all-mock test still records "skipped-mock" exactly as before.
-    let postFlight = { ok: true, lastSeen: null, target: String(upgradeTarget || "").replace(/^v/, ""), lastFailure: null };
+    let postFlight = { ok: true, lastSeen: null, target: postFlightWant(upgradeTarget), lastFailure: null };
     let postFlightMeasured = false;
     if (opts.mockProbe || !opts.mockExec) {
       postFlightMeasured = true;
@@ -1347,7 +1581,10 @@ async function runFullUpgrade({ doctor, opts }) {
         ...(postFlight.ok ? {} : {
           // Wording matches runRollback's sibling phase verbatim; the budget is a parameter now, so
           // the old hard-coded "within 10s" would be a claim this function no longer guarantees.
-          message: `health did not return status=ok AND version=${upgradeTarget} within the post-flight budget`
+          // #381 F7: was `${upgradeTarget}`, the RAW option, which rendered `version=null` when the
+          // target was absent — the same class fixed one line over. `postFlight.target` is the
+          // v-stripped value the comparison actually used.
+          message: `health did not return status=ok AND version=${postFlight.target} within the post-flight budget`
             + postFlightFailureSuffix(postFlight),
         }),
       });
@@ -1355,11 +1592,61 @@ async function runFullUpgrade({ doctor, opts }) {
       phases.push({ name: "post-flight", status: "skipped-mock" });
     }
 
-    // The four outcome cells, mirroring `ocp`'s cmd_restart (ocp:1051-1127) so the two paths tell
-    // the operator the same story. The ordering is the load-bearing part: the local-fault arm is
+    // The outcome cells, modelled on `ocp`'s cmd_restart (ocp:1051-1127).
+    //
+    // #381 review finding F6 — WHAT "MIRRORING" DOES AND DOES NOT MEAN HERE, because the earlier
+    // wording ("so the two paths tell the operator the same story") claimed an equivalence that is
+    // measurably false. `ocp`'s `_curl_probe` ends `[[ $status -eq 0 ]] && return 0`, and `curl -sf`
+    // exits 0 for a 200 carrying ANY body — so on a 200 with a non-JSON body bash reaches warned
+    // SUCCESS (ocp:1092) and cannot reach its DOWN cell (ocp:1073, which requires `probe_rc -ne 0`),
+    // while this path parses the body and throws SOMETHING ELSE IS ANSWERING. The JS behaviour is
+    // the better one — only this path has the body to judge — and it is stated as a deliberate
+    // divergence rather than dressed up as fidelity. What IS inherited from bash is the ORDERING
+    // and the refusal to call a local fault a dead proxy.
+    //
+    // The ordering is the load-bearing part: the local-fault arm is
     // checked FIRST, because it is also a non-ok probe, and getting this backwards would tell a
     // machine with a broken curl that its proxy is dead — asserting a state nobody measured.
+    //
+    // ISSUE #372. This ladder used to end its restart-failure half at `restartFailure &&
+    // !postFlight.ok` — DOWN as the `else`. `runPostFlightCheck` reports `ok: false` for seven
+    // distinct states and the DOWN wording ("/health is not answering") is true in exactly two of
+    // them, so the cell fired on the ABSENCE of a successful probe rather than on evidence of
+    // non-reach. Measured on this path at v3.29.2, all three with a restart command failing:
+    //
+    //   answering, wrong version   -> "THE PROXY IS DOWN … /health is not answering", in the same
+    //                                 thrown error whose own post-flight phase said
+    //                                 `last saw version=3.10.0`
+    //   answering, right version,  -> the same sentence, about a proxy serving exactly the version
+    //     status "degraded"           this upgrade installed
+    //   non-JSON body              -> the same sentence, while the phase message said "Something
+    //                                 is answering on the port, but it is not this proxy"
+    //
+    // `ocp`'s `cmd_restart`, which these cells cite as their authority, does NOT have this defect:
+    // its DOWN cell keys on the curl exit code (`probe_rc -ne 0`), not on a version predicate. So
+    // splitting is closer to bash than `!postFlight.ok` was — narrower where bash is narrow, and
+    // deliberately stricter where only this path can be, per the F6 note above. #352/#371 fixed
+    // exactly this in `runRollback`; the cells below are the same five, in the same order, with
+    // this path's own wording (its hints may end by pointing at `ocp update --rollback`, which the
+    // rollback path cannot say). #373 extracts the shared ordering.
+    //
+    // DOWN now requires POSITIVE evidence of non-reach. Anything the classifier did not produce one
+    // of these kinds for — notably `not-ok-status`, a degraded proxy already serving the target —
+    // falls through to the neutral post-flight failure below, which claims nothing about reach and
+    // carries the pre-#347 tree-state hint. That is deliberate and it costs one thing, stated so a
+    // reviewer can weigh it: in that state the HINT no longer names the restart failure. The fact
+    // survives where it always was — the `restart` phase carries `status: "fail"` with the command
+    // and its stderr, and the `[restart]` lines are already on stderr — and inventing a sixth cell
+    // to restate it would put wording ahead of the measurement, which is what #372 is about.
     const probeCouldNotRun = postFlight.lastFailure?.kind === "probe-could-not-run";
+    const failureKind = postFlight.lastFailure?.kind ?? null;
+    const servedWrongVersion = failureKind === "version-mismatch";
+    const answeredNotOcp = failureKind === "unparseable" || failureKind === "http-error" || failureKind === "body-not-ocp";
+    // #381 F1: `probe-failed-unclassified` is deliberately ABSENT from this list. It is the
+    // classifier's own else — an unrecognised curl exit, an empty reply, a connection reset — and
+    // routing it to DOWN is the defect #372 removed, one layer up. It falls to the neutral verdict.
+    const didNotReach = failureKind === "unreachable" || failureKind === "timeout";
+    const notOkStatus = failureKind === "not-ok-status";
     // F5: single source for "what to run by hand", shared by every hint below.
     const recoveryCmds = recoveryPlanCommands(restartPlan).join(" && ");
 
@@ -1384,17 +1671,62 @@ async function runFullUpgrade({ doctor, opts }) {
       );
     }
 
-    if (restartFailure && !postFlight.ok) {
+    if (restartFailure && !postFlight.ok && answeredNotOcp) {
+      // #372, ported from #371's F1 cell. Something answered on the port and it is not this proxy —
+      // bytes that are not JSON, a non-2xx, or JSON that is not a shape `/health` emits. Neither
+      // "THE PROXY IS DOWN" nor "SERVING THE WRONG VERSION" is true: there is no version to name,
+      // and the thing answering may not be OCP at all. The REMEDY differs too, which is why this is
+      // a cell and not a reworded sentence — if a foreign process holds the port, the recovery
+      // commands cannot bind it and re-running them accomplishes nothing.
+      const answeredDetail = postFlight.lastFailure.detail;
+      throw Object.assign(
+        new Error(`post-flight failed: ${answeredDetail} — something is answering on 127.0.0.1:${port}, but it is not this proxy`),
+        { phases, cmd: restartFailure.cmd, snapshotPath,
+          hint: `SOMETHING ELSE IS ANSWERING ON 127.0.0.1:${port} — ${answeredDetail}. `
+            + `A restart command also failed after ${restartFailure.attempts} attempts. Do NOT simply re-run the restart: `
+            + `if another process owns the port, the start command cannot bind it and will keep failing. `
+            + `Find out what owns it first — \`ocp doctor\`, then \`lsof -i :${port}\` / \`ss -ltnp\`. `
+            + `Rolling back will not free the port either, so leave \`ocp update --rollback\` until you know what is there. `
+            + `Once the port is genuinely free, bring the service back with: ${recoveryCmds}` }
+      );
+    }
+
+    if (restartFailure && !postFlight.ok && servedWrongVersion) {
+      // #372, ported from #371's MED-1 cell. A restart command failed AND something is answering on
+      // the port with a version that differs from the one this upgrade installed — the
+      // surviving-orphan shape #173 built the version comparison for, and the state whose existence
+      // makes "THE PROXY IS DOWN" false. This is the pre-#347 post-flight verdict with the restart
+      // failure attached, not a new claim.
+      throw Object.assign(
+        new Error(`post-flight failed: serving ${postFlight.lastSeen}, expected ${postFlight.target} — run \`ocp doctor\` before assuming the upgrade landed`),
+        { phases, cmd: restartFailure.cmd, snapshotPath,
+          hint: `THE PROXY IS UP BUT SERVING THE WRONG VERSION (${postFlight.lastSeen}, expected ${postFlight.target}). `
+            + `A restart command failed after ${restartFailure.attempts} attempts, so the process holding 127.0.0.1:${port} `
+            + `is most likely the pre-upgrade one that was never replaced. Replace it with: ${recoveryCmds}  `
+            + `Then re-check with \`${postFlightOnlyCommand(`v${postFlight.target}`)}\`, and run \`ocp doctor\` if it still `
+            + `reports ${postFlight.lastSeen} — that means something other than this unit owns the port. `
+            + `The working tree is at ${postFlight.target}; \`ocp update --rollback\` restores from the snapshot if you want it back.` }
+      );
+    }
+
+    if (restartFailure && !postFlight.ok && didNotReach) {
       // The incident, named. Service state leads; tree state is demoted to the second sentence,
       // because "run `ocp update --rollback`" was the ONLY thing the old hint said and version
       // state was not what mattered at 2am with the port dead.
+      //
+      // #372: reaching here now means the probe RAN, reached nothing, and the fault is not a local
+      // one — so "not answering" is measured rather than assumed.
       throw Object.assign(
         new Error(`phase restart failed: ${restartFailure.detail}`),
         { phases, cmd: restartFailure.cmd, snapshotPath,
           hint: `THE PROXY IS DOWN. A restart command failed after ${restartFailure.attempts} attempts, `
             + `${restoreOutcome?.ok ? "the restoration attempt ran but did not bring it back" : "the restoration attempt also failed"}, `
-            + `and /health is not answering on 127.0.0.1:${port}. This command stopped the service and could not start it again — `
-            + `nothing will start it on its own. Bring it back with: ${recoveryCmds}  `
+            + `and /health is not answering on 127.0.0.1:${port}. This command stopped the service and could not start it again. `
+            // #372 / #381 F4: "nothing will start it on its own" was asserted for BOTH shapes here
+            // (#352's LOW-1 fixed only the rollback path), and the two-way fix that replaced it was
+            // still a two-way split over a THREE-value domain. Per shape, from one shared helper.
+            + `${restartOwnerRecoveryNote(restartPlan.plan.action)} `
+            + `Bring it back with: ${recoveryCmds}  `
             + `Then, and only then, consider the working tree: it may be at the new version, and \`ocp update --rollback\` restores from the snapshot.` }
       );
     }
@@ -1412,19 +1744,68 @@ async function runFullUpgrade({ doctor, opts }) {
       throw Object.assign(
         new Error(`post-flight could not run on this machine (${postFlight.lastFailure.detail})`),
         { phases, snapshotPath, target: upgradeTarget,
+          // #372: the re-check invocation and the "genuinely not serving X" clause both
+          // interpolated `upgradeTarget` unconditionally. With no target they rendered
+          // `--post-flight-only ` / `--post-flight-only null` and "genuinely not serving null" —
+          // measured, at this cell, by driving `mockDoctor` with each of "", null and undefined.
+          //
+          // REACHABILITY, stated per the [measured]/[reasoned] discipline rather than implied:
+          //   [measured]  reachable through `opts.mockDoctor`, which is how the test below drives it.
+          //   [reasoned]  NOT demonstrated reachable in production on THIS path. `scripts/doctor.mjs`
+          //               falls back `latestVersion = currentVersion` when git/network fail (:742),
+          //               and `currentVersion` degrades to the literal "unknown" (:713), which
+          //               cannot pass the semver comparison that selects `next_action.kind =
+          //               "upgrade"`. I did not prove that exhaustively.
+          //   [measured]  reachable in PRODUCTION on the sibling path: `readSnapshot` returns null
+          //               for `fromVersion` on an unreadable `from-version.txt`, which is the
+          //               operand absence #372 was filed for. The renderer is shared, so the guard
+          //               is placed where it holds for every caller rather than at that one.
           hint: `THE UPGRADE MAY HAVE SUCCEEDED — do NOT roll back on this evidence. Every restart command `
             + `exited 0, and the post-flight probe could not RUN here (${postFlight.lastFailure.detail}). `
             + `That is a local environment fault and says nothing about the service. Check by hand from a `
-            + `working shell (\`curl -sf http://127.0.0.1:${port}/health\`), or fix the local curl and re-check `
-            + `with \`${postFlightOnlyCommand(upgradeTarget)}\`. Only if the service is genuinely not `
-            + `serving ${upgradeTarget} is \`ocp update --rollback\` the right move.` }
+            + `working shell (\`curl -sf http://127.0.0.1:${port}/health\`).`
+            + postFlightRecheckClause(postFlight.target, { prefix: " Or fix the local curl and re-check with" })
+            + (postFlight.target
+                ? ` Only if the service is genuinely not serving ${postFlight.target} is \`ocp update --rollback\` the right move.`
+                : ` Only if the service is genuinely not serving the intended version is \`ocp update --rollback\` the right move.`) }
+      );
+    }
+
+    if (!postFlight.ok && notOkStatus) {
+      // #381 review finding F2. WITHOUT this cell the state fell to the neutral arm below, whose
+      // hint is "Working tree may be at new version. Run `ocp update --rollback` to restore from
+      // snapshot." Measured state when it fired: /health answers 200 with
+      // `{status:"degraded", version:"<the version this upgrade just installed>"}`.
+      //
+      // So the operator was told to roll back a proxy that is serving exactly the right code, and
+      // a rollback cannot clear a `degraded` status anyway — that comes from the CLI binary not
+      // being OK, or from consecutive auth rejections (server.mjs), neither of which the tree
+      // version decides.
+      //
+      // #372 declined to give this state a cell and stated the cost as "the hint no longer names
+      // the restart failure". That was incomplete: it ALSO newly recommended a rollback, because
+      // #372 imported #371's disposition without its premise — the rollback path's neutral verdict
+      // says "run `ocp doctor` before assuming the rollback succeeded", which is true and useful,
+      // while this path's neutral verdict says roll back, which is neither.
+      throw Object.assign(
+        new Error(`post-flight failed: the proxy answered with ${postFlight.lastFailure.detail} while serving ${postFlight.target} — run \`ocp doctor\` before assuming the upgrade landed`),
+        { phases, snapshotPath, target: upgradeTarget,
+          hint: `THE PROXY IS ANSWERING AND SERVING ${postFlight.target}, BUT REPORTS ITSELF UNHEALTHY `
+            + `(${postFlight.lastFailure.detail}). The upgrade's code IS what is running, so this is not a `
+            + `version problem and \`ocp update --rollback\` will not clear it — a degraded status comes from `
+            + `the \`claude\` binary not being usable or from repeated auth rejections, neither of which the `
+            + `tree version decides. `
+            + `${restartFailure ? `A restart command also failed after ${restartFailure.attempts} attempts. ` : ""}`
+            + `Run \`ocp doctor\` to find out which.` }
       );
     }
 
     if (!postFlight.ok) {
       // Restart commands all succeeded and the probe genuinely ran and said no (orphan holding the
       // port, wrong version serving, ...). Unchanged pre-#347 behaviour, including the generic
-      // tree-state hint from the catch below, which is correct for this cell.
+      // tree-state hint from the catch below, which is correct for this cell — it is reached only
+      // when nothing above could say what happened, and "the tree may be at the new version" is
+      // then the one thing still true.
       throw new Error("post-flight failed");
     }
 
@@ -2008,7 +2389,7 @@ async function runRollback(opts) {
   // Issue #352: this now also runs after a FAILED restart command, which is the whole point — the
   // `exec` throw above used to make this block unreachable in exactly the case it was written for.
   // Its gate is unchanged.
-  let postFlight = { ok: true, lastSeen: null, target: String(meta.fromVersion || "").replace(/^v/, ""), lastFailure: null };
+  let postFlight = { ok: true, lastSeen: null, target: postFlightWant(meta.fromVersion), lastFailure: null };
   let postFlightMeasured = false;
   if (opts.mockProbe || !opts.mockExec) {
     postFlightMeasured = true;
@@ -2039,7 +2420,9 @@ async function runRollback(opts) {
   }
 
   // Issue #352: the outcome cells, structurally ported from runFullUpgrade's (which mirror `ocp`'s
-  // cmd_restart at ocp:1051-1127) so all three paths tell the operator the same story. Ordering is
+  // cmd_restart at ocp:1051-1127). NOT "the same story" — see the F6 note on runFullUpgrade's copy:
+  // bash cannot reach its DOWN cell for a 200 with a non-JSON body, because only these paths parse
+  // the body at all. What is shared is the ORDERING. Ordering is
   // the load-bearing part: the local-fault arm is checked FIRST, because it is also a non-ok probe,
   // and getting it backwards tells a machine with a broken curl that its proxy is dead.
   //
@@ -2057,15 +2440,20 @@ async function runRollback(opts) {
   // round the same loop a second time. What is true on this path instead: the tree IS restored, and
   // the only thing missing is a running service.
   const probeCouldNotRun = postFlight.lastFailure?.kind === "probe-could-not-run";
-  // #352 review findings MED-1 and F1. `postFlight.ok === false` covers FIVE distinct states, and
-  // the DOWN wording ("/health is not answering") is only true in two of them. Each cell below is
-  // keyed on the #291 CLASSIFICATION of the last attempt, so no operator-facing sentence asserts
-  // more than was measured.
+  // #352 review findings MED-1 and F1. `postFlight.ok === false` covers SEVEN distinct states
+  // (five before #372 split the body-rejection kind into three), and the DOWN wording ("/health is
+  // not answering") is only true in two of them. Each cell below is keyed on the #291
+  // CLASSIFICATION of the last attempt, so no operator-facing sentence asserts more than was
+  // measured.
   //
-  //   version-mismatch  -> reached, read a body, body REJECTED   -> see the misnomer note below;
-  //                        this kind does NOT mean "wrong version"
-  //   unparseable       -> reached, got bytes that are not JSON -> something answers, but it is
-  //                        NOT this proxy
+  //   version-mismatch  -> reached, read a body carrying a version, and it DIFFERS from a target
+  //                        that was itself present -> UP BUT SERVING THE WRONG VERSION
+  //   not-ok-status     -> reached, read a body, version fine, `status` rejected it -> NO CELL;
+  //                        falls to the neutral #274 verdict, which claims nothing
+  //   body-not-ocp      -> reached, read JSON that is not a shape this proxy emits (a scalar,
+  //                        `null`, or an object with no `version`) -> something answers, but it
+  //                        is NOT this proxy
+  //   unparseable       -> reached, got bytes that are not JSON -> same: something answers
   //   http-error        -> reached, got a non-2xx               -> same: something answers
   //   unreachable       -> did NOT reach (curl 7)               -> DOWN
   //   timeout           -> did not answer within the budget     -> DOWN
@@ -2096,45 +2484,33 @@ async function runRollback(opts) {
   //     path at all, so this is a false statement this PR would have introduced.
   const failureKind = postFlight.lastFailure?.kind ?? null;
 
-  // #352 review round 3, findings R2-1 and R2-4. THE KIND NAME `version-mismatch` IS A MISNOMER,
-  // and the previous round took it on trust — which is the one input the "assert only what was
-  // measured" rework did not apply itself to.
+  // #352 review round 3 (findings R2-1 and R2-4) discovered that the kind name `version-mismatch`
+  // was a misnomer covering three unrelated states, and reconstructed the missing distinctions
+  // HERE, from `lastSeen`, because fixing the classifier would have touched `runFullUpgrade` too.
+  // Issue #372 fixed the classifier, so those reconstructions are gone: each cell now keys on a
+  // kind that means what it says. `classifyPostFlightBodyRejection` carries the full argument.
   //
-  // `runPostFlightCheck` stamps `kind: "version-mismatch"` on EVERY post-body acceptance failure
-  // (this file, in the loop). The acceptance predicate is `postFlightOk`, which fails on **status**
-  // as well as version:  `if (body?.status !== "ok") return false;`  And `/health`'s status domain
-  // is exactly {"ok","degraded"} (server.mjs — degraded when the CLI binary is not OK, or after
-  // AUTH_DEGRADE_AFTER consecutive auth rejections), **always over HTTP 200**.
+  // What moved, and why it is not merely tidier:
+  //   - `servedWrongVersion` was `lastSeen !== postFlight.target`, a `!==` **satisfied by a missing
+  //     operand**. `readSnapshot` returns `null` for `fromVersion` when `from-version.txt` is
+  //     unreadable (scripts/lib/snapshot.mjs's `catch { return null; }`), `target` is then `""`,
+  //     and this measurably printed `SERVING THE WRONG VERSION (3.10.0, expected )`. The classifier
+  //     now requires a non-empty target before it will call anything a version mismatch, so the
+  //     property holds for every caller instead of being re-established per cell.
+  //   - `noVersionField` was `bodyRejected && lastSeen == null`. Same conclusion, now stated by the
+  //     kind (`body-not-ocp`) together with the JSON-scalar shape that used to THROW.
   //
-  // So a rollback that lands PERFECTLY on a degraded proxy produced, verbatim:
-  //     THE PROXY IS UP BUT SERVING THE WRONG VERSION (3.10.0, expected 3.10.0)
-  //     … the process holding …:PORT is most likely the pre-rollback one that was never replaced
-  //     … Replace the running process with: launchctl bootout … && launchctl bootstrap …
-  // Every clause false: one version named as both wrong and expected; the process IS the correctly
-  // rolled-back one; the remedy replaces a process running the right code; and the closing "run
-  // `ocp doctor` if it still reports X" rule fires unconditionally, sending the operator after a
-  // port conflict that does not exist. Not exotic either — `!binaryOk` is persistent, and a
-  // rollback is precisely when the tree under the `claude` path just changed.
-  //
-  // Two guards, both on facts this function can see without touching the shared classifier:
-  //   - R2-1: only claim a version is wrong when it DIFFERS from the target. `postFlight.target` is
-  //     already v-stripped by runPostFlightCheck and `lastSeen` is the raw `body.version`, which is
-  //     exactly the pair `postFlightOk` compares — so this is the same comparison, not a new rule.
-  //     The equal case (status-only rejection: degraded, correct version) falls through to the
-  //     neutral #274 verdict below, which says "may not be what's running — run `ocp doctor`". That
-  //     is true and it is the right next step for a degraded proxy.
-  //   - R2-4: a body that parsed but carries NO `version` field leaves `lastSeen` nullish, and
-  //     round 2 newly routed it here (round 1 sent it to DOWN), producing "(undefined, expected
-  //     3.10.0)". A JSON responder with no `version` is not this proxy, so it belongs in the
-  //     answering-but-not-OCP cell. `== null` deliberately, to catch `undefined` as well as `null`.
-  //
-  // NOT FIXED HERE, deliberately: splitting the classifier into `version-mismatch` vs
-  // `not-ok-status` would change `runPostFlightCheck`, which `runFullUpgrade` shares — so it goes
-  // with the extraction work in the follow-up issue rather than being smuggled in on this path.
-  const bodyRejected = failureKind === "version-mismatch";
-  const noVersionField = bodyRejected && postFlight.lastSeen == null;
-  const servedWrongVersion = bodyRejected && !noVersionField && postFlight.lastSeen !== postFlight.target;
-  const answeredNotOcp = failureKind === "unparseable" || failureKind === "http-error" || noVersionField;
+  // `not-ok-status` deliberately has NO cell: a proxy answering on the correct version with
+  // `status: "degraded"` falls through to the neutral #274 verdict below, which says "may not be
+  // what's running — run `ocp doctor`". That is true, and it is the right next step. This is the
+  // same disposition R2-1 chose; the difference is that it is now reached because no cell claims
+  // it, rather than because a guard subtracted it from a cell that would otherwise have lied.
+  const servedWrongVersion = failureKind === "version-mismatch";
+  const answeredNotOcp = failureKind === "unparseable" || failureKind === "http-error" || failureKind === "body-not-ocp";
+  // No `notOkStatus` cell on THIS path, deliberately (#381 F2): its neutral verdict below already
+  // says "restored tree may not be what's running — run `ocp doctor`", which is true for a degraded
+  // proxy and names the right next step. The forward path needed its own cell because ITS neutral
+  // verdict recommends a rollback, which cannot clear a degraded status.
   // DOWN requires POSITIVE evidence of non-reach rather than being the `else`. Anything the
   // classifier did not produce one of these five kinds for falls through to the neutral #274
   // verdict below, which claims nothing about the service beyond "this is not confirmed".
@@ -2168,12 +2544,12 @@ async function runRollback(opts) {
     // no version to name, and the thing answering may not be OCP at all. The remedy differs too,
     // which is why this is a cell rather than a reworded sentence: the recovery commands cannot
     // bind a port somebody else holds.
-    // R2-4: for the no-`version`-field case the classifier's own detail is the unhelpful "serving
-    // unknown" (it renders `body.version ?? "unknown"`), which reads as a version statement about a
-    // body that has no version. Say what was actually observed instead.
-    const answeredDetail = noVersionField
-      ? "it answered with JSON that carries no `version` field"
-      : postFlight.lastFailure.detail;
+    // R2-4 used to substitute the detail string here, because the shared classifier's own text for
+    // a body with no `version` field was "serving unknown" — a version statement about a body that
+    // has no version. #372 moved that wording into `classifyPostFlightBodyRejection`, where it is
+    // derived from what was actually observed, so this reads the classification instead of
+    // patching it. The substitution was the local workaround; the kind is the fix.
+    const answeredDetail = postFlight.lastFailure.detail;
     throw Object.assign(
       new Error(`rollback post-flight failed: ${answeredDetail} — something is answering on 127.0.0.1:${rollbackPort}, but it is not this proxy`),
       { phases, target: target.path,
@@ -2199,7 +2575,11 @@ async function runRollback(opts) {
           + `A restart command failed after ${restartFailure.attempts} attempts, so the process holding 127.0.0.1:${rollbackPort} `
           + `is most likely the pre-rollback one that was never replaced. The working tree IS rolled back to `
           + `${meta.fromVersion || meta.fromCommit}; do not run \`ocp update --rollback\` again. Replace the running process with: `
-          + `${recoveryCmds}  Then re-check with \`${postFlightOnlyCommand(meta.fromVersion)}\`, and run \`ocp doctor\` if it still `
+          // #372: `postFlightOnlyCommand(meta.fromVersion)` here read the snapshot field a second
+          // time, separately from the comparison that decided this cell. It is the SAME version —
+          // but reading it twice is how the hint and the verdict drift, and one of the two reads
+          // could be `null` while the other was not. Named from the measurement that fired the cell.
+          + `${recoveryCmds}  Then re-check with \`${postFlightOnlyCommand(`v${postFlight.target}`)}\`, and run \`ocp doctor\` if it still `
           + `reports ${postFlight.lastSeen} — that means something other than this unit owns the port.` }
     );
   }
@@ -2216,14 +2596,10 @@ async function runRollback(opts) {
         hint: `THE PROXY IS DOWN. A restart command failed after ${restartFailure.attempts} attempts, `
           + `${restoreOutcome?.ok ? "the restoration attempt ran without error but did not bring it back" : "the restoration attempt also failed"}, `
           + `and /health is not answering on 127.0.0.1:${rollbackPort}. This command stopped the service and could not start it again. `
-          // LOW-1: NOT "nothing will start it on its own". install-autostart.mjs writes
-          // `Restart=always`/`RestartSec=5` for the systemd unit, so on that shape systemd may well
-          // start it — indeed `recoveryPlanCommands`' own note depends on it doing so. The launchd
-          // plist has KeepAlive, but a SUCCEEDED bootout unloads the job, so there the claim holds.
-          // Stated per shape instead of asserted for both.
-          + `${restartPlan.plan.action === "launchd"
-              ? `The job has been unloaded, so nothing will start it on its own.`
-              : `The unit is configured Restart=always, so systemd may bring it back by itself — but it has not within the probe budget.`} `
+          // LOW-1, now via the shared helper (#381 F4): the two-way form this replaces asserted
+          // `Restart=always` for `system-unit` too, which OCP never installs and whose Restart=
+          // directive it never reads.
+          + `${restartOwnerRecoveryNote(restartPlan.plan.action)} `
           + `Bring it back with: ${recoveryCmds}  `
           + `The working tree is ALREADY rolled back to ${meta.fromVersion || meta.fromCommit} — do not run \`ocp update --rollback\` again; `
           + `the only thing missing is a running service.` }
@@ -2242,8 +2618,11 @@ async function runRollback(opts) {
         hint: `THE ROLLBACK MAY HAVE SUCCEEDED — do NOT re-run it on this evidence. Every restart command `
           + `exited 0, and the post-flight probe could not RUN here (${postFlight.lastFailure.detail}). `
           + `That is a local environment fault and says nothing about the service. Check by hand from a `
-          + `working shell (\`curl -sf http://127.0.0.1:${rollbackPort}/health\`), or fix the local curl and re-check `
-          + `with \`${postFlightOnlyCommand(meta.fromVersion)}\`.` }
+          + `working shell (\`curl -sf http://127.0.0.1:${rollbackPort}/health\`).`
+          // #372: was an unconditional `postFlightOnlyCommand(meta.fromVersion)`, which rendered
+          // `--post-flight-only null` on a host whose `from-version.txt` could not be read — this
+          // cell is reachable in exactly that state (unreadable snapshot AND a broken local curl).
+          + postFlightRecheckClause(postFlight.target, { prefix: " Or fix the local curl and re-check with" }) }
     );
   }
 
@@ -2352,7 +2731,13 @@ if (_isMain()) {
     // means an accidentally-omitted target here would report success against ANY version.
     // `ocp`'s bash caller always passes "v$target" explicitly, so this only guards a
     // hand-invoked or future misuse of the public flag, not anything reachable today.
-    if (!postFlightTarget || postFlightTarget.startsWith("--")) {
+    // #381 review finding F5: `!postFlightTarget` does not catch a target that is non-empty but
+    // v-strips to nothing. `--post-flight-only v` passed this guard, `postFlightWant("v")` is `""`,
+    // `postFlightOk` degrades an empty target to the serving check alone, and the command printed
+    // `✓ service now serving v` against ANY version. That is exactly the "hand-invoked or future
+    // misuse of the public flag" this guard's own comment says it exists for — and #372 made it
+    // reachable from a HINT as well as from a typo, before that hint was fixed too.
+    if (!postFlightTarget || postFlightTarget.startsWith("--") || !postFlightWant(postFlightTarget)) {
       console.error(`✗ --post-flight-only requires a target version argument, e.g. --post-flight-only v3.26.0`);
       process.exit(1);
     }
