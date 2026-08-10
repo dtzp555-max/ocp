@@ -1,7 +1,7 @@
 # ADR 0008 — TUI Warm Pane Pool
 
 **Date:** 2026-07-13
-**Status:** Accepted (maintainer sign-off 2026-08-04)
+**Status:** Accepted (maintainer sign-off 2026-08-04); amended 2026-08-11 — `POOL_MAX_SIZE` 4 → 32 (#404, authored by @sumlin in #189) — see Decision
 **Extends:** [ADR 0007](0007-tui-interactive-mode.md) (TUI interactive mode). This ADR does not
 change ADR 0007's billing-pool argument, security posture, or kill-switch — it adds a latency
 optimization *inside* the TUI spawn machinery ADR 0007 owns.
@@ -58,7 +58,19 @@ turn's text into the later turn's answer — a **cross-request data leak**, not 
 ## Decision
 
 Add an **opt-in pool of pre-booted, single-use `claude` panes**, `OCP_TUI_POOL_SIZE` (default
-`0` = off, max `4`). Implementation: `lib/tui/pool.mjs`.
+`0` = off, max `32`). Implementation: `lib/tui/pool.mjs`.
+
+> **Amendment (landed 2026-08-11; authored 2026-07-21 by @sumlin in #189):** `POOL_MAX_SIZE` raised `4 → 32`. The original cap of 4 aimed to
+> protect a small host from too many resident idle `claude` processes, but the operator already
+> controls the pool size directly via `OCP_TUI_POOL_SIZE`, so the low hard cap protected nobody
+> who couldn't already protect themselves — it only stopped an operator on capable hardware from
+> using more of their own RAM. The cap's remaining purpose is unchanged: bound a fat-fingered
+> value (e.g. `OCP_TUI_POOL_SIZE=99999999`) rather than guess. Small-host guidance ("keep it
+> small") stays in the docs; the pool remains **default-off**.
+>
+> Authored by [@sumlin](https://github.com/sumlin) in [#189](https://github.com/dtzp555-max/ocp/pull/189);
+> the amendment text is theirs. Landed via a re-created branch because #189 predates the
+> 2026-07-27 history recreation and shares no ancestor with `main`.
 
 ### 1. Panes are SINGLE-USE. This is the load-bearing rule.
 
@@ -107,7 +119,11 @@ The invariant, stated in a comment above `reapStaleTuiSessions` and pinned by te
    tmux server). Therefore **the pool is DRAINED immediately before every sweep**, so `spare` is
    empty on the normal tick and `kill-server` still fires. Without the drain, a permanently-full
    pool would **permanently disable zombie reaping** — the pool would silently break the thing
-   the sweep exists to do. The drain costs one pane re-boot per tick (15 min).
+   the sweep exists to do. The drain costs a **full pool** re-boot per tick (15 min): `drain()`
+   drops every warm pane and `resume()` refills serially back to `OCP_TUI_POOL_SIZE`, so the
+   cost scales with the pool size rather than being one boot. This is the standing cost the
+   2026-07-21 amendment's higher ceiling multiplies, and the reason "keep it small on a small
+   host" is guidance and not decoration.
 
 The `spare` mechanism is belt-and-braces given the drain: it makes it impossible for a reap call
 site that *forgets* to drain to kill a live pane.
@@ -154,11 +170,17 @@ tight because a *client* is blocked on it, which is not true of a pre-boot. Slow
 **A warm pane is a live idle `claude` process.** Peak process count is
 `OCP_TUI_POOL_SIZE` + `OCP_TUI_MAX_CONCURRENT` + 1 (booting replacement). This is the whole
 reason the pool is **default-off**: an operator must opt into holding processes for traffic that
-may never come. Size is clamped to `POOL_MAX_SIZE` = 4; an unparseable value **disables** the
-pool rather than guessing.
+may never come. Size is clamped to `POOL_MAX_SIZE` = 32 (see the 2026-07-21 amendment under
+Decision); an unparseable value **disables** the pool rather than guessing.
 
 Panes carry a 10-minute TTL and are health-checked at hand-out; a dead or degraded pane becomes
 a **miss** (cold path), never a hung turn.
+
+Because refills are **serial**, a full pool takes `OCP_TUI_POOL_SIZE` boots to reach target, so
+in principle the earliest pane can age out before the last one boots. Stated as a **trigger
+rather than a number**, so it survives either constant moving: this becomes reachable only if a
+single pane boot ever takes longer than `POOL_MAX_AGE_MS / POOL_MAX_SIZE`. At measured boot times
+(~1.2 s) it cannot occur, and a boot that genuinely fails does not re-kick the chain.
 
 ### Benefit
 

@@ -206,6 +206,17 @@ exit 1
  * five reachable variants (TUI alone; TUI+pool=1; skip-permissions alone; all three at pool=1;
  * all three at pool=4) and probing all 16 pairs produced NO key path that is absent from both of
  * the two profiles below. pool=4 records the same key set as pool=1 — the size is a value.
+ *
+ * RE-MEASURED AT pool=32 (#404), when POOL_MAX_SIZE was raised 4 -> 32. `pool=4` above was the
+ * CAP when it was written, so it read as a boundary; at a cap of 32 it is a mid-range datum.
+ * Probing this fixture at OCP_TUI_POOL_SIZE=32 gives 200 key paths against the 200 recorded at
+ * pool=1, diff empty — with a control against the `probes` block proving the differ fires, since
+ * a first attempt reported a bogus total from a wrong field name. Separately, executing
+ * `TuiPanePool.stats()` at sizes 1, 4 and 32 returns the SAME 10 scalar keys each time, and the
+ * source shows why it cannot vary: a fixed object literal with no size-conditional key. So size
+ * moves tui.pool.size's VALUE and nothing else. Full note, with the
+ * [measured] / [reasoned] split marked inline, in the snapshot's own `notCovered` entry opening
+ * "Shapes that only exist under a configuration NEITHER profile pins".
  */
 export const B2_PROFILES = [
   {
