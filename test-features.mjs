@@ -4198,7 +4198,7 @@ ltTest("integration: ltTest serialization keeps peak concurrent server.mjs child
 });
 
 // ── Upgrade Tests ──
-import { runUpgrade, postFlightOk, runPostFlightCheck, parseFlagValue, classifyPostFlightProbeFailure, postFlightFailureSuffix, probeLaunchdDomains, execRestartRetry, RESTART_ATTEMPTS, recoveryPlanCommands, postFlightOnlyCommand } from "./scripts/upgrade.mjs";
+import { runUpgrade, postFlightOk, runPostFlightCheck, parseFlagValue, classifyPostFlightProbeFailure, postFlightFailureSuffix, probeLaunchdDomains, execRestartRetry, RESTART_ATTEMPTS, recoveryPlanCommands, postFlightOnlyCommand, classifyPostFlightBodyRejection, postFlightWant, postFlightRecheckClause } from "./scripts/upgrade.mjs";
 
 console.log("\nUpgrade:");
 
@@ -6973,6 +6973,342 @@ test("#352 control: the pre-existing all-mock rollback lane is untouched — no 
   assert.equal(result.phases.find(p => p.name === "post-flight").status, "skipped-mock");
   assert.ok(!result.phases.some(p => p.name === "restart-restore"),
     "and no restoration pass may appear when nothing failed");
+});
+
+// ── #372: the negation-predicate class, and the classifier that conflated status with version ──
+//
+// Two defects, filed together because the second is the shared cause of the first on both paths.
+//
+// 1. CELLS THAT FIRE ON THE ABSENCE OF EVIDENCE. `runFullUpgrade`'s DOWN cell keyed on
+//    `restartFailure && !postFlight.ok` — the `else`. `runPostFlightCheck` reports `ok: false` for
+//    seven distinct states and "THE PROXY IS DOWN … /health is not answering" is true in two of
+//    them, so the sentence an operator reads was false in the other five. #352/#371 fixed exactly
+//    this in `runRollback`; `ocp`'s own `cmd_restart` — the authority these cells cite — never had
+//    it, because its DOWN cell keys on the curl exit code (`probe_rc -ne 0`).
+//
+//    The same shape one operand over: `servedWrongVersion` was `lastSeen !== postFlight.target`, a
+//    `!==` SATISFIED BY A MISSING OPERAND. `readSnapshot` returns `null` for `fromVersion` when
+//    `from-version.txt` is unreadable (scripts/lib/snapshot.mjs's `catch { return null; }`), so
+//    `target` is `""` and a correctly-rolled-back proxy was told it was
+//    "SERVING THE WRONG VERSION (3.10.0, expected )".
+//
+// 2. A NAME IS A CLAIM. `runPostFlightCheck` stamped `kind: "version-mismatch"` on EVERY post-body
+//    rejection, but `postFlightOk` rejects on `status` as well as version and /health's status
+//    domain is {"ok","degraded"}, always over HTTP 200. Three states, one name. Splitting it is
+//    what lets a cell key on a kind and get what the kind says — and note it does NOT subsume
+//    defect 1, which lived in the other operand.
+//
+// WHY THESE TESTS CANNOT TOUCH A REAL SERVICE: inherited verbatim from #347/#352 above — `execFn`
+// is a plain JS function with no shell in the call path, `_u347Opts`/`_u352Opts` pin `mockExec`
+// (the latter AFTER the caller's spread), and `mockProbe` replaces the curl. Every test below uses
+// those two helpers rather than building its own opts, so none of it can drift out of that.
+console.log("\n#372 — verdict cells must fire on evidence, not on its absence:");
+
+// The classifier first: it is where both fixes actually live, so a unit failure here localises
+// every behavioural failure below.
+test("#372: classifyPostFlightBodyRejection tells the three post-body rejections apart", () => {
+  const wrongVersion = classifyPostFlightBodyRejection({ status: "ok", version: "3.10.0" }, "v3.14.0");
+  assert.equal(wrongVersion.kind, "version-mismatch",
+    `two present versions that differ is the ONLY thing that may be called a version mismatch; got ${JSON.stringify(wrongVersion)}`);
+
+  const degraded = classifyPostFlightBodyRejection({ status: "degraded", version: "3.14.0" }, "v3.14.0");
+  assert.equal(degraded.kind, "not-ok-status",
+    `the version matched — this rejection came from \`status\`, and calling it a version mismatch is ` +
+    `what printed "(3.10.0, expected 3.10.0)"; got ${JSON.stringify(degraded)}`);
+  assert.match(degraded.detail, /status=degraded/,
+    `and the detail must name what was observed; got ${JSON.stringify(degraded)}`);
+
+  const noVersion = classifyPostFlightBodyRejection({ status: "ok" }, "v3.14.0");
+  assert.equal(noVersion.kind, "body-not-ocp",
+    `a JSON responder with no \`version\` is not this proxy; got ${JSON.stringify(noVersion)}`);
+  assert.match(noVersion.detail, /no .?version.? field/,
+    `and must say so rather than "serving unknown"; got ${JSON.stringify(noVersion)}`);
+});
+
+test("#372 (the negation predicate, at its source): an ABSENT target can never produce `version-mismatch`", () => {
+  // The `!==` satisfied by a missing operand, killed where every caller inherits the fix rather
+  // than in each cell. `postFlightOk` deliberately degrades to the serving check alone on an empty
+  // target, so a rejection there is ALWAYS a status rejection and never a version one.
+  for (const absent of ["", null, undefined]) {
+    const r = classifyPostFlightBodyRejection({ status: "degraded", version: "3.10.0" }, absent);
+    assert.equal(r.kind, "not-ok-status",
+      `target=${JSON.stringify(absent)}: nothing was compared, so nothing may be called a mismatch; got ${JSON.stringify(r)}`);
+    // Premise for the whole case: postFlightOk really does reject this body, or the classifier
+    // would never be consulted and this test would be measuring an unreachable branch.
+    assert.equal(postFlightOk({ status: "degraded", version: "3.10.0" }, absent), false,
+      `harness premise: postFlightOk must reject this body for target=${JSON.stringify(absent)}`);
+  }
+  // Control, in the same test so the pair cannot drift: with the target PRESENT the same body is a
+  // mismatch. Proves the guard narrowed the kind rather than disabling it.
+  assert.equal(classifyPostFlightBodyRejection({ status: "degraded", version: "3.10.0" }, "v3.14.0").kind,
+    "version-mismatch", "a present, differing target must still classify as a mismatch");
+});
+
+test("#372: a JSON `null` body is classified, not thrown — it used to become `unreachable` via a TypeError", async () => {
+  // `lastSeen = body.version` had no optional chaining. A valid-JSON `null` body threw
+  // `TypeError`, `classifyPostFlightProbeFailure` caught it in the `catch` two lines down, its
+  // default arm produced `{kind:"unreachable"}`, and a service that ANSWERED was reported DOWN —
+  // with "Cannot read properties of null (reading 'version')" as the operator-facing detail.
+  const r = await runPostFlightCheck("v3.14.0", { mockProbe: () => null, attempts: 1, intervalMs: 0 });
+  assert.equal(r.lastFailure.kind, "body-not-ocp",
+    `something answered; got ${JSON.stringify(r.lastFailure)}`);
+  assert.ok(!/Cannot read properties/.test(r.lastFailure.detail),
+    `and no JS TypeError text may reach an operator; got ${JSON.stringify(r.lastFailure)}`);
+  assert.equal(r.lastSeen, null, "a null body carries no version to remember");
+  // The other JSON scalars reach the same conclusion.
+  for (const scalar of [42, "3.14.0", true]) {
+    assert.equal(classifyPostFlightBodyRejection(scalar, "v3.14.0").kind, "body-not-ocp",
+      `a bare ${typeof scalar} is not a /health body`);
+  }
+});
+
+test("#372: postFlightFailureSuffix must not narrate an ANSWER as `unreachable` — the `default:` arm was the else", () => {
+  // This is the renderer bash's `ocp update` delegates its final verdict to (`_cmd_update_light` /
+  // `_cmd_update_restart` both report whatever `--post-flight-only` says), so a false sentence here
+  // reaches operators through a path that never touches the cells above.
+  const notOk = { ok: false, lastSeen: "3.14.0", target: "3.14.0",
+                  lastFailure: { kind: "not-ok-status", detail: "status=degraded" } };
+  const s = postFlightFailureSuffix(notOk);
+  assert.ok(!/unreachable/.test(s), `it answered; got ${JSON.stringify(s)}`);
+  assert.ok(!/stale process may still hold the port/.test(s),
+    `and the version matched, so nothing may point at a port conflict; got ${JSON.stringify(s)}`);
+  assert.match(s, /ocp doctor/, `it must name the right next step; got ${JSON.stringify(s)}`);
+
+  const noVersion = { ok: false, lastSeen: null, target: "3.14.0",
+                      lastFailure: { kind: "body-not-ocp", detail: "it answered with JSON that carries no `version` field" } };
+  const s2 = postFlightFailureSuffix(noVersion);
+  assert.ok(!/unreachable/.test(s2),
+    `this used to render " (unreachable — serving unknown)" — the else arm, about something that ` +
+    `answered; got ${JSON.stringify(s2)}`);
+  assert.match(s2, /not this proxy/, `got ${JSON.stringify(s2)}`);
+
+  // Control: a genuine non-reach must still say unreachable, so the fix is scoped.
+  assert.match(postFlightFailureSuffix({ ok: false, lastSeen: null, target: "3.14.0",
+    lastFailure: { kind: "unreachable", detail: "curl exit 7" } }), /unreachable/);
+});
+
+test("#372: no hint may name a `--post-flight-only` invocation with no version to check", () => {
+  // Both absent-operand renderings, measured before the fix: `--post-flight-only null` (rollback,
+  // unreadable from-version.txt) and `--post-flight-only v` (the suffix's own `v${target}`).
+  // Neither is caught downstream — the CLI's guard fails closed only on a MISSING or `--`-prefixed
+  // value, and "null" / "v" are ordinary non-empty strings. "v" v-strips to "", which postFlightOk
+  // degrades to the serving check alone, so the advice would report success against ANY version.
+  for (const absent of ["", null, undefined]) {
+    assert.equal(postFlightRecheckClause(absent), "",
+      `target=${JSON.stringify(absent)}: offer no invocation rather than a broken one`);
+  }
+  const present = postFlightRecheckClause("3.14.0");
+  assert.match(present, /--post-flight-only v3\.14\.0`\.$/,
+    `a present target must still get the clause, v-prefixed as the CLI expects; got ${JSON.stringify(present)}`);
+  assert.equal(postFlightRecheckClause("v3.14.0"), present,
+    "and it must be idempotent about the leading v, since callers pass both forms");
+  // The suffix's own probe-could-not-run arm, end to end.
+  const noTarget = postFlightFailureSuffix({ ok: false, lastSeen: null, target: "",
+    lastFailure: { kind: "probe-could-not-run", detail: "curl: not found" } });
+  assert.ok(!/--post-flight-only\s*`/.test(noTarget) && !/--post-flight-only v`/.test(noTarget),
+    `an empty target must not render a target-less invocation; got ${JSON.stringify(noTarget)}`);
+  assert.match(noTarget, /could not run on THIS machine/, "the rest of the arm must survive");
+});
+
+test("#372 (the money test): `ocp update`'s DOWN cell must not fire for a service that ANSWERED with the wrong version", async () => {
+  // The defect this issue was filed for, on the FLEET-ROLLOUT path — `ocp update` runs unattended,
+  // which makes it the more-trafficked of the two. Measured at v3.29.2: the hint said "THE PROXY IS
+  // DOWN … /health is not answering on 127.0.0.1:PORT" inside the same thrown error whose own
+  // post-flight phase recorded `last saw version=3.10.0`. One error, two contradictory statements
+  // about one measurement — and the CLI's phase printer surfaces the hint, so the false half is the
+  // half the operator reads.
+  const run = _u347Runner({ "launchctl bootstrap": Infinity });
+  let caught = null;
+  try {
+    await runUpgrade(_u347Opts({
+      execFn: run,
+      // The surviving-orphan shape: the pre-upgrade process still holds the port.
+      mockProbe: () => ({ status: "ok", auth: { ok: true }, version: "3.10.0" }),
+    }));
+  } catch (e) { caught = e; }
+
+  assert.ok(caught, "a restart failure plus the wrong version serving is still not a success");
+  // Premises, both asserted: the restart really exhausted its budget, and the probe really read a
+  // body. Without them "DOWN was wrong" would be a claim about a state that never occurred.
+  assert.equal(run.count("launchctl bootstrap"), 4,
+    `premise: 3 retries + 1 restoration; got calls=${JSON.stringify(run.calls)}`);
+  const pf = caught.phases.find(p => p.name === "post-flight");
+  assert.ok(pf && /last saw version=3\.10\.0/.test(pf.message || ""),
+    `premise: the probe really did read a body; got ${JSON.stringify(pf)}`);
+
+  assert.ok(!/THE PROXY IS DOWN/.test(caught.hint),
+    `a service that answered is not down; got hint=${JSON.stringify(caught.hint)}`);
+  assert.ok(!/is not answering/.test(caught.hint),
+    `and the hint must not deny the measurement its own phase recorded; got hint=${JSON.stringify(caught.hint)}`);
+  assert.ok(caught.hint.startsWith("THE PROXY IS UP BUT SERVING THE WRONG VERSION"),
+    `it must say what was observed; got hint=${JSON.stringify(caught.hint)}`);
+  assert.ok(caught.hint.includes("3.10.0") && caught.hint.includes("3.14.0"),
+    `naming both the version seen and the one expected; got hint=${JSON.stringify(caught.hint)}`);
+});
+
+test("#372: `ocp update` on a DEGRADED proxy already serving the target must claim nothing about reach or version", async () => {
+  // The status/version conflation, on the forward path. `!binaryOk` is persistent and an upgrade is
+  // exactly when the tree under the `claude` path just changed, so this is the ordinary shape of a
+  // half-good upgrade — and it used to print THE PROXY IS DOWN about a proxy serving the version
+  // this very upgrade installed.
+  const run = _u347Runner({ "launchctl bootstrap": Infinity });
+  let caught = null;
+  try {
+    await runUpgrade(_u347Opts({
+      execFn: run,
+      mockProbe: () => ({ status: "degraded", auth: { ok: true }, version: "3.14.0" }),
+    }));
+  } catch (e) { caught = e; }
+
+  assert.ok(caught, "a degraded proxy is still not a confirmed-good upgrade");
+  const pf = caught.phases.find(p => p.name === "post-flight");
+  assert.ok(pf && /version=3\.14\.0/.test(pf.message || ""),
+    `premise: the probe read a body carrying the CORRECT version; got ${JSON.stringify(pf)}`);
+
+  assert.ok(!/THE PROXY IS DOWN/.test(caught.hint || ""), `got hint=${JSON.stringify(caught.hint)}`);
+  assert.ok(!/WRONG VERSION/.test(caught.hint || ""),
+    `the version matched — nothing may call it wrong; got hint=${JSON.stringify(caught.hint)}`);
+  assert.ok(!/3\.14\.0, expected 3\.14\.0/.test(caught.hint || ""),
+    `and nothing may name one version as both wrong and expected; got hint=${JSON.stringify(caught.hint)}`);
+  // It falls to the neutral post-flight failure, whose tree-state hint is the pre-#347 one.
+  assert.equal(caught.message, "post-flight failed");
+  assert.ok(/^Working tree may be at new version/.test(caught.hint),
+    `got hint=${JSON.stringify(caught.hint)}`);
+  // And the phase message — which is where the diagnosis survives — must name what was observed.
+  assert.match(pf.message, /status=degraded/);
+  assert.ok(!/unreachable/.test(pf.message), `it answered; got ${JSON.stringify(pf.message)}`);
+});
+
+test("#372: `ocp update` with something ELSE answering on the port is not DOWN, and must not be told to just restart", async () => {
+  // #371's F1 cell, which the forward path never got. The REMEDY is what makes this a cell rather
+  // than a reworded sentence: if a foreign process owns the port, the recovery commands cannot bind
+  // it and re-running them accomplishes nothing.
+  const run = _u347Runner({ "launchctl bootstrap": Infinity });
+  let caught = null;
+  try {
+    await runUpgrade(_u347Opts({
+      execFn: run,
+      mockProbe: () => { throw new SyntaxError("Unexpected token < in JSON at position 0"); },
+    }));
+  } catch (e) { caught = e; }
+
+  assert.ok(caught);
+  assert.ok(!/THE PROXY IS DOWN/.test(caught.hint), `got hint=${JSON.stringify(caught.hint)}`);
+  assert.ok(!/is not answering/.test(caught.hint),
+    `a non-JSON body IS an answer; got hint=${JSON.stringify(caught.hint)}`);
+  assert.ok(caught.hint.startsWith("SOMETHING ELSE IS ANSWERING"),
+    `got hint=${JSON.stringify(caught.hint)}`);
+  assert.match(caught.hint, /Do NOT simply re-run the restart/);
+  assert.match(caught.hint, /lsof -i/);
+});
+
+test("#372 control: `ocp update` with a probe that genuinely REACHED NOTHING is still DOWN", async () => {
+  // Proves the split narrowed the DOWN cell rather than disabling it. `timeout` is used rather than
+  // `unreachable` because the existing #347 DOWN test already covers curl exit 7, and `timeout` is
+  // the second kind that must still reach this cell — untested on either path before now.
+  const run = _u347Runner({ "launchctl bootstrap": Infinity });
+  let caught = null;
+  try {
+    await runUpgrade(_u347Opts({
+      execFn: run,
+      mockProbe: () => { throw Object.assign(new Error("curl: (28) Operation timed out"), { status: 28 }); },
+    }));
+  } catch (e) { caught = e; }
+
+  assert.ok(caught);
+  const pf = caught.phases.find(p => p.name === "post-flight");
+  assert.ok(pf && /timed out/.test(pf.message || ""),
+    `premise: the probe really did time out rather than being refused; got ${JSON.stringify(pf)}`);
+  assert.ok(caught.hint.startsWith("THE PROXY IS DOWN"),
+    `a measured non-reach must still say DOWN; got hint=${JSON.stringify(caught.hint)}`);
+  assert.ok(caught.hint.includes("launchctl bootstrap"),
+    `and must still name the command that brings it back; got hint=${JSON.stringify(caught.hint)}`);
+});
+
+test("#372 (LOW-1, forward path): the DOWN hint must not claim `nothing will start it on its own` on systemd", async () => {
+  // #352's LOW-1 was fixed on the rollback path and left asserted for BOTH shapes here.
+  // `scripts/lib/install-autostart.mjs` writes `Restart=always`/`RestartSec=5` and no StartLimit
+  // override, and `recoveryPlanCommands`' own start-limit arithmetic DEPENDS on systemd restarting
+  // the unit by itself — so the claim contradicts a premise this file already relies on.
+  const run = _u347Runner({ "systemctl": Infinity });
+  let caught = null;
+  try { await runUpgrade(_u347Opts({ mockPlatform: "linux", execFn: run, mockProbe: _u347Unreachable })); }
+  catch (e) { caught = e; }
+  assert.ok(caught);
+  assert.ok(caught.hint.startsWith("THE PROXY IS DOWN"),
+    `premise: this must be the DOWN cell, or the claim under test is not on screen; got hint=${JSON.stringify(caught.hint)}`);
+  assert.ok(!/nothing will start it on its own/.test(caught.hint),
+    `false under Restart=always; got hint=${JSON.stringify(caught.hint)}`);
+  assert.match(caught.hint, /Restart=always/,
+    `and it must say what is actually configured; got hint=${JSON.stringify(caught.hint)}`);
+
+  // Control, launchd: a SUCCEEDED bootout unloads the job, so there the claim holds and must
+  // survive. Without this the fix could have been "delete the sentence everywhere".
+  const runMac = _u347Runner({ "launchctl bootstrap": Infinity });
+  let mac = null;
+  try { await runUpgrade(_u347Opts({ execFn: runMac, mockProbe: _u347Unreachable })); }
+  catch (e) { mac = e; }
+  assert.ok(mac && mac.hint.startsWith("THE PROXY IS DOWN"));
+  assert.match(mac.hint, /nothing will start it on its own/,
+    `on launchd the claim is true and must stay; got hint=${JSON.stringify(mac.hint)}`);
+  assert.ok(!/Restart=always/.test(mac.hint),
+    `and the systemd wording must not leak onto macOS; got hint=${JSON.stringify(mac.hint)}`);
+});
+
+test("#372 (rollback): an unreadable `from-version.txt` must not produce `SERVING THE WRONG VERSION (…, expected )`", async () => {
+  // The negation predicate, end to end, on the path where the absent operand is reachable in
+  // PRODUCTION: `readSnapshot` returns null for `fromVersion` when `from-version.txt` is unreadable
+  // (scripts/lib/snapshot.mjs's `catch { return null; }`). Verbatim output before the fix:
+  //     THE PROXY IS UP BUT SERVING THE WRONG VERSION (3.10.0, expected ). …
+  //     most likely the pre-rollback one that was never replaced. …
+  //     Then re-check with `node …/upgrade.mjs --post-flight-only null`
+  const run = _u347Runner({ "launchctl bootstrap": Infinity });
+  let caught = null;
+  try {
+    await runUpgrade(_u352Opts({
+      execFn: run,
+      mockSnapshotMeta: { fromCommit: "abc1234", fromVersion: null, toVersion: "v3.14.0", path: "/tmp/snap-x" },
+      mockProbe: () => ({ status: "degraded", auth: { ok: true }, version: "3.10.0" }),
+    }));
+  } catch (e) { caught = e; }
+
+  assert.ok(caught, "an unverifiable rollback is still not a success");
+  // Premise: the target really is absent, or this measures nothing. Read it off the phase message,
+  // which interpolates `postFlight.target` — empty renders as `version= within`.
+  const pf = caught.phases.find(p => p.name === "post-flight");
+  assert.ok(pf && /version= within the post-flight budget/.test(pf.message || ""),
+    `harness premise: the target must really be empty; got ${JSON.stringify(pf)}`);
+
+  const text = `${caught.hint || ""}\n${caught.message || ""}`;
+  assert.ok(!/WRONG VERSION/.test(text),
+    `nothing was compared, so nothing may be called wrong; got ${JSON.stringify(text)}`);
+  assert.ok(!/expected \)/.test(text) && !/expected \.\s/.test(text),
+    `and no sentence may render an empty operand; got ${JSON.stringify(text)}`);
+  assert.ok(!/--post-flight-only null/.test(text) && !/--post-flight-only undefined/.test(text),
+    `nor name a re-check command that cannot check anything; got ${JSON.stringify(text)}`);
+  // It falls to the neutral #274 verdict, which is true here and points at the right next step.
+  assert.match(caught.message, /restored tree may not be what's running/);
+  assert.match(caught.message, /ocp doctor/);
+});
+
+test("#372 (rollback) control: with `from-version.txt` READABLE the same fixture still reaches the wrong-version cell", async () => {
+  // The scoped control for the test above: identical in every respect except that the operand is
+  // present. Without it, "no WRONG VERSION" would also pass if the cell had simply been deleted.
+  const run = _u347Runner({ "launchctl bootstrap": Infinity });
+  let caught = null;
+  try {
+    await runUpgrade(_u352Opts({
+      execFn: run,
+      mockProbe: () => ({ status: "degraded", auth: { ok: true }, version: "3.14.0" }),
+    }));
+  } catch (e) { caught = e; }
+  assert.ok(caught);
+  assert.ok((caught.hint || "").startsWith("THE PROXY IS UP BUT SERVING THE WRONG VERSION"),
+    `a present, differing target must still reach this cell; got hint=${JSON.stringify(caught.hint)}`);
+  assert.ok(caught.hint.includes("3.14.0") && caught.hint.includes("3.10.0"),
+    `naming both versions; got hint=${JSON.stringify(caught.hint)}`);
+  assert.ok(!/--post-flight-only null/.test(caught.hint),
+    `and the re-check command must name the version the comparison used; got hint=${JSON.stringify(caught.hint)}`);
 });
 
 // ── #262 SECURITY (same shape as #257's injection, on the rollback path) ───────────────────────
