@@ -1499,8 +1499,9 @@ test("localToolsSafetyError: multi is checked before loopback/anon (most severe 
 import { spawn as _ltSpawn, execFileSync as _ltExecFile } from "node:child_process";
 import { createServer as _ltNetServer, connect as _ltNetConnect } from "node:net";
 import { createServer as _ltHttpServer } from "node:http";
-import { writeFileSync as _ltWrite, chmodSync as _ltChmod, readFileSync as _ltRead, existsSync as _ltExists, rmSync as _ltRm, mkdtempSync as _ltMkdtemp, renameSync as _ltRename } from "node:fs";
+import { writeFileSync as _ltWrite, chmodSync as _ltChmod, readFileSync as _ltRead, existsSync as _ltExists, rmSync as _ltRm, mkdtempSync as _ltMkdtemp, renameSync as _ltRename, mkdirSync as _ltMkdirSync, realpathSync as _ltRealpath } from "node:fs";
 import { tmpdir as _ltTmp } from "node:os";
+import { sep as _ltSep } from "node:path";
 import { fileURLToPath as _ltF2P } from "node:url";
 
 const LT_SERVER = _ltF2P(new URL("./server.mjs", import.meta.url));
@@ -1544,6 +1545,92 @@ exit 0
 
 function ltMkdir() { return _ltMkdtemp(join(_ltTmp(), "ocp-lt-")); }
 function ltFake(dir) { const p = join(dir, "claude"); _ltWrite(p, LT_FAKE); _ltChmod(p, 0o755); return p; }
+
+// ── #384: the harness's own `tmux` ───────────────────────────────────────────────────────
+// `lib/tui/session.mjs:54` resolves `process.env.OCP_TUI_TMUX_BIN || "tmux"` at module load,
+// so a TUI-mode boot with that variable unset runs whatever `tmux` PATH provides — on a
+// developer workstation, the operator's real one. Measured on the maintainer's host by giving
+// the two existing TUI sites a PATH-resolved logging `tmux` instead of the real binary. (Line
+// numbers below are the PRE-CHANGE ones #384 cites, kept so the issue and this comment can be
+// read against each other; the tests are "TUI mode → flag is announced INERT" and
+// "integration (#213): the TUI path bounds the prompt per model too".)
+//
+//   :2066 (boot only) — 1 invocation, `list-sessions`, in 12 of 15 runs (3/5 on a loaded
+//     host, 9/10 on a quiet one — the FREQUENCY tracks load, the reachability does not).
+//     That test asserts on the inert-flag warning (server.mjs:4018), printed BEFORE the boot
+//     reap at :4036, so whether the reap beats the test's SIGKILL is a race — and an exec'd
+//     tmux outlives its parent's SIGKILL, so losing the race does not undo the call.
+//   :2521 (boots and POSTs) — 3 invocations EVERY run: the boot reap's `list-sessions`, then
+//     one `tmux new-session -d` per request, each launching `claude` in a pane rooted at the
+//     operator's real `$HOME/.ocp-tui/work`. Three is the count the OBSERVING stub saw
+//     because it refuses; a real tmux answers `new-session` with a live pane and the turn
+//     goes on to capture/paste/kill it (38 invocations, measured against a permissive stub).
+//
+// What the real binary would then do is `reapStaleTuiSessions`' business: `kill-session` on
+// every session matching this port's prefix OR the legacy `ocp-tui-<8hex>` shape, and then
+// `tmux kill-server` when no foreign session remains (lib/tui/session.mjs:154).
+//
+// THIS STUB REFUSES EVERY SUBCOMMAND, and that is a decision with two measured legs, not a
+// default. Refusing puts `reapStaleTuiSessions` out at its FIRST guard — `if (!r || r.status
+// !== 0) return 0` (session.mjs:125) — so no kill of any kind is issued, and it makes
+// `bootTuiPane` throw `tui_spawn_failed` at `new-session` (session.mjs:664) so no pane exists.
+// A stub that SUCCEEDS instead was built and measured, and rejected on its own evidence:
+//
+//   - a `list-sessions` that exits 0 with empty output means "server up, zero sessions",
+//     which satisfies `!othersRemain && sparedLive === 0` — so the permissive stub FIRES
+//     `tmux kill-server`. It reproduces the hazard the pin exists to remove rather than
+//     removing it. Harmless against a stub, but it is the wrong shape to enshrine, and
+//     AGENTS.md asks that a stub which can mutate a running service fail loudly by default.
+//   - it buys nothing and costs a lot: :2521 measured 38 tmux invocations / 11723 ms under
+//     the permissive stub against 3 / 936 ms under this one, with the SAME four assertions
+//     passing either way.
+//
+// The log is a path baked into the generated script rather than read from an env var, so no
+// test's env can silently redirect or disable it.
+const LT_TMUX_STUB_LOG = "tmux-calls.log";
+function ltTmuxStub(dir, name = "tmux-stub") {
+  const p = join(dir, name);
+  const logPath = join(dir, `${name}.${LT_TMUX_STUB_LOG}`);
+  _ltWrite(p, `#!/bin/sh
+# OCP test-harness stub for tmux (#384) — logs argv, then refuses. See ltBoot.
+{ for a in "$@"; do printf '%s ' "$a"; done; printf '\\n'; } >> '${logPath}'
+exit 1
+`);
+  _ltChmod(p, 0o755);
+  return p;
+}
+// Every argv this stub was invoked with, one entry per invocation, oldest first.
+function ltTmuxCalls(dir, name = "tmux-stub") {
+  const logPath = join(dir, `${name}.${LT_TMUX_STUB_LOG}`);
+  if (!_ltExists(logPath)) return [];
+  return _ltRead(logPath, "utf8").split("\n").map(s => s.trim()).filter(Boolean);
+}
+// Resolve the `tmux` binary ltBoot hands the child. Split out from ltBoot so the refusal
+// below is reachable from a test without spawning a server.
+//
+// A caller MAY supply its own — a future test of the TUI REQUEST path needs a stub that
+// succeeds — but only one it created inside its OWN scratch dir. That is a bound on
+// capability rather than a prohibition: the operator's `/opt/homebrew/bin/tmux` cannot be
+// inside a directory ltMkdir() made this run, and realpath closes the symlink route.
+// Anything else THROWS rather than being quietly overridden: silently ignoring an override
+// the author believes took effect is worse than refusing it (#382's F4).
+function ltResolveTmuxBin(env, dir) {
+  const supplied = env && env.OCP_TUI_TMUX_BIN;
+  if (supplied === undefined || supplied === null) return ltTmuxStub(dir);
+  let root, target;
+  try { root = _ltRealpath(dir); } catch { throw new Error(`ltBoot: dir ${dir} does not exist`); }
+  try { target = _ltRealpath(supplied); } catch {
+    throw new Error(`ltBoot: OCP_TUI_TMUX_BIN=${supplied} does not exist. A test's tmux stub must be a ` +
+                    `real file inside its own scratch dir (${dir}).`);
+  }
+  if (target !== root && !target.startsWith(root + _ltSep)) {
+    throw new Error(`ltBoot: refusing OCP_TUI_TMUX_BIN=${supplied} (resolves to ${target}), which is OUTSIDE ` +
+                    `this test's scratch dir ${root}. A live-server test may never point server.mjs at a tmux ` +
+                    `it did not create: reapStaleTuiSessions issues kill-session and kill-server. Write a stub ` +
+                    `with ltTmuxStub(dir, name) and pass that.`);
+  }
+  return supplied;
+}
 // #248 mutation-table support: a deterministic, non-timing-based measurement of what ltTest's
 // serialization actually guarantees. Timing-based reproduction of "the queue isn't serializing"
 // became unreliable once the ltWait cap (below) was raised to 10x in response to review — the
@@ -1596,9 +1683,25 @@ async function ltDrain(cond, where, ms = 5000) {
   return ok;
 }
 function ltBoot(env, dir, nodeArgs = []) {
+  const childEnv = { ...process.env, NODE_ENV: "test", OCP_DIR_OVERRIDE: dir, OCP_SKIP_AUTH_TEST: "1",
+           CLAUDE_BIND: "127.0.0.1", CLAUDE_AUTH_MODE: "none", CLAUDE_CACHE_TTL: "0", CLAUDE_TIMEOUT: "4000", ...env };
+  // #384: pinned here, in the BASE env, and applied AFTER the `...env` spread — deliberately,
+  // on both counts.
+  //
+  // In the base rather than at the two TUI sites, because per-site pinning is a rule the next
+  // TUI test has to remember, and the two sites this issue was filed for are what happens when
+  // it isn't. AGENTS.md: constraints must be unreachable by construction, not stated as
+  // prohibitions. It is applied UNCONDITIONALLY (not gated on CLAUDE_TUI_MODE) for the same
+  // reason — a conditional pin is the same hole one level down, and ltBoot cannot see which
+  // caller will later turn TUI on. Measured no-op for every non-TUI test: all four tmux call
+  // sites (server.mjs:571, :572, :1045, :4036) are inside `if (TUI_MODE)`.
+  //
+  // After the spread, so a per-test env cannot take it back by accident — last write wins,
+  // which is #382's F4 finding applied to this harness. A DELIBERATE override still works, and
+  // is validated rather than ignored; see ltResolveTmuxBin.
+  childEnv.OCP_TUI_TMUX_BIN = ltResolveTmuxBin(env, dir);
   const child = _ltSpawn(process.execPath, [...nodeArgs, LT_SERVER], {
-    env: { ...process.env, NODE_ENV: "test", OCP_DIR_OVERRIDE: dir, OCP_SKIP_AUTH_TEST: "1",
-           CLAUDE_BIND: "127.0.0.1", CLAUDE_AUTH_MODE: "none", CLAUDE_CACHE_TTL: "0", CLAUDE_TIMEOUT: "4000", ...env },
+    env: childEnv,
     stdio: ["ignore", "pipe", "pipe"],
   });
   _ltActiveBoots++;
@@ -2078,6 +2181,95 @@ ltTest("integration: TUI mode → flag is announced INERT (not 'ON'), boot not r
     assert.ok(!buf.out.includes("Local tools: ON"),
       `must NOT claim local tools are ON in TUI mode (the wrapper is unused there) — ${ltDiag(buf)}`);
   } finally { child.kill("SIGKILL"); _ltRmRetry(dir); }
+});
+
+// #384: the pin above is only worth having if it actually beats PATH, and "the stub log is
+// non-empty" cannot show that on its own — an empty log is equally consistent with the pin
+// working and with the pin being gone and something else having run. So this test supplies the
+// missing operand: a DECOY `tmux`, first on PATH, standing in for the host's real binary
+// (/opt/homebrew/bin/tmux, measured present on the maintainer's workstation). The decoy is what
+// makes the assertion falsifiable AND what makes the mutation of this test safe to run — remove
+// the pin and the calls land on the decoy, not on the operator's tmux.
+//
+// Asserted on what the harness INVOKED, read out of the stub's own log. Nothing here reads the
+// source text of ltBoot.
+ltTest("integration (#384): ltBoot pins tmux at a refusing stub, so no live-server test can reach the host's tmux", async () => {
+  if (!LT_POSIX) return;
+  const dir = ltMkdir(); const fake = ltFake(dir);
+  const decoyDir = join(dir, "pathdecoy"); _ltMkdirSync(decoyDir, { recursive: true });
+  ltTmuxStub(decoyDir, "tmux"); // named `tmux` so a bare-name PATH lookup finds it first
+  const { child, buf } = await ltBootFresh(
+    { CLAUDE_TUI_MODE: "true", CLAUDE_BIN: fake, PATH: `${decoyDir}:${process.env.PATH}` }, dir);
+  try {
+    // Wait for the boot reap to have RUN, not for a proxy that only implies it will: the reap
+    // is server.mjs:4036 and "Coexistence:" is :4041, in the same synchronous listen callback,
+    // so this marker is strictly AFTER it. Gating on "listening on" instead would be the #199
+    // race — that line is printed at :3990, before the reap.
+    assert.ok(await ltWait(() => buf.out.includes("Coexistence:") || buf.closed || buf.spawnErr),
+      `TUI boot never completed, so the reap was never reached and the assertions below would be ` +
+      `vacuous — ${ltDiag(buf)}`);
+    const calls = ltTmuxCalls(dir);
+    const decoyCalls = ltTmuxCalls(decoyDir, "tmux");
+
+    // 1. EQUALITY, not ">= 0". Under CLAUDE_TUI_MODE=true the boot reap issues exactly one
+    //    `list-sessions`, so a count of 0 can only mean the pinned stub was not the binary
+    //    server.mjs resolved — the predicate-satisfied-by-a-missing-operand shape (#382 N3).
+    assert.equal(calls.length, 1,
+      `expected exactly 1 tmux invocation (the boot reap's list-sessions) against the PINNED stub, ` +
+      `saw ${calls.length}: ${JSON.stringify(calls)}. The PATH decoy saw ${JSON.stringify(decoyCalls)} — ` +
+      `if that is non-empty, ltBoot's OCP_TUI_TMUX_BIN pin is gone and a TUI-mode boot is resolving ` +
+      `tmux off PATH, i.e. running the operator's real one. ${ltDiag(buf)}`);
+    assert.match(calls[0], /^list-sessions /,
+      `the only boot-time tmux call must be the reap's read-only list-sessions. Got: ${calls[0]}`);
+
+    // 2. Nothing reached PATH at all. This is the assertion the decoy exists for.
+    assert.deepEqual(decoyCalls, [],
+      `a tmux was resolved off PATH despite the pin — on a developer workstation that is the ` +
+      `operator's own binary. Decoy log: ${JSON.stringify(decoyCalls)}`);
+
+    // 3. The REFUSAL is what stops the harm, so assert the harm did not happen rather than
+    //    trusting the exit status. reapStaleTuiSessions returns at its first guard when
+    //    list-sessions fails (lib/tui/session.mjs:125), so neither kill ever issues. A
+    //    permissive stub fails exactly here: list-sessions exiting 0 with no output reads as
+    //    "server up, zero sessions" and fires kill-server (session.mjs:154) — measured.
+    assert.ok(!calls.some(c => /^kill-(server|session) /.test(c)),
+      `the boot reap issued a kill against the stub: ${JSON.stringify(calls)}. Against a real tmux ` +
+      `that is the operator's session (kill-session) or their whole server (kill-server).`);
+  } finally { child.kill("SIGKILL"); _ltRmRetry(dir); }
+});
+
+// The override lane, exercised directly rather than through a boot — ltResolveTmuxBin is split
+// out of ltBoot precisely so this costs no server process. Behavioural: it calls the function
+// and observes what it returns or throws.
+test("#384: ltResolveTmuxBin accepts a stub the test owns and REFUSES one it does not", () => {
+  if (!LT_POSIX) return;
+  const dir = ltMkdir();
+  try {
+    // Default: no override → a stub inside the test's own dir, and it is executable.
+    const pinned = ltResolveTmuxBin({}, dir);
+    assert.ok(_ltRealpath(pinned).startsWith(_ltRealpath(dir) + _ltSep),
+      `the default pin must live inside the test's own scratch dir, got ${pinned}`);
+    assert.equal(ltResolveTmuxBin({ OCP_TUI_TMUX_BIN: undefined }, dir), ltTmuxStub(dir),
+      "an explicitly-undefined value is 'not supplied', not an override");
+
+    // A stub the test created inside its own dir is allowed — this is the lane a future
+    // TUI-request-path test needs.
+    const mine = ltTmuxStub(dir, "tmux-permissive");
+    assert.equal(ltResolveTmuxBin({ OCP_TUI_TMUX_BIN: mine }, dir), mine,
+      "a stub inside the test's own scratch dir must be accepted");
+
+    // The host's real tmux is refused. Not "an arbitrary path" — the actual binary this guard
+    // exists to keep server.mjs away from, when it is present.
+    for (const real of ["/opt/homebrew/bin/tmux", "/usr/bin/env", "/bin/sh"]) {
+      if (!_ltExists(real)) continue;
+      assert.throws(() => ltResolveTmuxBin({ OCP_TUI_TMUX_BIN: real }, dir), /OUTSIDE/,
+        `ltBoot must refuse a tmux outside the test's scratch dir (${real}), not silently ignore it`);
+    }
+    // A path that does not exist cannot be silently accepted either: server.mjs would fall back
+    // to spawnSync failing, which looks like a refusing stub and would hide a typo'd override.
+    assert.throws(() => ltResolveTmuxBin({ OCP_TUI_TMUX_BIN: join(dir, "nope") }, dir), /does not exist/,
+      "a non-existent override must be refused, not treated as a refusing stub");
+  } finally { _ltRmRetry(dir); }
 });
 
 ltTest("integration: toggling OCP_LOCAL_TOOLS invalidates the standard response cache (epoch fold)", async () => {
