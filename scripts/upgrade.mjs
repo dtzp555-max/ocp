@@ -1663,14 +1663,19 @@ async function runRollback(opts) {
   // and every restart command, so no `launchctl`/`systemctl` restart string is handed to a shell —
   // not "the stub happens to intercept it", but no shell in the call path at all.
   //
-  // It does NOT cover three other lanes, and `mockExec` is what holds those: the argv-form `git
-  // checkout` (gated on plain `opts.mockExec` below), the `tryCopy` block that writes a real plist /
-  // `~/.ocp/ocp.db` / `~/.ocp/admin-key`, and — the one the earlier draft missed — the MED-E
-  // `systemctl --user daemon-reload`, which is a `systemctl` string gated on `opts.mockExec &&
-  // !opts.run` and otherwise goes to the real `execRun`. Claiming "no systemctl string reaches a
-  // shell" while that lane exists would have been the false-mechanism shape this repo has been
-  // bitten by before. The test harness therefore pins `mockExec: true` structurally rather than
-  // conventionally; see `_u352Opts` in test-features.mjs.
+  // It does NOT cover four other lanes, and `mockExec` is what holds those: the argv-form `git
+  // checkout` (gated on plain `opts.mockExec` below); the `tryCopy` block that writes a real plist /
+  // `~/.ocp/ocp.db` / `~/.ocp/admin-key`; the MED-E `systemctl --user daemon-reload`, gated on
+  // `opts.mockExec && !opts.run` and otherwise going to the real `execRun`; and — the one two
+  // successive drafts of this comment missed, measured by independent review (finding LOW-B) —
+  // `resolveRestartPlan`'s OWNER-GATHERING, which under `mockExec:false` shells out to
+  // `lsof`/`netstat`/`ss`/`launchctl print` through that same `execRun` and, when the reviewer ran
+  // it, found the developer's live proxy.
+  //
+  // Claiming "no systemctl string reaches a shell" while those lanes exist is the false-mechanism
+  // shape this repo has been bitten by before, so the count is stated and each lane named. The test
+  // harness pins `mockExec: true` structurally rather than conventionally; see `_u352Opts` in
+  // test-features.mjs.
   //
   // In production `opts.execFn` is undefined and this is the same `execSync` call as before.
   //
@@ -1870,19 +1875,28 @@ async function runRollback(opts) {
   // Scoped to `user-unit` rather than applied to every shape, and that boundary is load-bearing:
   //   - `launchd` — `recoveryPlanCommands` is a pass-through there (its own `action` guard), so the
   //     scoping changes nothing; launchctl has no start limit and no equivalent command.
-  //   - `system-unit` — EXCLUDED, and this is the one that could hurt. There `recoveryPlanCommands`
-  //     emits `sudo systemctl reset-failed -- <unit>`: a DIFFERENT sudo command from the `sudo
-  //     systemctl restart -- <unit>` that planRestart verified with `sudo -n -l`, so a sudoers rule
-  //     authorizing only the latter leaves this one prompting for a password — a hang, in a recovery
-  //     path. Excluding it means no command this function EXECUTES can ever carry `sudo`, which is
-  //     true by construction of the `user-unit` branch (planRestart emits no `sudo` on it) rather
-  //     than by relying on `resolveRestartPlan`'s `isRollback && owner.kind === "system-unit"`
-  //     refusal further up. That refusal does make `system-unit` unreachable here today — but it is
-  //     a prohibition living in another function, and its shape has been revised twice already
-  //     (MED-8, then MED-F, then #234 added a second identity-keyed refusal beside it), so it is not
-  //     an invariant to hang an executed `sudo` on.
-  // Both directions are pinned by test: the executed pass carries reset-failed on `user-unit`, and
-  // no executed command anywhere carries `sudo`.
+  //   - `system-unit` — EXCLUDED. There `recoveryPlanCommands` emits `sudo systemctl reset-failed
+  //     -- <unit>`: a DIFFERENT sudo command from the `sudo systemctl restart -- <unit>` that
+  //     planRestart verified with `sudo -n -l`, so a sudoers rule authorizing only the latter leaves
+  //     this one prompting for a password — a hang, in a recovery path.
+  //
+  // WHAT KEEPS `sudo` OUT OF THIS FUNCTION, stated precisely because the first draft of this comment
+  // overstated it and an independent review measured the overstatement (finding F2). It is NOT this
+  // exclusion, and it is NOT "by construction". The retry loop above and the `else` branch of the
+  // restore both execute `restartCmds` VERBATIM, and a `system-unit` plan's commands carry `sudo`
+  // (restart-unit.mjs:1106). If a `system-unit` plan ever reached this function, `sudo` would be
+  // executed regardless of the scoping below.
+  //
+  // The property actually rests on ONE upstream refusal: `resolveRestartPlan` throws for
+  // `isRollback && owner.kind === "system-unit"` (this file, ~:399) before any command runs. That is
+  // the load-bearing line, so THAT is what carries a test with teeth — one asserting the refusal
+  // fires with ZERO commands executed. Testing the `system-unit` branch of the scoping below would
+  // mean testing a state the code refuses to enter.
+  //
+  // What the exclusion below buys is therefore narrower and worth stating honestly: the step this
+  // pass ADDS never carries `sudo`, independent of that refusal. Belt to the upstream braces, and
+  // the reason it stays is that the refusal's shape has been revised repeatedly (MED-8, then MED-F,
+  // then #234 added a second identity-keyed refusal beside it).
   const restartAttempts = opts.restartAttempts ?? RESTART_ATTEMPTS;
   const restartBackoffMs = opts.restartBackoffMs ?? 1000;
   const restartCmds = restartPlan.plan.cmds;
@@ -2037,23 +2051,50 @@ async function runRollback(opts) {
   // round the same loop a second time. What is true on this path instead: the tree IS restored, and
   // the only thing missing is a running service.
   const probeCouldNotRun = postFlight.lastFailure?.kind === "probe-could-not-run";
-  // #352 review finding MED-1. `postFlight.ok === false` covers FIVE distinct states, and one of
-  // them is `version-mismatch`: curl connected, a body was read, `lastSeen` is populated, and the
-  // service is answering — with the wrong version. On the rollback path that is the single most
-  // likely non-fatal outcome, because a surviving pre-rollback process holding the port is exactly
-  // the failure #274 built this post-flight to catch. Keying the DOWN cell on `!postFlight.ok`
-  // alone would print "THE PROXY IS DOWN … /health is not answering" about a service that just
-  // answered, in the same throw whose `post-flight` phase says `last saw version=…`.
+  // #352 review findings MED-1 and F1. `postFlight.ok === false` covers FIVE distinct states, and
+  // the DOWN wording ("/health is not answering") is only true in two of them. Each cell below is
+  // keyed on the #291 CLASSIFICATION of the last attempt, so no operator-facing sentence asserts
+  // more than was measured.
   //
-  // `ocp`'s cmd_restart, which the cells above cite as their authority, does NOT have this bug: its
-  // DOWN cell keys on the curl exit code (`probe_rc -ne 0`), not on a version predicate.
-  // `!postFlight.ok` is strictly broader, and the extra state is precisely the one where the
-  // message becomes false — so this is the faithful port, not an embellishment of it.
+  //   version-mismatch  -> reached, read a body, wrong version  -> the port is held by something
+  //                        else, most likely the pre-rollback process (#274's whole subject)
+  //   unparseable       -> reached, got bytes that are not JSON -> something answers, but it is
+  //                        NOT this proxy
+  //   http-error        -> reached, got a non-2xx               -> same: something answers
+  //   unreachable       -> did NOT reach (curl 7)               -> DOWN
+  //   timeout           -> did not answer within the budget     -> DOWN
+  //   probe-could-not-run                                       -> local fault, handled ABOVE
   //
-  // `lastSeen` is the discriminator because `runPostFlightCheck` assigns it only after `probe()`
-  // returned a body (`lastSeen = body.version`, before the acceptance test). Non-null therefore
-  // means "something answered on the port", which is the exact fact the DOWN wording denies.
-  const serviceAnswered = postFlight.lastSeen != null;
+  // WHY THIS IS KEYED ON `lastFailure` AND NOT ON `lastSeen` (review finding LOW-D, and the reason
+  // MED-1's first fix was only half right). `runPostFlightCheck` assigns `lastSeen = body.version`
+  // and NEVER resets it, while `lastFailure` is overwritten every attempt. So `lastSeen != null`
+  // is STICKY: a probe that answers `3.14.0` on attempt 1 and then gets connection-refused for the
+  // rest of the budget ends with `lastSeen = "3.14.0"` and `lastFailure = unreachable`. Keyed on
+  // `lastSeen`, that service — which is now DOWN — would be reported "UP BUT SERVING THE WRONG
+  // VERSION". Keyed on `lastFailure.kind`, it reports DOWN, which is what the last measurement
+  // actually says. `lastSeen` is still READ inside the version-mismatch arm, where it is current by
+  // construction: it is assigned in the same iteration that sets that kind.
+  //
+  // WHY THE `unparseable` ARM IS NOT COSMETIC — three reasons, in the order they matter:
+  //
+  //  1. It broke the authority these cells cite. `ocp`'s `_curl_probe` (ocp:210-227) returns 0
+  //     whenever curl exits 0, and `curl -sf` exits 0 on a 200 with a non-JSON body — so bash lands
+  //     on the ANSWERING branch (ocp:1092, warned success), never on its DOWN cell (ocp:1073, which
+  //     requires `probe_rc -ne 0`). The "faithful port" claim held for version-mismatch and failed
+  //     here, because only this path parses the body at all.
+  //  2. The REMEDY was wrong, not just the wording. If a foreign process holds the port, the
+  //     recovery commands cannot bind and re-running them accomplishes nothing. The right advice
+  //     already exists one cell up — `ocp doctor`, and "something other than this unit owns the
+  //     port" — and this repo has hit exactly that shape twice (#237, #239).
+  //  3. It was NEW surface. Before this PR the `exec` throw meant no DOWN claim existed on this
+  //     path at all, so this is a false statement this PR would have introduced.
+  const failureKind = postFlight.lastFailure?.kind ?? null;
+  const servedWrongVersion = failureKind === "version-mismatch";
+  const answeredNotOcp = failureKind === "unparseable" || failureKind === "http-error";
+  // DOWN requires POSITIVE evidence of non-reach rather than being the `else`. Anything the
+  // classifier did not produce one of these five kinds for falls through to the neutral #274
+  // verdict below, which claims nothing about the service beyond "this is not confirmed".
+  const didNotReach = failureKind === "unreachable" || failureKind === "timeout";
   const recoveryCmds = recoveryPlanCommands(restartPlan).join(" && ");
 
   if (restartFailure && !postFlightMeasured) {
@@ -2077,7 +2118,25 @@ async function runRollback(opts) {
     );
   }
 
-  if (restartFailure && !postFlight.ok && serviceAnswered) {
+  if (restartFailure && !postFlight.ok && answeredNotOcp) {
+    // F1's cell. Something answered on the port and it is not this proxy — a non-JSON body, or a
+    // non-2xx status. Neither "THE PROXY IS DOWN" nor "SERVING THE WRONG VERSION" is true: there is
+    // no version to name, and the thing answering may not be OCP at all. The remedy differs too,
+    // which is why this is a cell rather than a reworded sentence: the recovery commands cannot
+    // bind a port somebody else holds.
+    throw Object.assign(
+      new Error(`rollback post-flight failed: ${postFlight.lastFailure.detail} — something is answering on 127.0.0.1:${rollbackPort}, but it is not this proxy`),
+      { phases, target: target.path,
+        hint: `SOMETHING ELSE IS ANSWERING ON 127.0.0.1:${rollbackPort} — ${postFlight.lastFailure.detail}. `
+          + `A restart command also failed after ${restartFailure.attempts} attempts. Do NOT simply re-run the restart: `
+          + `if another process owns the port, the start command cannot bind it and will keep failing. `
+          + `Find out what owns it first — \`ocp doctor\`, then \`lsof -i :${rollbackPort}\` / \`ss -ltnp\`. `
+          + `The working tree IS rolled back to ${meta.fromVersion || meta.fromCommit}; do not run \`ocp update --rollback\` again. `
+          + `Once the port is genuinely free, bring the service back with: ${recoveryCmds}` }
+    );
+  }
+
+  if (restartFailure && !postFlight.ok && servedWrongVersion) {
     // MED-1's cell. A restart command failed AND something is answering on the port with the wrong
     // version — the surviving-old-process shape. Saying "THE PROXY IS DOWN" here would be false, and
     // saying nothing about the restart failure would lose the reason. This is #274's verdict with
@@ -2095,7 +2154,7 @@ async function runRollback(opts) {
     );
   }
 
-  if (restartFailure && !postFlight.ok) {
+  if (restartFailure && !postFlight.ok && didNotReach) {
     // The cell this issue exists for, on the path an operator only reaches because something else
     // already failed. Reaching here means the probe RAN, reached nothing, and the fault is not a
     // local one — so "not answering" is measured, not assumed. Service state leads; and unlike

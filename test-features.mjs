@@ -6199,19 +6199,31 @@ test("#274: rollback post-flight is skipped-mock under plain mockExec with no in
 //     command. No `launchctl`/`systemctl` RESTART string is ever handed to a shell, a child
 //     process, or an exec* call — there is no shell in that call path to intercept, which is
 //     strictly stronger than a stub that fails loudly.
-//   - `mockExec: true` holds the three lanes `execFn` does NOT cover, enumerated rather than waved
-//     at: the argv-form `git checkout` (gated on plain `opts.mockExec`), the `tryCopy` block that
-//     would write a real `~/Library/LaunchAgents/dev.ocp.proxy.plist` / `~/.config/systemd/user/
-//     ocp-proxy.service` / `~/.ocp/ocp.db` / `~/.ocp/admin-key`, and the MED-E `systemctl --user
-//     daemon-reload` (gated on `opts.mockExec && !opts.run`, and no test here passes `opts.run`).
+//   - `mockExec: true` holds the FOUR lanes `execFn` does NOT cover. The count was wrong twice —
+//     an independent review measured a fourth (finding LOW-B) — so it is stated as a count and each
+//     lane is named, rather than left as an "enumerated rather than waved at" claim that asserts an
+//     exhaustiveness nobody checked:
+//       1. the argv-form `git checkout` (gated on plain `opts.mockExec`);
+//       2. the `tryCopy` block that would write a real
+//          `~/Library/LaunchAgents/dev.ocp.proxy.plist` / `~/.config/systemd/user/ocp-proxy.service`
+//          / `~/.ocp/ocp.db` / `~/.ocp/admin-key`;
+//       3. the MED-E `systemctl --user daemon-reload` (gated on `opts.mockExec && !opts.run`, and
+//          no test here passes `opts.run`);
+//       4. `resolveRestartPlan`'s OWNER-GATHERING, which under `mockExec:false` shells out to
+//          `lsof` / `netstat` / `ss` / `launchctl print` via `execRun`. The reviewer ran it that way
+//          and it found the developer's live proxy.
 //     It also skips the 3s pre-restart sleep. `_u352Opts` pins `mockExec: true` AFTER the caller's
 //     spread precisely so this cannot be turned off by a future test passing `mockExec: false`
-//     alongside an `execFn` — that combination would re-enable all three at once, including a
+//     alongside an `execFn` — that combination would re-enable all four at once, including a
 //     `tryCopy` that overwrites the developer's own live plist from `/tmp/snap-x`. Unreachable by
 //     construction, not by convention (AGENTS.md, and #217's own incident).
 //   - `opts.mockProbe` replaces the post-flight curl the same way, so no network probe runs.
-//   - `mockSnapshots`/`mockSnapshotMeta` keep `listSnapshots`/`readSnapshot` off the real
-//     `~/.ocp/upgrade-snapshot-*` entirely.
+//   - `mockSnapshots`/`mockSnapshotMeta` are DEFAULTS, not guarantees: they sit before `...extra` in
+//     `_u352Opts`, so a caller can override them. They keep `listSnapshots`/`readSnapshot` off the
+//     real `~/.ocp/upgrade-snapshot-*` for every test in this file, which is a statement about these
+//     tests and not a property of the harness (finding LOW-C — the earlier wording implied the
+//     latter). `mockExec` is the one pinned after the spread, because it is the one whose loss
+//     writes to a real `$HOME`.
 console.log("\n#352 — rollback's restart phase (retry / restore / reach the #274 post-flight):");
 
 // Shared opts for the rollback lane. Backoff and settle delays are zeroed: the retry COUNT, not the
@@ -6520,18 +6532,26 @@ test("#352 MED-3 (G2, in the EXECUTED lane): a reset-failed that exits non-zero 
     `a failed best-effort step is a WARNING, not a restore failure; got ${JSON.stringify(resetPhase)}`);
 });
 
-test("#352 MED-3 boundary: no command this function EXECUTES may ever carry `sudo`, on any reachable plan shape", async () => {
-  // The half of MED-3 that is a safety property rather than an improvement. `recoveryPlanCommands`'s
-  // `system-unit` shape emits `sudo systemctl reset-failed -- <unit>` — a DIFFERENT sudo command
-  // from the `sudo systemctl restart -- <unit>` planRestart verified with `sudo -n -l`, so a
-  // sudoers rule authorizing only the latter leaves this one prompting for a password: a hang, in a
-  // recovery path. Excluding `system-unit` from the executed pass makes that unreachable by
-  // construction (planRestart emits no sudo on `user-unit`) rather than by relying on
-  // resolveRestartPlan's own system-unit refusal, which lives in another function and has been
-  // revised three times.
+test("#352 MED-3: the reset-failed step this pass ADDS carries no `sudo`, on either reachable plan shape", async () => {
+  // RENAMED AND RESCOPED after independent review (finding F2). This test was called "no command
+  // this function EXECUTES may ever carry sudo ... by construction", and that claim was false in
+  // two ways the reviewer measured:
   //
-  // Driven across BOTH shapes rollback can actually reach, since a single-shape assertion would not
-  // establish "on any reachable plan shape".
+  //   - It is not what the test pins. Replacing the `action === "user-unit"` boundary in
+  //     scripts/upgrade.mjs with `true` — removing the exclusion entirely — leaves this test
+  //     PASSING, with byte-identical command lists on both shapes: `recoveryPlanCommands` is a
+  //     pass-through on launchd (its own `action` guard) and emits no sudo on user-unit, so the
+  //     assertion is entailed regardless of the code under test.
+  //   - It is not true of the function either. The retry loop and the restore's `else` branch
+  //     execute `restartCmds` verbatim, and a `system-unit` plan's commands carry `sudo`
+  //     (restart-unit.mjs:1106). What actually keeps sudo out is an upstream refusal in
+  //     `resolveRestartPlan` — pinned by the next test, which is the one with teeth.
+  //
+  // What this test DOES pin, and can still fail: `recoveryPlanCommands` introduces no `sudo` of its
+  // own. Mutation M13 (prepending `sudo` to its returned reset-failed) turns it red, along with
+  // #347's own F5 sudo test. Kept for that, under an honest name.
+  //
+  // Driven across both shapes rollback can reach, so the claim covers what it says it covers.
   for (const [label, extra] of [
     ["launchd", { mockPlatform: "darwin" }],
     ["user-unit", { mockPlatform: "linux", mockOwnerProbe: { ssOutput: "" } }],
@@ -6544,6 +6564,140 @@ test("#352 MED-3 boundary: no command this function EXECUTES may ever carry `sud
     assert.equal(run.calls.filter(c => /\bsudo\b/.test(c)).length, 0,
       `no executed command may carry sudo on the ${label} shape; got calls=${JSON.stringify(run.calls)}`);
   }
+});
+
+test("#352 F2: the upstream `system-unit` refusal is what keeps `sudo` out of this function — it fires with ZERO commands executed", async () => {
+  // Review finding F2. The claim "no command this function executes can carry sudo, by
+  // construction" was false: the retry loop and the restore's `else` branch execute the plan's
+  // commands VERBATIM, and a system-unit plan carries `sudo systemctl restart --` (restart-unit.mjs).
+  // The property rests entirely on `resolveRestartPlan` refusing `isRollback && owner.kind ===
+  // "system-unit"` BEFORE any command runs — so that refusal is what deserves a test with teeth,
+  // and this is it.
+  //
+  // The teeth are the `run.calls` assertion, not the rejection: a test that only checked the
+  // message would still pass if the refusal moved to AFTER the restart loop, which is precisely the
+  // regression that would let a `sudo` through. Neutering the refusal makes the plan resolve to a
+  // system unit and `sudo systemctl restart -- ocp.service` gets executed — this goes red.
+  const run = _u347Runner({});
+  let caught = null;
+  try {
+    await runUpgrade(_u352Opts({
+      mockPlatform: "linux", execFn: run, mockProbe: _u352Restored,
+      mockOwnerProbe: {
+        ssOutput: `LISTEN 0 511 0.0.0.0:3456 0.0.0.0:* users:(("node",pid=798931,fd=19))`,
+        cgroupContent: "0::/system.slice/ocp.service\n",
+      },
+      mockIsRoot: false,   // so the refusal's own suggested command is the sudo-prefixed one
+    }));
+  } catch (e) { caught = e; }
+
+  assert.ok(caught, "a system-unit-owned port must abort the rollback");
+  assert.match(caught.message, /rollback only restores the launchd plist and the USER-scope systemd unit file/);
+  // Premise: the refusal really did name a sudo command, i.e. this fixture reaches the state where
+  // a sudo COULD have been executed had the refusal not fired.
+  assert.match(caught.message, /sudo systemctl restart -- ocp\.service/,
+    `harness premise: the refusal must be about a unit whose restart needs sudo; got ${JSON.stringify(caught.message)}`);
+
+  assert.equal(run.calls.filter(c => /\bsudo\b/.test(c)).length, 0,
+    `no sudo may be executed; got calls=${JSON.stringify(run.calls)}`);
+  assert.equal(run.count("systemctl"), 0,
+    `and no systemctl at all — the refusal must precede the restart loop, not follow it; got calls=${JSON.stringify(run.calls)}`);
+});
+
+test("#352 F1: a restart failure while something NON-OCP answers the port must not be reported as DOWN, and must not prescribe a restart", async () => {
+  // Review finding F1. `unparseable` (curl connected, body is not JSON) left `lastSeen` null, so
+  // the DOWN cell fired: one thrown error whose phase message said "Something is answering on the
+  // port, but it is not this proxy" and whose hint said "/health is not answering". The CLI prints
+  // the hint and never the phase message, so the operator saw only the false half — verbatim the
+  // signature that justified MED-1, one predicate over.
+  //
+  // It also broke the cited authority: `ocp`'s `_curl_probe` returns 0 whenever curl exits 0, and
+  // `curl -sf` exits 0 on a 200 with a non-JSON body, so bash lands on warned-success, never on its
+  // DOWN cell (which requires `probe_rc -ne 0`).
+  const run = _u347Runner({ "launchctl bootstrap": Infinity });
+  let caught = null;
+  try {
+    await runUpgrade(_u352Opts({
+      execFn: run,
+      // A body that is not JSON — the shape `classifyPostFlightProbeFailure` files as `unparseable`
+      // via the SyntaxError arm. Thrown from JSON.parse exactly as the real probe would.
+      mockProbe: () => JSON.parse("<html>nginx</html>"),
+    }));
+  } catch (e) { caught = e; }
+
+  assert.ok(caught);
+  const pf = caught.phases.find(p => p.name === "post-flight");
+  assert.ok(pf && /not JSON/.test(pf.message || ""),
+    `premise: the probe must have produced the unparseable classification; got ${JSON.stringify(pf)}`);
+
+  assert.ok(!/THE PROXY IS DOWN/.test(caught.hint),
+    `something answered — DOWN is not what was measured; got hint=${JSON.stringify(caught.hint)}`);
+  assert.ok(!/is not answering/.test(caught.hint),
+    `and the hint must not contradict its own phase message; got hint=${JSON.stringify(caught.hint)}`);
+  assert.ok(caught.hint.startsWith("SOMETHING ELSE IS ANSWERING"),
+    `got hint=${JSON.stringify(caught.hint)}`);
+  // The remedy, which is the half that makes this more than wording: re-running the restart cannot
+  // bind a port another process holds, so the hint must send the operator to find the owner first.
+  assert.ok(/ocp doctor/.test(caught.hint) && /Do NOT simply re-run the restart/.test(caught.hint),
+    `it must prescribe finding the port's owner, not another restart; got hint=${JSON.stringify(caught.hint)}`);
+});
+
+test("#352 F1: an HTTP-error post-flight is classified the same way — answering, not down", async () => {
+  // `http-error` (curl exit 22 under -f) is the sibling state: something responded, with a non-2xx.
+  // The DOWN verdict is closer to faithful here than for `unparseable`, but "/health is not
+  // answering" is still false, so it shares the cell.
+  const run = _u347Runner({ "launchctl bootstrap": Infinity });
+  let caught = null;
+  try {
+    await runUpgrade(_u352Opts({
+      execFn: run,
+      mockProbe: () => { throw Object.assign(new Error("curl: (22) The requested URL returned error: 502"), { status: 22 }); },
+    }));
+  } catch (e) { caught = e; }
+
+  assert.ok(caught);
+  assert.ok(!/is not answering/.test(caught.hint),
+    `a non-2xx IS an answer; got hint=${JSON.stringify(caught.hint)}`);
+  assert.ok(caught.hint.startsWith("SOMETHING ELSE IS ANSWERING"),
+    `got hint=${JSON.stringify(caught.hint)}`);
+});
+
+test("#352 LOW-D: `lastSeen` is STICKY — a probe that answers once and then dies must be reported DOWN, not as serving the wrong version", async () => {
+  // Review finding LOW-D, and the reason MED-1's first fix was only half right. `runPostFlightCheck`
+  // assigns `lastSeen = body.version` and never resets it, while `lastFailure` is overwritten each
+  // attempt. Keyed on `lastSeen != null`, a service that answered once at t=0 and was refused for
+  // the rest of the budget reports "UP BUT SERVING THE WRONG VERSION" — about a service that is
+  // down. Keyed on `lastFailure.kind`, it reports what the LAST measurement says.
+  //
+  // Two attempts, and the fixture makes the difference observable: answer `3.14.0` first, then
+  // refuse. Under the sticky predicate `postFlight.lastSeen` is still "3.14.0" at the end.
+  let n = 0;
+  const run = _u347Runner({ "launchctl bootstrap": Infinity });
+  let caught = null;
+  try {
+    await runUpgrade(_u352Opts({
+      execFn: run,
+      postFlightAttempts: 2, postFlightIntervalMs: 0,
+      mockProbe: () => {
+        n++;
+        if (n === 1) return { status: "ok", auth: { ok: true }, version: "3.14.0" };
+        throw Object.assign(new Error("curl: (7) Failed to connect to 127.0.0.1"), { status: 7 });
+      },
+    }));
+  } catch (e) { caught = e; }
+
+  assert.ok(caught);
+  assert.equal(n, 2, `harness premise: both probe attempts must have run; got n=${n}`);
+  // Premise: `lastSeen` really is sticky, or this test measures nothing. Read it off the phase
+  // message, which renders `lastSeen` when it is set.
+  const pf = caught.phases.find(p => p.name === "post-flight");
+  assert.ok(pf && /last saw version=3\.14\.0/.test(pf.message || ""),
+    `harness premise: lastSeen must have survived the later failure; got ${JSON.stringify(pf)}`);
+
+  assert.ok(!/SERVING THE WRONG VERSION/.test(caught.hint),
+    `the last measurement was a refusal, not a wrong version; got hint=${JSON.stringify(caught.hint)}`);
+  assert.ok(caught.hint.startsWith("THE PROXY IS DOWN"),
+    `got hint=${JSON.stringify(caught.hint)}`);
 });
 
 test("#352 MED-1: a restart failure with something ANSWERING on the port must not be reported as the proxy being DOWN", async () => {
