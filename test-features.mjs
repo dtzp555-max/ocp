@@ -9505,13 +9505,23 @@ test("#386 (the money test): the state #386 measured — unclassifiable probe + 
     `the message the CLI prints must say what to do; got message=${JSON.stringify(caught.message)}`);
 
   // "Demoted" is an ORDERING, so it is asserted as one rather than as the presence of a word.
+  //
+  // ORDER OF THESE TWO IS LOAD-BEARING (#386 review F4), and they were originally the other way
+  // round, which made the second DEAD: reaching it required `rollbackAt > doctorAt >= 0`, which
+  // already implies `rollbackAt !== -1`. Measured by the reviewer rather than reasoned — delete the
+  // trailing rollback sentence from the hint and the ORDERING assertion fires with
+  // `doctorAt=336 rollbackAt=-1`, blaming ordering for a deletion, while "demoted, not deleted" is
+  // never reached at all. Presence first, then ordering: both live, both diagnostics true.
+  //
+  // Same shape as the M3 -> M6 mutation disclosure in this PR — an assertion that never runs and an
+  // assertion that runs for the wrong reason are the same defect seen from two sides.
   const doctorAt = caught.hint.indexOf("ocp doctor");
   const rollbackAt = caught.hint.indexOf("ocp update --rollback");
-  assert.ok(rollbackAt > doctorAt && doctorAt !== -1,
-    `the rollback must come AFTER the diagnosis, not before it; doctorAt=${doctorAt} ` +
-    `rollbackAt=${rollbackAt} hint=${JSON.stringify(caught.hint)}`);
   assert.ok(rollbackAt !== -1,
-    `and it must still be OFFERED — demoted, not deleted; got hint=${JSON.stringify(caught.hint)}`);
+    `the rollback must still be OFFERED — demoted, not deleted; got hint=${JSON.stringify(caught.hint)}`);
+  assert.ok(doctorAt !== -1 && rollbackAt > doctorAt,
+    `and it must come AFTER the diagnosis, not before it; doctorAt=${doctorAt} ` +
+    `rollbackAt=${rollbackAt} hint=${JSON.stringify(caught.hint)}`);
 
   // #372 recorded "the hint no longer names the restart failure" as the accepted cost of NOT
   // giving this state a cell. Fixing the destination removes that cost as well, so it is pinned.

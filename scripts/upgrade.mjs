@@ -1987,11 +1987,10 @@ async function runFullUpgrade({ doctor, opts }) {
       // has now happened twice (#372's `not-ok-status`, then #381's `probe-failed-unclassified`).
       //
       // HOW BIG THE FALL-THROUGH ACTUALLY IS, measured end to end through `runUpgrade` rather than
-      // reasoned from the ladder — and it is six kinds, not one. Since #372/#381 re-keyed DOWN onto
-      // POSITIVE evidence, every restart-failure arm above also requires `restartFailure`, so with
-      // the restart commands all exiting 0 this arm is the destination for `unreachable`, `timeout`,
-      // `http-error`, `unparseable`, `body-not-ocp`, `version-mismatch` AND
-      // `probe-failed-unclassified`. All seven printed, verbatim and identically:
+      // reasoned from the ladder — and it is SEVEN kinds, not one. With the restart commands all
+      // exiting 0 this arm is the destination for `unreachable`, `timeout`, `http-error`,
+      // `unparseable`, `body-not-ocp`, `version-mismatch` AND `probe-failed-unclassified`. All
+      // seven printed, verbatim and identically:
       //
       //     ✗ post-flight failed
       //        hint: Working tree may be at new version. Run `ocp update --rollback` to restore …
@@ -2001,6 +2000,24 @@ async function runFullUpgrade({ doctor, opts }) {
       // `snapshot`, `target` and `hint` — never a phase's `message` — so the classification the
       // post-flight phase carries never reaches the operator at all. Seven measurements, one
       // sentence, and that sentence recommends a rollback.
+      //
+      // WHAT DID *NOT* CAUSE THIS, corrected by #386's review because the first version of this
+      // note asserted a cause that does not follow. It read: "since #372/#381 re-keyed DOWN onto
+      // POSITIVE evidence, every restart-failure arm above also requires `restartFailure`, so with
+      // the restart commands exiting 0 …". The premise is true and the inference is empty — with
+      // `restartFailure` falsy those arms cannot fire WHATEVER they are keyed on, so the re-keying
+      // is irrelevant to this lane. These seven have always fallen through for want of a cell of
+      // their own. Measured, forward lane, rows carrying the generic tree hint:
+      //
+      //   8a2c884 (pre-#381) ... 9 rows, ALL restart-ok
+      //   40bd94b (#381) ....... 8 rows      #381 REMOVED two by giving `probe-could-not-run` and
+      //   11f49f2 (#385) ....... 8 rows      `not-ok-status` their own cells, and ADDED one — the
+      //                                      `probe-failed-unclassified` + restart-FAILED row #386
+      //                                      reported, which before #381 printed THE PROXY IS DOWN.
+      //
+      // So the re-keying narrowed this lane by two and widened it by one; it did not create the
+      // seven. And #385 changed ZERO rows — it moved the classification and left every call site's
+      // wording untouched, which is exactly what it said it did.
       //
       // WHAT THIS ARM MAY SAY, and why it is worded from the population rather than from the kind:
       // a catch-all may only assert what is true of every member. Three things are:
@@ -2017,7 +2034,11 @@ async function runFullUpgrade({ doctor, opts }) {
       // " (unreachable — …)", a claim about REACH. Rendering it here would re-import #386's own
       // shape into the one arm whose entire job is to claim nothing — the next unnamed kind would
       // arrive pre-narrated as a dead proxy. `detail` carries no disposition, so it cannot.
-      const measured = postFlight?.lastFailure?.detail ? ` — ${postFlight.lastFailure.detail}` : "";
+      // `postFlight` is not optional-chained (#386 review F5): it is assigned unconditionally at
+      // this function's own `let postFlight = {…}` and only ever replaced by `runPostFlightCheck`'s
+      // return, so a `?.` there would state a doubt the next line — and every sibling cell — does
+      // not share. `lastFailure` IS genuinely nullable in this arm, so that guard stays.
+      const measured = postFlight.lastFailure?.detail ? ` — ${postFlight.lastFailure.detail}` : "";
       throw Object.assign(
         new Error(`post-flight failed: the upgraded tree may not be what's running — run \`ocp doctor\` before assuming the upgrade landed`),
         { phases, snapshotPath,
