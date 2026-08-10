@@ -2087,9 +2087,9 @@ function ltFake(dir) { const p = join(dir, "claude"); _ltWrite(p, LT_FAKE); _ltC
 //
 //   :2066 (boot only) — 1 invocation, `list-sessions`, in 12 of 15 runs (3/5 on a loaded
 //     host, 9/10 on a quiet one — the FREQUENCY tracks load, the reachability does not).
-//     That test asserts on the inert-flag warning (`ignored in TUI mode`, server.mjs:4210),
+//     That test asserts on the inert-flag warning (`ignored in TUI mode`, server.mjs:4158),
 //     printed BEFORE the boot reap (`reapStaleTuiSessions({ port: PORT, includeLegacy:
-//     true })`, :4242), so whether the reap beats the test's SIGKILL is a race — and an
+//     true })`, :4190), so whether the reap beats the test's SIGKILL is a race — and an
 //     exec'd tmux outlives its parent's SIGKILL, so losing the race does not undo the call.
 //   :2521 (boots and POSTs) — 3 invocations EVERY run: the boot reap's `list-sessions`, then
 //     one `tmux new-session -d` per request, each launching `claude` in a pane rooted at the
@@ -2248,9 +2248,9 @@ function ltBoot(env, dir, nodeArgs = []) {
   // prohibitions. It is applied UNCONDITIONALLY (not gated on CLAUDE_TUI_MODE) for the same
   // reason — a conditional pin is the same hole one level down, and ltBoot cannot see which
   // caller will later turn TUI on. Measured no-op for every non-TUI test: all SIX tmux call
-  // sites are gated — server.mjs:538 (TUI_POOL_SIZE, which makes tuiPool null so :571/:572
-  // are unreachable), :571, :572, :1045 (the periodic sweep), :1974/:2151 (runTuiTurn, behind
-  // `TUI_MODE ?` dispatch) and :4242 (the boot reap). An earlier revision of this comment said
+  // sites are gated — server.mjs:536 (TUI_POOL_SIZE, which makes tuiPool null so :569/:570
+  // are unreachable), :569, :570, :1018 (the periodic sweep), :1949/:2126 (runTuiTurn, behind
+  // `TUI_MODE ?` dispatch) and :4190 (the boot reap). An earlier revision of this comment said
   // "four" and listed the wrong last line; the conclusion was right and the enumeration was
   // short, which is its own kind of wrong in a comment a reader is meant to re-derive from.
   //
@@ -2763,18 +2763,20 @@ ltTest("integration (#384): ltBoot pins tmux at a refusing stub, so no live-serv
     // this depends on is the ORDER of three markers inside server.mjs's single synchronous
     // listen callback, so they are named by their greppable text first and by line second:
     //
-    //     `listening on ${bindMsg}`                     :4196   <- do NOT gate on this
-    //     `ignored in TUI mode`                         :4210
-    //     reapStaleTuiSessions({ ..., includeLegacy })  :4242   <- the thing being waited for
-    //     `Coexistence: This proxy`                     :4247   <- so this marker is AFTER it
+    //     `listening on ${bindMsg}`                     :4145   <- do NOT gate on this
+    //     `ignored in TUI mode`                         :4158
+    //     reapStaleTuiSessions({ ..., includeLegacy })  :4190   <- the thing being waited for
+    //     `Coexistence: This proxy`                     :4195   <- so this marker is AFTER it
     //
     // Gating on "listening on" would be the #199 race: it is printed BEFORE the reap.
     //
-    // LINE NUMBERS ARE AS OF ab3f28f AND WILL DRIFT; the marker strings are the contract.
+    // LINE NUMBERS ARE AS OF c0e57dc AND WILL DRIFT; the marker strings are the contract.
     // #393's review caught all four of these stale by ~139 lines after a merge-forward, and
     // named the reason worth remembering: this comment did not change, and byte-identity of
     // a region is EXACTLY the condition under which its citations into another file go stale
-    // silently — nothing in the file you are editing prompts the re-check.
+    // silently — nothing in the file you are editing prompts the re-check. Then #395 moved
+    // them AGAIN, in the same direction, while this PR was in review — which is the argument
+    // for the marker strings above rather than a fresher set of numbers.
     assert.ok(await ltWait(() => buf.out.includes("Coexistence:") || buf.closed || buf.spawnErr),
       `TUI boot never completed, so the reap was never reached and the assertions below would be ` +
       `vacuous — ${ltDiag(buf)}`);
