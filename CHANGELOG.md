@@ -10,7 +10,7 @@
 
   **Why `--tools` and not `--disallowedTools`.** `--tools` is the tool-*availability* registry (which built-ins exist for the session), not a permission layer. A tool that is never offered can never raise an interactive permission prompt — and a headless tmux pane has nobody to answer one, so such a prompt hangs the turn to the wallclock cap and bricks the pane. That is the same failure that already rules out `--dangerously-skip-permissions` for TUI, which is what makes the availability registry the right lever rather than merely a convenient one.
 
-  Scoped to the default MCP-walled surface: it is **not** read under `OCP_TUI_FULL_TOOLS=1`, whose tool surface is `CLAUDE_ALLOWED_TOOLS`. Whitespace-only is treated as unset deliberately — `--tools ""` means *disable every tool* to `claude`, and a stray-empty env var must not silently do that.
+  Scoped to the default MCP-walled surface: it is **not** read under `OCP_TUI_FULL_TOOLS=1`, whose tool surface is `CLAUDE_ALLOWED_TOOLS` (or, when that is unset, its hardcoded default set). It narrows what the pane's model is **offered** and is explicitly **not a trust boundary** — everything the pane runs still runs as the OCP host user; ADR 0007 lists `--tools ""` as only *one of three* requirements for the deferred multi-tenant B-path. Whitespace-only is treated as unset deliberately — `--tools ""` means *disable every tool* to `claude`, and a stray-empty env var must not silently do that.
 
   **Not endpoint-touching.** `lib/tui/session.mjs` only assembles the argv for the locally spawned interactive `claude`; no request handler, no response shape, no `server.mjs`. `docs/governance/b2-response-keys.json` is unchanged and the in-suite key-set diff stayed green.
 

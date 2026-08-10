@@ -12327,8 +12327,13 @@ function mk190ArgvProbe() {
   const save = { ...process.env };
   const dir = _ltMkdtemp(join(_ltTmp(), "ocp-190-argv-"));
   const argvDump = join(dir, "argvdump.sh");
-  _ltWrite(argvDump, "#!/bin/sh\nfor a in \"$@\"; do printf '%s\\n' \"$a\"; done\n");
-  _ltChmod(argvDump, 0o755);
+  try {
+    _ltWrite(argvDump, "#!/bin/sh\nfor a in \"$@\"; do printf '%s\\n' \"$a\"; done\n");
+    _ltChmod(argvDump, 0o755);
+  } catch (e) {
+    _ltRm(dir, { recursive: true, force: true }); // no caller `finally` exists yet
+    throw e;
+  }
   for (const k of ["OCP_TUI_TOOLS", "OCP_TUI_FULL_TOOLS", "CLAUDE_ALLOWED_TOOLS", "CLAUDE_MCP_CONFIG"]) {
     delete process.env[k];
   }
@@ -12339,7 +12344,8 @@ function mk190ArgvProbe() {
   const paneArgv = (sid) => {
     const cmd = buildTuiCmd(argvDump, "m", sid, "/home/u", "cli");
     const r = spawnSync("/bin/sh", ["-c", cmd], { encoding: "utf8" });
-    assert.equal(r.status, 0, `pane command must be a valid shell string; sh said: ${String(r.stderr).trim()}`);
+    assert.equal(r.status, 0,
+      `pane command must be a valid shell string; sh said: ${String(r.stderr).trim()}${r.error ? ` (spawn error: ${r.error.message})` : ""}`);
     const argv = String(r.stdout).split("\n").slice(0, -1); // drop the "" after the final printf newline
     assert.ok(argv.length > 0 && argv.includes("--model") && argv.includes("--session-id"),
       `argv probe must be live before anything is asserted absent; got ${JSON.stringify(argv)}`);
@@ -12358,7 +12364,7 @@ test("buildTuiCmd OCP_TUI_TOOLS: unset or blank keeps today's argv, a value adds
   const { paneArgv, cleanup } = mk190ArgvProbe();
   try {
     // unset => today's behaviour: no --tools at all, MCP wall intact.
-    const off = paneArgv("s-off");
+    const off = paneArgv("s-cmp");
     assert.ok(!off.includes("--tools"),
       `unset OCP_TUI_TOOLS => no --tools (all built-in tools available); got ${JSON.stringify(off)}`);
     assert.ok(off.includes("--strict-mcp-config") && off.includes("--disallowedTools") && off.includes("mcp__*"),
@@ -12367,9 +12373,14 @@ test("buildTuiCmd OCP_TUI_TOOLS: unset or blank keeps today's argv, a value adds
     // whitespace-only is treated as unset (footgun guard): a stray-empty var must not silently
     // disable EVERY built-in tool, which is what `--tools ''` means to claude.
     process.env.OCP_TUI_TOOLS = "   ";
-    const blank = paneArgv("s-blank");
-    assert.ok(!blank.includes("--tools"),
-      `whitespace-only OCP_TUI_TOOLS => no --tools; got ${JSON.stringify(blank)}`);
+    const blank = paneArgv("s-cmp"); // SAME session id as `off` — the deepEqual below compares
+                                     // the WHOLE argv, and --session-id is echoed into it.
+    // Deliberately the WHOLE argv, not `!blank.includes("--tools")`. This test's name claims the
+    // argv is *kept*, and deepEqual is what makes that name true; it also strictly implies the
+    // narrower check, so having both would leave the broader one permanently unprovable — any
+    // mutation reaching it is caught by the narrow assertion first. One assertion, one claim.
+    assert.deepEqual(blank, off,
+      `whitespace-only OCP_TUI_TOOLS must produce the SAME argv as unset (a stray-empty var must not reach claude as \`--tools ""\`, which disables every tool); got ${JSON.stringify(blank)} vs ${JSON.stringify(off)}`);
 
     // set => --tools exactly once, value verbatim in the very next argv element.
     process.env.OCP_TUI_TOOLS = "Read,Glob,Grep,WebSearch,WebFetch";
