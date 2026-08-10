@@ -37,7 +37,8 @@ _curl() {
 _json() { python3 -m json.tool 2>/dev/null || cat; }
 
 # Issue #242 (audit follow-up to #236): shared graceful-degradation fallback for the read-only
-# display commands' `<curl-or-var> | python3 -c "..."` pipelines (usage/logs/models/keys/settings). Under `set -euo pipefail` (ocp:7), a bare pipeline like this that is NOT
+# display commands' `<curl-or-var> | python3 -c "..."` pipelines (usage/logs/models/keys/
+# settings). Under `set -euo pipefail` (ocp:7), a bare pipeline like this that is NOT
 # inside an if/while condition kills the WHOLE `ocp` invocation the instant python3 exits
 # non-zero — whether because python3 isn't on PATH (bash's own command-not-found, exit 127,
 # exactly #236's repro one level up) or because the formatter itself choked on the response body

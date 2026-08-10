@@ -188,7 +188,7 @@ release_kit:
       how: |
         The mechanism is scripts/b2-key-snapshot.mjs and the checked-in record is
         docs/governance/b2-response-keys.json. It boots a real server.mjs against a
-        fixture that pins every shape-deciding setting, probes all 16 Class B.2
+        fixture that pins every shape-deciding setting, probes all 14 Class B.2
         endpoint+method pairs in ALIGNMENT.md's inventory, and records each response's
         recursive KEY PATH set plus its status and content-type. Values are never
         recorded, so uptime, timestamps and counters cannot make it flap; the suite
@@ -203,7 +203,7 @@ release_kit:
           probesTuiPool    the config-variant corner — CLAUDE_TUI_MODE=true,
                            OCP_TUI_POOL_SIZE=1, CLAUDE_SKIP_PERMISSIONS=true.
 
-        BOTH blocks get all 16 pairs, two fresh boots, and their own ALIGNMENT.md
+        BOTH blocks get all 14 pairs, two fresh boots, and their own ALIGNMENT.md
         coverage check, so a second profile is not a place an endpoint can hide. Read
         the diff of both; a key path that appears in only one is surface only that
         configuration reaches, not a discrepancy.
@@ -313,7 +313,13 @@ release_kit:
             the three settings are independent — MEASURED by booting the five reachable
             variants (TUI alone; TUI+pool=1; skip-permissions alone; all three at
             pool=1; all three at pool=4) and probing all 16 pairs: no key path appeared
-            that is absent from both blocks. What is still blind is the NEXT
+            that is absent from both blocks. SIXTEEN is correct here and is NOT the 14
+            stated above: this sentence RECORDS a measurement performed at #357, when the
+            inventory still held /sessions. #395 removed that endpoint, so the mechanism
+            probes 14 today. Do not harmonise the two — editing this number would falsify
+            a measurement, and the same distinction applies to the identical sentence in
+            scripts/b2-key-snapshot.mjs § B2_PROFILES and to the CHANGELOG.
+            What is still blind is the NEXT
             shape-deciding setting, if both profiles happen to pin it to one value.
           - The TUI REQUEST path, in either profile. OCP_TUI_TMUX_BIN points at a stub
             tmux that logs its argv and exits 1, so no pane boots and no `claude` runs;
