@@ -5049,7 +5049,9 @@ ltTest("integration (ADR 0016): the whole session surface is gone from the wire,
 //   M1  re-add `sessionHits: 0`   -> 1197/3, both tests below + the #346 snapshot test
 //   M2  re-add `sessionMisses: 0` -> 1197/3, same three; M2 proves the SECOND assertion in each
 //       body executes, since the sessionHits assertion above it passes and the next one throws
-//   M3  delete `stats,` from /health -> 1196/4, both tests below fail at the PREMISE
+//   M3  delete `stats,` from /health -> 1196/4, both tests below fail at the PREMISE, plus the
+//       #346 snapshot test and the #365 stderr-consumer test (which reads /health's stats.errors)
+//       — named so this row's count is as legible as M1's and M2's
 console.log("\nADR 0016 Amendment 1 — stats.sessionHits / stats.sessionMisses removed (#395 follow-up):");
 
 // Returns the OWN key names of /health's stats block, having first proved the block is real.

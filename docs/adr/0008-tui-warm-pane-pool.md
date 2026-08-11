@@ -73,16 +73,25 @@ Add an **opt-in pool of pre-booted, single-use `claude` panes**, `OCP_TUI_POOL_S
 > 2026-07-27 history recreation and shares no ancestor with `main`.
 >
 > **Correction (2026-08-11, #409) — the second sentence above is false, and is kept rather than
-> reworded so the record shows what was believed.** There was no history recreation and #189 is an
-> ordinary descendant of `main`. Measured in a non-shallow clone: `git merge-base origin/main
-> db8cc6a` returns **`bdb6662`** (v3.24.0 — exactly the base the branch names) at **exit 0**, and
-> the repository has a single root, `593d0dc`. The re-creation was **not** necessary; what three
-> weeks of movement produced were ordinary content conflicts, which a rebase would have resolved.
-> The cause was a **shallow clone**, whose boundary commit is locally parentless — so `merge-base`
-> across it exits 1 with empty stdout *and* empty stderr, byte-identical to a genuine "no common
-> ancestor", and the exit code cannot disambiguate. `2593eb1` (#408) corrected this claim in the
-> CHANGELOG and `server.mjs` and recorded the mechanism in ADR 0017; **this copy was missed**,
-> because that sweep matched `no common ancestor` and this sentence says `shares no ancestor`.
+> reworded so the record shows what was believed.** There was no history recreation, and #189
+> branches from `bdb6662` — an ordinary **ancestor** of `main`, not a descendant of it: the two
+> diverged there, which is why `git merge-base --is-ancestor origin/main db8cc6a` fails while
+> `git merge-base origin/main db8cc6a` returns **`bdb6662`** (v3.24.0, exactly the base the branch
+> names) at **exit 0**. The repository has a single root, `593d0dc`. The re-creation was **not**
+> necessary; what three weeks of movement produced were ordinary content conflicts, which a rebase
+> would have resolved. The cause of the original error was a **shallow clone**, whose boundary
+> commit is locally parentless — so `merge-base` across it exits 1 with empty stdout *and* empty
+> stderr, byte-identical to a genuine "no common ancestor", and the exit code cannot disambiguate.
+>
+> **Why this copy survived `2593eb1` (#408), which corrected the same claim in `server.mjs` and the
+> CHANGELOG and recorded the mechanism in ADR 0017: a SCOPE gap, not a pattern gap.** `git show
+> 2593eb1 --name-only` lists seven files and this one is not among them, so no pattern was ever run
+> against it. (An earlier draft of this correction blamed a phrasing difference — that #408's sweep
+> matched `no common ancestor` while this line says `shares no ancestor`. A second reviewer refuted
+> it: the sites #408 *did* fix say `share NO ancestor`, so a `no common ancestor` grep would have
+> matched none of them either. The phrase was never the discriminator.) The claim reached this file
+> through the #404 amendment, which landed the same day the sweep ran.
+>
 > The attribution above is unaffected — the work is still @sumlin's.
 
 ### 1. Panes are SINGLE-USE. This is the load-bearing rule.
