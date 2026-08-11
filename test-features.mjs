@@ -2233,6 +2233,63 @@ function ltResolveTmuxBin(env, dir) {
   }
   return supplied;
 }
+
+// ── #396: the harness's own `HOME` ───────────────────────────────────────────────────────────
+// A TUI-mode boot with HOME left ambient rewrites the OPERATOR'S LIVE ~/.claude.json. The chain:
+// `resolveTuiHome` (lib/tui/session.mjs) returns `realHome` when neither OCP_TUI_HOME nor
+// CLAUDE_CODE_OAUTH_TOKEN is set — a plain developer shell — and `prepareTuiHome` then calls
+// `ensureTuiCwdTrusted(realHome, cwd)`, which READ-MODIFY-RENAMES that file to add a trust entry
+// for $HOME/.ocp-tui/work. #384's refusing tmux stub cannot stop it: `bootTuiPane` does the
+// mkdirSync and prepareTuiHome BEFORE the `new-session` it then refuses.
+//
+// It is a read-modify-rename, so the harm is not only the added entry: a write made by the
+// operator's own live Claude Code session between our read and our rename is LOST. That is the
+// part #396 understates, and the reason this lands before any further full-suite run.
+//
+// WHY `HOME` AND NOT `OCP_TUI_HOME`. Pinning OCP_TUI_HOME would take `resolveTuiHome`'s FIRST
+// branch (configuredHome wins) and, with no env token, land in prepareTuiHome's LEGACY
+// scratch-home mode — which SYMLINKS the real ~/.claude/.credentials.json into the scratch home.
+// That trades a config rewrite for a credential symlink, which is not obviously better. Pinning
+// HOME instead makes `realHome` itself scratch, so EVERY branch of resolveTuiHome lands inside
+// the scratch tree and the legacy branch has no real credentials file to link. One variable,
+// and it also redirects TUI_CWD (server.mjs: `OCP_TUI_CWD || ${HOME}/.ocp-tui/work`),
+// TUI_STREAM_DIR, SPAWN_HOME_DIR, the openclaw log path, and every `homedir()` call — os.homedir()
+// reads $HOME on POSIX. scripts/b2-key-snapshot.mjs already pins HOME for exactly this reason.
+//
+// WHY THE BASE ENV. Measured on this tree: of the SEVEN `CLAUDE_TUI_MODE: "true"` boot sites,
+// SEVEN pin no HOME; of the eight other TUI-ish sites (the `ltTuiTmux` ones), EIGHT do. Eight
+// authors remembered and seven did not, which is AGENTS.md's "constraints must be unreachable by
+// construction, not stated as prohibitions" with the count attached. Applied unconditionally
+// rather than gated on CLAUDE_TUI_MODE, for #384's reason: ltBoot cannot see which caller will
+// later turn TUI on, and a conditional pin is the same hole one level down.
+//
+// WHY THE CONTAINMENT BOUNDARY IS _ltTmp() AND NOT `dir`. This is the one place #384's pattern
+// must NOT be copied verbatim. Its tmux guard requires the supplied path to sit inside the
+// test's own `dir`; the eight sites that already pin HOME use `const home = ltMkdir()`, a
+// SIBLING of `dir` under the same temp root. A dir-scoped guard here would reject all eight.
+// The property that matters is "not the operator's real home", not "inside this specific test",
+// so the boundary is the harness's temp root.
+function ltResolveHome(env, dir) {
+  const supplied = env && env.HOME;
+  if (supplied === undefined || supplied === null) {
+    const h = join(dir, "home");
+    if (!_ltExists(h)) _ltMkdirSync(h, { recursive: true });
+    return h;
+  }
+  let root, target;
+  try { root = _ltRealpath(_ltTmp()); } catch { throw new Error(`ltBoot: temp root ${_ltTmp()} does not exist`); }
+  try { target = _ltRealpath(supplied); } catch {
+    throw new Error(`ltBoot: HOME=${supplied} does not exist. A live-server test's HOME must be a real ` +
+                    `directory it created, under ${_ltTmp()} (use ltMkdir()).`);
+  }
+  if (target !== root && !target.startsWith(root + _ltSep)) {
+    throw new Error(`ltBoot: refusing HOME=${supplied} (resolves to ${target}), which is OUTSIDE the harness ` +
+                    `temp root ${root}. A TUI-mode boot rewrites $HOME/.claude.json — read-modify-rename, so it ` +
+                    `can also lose a concurrent write by the operator's own Claude session. Create one with ` +
+                    `ltMkdir() and pass that.`);
+  }
+  return supplied;
+}
 // #248 mutation-table support: a deterministic, non-timing-based measurement of what ltTest's
 // serialization actually guarantees. Timing-based reproduction of "the queue isn't serializing"
 // became unreliable once the ltWait cap (below) was raised to 10x in response to review — the
@@ -2306,6 +2363,8 @@ function ltBoot(env, dir, nodeArgs = []) {
   // which is #382's F4 finding applied to this harness. A DELIBERATE override still works, and
   // is validated rather than ignored; see ltResolveTmuxBin.
   childEnv.OCP_TUI_TMUX_BIN = ltResolveTmuxBin(env, dir);
+  // #396: same construction, same reason, DIFFERENT containment boundary — see ltResolveHome.
+  childEnv.HOME = ltResolveHome(env, dir);
   const child = _ltSpawn(process.execPath, [...nodeArgs, LT_SERVER], {
     env: childEnv,
     stdio: ["ignore", "pipe", "pipe"],
@@ -3097,6 +3156,103 @@ test("#384: ltResolveTmuxBin accepts a stub the test owns and REFUSES one it doe
     assert.throws(() => ltResolveTmuxBin({ OCP_TUI_TMUX_BIN: join(dir, "nope") }, dir), /does not exist/,
       "a non-existent override must be refused, not treated as a refusing stub");
   } finally { _ltRmRetry(dir); }
+});
+
+test("#396: ltResolveHome defaults inside the test's dir, accepts a SIBLING scratch, refuses the real home", () => {
+  if (!LT_POSIX) return;
+  const dir = ltMkdir(); const sibling = ltMkdir();
+  try {
+    // Default: no HOME supplied → a directory this test owns, created for it.
+    const pinned = ltResolveHome({}, dir);
+    assert.ok(_ltRealpath(pinned).startsWith(_ltRealpath(dir) + _ltSep),
+      `the default HOME must live inside the test's own scratch dir, got ${pinned}`);
+    assert.ok(_ltExists(pinned), "the default HOME must be created, not merely named — prepareTuiHome writes into it");
+    assert.equal(ltResolveHome({ HOME: undefined }, dir), ltResolveHome({}, dir),
+      "an explicitly-undefined value is 'not supplied', not an override");
+
+    // A SIBLING scratch dir is accepted. This is the case that decides the boundary: the eight
+    // TUI sites that already pin HOME use `const home = ltMkdir()`, which is a sibling of `dir`,
+    // not a child of it. A dir-scoped guard — the shape #384 uses for tmux — would reject all
+    // eight. Copying that pattern verbatim here would have been wrong, which is why this
+    // assertion exists rather than being left to the integration test to discover.
+    assert.equal(ltResolveHome({ HOME: sibling }, dir), sibling,
+      "a sibling scratch dir under the harness temp root must be accepted");
+
+    // The operator's real home is refused. Counted, so a machine where none of the candidates
+    // resolves cannot pass this vacuously — the empty-set shape AGENTS.md calls anchor drift.
+    let refused = 0;
+    for (const real of [homedir(), join(homedir(), ".claude"), "/", "/tmp/.."]) {
+      if (!_ltExists(real)) continue;
+      let outside = true;
+      try { outside = !_ltRealpath(real).startsWith(_ltRealpath(_ltTmp()) + _ltSep) && _ltRealpath(real) !== _ltRealpath(_ltTmp()); } catch { outside = true; }
+      if (!outside) continue; // a machine whose TMPDIR is under $HOME — skip, do not miscount
+      assert.throws(() => ltResolveHome({ HOME: real }, dir), /OUTSIDE/,
+        `ltBoot must refuse HOME outside the harness temp root (${real}) — a TUI boot rewrites $HOME/.claude.json`);
+      refused++;
+    }
+    assert.ok(refused >= 1,
+      "no candidate resolved outside the temp root, so the refusal was never exercised — " +
+      "this test would have passed without testing anything");
+
+    assert.throws(() => ltResolveHome({ HOME: join(dir, "nope") }, dir), /does not exist/,
+      "a non-existent HOME must be refused, not silently accepted — server.mjs would create it under a typo");
+  } finally { _ltRmRetry(dir); _ltRmRetry(sibling); }
+});
+
+ltTest("integration (#396): a TUI turn writes its trust entry into the PINNED home, with no HOME supplied", async () => {
+  if (!LT_POSIX) return;
+  const dir = ltMkdir(); const fake = ltFake(dir); const tmux = ltTuiTmux(dir);
+  const pinned = join(dir, "home");                 // what ltResolveHome defaults to
+  // Deliberately NO `HOME:` in this env. That is the whole test: the seven CLAUDE_TUI_MODE boot
+  // sites on this tree pin no HOME, and before this change each of them rewrote the operator's
+  // live ~/.claude.json. A test that passed HOME would be asserting the fix it is meant to prove.
+  // ltResolveHome creates the dir; seed a config INSIDE it before booting. This is what makes the
+  // redirect observable rather than merely absent: `ensureTuiCwdTrusted` opens <home>/.claude.json
+  // and RETURNS if it cannot be read (session.mjs — `catch { return; }`), so on a virgin scratch
+  // home the write simply never happens. That is the containment we want, but "no file appeared"
+  // is also what a boot that never reached the path produces, and the two are indistinguishable.
+  // Seeding forces the write path to run and makes its destination the thing under test.
+  // Created directly, NOT via ltResolveHome: the seed must not depend on the function under test,
+  // or a mutation of that function breaks the setup and the test reddens for the wrong reason —
+  // measured, on the first version of this test.
+  _ltMkdirSync(pinned, { recursive: true });
+  _ltWrite(join(pinned, ".claude.json"), "{}\n");
+  const { child, buf, port } = await ltBootFresh({ ...tmux.env, CLAUDE_BIN: fake }, dir);
+  try {
+    assert.ok(await ltWait(() => buf.out.includes("listening on"), 8000), `boot — ${ltDiag(buf)}`);
+    await ltPost(port, { model: "haiku", messages: [{ role: "user", content: "hi" }] });
+
+    // PREMISE, before any claim about where the write landed: a pane actually booted. bootTuiPane
+    // runs mkdirSync + prepareTuiHome and THEN spawns `new-session`, so a recorded new-session is
+    // positive evidence that the trust-writing path executed. Without this, a boot that failed
+    // earlier would make every assertion below pass over a path that never ran.
+    assert.ok(tmux.calls().some(c => c.startsWith("new-session ")),
+      `premise: a pane must have booted, so prepareTuiHome ran; got ${JSON.stringify(tmux.calls())}`);
+
+    // The TUI cwd was created under the PINNED home. TUI_CWD is `OCP_TUI_CWD || ${HOME}/.ocp-tui/work`
+    // (server.mjs), so this is the second path the pin closes and it is independent of the config write.
+    assert.ok(_ltExists(join(pinned, ".ocp-tui", "work")),
+      `the TUI cwd must be created under the pinned home (${pinned}), not under the operator's $HOME`);
+
+    // And the trust entry landed in the SEEDED config, in the pinned home — the write happened,
+    // and it happened here. Before this pin the same write went to the operator's live config.
+    //
+    // Existence first, then read. Measured: with the pin redirected to a different scratch dir
+    // (mutation M1), reading straight through threw `ENOENT ... /home/.claude.json` — a real
+    // detection carrying a filesystem message instead of naming the defect. The assertion below
+    // is what a future reader needs to see when the pin moves.
+    const cfgPath = join(pinned, ".claude.json");
+    assert.ok(_ltExists(cfgPath),
+      `the seeded config vanished from the pinned home (${cfgPath}) — the boot used a different ` +
+      `HOME than the one this test seeded, so the trust write went somewhere unobserved`);
+    const cfg = JSON.parse(_ltRead(cfgPath, "utf8"));
+    const trusted = Object.keys(cfg.projects || {});
+    assert.ok(trusted.length > 0,
+      `premise: the seeded config must have been rewritten at all — an untouched "{}" means the ` +
+      `trust path did not run, so the next assertion would pass on an empty set`);
+    assert.ok(trusted.every(p => p.startsWith(pinned + _ltSep)),
+      `every trusted cwd must live under the pinned home; got ${JSON.stringify(trusted)}`);
+  } finally { child.kill("SIGKILL"); _ltRmRetry(dir); }
 });
 
 ltTest("integration: toggling OCP_LOCAL_TOOLS invalidates the standard response cache (epoch fold)", async () => {
