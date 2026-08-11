@@ -5040,7 +5040,11 @@ ltTest("integration (ADR 0016): the whole session surface is gone from the wire,
 // ONE mutation (re-adding a field) breaks the same claim in both profiles — the MUTUAL case,
 // where ordering is no defence and only separate bodies can produce a row each.
 //
-// Mutation rows, all measured against base 2593eb1 (control 1200/0), full table in the PR body:
+// Mutation rows, measured on the PR TREE (branch base 2593eb1 PLUS this branch) — control
+// 1200/0. Stated that way deliberately, and the base was RUN rather than subtracted: a detached
+// worktree at 2593eb1 gives 1198 passed / 0 failed, 2 skipped. So a reader who checks out the
+// base to reproduce the control will find 1198, and the +2 is these two registrations. Full
+// table in the PR body:
 //   M1  re-add `sessionHits: 0`   -> 1197/3, both tests below + the #346 snapshot test
 //   M2  re-add `sessionMisses: 0` -> 1197/3, same three; M2 proves the SECOND assertion in each
 //       body executes, since the sessionHits assertion above it passes and the next one throws
@@ -5048,8 +5052,14 @@ ltTest("integration (ADR 0016): the whole session surface is gone from the wire,
 console.log("\nADR 0016 Amendment 1 — stats.sessionHits / stats.sessionMisses removed (#395 follow-up):");
 
 // Returns the OWN key names of /health's stats block, having first proved the block is real.
-// The premise is ordered widest-to-narrowest and every step is about the OBSERVATION, never
-// about the two fields under test, so no mutation aimed at those fields can be absorbed here.
+//
+// Why no mutation aimed at the two fields can be ABSORBED here, stated as the real argument
+// rather than the convenient one: `keys.length >= 5` IS computed from a set that contains the
+// fields under test, so "every step is about the observation, not the fields" would be false.
+// It is safe because it is a LOWER BOUND and every mutation this test guards against is
+// ADDITIVE — re-adding a field moves the count UP, away from the floor, so the premise still
+// passes and the absence assertion below is the one that fires. Measured as M1/M2 in the table
+// above: 8 keys, premise clear, absence assertion red.
 async function ltAmd1StatsKeys(port, buf, what) {
   const r = await fetch(`http://127.0.0.1:${port}/health`);
   assert.equal(r.status, 200, `${what}: premise — /health did not answer 200, got ${r.status} — ${ltDiag(buf)}`);
@@ -5058,9 +5068,11 @@ async function ltAmd1StatsKeys(port, buf, what) {
   assert.ok(body.stats && typeof body.stats === "object" && !Array.isArray(body.stats),
     `${what}: premise — /health carries no stats OBJECT, so an absence claim about its keys would be vacuous: ${JSON.stringify(body.stats)}`);
   const keys = Object.keys(body.stats);
-  // A positive count, not "not empty": the block must still carry the seven counters that survive
-  // this removal. 5 is a floor with margin, chosen so that re-adding a field (8 keys) cannot make
-  // this fire and absorb a mutation aimed at the absence assertions below.
+  // A positive count, not "not empty": the block must still carry the counters that survive this
+  // removal (seven of them today). The floor is 5 rather than 7 for HEADROOM, not because 7 would
+  // absorb anything — any floor <= 8 is absorption-safe. A floor pinned at today's exact count
+  // would turn an unrelated future counter removal into a PREMISE failure, which reads as "the
+  // probe saw a stub" and points a reader at the harness instead of at the change they made.
   assert.ok(keys.length >= 5,
     `${what}: premise — stats has only ${keys.length} keys, so the probe saw a stub: ${JSON.stringify(body.stats)}`);
   assert.ok(keys.includes("totalRequests"),
@@ -5090,6 +5102,13 @@ ltTest("integration (ADR 0016 Amendment 1): the same holds under TUI mode, the s
   // The snapshot's probesTuiPool block recorded these two key paths independently of `probes`, so
   // a removal proved only on the default profile would leave the other recorded occurrence
   // unverified from the wire. `stats` is built unconditionally, which is what this pins.
+  //
+  // BOUND THE CLAIM, so a reader does not over-count this as independent coverage: because the
+  // /health handler emits `stats` through one unconditional bare shorthand, no mutation can redden
+  // this test without also reddening the default-profile one — its M1/M2 rows are necessarily
+  // duplicates. It earns its place by pinning the SECOND wire record the snapshot keeps, and it
+  // would catch a future change that made the stats block config-conditional. It is not a second
+  // independent proof of the same fact.
   const dir = ltMkdir(); const fake = ltFake(dir);
   const { child, buf, port } = await ltBootFresh({ CLAUDE_BIN: fake, CLAUDE_TUI_MODE: "true" }, dir);
   try {
