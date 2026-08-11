@@ -4049,9 +4049,18 @@ const server = createServer(async (req, res) => {
     // primitive boxes instead of throwing, so `parsed.name` is `undefined` and the `||` falls to
     // the auto-name. Authorized by ADR 0006 (Class B.2 inventory) AND ADR 0017 (this change).
     //
-    // The requirement is stated POSITIVELY and at the site, per ADR 0017 § "Alternatives rejected",
-    // which declines the shared `isJsonObject` predicate here: the body must be a non-null,
-    // non-array object.
+    // The requirement — the body must be a non-null, non-array object — is stated POSITIVELY, and
+    // it is stated by `isJsonObject`, the SHARED predicate, not re-inlined here. ADR 0017 as signed
+    // rejected that predicate by name; that rejection was withdrawn (ADR 0017, second post-sign-off
+    // correction) because it asserted a property `isJsonObject` does not have. The predicate is
+    // character-for-character this requirement, and it IS #360's implementation of the very lesson
+    // the rejection cited against it. An earlier revision of this comment said "Deliberately NOT
+    // `isJsonObject`" — true under #360's scope, which forbade changing which requests are accepted,
+    // and false here, because ADR 0017 removes exactly that constraint.
+    //
+    // Inlining it would also re-open what the predicates' own doc block closes: they exist so the
+    // null case is "decided ONCE rather than re-remembered at each site". A fourth hand-rolled copy
+    // is the fifth reader arriving carrying the bug again.
     //
     // THE ENUMERATION IS CLOSED, not sampled. `JSON.parse` with no reviver returns exactly one of
     // RFC 8259's six value productions — object, array, string, number, boolean, null. A body that
@@ -4064,7 +4073,7 @@ const server = createServer(async (req, res) => {
     // escaped this `async` handler unobserved by Node, and the socket was never answered or closed.
     // The rejection body is the `{ error: "<string>" }` shape this handler already used for a
     // malformed body; no new error shape is invented here.
-    if (!(typeof parsed === "object" && parsed !== null && !Array.isArray(parsed))) {
+    if (!isJsonObject(parsed)) {
       return jsonResponse(res, 400, { error: "Expected JSON object with key-value pairs" });
     }
     const name = parsed.name || `key-${Date.now()}`;
