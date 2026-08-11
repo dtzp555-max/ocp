@@ -5026,7 +5026,8 @@ ltTest("integration (ADR 0016): the whole session surface is gone from the wire,
 // before trusting a negative predicate).
 //
 // That the premise is load-bearing here is MEASURED, not argued, because the counterfactual is
-// the only thing that can establish it. Base 2593eb1, control 1200 passed / 0 failed. Deleting
+// the only thing that can establish it. Control 1200 passed / 0 failed on the PR tree (see the
+// base-vs-PR-tree note below before reproducing these numbers from 2593eb1). Deleting
 // `stats,` from the /health response (mutation M3) reddens both tests below AT THE PREMISE
 // ("premise — /health carries no stats OBJECT ... : undefined"), 1196/4. Re-running that SAME
 // mutation against a variant of the helper with the premise stripped and `body.stats ?? {}` in
