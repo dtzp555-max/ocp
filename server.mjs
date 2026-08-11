@@ -1039,8 +1039,11 @@ const stats = {
   activeRequests: 0,
   errors: 0,
   timeouts: 0,
-  sessionHits: 0,
-  sessionMisses: 0,
+  // sessionHits / sessionMisses removed here under ADR 0016 Amendment 1. `git show 885f62a`
+  // (PR #103) deletes `stats.sessionHits++` and `stats.sessionMisses++` in the same hunk as
+  // `sessions.set(...)`, so both were permanently 0 from then on. They reached the wire via the
+  // bare `stats,` shorthand in GET /health — which is why deleting two declarations here was a
+  // Class B.2 response-shape change and needed an authorization rather than a tidy-up.
   oneOffRequests: 0,
   queued: 0,           // current requests waiting for a -p concurrency slot (FIX ⑥)
   queueRejections: 0,  // total requests rejected with HTTP 429 because the wait-queue was full (FIX ⑥)

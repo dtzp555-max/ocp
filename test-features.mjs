@@ -5015,6 +5015,96 @@ ltTest("integration (ADR 0016): the whole session surface is gone from the wire,
   }
 });
 
+// ── ADR 0016 Amendment 1: stats.sessionHits / stats.sessionMisses are GONE ───────────────────
+// Behavioural, and specifically not a source grep. `stats` reaches the wire through a single bare
+// `stats,` shorthand in the /health handler, so a test that greps server.mjs for the two names
+// proves nothing about what a client receives — it would pass with the object rebuilt elsewhere.
+//
+// EVERY BODY ESTABLISHES A LIVENESS PREMISE BEFORE IT ASSERTS AN ABSENCE. An absence assertion
+// passes trivially over an empty observation (AGENTS.md: "an assertion that never EXECUTED is
+// indistinguishable from one that passed", and its prescription — require a POSITIVE count
+// before trusting a negative predicate).
+//
+// That the premise is load-bearing here is MEASURED, not argued, because the counterfactual is
+// the only thing that can establish it. Base 2593eb1, control 1200 passed / 0 failed. Deleting
+// `stats,` from the /health response (mutation M3) reddens both tests below AT THE PREMISE
+// ("premise — /health carries no stats OBJECT ... : undefined"), 1196/4. Re-running that SAME
+// mutation against a variant of the helper with the premise stripped and `body.stats ?? {}` in
+// its place gives 1198/2 — with NEITHER of these two tests among the failures. So the naive
+// spelling of this test passes while /health has no stats block at all, which is the exact
+// vacuous pass the premise converts into a failure.
+//
+// TWO PROFILES, IN SEPARATE test() BODIES. The snapshot recorded these two key paths under
+// `GET /health` in BOTH `probes` and `probesTuiPool`, so both are re-checked against a live
+// server rather than inherited from the snapshot file. They are separate registrations because
+// ONE mutation (re-adding a field) breaks the same claim in both profiles — the MUTUAL case,
+// where ordering is no defence and only separate bodies can produce a row each.
+//
+// Mutation rows, all measured against base 2593eb1 (control 1200/0), full table in the PR body:
+//   M1  re-add `sessionHits: 0`   -> 1197/3, both tests below + the #346 snapshot test
+//   M2  re-add `sessionMisses: 0` -> 1197/3, same three; M2 proves the SECOND assertion in each
+//       body executes, since the sessionHits assertion above it passes and the next one throws
+//   M3  delete `stats,` from /health -> 1196/4, both tests below fail at the PREMISE
+console.log("\nADR 0016 Amendment 1 — stats.sessionHits / stats.sessionMisses removed (#395 follow-up):");
+
+// Returns the OWN key names of /health's stats block, having first proved the block is real.
+// The premise is ordered widest-to-narrowest and every step is about the OBSERVATION, never
+// about the two fields under test, so no mutation aimed at those fields can be absorbed here.
+async function ltAmd1StatsKeys(port, buf, what) {
+  const r = await fetch(`http://127.0.0.1:${port}/health`);
+  assert.equal(r.status, 200, `${what}: premise — /health did not answer 200, got ${r.status} — ${ltDiag(buf)}`);
+  const body = await r.json();
+  assert.ok(body && typeof body === "object", `${what}: premise — /health body is not an object`);
+  assert.ok(body.stats && typeof body.stats === "object" && !Array.isArray(body.stats),
+    `${what}: premise — /health carries no stats OBJECT, so an absence claim about its keys would be vacuous: ${JSON.stringify(body.stats)}`);
+  const keys = Object.keys(body.stats);
+  // A positive count, not "not empty": the block must still carry the seven counters that survive
+  // this removal. 5 is a floor with margin, chosen so that re-adding a field (8 keys) cannot make
+  // this fire and absorb a mutation aimed at the absence assertions below.
+  assert.ok(keys.length >= 5,
+    `${what}: premise — stats has only ${keys.length} keys, so the probe saw a stub: ${JSON.stringify(body.stats)}`);
+  assert.ok(keys.includes("totalRequests"),
+    `${what}: premise — stats lacks totalRequests, so this is not the real counter block: ${JSON.stringify(keys)}`);
+  return keys;
+}
+
+ltTest("integration (ADR 0016 Amendment 1): /health's stats block carries no sessionHits or sessionMisses", async () => {
+  if (!LT_POSIX) return;
+  const dir = ltMkdir(); const fake = ltFake(dir);
+  const { child, buf, port } = await ltBootFresh({ CLAUDE_BIN: fake }, dir);
+  try {
+    const keys = await ltAmd1StatsKeys(port, buf, "default profile");
+    assert.ok(!keys.includes("sessionHits"),
+      `/health still reports stats.sessionHits — a key with no writer since 885f62a: ${JSON.stringify(keys)}`);
+    assert.ok(!keys.includes("sessionMisses"),
+      `/health still reports stats.sessionMisses — a key with no writer since 885f62a: ${JSON.stringify(keys)}`);
+  } finally {
+    child.kill("SIGKILL");
+    await ltDrain(() => buf.closed, "adr0016a1-default", 5000);
+    _ltRmRetry(dir);
+  }
+});
+
+ltTest("integration (ADR 0016 Amendment 1): the same holds under TUI mode, the second profile the snapshot records", async () => {
+  if (!LT_POSIX) return;
+  // The snapshot's probesTuiPool block recorded these two key paths independently of `probes`, so
+  // a removal proved only on the default profile would leave the other recorded occurrence
+  // unverified from the wire. `stats` is built unconditionally, which is what this pins.
+  const dir = ltMkdir(); const fake = ltFake(dir);
+  const { child, buf, port } = await ltBootFresh({ CLAUDE_BIN: fake, CLAUDE_TUI_MODE: "true" }, dir);
+  try {
+    const keys = await ltAmd1StatsKeys(port, buf, "tui profile");
+    assert.ok(!keys.includes("sessionHits"),
+      `/health under TUI mode still reports stats.sessionHits: ${JSON.stringify(keys)}`);
+    assert.ok(!keys.includes("sessionMisses"),
+      `/health under TUI mode still reports stats.sessionMisses: ${JSON.stringify(keys)}`);
+  } finally {
+    child.kill("SIGKILL");
+    await ltDrain(() => buf.closed, "adr0016a1-tui", 5000);
+    _ltRmRetry(dir);
+  }
+});
+
 const LT_U8_THREE = "你"; // U+4F60   E4 BD A0        — CJK, 3 bytes
 const LT_U8_FOUR = "🙂";  // U+1F642  F0 9F 99 82     — astral, 4 bytes / 2 UTF-16 units
 
