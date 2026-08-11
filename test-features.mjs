@@ -3737,14 +3737,25 @@ function ltAuthFake(dir) { const p = join(dir, "claude-auth"); _ltWrite(p, LT_AU
 // `await` — the window in which the tmux session already exists (new-session is synchronous) but
 // `runTuiTurn` has not yet been handed a pane. BOOT_MS is 4 s by default, which is the size of
 // that window and far longer than a test needs.
-const LT_TUI_TMUX = (logPath, replyText, hang, neverReady) => `#!/bin/sh
+//
+// `nonTerminal` (ADR 0018) is the THIRD stall shape, and it is the only one that reaches
+// `truncated: true`. `hang` writes NO transcript, so `readTuiTranscript` reaches its cap with no
+// assistant text and THROWS `tui_transcript_timeout`. `nonTerminal` writes the transcript but omits
+// `stop_reason`, so `isTerminalLine` is false, the poll loop runs to the cap WITH text in hand, and
+// the function returns `{ truncated: true }` instead. Those are the two wall-clock outcomes ADR 0018
+// folds into `stats.timeouts`, and they are reached by two different fixtures on purpose — a test
+// that only ever drove one of them would leave the other's increment unproven.
+// Not assumed: the comment above already records this shape being hit by accident — the first cut
+// of this fixture omitted `stop_reason` and produced `tui_wallclock_truncated` with chars:4.
+// Pair it with a short CLAUDE_TUI_WALLCLOCK_MS; the 120 s default is the whole cap.
+const LT_TUI_TMUX = (logPath, replyText, hang, neverReady, nonTerminal) => `#!/bin/sh
 printf '%s\\n' "$*" >> ${JSON.stringify(logPath)}
 case "$1" in
   new-session)
     sid=\`printf '%s' "$*" | sed -n 's/.*--session-id \\([0-9a-fA-F-]*\\).*/\\1/p'\`
     if [ -n "$sid" ] && [ ${hang || neverReady ? "0" : "1"} -eq 1 ]; then
       mkdir -p "$HOME/.claude/projects/x"
-      printf '%s\\n' '{"type":"assistant","message":{"role":"assistant","stop_reason":"end_turn","content":[{"type":"text","text":${JSON.stringify(replyText)}}]},"entrypoint":"cli"}' > "$HOME/.claude/projects/x/$sid.jsonl"
+      printf '%s\\n' '{"type":"assistant","message":{"role":"assistant",${nonTerminal ? "" : '"stop_reason":"end_turn",'}"content":[{"type":"text","text":${JSON.stringify(replyText)}}]},"entrypoint":"cli"}' > "$HOME/.claude/projects/x/$sid.jsonl"
     fi
     exit 0 ;;
   capture-pane)
@@ -3760,11 +3771,11 @@ esac
 // `calls()` is every stub invocation, one argv string per line — the positive evidence that the
 // stub really was the binary server.mjs resolved. An EMPTY log is equally consistent with "the
 // stub was never reached", so tests assert on what IS in it, never only on what is not.
-function ltTuiTmux(dir, replyText = "PONG", { hang = false, neverReady = false } = {}) {
+function ltTuiTmux(dir, replyText = "PONG", { hang = false, neverReady = false, nonTerminal = false } = {}) {
   const log = join(dir, "tmux-calls.log");
   _ltWrite(log, "");
   const bin = join(dir, "tmux-stub");
-  _ltWrite(bin, LT_TUI_TMUX(log, replyText, hang, neverReady));
+  _ltWrite(bin, LT_TUI_TMUX(log, replyText, hang, neverReady, nonTerminal));
   _ltChmod(bin, 0o755);
   return {
     bin, log,
@@ -4157,6 +4168,208 @@ ltTest("integration (#361): a completed TUI-lane request raises the verdict too 
     // still what degrades — but the input becomes truthful on a lane where it never moved.
     assert.equal(after.auth.consecutiveFailures, 0,
       "a completed request is direct evidence the credential is not being refused, so the rejection tally clears");
+  } finally { child.kill("SIGKILL"); _ltRmRetry(dir); _ltRmRetry(home); }
+});
+
+console.log("\nADR 0018 (#361): the aggregate request counters count every lane:");
+
+// The counter half of #361, authorized by ADR 0018 (the auth half above needed none — ADR 0015
+// correction 2 adjudicates them differently).
+//
+// Each of the four folded counters gets its OWN ltTest, and that is deliberate rather than
+// stylistic. AGENTS.md's newest testing entry: two assertions broken by ONE mutation cannot both be
+// proven by a green run, and ordering cannot help. Four counters asserted in one body would go red
+// together under any single deleted `++`, which proves something is wired and not that each one is.
+// Split this way, deleting exactly one increment reddens exactly one test — see the PR's mutation
+// table.
+//
+// `/health` is the primary probe throughout because it needs no credentials and makes no network
+// call. `/status` is read once, in the stats.errors test, where the credential sources are closed
+// first — see the comment there.
+
+// FOLDED: stats.totalRequests. NOT FOLDED: stats.oneOffRequests — it means "served by a one-off -p
+// spawn", not "a request", and a TUI turn is the opposite of a one-off spawn (ADR 0018 § Not
+// folded). Both claims live here because the second is an ABSENCE assertion and the first is its
+// LIVENESS PREMISE: `oneOffRequests === 0` proves nothing unless the same response shows the probe
+// could see a counter move at all. Reading both from ONE /health body is what makes that airtight —
+// a server that counted nothing would fail the totalRequests assertion first.
+ltTest("integration (ADR 0018): a completed TUI turn moves stats.totalRequests — and deliberately NOT oneOffRequests", async () => {
+  if (!LT_POSIX) return;
+  const dir = ltMkdir(); const home = ltMkdir(); const fake = ltAuthFake(dir);
+  const tmux = ltTuiTmux(dir);
+  const { child, buf, port } = await ltBootFresh({ ...tmux.env, CLAUDE_BIN: fake, HOME: home }, dir);
+  try {
+    const before = await ltWaitHealth(port, b => b.stats, 15000);
+    assert.ok(before, `precondition: /health must serve a stats block — ${ltDiag(buf)}`);
+    assert.equal(before.stats.totalRequests, 0, "precondition: nothing has been served yet");
+    assert.equal(before.stats.oneOffRequests, 0, "precondition: the -p subset counter starts level with it");
+
+    const r = await ltPostStatus(port, { model: "sonnet", messages: [{ role: "user", content: "ping" }] });
+    assert.equal(r.status, 200, `the TUI turn must complete — ${r.text.slice(0, 300)} ${ltDiag(buf)}`);
+    assert.match(r.text, /"content":"PONG"/, `and it must be the stub's transcript text — got ${r.text.slice(0, 300)}`);
+    // Harness premise (the #361 test above states the reasoning): an EMPTY stub log is equally
+    // consistent with the real tmux having run, so assert on what IS in it.
+    assert.ok(tmux.calls().some(c => c.startsWith("new-session ")),
+      `premise: the stub tmux must be the binary that booted the pane; got ${JSON.stringify(tmux.calls())}`);
+
+    const after = await ltHealth(port);
+    assert.ok(after, `/health must still serve after the turn — ${ltDiag(buf)}`);
+    assert.equal(after.stats.totalRequests, 1,
+      "a TUI turn is a request the proxy served, so the aggregate total must move (ADR 0018)");
+    // The absence assertion, and the whole reason the line above is asserted first.
+    assert.equal(after.stats.oneOffRequests, 0,
+      "oneOffRequests counts -p one-off SPAWNS, not requests — a TUI turn must NOT move it (ADR 0018 § Not folded)");
+    // activeRequests is a gauge: the turn is over, so it must be back at rest. This is the paired
+    // half of the mid-turn test below — that one proves it goes UP, this one proves it comes DOWN,
+    // and a `++` with no matching `--` would leak +1 forever here.
+    assert.equal(after.stats.activeRequests, 0,
+      "the turn completed, so the in-flight gauge must have returned to 0 — a leaked +1 is #180's defect on the TUI lane");
+  } finally { child.kill("SIGKILL"); _ltRmRetry(dir); _ltRmRetry(home); }
+});
+
+// FOLDED: stats.activeRequests, observed WHILE a turn is genuinely in flight. `hang` holds the turn
+// at the transcript wait (the fixture writes no transcript), so the pane is really held rather than
+// the test racing a sleep.
+//
+// Also pins ADR 0018's containment claim on the wire: tui.inflight keeps reporting the TUI-ONLY
+// count and stats.activeRequests becomes the total across both lanes, so during a TUI turn they are
+// equal. That is what makes this a superseding of ADR 0007's "no existing semantics change" rather
+// than a replacement of the tui block.
+ltTest("integration (ADR 0018): stats.activeRequests counts a TUI turn WHILE it is in flight", async () => {
+  if (!LT_POSIX) return;
+  const dir = ltMkdir(); const home = ltMkdir(); const fake = ltAuthFake(dir);
+  const tmux = ltTuiTmux(dir, "PONG", { hang: true });
+  const { child, buf, port } = await ltBootFresh({ ...tmux.env, CLAUDE_BIN: fake, HOME: home }, dir);
+  let pending = null;
+  try {
+    const before = await ltWaitHealth(port, b => b.stats, 15000);
+    assert.ok(before, `precondition: /health must serve a stats block — ${ltDiag(buf)}`);
+    assert.equal(before.stats.activeRequests, 0, "precondition: nothing in flight before the turn");
+    assert.equal(before.tui.inflight, 0, "precondition: and the TUI-lane gauge agrees");
+
+    // NOT awaited: this turn never completes on its own (that is the point). It is settled in the
+    // finally, when the child is killed.
+    pending = ltPostStatus(port, { model: "sonnet", messages: [{ role: "user", content: "ping" }] })
+      .then(() => null, () => null);
+
+    const mid = await ltWaitHealth(port, b => b.stats && b.stats.activeRequests === 1, 20000);
+    assert.ok(mid,
+      `stats.activeRequests never reached 1 while a TUI turn was in flight — the TUI lane does not ` +
+      `feed the aggregate in-flight gauge (ADR 0018) — ${ltDiag(buf)}`);
+    // Non-vacuity: prove the turn really IS held, rather than the gauge having been nudged by
+    // something else. tui.inflight is written by the semaphore, which this change does not touch,
+    // so it is independent evidence that a turn is genuinely occupying a slot right now.
+    // Deliberately NOT asserted here: stats.totalRequests. It is the subject of the test above, and
+    // asserting it as a premise here would make one deleted `++` redden two tests — the coupling
+    // AGENTS.md's newest entry says a green run cannot then disentangle. tui.inflight is the better
+    // premise precisely because this change does not write it: it is INDEPENDENT evidence that a
+    // turn is genuinely occupying a slot right now, so it cannot be satisfied by the code under test.
+    assert.equal(mid.tui.inflight, 1,
+      `premise: the TUI semaphore must show the turn in flight too; got ${JSON.stringify(mid.tui)}`);
+  } finally {
+    child.kill("SIGKILL");
+    if (pending) await pending;
+    _ltRmRetry(dir); _ltRmRetry(home);
+  }
+});
+
+// FOLDED: stats.errors — the headline of #361. A failed TUI turn is a failure OF THE PROXY, and it
+// reached no aggregate counter at all, so /health's stats.errors, /status's requests.errors and
+// /usage's proxy.errors all read 0 while the proxy returned 500s.
+//
+// The failure is driven through the C-1 honesty gate with a real auth-failure banner: the exact
+// string is copied from the C-1 unit tests below, so this fixture and that detector cannot drift
+// apart silently. The banner path is chosen over the wall-clock path because it fails in
+// milliseconds rather than at a cap.
+//
+// This is also the one test that reads /status, and the ONLY safe way to do it: handleStatus calls
+// fetchUsageFromApi(), which resolves an OAuth token from (1) the env, (2) $HOME/.claude/
+// .credentials.json, (3) the macOS keychain via `security`. On a developer's Mac (3) SUCCEEDS and
+// /status would make a REAL BILLED request to api.anthropic.com from inside `npm test`. All three
+// are closed here — ltTuiTmux.env pins CLAUDE_CODE_OAUTH_TOKEN empty, HOME is a scratch dir, and a
+// refusing `security` goes first on PATH. Same mechanism, same reason, as
+// scripts/b2-key-snapshot.mjs § FIXTURE_SECURITY.
+ltTest("integration (ADR 0018): a FAILED TUI turn moves stats.errors, on /health and /status", async () => {
+  if (!LT_POSIX) return;
+  const dir = ltMkdir(); const home = ltMkdir(); const fake = ltAuthFake(dir);
+  const shimDir = join(dir, "nocreds"); _ltMkdirSync(shimDir, { recursive: true });
+  const securityStub = join(shimDir, "security");
+  _ltWrite(securityStub, "#!/bin/sh\nexit 1\n"); _ltChmod(securityStub, 0o755);
+  // Whole-message auth banner: short, 4xx core, auth keyword, no code/quote chars — the four
+  // conditions isDefaultAuthFailureBanner tests. Verbatim from the C-1 case below.
+  const banner = "Failed to authenticate. API Error: 401 Invalid authentication credentials";
+  const tmux = ltTuiTmux(dir, banner);
+  const { child, buf, port } = await ltBootFresh({
+    ...tmux.env, CLAUDE_BIN: fake, HOME: home, PATH: `${shimDir}:${process.env.PATH}`,
+  }, dir);
+  try {
+    const before = await ltWaitHealth(port, b => b.stats, 15000);
+    assert.ok(before, `precondition: /health must serve a stats block — ${ltDiag(buf)}`);
+    assert.equal(before.stats.errors, 0, "precondition: no errors recorded yet");
+
+    const r = await ltPostStatus(port, { model: "sonnet", messages: [{ role: "user", content: "ping" }] });
+    // The turn must fail for the REASON this test is about. A 200 would mean the banner gate did
+    // not fire and there is no failure to count; asserting the status alone would not catch that.
+    assert.equal(r.status, 500,
+      `the banner must be REFUSED by the C-1 gate, not served as an answer — got ${r.status} ${r.text.slice(0, 300)} ${ltDiag(buf)}`);
+    assert.ok(!r.text.includes("Invalid authentication credentials"),
+      `and the banner text must not be served to the client as content — got ${r.text.slice(0, 300)}`);
+
+    const after = await ltHealth(port);
+    assert.ok(after, `/health must still serve after the failed turn — ${ltDiag(buf)}`);
+    assert.equal(after.stats.errors, 1,
+      "a failed TUI turn is a proxy failure and must reach the aggregate error counter (ADR 0018)");
+    // trackError's other half: the same call populates recentErrors, which /health and /status both
+    // expose. Asserting it proves trackError itself ran, not merely that some counter moved.
+    assert.ok(after.recentErrors.some(e => /tui_upstream_error/.test(e.message)),
+      `recentErrors must carry the refused turn; got ${JSON.stringify(after.recentErrors)}`);
+
+    // The second endpoint, from the wire. requests.errors reads the same variable, so this proves
+    // the fold reaches every surface that publishes it rather than just the one we probed.
+    const st = await fetch(`http://127.0.0.1:${port}/status`);
+    assert.equal(st.status, 200, `/status must serve — ${ltDiag(buf)}`);
+    const sb = await st.json();
+    assert.equal(sb.requests.errors, 1, "/status.requests.errors reads the same counter and must agree with /health");
+    assert.equal(sb.requests.total, 1, "and the turn must be counted as served there too");
+    // Proof the credential sources really were closed — i.e. that /status took its no-token branch
+    // and made NO billed network call. Without this the test would still pass having spent quota.
+    assert.match(String(sb.plan), /No OAuth token found/,
+      `/status must have taken the no-token branch, not made a real API call; got ${JSON.stringify(sb.plan)}`);
+  } finally { child.kill("SIGKILL"); _ltRmRetry(dir); _ltRmRetry(home); }
+});
+
+// FOLDED: stats.timeouts, on the `truncated` wall-clock outcome. `nonTerminal` writes a transcript
+// with no stop_reason, so readTuiTranscript polls to the cap WITH text in hand and returns
+// truncated:true — the branch ADR 0018 counts as this lane's timeout, the analogue of the -p lane's
+// overallTimer firing.
+//
+// The cap is pinned short. CLAUDE_TUI_WALLCLOCK_MS's default is 120 s, which is the whole point of
+// the knob existing here.
+ltTest("integration (ADR 0018): a TUI turn that hits its wall-clock cap moves stats.timeouts", async () => {
+  if (!LT_POSIX) return;
+  const dir = ltMkdir(); const home = ltMkdir(); const fake = ltAuthFake(dir);
+  const tmux = ltTuiTmux(dir, "PARTIAL", { nonTerminal: true });
+  const { child, buf, port } = await ltBootFresh({
+    ...tmux.env, CLAUDE_BIN: fake, HOME: home, CLAUDE_TUI_WALLCLOCK_MS: "2000",
+  }, dir);
+  try {
+    const before = await ltWaitHealth(port, b => b.stats, 15000);
+    assert.ok(before, `precondition: /health must serve a stats block — ${ltDiag(buf)}`);
+    assert.equal(before.stats.timeouts, 0, "precondition: no timeouts recorded yet");
+
+    const r = await ltPostStatus(port, { model: "sonnet", messages: [{ role: "user", content: "ping" }] });
+    assert.equal(r.status, 500,
+      `a turn cut off by the cap must be REFUSED, not served as a complete answer — got ${r.status} ${r.text.slice(0, 300)} ${ltDiag(buf)}`);
+    // Pin WHICH wall-clock outcome this was. `hang` reaches the cap too but throws
+    // tui_transcript_timeout instead; if this fixture silently drifted into that shape the counter
+    // assertion below would still pass, and it would be proving the other branch.
+    assert.ok(buf.out.includes("tui_wallclock_truncated") || buf.err.includes("tui_wallclock_truncated"),
+      `premise: the turn must have ended at the TRUNCATED branch specifically — ${ltDiag(buf)}`);
+
+    const after = await ltHealth(port);
+    assert.ok(after, `/health must still serve after the timed-out turn — ${ltDiag(buf)}`);
+    assert.equal(after.stats.timeouts, 1,
+      "a TUI turn that exceeded its wall-clock bound is a timeout on the aggregate counter (ADR 0018)");
   } finally { child.kill("SIGKILL"); _ltRmRetry(dir); _ltRmRetry(home); }
 });
 

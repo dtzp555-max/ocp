@@ -1950,7 +1950,30 @@ async function callClaudeTui(model, messages, _conversationId, _keyName, res, st
         if (out) streamCtx.emit(out); // released past the holdback — safe to show the client
       }
     : null;
+  // ADR 0018 (#361): did THIS turn exceed its wall-clock bound? Read by the catch below, which
+  // cannot otherwise tell a timeout from any other failure. Declared out here so both wall-clock
+  // outcomes — `truncated` (partial text) and the `tui_transcript_timeout` throw (no text at all)
+  // — converge on one flag; they are the same event seen at two different transcript lengths.
+  let timedOut = false;
   try {
+    // ── ADR 0018 (#361): the aggregate counters count EVERY lane ──────────────────────────────
+    // Before this, `stats.*` was written only by `spawnClaudeProcess` and `trackError`, so the TUI
+    // lane HALF-participated: every per-model counter (recordModelRequest / recordModelSuccess /
+    // recordModelError, all already called here) but no aggregate one. A failed TUI turn moved the
+    // per-model error count while /health's stats.errors, /status's requests.errors and /usage's
+    // proxy.errors all stayed 0 — one response reporting the same event two ways.
+    //
+    // PLACEMENT MIRRORS THE -p LANE, and that is why it is here and not beside recordModelRequest
+    // at the top of this function. On -p, `acquireClaudeSlot` runs BEFORE `spawnClaudeProcess`, so
+    // a client that disconnects while QUEUED is never counted. Counting at the top of this function
+    // would count it. Inside this try, the semaphore has already been acquired.
+    //
+    // activeRequests is safe to increment before runTuiTurn — unlike the -p lane, whose #180 fix
+    // had to wait for a successful spawn because its decrement is wired to child-process events
+    // with nothing covering a synchronous throw. Here the `finally` below covers every exit path
+    // by construction, so there is no window in which a throw can leak a +1.
+    stats.totalRequests++;
+    stats.activeRequests++;
     const { text, entrypoint, truncated } = await runTuiTurn({
       prompt,
       model: cliModel,
@@ -2003,6 +2026,13 @@ async function callClaudeTui(model, messages, _conversationId, _keyName, res, st
     // is INCOMPLETE. Returning the cut-off prefix would cache it and report it as
     // finish_reason:stop (a truncated answer served as a complete one). Reject instead.
     if (truncated) {
+      // ADR 0018: the wall-clock cap expiring IS this lane's timeout — the same event the -p
+      // lane's `overallTimer` books as stats.timeouts. Counted here rather than in the catch
+      // because only this branch knows the cap is what ended the turn; the catch sees a generic
+      // Error. `timedOut` then also makes the per-model call below truthful (it was hard-coded
+      // `false`, which is why the TUI lane's per-model `timeouts` was permanently 0 too).
+      timedOut = true;
+      stats.timeouts++;
       logEvent("error", "tui_wallclock_truncated", { model: cliModel, chars: (text || "").length, wallclockMs: TUI_WALLCLOCK_MS });
       throw new Error("tui_wallclock_truncated: turn hit the wall-clock cap before completing; partial text dropped");
     }
@@ -2105,9 +2135,27 @@ async function callClaudeTui(model, messages, _conversationId, _keyName, res, st
       logEvent("info", "tui_turn_aborted", { reason: "client_disconnected", model: cliModel });
       throw new RequestDisconnectedError("client disconnected mid-turn; TUI pane torn down");
     }
-    recordModelError(cliModel, false);
+    // ADR 0018: the OTHER wall-clock outcome. readTuiTranscript polls to a single cap and then
+    // either returns truncated:true (partial text — handled above) or throws this (no assistant
+    // text at all). The difference is how much text arrived, not whether the bound was exceeded,
+    // so counting only one would make stats.timeouts depend on an accident of the transcript.
+    // Matched on the thrown token because that is the only thing distinguishing it; the token is
+    // pinned by a behavioural test, so a rename reddens the suite instead of silently under-counting.
+    if (!timedOut && typeof err?.message === "string" && err.message.startsWith("tui_transcript_timeout")) {
+      timedOut = true;
+      stats.timeouts++;
+    }
+    recordModelError(cliModel, timedOut);
+    // ADR 0018: the headline of #361 — a failed TUI turn is a failure OF THE PROXY, and until now
+    // it reached no aggregate counter at all. Deliberately placed AFTER the TuiAbortError branch
+    // above (which returns), so it inherits that branch's already-correct exclusion of client
+    // disconnects: a client walking away is not an upstream error on either lane.
+    trackError(err?.message || String(err));
     throw err;
   } finally {
+    // Paired with the `stats.activeRequests++` at the top of the try. A `finally` is what makes the
+    // pairing unreachable-by-construction rather than a prohibition someone must remember.
+    stats.activeRequests--;
     tuiSemaphore.release();
   }
 }
