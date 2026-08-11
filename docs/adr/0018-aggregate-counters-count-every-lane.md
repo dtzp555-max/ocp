@@ -70,7 +70,7 @@ Each field was decided on its own evidence; the result is deliberately not unifo
 
 | Field (on the wire) | New rule | Where |
 |---|---|---|
-| `stats.totalRequests` | every request the proxy accepts and begins upstream work for, on either lane | `callClaudeTui`, beside the existing `recordModelRequest` — mirroring the `-p` lane, which also counts before the child exists |
+| `stats.totalRequests` | every request the proxy accepts and begins upstream work for, on either lane | `callClaudeTui`, in the turn's `try` — **after** the semaphore, and deliberately *not* beside `recordModelRequest`, which runs before it. That mirrors the `-p` lane, where `acquireClaudeSlot` runs before `spawnClaudeProcess`, so a client that disconnects while queued is never counted |
 | `stats.activeRequests` | requests in flight on either lane | `callClaudeTui`: `++` as the first statement of the turn's `try`, `--` in the `finally` that already releases the semaphore |
 | `stats.errors` | any upstream failure on either lane | `callClaudeTui`'s `catch`, beside the existing `recordModelError` — so it inherits that branch's existing, correct exclusion of client disconnects |
 | `stats.timeouts` | a turn that exceeded its wall-clock bound, on either lane | `callClaudeTui`: both wall-clock outcomes (see below) |
@@ -109,7 +109,16 @@ behaviour-preserving. Its first bullet reads:
 
 > - The change is **additive**: it adds one new top-level field (`tui`) containing only new
 >   sub-fields. **No existing `/health` field is changed, renamed, removed, or re-typed**, and no
->   existing semantics change.
+>   existing semantics change. Existing `/health` consumers (the dashboard, `ocp-connect`,
+>   monitoring) read the fields they already read and are unaffected — the change is
+>   **behaviour-preserving** for them, which is exactly the bar the grandfather provision sets for
+>   a non-ADR contract change.
+
+The bullet is quoted **in full, to its end**, deliberately: ADR 0016's Amendment 1 exists because an
+enumeration quoted a source and cut it mid-clause two sentences before that source named what the
+enumeration had missed. Here the tail names `ocp-connect` as a `/health` consumer — checked, and it
+reads only `version`, `authMode` and `anonymousKey`, none of the four counters, so it needs no
+change.
 
 **That bullet's final clause — "and no existing semantics change" — is superseded by this ADR, for
 the four folded fields only.** Everything else in ADR 0007 stands, including the whole of § C-5
@@ -170,6 +179,19 @@ and `tui.inflight` is the TUI component of it — a containment relationship, no
 - **TUI mode is off in production** (`tui.enabled: false`; the mode is a dormant billing hedge).
   This is a real defect on a lane nothing currently runs, which is why it was worth deciding
   carefully rather than quickly.
-- **Not covered, and stated so nobody reads a green suite as coverage**: a TUI queue-full rejection
-  is still counted nowhere; cache hits and singleflight followers still move no aggregate counter on
-  either lane; `avgElapsed` / `maxElapsed` still report `0` for every TUI turn.
+- **Not covered, and stated so nobody reads a green suite as coverage**:
+  - A TUI **queue-full rejection** is still counted nowhere.
+  - **Cache hits and singleflight followers** still move no aggregate counter, on **either** lane.
+    That is ADR 0015 correction 1's two-token question, untouched here.
+  - `avgElapsed` / `maxElapsed` still report `0` for every TUI turn.
+  - **A TUI turn waiting for a semaphore slot still reads `activeRequests: 0`.** The increment is
+    after the acquire, so "in flight" means "running", not "accepted and queued". This is symmetric
+    with the `-p` lane and is not a regression — but it bounds the `615-canary` repair above: the
+    runbook's *"Confirm the proxy is idle"* is now true for **running** turns and still blind to
+    queued ones. `tui.queued` is the field that shows those.
+  - **Per-model `requests` and `stats.totalRequests` can now differ by one on a queued disconnect.**
+    `recordModelRequest` runs before the semaphore and the aggregate counter after it, so a client
+    that gives up while queued is counted per-model and not in aggregate. The placement predates
+    this ADR; what is new is that the two are now comparable at all, which is the shape this ADR
+    exists to end. Recorded rather than fixed, because moving `recordModelRequest` is a change to a
+    field this authorization does not cover.

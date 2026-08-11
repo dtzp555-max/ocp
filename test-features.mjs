@@ -4373,6 +4373,93 @@ ltTest("integration (ADR 0018): a TUI turn that hits its wall-clock cap moves st
   } finally { child.kill("SIGKILL"); _ltRmRetry(dir); _ltRmRetry(home); }
 });
 
+// The OTHER wall-clock outcome, and the reason it needs its own test rather than a second assertion
+// in the one above: `readTuiTranscript` polls to ONE cap and then either returns `truncated: true`
+// (partial text — the test above) or THROWS `tui_transcript_timeout` (no assistant text at all —
+// this one). They are the same event at two transcript lengths, ADR 0018 counts both, and they are
+// reached through two different branches of `callClaudeTui`: the first counts inline, the second is
+// recognised in the `catch` by the thrown token.
+//
+// WITHOUT THIS TEST the token match was an unproven claim. An independent review of this PR found
+// exactly that: the source comment asserted the token was "pinned by a behavioural test" while no
+// assertion on it existed anywhere in the suite, so renaming the string in `lib/tui/transcript.mjs`
+// — or deleting the whole `catch` branch — left the suite green and `stats.timeouts` silently
+// under-counting. The comment was the load-bearing part, because a brittle string match is only
+// defensible if a rename reddens something.
+//
+// It also carries the ONLY assertion in the suite on a per-model RUNTIME counter. ADR 0018
+// authorizes correcting `recordModelError(cliModel, timedOut)` — the call was hard-coded `false`,
+// so the TUI lane's per-model `timeouts` was permanently 0 for the same reason the aggregate one
+// was. Nothing else covers it, and two mechanisms that look like they would, do not:
+//   - the B.2 key-set snapshot probes a freshly booted server whose `modelStats` map is empty, so
+//     `getModelStatsSnapshot()` returns `{}` and contributes zero key paths even where it IS served;
+//   - `/health` does not serve per-model stats AT ALL. `getModelStatsSnapshot()` has exactly two
+//     call sites and both are the `/usage` response (the cached-usage builder and `handleUsage`);
+//     `models` is absent from `/health`'s recorded key set. An earlier draft of this test asserted
+//     against `/health` on that mistaken premise and would have failed on a missing object.
+// So the per-model read below is from `/usage`, which is Hybrid (ADR 0006) rather than B.2. With
+// every credential source closed, `fetchUsageFromApi()` returns its no-token error WITHOUT any
+// network call and `handleUsage` still attaches the live `proxy` and `models` blocks — at HTTP 502,
+// which is asserted, so a future change that made the endpoint fail differently cannot pass here.
+ltTest("integration (ADR 0018): a TUI turn whose transcript never arrives is ALSO a timeout — aggregate and per-model", async () => {
+  if (!LT_POSIX) return;
+  const dir = ltMkdir(); const home = ltMkdir(); const fake = ltAuthFake(dir);
+  const shimDir = join(dir, "nocreds"); _ltMkdirSync(shimDir, { recursive: true });
+  const securityStub = join(shimDir, "security");
+  _ltWrite(securityStub, "#!/bin/sh\nexit 1\n"); _ltChmod(securityStub, 0o755);
+  // hang: the stub writes NO transcript at all, so the poll loop reaches the cap with no text and
+  // throws, rather than returning truncated:true. Distinct fixture, distinct branch.
+  const tmux = ltTuiTmux(dir, "PONG", { hang: true });
+  const { child, buf, port } = await ltBootFresh({
+    ...tmux.env, CLAUDE_BIN: fake, HOME: home, CLAUDE_TUI_WALLCLOCK_MS: "2000",
+    PATH: `${shimDir}:${process.env.PATH}`,
+  }, dir);
+  try {
+    const before = await ltWaitHealth(port, b => b.stats, 15000);
+    assert.ok(before, `precondition: /health must serve a stats block — ${ltDiag(buf)}`);
+    assert.equal(before.stats.timeouts, 0, "precondition: no timeouts recorded yet");
+
+    const r = await ltPostStatus(port, { model: "sonnet", messages: [{ role: "user", content: "ping" }] });
+    assert.equal(r.status, 500,
+      `a turn whose transcript never arrived must be REFUSED — got ${r.status} ${r.text.slice(0, 300)} ${ltDiag(buf)}`);
+    // Pin WHICH branch produced it. This is the assertion whose absence the review found: it is what
+    // makes a rename of the thrown token in lib/tui/transcript.mjs redden the suite. Asserted on the
+    // served error body rather than a log line, because that is where the token actually reaches a
+    // consumer — and `sanitizeError` passes it through, which the 500 above already demonstrates.
+    assert.match(r.text, /tui_transcript_timeout/,
+      `premise: the turn must have ended at the TRANSCRIPT-TIMEOUT branch specifically, not the ` +
+      `truncated one — got ${r.text.slice(0, 300)}`);
+
+    const after = await ltHealth(port);
+    assert.ok(after, `/health must still serve — ${ltDiag(buf)}`);
+    assert.equal(after.stats.timeouts, 1,
+      "the cap expiring with NO text is the same wall-clock event as expiring with partial text (ADR 0018)");
+
+    // Per-model, from the wire — /usage, the only endpoint that serves it (see the header comment).
+    const ur = await fetch(`http://127.0.0.1:${port}/usage`);
+    assert.equal(ur.status, 502,
+      `/usage must answer with the no-token error rather than a real API call — got ${ur.status} ${ltDiag(buf)}`);
+    const ub = await ur.json();
+    // Proof the credential sources really were closed, i.e. NO billed network call was made.
+    assert.match(String(ub.error), /No OAuth token found/,
+      `/usage must have taken the no-token branch; got ${JSON.stringify(ub.error)}`);
+    // Liveness premise for the per-model assertions: the block must exist and be populated. An
+    // empty `models` object is what a server that recorded nothing returns, and `{}[k].timeouts`
+    // would throw rather than assert cleanly — so establish the row exists before reading it.
+    const m = ub.models || {};
+    const keys = Object.keys(m);
+    assert.ok(keys.length > 0,
+      `premise: /usage must expose at least one per-model row, or the assertions below are vacuous; got ${JSON.stringify(m)}`);
+    const row = m[keys[0]];
+    assert.equal(row.timeouts, 1,
+      `the per-model timeout counter must agree with the aggregate one — ADR 0018 corrects the ` +
+      `hard-coded recordModelError(cliModel, false); got ${keys[0]}=${JSON.stringify(row)}`);
+    assert.equal(row.errors, 1,
+      `and the same turn is still ONE per-model error, not two — the timeout flag must not add a ` +
+      `second booking; got ${keys[0]}=${JSON.stringify(row)}`);
+  } finally { child.kill("SIGKILL"); _ltRmRetry(dir); _ltRmRetry(home); }
+});
+
 // #362. The pool has two green tests either side of this state and none on it:
 // "M1b: shutdown drain kills the booting pane SYNCHRONOUSLY" proves cleanup for a pane the pool
 // still owns, and "a pane handed out for a turn leaves the spare set immediately" proves an

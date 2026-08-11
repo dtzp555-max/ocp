@@ -2139,8 +2139,12 @@ async function callClaudeTui(model, messages, _conversationId, _keyName, res, st
     // either returns truncated:true (partial text — handled above) or throws this (no assistant
     // text at all). The difference is how much text arrived, not whether the bound was exceeded,
     // so counting only one would make stats.timeouts depend on an accident of the transcript.
-    // Matched on the thrown token because that is the only thing distinguishing it; the token is
-    // pinned by a behavioural test, so a rename reddens the suite instead of silently under-counting.
+    // Matched on the thrown token because that is the only thing distinguishing it. A brittle string
+    // match is only defensible if a rename reddens something, so the token is pinned by the test
+    // named "a TUI turn whose transcript never arrives is ALSO a timeout" (grep the name, not a line
+    // number), which drives this branch and asserts the token on the served body. That test was
+    // added because an independent review found this comment claiming to be pinned when nothing
+    // asserted it anywhere — the claim, not the code, was the defect.
     if (!timedOut && typeof err?.message === "string" && err.message.startsWith("tui_transcript_timeout")) {
       timedOut = true;
       stats.timeouts++;
