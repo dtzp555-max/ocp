@@ -93,13 +93,36 @@ function createHarness({ log = console.log } = {}) {
   // whole reason this is AsyncLocalStorage and not a plain variable (#402 part 2). Per-instance,
   // not module-level: a self-check calling h.testSkipped() from inside an OUTER test's body must
   // be attributed to no body at all on `h`, and a shared store would charge it to the outer test.
+  //
+  // WHAT THIS DOES NOT SEE, stated from measurement rather than from reasoning, because #415's
+  // review found the first version of this note asserting the opposite of what the code does.
+  // The store survives into every continuation, so attribution is not the limit — TIMING is: the
+  // verdict is read once, and anything recorded after that read is not in it.
+  //
+  //   sync body, detached microtask                 -> NOT seen (verdict already read)
+  //   async body, detached microtask, no further await -> SEEN (microtasks drain before settle)
+  //   async body, detached setTimeout past settle   -> NOT seen
+  //   async body that AWAITS the continuation       -> SEEN
+  //
+  // So "a detached promise is missed" is false as a blanket statement; it depends on whether the
+  // continuation runs before the runner reads the verdict. The same timing governs the swallowed-
+  // skip guard below, since both read the same context at the same moment.
   const runningBody = new AsyncLocalStorage();
 
-  // Recording a skip, with NO misuse accounting. Both skip helpers funnel through here; only the
-  // TOP-LEVEL one consults `runningBody`. skipRemainingTest()'s exemption is therefore STRUCTURAL
-  // — it is not on the code path that checks — rather than a flag it sets and clears, which is the
-  // shape that goes wrong the first time a body throws between the set and the clear.
+  // The single funnel for recording a skip. Both skip helpers reach it; only the TOP-LEVEL
+  // testSkipped() additionally consults `runningBody` for MISUSE, so skipRemainingTest()'s
+  // exemption from that check is structural rather than a flag set and cleared around a call that
+  // throws.
+  //
+  // It also records, on the running body, THAT a skip happened. That second counter is what makes
+  // the swallowed-sentinel case reachable (see _recordSwallowedSkip), and it lives here rather
+  // than in either public helper precisely because this is the funnel: a future skip helper cannot
+  // forget to do it. Outside any body `getStore()` is undefined and nothing is recorded, which is
+  // what keeps a legitimate top-level testSkipped() — and an unrelated skip landing while some
+  // other test is in flight — inert.
   function _recordSkip(name, reason) {
+    const body = runningBody.getStore();
+    if (body) body.skips++;
     skipped++;
     log(`  ⊘ SKIP ${name} — ${reason}`);
   }
@@ -109,6 +132,25 @@ function createHarness({ log = console.log } = {}) {
     recordFailure(name);
     log(`  ✗ ${name}: called testSkipped() inside a test body — use skipRemainingTest(), ` +
         `which also aborts the body`);
+  }
+
+  // A body that recorded a skip and then RETURNED NORMALLY — it caught skipRemainingTest()'s
+  // abort instead of letting it propagate. Independent review of #415 found this, and it is the
+  // same "skipped AND passed" pair the rest of this file exists to prevent, so it is a failure and
+  // not a warning. Measured on all three constructions before this arm existed:
+  //
+  //   origin/main            failed=["swallower"]   <- its counter guard caught it
+  //   #415 as first pushed   passed=["swallower"]   <- skipped AND passed, on all THREE runners
+  //   #415 + this arm        failed=["swallower"]
+  //
+  // That middle row is why "the broader check implies the narrower one" was wrong here: in this
+  // one corner the counter comparison saw something the context check did not, because the context
+  // check only ever looked for MISUSE. Reaching the normal-completion path with a skip recorded is
+  // the missing half, and it is detected here rather than described in a Known-gaps list.
+  function _recordSwallowedSkip(name) {
+    recordFailure(name);
+    log(`  ✗ ${name}: recorded a skip and then CONTINUED — skipRemainingTest()'s abort was caught ` +
+        `by this body, so it would be counted as skipped AND passed`);
   }
 
   // Pending promises from tests declared `async` but registered through the SYNC `test()` helper.
@@ -141,7 +183,7 @@ function createHarness({ log = console.log } = {}) {
     // this check permanently unprovable on the sync path: the narrow guard fires first, so every
     // mutation aimed at the broad one dies before reaching it and the mutation table records a
     // kill that belongs to the other assertion.
-    const body = { misuse: 0 };
+    const body = { misuse: 0, skips: 0 };
     try {
       const r = runningBody.run(body, fn);
       if (r && typeof r.then === "function") {
@@ -150,6 +192,7 @@ function createHarness({ log = console.log } = {}) {
           r.then(
             () => {
               if (body.misuse > 0) { _recordMisuse(name); return; }
+              if (body.skips > 0) { _recordSwallowedSkip(name); return; }
               recordPass(name); log(`  ✓ ${name}`);
             },
             (e) => {
@@ -161,6 +204,7 @@ function createHarness({ log = console.log } = {}) {
         return;
       }
       if (body.misuse > 0) { _recordMisuse(name); return; }
+      if (body.skips > 0) { _recordSwallowedSkip(name); return; }
       recordPass(name);
       log(`  ✓ ${name}`);
     } catch (e) {
@@ -201,10 +245,11 @@ function createHarness({ log = console.log } = {}) {
   }
 
   async function testAsync(name, fn) {
-    const body = { misuse: 0 };
+    const body = { misuse: 0, skips: 0 };
     try {
       await runningBody.run(body, fn);
       if (body.misuse > 0) { _recordMisuse(name); return; }
+      if (body.skips > 0) { _recordSwallowedSkip(name); return; }
       recordPass(name);
       log(`  ✓ ${name}`);
     } catch (e) {
@@ -1612,16 +1657,77 @@ test("#402: a TOP-LEVEL testSkipped() — outside any test body — is not misus
 test("#402: skipRemainingTest() in a SYNC body stays a skip — not misuse, not passed", () => {
   const { h, lines } = _h402();
   h.test("fixture", () => {
-    h.skipRemainingTest("inner", "synthetic: the in-body form, which must BYPASS the misuse check");
+    h.skipRemainingTest("inner", "synthetic: the in-body form, whose abort must propagate");
     throw new Error("unreachable: skipRemainingTest must abort the body");
   });
   assert.equal(h.counts().skipped, 1, "control: the skip was recorded");
+  // Says only what this assertion can see. An earlier revision claimed the exemption is
+  // "STRUCTURAL, not a flag set and cleared" — but an empty failure ledger is produced by BOTH
+  // constructions, so the assertion could not discriminate them and the message was asserting a
+  // property it had not measured. Found by independent review of #415.
   assert.deepEqual(h.failedNames, [],
-    "REGRESSION: skipRemainingTest() tripped the misuse guard — its exemption must be STRUCTURAL " +
-    "(it never reaches the check), not a flag set and cleared around a call that throws");
+    "REGRESSION: a body whose skipRemainingTest() abort propagated normally was recorded as a " +
+    "failure — a skip is not a failure");
   assert.deepEqual(h.passedNames, [], "and a skipping body is still not a pass");
   assert.deepEqual(lines.filter(l => l.startsWith("  ✗ ") || l.startsWith("  ✓ ")), [],
     `no verdict line may be emitted for a skip; got ${JSON.stringify(lines)}`);
+});
+
+// ── #415 review, F1: the swallowed sentinel ───────────────────────────────────────────────────
+//
+// A body that calls skipRemainingTest() and CATCHES its abort returns normally, so it reaches the
+// runner's normal-completion path with a skip already counted. As #415 was first pushed that path
+// counted it as PASSED — skipped AND passed, the exact pair this whole facility exists to prevent
+// — on all THREE runners. `origin/main`'s counter comparison caught it, which is the one corner
+// where the check this PR REPLACED saw something the replacement did not.
+//
+// The three shapes are separate registrations because they are three different code paths
+// (test() sync, test() resolve handler, testAsync()) and one mutation must not be able to hide
+// two of them.
+//
+// Each asserts the swallow-specific MESSAGE, not merely that something failed. That is deliberate:
+// reverting skipRemainingTest()'s structural bypass ALSO makes these bodies fail, but as MISUSE,
+// with the other message. Asserting the message is what makes these tests discriminate the two
+// constructions — and it is what finally gives that bypass a killing mutation row.
+const _H402_SWALLOW = "recorded a skip and then CONTINUED — skipRemainingTest()'s abort was caught by this body, so it would be counted as skipped AND passed";
+
+test("#415 F1: a SYNC body that swallows skipRemainingTest()'s abort is reported, not counted as passed", () => {
+  const { h, lines } = _h402();
+  h.test("swallower", () => { try { h.skipRemainingTest("inner", "synthetic"); } catch { /* swallowed */ } });
+  assert.equal(h.counts().skipped, 1, "control: the skip really was recorded before the body continued");
+  assert.deepEqual(h.passedNames, [],
+    "REGRESSION (#415 F1): a body that recorded a skip and then continued was counted as PASSED — " +
+    "skipped AND passed");
+  assert.deepEqual(h.failedNames, ["swallower"], "and it is charged to the swallowing test, by name");
+  assert.deepEqual(lines.filter(l => l.startsWith("  ✗ ")), [`  ✗ swallower: ${_H402_SWALLOW}`],
+    `the verdict must name the swallowed abort, not misuse; got ${JSON.stringify(lines)}`);
+});
+
+test("#415 F1: an ASYNC body that swallows the abort is reported at settle, not counted as passed", async () => {
+  const { h, lines } = _h402();
+  h.test("swallower", async () => {
+    await new Promise(r => setTimeout(r, 5));
+    try { h.skipRemainingTest("inner", "synthetic"); } catch { /* swallowed */ }
+  });
+  assert.equal(h.pendingAsync.length, 1, "premise: the async body registered exactly one promise");
+  await Promise.all(h.pendingAsync);
+  assert.equal(h.counts().skipped, 1, "control: the skip really was recorded");
+  assert.deepEqual(h.passedNames, [], "REGRESSION (#415 F1): the async swallower was counted as PASSED");
+  assert.deepEqual(h.failedNames, ["swallower"], "and it is charged by name");
+  assert.deepEqual(lines.filter(l => l.startsWith("  ✗ ")), [`  ✗ swallower: ${_H402_SWALLOW}`],
+    `got ${JSON.stringify(lines)}`);
+});
+
+test("#415 F1: testAsync() reports a swallowed abort the same way — the third runner again", async () => {
+  const { h, lines } = _h402();
+  await h.testAsync("swallower", async () => {
+    try { h.skipRemainingTest("inner", "synthetic"); } catch { /* swallowed */ }
+  });
+  assert.equal(h.counts().skipped, 1, "control: the skip really was recorded");
+  assert.deepEqual(h.passedNames, [], "REGRESSION (#415 F1): testAsync counted the swallower as PASSED");
+  assert.deepEqual(h.failedNames, ["swallower"], "and it is charged by name");
+  assert.deepEqual(lines.filter(l => l.startsWith("  ✗ ")), [`  ✗ swallower: ${_H402_SWALLOW}`],
+    `testAsync's message must not drift from test()'s; got ${JSON.stringify(lines)}`);
 });
 
 test("#402: skipRemainingTest() in an ASYNC body stays a skip — not misuse, not passed", async () => {
