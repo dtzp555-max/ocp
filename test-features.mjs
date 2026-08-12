@@ -2753,6 +2753,302 @@ let _ltPeakBoots = 0;
 // Non-empty means _ltPeakBoots is UNATTRIBUTABLE — see the assertions at the end of the file.
 const _ltDrainTimeouts = [];
 
+// ── #374 teardown instrumentation — OBSERVATIONAL ONLY ───────────────────────────────────────
+//
+// #374 recorded two teardown waits that gave up after 75514ms and 111203ms against a 5000ms
+// budget, both with active=1, both on a host running two concurrent full suites. Everything
+// concluded from those two numbers so far is ELIMINATION — hypothesis 2 (a grandchild holding
+// the harness's pipes) and hypothesis 3 (the SIGKILL not landing) were refuted by measurement in
+// the thread (0ms exit->close lag over six runs; spawnClaudeProcess uses own-pipes stdio, so a
+// `claude` grandchild structurally cannot hold THIS process's pipes), which leaves parent-side
+// starvation as the last candidate standing rather than as a thing anybody watched happen.
+//
+// The instrument the issue was filed with cannot close that gap, and this is the whole reason
+// the code below exists. Recording buf.exit / buf.signal alongside the timeout reads the 'exit'
+// EVENT, and 'exit' is itself a parent-loop callback: under exactly the condition being tested it
+// is queued behind the same stall, so at the instant the record is written buf.exit can read
+// `undefined` even when the child died a minute earlier — which reads as "child still alive" and
+// flips the conclusion the wrong way. THE INSTRUMENT IS SUBJECT TO THE PHENOMENON IT MEASURES.
+// Two independent cross-model reviews found that flaw separately (#374, 2026-08-11).
+//
+// So the ground truth here is the kernel, asked SYNCHRONOUSLY: spawnSync needs no event loop.
+// buf.exit / buf.signal are still recorded, explicitly labelled loop-dependent, so that a
+// divergence between the two readings is VISIBLE rather than inferred.
+//
+// Nothing here widens a budget or changes a verdict: ltDrain still gives up at the same ms, still
+// records the same offender, and still reports rather than asserts. These are extra fields on the
+// record it already pushes. Widening the budget is what #374 forbids twice — it would restore
+// exactly the silence #358 was filed about.
+
+// A drain that overran its budget and then SUCCEEDED. This ledger is not in #374's plan, and it
+// exists because the reproduction run put the plan's blind spot on the record: two deliberately
+// concurrent suites both hit the exact site #374 names — `between-tests:integration:
+// OCP_LOCAL_TOOLS=1 → the -p spawn receives the POSITIVE wrapper` — at 120173ms and 119960ms
+// against a 5000ms budget, a 24x overrun, with EVERY other drain in the same run between 0ms and
+// 43ms. Both returned ok=TRUE, because by the time the loop came back the child had closed. So
+// nothing was recorded, no assertion moved, and an instrument that only fires on a timed-out drain
+// would have watched the phenomenon happen and said nothing.
+//
+// #374's two field reports are the ok=false face of the same event (the child had NOT closed yet);
+// this is the ok=true face, and on this host it is the more common one. Recording it costs nothing
+// and widens no budget: ltWait's deadline, ltDrain's verdict and the value returned to the caller
+// are all byte-for-byte what they were.
+const _ltLateDrains = [];
+
+// Every ltBoot child that has been spawned and has not yet emitted 'close'. ltDrain's condition
+// is `() => _ltActiveBoots === 0` — a COUNT — so at give-up time the drain's closure cannot name
+// the child it is still waiting on. This registry is what makes the pid reachable from there.
+const _ltOpenChildren = new Map(); // pid -> { pid, label, spawnedAt, buf }
+function _ltRegisterOpenChild(child, buf, label) {
+  // A synchronous spawn failure (ENOENT) leaves child.pid undefined; 'error' + 'close' still fire.
+  if (child.pid === undefined) return null;
+  const rec = { pid: child.pid, label, spawnedAt: Date.now(), buf };
+  _ltOpenChildren.set(child.pid, rec);
+  return rec;
+}
+function _ltDeregisterOpenChild(child) {
+  if (child.pid !== undefined) _ltOpenChildren.delete(child.pid);
+}
+
+const LT_PS_VERDICT = Object.freeze({
+  ZOMBIE: "ZOMBIE-UNREAPED",
+  ALIVE: "ALIVE",
+  GONE: "REAPED-GONE",
+  UNKNOWN: "PROBE-FAILED",
+});
+// One sentence per outcome, printed verbatim next to the verdict. #374's plan calls for each of
+// the three to be NAMED in the output: a reader must not have to infer which world they are in.
+const LT_PS_DIAGNOSIS = Object.freeze({
+  [LT_PS_VERDICT.ZOMBIE]:
+    "child is DEAD and UNREAPED -> this parent has not processed SIGCHLD -> parent-side, confirmed DIRECTLY",
+  [LT_PS_VERDICT.ALIVE]:
+    "child is STILL RUNNING -> the SIGKILL did not take, or went to the wrong process -> HYPOTHESIS FLIPPED",
+  [LT_PS_VERDICT.GONE]:
+    "no such pid -> the child was reaped, so 'close' is outstanding after the exit was processed -> read with the loop verdict: LOOP-LIVE makes this the pipe-holder world, a stall verdict makes it a stall that ended before the probe",
+  [LT_PS_VERDICT.UNKNOWN]:
+    "ps itself did not run -> NO VERDICT; do not read this as any of the other three",
+});
+// `state=` is asked for first because it is the decisive field. `etime=` and `comm=` are EVIDENCE
+// and never identity: etime is a rendering (as is lstart, which is worse — it is local-time
+// formatted, so the same process reads differently under a different TZ), and what they are
+// wanted for is the one thing they cannot settle, pid reuse. On the ALIVE branch comm= is what
+// tells a reader whether the pid is still our own node child or somebody else's reused number.
+const LT_PS_ARGS = ["-o", "state=,etime=,comm=", "-p"];
+function _ltProbePid(pid) {
+  const r = spawnSync("ps", [...LT_PS_ARGS, String(pid)], { encoding: "utf8" });
+  if (r.error) {
+    return { verdict: LT_PS_VERDICT.UNKNOWN, state: null, etime: null, comm: null,
+             raw: `spawnSync ps: ${r.error.code || r.error.message}` };
+  }
+  const raw = (r.stdout || "").replace(/\n+$/, "");
+  // Measured on this host: a reaped child and a nonexistent pid both give status=1 with EMPTY
+  // stdout (the nonexistent case may also write to stderr). A process that died the ordinary way
+  // is reaped and leaves no ps entry at all, so this is the COMMON outcome, not the rare one.
+  if (r.status !== 0 || raw.trim() === "") {
+    return { verdict: LT_PS_VERDICT.GONE, state: null, etime: null, comm: null,
+             raw: `status=${r.status} stdout="" stderr=${JSON.stringify((r.stderr || "").trim().slice(0, 120))}` };
+  }
+  // ps output is COLUMN-PADDED on macOS. Measured repeatedly on this host: a real zombie renders
+  // as "Z    00:01" and a live child as "S    00:00", so reading the column as fixed width and
+  // comparing `state === "Z"` is FALSE ON A REAL ZOMBIE. Linux procps is unpadded, which makes
+  // the naive form a platform-dependent guard: right on CI, wrong on the workstation. Split on
+  // whitespace and then PREFIX-test, because macOS also decorates the state ("Z+", "SN", "S+").
+  const [state = "", etime = null, ...rest] = raw.trim().split(/\s+/);
+  const verdict = state.startsWith("Z") ? LT_PS_VERDICT.ZOMBIE : LT_PS_VERDICT.ALIVE;
+  return { verdict, state, etime, comm: rest.join(" ") || null, raw };
+}
+// Only ever called on the REAPED-GONE branch, per #374's plan: if the child is gone and 'close'
+// still has not fired, the question is who else is holding the pipe. Filtered on the caller's own
+// label (the fixture dir for a real boot) so this reports our own processes and not the host's.
+function _ltGrandchildScan(label) {
+  if (!label) return null;
+  const r = spawnSync("ps", ["-eo", "pid=,ppid=,state=,command="],
+                      { encoding: "utf8", maxBuffer: 16 * 1024 * 1024 });
+  if (r.error || r.status !== 0) return [`ps -eo failed: ${r.error ? (r.error.code || r.error.message) : `status=${r.status}`}`];
+  return r.stdout.split("\n").map(l => l.trim()).filter(l => l.includes(label)).map(l => l.slice(0, 200));
+}
+
+// ── the stall tracer ─────────────────────────────────────────────────────────────────────────
+// A self-rescheduling 500ms tick appending {wall, cpu} to a 256-slot ring (128s of history).
+// unref'd, so it can never hold the process open. On a drain timeout the max inter-tick gap in
+// the drain's own window is attached to the record, with the CPU consumed across that gap.
+//
+// The point is that "starvation" conflates three causes with DIFFERENT fixes, and the CPU delta
+// separates them: a gap with ~zero CPU means this process was not executing at all, a gap with a
+// CPU delta the size of the gap means it was executing something synchronous (a suite bug, and
+// findable), and no gap at all means the loop was live and 'close' genuinely had not fired.
+// perf_hooks.monitorEventLoopDelay would give the magnitude but not the WHEN; the ring gives when.
+const LT_TICK_MS = 500;
+const LT_TICK_SLOTS = 256;
+const _ltTicks = new Array(LT_TICK_SLOTS);
+let _ltTickN = 0;
+let _ltTracerTimer = null;
+function _ltTracerTick() {
+  const c = process.cpuUsage();
+  _ltTicks[_ltTickN++ % LT_TICK_SLOTS] = { wall: Date.now(), cpuUs: c.user + c.system };
+  _ltTracerTimer = setTimeout(_ltTracerTick, LT_TICK_MS).unref();
+}
+_ltTracerTimer = setTimeout(_ltTracerTick, LT_TICK_MS).unref();
+
+const LT_LOOP_VERDICT = Object.freeze({
+  LIVE: "LOOP-LIVE",
+  NO_CPU: "STALL-NO-CPU",
+  MIXED: "STALL-MIXED",
+  CPU: "STALL-CPU-BOUND",
+});
+// 1200ms is 2.4x the nominal tick, so two consecutive ticks arriving late do not read as a stall.
+// The CPU bands are deliberately three and not two: a ratio in the middle is not evidence for
+// either clean reading, and naming it as one would be an assertion the measurement does not carry.
+//
+// The upper bound is 0.50 BECAUSE OF A MEASUREMENT, and the measurement is the interesting part.
+// Standalone on an idle host, a 1200ms `while (Date.now() < end)` costs 1199ms of CPU — ratio
+// 0.999 — and a 1200ms Atomics.wait costs 0ms. Bimodal, so 0.75 looked safe and was the first
+// value here. Run INSIDE the suite, the identical busy block measured 1545ms of CPU across a
+// 2220ms gap: ratio 0.696, and control A failed. Nothing was wrong with the tracer — the host
+// really did deschedule a busy loop for ~450ms of its 2000ms, and process.cpuUsage() correctly
+// declined to count time this process was not running. So a busy block on a contended host is
+// GENUINELY part-executing, and reading it as STALL-MIXED is right rather than a mis-classification.
+// 0.50 is set below the measured busy figure and far above the measured idle one; the band that
+// matters is the bottom one, which is what keeps a suite bug from being filed as host contention.
+const LT_STALL_MIN_MS = 1200;
+const LT_STALL_CPU_BOUND = 0.50;
+const LT_STALL_CPU_IDLE = 0.20;
+// Pure, so the band boundaries can be proven by a table instead of by staging four hosts. The
+// measurement side (does a real block produce these numbers) is controls A and B; this is the
+// mapping side, and it is the half that can be made deterministic.
+function _ltClassifyLoopVerdict(maxGapMs, ratio) {
+  if (maxGapMs < LT_STALL_MIN_MS) return LT_LOOP_VERDICT.LIVE;
+  if (ratio < LT_STALL_CPU_IDLE) return LT_LOOP_VERDICT.NO_CPU;
+  if (ratio >= LT_STALL_CPU_BOUND) return LT_LOOP_VERDICT.CPU;
+  return LT_LOOP_VERDICT.MIXED;
+}
+function _ltStallSince(t0) {
+  const now = Date.now();
+  const c = process.cpuUsage();
+  const first = Math.max(0, _ltTickN - LT_TICK_SLOTS);
+  const samples = [];
+  for (let n = first; n < _ltTickN; n++) {
+    const t = _ltTicks[n % LT_TICK_SLOTS];
+    if (t) samples.push(t);
+  }
+  // The CLOSING sample is taken NOW, synchronously, rather than waiting for the next tick — and
+  // that is load-bearing, not a convenience. When a stall ends, the tracer's overdue 500ms timer
+  // and ltWait's overdue 40ms timer are BOTH expired; libuv runs expired timers in due order, so
+  // the tick that would close the gap is not guaranteed to have run by the time ltWait gives up
+  // and this is read. Sampling here closes the gap deterministically, whichever timer won.
+  samples.push({ wall: now, cpuUs: c.user + c.system, virtual: true });
+  const gaps = [];
+  for (let i = 1; i < samples.length; i++) {
+    const a = samples[i - 1], b = samples[i];
+    // A gap counts if it ENDS after the window opened: a stall that began before the drain did is
+    // still the stall the drain paid for. (t0 is the drain's start; the window closes at `now`.)
+    if (b.wall <= t0) continue;
+    gaps.push({ gapMs: b.wall - a.wall, cpuMs: Math.round((b.cpuUs - a.cpuUs) / 1000), atMs: a.wall - t0 });
+  }
+  gaps.sort((x, y) => y.gapMs - x.gapMs);
+  // WHERE THIS VERDICT IS THIN, stated because a LOOP-LIVE read from no data would send a reader
+  // to the pipe-holder world for nothing. `gaps` is empty only when the ring is empty, because the
+  // virtual sample's wall is `now` and every drain has t0 <= now — so one recorded tick is enough
+  // to produce one gap. An empty ring means the process is younger than LT_TICK_MS, which no drain
+  // can be. What IS reachable is a THIN verdict: a field capture recorded ticksInRing=4, because
+  // the tracer only ticks when the loop turns and this suite spends long stretches inside
+  // synchronous child processes. Each gap is still a real observation (the loop demonstrably ran at
+  // both ends of it); there are simply few of them, which is why the record carries gapsInWindow
+  // and ticksInRing rather than only a verdict.
+  const max = gaps[0] || { gapMs: 0, cpuMs: 0, atMs: 0 };
+  const ratio = max.gapMs > 0 ? max.cpuMs / max.gapMs : 0;
+  const stalls = gaps.filter(g => g.gapMs >= LT_STALL_MIN_MS);
+  const verdict = _ltClassifyLoopVerdict(max.gapMs, ratio);
+  return {
+    verdict, maxGapMs: max.gapMs, cpuMs: max.cpuMs, ratio: Number(ratio.toFixed(3)),
+    atMs: max.atMs, windowMs: now - t0,
+    // Two different counts, because one of them was briefly printed under the other's name.
+    // ticksInRing is EVERY sample the ring still holds (128s of history at most) plus the virtual
+    // closing one; gapsInWindow is how many consecutive pairs actually ended inside this window.
+    // A field capture read `ticks in window=4` while the ring held 4 samples in total — the label
+    // was a claim the number could not support, which is the failure mode this suite keeps
+    // finding in its own prose. The low count is itself a datum: the tracer only ticks when the
+    // loop turns, and this suite spends long stretches inside synchronous child processes.
+    ticksInRing: samples.length, gapsInWindow: gaps.length,
+    // #374's falsifiable prediction is about SHAPE, not total: 75514ms needs ONE contiguous stall
+    // of >=25.5s and 111203ms needs >=61s, because ltWait's deadline is capped at ms*10 and the
+    // loop can overrun the cap by one final late await only. Many small gaps would REFUTE that
+    // model. So the count and the sum of stall-sized gaps are recorded next to the max, and the
+    // top three are kept: one 61s gap and sixty 1.2s gaps are different diagnoses.
+    nStalls: stalls.length,
+    sumStallMs: stalls.reduce((s, g) => s + g.gapMs, 0),
+    top: gaps.slice(0, 3),
+  };
+}
+function _ltLoopDiagnosis(loop) {
+  // atMs is relative to the drain's start and is NEGATIVE when the gap began before the drain did.
+  // That is deliberate: a stall the drain was already inside is the stall the drain paid for. It
+  // also means the figure is "since the last tick", so read it with atMs and not on its own.
+  const at = `max gap ${loop.maxGapMs}ms starting ${loop.atMs >= 0 ? "+" : ""}${loop.atMs}ms into a ` +
+             `${loop.windowMs}ms window, ${loop.cpuMs}ms CPU across it (${loop.ratio}x)`;
+  switch (loop.verdict) {
+    case LT_LOOP_VERDICT.LIVE:
+      return `${at} -> no gap reached ${LT_STALL_MIN_MS}ms: the loop kept ticking, so 'close' genuinely had not fired`;
+    case LT_LOOP_VERDICT.NO_CPU:
+      return `${at} -> this process was NOT EXECUTING across the gap: descheduled, swapped, QoS-throttled, or blocked in a syscall`;
+    case LT_LOOP_VERDICT.CPU:
+      return `${at} -> this process WAS EXECUTING for most of the gap: synchronous work in the parent, which is a suite bug and is findable`;
+    default:
+      return `${at} -> part-executing and part-not: neither clean reading is supported on its own. A CPU-burning block on a contended host lands here legitimately — read the top gaps`;
+  }
+}
+
+// Builds the record ltDrain pushes on a timeout. Separated from ltDrain so the calibration
+// controls can drive the instrument directly, with NO intervening await between the fault they
+// stage and the observation — which is the only way to make the zombie window deterministic.
+function _ltObserveDrainTimeout(where, elapsedMs, t0, kind = "TIMED OUT") {
+  const loop = _ltStallSince(t0);
+  const children = [];
+  for (const rec of _ltOpenChildren.values()) {
+    const probe = _ltProbePid(rec.pid);
+    children.push({
+      pid: rec.pid, label: rec.label, openMs: Date.now() - rec.spawnedAt, ...probe,
+      // The loop-DEPENDENT reading, kept next to the kernel's answer precisely so the two can be
+      // seen to disagree. This is the field #374's original plan would have concluded from.
+      loopRead: { exit: rec.buf.exit, signal: rec.buf.signal, closed: rec.buf.closed },
+      grandchildren: probe.verdict === LT_PS_VERDICT.GONE ? _ltGrandchildScan(rec.label) : null,
+    });
+  }
+  return { where, kind, ms: elapsedMs, active: _ltActiveBoots, loop, children };
+}
+// Compact form, for the offender list inside the #358 summary's message.
+function _ltRenderDrainTimeout(r) {
+  const kids = r.children.length
+    ? r.children.map(c => `pid ${c.pid} ${c.verdict}` +
+        (c.state ? ` state=${JSON.stringify(c.state)} etime=${c.etime}` : "") +
+        ` loopRead[exit=${c.loopRead.exit} signal=${c.loopRead.signal} closed=${c.loopRead.closed}]`).join("; ")
+    : "no child was still registered at give-up";
+  return `${r.where}(${r.ms}ms, active=${r.active}, ps=[${kids}], ` +
+         `loop=${r.loop.verdict} maxGap=${r.loop.maxGapMs}ms cpu=${r.loop.cpuMs}ms n>=${LT_STALL_MIN_MS}ms=${r.loop.nStalls})`;
+}
+// Full form, printed at the MOMENT of the timeout rather than only in the end-of-block summary:
+// four of the six drain sites are outside the ltTest block, and a recurrence should carry its own
+// answer in the log wherever it lands. No "✗" here — flake-hunt.yml histograms stdout ✗ lines.
+function _ltExplainDrainTimeout(r) {
+  const lines = [`    [#374] drain ${r.kind}: ${r.where} after ${r.ms}ms (active=${r.active})`];
+  lines.push(`    [#374]   loop: ${r.loop.verdict} — ${_ltLoopDiagnosis(r.loop)}`);
+  lines.push(`    [#374]   loop: gaps >= ${LT_STALL_MIN_MS}ms: ${r.loop.nStalls} totalling ${r.loop.sumStallMs}ms; ` +
+             `top=${JSON.stringify(r.loop.top)}; gaps in window=${r.loop.gapsInWindow}; ticks in ring=${r.loop.ticksInRing}`);
+  if (!r.children.length) lines.push(`    [#374]   ps: no child was still registered at give-up — nothing to probe`);
+  for (const c of r.children) {
+    lines.push(`    [#374]   ps: pid ${c.pid} ${c.verdict} — ${LT_PS_DIAGNOSIS[c.verdict]}`);
+    lines.push(`    [#374]       raw=${JSON.stringify(c.raw)} open=${c.openMs}ms label=${c.label}`);
+    lines.push(`    [#374]       loop-dependent reading (NOT the verdict): exit=${c.loopRead.exit} ` +
+               `signal=${c.loopRead.signal} closed=${c.loopRead.closed}`);
+    if (c.grandchildren) {
+      lines.push(`    [#374]       processes still matching this label: ${c.grandchildren.length}`);
+      for (const g of c.grandchildren) lines.push(`    [#374]         ${g}`);
+    }
+  }
+  return lines.join("\n");
+}
+// ── end #374 instrumentation ─────────────────────────────────────────────────────────────────
+
 // #358 round 2: the between-test drain is NOT the only place a boot waits for a predecessor to
 // close. Five sites do it INSIDE a single test body, because two boots in one body are not
 // separated by ltTest's barrier at all — the comment at the `bootOnce` site says so verbatim.
@@ -2786,7 +3082,22 @@ const _ltDrainTimeouts = [];
 async function ltDrain(cond, where, ms = 5000) {
   const t0 = Date.now();
   const ok = await ltWait(cond, ms);
-  if (!ok) _ltDrainTimeouts.push({ where, ms: Date.now() - t0, active: _ltActiveBoots });
+  // #374: the record gains the kernel's answer and the loop tracer's; `where`, `ms` and `active`
+  // are unchanged, and so is everything about WHEN this gives up.
+  const elapsed = Date.now() - t0;
+  if (!ok) {
+    const rec = _ltObserveDrainTimeout(where, elapsed, t0);
+    _ltDrainTimeouts.push(rec);
+    console.warn(_ltExplainDrainTimeout(rec));
+  } else if (elapsed >= ms) {
+    // The ok=TRUE face of the same event — see _ltLateDrains. Deliberately NOT pushed into
+    // _ltDrainTimeouts: that ledger is what the #358 summary reads to decide whether the peak is
+    // attributable, and a drain that SUCCEEDED does not make the peak unattributable. Conflating
+    // them would change a verdict, which this PR is not allowed to do.
+    const rec = _ltObserveDrainTimeout(where, elapsed, t0, "OVERRAN ITS BUDGET BUT SUCCEEDED");
+    _ltLateDrains.push(rec);
+    console.warn(_ltExplainDrainTimeout(rec));
+  }
   return ok;
 }
 function ltBoot(env, dir, nodeArgs = []) {
@@ -2827,7 +3138,16 @@ function ltBoot(env, dir, nodeArgs = []) {
   // then asserts on buf.err/buf.out must wait for `closed`, not `exit != null`, or it can read
   // an empty buffer.
   child.on("exit", (code, signal) => { buf.exit = code; buf.signal = signal; });
-  child.on("close", () => { buf.closed = true; buf.closeMs = Date.now() - buf.t0; _ltActiveBoots--; });
+  // #374: registered HERE and deleted in the 'close' handler, alongside the decrement it mirrors,
+  // so every ltBoot child that has not yet closed is in the registry and none that has. (The
+  // calibration controls stage their own children through the same registry without touching
+  // _ltActiveBoots, so the two populations are equal for BOOTS, not identical in general.)
+  // The delete being
+  // loop-dependent is the point: during a stall the entry survives, which is what gives the drain
+  // a pid to ask the kernel about. Labelled with the fixture dir — it is what identifies the test
+  // to a human reading the log, and what the REAPED-GONE branch filters ps on.
+  _ltRegisterOpenChild(child, buf, dir);
+  child.on("close", () => { buf.closed = true; buf.closeMs = Date.now() - buf.t0; _ltActiveBoots--; _ltDeregisterOpenChild(child); });
   // Without a listener, a spawn 'error' is re-thrown as an uncaught exception and takes down the
   // whole runner instead of failing one test.
   child.on("error", e => { buf.spawnErr = e; });
@@ -7939,6 +8259,298 @@ ltTest("integration (#365): a stream that ends mid-character — stdout truncati
   } finally { child.kill("SIGKILL"); _ltRmRetry(dir); }
 });
 
+// ── #374 calibration controls ────────────────────────────────────────────────────────────────
+//
+// A tracer that has never been shown to distinguish the cases cannot be trusted when it says
+// which one occurred, so the instrument above is calibrated against staged faults BEFORE any
+// field capture is read. Four controls, four DIFFERENT named diagnostics:
+//
+//   A  parent blocked, burning CPU     -> ZOMBIE-UNREAPED + STALL-CPU-BOUND
+//   B  parent blocked, consuming none  -> ZOMBIE-UNREAPED + STALL-NO-CPU
+//   C  grandchild holding stdout       -> REAPED-GONE     + LOOP-LIVE
+//   D  child genuinely still running   -> ALIVE           + LOOP-LIVE   (through the real ltDrain)
+//
+// A and B are the two readings that "starvation" conflates and that have different fixes; C is
+// the pipe-holder world the thread refuted for server.mjs children but which remains the correct
+// reading of a REAPED-GONE probe on a live loop; D is the one that proves the wiring, because the
+// other three drive _ltObserveDrainTimeout directly.
+//
+// A and B MUST call it directly: the zombie window is only deterministic while no loop iteration
+// intervenes between the kill and the observation, and `await` anywhere in between hands libuv
+// the poll phase in which it reaps. That is not an artefact of the controls — it is the same
+// ordering that decides what a field capture sees, and it is why a REAPED-GONE result in the
+// field is not by itself the pipe-holder world (see the diagnosis string, which says so).
+//
+// Registered before the serialization summary below so that test still runs LAST in the ltTest
+// chain, and inside ltTest so nothing else in the suite is running while a control blocks the
+// loop for 2s. Cost: ~7s of suite time, of which 4s is the two deliberate blocks.
+const LT_CONTROL_BLOCK_MS = 2000;
+// Measured on this host at node v26.5.0, which is what sets the CPU bands above: a 1200ms
+// Atomics.wait on the main thread costs 0ms of CPU, and a 1200ms `while (Date.now() < end)` costs
+// 1199ms. The two readings are bimodal, not a spectrum, which is why a threshold can separate them.
+function _ltBlockBusy(ms) { const end = Date.now() + ms; let x = 0; while (Date.now() < end) x++; return x; }
+function _ltBlockIdle(ms) { Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms); }
+// Stages a child through the SAME registry the real ltBoot uses — not a copy of it. The controls
+// exercise _ltRegisterOpenChild / _ltDeregisterOpenChild / _ltProbePid / _ltStallSince / the two
+// renderers exactly as a real boot does; only the process on the other end is cheaper.
+function _ltStageChild(argv, label) {
+  const child = _ltSpawn(argv[0], argv.slice(1), { stdio: ["ignore", "pipe", "pipe"] });
+  const buf = { out: "", err: "", exit: undefined, signal: undefined, closed: false, t0: Date.now() };
+  child.stdout.on("data", d => { buf.out += d; });
+  child.stderr.on("data", d => { buf.err += d; });
+  child.on("error", () => {});
+  child.on("exit", (c, s) => { buf.exit = c; buf.signal = s; });
+  child.on("close", () => { buf.closed = true; _ltDeregisterOpenChild(child); });
+  _ltRegisterOpenChild(child, buf, label);
+  return { child, buf };
+}
+// The controls stage exactly one child each, but the registry is global and a run that is ALREADY
+// in #374's state can have a straggler in it. Reporting that rather than asserting on the total
+// keeps the control's own claim ("the child I staged reads X") provable without making it fail on
+// the very condition the instrument exists to observe.
+function _ltControlChild(rec, child, where) {
+  const mine = rec.children.find(c => c.pid === child.pid);
+  assert.ok(mine, `${where}: the staged child (pid ${child.pid}) must appear in the record, got ` +
+                  `${JSON.stringify(rec.children.map(c => c.pid))}`);
+  const others = rec.children.filter(c => c.pid !== child.pid);
+  if (others.length) {
+    console.warn(`    [#374] ${where}: ${others.length} other child(ren) were open during this control — ` +
+      `${JSON.stringify(others.map(o => ({ pid: o.pid, verdict: o.verdict, label: o.label })))}`);
+  }
+  return mine;
+}
+
+// The tracer is a MACROTASK, so a control that stages its block without first letting one land
+// does not measure its own gap. Measured, on the first run of these controls: A and B ran in the
+// same macrotask turn — ltWait returns on its first cond() without awaiting anything when the
+// condition already holds, so ltTest's between-test drain, the queue's .then() chain and B's
+// staging were all microtasks — and the tracer saw ONE 4238ms gap spanning BOTH blocks, CPU 1556ms
+// from A's busy loop, ratio 0.367. B was measuring A. Waiting for a fresh tick makes the gap the
+// control's own. The field code needs no equivalent: a drain that times out has awaited real
+// timers throughout, and a gap that started before its window is reported with a negative atMs
+// rather than hidden.
+async function _ltAwaitFreshTick(where) {
+  const n0 = _ltTickN;
+  assert.ok(await ltWait(() => _ltTickN > n0, 5000),
+    `${where}: a tracer tick must land before the staged block, or the gap measured is not this control's own`);
+}
+
+ltTest("#374 control A: a CPU-BURNING parent block is never named STALL-NO-CPU, and the child it could not reap reads ZOMBIE-UNREAPED", async () => {
+  const where = "#374-control-A-EXPECTED-CONTROL";
+  await _ltAwaitFreshTick(where);
+  const { child, buf } = _ltStageChild(["/bin/sleep", "30"], where);
+  try {
+    const t0 = Date.now();
+    // No await between these three statements, by construction: the loop cannot reap what it never
+    // gets a turn to reap, so the zombie is not a race.
+    child.kill("SIGKILL");
+    _ltBlockBusy(LT_CONTROL_BLOCK_MS);
+    const rec = _ltObserveDrainTimeout(where, Date.now() - t0, t0);
+
+    const mine = _ltControlChild(rec, child, where);
+    assert.equal(mine.verdict, LT_PS_VERDICT.ZOMBIE,
+      `a killed-but-unreaped child must read ZOMBIE-UNREAPED; ps said ${JSON.stringify(mine.raw)}`);
+    assert.ok(mine.state.startsWith("Z"),
+      `the state must be prefix-tested, not compared: macOS pads and decorates it, got ${JSON.stringify(mine.state)}`);
+    // This is the finding both #374 reviews made independently, asserted rather than argued: at
+    // the moment the record is written the loop-dependent reading still says `undefined` — "child
+    // still alive" — for a child that is provably dead. Recording buf.exit as the instrument, which
+    // is what #374 was filed proposing, would have concluded the opposite of the truth here.
+    assert.equal(mine.loopRead.exit, undefined,
+      "buf.exit must STILL be undefined while ps already says the child is dead — that divergence is the whole reason ps is the ground truth");
+    assert.equal(mine.loopRead.closed, false, "'close' cannot have fired either");
+    assert.ok(rec.loop.maxGapMs >= LT_CONTROL_BLOCK_MS,
+      `the measured gap must cover the block: ${rec.loop.maxGapMs}ms < ${LT_CONTROL_BLOCK_MS}ms`);
+    // NOT `=== STALL-CPU-BOUND`. That was the first form and it failed on measurement: inside the
+    // suite the identical block read 1545ms of CPU across a 2220ms gap — ratio 0.696, because the
+    // host descheduled the busy loop for ~450ms of it — against a bound then set at 0.75. The bound
+    // moved to 0.50 in response, so that exact reading now DOES land in STALL-CPU-BOUND (the band
+    // table below carries it as a row). The assertion stays relaxed anyway, because the figure that
+    // moved once under this suite's own load can move further under the two-concurrent-suite
+    // condition #374 is about, and a control that flakes exactly when the phenomenon appears is
+    // worthless. What must never happen is the reading that sends an investigator to the wrong
+    // continent, so that is what is asserted: a parent that WAS executing is never reported as a
+    // parent that was not. The CPU-BOUND/MIXED boundary itself is proven by the band table, which
+    // is deterministic where this cannot be.
+    assert.notEqual(rec.loop.verdict, LT_LOOP_VERDICT.NO_CPU,
+      `a CPU-burning block must never read STALL-NO-CPU — that is the misdiagnosis this tracer exists to prevent: ${JSON.stringify(rec.loop)}`);
+    assert.notEqual(rec.loop.verdict, LT_LOOP_VERDICT.LIVE,
+      `a ${LT_CONTROL_BLOCK_MS}ms block must not read LOOP-LIVE: ${JSON.stringify(rec.loop)}`);
+    assert.ok(rec.loop.cpuMs >= LT_CONTROL_BLOCK_MS * 0.4,
+      `the block burned CPU and the tracer must have seen most of it, got ${rec.loop.cpuMs}ms across ${rec.loop.maxGapMs}ms`);
+    assert.ok(_ltExplainDrainTimeout(rec).includes(LT_PS_DIAGNOSIS[LT_PS_VERDICT.ZOMBIE]),
+      "the printed output must carry the diagnosis SENTENCE, not just the verdict label");
+  } finally {
+    // In a finally so a failed assertion cannot leave a zombie registered: the first run of these
+    // controls did exactly that, and control B's record then carried control A's leftover child.
+    child.kill("SIGKILL");
+    await ltWait(() => buf.closed, 5000);
+  }
+  assert.equal(buf.closed, true, "control A must clean up its own child");
+  assert.equal(_ltOpenChildren.has(child.pid), false, "'close' must deregister it");
+});
+
+ltTest("#374 control B: a parent blocked WITHOUT consuming CPU reads STALL-NO-CPU — the same gap, the opposite cause", async () => {
+  const where = "#374-control-B-EXPECTED-CONTROL";
+  await _ltAwaitFreshTick(where);
+  const { child, buf } = _ltStageChild(["/bin/sleep", "30"], where);
+  try {
+    const t0 = Date.now();
+    child.kill("SIGKILL");
+    _ltBlockIdle(LT_CONTROL_BLOCK_MS);
+    const rec = _ltObserveDrainTimeout(where, Date.now() - t0, t0);
+
+    const mine = _ltControlChild(rec, child, where);
+    // Identical to control A on the ps axis — which is the point. The kernel's verdict does not
+    // distinguish these two, and reporting only "the loop stalled" would collapse a host-contention
+    // problem and a suite bug into one word.
+    assert.equal(mine.verdict, LT_PS_VERDICT.ZOMBIE,
+      `still a zombie: blocking without burning CPU reaps nothing either; ps said ${JSON.stringify(mine.raw)}`);
+    assert.equal(rec.loop.verdict, LT_LOOP_VERDICT.NO_CPU,
+      `an idle block must read STALL-NO-CPU, got ${rec.loop.verdict} (${JSON.stringify(rec.loop)})`);
+    assert.ok(rec.loop.maxGapMs >= LT_CONTROL_BLOCK_MS,
+      `the measured gap must cover the block: ${rec.loop.maxGapMs}ms < ${LT_CONTROL_BLOCK_MS}ms`);
+    assert.ok(rec.loop.ratio < LT_STALL_CPU_IDLE,
+      `CPU across the gap must be ~nothing, got ratio ${rec.loop.ratio}`);
+    // Control A asserts the complement of this on the same axis, so the pair is what proves the
+    // two causes are told apart rather than both being called "a stall".
+    assert.notEqual(rec.loop.verdict, LT_LOOP_VERDICT.CPU,
+      "control A and control B must not produce the same diagnostic");
+  } finally {
+    child.kill("SIGKILL");
+    await ltWait(() => buf.closed, 5000);
+  }
+  assert.equal(buf.closed, true, "control B must clean up its own child");
+});
+
+// The deterministic half of the calibration: controls A and B prove a real block produces real
+// numbers, and this proves those numbers map to the four names — including STALL-CPU-BOUND, which
+// a contended host may never hand control A. Behavioural: it calls the classifier the tracer
+// calls, so re-banding the constants reddens it.
+test("#374: the loop-verdict bands map gap and CPU ratio to all four names", () => {
+  const rows = [
+    [LT_STALL_MIN_MS - 1, 0.00, LT_LOOP_VERDICT.LIVE, "under the gap floor, CPU is irrelevant"],
+    [LT_STALL_MIN_MS - 1, 1.00, LT_LOOP_VERDICT.LIVE, "under the gap floor even at full CPU"],
+    [LT_STALL_MIN_MS, 0.00, LT_LOOP_VERDICT.NO_CPU, "the floor itself is a stall"],
+    [60000, 0.001, LT_LOOP_VERDICT.NO_CPU, "a 60s gap consuming nothing: not scheduled"],
+    [60000, LT_STALL_CPU_IDLE - 0.001, LT_LOOP_VERDICT.NO_CPU, "just under the idle band's top"],
+    [60000, LT_STALL_CPU_IDLE, LT_LOOP_VERDICT.MIXED, "the idle band is exclusive at its top"],
+    // The two figures actually measured on this host, kept as rows so the bands stay anchored to
+    // observation. 0.696 read STALL-MIXED under the original 0.75 bound and reads STALL-CPU-BOUND
+    // under 0.50 — that re-classification IS why the bound moved, and this row is what would
+    // redden if it moved back.
+    [2220, 0.696, LT_LOOP_VERDICT.CPU, "the busy block measured inside the suite, under load"],
+    [60000, LT_STALL_CPU_BOUND - 0.001, LT_LOOP_VERDICT.MIXED, "just under the CPU band"],
+    [60000, LT_STALL_CPU_BOUND, LT_LOOP_VERDICT.CPU, "the CPU band is inclusive at its floor"],
+    [1200, 0.999, LT_LOOP_VERDICT.CPU, "the busy block measured standalone"],
+  ];
+  for (const [gap, ratio, want, why] of rows) {
+    assert.equal(_ltClassifyLoopVerdict(gap, ratio), want,
+      `gap=${gap}ms ratio=${ratio} (${why}) must read ${want}`);
+  }
+  // All four names reachable — a band table that can only ever produce three is a silent hole.
+  assert.equal(new Set(rows.map(r => r[2])).size, 4, "every verdict name must be exercised");
+});
+
+ltTest("#374 control C: a grandchild holding stdout reads REAPED-GONE on a LIVE loop, and the scan names the holder", async () => {
+  // Marker rather than a directory: the ps filter is on the label, and this control has no fixture
+  // dir. It goes in the grandchild's argv so `ps -eo command=` carries it — measured unnecessary
+  // to pass -ww on this host, but the marker is placed last precisely because that is the end that
+  // truncates. Includes this pid so two concurrent suites cannot match each other's holder.
+  const where = `oc374holdC${process.pid}`;
+  const holder = `require("child_process").spawn(process.execPath,["-e","setTimeout(()=>{},2500)","${where}"],{stdio:"inherit"});setTimeout(()=>{},30000)`;
+  const { child, buf } = _ltStageChild([process.execPath, "-e", holder], where);
+  // Wait for the grandchild to EXIST before killing the parent — waiting on the thing about to be
+  // asserted, not a proxy for it. Two hits: the parent (the marker is in its -e source) and the
+  // grandchild (the marker is its argv).
+  assert.ok(await ltWait(() => (_ltGrandchildScan(where) || []).length >= 2, 10000),
+    "the grandchild must be running before the parent is killed");
+
+  const t0 = Date.now();
+  child.kill("SIGKILL");
+  // Here the loop IS live, deliberately: this is the world in which 'exit' lands and 'close' does
+  // not. Waiting for exit is what makes the REAPED-GONE reading deterministic rather than a race.
+  assert.ok(await ltWait(() => buf.signal !== undefined, 10000), "the parent's exit must be observed");
+  assert.equal(buf.closed, false, "'close' must NOT have fired — the grandchild still holds the pipe");
+  const rec = _ltObserveDrainTimeout(where, Date.now() - t0, t0);
+
+  const mine = _ltControlChild(rec, child, where);
+  assert.equal(mine.verdict, LT_PS_VERDICT.GONE,
+    `a reaped child must read REAPED-GONE; ps said ${JSON.stringify(mine.raw)}`);
+  assert.equal(rec.loop.verdict, LT_LOOP_VERDICT.LIVE,
+    `the loop was never blocked here, so it must read LOOP-LIVE, got ${rec.loop.verdict} (${JSON.stringify(rec.loop)})`);
+  // The contrast with control A is the reading itself: `undefined` there means UNOBSERVED, `null`
+  // here means observed-and-killed. Same field, and only the ps verdict tells them apart.
+  assert.equal(mine.loopRead.exit, null, "a SIGKILLed child reports exit=null with signal set");
+  assert.equal(mine.loopRead.signal, "SIGKILL", "the signal is the observed part of that reading");
+  assert.ok(Array.isArray(mine.grandchildren) && mine.grandchildren.some(l => l.includes(where)),
+    `the REAPED-GONE branch must scan for who is still holding the pipe, got ${JSON.stringify(mine.grandchildren)}`);
+
+  assert.ok(await ltWait(() => buf.closed, 15000),
+    "the grandchild exits on its own, so this control needs no kill it cannot attribute");
+  assert.equal(_ltOpenChildren.has(child.pid), false, "'close' must deregister it");
+});
+
+ltTest("#374 control E: a drain that overruns its budget and SUCCEEDS is recorded too — the face the reproduction actually produced", async () => {
+  const where = "#374-control-E-EXPECTED-CONTROL";
+  await _ltAwaitFreshTick(where);
+  const beforeLate = _ltLateDrains.length;
+  const beforeTimeouts = _ltDrainTimeouts.length;
+  let calls = 0;
+  // Blocks past the budget on the first look and holds on the second, which is exactly the shape
+  // the 120173ms field-reproduction had: overrun enormously, then succeed.
+  const ok = await ltDrain(() => { if (calls++ === 0) { _ltBlockIdle(LT_CONTROL_BLOCK_MS); return false; } return true; },
+                           where, 100);
+  assert.equal(ok, true, "the condition holds on the second look, so this drain SUCCEEDS");
+  assert.equal(_ltDrainTimeouts.length, beforeTimeouts,
+    "a successful drain must NOT enter the #358 offender ledger — that ledger is what decides whether the peak is attributable, and a drain that succeeded leaves it attributable");
+  assert.equal(_ltLateDrains.length, beforeLate + 1,
+    "an overrun that succeeded must still be recorded somewhere, or the instrument is silent in the case the reproduction produced");
+  const rec = _ltLateDrains.pop();
+  assert.equal(_ltLateDrains.length, beforeLate, "the control record must not survive in the ledger");
+  assert.ok(rec.ms >= LT_CONTROL_BLOCK_MS,
+    `the record must carry the overrun, not the budget: got ${rec.ms}ms for a ${LT_CONTROL_BLOCK_MS}ms block`);
+  assert.equal(rec.loop.verdict, LT_LOOP_VERDICT.NO_CPU,
+    `the tracer must characterise a successful overrun exactly as it does a failed one, got ${JSON.stringify(rec.loop)}`);
+  assert.ok(_ltExplainDrainTimeout(rec).includes("OVERRAN ITS BUDGET BUT SUCCEEDED"),
+    "the printed line must name WHICH face this is — a reader must not have to tell them apart by absence");
+});
+
+ltTest("#374 control D: a real ltDrain timeout carries the probe and the tracer, and a still-running child reads ALIVE", async () => {
+  const where = "#374-control-D-EXPECTED-CONTROL";
+  const { child, buf } = _ltStageChild(["/bin/sleep", "30"], where);
+  const before = _ltDrainTimeouts.length;
+  // The real thing, timing out for real — the other three controls stage the observation, this one
+  // proves ltDrain reaches it. cond is constant-false, so the give-up is not a race either.
+  const ok = await ltDrain(() => false, where, 60);
+  assert.equal(ok, false, "a constant-false condition must time out");
+  assert.equal(_ltDrainTimeouts.length, before + 1, "ltDrain must push exactly one record per timeout");
+  // Popped, not left behind: this is a DELIBERATE timeout, and the #358 summary reads that ledger
+  // to name real offenders. A control that seeded it would make a green run print a #374 lead that
+  // did not happen — which is the failure mode this whole PR exists to remove, not to add.
+  const rec = _ltDrainTimeouts.pop();
+  assert.equal(_ltDrainTimeouts.length, before, "the control record must not survive in the offender ledger");
+  assert.equal(rec.where, where, "the record must carry the site that timed out");
+  assert.ok(rec.ms >= 60, `the record must carry the elapsed wait, got ${rec.ms}ms`);
+
+  const mine = _ltControlChild(rec, child, where);
+  assert.equal(mine.verdict, LT_PS_VERDICT.ALIVE,
+    `a child that was never killed must read ALIVE; ps said ${JSON.stringify(mine.raw)}`);
+  assert.ok(!mine.state.startsWith("Z"), `ALIVE must not be a zombie state, got ${JSON.stringify(mine.state)}`);
+  assert.equal(mine.grandchildren, null, "the grandchild scan is REAPED-GONE-only — it must not run here");
+  assert.equal(rec.loop.verdict, LT_LOOP_VERDICT.LIVE, `the loop was live, got ${JSON.stringify(rec.loop)}`);
+
+  const line = _ltRenderDrainTimeout(rec);
+  assert.ok(line.includes(LT_PS_VERDICT.ALIVE) && line.includes(LT_LOOP_VERDICT.LIVE),
+    `the offender line must name BOTH verdicts so a reader need not infer the world: ${line}`);
+  assert.ok(_ltExplainDrainTimeout(rec).includes(LT_PS_DIAGNOSIS[LT_PS_VERDICT.ALIVE]),
+    "the full explanation must carry the ALIVE diagnosis sentence — the one that says the hypothesis flipped");
+
+  child.kill("SIGKILL");
+  assert.ok(await ltWait(() => buf.closed, 5000), "control D must clean up its own child");
+});
+// ── end #374 calibration controls ────────────────────────────────────────────────────────────
+
 // Deterministic close for the ltTest serialization claim: a fact about how many server.mjs
 // children were EVER alive at once during this block, not a race against wall-clock luck (see
 // the comment on _ltPeakBoots above ltBoot's definition). Registered last in the ltTest chain —
@@ -7967,12 +8579,22 @@ ltTest("integration: ltTest serialization keeps peak concurrent server.mjs child
   // Four of the six gaps are terminal on their last iteration, so it needed no mutation to reach.
   //
   // The timeout is still worth surfacing — it is the #374 lead — so it is reported, not asserted.
-  const _drainSummary = _ltDrainTimeouts
-    .map(d => `${d.where}(${d.ms}ms, active=${d.active})`).join(", ");
+  // #374: the offender list now carries the kernel's verdict on each still-open child and the
+  // loop tracer's verdict on the window, so a recurrence names which of the three worlds it is in
+  // instead of leaving the reader to infer it from the elapsed number.
+  const _drainSummary = _ltDrainTimeouts.map(_ltRenderDrainTimeout).join(", ");
   if (_ltDrainTimeouts.length && _ltPeakBoots === 1) {
     console.warn(`    [#358] ${_ltDrainTimeouts.length} teardown wait(s) timed out, but peak stayed 1, ` +
       `so serialization is still PROVEN — a slow-teardown lead (#374), not a failure here. ` +
       `Offenders: ${_drainSummary}`);
+  }
+  // #374: reported, never asserted, and deliberately not folded into the line above. A drain that
+  // overran and then SUCCEEDED leaves the peak perfectly attributable, so it is not a #358
+  // offender — but it is the same underlying event, and on the host where this was reproduced it
+  // is the face that actually shows up. Silence here would be the instrument's blind spot.
+  if (_ltLateDrains.length) {
+    console.warn(`    [#374] ${_ltLateDrains.length} drain(s) overran their budget and still succeeded, so they are ` +
+      `NOT #358 offenders and nothing above counts them: ${_ltLateDrains.map(_ltRenderDrainTimeout).join(", ")}`);
   }
 
   // Both directions of "not 1" are failures, and they mean different things — say which. And when
