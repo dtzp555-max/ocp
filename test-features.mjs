@@ -6608,10 +6608,22 @@ ltTest("integration (#400): GET /api/usage answers a finite out-of-domain ?hours
     const byParam = (p) => subs.find(s => s.param === p);
     assert.ok(byParam("limit"), `no substitution was logged for ?limit; logged: ${JSON.stringify(subs)}`);
     assert.ok(byParam("hours"), `no substitution was logged for ?hours; logged: ${JSON.stringify(subs)}`);
+    // WHAT THE NEXT TWO ASSERTIONS DO **NOT** CHECK, stated because they read stronger than they
+    // are. They compare the LOG against a CONSTANT, so they establish that the log is
+    // self-consistent with the documented default — NOT that the log matches the value the sink
+    // actually substituted. Mutation M4 is the witness: it makes the retry use the 500 cap while
+    // this line still logs 50, and these two assertions PASS. The arm that catches that divergence
+    // is the row-count arm above, which throws first, so these can never report it. Proving them
+    // against behaviour would need the log compared to the wire in a body that has no value arm
+    // ahead of it; that is a fixture change, not a one-line fix, and it is recorded rather than
+    // quietly implied.
     assert.equal(byParam("limit").substituted, LT400_DEFAULT_LIMIT,
       `the logged substitute must be the documented default: ${JSON.stringify(byParam("limit"))}`);
     assert.equal(byParam("hours").substituted, LT400_DEFAULT_HOURS,
       `the logged substitute must be the documented default: ${JSON.stringify(byParam("hours"))}`);
+    // THE PAYLOAD. This is the field an operator would actually act on — the value that was
+    // discarded — and it has its own mutation row (M12: drop `supplied` from the log line), because
+    // "the mitigation carries the value" is a claim the PR body makes and nothing else here proves.
     assert.equal(byParam("hours").supplied, -2400000000,
       `the logged line must name the value that was DISCARDED, or it cannot be acted on: ` +
       `${JSON.stringify(byParam("hours"))}`);
