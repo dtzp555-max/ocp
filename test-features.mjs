@@ -2815,18 +2815,41 @@ const LT_PS_VERDICT = Object.freeze({
   ALIVE: "ALIVE",
   GONE: "REAPED-GONE",
   UNKNOWN: "PROBE-FAILED",
+  // Record-level rather than per-child: these describe the REGISTRY, not a pid. The first is the
+  // outcome this instrument's own field capture produced, and it had no name for one revision —
+  // it printed as "nothing to probe", which reads as absence of information when it is in fact
+  // the most specific signal of the four. Independent review measured what it means.
+  CLOSED_FIRST: "CLOSED-BEFORE-PROBE",
+  NONE_OPEN: "NO-CHILD-WAS-OPEN",
 });
-// One sentence per outcome, printed verbatim next to the verdict. #374's plan calls for each of
-// the three to be NAMED in the output: a reader must not have to infer which world they are in.
+// One sentence per outcome, printed verbatim next to the verdict. #374's plan calls for each
+// outcome to be NAMED: a reader must not have to infer which world they are in. Each mechanism
+// claim carries [measured] or [reasoned] so a reader can tell which were observed from a running
+// process and which were read off the source — the b2 snapshot's notCovered block does the same,
+// and for the same reason.
 const LT_PS_DIAGNOSIS = Object.freeze({
   [LT_PS_VERDICT.ZOMBIE]:
-    "child is DEAD and UNREAPED -> this parent has not processed SIGCHLD -> parent-side, confirmed DIRECTLY",
+    "[measured] child is DEAD and UNREAPED -> this parent has not processed SIGCHLD -> parent-side, confirmed DIRECTLY",
   [LT_PS_VERDICT.ALIVE]:
-    "child is STILL RUNNING -> the SIGKILL did not take, or went to the wrong process -> HYPOTHESIS FLIPPED",
+    "[measured] child is STILL RUNNING -> the SIGKILL did not take, or went to the wrong process -> HYPOTHESIS FLIPPED",
+  // #374's original reading, restored after an incorrect 'correction' from this PR's author.
+  // The author reasoned: libuv delivers a child's exit in the POLL phase and ltWait resumes in
+  // TIMERS, so a stall that ends by rescheduling gets the child reaped BEFORE ltWait's turn —
+  // therefore REAPED-GONE could be a stall rather than a pipe-holder. The first half is right and
+  // [measured]. The conclusion does not follow, and independent review measured why: in the
+  // reschedule case 'close' fires in the SAME turn as 'exit', because the child's death delivers
+  // the stdio EOFs in that same poll phase. Sampling every macrotask turn — ltWait's finest
+  // possible granularity — turns observed with exit delivered but closed=false: ZERO, over 3+2
+  // staged runs. A world that reaps therefore leaves an EMPTY REGISTRY (see CLOSED-BEFORE-PROBE),
+  // not this row. So a registry-visible REAPED-GONE still means the pipes are open.
   [LT_PS_VERDICT.GONE]:
-    "no such pid -> the child was reaped, so 'close' is outstanding after the exit was processed -> read with the loop verdict: LOOP-LIVE makes this the pipe-holder world, a stall verdict makes it a stall that ended before the probe",
+    "[measured] no such pid, yet the child is STILL REGISTERED -> 'close' has not fired though the pid is gone -> the pipes are still open -> PIPE-HOLDER; dump the grandchildren below. (A stall that merely ended by rescheduling does NOT land here: it delivers exit and 'close' in one turn and leaves no row at all.)",
   [LT_PS_VERDICT.UNKNOWN]:
-    "ps itself did not run -> NO VERDICT; do not read this as any of the other three",
+    "ps itself did not run -> NO VERDICT; do not read this as any of the other outcomes",
+  [LT_PS_VERDICT.CLOSED_FIRST]:
+    "[measured] every child open when this drain STARTED has since emitted 'close' -> exit and both stdio EOFs were delivered together -> the signature of a stall that ended in the poll phase, and the ok=true face of #374. NOT an absence of information: it positively excludes both the zombie and the pipe-holder worlds",
+  [LT_PS_VERDICT.NONE_OPEN]:
+    "no child was registered when this drain started -> it was not waiting on an ltBoot child at all -> the probe has nothing to say here, and this is the one outcome that IS an absence of information",
 });
 // `state=` is asked for first because it is the decisive field. `etime=` and `comm=` are EVIDENCE
 // and never identity: etime is a rendering (as is lstart, which is worse — it is local-time
@@ -2988,7 +3011,12 @@ function _ltLoopDiagnosis(loop) {
              `${loop.windowMs}ms window, ${loop.cpuMs}ms CPU across it (${loop.ratio}x)`;
   switch (loop.verdict) {
     case LT_LOOP_VERDICT.LIVE:
-      return `${at} -> no gap reached ${LT_STALL_MIN_MS}ms: the loop kept ticking, so 'close' genuinely had not fired`;
+      // This clause used to end "...so 'close' genuinely had not fired", which is a claim about
+      // the CHILD made by an instrument that only watches the LOOP — and it was printed verbatim
+      // under "OVERRAN ITS BUDGET BUT SUCCEEDED", where 'close' demonstrably HAD fired. Two lines
+      // of the same record contradicting each other, in the PR that quotes "a name is a claim".
+      // The loop tracer now says only what it measured; what 'close' did is the ps line's job.
+      return `${at} -> no gap reached ${LT_STALL_MIN_MS}ms: this loop kept ticking through the window`;
     case LT_LOOP_VERDICT.NO_CPU:
       return `${at} -> this process was NOT EXECUTING across the gap: descheduled, swapped, QoS-throttled, or blocked in a syscall`;
     case LT_LOOP_VERDICT.CPU:
@@ -3001,7 +3029,7 @@ function _ltLoopDiagnosis(loop) {
 // Builds the record ltDrain pushes on a timeout. Separated from ltDrain so the calibration
 // controls can drive the instrument directly, with NO intervening await between the fault they
 // stage and the observation — which is the only way to make the zombie window deterministic.
-function _ltObserveDrainTimeout(where, elapsedMs, t0, kind = "TIMED OUT") {
+function _ltObserveDrainTimeout(where, elapsedMs, t0, kind = "TIMED OUT", openAtStart = 0) {
   const loop = _ltStallSince(t0);
   const children = [];
   for (const rec of _ltOpenChildren.values()) {
@@ -3014,7 +3042,13 @@ function _ltObserveDrainTimeout(where, elapsedMs, t0, kind = "TIMED OUT") {
       grandchildren: probe.verdict === LT_PS_VERDICT.GONE ? _ltGrandchildScan(rec.label) : null,
     });
   }
-  return { where, kind, ms: elapsedMs, active: _ltActiveBoots, loop, children };
+  // The registry's own verdict, for the case where no child is left to probe. Which of the two it
+  // is depends on how many were open when the drain STARTED, which is why ltDrain samples that and
+  // passes it: "all of them closed while I waited" and "there were never any" are opposite
+  // findings, and without openAtStart they print identically.
+  const registry = children.length ? null
+    : (openAtStart > 0 ? LT_PS_VERDICT.CLOSED_FIRST : LT_PS_VERDICT.NONE_OPEN);
+  return { where, kind, ms: elapsedMs, active: _ltActiveBoots, openAtStart, registry, loop, children };
 }
 // Compact form, for the offender list inside the #358 summary's message.
 function _ltRenderDrainTimeout(r) {
@@ -3022,9 +3056,15 @@ function _ltRenderDrainTimeout(r) {
     ? r.children.map(c => `pid ${c.pid} ${c.verdict}` +
         (c.state ? ` state=${JSON.stringify(c.state)} etime=${c.etime}` : "") +
         ` loopRead[exit=${c.loopRead.exit} signal=${c.loopRead.signal} closed=${c.loopRead.closed}]`).join("; ")
-    : "no child was still registered at give-up";
+    : `${r.registry} (openAtStart=${r.openAtStart})`;
+  // maxGap is rendered WITH atMs and the window, never bare. A gap is measured from the last tick,
+  // so it can begin before the drain did — and the compact form used to drop that, which reads as
+  // "the drain caused this gap". Measured on control D, on every run: a 146ms gap reported inside
+  // an 84ms window, 155% of the window it is printed next to, benign only because it sits under
+  // the stall floor. A negative atMs is the tell, so it has to be on the same line as the number.
   return `${r.where}(${r.ms}ms, active=${r.active}, ps=[${kids}], ` +
-         `loop=${r.loop.verdict} maxGap=${r.loop.maxGapMs}ms cpu=${r.loop.cpuMs}ms n>=${LT_STALL_MIN_MS}ms=${r.loop.nStalls})`;
+         `loop=${r.loop.verdict} maxGap=${r.loop.maxGapMs}ms@${r.loop.atMs >= 0 ? "+" : ""}${r.loop.atMs}ms ` +
+         `of ${r.loop.windowMs}ms cpu=${r.loop.cpuMs}ms n>=${LT_STALL_MIN_MS}ms=${r.loop.nStalls})`;
 }
 // Full form, printed at the MOMENT of the timeout rather than only in the end-of-block summary:
 // four of the six drain sites are outside the ltTest block, and a recurrence should carry its own
@@ -3034,7 +3074,10 @@ function _ltExplainDrainTimeout(r) {
   lines.push(`    [#374]   loop: ${r.loop.verdict} — ${_ltLoopDiagnosis(r.loop)}`);
   lines.push(`    [#374]   loop: gaps >= ${LT_STALL_MIN_MS}ms: ${r.loop.nStalls} totalling ${r.loop.sumStallMs}ms; ` +
              `top=${JSON.stringify(r.loop.top)}; gaps in window=${r.loop.gapsInWindow}; ticks in ring=${r.loop.ticksInRing}`);
-  if (!r.children.length) lines.push(`    [#374]   ps: no child was still registered at give-up — nothing to probe`);
+  if (!r.children.length) {
+    lines.push(`    [#374]   ps: ${r.registry} (${r.openAtStart} open when the drain started, 0 now) — ` +
+               `${LT_PS_DIAGNOSIS[r.registry]}`);
+  }
   for (const c of r.children) {
     lines.push(`    [#374]   ps: pid ${c.pid} ${c.verdict} — ${LT_PS_DIAGNOSIS[c.verdict]}`);
     lines.push(`    [#374]       raw=${JSON.stringify(c.raw)} open=${c.openMs}ms label=${c.label}`);
@@ -3081,12 +3124,16 @@ function _ltExplainDrainTimeout(r) {
 // diagnoses, and both were observed while mutation-proving this fix.
 async function ltDrain(cond, where, ms = 5000) {
   const t0 = Date.now();
+  // Sampled BEFORE the wait, and it is the only thing this function reads ahead of ltWait. It is
+  // what separates "every child I was waiting on closed while I waited" from "I was never waiting
+  // on one" — see CLOSED-BEFORE-PROBE. A Map .size read costs nothing and cannot change behaviour.
+  const openAtStart = _ltOpenChildren.size;
   const ok = await ltWait(cond, ms);
   // #374: the record gains the kernel's answer and the loop tracer's; `where`, `ms` and `active`
   // are unchanged, and so is everything about WHEN this gives up.
   const elapsed = Date.now() - t0;
   if (!ok) {
-    const rec = _ltObserveDrainTimeout(where, elapsed, t0);
+    const rec = _ltObserveDrainTimeout(where, elapsed, t0, "TIMED OUT", openAtStart);
     _ltDrainTimeouts.push(rec);
     console.warn(_ltExplainDrainTimeout(rec));
   } else if (elapsed >= ms) {
@@ -3094,7 +3141,7 @@ async function ltDrain(cond, where, ms = 5000) {
     // _ltDrainTimeouts: that ledger is what the #358 summary reads to decide whether the peak is
     // attributable, and a drain that SUCCEEDED does not make the peak unattributable. Conflating
     // them would change a verdict, which this PR is not allowed to do.
-    const rec = _ltObserveDrainTimeout(where, elapsed, t0, "OVERRAN ITS BUDGET BUT SUCCEEDED");
+    const rec = _ltObserveDrainTimeout(where, elapsed, t0, "OVERRAN ITS BUDGET BUT SUCCEEDED", openAtStart);
     _ltLateDrains.push(rec);
     console.warn(_ltExplainDrainTimeout(rec));
   }
@@ -8514,6 +8561,57 @@ ltTest("#374 control E: a drain that overruns its budget and SUCCEEDS is recorde
     `the tracer must characterise a successful overrun exactly as it does a failed one, got ${JSON.stringify(rec.loop)}`);
   assert.ok(_ltExplainDrainTimeout(rec).includes("OVERRAN ITS BUDGET BUT SUCCEEDED"),
     "the printed line must name WHICH face this is — a reader must not have to tell them apart by absence");
+});
+
+// F and G are the outcome this instrument's own FIELD CAPTURE produced, which had no name for one
+// revision: it printed "no child was still registered at give-up — nothing to probe", which reads
+// as the absence of a result. It is the opposite. Independent review measured that a stall ending
+// by rescheduling delivers 'exit' and 'close' in the SAME turn — turns observed with exit
+// delivered but closed=false: ZERO — so an emptied registry positively excludes both the zombie
+// world and the pipe-holder world. It is the most specific of the four outcomes and it was the
+// only one unnamed. Splitting it in two is what makes it say anything: "everything I was waiting
+// on closed" and "I was never waiting on anything" print identically without openAtStart.
+ltTest("#374 control F: a child that closes WHILE the drain waits reads CLOSED-BEFORE-PROBE — a result, not a silence", async () => {
+  const where = "#374-control-F-EXPECTED-CONTROL";
+  assert.ok(await ltWait(() => _ltOpenChildren.size === 0, 10000),
+    "premise: no earlier boot is still registered, or openAtStart is not this control's");
+  const beforeTimeouts = _ltDrainTimeouts.length;
+  const { child, buf } = _ltStageChild(["/bin/sleep", "30"], where);
+  assert.equal(_ltOpenChildren.size, 1, "premise: exactly the staged child is registered");
+  // Killed BEFORE the drain and never awaited, so it closes while the drain is waiting and the
+  // loop is live throughout — the reschedule world, staged.
+  child.kill("SIGKILL");
+  const ok = await ltDrain(() => false, where, 500);
+  assert.equal(ok, false, "a constant-false condition must still time out");
+  assert.equal(_ltDrainTimeouts.length, beforeTimeouts + 1, "exactly one record");
+  const rec = _ltDrainTimeouts.pop();
+  assert.equal(_ltDrainTimeouts.length, beforeTimeouts, "the control record must not survive in the offender ledger");
+
+  assert.equal(buf.closed, true, "premise: the child closed while the drain waited");
+  assert.equal(rec.children.length, 0, "so there is nothing left to probe");
+  assert.equal(rec.openAtStart, 1, "but one child WAS open when the drain started — that is the whole signal");
+  assert.equal(rec.registry, LT_PS_VERDICT.CLOSED_FIRST,
+    `an emptied registry must be NAMED, got ${rec.registry}`);
+  assert.ok(_ltExplainDrainTimeout(rec).includes("positively excludes"),
+    "the printed diagnosis must say this is information rather than the absence of it");
+  assert.ok(_ltRenderDrainTimeout(rec).includes(LT_PS_VERDICT.CLOSED_FIRST),
+    "the compact offender line must carry it too — that line is what the #358 summary prints");
+});
+
+ltTest("#374 control G: a drain that was never waiting on a child says NO-CHILD-WAS-OPEN, and the two must not collapse", async () => {
+  const where = "#374-control-G-EXPECTED-CONTROL";
+  assert.ok(await ltWait(() => _ltOpenChildren.size === 0, 10000), "premise: nothing is registered");
+  const beforeTimeouts = _ltDrainTimeouts.length;
+  const ok = await ltDrain(() => false, where, 60);
+  assert.equal(ok, false, "a constant-false condition must time out");
+  const rec = _ltDrainTimeouts.pop();
+  assert.equal(_ltDrainTimeouts.length, beforeTimeouts, "the control record must not survive in the offender ledger");
+  assert.equal(rec.openAtStart, 0, "nothing was open when this drain started");
+  assert.equal(rec.registry, LT_PS_VERDICT.NONE_OPEN, `got ${rec.registry}`);
+  assert.notEqual(rec.registry, LT_PS_VERDICT.CLOSED_FIRST,
+    "this is the case that really IS an absence of information, and it must not wear the other's name");
+  assert.ok(_ltExplainDrainTimeout(rec).includes("IS an absence of information"),
+    "and the printed diagnosis must say so");
 });
 
 ltTest("#374 control D: a real ltDrain timeout carries the probe and the tracer, and a still-running child reads ALIVE", async () => {
