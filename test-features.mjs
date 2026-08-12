@@ -2248,27 +2248,70 @@ function ltResolveTmuxBin(env, dir) {
 //
 // WHY `HOME` AND NOT `OCP_TUI_HOME`. Pinning OCP_TUI_HOME would take `resolveTuiHome`'s FIRST
 // branch (configuredHome wins) and, with no env token, land in prepareTuiHome's LEGACY
-// scratch-home mode — which SYMLINKS the real ~/.claude/.credentials.json into the scratch home.
-// That trades a config rewrite for a credential symlink, which is not obviously better. Pinning
-// HOME instead makes `realHome` itself scratch, so EVERY branch of resolveTuiHome lands inside
-// the scratch tree and the legacy branch has no real credentials file to link. One variable,
-// and it also redirects TUI_CWD (server.mjs: `OCP_TUI_CWD || ${HOME}/.ocp-tui/work`),
-// TUI_STREAM_DIR, SPAWN_HOME_DIR, the openclaw log path, and every `homedir()` call — os.homedir()
-// reads $HOME on POSIX. scripts/b2-key-snapshot.mjs already pins HOME for exactly this reason.
+// scratch-home mode, which reaches into the operator's real home TWICE: it SYMLINKS the real
+// ~/.claude/.credentials.json into the scratch home, AND it seeds the scratch config by READING
+// the real one (`if (!envTokenMode) base = JSON.parse(readFileSync(<realHome>/.claude.json))`).
+// So it would trade a config rewrite for a credential symlink PLUS a copy of the operator's
+// Claude config into a temp directory. Pinning HOME instead makes `realHome` itself scratch, so
+// EVERY branch of resolveTuiHome lands inside the scratch tree: no real credentials file to
+// link and no real config to copy. One variable, and it also redirects TUI_CWD (server.mjs:
+// `OCP_TUI_CWD || ${HOME}/.ocp-tui/work`), TUI_STREAM_DIR, SPAWN_HOME_DIR, the openclaw log
+// path, and every `homedir()` call — os.homedir() reads $HOME on POSIX.
+//   BOTH LEGS ARE ALREADY EXECUTED BY THIS SUITE, so neither is a source-only claim (the first
+//   version of this PR hedged that it had "verified it in source but not by execution", which
+//   under-claimed). `test("prepareTuiHome scratch mode: symlinks creds, seeds onboarded config,
+//   trusts cwd, strips history")` calls prepareTuiHome with envTokenMode defaulted — the legacy
+//   branch — and asserts the readlink target IS <realHome>/.claude/.credentials.json and that
+//   the seed carried `theme: "dark"` over from the real config; `test("resolveTuiHome: explicit
+//   OCP_TUI_HOME wins regardless of env token (back-compat)")` executes the first branch for
+//   both token states.
+//   scripts/b2-key-snapshot.mjs also pins HOME, but for a NEIGHBOURING reason rather than this
+//   one, and the distinction is worth keeping: its stated purpose is snapshot DETERMINISM —
+//   handleLogs reads $HOME/.openclaw/logs/proxy.log, so an ambient HOME makes /logs record a
+//   different key set on a developer machine than on CI. That is about READING the operator's
+//   files; this is about WRITING to their home. Precedent for the mechanism, not the argument.
 //
-// WHY THE BASE ENV. Measured on this tree: of the SEVEN `CLAUDE_TUI_MODE: "true"` boot sites,
-// SEVEN pin no HOME; of the eight other TUI-ish sites (the `ltTuiTmux` ones), EIGHT do. Eight
-// authors remembered and seven did not, which is AGENTS.md's "constraints must be unreachable by
-// construction, not stated as prohibitions" with the count attached. Applied unconditionally
-// rather than gated on CLAUDE_TUI_MODE, for #384's reason: ltBoot cannot see which caller will
-// later turn TUI on, and a conditional pin is the same hole one level down.
+// WHY THE BASE ENV. RE-DERIVED against origin/main, not carried forward — the first version of
+// this comment said seven/seven and eight/eight and BOTH were wrong. The seventh
+// `grep -n 'CLAUDE_TUI_MODE: "true"'` hit is inside `ltTuiTmux`'s returned `env` object, i.e.
+// the fixture body and not a call site, so it was counted as a site that forgot when it is in
+// fact the thing every remembering site spreads — wrong side of the ledger, twice over. It is
+// AGENTS.md's "numbers are claims too" and #338's over-count in the same shape: a grep hit
+// counted without opening what it was attached to. Correct, on origin/main:
+//   SIX hand-rolled CLAUDE_TUI_MODE boot sites pin NO HOME (:2822 :2859 :2929 :2962 :3540 :5416)
+//   NINE that go through a SHARED FIXTURE all pin it — eight spreading `...ltTuiTmux(dir).env`
+//     with `HOME: home` from `const home = ltMkdir()`, plus makeB2Fixture's `tui-pool` profile,
+//     whose `...profile.env` spreads over a base env already carrying `HOME: home`. That ninth
+//     one a grep of THIS file structurally cannot see: it lives in scripts/b2-key-snapshot.mjs
+//     and is booted through `ltBootFresh(fx.env, fx.dir)`. M-D below reddens it, which is how it
+//     was found rather than argued.
+// Six forgot and nine remembered, and the correction SHARPENS the argument instead of weakening
+// it: every site that remembers is a shared fixture and every site that forgets is hand-rolled.
+// That is AGENTS.md's "constraints must be unreachable by construction, not stated as
+// prohibitions" with the count attached. Applied unconditionally rather than gated on
+// CLAUDE_TUI_MODE, for #384's reason: ltBoot cannot see which caller will later turn TUI on, and
+// a conditional pin is the same hole one level down.
+//   TO RE-DERIVE (do not quote these from here): `git show origin/main:test-features.mjs |
+//   grep -n 'CLAUDE_TUI_MODE: "true"'`, then OPEN each hit and decide call site vs fixture body;
+//   then `grep -n 'CLAUDE_TUI_MODE' scripts/b2-key-snapshot.mjs` for the profile the first grep
+//   cannot reach.
 //
 // WHY THE CONTAINMENT BOUNDARY IS _ltTmp() AND NOT `dir`. This is the one place #384's pattern
 // must NOT be copied verbatim. Its tmux guard requires the supplied path to sit inside the
-// test's own `dir`; the eight sites that already pin HOME use `const home = ltMkdir()`, a
-// SIBLING of `dir` under the same temp root. A dir-scoped guard here would reject all eight.
-// The property that matters is "not the operator's real home", not "inside this specific test",
-// so the boundary is the harness's temp root.
+// test's own `dir`; the nine sites that already pin HOME all use a SIBLING of `dir` under the
+// same temp root (`ltMkdir()`, or `mkdtempSync(join(tmpdir(), "ocp-b2-home-"))` for the b2
+// fixture). A dir-scoped guard here would reject all nine — MEASURED, mutation M-D: 1197 passed / 10 failed against a 1207 / 0 / 2 baseline,
+// the reds being the #396 unit test's sibling-acceptance assertion, the eight `ltTuiTmux`
+// integration tests, and the #346 B.2 snapshot test, which is the ninth site. The property that
+// matters is "not the operator's real home", not "inside this specific test", so the boundary is
+// the harness's temp root.
+//   ONE TOLERANCE OF #384's GUARD IS DELIBERATELY NOT COPIED: it permits `target === root`. For
+//   tmux that escape is unreachable in practice — the stub is a file and the boundary is the
+//   directory containing it, so equality cannot arise. For HOME it is both reachable and
+//   harmful: HOME=$TMPDIR is shared by every concurrently-running test AND by makeB2Fixture, so
+//   it would put .claude.json and .ocp-tui/ somewhere two boots contend over — the shared-
+//   mutable-home failure this pin exists to remove. Containment here is STRICT, and the
+//   divergence is asserted rather than left implicit (mutation M-E).
 function ltResolveHome(env, dir) {
   const supplied = env && env.HOME;
   if (supplied === undefined || supplied === null) {
@@ -2282,11 +2325,15 @@ function ltResolveHome(env, dir) {
     throw new Error(`ltBoot: HOME=${supplied} does not exist. A live-server test's HOME must be a real ` +
                     `directory it created, under ${_ltTmp()} (use ltMkdir()).`);
   }
-  if (target !== root && !target.startsWith(root + _ltSep)) {
-    throw new Error(`ltBoot: refusing HOME=${supplied} (resolves to ${target}), which is OUTSIDE the harness ` +
-                    `temp root ${root}. A TUI-mode boot rewrites $HOME/.claude.json — read-modify-rename, so it ` +
-                    `can also lose a concurrent write by the operator's own Claude session. Create one with ` +
-                    `ltMkdir() and pass that.`);
+  // STRICT containment — no `target !== root` escape, unlike ltResolveTmuxBin above. See the
+  // last paragraph of this function's comment: $TMPDIR itself is shared, so accepting it would
+  // reintroduce the contention the pin removes.
+  if (!target.startsWith(root + _ltSep)) {
+    throw new Error(`ltBoot: refusing HOME=${supplied} (resolves to ${target}), which is not strictly inside ` +
+                    `the harness temp root ${root} — either OUTSIDE it, or the root ITSELF, which is refused ` +
+                    `too because $TMPDIR is shared by every concurrent test and by makeB2Fixture. A TUI-mode ` +
+                    `boot rewrites $HOME/.claude.json — read-modify-rename, so it can also lose a concurrent ` +
+                    `write by the operator's own Claude session. Create one with ltMkdir() and pass that.`);
   }
   return supplied;
 }
@@ -3170,11 +3217,12 @@ test("#396: ltResolveHome defaults inside the test's dir, accepts a SIBLING scra
     assert.equal(ltResolveHome({ HOME: undefined }, dir), ltResolveHome({}, dir),
       "an explicitly-undefined value is 'not supplied', not an override");
 
-    // A SIBLING scratch dir is accepted. This is the case that decides the boundary: the eight
-    // TUI sites that already pin HOME use `const home = ltMkdir()`, which is a sibling of `dir`,
-    // not a child of it. A dir-scoped guard — the shape #384 uses for tmux — would reject all
-    // eight. Copying that pattern verbatim here would have been wrong, which is why this
-    // assertion exists rather than being left to the integration test to discover.
+    // A SIBLING scratch dir is accepted. This is the case that decides the boundary: the NINE
+    // TUI boot sites that already pin HOME all use a sibling of `dir` rather than a child —
+    // eight via `const home = ltMkdir()`, one via makeB2Fixture's `ocp-b2-home-` mkdtemp. A
+    // dir-scoped guard — the shape #384 uses for tmux — would reject all nine (M-D). Copying
+    // that pattern verbatim here would have been wrong, which is why this assertion exists
+    // rather than being left to the integration test to discover.
     assert.equal(ltResolveHome({ HOME: sibling }, dir), sibling,
       "a sibling scratch dir under the harness temp root must be accepted");
 
@@ -3183,8 +3231,13 @@ test("#396: ltResolveHome defaults inside the test's dir, accepts a SIBLING scra
     let refused = 0;
     for (const real of [homedir(), join(homedir(), ".claude"), "/", "/tmp/.."]) {
       if (!_ltExists(real)) continue;
+      // Mirrors the guard EXACTLY, including its strictness: containment is `startsWith(root+sep)`
+      // with no equality escape, so a candidate that resolved to the temp root itself would be
+      // refused and must be counted as such rather than skipped. Kept in step deliberately — a
+      // predicate that models a stale version of the guard is the "prose about the code" defect
+      // this suite keeps shipping.
       let outside = true;
-      try { outside = !_ltRealpath(real).startsWith(_ltRealpath(_ltTmp()) + _ltSep) && _ltRealpath(real) !== _ltRealpath(_ltTmp()); } catch { outside = true; }
+      try { outside = !_ltRealpath(real).startsWith(_ltRealpath(_ltTmp()) + _ltSep); } catch { outside = true; }
       if (!outside) continue; // a machine whose TMPDIR is under $HOME — skip, do not miscount
       assert.throws(() => ltResolveHome({ HOME: real }, dir), /OUTSIDE/,
         `ltBoot must refuse HOME outside the harness temp root (${real}) — a TUI boot rewrites $HOME/.claude.json`);
@@ -3193,6 +3246,16 @@ test("#396: ltResolveHome defaults inside the test's dir, accepts a SIBLING scra
     assert.ok(refused >= 1,
       "no candidate resolved outside the temp root, so the refusal was never exercised — " +
       "this test would have passed without testing anything");
+
+    // The temp ROOT ITSELF is refused. This is a deliberate divergence from #384's tmux guard,
+    // which permits `target === root`; there that escape is unreachable (a file can never equal
+    // the directory it sits in), here it is reachable and harmful — $TMPDIR is shared by every
+    // concurrently-running test and by makeB2Fixture, so HOME=$TMPDIR puts .claude.json and
+    // .ocp-tui/ where two boots contend for them. Placed AFTER the loop above on purpose: put
+    // first, it would swallow the `if (false)` mutation (M-C) that the loop is there to catch,
+    // which is the very defect F3 of this PR's review was about. Its own row is M-E.
+    assert.throws(() => ltResolveHome({ HOME: _ltTmp() }, dir), /OUTSIDE|root ITSELF/,
+      "the harness temp root itself must be refused as HOME — it is shared by every concurrent test");
 
     assert.throws(() => ltResolveHome({ HOME: join(dir, "nope") }, dir), /does not exist/,
       "a non-existent HOME must be refused, not silently accepted — server.mjs would create it under a typo");
@@ -3203,9 +3266,11 @@ ltTest("integration (#396): a TUI turn writes its trust entry into the PINNED ho
   if (!LT_POSIX) return;
   const dir = ltMkdir(); const fake = ltFake(dir); const tmux = ltTuiTmux(dir);
   const pinned = join(dir, "home");                 // what ltResolveHome defaults to
-  // Deliberately NO `HOME:` in this env. That is the whole test: the seven CLAUDE_TUI_MODE boot
-  // sites on this tree pin no HOME, and before this change each of them rewrote the operator's
-  // live ~/.claude.json. A test that passed HOME would be asserting the fix it is meant to prove.
+  // Deliberately NO `HOME:` in this env. That is the whole test: the SIX hand-rolled
+  // CLAUDE_TUI_MODE boot sites on origin/main pin no HOME (see ltResolveHome's comment for the
+  // re-derivation, and for why the first count said seven), and before this change each of them
+  // rewrote the operator's live ~/.claude.json. A test that passed HOME would be asserting the
+  // fix it is meant to prove.
   // ltResolveHome creates the dir; seed a config INSIDE it before booting. This is what makes the
   // redirect observable rather than merely absent: `ensureTuiCwdTrusted` opens <home>/.claude.json
   // and RETURNS if it cannot be read (session.mjs — `catch { return; }`), so on a virgin scratch
@@ -3229,18 +3294,60 @@ ltTest("integration (#396): a TUI turn writes its trust entry into the PINNED ho
     assert.ok(tmux.calls().some(c => c.startsWith("new-session ")),
       `premise: a pane must have booted, so prepareTuiHome ran; got ${JSON.stringify(tmux.calls())}`);
 
-    // The TUI cwd was created under the PINNED home. TUI_CWD is `OCP_TUI_CWD || ${HOME}/.ocp-tui/work`
-    // (server.mjs), so this is the second path the pin closes and it is independent of the config write.
-    assert.ok(_ltExists(join(pinned, ".ocp-tui", "work")),
-      `the TUI cwd must be created under the pinned home (${pinned}), not under the operator's $HOME`);
+    // THERE IS DELIBERATELY NO `_ltExists(join(pinned, ".ocp-tui", "work"))` ASSERTION HERE, and
+    // its absence is the point (review of this PR, F3). One was, and it is DELETED rather than
+    // moved. It was broken by the same mutation as the headline claim below and it threw FIRST,
+    // so under BOTH mutations that can reach this test the body died on it and the claim in this
+    // test's own NAME never executed — AGENTS.md: "an assertion that never EXECUTED is
+    // indistinguishable from one that passed", and "a claim with no row of its own is unproven
+    // however green the suite is". Its comment also asserted the two were "independent", which
+    // the review measured as false; that sentence is the reason it survived a self-review.
+    //
+    // Reordering was the other option and it is the WRONG one here: it would only swap which of
+    // the two ships unproven. Deletion is right because the claim below IMPLIES this one, which
+    // was verified in lib/tui/session.mjs rather than assumed — `bootTuiPane` runs
+    // `if (!existsSync(cwd)) mkdirSync(cwd, { recursive: true })` and THEN prepareTuiHome →
+    // `ensureTuiCwdTrusted(home, cwd)`, whose only write is `j.projects[cwd]`. So every key in
+    // `trusted` below names a directory this very boot created, and asserting they ALL sit under
+    // `pinned` asserts that the created cwd did too. This is #405's shape: a whole-argv deepEqual
+    // REPLACING `!argv.includes(...)` rather than joining it.
+    // What is knowingly given up: the literal `.ocp-tui/work` path SHAPE. That is a server.mjs
+    // default this test never named in its title and does not own; #396 is about which HOME the
+    // write lands in, not about what the cwd is called.
+    //
+    // AND THE ORDERING FIX ALONE WAS NOT ENOUGH — recorded because the half-measure is the part a
+    // later reader will otherwise repeat. Deleting the cwd assertion moved M-A's red from it onto
+    // (f) "the seeded config must have been rewritten at all", which is the right assertion to
+    // report. But (f) and (g) are still MUTUAL under any mutation that moves HOME: the write lands
+    // in the ambient home, the seeded config stays "{}", (f) throws and (g) never runs. Ordering
+    // cannot separate them, because that mutation breaks both. So (g) needed a mutation that moves
+    // the CWD INDEPENDENTLY OF HOME, and there is one:
+    //
+    //   M-G — export OCP_TUI_CWD into the suite's own AMBIENT environment. ltBoot builds its child
+    //   env as `{ ...process.env, … }` and never strips it, and server.mjs resolves
+    //   `TUI_CWD = OCP_TUI_CWD || ${HOME}/.ocp-tui/work`. The HOME pin stays intact, so the trust
+    //   write still lands in the SEEDED config and (f) PASSES; the trusted cwd is outside the
+    //   pinned home, so (g) FAILS alone, by name. MEASURED: 1206 passed / 1 failed, the single red
+    //   being this test at `every trusted cwd must live under the pinned home`.
+    //
+    // Note what M-G is and is not. It is an AMBIENT-ENVIRONMENT perturbation, not a source
+    // mutation and not a fixture edit — the tree is byte-identical for that row. So it proves (g)
+    // catches a REAL, operator-triggerable leak; it does NOT prove (g) catches a regression in
+    // ltResolveHome, and no mutation of ltResolveHome can, because moving HOME moves both. The
+    // leak is worth stating plainly: THIS PIN CLOSES `HOME`, IT DOES NOT CLOSE `OCP_TUI_CWD`. An
+    // operator with that variable exported still gets bootTuiPane's mkdirSync firing at their own
+    // path on every TUI boot of this suite. Whether ltBoot should pin or strip it too is a
+    // separate change and is deliberately NOT made here.
 
-    // And the trust entry landed in the SEEDED config, in the pinned home — the write happened,
+    // The trust entry landed in the SEEDED config, in the pinned home — the write happened,
     // and it happened here. Before this pin the same write went to the operator's live config.
     //
     // Existence first, then read. Measured: with the pin redirected to a different scratch dir
-    // (mutation M1), reading straight through threw `ENOENT ... /home/.claude.json` — a real
+    // (the M-B shape), reading straight through threw `ENOENT ... /home/.claude.json` — a real
     // detection carrying a filesystem message instead of naming the defect. The assertion below
-    // is what a future reader needs to see when the pin moves.
+    // is what a future reader needs to see when the pin moves. It is a DIAGNOSTIC guard, not a
+    // claim: the file is created by this test's own seed, so no mutation of ltResolveHome can
+    // remove it, and it correctly has no mutation row of its own.
     const cfgPath = join(pinned, ".claude.json");
     assert.ok(_ltExists(cfgPath),
       `the seeded config vanished from the pinned home (${cfgPath}) — the boot used a different ` +
