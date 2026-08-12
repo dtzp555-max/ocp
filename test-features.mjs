@@ -16,6 +16,7 @@ import { join } from "node:path";
 import { pathToFileURL } from "node:url";
 import { execFileSync, spawnSync } from "node:child_process";
 import { homedir } from "node:os";
+import { AsyncLocalStorage } from "node:async_hooks";
 
 process.env.HOME = homedir(); // normalize HOME so homedir()-derived paths are stable across shells
 
@@ -24,133 +25,251 @@ process.env.HOME = homedir(); // normalize HOME so homedir()-derived paths are s
 // env var, and ESM hoisting meant the assignment ran after the import anyway. The redirect is
 // now real, and lives in test-env.mjs (imported above, before keys.mjs). This test proves it.
 
-let passed = 0;
-let failed = 0;
-// The NAME of every test that incremented `failed`, pushed at the same moment the counter moves.
-//
-// `failed` is one global counter, so `after.failed - before.failed` attributes every failure that
-// landed in the window to whoever happens to be reading it. Across an `await` that window is the
-// rest of the run, and #394 measured the cost: ONE unrelated failing synchronous test made the
-// #366-review-C async self-check go red as collateral — the one test guaranteed to fire in a red
-// run while carrying no information about what broke. Worse, it is POSITIONAL: a failure landing
-// after the reader's post-await resume (the first top-level `await` past the self-check) escapes
-// entirely, so whether a given mutation pays the tax depends on where its failure happens to land.
-//
-// A self-check that needs to know whether IT failed asks this ledger by name instead of
-// subtracting counters. Every `failed++` in this file goes through recordFailure() so the ledger
-// stays complete; `failedNames.length === failed` is the invariant, and it is asserted at the one
-// place the ledger is read rather than merely assumed.
-const failedNames = [];
-function recordFailure(name) { failed++; failedNames.push(name); }
-// Tests that did NOT run because a premise this platform cannot provide was absent. Counted and
-// named rather than folded into `passed`, because a skipped test and a passing one are the same
-// green tick otherwise — and #366's review found exactly that: its case-fold guard asserts a
-// property only reachable on a case-INSENSITIVE filesystem, CI is ubuntu-latest/ext4, and there
-// the test passed for a second reason while covering nothing. A green CI run must not be readable
-// as coverage the run did not provide.
-let skipped = 0;
-// Read the live counters. The #366 review's finding C was a MIScount, so its regression test has
-// to observe the same variables the summary prints rather than a copy.
-function _m366Counts() { return { passed, failed, skipped }; }
-
-// Pending promises from tests declared `async` but registered through the SYNC `test()` helper.
-// 44 tests in this file are written that way. Before this, `test()` called fn(), got a promise back,
-// and immediately printed ✓ and incremented `passed` — WITHOUT AWAITING IT. So for every async test:
-//   - ✓ meant "did not throw synchronously", NOT "passed";
-//   - a failed assertion escaped as an unhandled rejection, which crashes the process (CI still goes
-//     red on the non-zero exit) but is NOT counted, so the summary could print "N passed, 0 failed"
-//     and be wrong.
-// The suite's own headline number was therefore not evidence for any async test — including the
-// regression guards in this PR. Collected here and awaited before the summary prints.
-const pendingAsync = [];
-
-function test(name, fn) {
-  // #366 review, finding C: a body that skips must not ALSO be counted as passed.
-  //
-  // A SENTINEL, not a counter comparison. The first fix compared `skipped` across the body, which
-  // is race-free on the synchronous path but WRONG on the async one: that comparison is evaluated
-  // when the promise RESOLVES, and any unrelated test may have skipped in between, silently
-  // suppressing a passing async test's ✓ and under-counting `passed`. Reproduced in isolation
-  // before replacing it. A per-invocation sentinel compares nothing across time.
-  const skippedBefore = skipped;
-  try {
-    const r = fn();
-    if (r && typeof r.then === "function") {
-      // Async body: settle it before counting. Do NOT print ✓ yet.
-      pendingAsync.push(
-        r.then(
-          () => { passed++; console.log(`  ✓ ${name}`); },
-          (e) => {
-            if (e && e[TEST_SKIPPED]) return; // already counted by skipRemainingTest()
-            recordFailure(name); console.log(`  ✗ ${name}: ${e.message}`);
-          },
-        ),
-      );
-      return;
-    }
-    // Sync path only, where no other test can interleave: calling the TOP-LEVEL form from inside a
-    // body is misuse, and it is made LOUD rather than silently miscounted.
-    if (skipped > skippedBefore) {
-      recordFailure(name);
-      console.log(`  ✗ ${name}: called testSkipped() inside a test body — use skipRemainingTest(), ` +
-                  `which also aborts the body`);
-      return;
-    }
-    passed++;
-    console.log(`  ✓ ${name}`);
-  } catch (e) {
-    if (e && e[TEST_SKIPPED]) return; // already counted by skipRemainingTest()
-    recordFailure(name);
-    console.log(`  ✗ ${name}: ${e.message}`);
-  }
-}
-
-/**
- * Register a test as NOT RUN, with the reason. Never counts as passed.
- *
- * For a premise the current platform cannot supply — not for a test that is inconvenient. The
- * reason is mandatory and is printed, so `npm test`'s output says which coverage this run did not
- * provide instead of implying it did.
- *
- * TOP-LEVEL FORM. Call it in the `else` of the condition that decides whether the premise holds,
- * so `test()` is never invoked at all. From inside a test body use skipRemainingTest() instead —
- * this one does not abort the body, and `test()` reports that misuse as a failure.
- */
-function testSkipped(name, reason) {
-  skipped++;
-  console.log(`  ⊘ SKIP ${name} — ${reason}`);
-}
-
 // Marks the one Error that means "this test skipped" rather than "this test failed".
+//
+// MODULE-LEVEL, deliberately shared by every harness instance created below: a body registered on
+// one instance may be handed a skip helper bound to another (the #402 self-checks do exactly
+// that), and a per-instance symbol would make such a throw read as a failure.
 const TEST_SKIPPED = Symbol("ocp.test.skipped");
 
 /**
- * IN-BODY FORM: record the skip and abort the rest of the body. Works identically for sync and
- * async bodies, because `test()` recognises the sentinel in both its catch and its rejection
- * handler — and because nothing is compared across time, an unrelated skip elsewhere in the file
- * cannot affect this test's outcome.
+ * The suite's runner, as a FACTORY rather than a set of module-level bindings (#402).
+ *
+ * WHY A FACTORY. #402 needed regression tests for the runner's own verdicts, including the
+ * verdict "this body misused testSkipped()", which is reported as a FAILURE. Driving that against
+ * the live suite would make `npm test` exit 1 on a healthy tree, so a fixture has to run against
+ * an isolated set of counters. The alternative — a miniature re-implementation of test() inside
+ * the test — is exactly the shape AGENTS.md § "Testing discipline" forbids: it passes while the
+ * real runner is broken. A second INSTANCE of the same code is the real thing with its own ledger.
+ *
+ * `log` is injectable for the same reason. A fixture's synthetic `✗` and `⊘ SKIP` lines must not
+ * reach stdout: `.github/workflows/flake-hunt.yml:179` builds its failure histogram with
+ * `grep -h '✗' logs/*.log`, so a deliberately-failing fixture would show up there as a flake on a
+ * clean run. The self-checks collect the lines into an array instead — and then assert on them,
+ * which is how "the message stays accurate on all three runner paths" is proven rather than
+ * asserted.
  */
-function skipRemainingTest(name, reason) {
-  testSkipped(name, reason);
-  const e = new Error(`skipped: ${reason}`);
-  e[TEST_SKIPPED] = true;
-  throw e;
+function createHarness({ log = console.log } = {}) {
+  let passed = 0;
+  let failed = 0;
+  // The NAME of every test that incremented `failed`, pushed at the same moment the counter moves.
+  //
+  // `failed` is one counter, so `after.failed - before.failed` attributes every failure that
+  // landed in the window to whoever happens to be reading it. Across an `await` that window is the
+  // rest of the run, and #394 measured the cost: ONE unrelated failing synchronous test made the
+  // #366-review-C async self-check go red as collateral — the one test guaranteed to fire in a red
+  // run while carrying no information about what broke. Worse, it is POSITIONAL: a failure landing
+  // after the reader's post-await resume (the first top-level `await` past the self-check) escapes
+  // entirely, so whether a given mutation pays the tax depends on where its failure happens to land.
+  //
+  // A self-check that needs to know whether IT failed asks this ledger by name instead of
+  // subtracting counters. Every `failed++` goes through recordFailure() so the ledger stays
+  // complete; `failedNames.length === failed` is the invariant, and it is asserted at the one
+  // place the ledger is read rather than merely assumed.
+  const failedNames = [];
+  function recordFailure(name) { failed++; failedNames.push(name); }
+  // The symmetric counterpart, added by #402. `failedNames` closed "this test was counted as
+  // FAILED by someone else"; this closes "this test was counted as PASSED when it never ran its
+  // subject". The hole it plugs: #366 review C's async fixture skips via skipRemainingTest(), so
+  // it must settle through test()'s REJECTION handler. Had the fixture used the top-level
+  // testSkipped() instead, the body would return normally, settle through the RESOLVE handler,
+  // and be counted as passed — and every assertion in that self-check still held, because none of
+  // them could see a pass. Same discipline as above: every `passed++` goes through recordPass(),
+  // and `passedNames.length === passed` is asserted where the ledger is read.
+  const passedNames = [];
+  function recordPass(name) { passed++; passedNames.push(name); }
+  // Tests that did NOT run because a premise this platform cannot provide was absent. Counted and
+  // named rather than folded into `passed`, because a skipped test and a passing one are the same
+  // green tick otherwise — and #366's review found exactly that: its case-fold guard asserts a
+  // property only reachable on a case-INSENSITIVE filesystem, CI is ubuntu-latest/ext4, and there
+  // the test passed for a second reason while covering nothing. A green CI run must not be readable
+  // as coverage the run did not provide.
+  let skipped = 0;
+  // Read the live counters. The #366 review's finding C was a MIScount, so its regression test has
+  // to observe the same variables the summary prints rather than a copy.
+  function counts() { return { passed, failed, skipped }; }
+
+  // Which test body is currently executing, if any — INCLUDING after an `await`, which is the
+  // whole reason this is AsyncLocalStorage and not a plain variable (#402 part 2). Per-instance,
+  // not module-level: a self-check calling h.testSkipped() from inside an OUTER test's body must
+  // be attributed to no body at all on `h`, and a shared store would charge it to the outer test.
+  //
+  // WHAT THIS DOES NOT SEE, stated from measurement rather than from reasoning, because #415's
+  // review found the first version of this note asserting the opposite of what the code does.
+  // The store survives into every continuation, so attribution is not the limit — TIMING is: the
+  // verdict is read once, and anything recorded after that read is not in it.
+  //
+  //   sync body, detached microtask                 -> NOT seen (verdict already read)
+  //   async body, detached microtask, no further await -> SEEN (microtasks drain before settle)
+  //   async body, detached setTimeout past settle   -> NOT seen
+  //   async body that AWAITS the continuation       -> SEEN
+  //
+  // So "a detached promise is missed" is false as a blanket statement; it depends on whether the
+  // continuation runs before the runner reads the verdict. The same timing governs the swallowed-
+  // skip guard below, since both read the same context at the same moment.
+  const runningBody = new AsyncLocalStorage();
+
+  // The single funnel for recording a skip. Both skip helpers reach it; only the TOP-LEVEL
+  // testSkipped() additionally consults `runningBody` for MISUSE, so skipRemainingTest()'s
+  // exemption from that check is structural rather than a flag set and cleared around a call that
+  // throws.
+  //
+  // It also records, on the running body, THAT a skip happened. That second counter is what makes
+  // the swallowed-sentinel case reachable (see _recordSwallowedSkip), and it lives here rather
+  // than in either public helper precisely because this is the funnel: a future skip helper cannot
+  // forget to do it. Outside any body `getStore()` is undefined and nothing is recorded, which is
+  // what keeps a legitimate top-level testSkipped() — and an unrelated skip landing while some
+  // other test is in flight — inert.
+  function _recordSkip(name, reason) {
+    const body = runningBody.getStore();
+    if (body) body.skips++;
+    skipped++;
+    log(`  ⊘ SKIP ${name} — ${reason}`);
+  }
+
+  // The misuse verdict, shared by all three runner paths so the message cannot drift between them.
+  function _recordMisuse(name) {
+    recordFailure(name);
+    log(`  ✗ ${name}: called testSkipped() inside a test body — use skipRemainingTest(), ` +
+        `which also aborts the body`);
+  }
+
+  // A body that recorded a skip and then RETURNED NORMALLY — it caught skipRemainingTest()'s
+  // abort instead of letting it propagate. Independent review of #415 found this, and it is the
+  // same "skipped AND passed" pair the rest of this file exists to prevent, so it is a failure and
+  // not a warning. Measured on all three constructions before this arm existed:
+  //
+  //   origin/main            failed=["swallower"]   <- its counter guard caught it
+  //   #415 as first pushed   passed=["swallower"]   <- skipped AND passed, on all THREE runners
+  //   #415 + this arm        failed=["swallower"]
+  //
+  // That middle row is why "the broader check implies the narrower one" was wrong here: in this
+  // one corner the counter comparison saw something the context check did not, because the context
+  // check only ever looked for MISUSE. Reaching the normal-completion path with a skip recorded is
+  // the missing half, and it is detected here rather than described in a Known-gaps list.
+  function _recordSwallowedSkip(name) {
+    recordFailure(name);
+    log(`  ✗ ${name}: recorded a skip and then CONTINUED — skipRemainingTest()'s abort was caught ` +
+        `by this body, so it would be counted as skipped AND passed`);
+  }
+
+  // Pending promises from tests declared `async` but registered through the SYNC `test()` helper.
+  // 44 tests in this file are written that way. Before this, `test()` called fn(), got a promise back,
+  // and immediately printed ✓ and incremented `passed` — WITHOUT AWAITING IT. So for every async test:
+  //   - ✓ meant "did not throw synchronously", NOT "passed";
+  //   - a failed assertion escaped as an unhandled rejection, which crashes the process (CI still goes
+  //     red on the non-zero exit) but is NOT counted, so the summary could print "N passed, 0 failed"
+  //     and be wrong.
+  // The suite's own headline number was therefore not evidence for any async test — including the
+  // regression guards in this PR. Collected here and awaited before the summary prints.
+  const pendingAsync = [];
+
+  function test(name, fn) {
+    // #366 review, finding C: a body that skips must not ALSO be counted as passed.
+    //
+    // A SENTINEL, not a counter comparison, for the skip itself. The first fix compared `skipped`
+    // across the body, which is race-free on the synchronous path but WRONG on the async one: that
+    // comparison is evaluated when the promise RESOLVES, and any unrelated test may have skipped in
+    // between, silently suppressing a passing async test's ✓ and under-counting `passed`.
+    // Reproduced in isolation before replacing it, and re-measured for #402.
+    //
+    // MISUSE detection (#402 part 2) is a per-invocation AsyncLocalStorage context, for the same
+    // reason. The pre-#402 guard `if (skipped > skippedBefore)` covered the SYNC path only; the
+    // resolve handler and testAsync() had no counterpart at all, so a testSkipped() call inside an
+    // async body was counted as skipped AND as passed — the exact pair the facility exists to
+    // prevent. Measured: 2 of 2 forms (before-await and after-await) slipped through.
+    //
+    // The counter comparison was REPLACED here, not joined by this one. Keeping both would leave
+    // this check permanently unprovable on the sync path: the narrow guard fires first, so every
+    // mutation aimed at the broad one dies before reaching it and the mutation table records a
+    // kill that belongs to the other assertion.
+    const body = { misuse: 0, skips: 0 };
+    try {
+      const r = runningBody.run(body, fn);
+      if (r && typeof r.then === "function") {
+        // Async body: settle it before counting. Do NOT print ✓ yet.
+        pendingAsync.push(
+          r.then(
+            () => {
+              if (body.misuse > 0) { _recordMisuse(name); return; }
+              if (body.skips > 0) { _recordSwallowedSkip(name); return; }
+              recordPass(name); log(`  ✓ ${name}`);
+            },
+            (e) => {
+              if (e && e[TEST_SKIPPED]) return; // already counted by skipRemainingTest()
+              recordFailure(name); log(`  ✗ ${name}: ${e.message}`);
+            },
+          ),
+        );
+        return;
+      }
+      if (body.misuse > 0) { _recordMisuse(name); return; }
+      if (body.skips > 0) { _recordSwallowedSkip(name); return; }
+      recordPass(name);
+      log(`  ✓ ${name}`);
+    } catch (e) {
+      if (e && e[TEST_SKIPPED]) return; // already counted by skipRemainingTest()
+      recordFailure(name);
+      log(`  ✗ ${name}: ${e.message}`);
+    }
+  }
+
+  /**
+   * Register a test as NOT RUN, with the reason. Never counts as passed.
+   *
+   * For a premise the current platform cannot supply — not for a test that is inconvenient. The
+   * reason is mandatory and is printed, so `npm test`'s output says which coverage this run did not
+   * provide instead of implying it did.
+   *
+   * TOP-LEVEL FORM. Call it in the `else` of the condition that decides whether the premise holds,
+   * so `test()` is never invoked at all. From inside a test body use skipRemainingTest() instead —
+   * this one does not abort the body, and every runner reports that misuse as a failure.
+   */
+  function testSkipped(name, reason) {
+    const body = runningBody.getStore();
+    if (body) body.misuse++;
+    _recordSkip(name, reason);
+  }
+
+  /**
+   * IN-BODY FORM: record the skip and abort the rest of the body. Works identically for sync and
+   * async bodies, because the runners recognise the sentinel in both their catch and their
+   * rejection handler — and because nothing is compared across time, an unrelated skip elsewhere
+   * in the file cannot affect this test's outcome.
+   */
+  function skipRemainingTest(name, reason) {
+    _recordSkip(name, reason);
+    const e = new Error(`skipped: ${reason}`);
+    e[TEST_SKIPPED] = true;
+    throw e;
+  }
+
+  async function testAsync(name, fn) {
+    const body = { misuse: 0, skips: 0 };
+    try {
+      await runningBody.run(body, fn);
+      if (body.misuse > 0) { _recordMisuse(name); return; }
+      if (body.skips > 0) { _recordSwallowedSkip(name); return; }
+      recordPass(name);
+      log(`  ✓ ${name}`);
+    } catch (e) {
+      // Same sentinel as test(): a body that called skipRemainingTest() is already counted as
+      // skipped and must not also be counted as failed. Both runners honour it, so a caller does
+      // not have to know which one it is under.
+      if (e && e[TEST_SKIPPED]) return;
+      recordFailure(name);
+      log(`  ✗ ${name}: ${e.message}`);
+    }
+  }
+
+  return { test, testAsync, testSkipped, skipRemainingTest, counts,
+           passedNames, failedNames, pendingAsync };
 }
 
-async function testAsync(name, fn) {
-  try {
-    await fn();
-    passed++;
-    console.log(`  ✓ ${name}`);
-  } catch (e) {
-    // Same sentinel as test(): a body that called skipRemainingTest() is already counted as
-    // skipped and must not also be counted as failed. Both runners honour it, so a caller does
-    // not have to know which one it is under.
-    if (e && e[TEST_SKIPPED]) return;
-    recordFailure(name);
-    console.log(`  ✗ ${name}: ${e.message}`);
-  }
-}
+// The one instance the suite itself runs on. Everything below binds to it.
+const _harness = createHarness();
+const { test, testAsync, testSkipped, skipRemainingTest, passedNames, failedNames, pendingAsync } = _harness;
+const _m366Counts = _harness.counts;
 
 console.log("\n=== OCP Feature Tests (Quota + Cache) ===\n");
 
@@ -528,16 +647,16 @@ test("D3: chunked replay uses Array.from — multibyte codepoints stay intact", 
 });
 
 // ── PR-B Singleflight tests (async) ──
-async function asyncTest(name, fn) {
-  try {
-    await fn();
-    passed++;
-    console.log(`  ✓ ${name}`);
-  } catch (e) {
-    recordFailure(name);
-    console.log(`  ✗ ${name}: ${e.message}`);
-  }
-}
+//
+// #402 found a FOURTH runner here, where the brief for that issue expected three. `asyncTest` was
+// a verbatim copy of testAsync() minus its TEST_SKIPPED arm, and it carried the fourth `passed++`
+// in the file. The ledger invariant `passedNames.length === passed` only means anything if it is
+// total, so every increment has to route through recordPass() — and wiring a duplicate runner up
+// to the ledger and the misuse guard would just create a fourth place for them to drift apart.
+// Aliasing removes the site instead. Behaviour for all 34 call sites below is unchanged: none of
+// them throws the skip sentinel and none calls testSkipped(), so the two arms testAsync() has and
+// this copy lacked were unreachable from here.
+const asyncTest = testAsync;
 
 async function runSingleflightTests() {
   console.log("\nPR-B Singleflight:");
@@ -1357,6 +1476,22 @@ console.log("\nInstall-marker type check (#366):");
   // `asyncOwn.length` premise proves the body registered, the `skipped` delta proves it ran and
   // skipped, and the `await` proves its settle handler has finished — so "no failure recorded
   // under this name" cannot be satisfied by a run in which the self-check never executed.
+  //
+  // #402 ADDS THE OTHER HALF. Everything above says nothing about `passed`, and that was a hole,
+  // not an omission: if this fixture's body called the top-level testSkipped() instead of
+  // skipRemainingTest(), it would return NORMALLY, settle through test()'s RESOLVE handler, be
+  // counted as passed, print ✓ — and all four assertions below would still hold, because none of
+  // them can see a pass. The sentinel path, which is this test's entire subject, would never run.
+  // Measured on af7c416 and on #401's head: green either way. The `passedNames` ledger is the
+  // symmetric counterpart of `failedNames`, and the negative over it is asked LAST, after every
+  // premise above has already established that the fixture ran.
+  //
+  // The completeness premise `passedNames.length === passed` carries the same caveat #402 records
+  // for its `failed` twin: it is read post-`await`, so it can only catch a bare `passed++` landing
+  // BEFORE the resume. That is complete exactly where it needs to be — the site whose omission
+  // would matter is test()'s async RESOLVE handler, which increments during the inner promise's
+  // settle, structurally before `await Promise.all(asyncOwn)` returns. A future widening should
+  // preserve that reasoning rather than assume the guard is total.
   const asyncBefore = _m366Counts();
   const asyncFrom = pendingAsync.length;
   // ONE string, used both to register the test and to interrogate the ledger, so the two cannot
@@ -1368,21 +1503,285 @@ console.log("\nInstall-marker type check (#366):");
   });
   const asyncOwn = pendingAsync.slice(asyncFrom);          // this test's promise, and no other
   const asyncSkippedSync = _m366Counts().skipped;          // read BEFORE any await — attributable
-  testAsync("#366 review C: an ASYNC body that skips is counted as skipped, never as failed", async () => {
+  testAsync("#366 review C: an ASYNC body that skips is counted as skipped — never as failed, never as passed", async () => {
     assert.equal(asyncOwn.length, 1,
       "premise: the async body must have registered exactly one pending promise");
     assert.equal(asyncSkippedSync - asyncBefore.skipped, 1,
       "the async skip must be counted exactly once, synchronously with the body's throw");
     await Promise.all(asyncOwn);
-    assert.equal(failedNames.length, failed,
+    assert.equal(failedNames.length, _m366Counts().failed,
       "premise: the failure ledger must account for EVERY counted failure — a `failed++` written " +
       "without a matching recordFailure() would turn the check below into a negative over an " +
       "incomplete list, which passes for the wrong reason");
     assert.deepEqual(failedNames.filter(n => n === asyncOwnName), [],
       "REGRESSION: an async skip was counted as FAILED — the TEST_SKIPPED sentinel is not being " +
       "recognised in test()'s rejection handler");
+    assert.equal(passedNames.length, _m366Counts().passed,
+      "premise: the PASS ledger must account for EVERY counted pass — a `passed++` written " +
+      "without a matching recordPass() would turn the check below into a negative over an " +
+      "incomplete list, which passes for the wrong reason (#402)");
+    assert.deepEqual(passedNames.filter(n => n === asyncOwnName), [],
+      "REGRESSION (#402): the skipping async body was counted as PASSED — it settled through " +
+      "test()'s RESOLVE handler instead of its rejection handler, so the sentinel path this test " +
+      "exists to prove was never exercised");
   });
 }
+
+// ── #402 part 2: testSkipped() misuse, on every runner path ──────────────────────────────────
+//
+// The block above proves things about the LIVE harness, which is the right instance for an
+// end-to-end claim. These prove things about the runner's VERDICTS, one of which is a failure, so
+// they run against isolated instances of the same code (createHarness, see its comment). Nothing
+// here touches the suite's own counters, and every synthetic `✓ / ✗ / ⊘ SKIP` line is collected
+// rather than printed — flake-hunt.yml:179 histograms stdout `✗` lines and would read a
+// deliberately-failing fixture as a flake.
+//
+// WHAT WAS BROKEN. `test()`'s sync path caught "the body called the top-level testSkipped()" by
+// comparing the skip counter across the body. The async resolve handler had no counterpart and
+// neither did testAsync(), so an async body that misused it was counted as skipped AND as passed.
+// Measured before writing any of this: 2 of 2 forms slipped through (before-await, after-await),
+// while the sync control was caught.
+//
+// WHY NOT JUST COPY THE COUNTER COMPARISON. Because it is wrong on the async path, and that was
+// re-measured rather than inherited from the comment at the top of this file: a harness whose
+// resolve handler compares `skipped` against a pre-body snapshot FALSE-ACCUSES an innocent async
+// test when any unrelated skip lands while it is in flight. The "(the Q2 regression)" test below
+// is the standing guard for that, and the one to break first if this is ever "simplified".
+// Measured on the real suite, not argued: wiring that comparison into the resolve handler turns
+// 1214/0 into 1193/21 — the guard itself plus NINETEEN innocent async `doctor` tests that merely
+// happened to be in flight when the two synthetic #366 skips landed.
+//
+// Each claim gets its OWN registration. One mutation reddening a shared body would leave the
+// second claim in it unproven, however green the suite is.
+console.log("\nHarness misuse accounting (#402):");
+
+// A fresh runner plus the lines it emitted. `lines` is asserted on, not grepped for source text:
+// these are the harness's own output, which is the interface an operator reads.
+function _h402() {
+  const lines = [];
+  return { h: createHarness({ log: (s) => lines.push(s) }), lines };
+}
+// Asserted as a LITERAL, never against the constant the harness built it from — comparing output
+// to the expression it came from is self-referential and survives the arms being swapped.
+const _H402_MISUSE = "called testSkipped() inside a test body — use skipRemainingTest(), which also aborts the body";
+
+test("#402: testSkipped() misused in a SYNC body is still reported as misuse — the guard that was REPLACED, not joined", () => {
+  // The pre-#402 sync guard (`if (skipped > skippedBefore)`) is gone, so this path's coverage is
+  // no longer a free rider on it. Keeping both would have made the context check unprovable here:
+  // the narrow guard fires first, so every mutation aimed at the broad one dies before reaching
+  // it and the table records a kill belonging to the other assertion.
+  //
+  // READ THIS BEFORE "SIMPLIFYING" THE MESSAGE ASSERTION AT THE BOTTOM OF THIS BODY. Since #415's
+  // F1 arm landed, a misused testSkipped() sets BOTH `misuse` and `skips`, so deleting the misuse
+  // arm still produces a failure — just with the swallowed-abort message instead. Every other
+  // assertion here (skip counted, not passed, charged by name) therefore still holds under that
+  // mutation, and the ENTIRE proof that the misuse arm is reachable at all now rests on the one
+  // string comparison below. Measured: M3 reddens exactly this test, and only via that assertion.
+  // Weaken it to "some ✗ was emitted" and the misuse arm becomes unprovable on this path.
+  const { h, lines } = _h402();
+  h.test("fixture", () => { h.testSkipped("inner", "synthetic: the misuse under test"); });
+  assert.equal(h.counts().skipped, 1, "control: the fixture really did call testSkipped()");
+  assert.deepEqual(h.passedNames, [],
+    "REGRESSION: a sync body that misused testSkipped() was counted as PASSED");
+  assert.deepEqual(h.failedNames, ["fixture"], "the misuse is charged to the misusing test, by name");
+  assert.deepEqual(lines.filter(l => l.startsWith("  ✗ ")), [`  ✗ fixture: ${_H402_MISUSE}`],
+    `got ${JSON.stringify(lines)}`);
+});
+
+test("#402: testSkipped() misused BEFORE an await in an async body is reported as misuse, not as passed", async () => {
+  const { h, lines } = _h402();
+  h.test("fixture", async () => { h.testSkipped("inner", "synthetic: the misuse under test"); });
+  assert.equal(h.pendingAsync.length, 1, "premise: the async body must have registered exactly one promise");
+  await Promise.all(h.pendingAsync);
+  assert.equal(h.counts().skipped, 1,
+    "control: the fixture really did call testSkipped() — without this the assertions below hold vacuously");
+  assert.deepEqual(h.passedNames, [],
+    "REGRESSION: an async body that misused testSkipped() was counted as PASSED — skipped AND passed, " +
+    "the exact pair the skip facility exists to prevent");
+  assert.deepEqual(h.failedNames, ["fixture"],
+    "the misuse must be reported as a failure, under the misusing test's own name");
+  assert.deepEqual(lines.filter(l => l.startsWith("  ✗ ")), [`  ✗ fixture: ${_H402_MISUSE}`],
+    `the async path's message must name the fix, exactly as the sync path's does; got ${JSON.stringify(lines)}`);
+});
+
+test("#402: testSkipped() misused AFTER an await is attributed to the body that called it, not to whoever is running at settle time", async () => {
+  const { h, lines } = _h402();
+  h.test("fixture", async () => {
+    await new Promise(r => setTimeout(r, 5));
+    h.testSkipped("inner", "synthetic: the post-await form, which a plain variable cannot attribute");
+  });
+  assert.equal(h.pendingAsync.length, 1, "premise: the async body must have registered exactly one promise");
+  await Promise.all(h.pendingAsync);
+  assert.equal(h.counts().skipped, 1, "control: the fixture really did call testSkipped()");
+  assert.deepEqual(h.passedNames, [],
+    "REGRESSION: the post-await misuse was counted as PASSED — the context did not survive the await");
+  assert.deepEqual(h.failedNames, ["fixture"], "and it is charged to the fixture, by name");
+  assert.deepEqual(lines.filter(l => l.startsWith("  ✗ ")), [`  ✗ fixture: ${_H402_MISUSE}`],
+    `got ${JSON.stringify(lines)}`);
+});
+
+test("#402: testAsync() reports the same misuse the same way — the third runner, swept with the other two", async () => {
+  const { h, lines } = _h402();
+  await h.testAsync("fixture", async () => {
+    await new Promise(r => setTimeout(r, 5));
+    h.testSkipped("inner", "synthetic: testAsync had no misuse guard at all before #402");
+  });
+  assert.equal(h.counts().skipped, 1, "control: the fixture really did call testSkipped()");
+  assert.deepEqual(h.passedNames, [], "REGRESSION: testAsync counted a misusing body as PASSED");
+  assert.deepEqual(h.failedNames, ["fixture"], "and it is charged to the fixture, by name");
+  assert.deepEqual(lines.filter(l => l.startsWith("  ✗ ")), [`  ✗ fixture: ${_H402_MISUSE}`],
+    `testAsync's message must not drift from test()'s; got ${JSON.stringify(lines)}`);
+});
+
+test("#402 (the Q2 regression): an unrelated skip landing while an INNOCENT async test is in flight must not accuse it", async () => {
+  // THE REASON THE SYNC GUARD WAS NOT COPIED. Break this one and you have reintroduced the race
+  // the top-of-file comment warns about — a passing async test silently reported as misuse
+  // because somebody else skipped during its await.
+  const { h, lines } = _h402();
+  h.test("innocent", async () => { await new Promise(r => setTimeout(r, 10)); });
+  h.testSkipped("unrelated", "synthetic: lands at top level while `innocent` is still in flight");
+  assert.equal(h.counts().skipped, 1,
+    "control: the unrelated skip really did land inside the innocent test's window — otherwise this proves nothing");
+  await Promise.all(h.pendingAsync);
+  assert.deepEqual(h.passedNames, ["innocent"],
+    "REGRESSION: an innocent async test was accused because an unrelated skip landed during its await");
+  assert.deepEqual(h.failedNames, [], "and nothing was recorded as failed");
+  assert.deepEqual(lines.filter(l => l.startsWith("  ✗ ")), [], `no ✗ may be emitted; got ${JSON.stringify(lines)}`);
+});
+
+test("#402: a TOP-LEVEL testSkipped() — outside any test body — is not misuse", () => {
+  // The documented form. If this reddens, every legitimate platform skip in this file has become
+  // a failure, which is a strictly worse outcome than the hole #402 closed.
+  const { h, lines } = _h402();
+  h.testSkipped("top-level", "synthetic: the documented form, called with no body running");
+  assert.equal(h.counts().skipped, 1, "the skip is counted");
+  assert.deepEqual(h.failedNames, [],
+    "REGRESSION: the documented top-level form was reported as misuse");
+  assert.deepEqual(h.passedNames, [], "and it is not a pass either");
+  assert.deepEqual(lines, ["  ⊘ SKIP top-level — synthetic: the documented form, called with no body running"],
+    `got ${JSON.stringify(lines)}`);
+});
+
+test("#402: skipRemainingTest() in a SYNC body stays a skip — not misuse, not passed", () => {
+  const { h, lines } = _h402();
+  h.test("fixture", () => {
+    h.skipRemainingTest("inner", "synthetic: the in-body form, whose abort must propagate");
+    throw new Error("unreachable: skipRemainingTest must abort the body");
+  });
+  assert.equal(h.counts().skipped, 1, "control: the skip was recorded");
+  // Says only what this assertion can see. An earlier revision claimed the exemption is
+  // "STRUCTURAL, not a flag set and cleared" — but an empty failure ledger is produced by BOTH
+  // constructions, so the assertion could not discriminate them and the message was asserting a
+  // property it had not measured. Found by independent review of #415.
+  assert.deepEqual(h.failedNames, [],
+    "REGRESSION: a body whose skipRemainingTest() abort propagated normally was recorded as a " +
+    "failure — a skip is not a failure");
+  assert.deepEqual(h.passedNames, [], "and a skipping body is still not a pass");
+  assert.deepEqual(lines.filter(l => l.startsWith("  ✗ ") || l.startsWith("  ✓ ")), [],
+    `no verdict line may be emitted for a skip; got ${JSON.stringify(lines)}`);
+});
+
+// ── #415 review, F1: the swallowed sentinel ───────────────────────────────────────────────────
+//
+// A body that calls skipRemainingTest() and CATCHES its abort returns normally, so it reaches the
+// runner's normal-completion path with a skip already counted. As #415 was first pushed that path
+// counted it as PASSED — skipped AND passed, the exact pair this whole facility exists to prevent
+// — on all THREE runners. `origin/main`'s counter comparison caught it, which is the one corner
+// where the check this PR REPLACED saw something the replacement did not.
+//
+// The three shapes are separate registrations because they are three different code paths
+// (test() sync, test() resolve handler, testAsync()) and one mutation must not be able to hide
+// two of them.
+//
+// Each asserts the swallow-specific MESSAGE, not merely that something failed. That is deliberate:
+// reverting skipRemainingTest()'s structural bypass ALSO makes these bodies fail, but as MISUSE,
+// with the other message. Asserting the message is what makes these tests discriminate the two
+// constructions — and it is what finally gives that bypass a killing mutation row.
+const _H402_SWALLOW = "recorded a skip and then CONTINUED — skipRemainingTest()'s abort was caught by this body, so it would be counted as skipped AND passed";
+
+test("#415 F1: a SYNC body that swallows skipRemainingTest()'s abort is reported, not counted as passed", () => {
+  const { h, lines } = _h402();
+  h.test("swallower", () => { try { h.skipRemainingTest("inner", "synthetic"); } catch { /* swallowed */ } });
+  assert.equal(h.counts().skipped, 1, "control: the skip really was recorded before the body continued");
+  assert.deepEqual(h.passedNames, [],
+    "REGRESSION (#415 F1): a body that recorded a skip and then continued was counted as PASSED — " +
+    "skipped AND passed");
+  assert.deepEqual(h.failedNames, ["swallower"], "and it is charged to the swallowing test, by name");
+  assert.deepEqual(lines.filter(l => l.startsWith("  ✗ ")), [`  ✗ swallower: ${_H402_SWALLOW}`],
+    `the verdict must name the swallowed abort, not misuse; got ${JSON.stringify(lines)}`);
+});
+
+test("#415 F1: an ASYNC body that swallows the abort is reported at settle, not counted as passed", async () => {
+  const { h, lines } = _h402();
+  h.test("swallower", async () => {
+    await new Promise(r => setTimeout(r, 5));
+    try { h.skipRemainingTest("inner", "synthetic"); } catch { /* swallowed */ }
+  });
+  assert.equal(h.pendingAsync.length, 1, "premise: the async body registered exactly one promise");
+  await Promise.all(h.pendingAsync);
+  assert.equal(h.counts().skipped, 1, "control: the skip really was recorded");
+  assert.deepEqual(h.passedNames, [], "REGRESSION (#415 F1): the async swallower was counted as PASSED");
+  assert.deepEqual(h.failedNames, ["swallower"], "and it is charged by name");
+  assert.deepEqual(lines.filter(l => l.startsWith("  ✗ ")), [`  ✗ swallower: ${_H402_SWALLOW}`],
+    `got ${JSON.stringify(lines)}`);
+});
+
+test("#415 F1: testAsync() reports a swallowed abort the same way — the third runner again", async () => {
+  const { h, lines } = _h402();
+  await h.testAsync("swallower", async () => {
+    try { h.skipRemainingTest("inner", "synthetic"); } catch { /* swallowed */ }
+  });
+  assert.equal(h.counts().skipped, 1, "control: the skip really was recorded");
+  assert.deepEqual(h.passedNames, [], "REGRESSION (#415 F1): testAsync counted the swallower as PASSED");
+  assert.deepEqual(h.failedNames, ["swallower"], "and it is charged by name");
+  assert.deepEqual(lines.filter(l => l.startsWith("  ✗ ")), [`  ✗ swallower: ${_H402_SWALLOW}`],
+    `testAsync's message must not drift from test()'s; got ${JSON.stringify(lines)}`);
+});
+
+test("#402: skipRemainingTest() in an ASYNC body stays a skip — not misuse, not passed", async () => {
+  const { h, lines } = _h402();
+  h.test("fixture", async () => {
+    await new Promise(r => setTimeout(r, 5));
+    h.skipRemainingTest("inner", "synthetic: post-await, where the sentinel travels via the rejection handler");
+    throw new Error("unreachable: skipRemainingTest must abort the body");
+  });
+  assert.equal(h.pendingAsync.length, 1, "premise: the async body registered exactly one promise");
+  await Promise.all(h.pendingAsync);
+  assert.equal(h.counts().skipped, 1, "control: the skip was recorded");
+  assert.deepEqual(h.failedNames, [], "REGRESSION: an async skipRemainingTest() was counted as failed or as misuse");
+  assert.deepEqual(h.passedNames, [], "and not as passed");
+  assert.deepEqual(lines.filter(l => l.startsWith("  ✗ ") || l.startsWith("  ✓ ")), [],
+    `no verdict line may be emitted for a skip; got ${JSON.stringify(lines)}`);
+});
+
+test("#402: every counter the harness prints is accounted for by name — passedNames and failedNames are TOTAL", async () => {
+  // The completeness invariant, driven through all four outcomes at once. The self-check in the
+  // #366 block asserts the same property of the LIVE harness at the one point it is read; this
+  // one proves the property survives a run that exercises every arm, including the two arms a
+  // healthy suite never takes.
+  const { h } = _h402();
+  h.test("sync-pass", () => {});
+  h.test("sync-fail", () => { throw new Error("synthetic"); });
+  h.test("async-pass", async () => {});
+  h.test("async-fail", async () => { throw new Error("synthetic"); });
+  h.test("misuse", () => { h.testSkipped("inner", "synthetic"); });
+  h.test("skip", () => { h.skipRemainingTest("inner", "synthetic"); });
+  await h.testAsync("testAsync-pass", async () => {});
+  await Promise.all(h.pendingAsync);
+  const c = h.counts();
+  assert.equal(h.passedNames.length, c.passed,
+    `REGRESSION: a passed++ that did not go through recordPass() — ${c.passed} counted, ${h.passedNames.length} named`);
+  assert.equal(h.failedNames.length, c.failed,
+    `REGRESSION: a failed++ that did not go through recordFailure() — ${c.failed} counted, ${h.failedNames.length} named`);
+  // Control: the ledgers are non-trivially populated, so the two equalities above are not 0 === 0.
+  // Sorted, deliberately — the interleaving of sync recording with microtask settle order is not
+  // this test's claim, and pinning it would make the test fail for a reason it does not care about.
+  assert.deepEqual(h.passedNames.slice().sort(), ["async-pass", "sync-pass", "testAsync-pass"],
+    "control: the pass ledger holds every passing arm — sync, async-via-test(), and testAsync()");
+  assert.deepEqual(h.failedNames.slice().sort(), ["async-fail", "misuse", "sync-fail"],
+    "control: the failure ledger holds both real failures and the misuse verdict");
+  assert.equal(c.skipped, 2, "control: the misuse and the in-body skip both counted as skips");
+});
 
 
 test("#366 severity: on the DOCUMENTED default layout, $HOME is ONE stray file away from rm -rf", () => {
@@ -23968,6 +24367,7 @@ runAsyncTests().then(() => Promise.all(pendingAsync)).then(() => {
   // The skip count goes on its OWN line. That restores the invariant those greps were written
   // against instead of teaching three call sites a new format, and it is why this must not be
   // "fixed" by editing flake-hunt.yml.
+  const { passed, failed, skipped } = _m366Counts();
   console.log(`\n=== Results: ${passed} passed, ${failed} failed ===\n`);
   if (skipped) {
     console.log(`=== Skipped: ${skipped} ===`);
