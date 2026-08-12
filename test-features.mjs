@@ -8310,12 +8310,19 @@ ltTest("integration (#365): a stream that ends mid-character — stdout truncati
 //
 // A tracer that has never been shown to distinguish the cases cannot be trusted when it says
 // which one occurred, so the instrument above is calibrated against staged faults BEFORE any
-// field capture is read. Four controls, four DIFFERENT named diagnostics:
+// field capture is read. SEVEN controls, each pinning a DIFFERENT named diagnostic — count them
+// from the ltTest registrations below, not from this list, which is the artifact and not the prose:
 //
 //   A  parent blocked, burning CPU     -> ZOMBIE-UNREAPED + STALL-CPU-BOUND
 //   B  parent blocked, consuming none  -> ZOMBIE-UNREAPED + STALL-NO-CPU
 //   C  grandchild holding stdout       -> REAPED-GONE     + LOOP-LIVE
 //   D  child genuinely still running   -> ALIVE           + LOOP-LIVE   (through the real ltDrain)
+//   E  drain overran its budget and SUCCEEDED -> the face the reproduction actually produced
+//   F  child closed WHILE the drain waited    -> CLOSED-BEFORE-PROBE
+//   G  drain was never waiting on a child     -> NO-CHILD-WAS-OPEN
+//
+// A-D calibrate the tracer and the probe; E-G pin the drain-outcome NAMES, which is where an
+// earlier revision printed 'positively excludes both worlds' and 'we know nothing' identically.
 //
 // A and B are the two readings that "starvation" conflates and that have different fixes; C is
 // the pipe-holder world the thread refuted for server.mjs children but which remains the correct
@@ -8325,8 +8332,16 @@ ltTest("integration (#365): a stream that ends mid-character — stdout truncati
 // A and B MUST call it directly: the zombie window is only deterministic while no loop iteration
 // intervenes between the kill and the observation, and `await` anywhere in between hands libuv
 // the poll phase in which it reaps. That is not an artefact of the controls — it is the same
-// ordering that decides what a field capture sees, and it is why a REAPED-GONE result in the
-// field is not by itself the pipe-holder world (see the diagnosis string, which says so).
+// ordering that decides what a field capture sees.
+//
+// AN EARLIER REVISION CONTINUED: "...and it is why a REAPED-GONE result in the field is not by
+// itself the pipe-holder world (see the diagnosis string, which says so)." BOTH HALVES OF THAT
+// WERE WRONG and it is retracted here rather than deleted. [measured, #419 review, 3+2 runs]
+// 'close' fires in the SAME TURN as 'exit' -- turns with exit delivered but closed=false: ZERO --
+// and 'close' is what DELETES the registry row. So the reschedule world leaves an EMPTY REGISTRY,
+// which is why the field capture reads CLOSED-BEFORE-PROBE. A registry-visible REAPED-GONE still
+// implies the pipes are open, i.e. the pipe-holder world, exactly as #374 said. The citation was
+// wrong too: the diagnosis string now says the OPPOSITE of what that sentence claimed it said.
 //
 // Registered before the serialization summary below so that test still runs LAST in the ltTest
 // chain, and inside ltTest so nothing else in the suite is running while a control blocks the
