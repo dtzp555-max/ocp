@@ -198,9 +198,139 @@ export function getUsageByKey({ since, until } = {}) {
   `).all(...params);
 }
 
-export function getUsageTimeline({ keyName, hours = 24 } = {}) {
+// ── #400: the two /api/usage sinks answer a FINITE value their own input domain rejects ──────
+//
+// #398 made `usageQueryInt` (server.mjs) guarantee a FINITE number, which closed the
+// `parseInt`-yields-NaN class. It could not close this one: `Math.min(x, cap)` bounds only the
+// HIGH side, so on both parameters an ordinary finite NEGATIVE survives the clamp and is refused
+// by the sink itself. Measured on `main`, loopback, default `CLAUDE_AUTH_MODE=none`, both bare
+// GETs with no body and no credentials — 0 bytes received, socket still open at the deadline, one
+// `{"event":"unhandled_rejection"}` each:
+//
+//   GET /api/usage?hours=-2400000000            → new Date(...) leaves Date's ±8.64e15 ms range
+//                                               → Invalid Date → .toISOString() throws RangeError
+//   GET /api/usage?limit=-100000000000000000000 → outside int64 → SQLite bind → "datatype mismatch"
+//
+// THE GUARD LIVES HERE, AT THE SINK, AND IS DELIBERATELY NOT DUPLICATED AS A HANDLER PRE-CHECK.
+// That is not a style preference, it is the completeness argument: for `hours` the boundary MOVES
+// WITH THE CLOCK (`Date.now() - hours*3600000`), so a pre-check in the handler evaluates
+// `Date.now()` at a DIFFERENT INSTANT than the sink does, and a negative `hours` can pass the
+// pre-check and still throw microseconds later. Guarding on the authoritative operation itself
+// makes the changed-input set equal the throw set BY CONSTRUCTION, at every instant — strictly
+// stronger than the enumeration #398 relied on. Two independent cross-vendor reviews of #400
+// derived this placement separately; see the decision comment on issue #400.
+//
+// DISPOSITION: SUBSTITUTE THE ENDPOINT'S DOCUMENTED DEFAULT (24 hours / 50 rows), and LOG IT.
+// Not a 400: #403 measured that NO 400 in server.mjs is URL-triggered — every one is body- or
+// body-derived — and declined to invent that rejection kind for #379 cases 1+2 on exactly that
+// ground. Not a clamp of `limit` to -1 either: that would make SQLite's "any negative LIMIT means
+// unbounded" rule load-bearing, and this guard has to keep working whatever that rule is.
+// Default substitution is already this endpoint's rule for a value its sink cannot use (#398).
+// The stated cost is that an operator sending `?limit=-1e20` silently gets 50 rows instead of
+// being told the parameter was unusable — hence the log line, which is the only place that fact
+// can be recorded, since the operator cannot see it from the response either way.
+//
+// AUTHORIZATION: Class B.2, `/api/usage`, `ALIGNMENT.md:132`, grandfathered by ADR 0006 at
+// v3.16.4. ROUTE (a) — the reasoning ADR 0017 records at `:46`: a request that currently receives
+// NO RESPONSE AT ALL is not a behaviour anyone can be relying on. Neither request shape nor
+// response keys change.
+//
+// EXPLICITLY NOT FIXED HERE, because it is route (b) and needs its own ADR: `since` below is
+// built with `.toISOString()` ("2026-08-10T15:09:39.023Z") while `created_at` is stored
+// SQLite-style ("2026-08-10 16:09:39"), and `' ' (0x20) < 'T' (0x54)`, so a SAME-DAY `since`
+// excludes today's rows. `sqliteDatetime` (below) exists for exactly this mismatch and this
+// function still does not use it. Fixing it changes WHICH ROWS AN ANSWERED REQUEST RETURNS —
+// a semantics change on a grandfathered endpoint (`ALIGNMENT.md:114`, ADR 0006:39), with ADR 0010
+// as the worked precedent. Issue #400 records it, and a future ADR should cover `getUsageByKey`'s
+// `{since, until}` in the same breath, since those feed raw client strings into the same
+// comparison.
+
+// The documented defaults of GET /api/usage's two query parameters, written ONCE. Each is both
+// the sink's default argument and the value the sink substitutes when its input domain rejects
+// the caller's value, so "the default" and "the substitute" cannot drift apart.
+const DEFAULT_TIMELINE_HOURS = 24;
+const DEFAULT_RECENT_LIMIT   = 50;
+
+// SQLite result code 20, SQLITE_MISMATCH. See isUsageBindDomainError.
+const SQLITE_MISMATCH = 20;
+
+// HOW THE SINK'S OWN INPUT-DOMAIN FAILURE IS TOLD APART FROM EVERY OTHER FAILURE, and this is the
+// weakest link in the change — stated here rather than left for a reader to discover.
+//
+// A blanket try/catch would be wrong: a genuine database fault, a corrupted store, a missing table
+// must still PROPAGATE, not be silently answered with default data. So the catch below rethrows
+// unless BOTH structured properties match — never the message text, which is not a contract:
+//
+//   err.code    === "ERR_SQLITE_ERROR"   Node's own error code for a libsqlite failure
+//   err.errcode === 20                    SQLITE_MISMATCH, the numeric SQLite result code
+//
+// [measured, node v26.5.0] Binding a value outside SQLite's integer domain to a `?` placeholder —
+// 1.5, NaN, ±Infinity, ±1e20, ±1e300 — yields errcode 20 / errstr "datatype mismatch". A genuine
+// store fault on the SAME statement yields a DIFFERENT code: a dropped table is errcode 1 / "SQL
+// logic error", and a runtime SQL failure at step time (integer overflow inside the query) is also
+// errcode 1. So the two classes are distinguished by a number, not by prose.
+//
+// [reasoned, NOT measured] What makes this narrow rather than exact: SQLITE_MISMATCH is a
+// well-defined but not uniquely-sourced result code. On THIS statement — a parameterless SELECT
+// over `usage_log` whose only bound value is the `LIMIT` — the bind is the only place SQLite
+// documents it arising, since its other documented sources are rowid/type-affinity conflicts on
+// writes. That is an argument from SQLite's documented behaviour, not an enumeration of every
+// path. If a future SQLITE_MISMATCH could reach this statement from somewhere other than the
+// bind, it would be misclassified as an input-domain failure and answered with default rows. The
+// `hours` guard below has no equivalent weakness because it is a check rather than a catch.
+//
+// Two structural properties keep the blast radius small, and both are testable:
+//   - The `try` wraps ONLY `stmt.all(limit)`. `getDb()` and `d.prepare(...)` are outside it, so a
+//     connection or compile failure can never be absorbed.
+//   - The substituted retry is ALSO outside the `try`. If the store is genuinely broken, the retry
+//     throws and the caller sees the fault rather than 50 rows of nothing.
+//
+// >> DO NOT REMOVE THE LOG CALL BELOW AS "JUST OBSERVABILITY". IT IS THE ONLY THING THAT MAKES
+// >> THIS PREDICATE TESTABLE AT ALL, and that was MEASURED, not assumed. Deleting the rethrow above
+// >> — i.e. making the catch blanket — leaves the sink's THROWN result byte-identical: the second
+// >> structural property re-raises the very same deterministic store fault from the retry, so
+// >> `threw`, `code`, `errcode` and `message` all match the correct implementation. The regression
+// >> test asserting exactly that scored a FULL GREEN SUITE against the blanket-catch mutation
+// >> (1208/0) before this was understood. What differs is the log: a blanket catch records a
+// >> substitution for a `limit` the sink accepts, blaming a valid input for a database fault.
+// >> test-features.mjs's `#400: a store fault inside the sink PROPAGATES ...` now asserts that
+// >> count is zero, and that single assertion is the whole test of the errcode-20 discrimination.
+function isUsageBindDomainError(err) {
+  return err != null && err.code === "ERR_SQLITE_ERROR" && err.errcode === SQLITE_MISMATCH;
+}
+
+// Records a substitution on the proxy log. Uses the SAME envelope server.mjs's logEvent() emits —
+// one JSON object per line, {ts, level, event, ...data}, warn to stderr — so `/logs` parses it
+// identically. Duplicated rather than imported ON PURPOSE: server.mjs imports this module, so
+// importing logEvent back would be an import cycle. If that envelope changes, change this too.
+function logUsageParamSubstituted(param, supplied, substituted, reason) {
+  console.error(JSON.stringify({
+    ts: new Date().toISOString(),
+    level: "warn",
+    event: "usage_param_substituted",
+    param,
+    // JSON.stringify renders NaN and ±Infinity as null, which would erase the one thing worth
+    // recording, so a non-finite value is written as its String() form instead.
+    supplied: Number.isFinite(supplied) ? supplied : String(supplied),
+    substituted,
+    reason,
+  }));
+}
+
+export function getUsageTimeline({ keyName, hours = DEFAULT_TIMELINE_HOURS } = {}) {
   const d = getDb();
-  const since = new Date(Date.now() - hours * 3600000).toISOString();
+  // #400 — A CHECK, NOT A CATCH, and it is performed on the VERY Date object that is about to be
+  // formatted, not on a recomputed one. `Date.prototype.toISOString` throws RangeError if and only
+  // if the time value is NaN (ECMA-262), and an out-of-range Date has a NaN time value, so
+  // `Number.isNaN(d.getTime())` is that condition exactly — no error matching, and nothing else
+  // can be swallowed. Because the SAME object is tested and then used, the moving boundary cannot
+  // open a gap: there is no second `Date.now()`.
+  let sinceDate = new Date(Date.now() - hours * 3600000);
+  if (Number.isNaN(sinceDate.getTime())) {
+    logUsageParamSubstituted("hours", hours, DEFAULT_TIMELINE_HOURS, "invalid time value");
+    sinceDate = new Date(Date.now() - DEFAULT_TIMELINE_HOURS * 3600000);
+  }
+  const since = sinceDate.toISOString();
   let where = "WHERE created_at >= ?";
   const params = [since];
   if (keyName) { where += " AND key_name = ?"; params.push(keyName); }
@@ -219,14 +349,27 @@ export function getUsageTimeline({ keyName, hours = 24 } = {}) {
   `).all(...params);
 }
 
-export function getRecentUsage(limit = 50) {
+export function getRecentUsage(limit = DEFAULT_RECENT_LIMIT) {
   const d = getDb();
-  return d.prepare(`
+  // Prepared OUTSIDE the try on purpose — see isUsageBindDomainError. A compile failure (missing
+  // table, broken schema) must reach the caller, not be mistaken for a bad `limit`.
+  const stmt = d.prepare(`
     SELECT key_name, model, prompt_chars, response_chars, elapsed_ms, success, created_at
     FROM usage_log
     ORDER BY created_at DESC
     LIMIT ?
-  `).all(limit);
+  `);
+  try {
+    return stmt.all(limit);
+  } catch (err) {
+    // #400 — only the sink's own typed input-domain failure is absorbed. Everything else rethrows
+    // here, unchanged, with its original stack.
+    if (!isUsageBindDomainError(err)) throw err;
+    logUsageParamSubstituted("limit", limit, DEFAULT_RECENT_LIMIT, err.errstr || err.message);
+  }
+  // Deliberately outside the `try`: if the store itself is broken, THIS throws and the caller sees
+  // the fault. A retry nested inside the catch would turn a real database fault into default data.
+  return stmt.all(DEFAULT_RECENT_LIMIT);
 }
 
 // ── SQLite datetime helper ──

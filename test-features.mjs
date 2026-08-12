@@ -6459,6 +6459,386 @@ ltTest("integration (#379 cases 1+2): a malformed percent-escape in a /api/keys 
   } finally { child.kill("SIGKILL"); _ltRmRetry(dir); }
 });
 
+// ── #400: a FINITE ?hours / ?limit that the SINK refuses must be ANSWERED, not walked into ────
+//
+// The residue #398 could not reach. `usageQueryInt` guarantees only that its result is FINITE, and
+// `Math.min(x, cap)` bounds only the HIGH side, so an ordinary finite NEGATIVE passes the clamp
+// untouched and is refused by the sink itself. Measured on `main`, loopback, default
+// `CLAUDE_AUTH_MODE=none`, both bare GETs with no body and no credentials — 0 bytes received,
+// socket still open at the deadline, one `{"event":"unhandled_rejection"}` each:
+//
+//   ?hours=-2400000000            → new Date(...) leaves Date's ±8.64e15 ms range → Invalid Date
+//                                 → .toISOString() throws RangeError "Invalid time value"
+//   ?limit=-100000000000000000000 → outside int64 → SQLite bind → "datatype mismatch"
+//
+// The fix guards AT THE SINK (keys.mjs) and substitutes the endpoint's documented default. It is
+// deliberately NOT a handler pre-check: `hours`'s boundary moves with the clock, so a pre-check
+// would evaluate `Date.now()` at a different instant than the sink and could pass a value that
+// still throws. These arms therefore probe the WIRE, which is the only place the two are the same
+// operation.
+//
+// WHY EVERY DEFECT ARM ASSERTS THE RESULTING VALUE AND NOT MERELY THE STATUS. "It answered" is
+// satisfied by any implementation that answers, including ones that answer with the WRONG default,
+// with the 500/720 cap, or with an unbounded row set. The substituted value is the contract claim
+// — the endpoint's DOCUMENTED default, 50 rows / 24 hours — so it is asserted against the literals
+// below and, for `hours`, against an explicit `?hours=24` request whose difference from `?hours=720`
+// is established as a premise first. That is the #379 lesson repeated on purpose: two mutations
+// passed against its first revision because its count assertions could not tell one default from
+// another.
+//
+// ── What these arms do NOT pin, stated so a green run is not mistaken for coverage ────────────
+//   - THE B.2 KEY-SET SNAPSHOT IS NOT EVIDENCE FOR ANY OF THIS. [reasoned, from the snapshot's own
+//     `notCovered` block] docs/governance/b2-response-keys.json records only the localhost SUCCESS
+//     path of each endpoint+method pair and explicitly excludes validation and error responses. A
+//     green snapshot says the response KEYS did not move, which is exactly what this PR claims —
+//     it says nothing at all about whether a request is answered. Direct live-server arms are the
+//     only evidence here, which is why these exist.
+//   - THE TWO CAPS — 500 for `limit`, 720 for `hours`. Unpinned for the same fixture-cost reason
+//     the #379 block records: 60 seeded rows sits below both caps, so `Math.min(x, cap)` is never
+//     the binding constraint on anything asserted here either.
+//   - THE `getUsageTimeline` DATETIME MISMATCH. [measured] `?hours=1` still returns 0 buckets for a
+//     row written seconds ago, because `since` is built with `.toISOString()` while `created_at` is
+//     stored SQLite-style and `' ' < 'T'`. DELIBERATELY UNFIXED — it changes WHICH ROWS an answered
+//     request returns, i.e. route (b), and needs its own ADR. Issue #400 records it.
+//   - NON-LOOPBACK AND NON-DEFAULT AUTH MODES. [reasoned] Every probe is loopback with
+//     CLAUDE_AUTH_MODE=none; the sinks are downstream of the auth gate, so the mode cannot change
+//     their behaviour, but that is read off the code rather than measured. Same limit as #379's.
+//   - WHETHER THE `errcode === 20` DISCRIMINATION IS EXACT. It is narrow, not exact — see
+//     keys.mjs's isUsageBindDomainError. The third test below measures the half that IS provable:
+//     that a store fault carrying a different code propagates instead of being answered.
+const LT400_BUDGET = 15000;   // a hang is unbounded, so a generous budget costs no detection power
+const LT400_DEFAULT_LIMIT = 50;   // the DOCUMENTED default, asserted as a literal, never derived
+const LT400_DEFAULT_HOURS = 24;   // ditto
+
+// The two inputs that were never answered, named once so both tests probe the same strings.
+const LT400_HANG_HOURS = "/api/usage?hours=-2400000000";
+const LT400_HANG_LIMIT = "/api/usage?limit=-100000000000000000000";
+
+// A huge negative `limit` that SQLite ACCEPTS: -(2^53) binds fine and means "unbounded". It is the
+// arm that rejects a magnitude-based or `Number.isSafeInteger`-based guard, both of which look
+// reasonable and both of which would change a request that is answered today.
+const LT400_BIG_NEG_LIMIT = "/api/usage?limit=-9007199254740992";
+// A huge negative `hours` that is ANSWERED today: `Date.now() + 7.2e15` is still inside Date's
+// ±8.64e15 ms range, so it produces an extended-year `since` ("+230185-07-…") and — via a lexical
+// accident, `'+' (0x2B) < '2' (0x32)` — matches every row. Answered means untouchable under route
+// (a). The boundary between this and LT400_HANG_HOURS is where `Date` overflows, and it MOVES with
+// the wall clock; both values sit far enough from it that no plausible run drifts across.
+const LT400_BIG_NEG_HOURS = "/api/usage?hours=-2000000000";
+
+// One probe. Asserts, IN THIS ORDER: the server answered at all, then the answer was 200, then
+// hands back the parsed body. The order is load-bearing and is the whole reason this block cannot
+// be written with a status assertion alone — the defect is SILENCE, and reverting the guard must
+// fail on the deadline arm, never as a status mismatch.
+async function lt400Get(port, path, what) {
+  const r = await ltRawSend(port, {
+    method: "GET", path, bytes: Buffer.alloc(0), contentLength: 0, timeoutMs: LT400_BUDGET,
+  });
+  assert.ok(!r.timedOut,
+    `${what} (${path}): NO RESPONSE within ${LT400_BUDGET}ms and the socket was never closed. ` +
+    `This is #400 itself — the value is FINITE, so #398's guard passes it through, the sink ` +
+    `refuses it, the throw escapes the async request callback into unhandledRejection, and the ` +
+    `client is left holding a connection the server will never release. A bare GET with no ` +
+    `credentials can do this on the default configuration.`);
+  assert.equal(r.status, 200,
+    `${what} (${path}): expected 200, got ${r.status}: ${r.text.slice(0, 200)}`);
+  try { return JSON.parse(r.text); }
+  catch (e) { throw new assert.AssertionError({ message: `${what} (${path}): body is not JSON: ${e.message} — ${r.text.slice(0, 200)}` }); }
+}
+
+// Seeded exactly as #379's arms are, and for the same two reasons: more rows than the default so
+// `recent.length === 50` is an EQUALITY rather than a floor, and half of them backdated so the
+// WINDOW SIZE is observable and 24 h can be told from 720 h. Reused rather than re-derived —
+// lt379Seed is a fixture helper, and the premise assertions below re-verify its result on the wire.
+ltTest("integration (#400): GET /api/usage answers a finite out-of-domain ?hours / ?limit within a bounded time, with the documented default, and says so in the log", async () => {
+  if (!LT_POSIX) return;
+  const dir = ltMkdir(); const fake = ltFake(dir);
+  lt379Seed(dir, _ltF2P(new URL("./keys.mjs", import.meta.url)));
+  const { child, buf, port } = await ltBootFresh(
+    { CLAUDE_BIN: fake, SP_CAPTURE: join(dir, "sp.txt") }, dir);
+  try {
+    assert.ok(await ltWait(() => buf.out.includes("listening on") || buf.spawnErr, 20000) && !buf.spawnErr,
+      `did not start: ${buf.spawnErr ? buf.spawnErr.message : buf.err.slice(0, 300)}`);
+
+    // ── PREMISES, on the wire, before anything depends on them.
+    const all = await lt400Get(port, "/api/usage?limit=-1", "the unbounded baseline");
+    assert.equal(all.recent.length, LT379_SEED_ROWS,
+      `PREMISE FAILED: expected ${LT379_SEED_ROWS} seeded rows via ?limit=-1 (unbounded), saw ` +
+      `recent.length=${all.recent.length}. Every count below would be vacuous, and in particular ` +
+      `${LT400_DEFAULT_LIMIT} could not be told apart from "everything".`);
+    assert.notEqual(LT379_SEED_ROWS, LT400_DEFAULT_LIMIT,
+      `PREMISE FAILED: the fixture seeds exactly the default (${LT400_DEFAULT_LIMIT}) rows, so an ` +
+      `implementation that ignored ?limit entirely would satisfy the default arm below.`);
+
+    const win24 = await lt400Get(port, `/api/usage?hours=${LT400_DEFAULT_HOURS}`, "the 24h window");
+    const win720 = await lt400Get(port, "/api/usage?hours=720", "the 720h window");
+    assert.notDeepEqual(win24.timeline, win720.timeline,
+      `PREMISE FAILED: the 24 h and 720 h windows return the SAME timeline, so the ?hours arm ` +
+      `below cannot tell the documented default from the cap. The backdated rows are what make ` +
+      `the window size observable.`);
+
+    // ── THE DEFECT. Both of these received NO RESPONSE AT ALL before this fix.
+    const badLimit = await lt400Get(port, LT400_HANG_LIMIT, "a finite out-of-int64 ?limit");
+    assert.equal(badLimit.recent.length, LT400_DEFAULT_LIMIT,
+      `${LT400_HANG_LIMIT} must be answered with the DOCUMENTED default limit of ` +
+      `${LT400_DEFAULT_LIMIT}, so with ${LT379_SEED_ROWS} rows seeded it must return exactly ` +
+      `${LT400_DEFAULT_LIMIT}; got recent.length=${badLimit.recent.length}. ${LT379_SEED_ROWS} ` +
+      `would mean the value reached SQLite as an unbounded LIMIT (a clamp to -1, which is the ` +
+      `half of the fix that was rejected because it makes SQLite's negative-LIMIT rule ` +
+      `load-bearing); 500 would mean the cap was substituted instead of the default.`);
+
+    const badHours = await lt400Get(port, LT400_HANG_HOURS, "a finite out-of-Date-range ?hours");
+    assert.deepEqual(badHours.timeline, win24.timeline,
+      `${LT400_HANG_HOURS} must be answered with the DOCUMENTED default of ` +
+      `${LT400_DEFAULT_HOURS} hours, i.e. produce exactly what ?hours=${LT400_DEFAULT_HOURS} ` +
+      `produces. Compared against the EXPLICIT 24 h request rather than the unparameterised one, ` +
+      `which shares the same fallback and would move with it. ?hours=720 is asserted different ` +
+      `above, so this equality can actually fail.`);
+
+    // ── THE SUBSTITUTION IS RECORDED. This is the stated cost of the chosen disposition — the
+    // operator gets default data and cannot tell from the response that the parameter was
+    // unusable — so the log line is the mitigation, and an unlogged substitution is the defect
+    // this arm exists to catch. It is also the assertion that distinguishes "the default was
+    // substituted" from "the request happened to be answered": nothing else on the wire can.
+    assert.ok(await ltWait(() => /"event":"usage_param_substituted"/.test(buf.err), 5000),
+      `both probes above were answered with the default but NOTHING was logged. The substitution ` +
+      `is invisible to the caller by construction, so the log is the only record that a parameter ` +
+      `was discarded; server stderr had: ${buf.err.slice(0, 600)}`);
+    const subs = buf.err.split("\n").filter(l => l.includes('"usage_param_substituted"'))
+      .map(l => { try { return JSON.parse(l); } catch { return null; } }).filter(Boolean);
+    const byParam = (p) => subs.find(s => s.param === p);
+    assert.ok(byParam("limit"), `no substitution was logged for ?limit; logged: ${JSON.stringify(subs)}`);
+    assert.ok(byParam("hours"), `no substitution was logged for ?hours; logged: ${JSON.stringify(subs)}`);
+    assert.equal(byParam("limit").substituted, LT400_DEFAULT_LIMIT,
+      `the logged substitute must be the documented default: ${JSON.stringify(byParam("limit"))}`);
+    assert.equal(byParam("hours").substituted, LT400_DEFAULT_HOURS,
+      `the logged substitute must be the documented default: ${JSON.stringify(byParam("hours"))}`);
+    assert.equal(byParam("hours").supplied, -2400000000,
+      `the logged line must name the value that was DISCARDED, or it cannot be acted on: ` +
+      `${JSON.stringify(byParam("hours"))}`);
+
+    // ── Not wedged, and nothing swallowed. Before the fix each of the two defect probes left
+    // exactly one of these lines behind, and that log line was the ONLY place the defect surfaced.
+    assert.ok(!/"event":"unhandled_rejection"/.test(buf.err),
+      `no request in this test may produce an unhandled rejection; server stderr had: ${buf.err.slice(0, 400)}`);
+    const health = await ltRawSend(port, { method: "GET", path: "/health", bytes: Buffer.alloc(0), contentLength: 0, timeoutMs: LT400_BUDGET });
+    assert.equal(health.status, 200, `the server must still serve requests afterwards: ${health.status} ${health.text.slice(0, 200)}`);
+  } finally { child.kill("SIGKILL"); _ltRmRetry(dir); }
+});
+
+// Separate BODY, not a further assertion in the one above, because a mutation that widens the
+// guard must be able to redden PRESERVATION without first tripping a defect arm — and a claim that
+// only ever fails after another claim has already failed is a claim nobody has proven.
+ltTest("integration (#400): every ?hours / ?limit that /api/usage answers today is answered identically, including the huge negatives the sinks accept", async () => {
+  if (!LT_POSIX) return;
+  const dir = ltMkdir(); const fake = ltFake(dir);
+  lt379Seed(dir, _ltF2P(new URL("./keys.mjs", import.meta.url)));
+  const { child, buf, port } = await ltBootFresh(
+    { CLAUDE_BIN: fake, SP_CAPTURE: join(dir, "sp.txt") }, dir);
+  try {
+    assert.ok(await ltWait(() => buf.out.includes("listening on") || buf.spawnErr, 20000) && !buf.spawnErr,
+      `did not start: ${buf.spawnErr ? buf.spawnErr.message : buf.err.slice(0, 300)}`);
+
+    const win24 = await lt400Get(port, `/api/usage?hours=${LT400_DEFAULT_HOURS}`, "the 24h window");
+    const win720 = await lt400Get(port, "/api/usage?hours=720", "the 720h window");
+    assert.notDeepEqual(win24.timeline, win720.timeline,
+      `PREMISE FAILED: the 24 h and 720 h windows are identical, so the ?hours preservation arm ` +
+      `below cannot detect a guard that substituted the default for an answered value.`);
+
+    // ── `limit`: values SQLite accepts must still reach it unchanged. The magnitudes here are the
+    // point — the issue measured that ±2^53 bind fine, so `Number.isSafeInteger` is too strict by
+    // a hair and would convert an answered request into a defaulted one.
+    for (const [path, expected, why] of [
+      ["/api/usage?limit=-1", LT379_SEED_ROWS,
+        "`LIMIT -1` means UNBOUNDED in SQLite and returns every row today; a guard that rejected negatives would return the default 50 instead"],
+      [LT400_BIG_NEG_LIMIT, LT379_SEED_ROWS,
+        "-(2^53) binds fine and is also unbounded — #400's sweep of 25 values against the sink found it accepted, and this PR re-measured 22 values on node v26.5.0 with the same result. A magnitude-based or Number.isSafeInteger-based guard would substitute the default here and change an answered request"],
+      ["/api/usage?limit=0", 0,
+        "`?limit=0` returns zero rows today; it is the arm that catches a falsy-test guard (`limit || fallback`)"],
+      ["/api/usage?limit=1", 1,
+        "an ordinary numeric limit must still be honoured — a guard that ignored `limit` entirely would satisfy every defect arm in the test above"],
+    ]) {
+      const r = await lt400Get(port, path, "an already-answered ?limit");
+      assert.equal(r.recent.length, expected,
+        `${path}: expected recent.length=${expected}, got ${r.recent.length}. ${why}. This PR is ` +
+        `authorized as ADR 0006 route (a) — only inputs that received NO RESPONSE AT ALL may ` +
+        `change. If this fires, the change is a CONTRACT CHANGE and needs its own ADR ` +
+        `(ALIGNMENT.md:114).`);
+    }
+
+    // ── `hours`: the huge negative that Date still accepts. This is the sharpest preservation arm
+    // in the PR, because it sits on the SAME side of zero as the defect and differs only by
+    // magnitude — a guard written as "negative hours are nonsense, default them" passes every
+    // other arm here and fails this one.
+    const bigNeg = await lt400Get(port, LT400_BIG_NEG_HOURS, "an already-answered huge negative ?hours");
+    assert.deepEqual(bigNeg.timeline, win720.timeline,
+      `${LT400_BIG_NEG_HOURS} is ANSWERED today: Date.now() + 7.2e15 ms is still inside Date's ` +
+      `range, the since bound becomes an extended year, and every row matches. It must therefore return ` +
+      `what ?hours=720 returns (all rows), NOT what ?hours=24 returns. Getting win24 back means ` +
+      `the guard fired on a value the sink accepts — a contract change on an answered request.`);
+    assert.notDeepEqual(bigNeg.timeline, win24.timeline,
+      `${LT400_BIG_NEG_HOURS} must not collapse to the 24 h default; the previous assertion and ` +
+      `this one are the two halves of "the guard did not fire here".`);
+
+    const futureWindow = await lt400Get(port, "/api/usage?hours=-1", "an already-answered ?hours");
+    assert.equal(futureWindow.timeline.length, 0,
+      `?hours=-1 returns 0 buckets today; got ${futureWindow.timeline.length}. A guard that ` +
+      `rejected negatives would fall back to 24 h and repopulate this.`);
+
+    // NOTHING may have been substituted anywhere in this test — every probe above is a value the
+    // sinks accept. This is the assertion that makes the whole body a preservation test rather
+    // than a set of coincidences: a widened guard that happened to return the same counts would
+    // still be caught here.
+    assert.ok(!/"event":"usage_param_substituted"/.test(buf.err),
+      `every request in this test is one the sinks accept, so NO substitution may be logged; ` +
+      `server stderr had: ${buf.err.slice(0, 600)}`);
+    assert.ok(!/"event":"unhandled_rejection"/.test(buf.err),
+      `no request in this test may produce an unhandled rejection; server stderr had: ${buf.err.slice(0, 400)}`);
+  } finally { child.kill("SIGKILL"); _ltRmRetry(dir); }
+});
+
+// ── #400: the catch absorbs the sink's own input-domain failure and NOTHING else ───────────────
+//
+// The one thing about this fix that is a judgement call rather than an identity: `limit`'s guard is
+// a CATCH, and a catch can absorb the wrong thing. keys.mjs discriminates on two STRUCTURED
+// properties (`code === "ERR_SQLITE_ERROR"` and `errcode === 20`, SQLITE_MISMATCH), never on the
+// message text — but "only SQLITE_MISMATCH reaches this statement from the bind" is reasoned from
+// SQLite's documented behaviour, not enumerated. What CAN be measured is the consequence, and this
+// is where it is measured: a genuine store fault must come out of the sink as a THROW, so the
+// request 500s or is logged, rather than being quietly answered with 50 rows of default data.
+//
+// The fault is induced by replacing `usage_log` with a VIEW whose WHERE clause raises at STEP time
+// (`abs(-9223372036854775808)` → "integer overflow", errcode 1). That shape is chosen deliberately:
+// it lands INSIDE `stmt.all(...)`, which is the only region the `try` covers, so it exercises the
+// rethrow itself rather than a failure that was never at risk of being swallowed. The
+// dropped-relation arm at the end covers the other region — `d.prepare(...)`, deliberately outside
+// the `try` — and would pass even under a broad catch, which is exactly why it is not the load-
+// bearing arm here.
+//
+// Runs in a CHILD with its own scratch OCP_DIR_OVERRIDE. It has to: proving this on the wire would
+// mean breaking the store a live server has open, and `getUsageByKey` runs before `getRecentUsage`
+// in the handler, so a broken store never reaches the code under test through HTTP at all.
+function lt400SinkFaults(dir, keysPath) {
+  const script = `
+    import { recordUsage, getRecentUsage, getUsageTimeline, getDb, closeDb } from ${JSON.stringify(keysPath)};
+    // The substitution log is CAPTURED, not just emitted, because it is the only observable that
+    // separates "the predicate rethrew" from "the catch absorbed and the retry re-raised the same
+    // fault". See the substitutionsLogged assertions below — this capture is what mutation M9 needs.
+    const logged = [];
+    console.error = (...a) => { logged.push(a.map(String).join(" ")); };
+    const subsSince = (n) => logged.slice(n).filter(l => l.includes('"usage_param_substituted"')).length;
+    const probe = (fn) => { const at = logged.length;
+                            try { const r = fn(); return { threw: false, rows: Array.isArray(r) ? r.length : null, substitutionsLogged: subsSince(at) }; }
+                            catch (e) { return { threw: true, code: e.code ?? null, errcode: e.errcode ?? null, message: String(e.message).slice(0, 160), substitutionsLogged: subsSince(at) }; } };
+    const out = {};
+    for (let i = 0; i < 60; i++) recordUsage({ keyId: null, keyName: "local", model: "m" + i,
+      promptChars: 1, responseChars: 1, elapsedMs: 1, success: true });
+    // Control: with a HEALTHY store the substitution happens, so a red result below cannot be
+    // blamed on the harness failing to reach the code at all.
+    out.healthyBadLimit  = probe(() => getRecentUsage(-1e20));
+    out.healthyGoodLimit = probe(() => getRecentUsage(50));
+    // Break the relation the sinks read, in a way that fails at STEP rather than at compile.
+    getDb().exec("ALTER TABLE usage_log RENAME TO usage_log_real");
+    getDb().exec("CREATE VIEW usage_log AS SELECT * FROM usage_log_real WHERE abs(-9223372036854775808) > 0");
+    out.brokenGoodLimit = probe(() => getRecentUsage(50));
+    out.brokenBadLimit  = probe(() => getRecentUsage(-1e20));
+    out.brokenHours     = probe(() => getUsageTimeline({ hours: -2400000000 }));
+    // And the compile-time region, which the try deliberately does not cover.
+    getDb().exec("DROP VIEW usage_log");
+    out.missingRelation = probe(() => getRecentUsage(50));
+    process.stdout.write("LT400RESULT" + JSON.stringify(out) + "LT400END");
+    closeDb();
+  `;
+  const raw = String(_ltExecFile(process.execPath, ["--input-type=module", "--eval", script],
+    { env: { ...process.env, NODE_ENV: "test", OCP_DIR_OVERRIDE: dir }, encoding: "utf8" }));
+  // ANCHORS BY INDEX BEFORE SLICING (#347): `indexOf` returns -1 for an absent marker, and
+  // `slice(start, -1)` is neither an error nor empty — it silently runs to one before the end,
+  // producing a LONGER, healthier-looking string than the correct slice. A length floor or a
+  // substring check on the result is not a substitute for checking both anchors first.
+  const start = raw.indexOf("LT400RESULT"), end = raw.indexOf("LT400END");
+  assert.ok(start > -1 && end > start,
+    `the sink-fault child did not produce a delimited result (start=${start}, end=${end}): ${raw.slice(0, 400)}`);
+  return JSON.parse(raw.slice(start + "LT400RESULT".length, end));
+}
+
+// No LT_POSIX guard, deliberately: this child needs only node and node:sqlite, no /bin/sh fake, so
+// an early `return` here would print a green tick on a platform where nothing was actually checked.
+test("#400: a store fault inside the sink PROPAGATES out of getRecentUsage instead of being answered with default rows", () => {
+  const dir = ltMkdir();
+  try {
+    const r = lt400SinkFaults(dir, _ltF2P(new URL("./keys.mjs", import.meta.url)));
+
+    // Control first: the harness reaches the code, and the input-domain path really does substitute.
+    assert.equal(r.healthyBadLimit.threw, false,
+      `PREMISE FAILED: against a HEALTHY store, getRecentUsage(-1e20) must not throw. If this ` +
+      `fires, every assertion below is measuring a broken harness rather than the discrimination: ` +
+      `${JSON.stringify(r.healthyBadLimit)}`);
+    assert.equal(r.healthyBadLimit.rows, LT400_DEFAULT_LIMIT,
+      `PREMISE FAILED: it must return the default ${LT400_DEFAULT_LIMIT} rows: ${JSON.stringify(r.healthyBadLimit)}`);
+    assert.equal(r.healthyBadLimit.substitutionsLogged, 1,
+      `the substitution must be recorded exactly once at the sink: ${JSON.stringify(r.healthyBadLimit)}`);
+    assert.equal(r.healthyGoodLimit.threw, false,
+      `PREMISE FAILED: an ordinary limit must return rows: ${JSON.stringify(r.healthyGoodLimit)}`);
+    assert.equal(r.healthyGoodLimit.rows, LT400_DEFAULT_LIMIT,
+      `PREMISE FAILED: an ordinary limit must return rows: ${JSON.stringify(r.healthyGoodLimit)}`);
+    assert.equal(r.healthyGoodLimit.substitutionsLogged, 0,
+      `a limit the sink ACCEPTS must not be recorded as substituted: ${JSON.stringify(r.healthyGoodLimit)}`);
+
+    // THE LOAD-BEARING ARM. The fault is raised inside `stmt.all(...)` — the only region the catch
+    // covers — and carries a DIFFERENT SQLite result code (1, "SQL logic error") from the bind
+    // failure (20, SQLITE_MISMATCH). It must come back out.
+    assert.equal(r.brokenGoodLimit.threw, true,
+      `a genuine store fault raised INSIDE stmt.all() must propagate, not be answered with ` +
+      `default data. Got ${JSON.stringify(r.brokenGoodLimit)}.`);
+    assert.equal(r.brokenGoodLimit.errcode, 1,
+      `PREMISE FAILED: the induced fault must carry a code OTHER than SQLITE_MISMATCH (20), or ` +
+      `it does not test the discrimination at all: ${JSON.stringify(r.brokenGoodLimit)}`);
+
+    // ── AND THIS IS THE ONE THAT ACTUALLY TESTS THE PREDICATE. Added after a control mutation
+    // came back GREEN and proved the arm above does not.
+    //
+    // Blanket the catch — delete the `isUsageBindDomainError` rethrow — and `threw` above is STILL
+    // true, because the store fault is deterministic: the catch absorbs it, and the substituted
+    // retry outside the `try` raises the very same error. Measured: mutation M9 scored 1208/0.
+    // Every observable the arm above reads is identical under both implementations.
+    //
+    // The LOG is not. A blanket catch treats a store fault as an unusable parameter and says so —
+    // it records a substitution for a `limit` the sink accepts perfectly well. The correct
+    // implementation records nothing here, because nothing was substituted. So the discrimination
+    // is observable exactly once, on this line.
+    assert.equal(r.brokenGoodLimit.substitutionsLogged, 0,
+      `a VALID limit against a BROKEN store must not be recorded as a parameter substitution. Got ` +
+      `${JSON.stringify(r.brokenGoodLimit)}. A count of 1 means the catch absorbed a fault that is ` +
+      `nothing to do with the parameter — i.e. the errcode-20 discrimination is gone — and the ` +
+      `operator's log now blames a valid input for a database fault. This is the ONLY assertion in ` +
+      `this file that can see that; the throw/errcode arms above cannot, because the retry outside ` +
+      `the try re-raises the identical error either way.`);
+
+    // Sharper: a BAD input AND a broken store. The bind fails first (errcode 20) and IS absorbed;
+    // the substituted retry then hits the store fault. That retry sits outside the `try` precisely
+    // so this throws — a retry nested in the catch would convert a real fault into default rows,
+    // and this is the only arm that can tell the two placements apart.
+    assert.equal(r.brokenBadLimit.threw, true,
+      `an out-of-domain limit against a BROKEN store must still surface the store fault. Got ` +
+      `${JSON.stringify(r.brokenBadLimit)}. Returning rows here means the substituted retry was ` +
+      `nested inside the catch, so a database fault is being reported as default data.`);
+    assert.equal(r.brokenBadLimit.errcode, 1,
+      `the error that escapes must be the STORE fault, not the bind failure that was absorbed: ` +
+      `${JSON.stringify(r.brokenBadLimit)}`);
+
+    // The `hours` sink has no catch at all — its guard is a check — so a store fault there can
+    // only propagate. Asserted anyway, because that is a property of the current shape rather
+    // than of the language, and someone widening it to a try/catch would silence it.
+    assert.equal(r.brokenHours.threw, true,
+      `getUsageTimeline must surface a store fault too; its #400 guard is a CHECK on the Date and ` +
+      `absorbs nothing: ${JSON.stringify(r.brokenHours)}`);
+
+    // The compile-time region, outside the `try` by construction.
+    assert.equal(r.missingRelation.threw, true,
+      `a missing relation fails at d.prepare(), which is deliberately outside the try: ` +
+      `${JSON.stringify(r.missingRelation)}`);
+  } finally { _ltRmRetry(dir); }
+});
+
 // ── #365: the CHILD's stdout/stderr must decode UTF-8 ACROSS chunk boundaries ───────────────
 //
 // The other half of #359. `lineBuffer += d.toString()` and `stderr += d` decoded each Buffer from

@@ -2631,17 +2631,21 @@ const isLegalInOperand = (v) => typeof v === "object" && v !== null;
 // sample of it. Corroborated empirically over 47 raw inputs × both parameters against the real
 // sinks: ZERO inputs the old code answered change value, and 20 that it could not answer now do.
 //
-// WHAT THIS DOES NOT FIX, STATED SO THE NEXT READER DOES NOT TRUST IT TOO FAR. A FINITE value
-// can still reach both sinks and throw, and those requests still hang. Measured, on this tree,
-// after this fix:
+// WHAT THIS FUNCTION DOES NOT FIX, STATED SO THE NEXT READER DOES NOT TRUST IT TOO FAR. A FINITE
+// value still reaches both sinks and is still refused by them — `Math.min(x, cap)` bounds only
+// the HIGH side, so it is the NEGATIVE direction that survives:
 //   `?limit=-100000000000000000000` → SQLite bind rejects it        → "datatype mismatch"
 //   `?hours=-2400000000`            → Date range overflow           → "Invalid time value"
-// Both are PRE-EXISTING — they hang identically at v3.16.4 and on `main` — and both are a
-// different input class from the `parseInt`-yields-NaN defect issue #379 case 3 describes, with
-// their own contract questions (SQLite's int64 bind range; `Date`'s ±8.64e15 ms range, plus a
-// separate pre-existing `created_at` string-comparison bug in getUsageTimeline). Tracked as
-// ISSUE #400, which carries both sinks' measured acceptance sets. This guard closes the NaN
-// class only, and the ?hours=-1 test arm records the string-comparison defect it runs into.
+// Both were PRE-EXISTING hangs — identical at v3.16.4 and on `main` — and both are a different
+// input class from the `parseInt`-yields-NaN defect issue #379 case 3 describes, with their own
+// contract questions (SQLite's int64 bind range; `Date`'s ±8.64e15 ms range). They are now
+// answered, but NOT HERE: #400 guards them AT THE SINKS in keys.mjs, because the `hours` boundary
+// MOVES WITH THE CLOCK and a pre-check in this file would evaluate `Date.now()` at a different
+// instant than the sink does. This helper's guarantee is unchanged and remains exactly one thing:
+// the value it returns is finite. See keys.mjs's #400 block for the rest.
+// Still unfixed, and route (b) rather than route (a): the `created_at` string-comparison bug in
+// getUsageTimeline (`.toISOString()` vs SQLite's space-separated format), which changes WHICH ROWS
+// an answered request returns and needs its own ADR. The ?hours=-1 test arm records it.
 //
 // Authorized by ADR 0006 (grandfathered as of v3.16.4) — behaviour-preserving, route (a). At
 // v3.16.4 (`git rev-list -n1 v3.16.4` → 9e25160, read with `git show`; the maintainer's checkout
