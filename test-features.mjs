@@ -2671,13 +2671,15 @@ function ltResolveTmuxBin(env, dir) {
 //   files; this is about WRITING to their home. Precedent for the mechanism, not the argument.
 //
 // WHY THE BASE ENV. RE-DERIVED against origin/main, not carried forward — the first version of
-// this comment said seven/seven and eight/eight and BOTH were wrong. The seventh
+// this comment said seven/seven and eight/eight and BOTH were wrong. The sixth
 // `grep -n 'CLAUDE_TUI_MODE: "true"'` hit is inside `ltTuiTmux`'s returned `env` object, i.e.
 // the fixture body and not a call site, so it was counted as a site that forgot when it is in
 // fact the thing every remembering site spreads — wrong side of the ledger, twice over. It is
 // AGENTS.md's "numbers are claims too" and #338's over-count in the same shape: a grep hit
-// counted without opening what it was attached to. Correct, on origin/main:
-//   SIX hand-rolled CLAUDE_TUI_MODE boot sites pin NO HOME (:2822 :2859 :2929 :2962 :3540 :5416)
+// counted without opening what it was attached to. Correct, MEASURED AT 60e0b4b — the line numbers
+// below are pinned to that SHA and are ALREADY STALE on main, because this PR's own merge-forward
+// moved them: #393's rule happening to the artifact that cites it. Re-derive, never quote:
+//   SIX hand-rolled CLAUDE_TUI_MODE boot sites pin NO HOME (at 60e0b4b: :2822 :2859 :2929 :2962 :3540 :5416)
 //   NINE that go through a SHARED FIXTURE all pin it — eight spreading `...ltTuiTmux(dir).env`
 //     with `HOME: home` from `const home = ltMkdir()`, plus makeB2Fixture's `tui-pool` profile,
 //     whose `...profile.env` spreads over a base env already carrying `HOME: home`. That ninth
@@ -2699,7 +2701,7 @@ function ltResolveTmuxBin(env, dir) {
 // must NOT be copied verbatim. Its tmux guard requires the supplied path to sit inside the
 // test's own `dir`; the nine sites that already pin HOME all use a SIBLING of `dir` under the
 // same temp root (`ltMkdir()`, or `mkdtempSync(join(tmpdir(), "ocp-b2-home-"))` for the b2
-// fixture). A dir-scoped guard here would reject all nine — MEASURED, mutation M-D: 1197 passed / 10 failed against a 1207 / 0 / 2 baseline,
+// fixture). A dir-scoped guard here would reject all nine — MEASURED AT 60e0b4b, mutation M-D: 1197 passed / 10 failed against that tree's 1207 / 0 / 2 baseline — every figure in this comment is relative to 60e0b4b; the branch ships at 1222 / 0 / 2 after merging main —
 // the reds being the #396 unit test's sibling-acceptance assertion, the eight `ltTuiTmux`
 // integration tests, and the #346 B.2 snapshot test, which is the ninth site. The property that
 // matters is "not the operator's real home", not "inside this specific test", so the boundary is
