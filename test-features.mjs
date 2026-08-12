@@ -1570,6 +1570,14 @@ test("#402: testSkipped() misused in a SYNC body is still reported as misuse —
   // no longer a free rider on it. Keeping both would have made the context check unprovable here:
   // the narrow guard fires first, so every mutation aimed at the broad one dies before reaching
   // it and the table records a kill belonging to the other assertion.
+  //
+  // READ THIS BEFORE "SIMPLIFYING" THE MESSAGE ASSERTION AT THE BOTTOM OF THIS BODY. Since #415's
+  // F1 arm landed, a misused testSkipped() sets BOTH `misuse` and `skips`, so deleting the misuse
+  // arm still produces a failure — just with the swallowed-abort message instead. Every other
+  // assertion here (skip counted, not passed, charged by name) therefore still holds under that
+  // mutation, and the ENTIRE proof that the misuse arm is reachable at all now rests on the one
+  // string comparison below. Measured: M3 reddens exactly this test, and only via that assertion.
+  // Weaken it to "some ✗ was emitted" and the misuse arm becomes unprovable on this path.
   const { h, lines } = _h402();
   h.test("fixture", () => { h.testSkipped("inner", "synthetic: the misuse under test"); });
   assert.equal(h.counts().skipped, 1, "control: the fixture really did call testSkipped()");
