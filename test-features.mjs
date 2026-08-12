@@ -3722,13 +3722,20 @@ ltTest("integration (#396): a TUI turn writes its trust entry into the PINNED ho
     // report. But (f) and (g) are still MUTUAL under any mutation that moves HOME: the write lands
     // in the ambient home, the seeded config stays "{}", (f) throws and (g) never runs. Ordering
     // cannot separate them, because that mutation breaks both. So (g) needed a mutation that moves
-    // the CWD INDEPENDENTLY OF HOME, and there is one:
+    // the CWD INDEPENDENTLY OF HOME. There are at least TWO — this ambient one, and a source mutation of
+    // server.mjs's `TUI_CWD` default, which #413's remediation review built as M-H (1221/1/2, alone, at
+    // (g)). Under "break the code it guards", (g) guards two operands — HOME's pin AND TUI_CWD's default —
+    // so M-H is (g)'s row and this one is the supplement. What this one carries that M-H cannot: it
+    // demonstrates a defect present on the SHIPPED tree with no edits at all. The ambient route:
     //
     //   M-G — export OCP_TUI_CWD into the suite's own AMBIENT environment. ltBoot builds its child
     //   env as `{ ...process.env, … }` and never strips it, and server.mjs resolves
     //   `TUI_CWD = OCP_TUI_CWD || ${HOME}/.ocp-tui/work`. The HOME pin stays intact, so the trust
     //   write still lands in the SEEDED config and (f) PASSES; the trusted cwd is outside the
-    //   pinned home, so (g) FAILS alone, by name. MEASURED: 1206 passed / 1 failed, the single red
+    //   pinned home, so (g) FAILS alone, by name. MEASURED AT 60e0b4b: 1206 passed / 1 failed. ON THE SHIPPED TREE IT IS 1221 / 1 / 2 — this is the
+    //   one row a reader can reproduce with no source edit at all (`OCP_TUI_CWD=<outside> npm test`),
+    //   so it is the figure most likely to be checked against a tree that is not 60e0b4b. Both are the
+    //   same single red
     //   being this test at `every trusted cwd must live under the pinned home`.
     //
     // Note what M-G is and is not. It is an AMBIENT-ENVIRONMENT perturbation, not a source
