@@ -25872,3 +25872,26 @@ test("#327 part 5: runDoctor's --json result carries the structured per-host uni
   assert.strictEqual(byName["ocp.service"].instanceName, null, "an absent directive is null");
 });
 
+
+test("#327 part 4: a multi-instance host's plan reports each sibling with its own update command", async () => {
+  const result = await runUpgrade({
+    dryRun: true, yes: true,
+    mockDoctor: {
+      ready_to_upgrade: true, next_action: { kind: "upgrade" },
+      current_version: "v3.29.1", latest_version: "v3.29.2",
+      units: [
+        { name: "ocp.service", port: 3456, instanceName: null, workingTree: "/home/opc/ocp" },
+        { name: "ocp-wifibot.service", port: 3457, instanceName: "wifibot", workingTree: "/opt/ocp-wifibot" },
+      ],
+    },
+  });
+  assert.equal(result.executed, false, "dry-run premise: nothing may execute");
+  const report = result.plan.filter((l) => l.includes("[multi-instance]"));
+  assert.equal(report.length, 2, `each sibling gets its own report line; got ${JSON.stringify(report)}`);
+  assert.ok(report.some((l) => l.includes("ocp-wifibot.service") && l.includes("(instance \"wifibot\")")),
+    "the sibling's declared identity must be named, not conflated with the primary");
+  assert.ok(report.some((l) => l.includes("(cd /opt/ocp-wifibot && ./ocp update)")),
+    "the sibling's OWN tree and update command must be printed — report, never cross-identity act");
+  assert.ok(!report.some((l) => l.includes("(tree unknown)")), "workingTree is in the record; an unknown tree would be a regression");
+});
+

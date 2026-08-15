@@ -1435,6 +1435,18 @@ export async function runUpgrade(opts = {}) {
   const kind = doctor.next_action.kind;
   plan.push(`[doctor] from=${doctor.current_version} to=${doctor.latest_version} kind=${kind}`);
 
+  // #327 part 4: report sibling instances, never act across identities. This update touches ONLY
+  // the instance it was invoked from — a sibling under another Unix identity cannot be written here
+  // (the isolation that motivates a second instance is exactly what prevents one process from
+  // updating both). Each sibling gets its OWN update command printed, to run as its owner.
+  if (Array.isArray(doctor.units) && doctor.units.length > 1) {
+    for (const u of doctor.units) {
+      const label = u.instanceName === null ? "primary" : `instance ${JSON.stringify(u.instanceName)}`;
+      const tree = u.workingTree || "(tree unknown)";
+      plan.push(`[multi-instance] ${u.name} (${label}) at ${tree} — update separately: (cd ${tree} && ./ocp update)`);
+    }
+  }
+
   // Issue #260: --target is a PIN ("do not put me on anything else"), not a preference. noop,
   // restart, and fresh_install have no mechanism to redirect what they do onto a specific
   // version: noop does nothing, restart re-serves the CURRENT tree exactly as-is, and
