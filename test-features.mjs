@@ -25626,3 +25626,32 @@ runAsyncTests().then(() => Promise.all(pendingAsync)).then(() => {
   closeDb();
   process.exit(1);
 });
+
+// ── #411: an unhandledRejection must carry the request's method + path ──────────────────────
+// The fix wraps handleRequest in an AsyncLocalStorage and reads it back in the unhandledRejection
+// handler. The load-bearing claim is that the context SURVIVES into the rejection handler — the
+// one thing a wrong implementation gets wrong (a module-level variable would race under concurrency;
+// a context captured too early would be null). This test proves the mechanism behaviourally: a
+// rejection thrown inside the context is observed by the handler WITH the context, not null.
+// server.mjs cannot be imported (it calls listen() at top level), so this exercises the exact
+// AsyncLocalStorage → unhandledRejection path the fix depends on, at the unit level.
+test("#411: an unhandledRejection observed inside an AsyncLocalStorage context carries the store", async () => {
+  const { AsyncLocalStorage } = await import("node:async_hooks");
+  const als = new AsyncLocalStorage();
+  let observed = null;
+  const onReject = (e) => { observed = als.getStore(); };
+  process.on("unhandledRejection", onReject);
+  try {
+    als.run({ method: "POST", path: "/v1/chat/completions" }, async () => {
+      await Promise.resolve();
+      throw new Error("probe-411");
+    });
+    await new Promise((r) => setTimeout(r, 60)); // let the rejection fire and the handler run
+    assert.deepEqual(observed, { method: "POST", path: "/v1/chat/completions" },
+      `the rejection handler must see the request context, not null — the whole point of #411. ` +
+      `got ${JSON.stringify(observed)}`);
+  } finally {
+    process.removeListener("unhandledRejection", onReject);
+  }
+});
+

@@ -34,6 +34,7 @@
  *   PROXY_API_KEY                — Bearer token for API auth (optional)
  *   CLAUDE_HEARTBEAT_INTERVAL    — SSE heartbeat interval in ms on streaming path (default: 0 = disabled)
  */
+import { AsyncLocalStorage } from "node:async_hooks";
 import { createServer } from "node:http";
 import { spawn, execFile, execFileSync, spawnSync } from "node:child_process";
 import { randomUUID, timingSafeEqual, createHash as cryptoCreateHash } from "node:crypto";
@@ -3864,7 +3865,13 @@ async function handleChatCompletions(req, res) {
 }
 
 // ── HTTP server ─────────────────────────────────────────────────────────
-const server = createServer(async (req, res) => {
+// #411: request-context storage so the unhandledRejection handler can name the request (method +
+// path) whose async callback threw. The storage runs around handleRequest, and the rejection
+// handler below reads it back — the difference between "a hang went unnoticed" and "we know which
+// request hung". Not endpoint-touching: no request handler change, no response shape change.
+const requestContext = new AsyncLocalStorage();
+
+async function handleRequest(req, res) {
   // Dynamic CORS: allow localhost and LAN origins
   const origin = req.headers["origin"] || "";
   const isAllowedOrigin = /^https?:\/\/(127\.0\.0\.1|localhost|192\.168\.\d+\.\d+|172\.(1[6-9]|2\d|3[01])\.\d+\.\d+|10\.\d+\.\d+\.\d+)(:\d+)?$/.test(origin);
@@ -4333,6 +4340,10 @@ const server = createServer(async (req, res) => {
   }
 
   jsonResponse(res, 404, { error: "Not found. Endpoints: GET /v1/models, POST /v1/chat/completions, GET /health, GET /usage, GET /status, GET /logs, GET|PATCH /settings, GET /dashboard, GET|POST|DELETE /api/keys, GET|PATCH /api/keys/:id/quota, GET /api/usage, GET /cache/stats, DELETE /cache" });
+}
+
+const server = createServer((req, res) => {
+  return requestContext.run({ method: req.method, path: req.url ? req.url.split("?")[0] : null }, () => handleRequest(req, res));
 });
 
 
@@ -4340,9 +4351,19 @@ const server = createServer(async (req, res) => {
 // Prevent unhandled async rejections and synchronous exceptions from crashing
 // the daemon. Each registers once at module level so they are installed before
 // the first request arrives. These are global no-ops on the happy path.
-process.on("unhandledRejection", (e) =>
-  logEvent("error", "unhandled_rejection", { error: e && e.message ? e.message : String(e) })
-);
+process.on("unhandledRejection", (e) => {
+  // #411: name the request whose async callback threw, or the record is unactionable — the whole
+  // point of this issue is that four live hangs went unnoticed because the log said only the error,
+  // never which request produced it. Honest limit: a rejection that escapes before requestContext.run
+  // (or before the router parsed anything) has method/path null — say so rather than emit a field
+  // that is sometimes a lie.
+  const ctx = requestContext.getStore();
+  logEvent("error", "unhandled_rejection", {
+    error: e && e.message ? e.message : String(e),
+    method: ctx?.method ?? null,
+    path: ctx?.path ?? null,
+  });
+});
 process.on("uncaughtException", (e) =>
   logEvent("error", "uncaught_exception", { error: e && e.message ? e.message : String(e) })
 );
