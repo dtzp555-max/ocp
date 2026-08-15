@@ -103,7 +103,10 @@ function suiteLockAcquire(dir) {
     _lockSweepStaleTickets(dir);
     let oldest = null;
     try { oldest = _lockReaddirSync(_lockTicketDir(dir)).sort()[0]; } catch {}
-    if (oldest !== undefined && !myTicket.endsWith(oldest)) { _lockSleep(500); continue; }
+    // F1 (review): a readdir failure must FAIL SAFE — proceed to attempt, never sleep forever.
+    // A tie attempt on an unreadable queue is at worst a temporary lottery, which is strictly
+    // better than a deadlock on a free lock.
+    if (oldest && !myTicket.endsWith(oldest)) { _lockSleep(500); continue; }
     // Stale-break by ATOMIC RENAME-STEAL (review F3): rename the lock to a private name FIRST,
     // then inspect the renamed owner. A check-then-act here (read owner -> pid-gone -> rm) races:
     // a claimant that re-acquired between the read and the rm gets its LIVE lock deleted and two
@@ -25980,6 +25983,7 @@ test("#416 fairness: a stale ticket (owner pid ESRCH-gone) is swept, so a crashe
   const remaining = _lockReaddirSync(_lockTicketDir(dir));
   assert.deepEqual(remaining, [],
     `a ticket whose owner is ESRCH-gone must be swept, or it sits at the queue head and stalls everyone: ${JSON.stringify(remaining)}`);
+  try { _lockRmSync(_lockTicketDir(dir), { recursive: true, force: true }); } catch {}
   try { _lockRmSync(dir, { recursive: true, force: true }); } catch {}
 });
 
@@ -25992,6 +25996,7 @@ test("#416 fairness: a LIVE owner's ticket is NOT swept (a reused-pid read is co
   const remaining = _lockReaddirSync(_lockTicketDir(dir));
   assert.deepEqual(remaining, [liveName],
     `a LIVE owner's ticket must survive the sweep; got ${JSON.stringify(remaining)}`);
+  try { _lockRmSync(_lockTicketDir(dir), { recursive: true, force: true }); } catch {}
   try { _lockRmSync(dir, { recursive: true, force: true }); } catch {}
 });
 
