@@ -25846,3 +25846,30 @@ test("#416 mode 2: the pid-gone decision is ESRCH-only — a rendered ps state f
     `a dead pid must read as gone even when a ps-style state renders it alive — the decision is ESRCH-only, never a rendered column (macOS pads "Z    00:02", so a fixed-width read is the failed prescription)`);
 });
 
+
+test("#327 part 5: runDoctor's --json result carries the structured per-host unit inventory", async () => {
+  // Mock the systemctl chain: one undeclared primary in the user scope, one DECLARED second
+  // instance in the system scope — the intended multi-instance host from the issue.
+  const run = (cmd) => {
+    if (cmd.includes("--user list-unit-files")) return "ocp.service enabled";
+    if (cmd.includes("list-unit-files")) return "ocp-wifibot.service enabled";
+    if (cmd.includes("systemctl --user show")) return unitShow({ id: "ocp.service", port: 3456 });
+    if (cmd.includes("systemctl show ")) return unitShow({ id: "ocp-wifibot.service", port: 3457, instance: "wifibot" });
+    throw new Error("unexpected cmd: " + cmd);
+  };
+  const result = await runDoctor({
+    mockPlatform: "linux", run, skipNetwork: false,
+    mockVersion: "v3.29.2", mockLatest: "v3.29.2",
+    // Mocked health so this never probes the live production proxy; the oauth check reads the
+    // same body via classifyAuthOk.
+    mockHealth: { status: 200, body: { version: "3.29.2", auth: { ok: true } } },
+  });
+  assert.ok(Array.isArray(result.units),
+    `the units inventory must be a structured array (null only when the check cannot enumerate); got ${JSON.stringify(result.units)}`);
+  assert.equal(result.units.length, 2, "both enabled units must be in the inventory");
+  const byName = Object.fromEntries(result.units.map(u => [u.name, u]));
+  assert.equal(byName["ocp-wifibot.service"].instanceName, "wifibot",
+    "the declared name must be in the structured record, not only in the human message");
+  assert.strictEqual(byName["ocp.service"].instanceName, null, "an absent directive is null");
+});
+
