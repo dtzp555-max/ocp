@@ -20040,10 +20040,9 @@ test("#327: ...but the two are still DISTINGUISHABLE in the parsed model and in 
     unitShow({ id: "b.service", port: 3458, instance: "" }),
   );
   // STATE FIRST, THEN DEREFERENCE — the discipline stated in full at the SPACE test below, and
-  // applied to every test in this block that reads `result.units`. `groupAndAssessConflicts`
-  // returns `{ state: "clear" }` with NO `units`, so a regression routing this fixture there
-  // would otherwise surface as `Cannot read properties of undefined (reading 'map')`: a real
-  // detection wearing the name of a JavaScript property instead of the name of the defect.
+  // applied to every test in this block that reads `result.units`. (#327 part 5 changed `clear`
+  // to carry `units` too, so the dereference hazard below is now only the UNKNOWN state, which
+  // still has none — the discipline stays because that state remains reachable.)
   assert.equal(result.state, "warn", "premise: both units are present and both claim the primary");
   const byName = Object.fromEntries(result.units.map(u => [u.name, u]));
   assert.strictEqual(byName["a.service"].instanceName, null, "absent must be null");
