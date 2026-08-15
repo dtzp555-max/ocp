@@ -12212,22 +12212,29 @@ test("#381 F4: the `will anything restart it?` note is per plan shape over all T
   // system-unit; the `else` asserted `Restart=always` for BOTH non-launchd shapes. The cited
   // authority (`install-autostart.mjs`) writes only the USER unit — a `system-unit` comes from
   // `resolveOwningUnit`, an arbitrary unit whose Restart= directive OCP never reads.
-  const user = restartOwnerRecoveryNote("user-unit");
-  const system = restartOwnerRecoveryNote("system-unit");
-  const launchd = restartOwnerRecoveryNote("launchd");
+  const user = restartOwnerRecoveryNote({ action: "user-unit", mismatched: false });
+  const userMismatched = restartOwnerRecoveryNote({ action: "user-unit", mismatched: true });
+  const system = restartOwnerRecoveryNote({ action: "system-unit", mismatched: true });
+  const launchd = restartOwnerRecoveryNote({ action: "launchd" });
 
   assert.notEqual(user, system,
     "the two systemd shapes must not render the same sentence — that is the defect");
   assert.match(user, /Restart=always/, "OCP installs this one and knows its policy");
   assert.ok(!/Restart=always/.test(system),
     `OCP never reads a discovered unit's Restart= directive; got ${JSON.stringify(system)}`);
+  // #392: a mismatched user-unit is NOT OCP's own — the SCOPE-derived tag used to claim it was.
+  // It must get the same honest "discovered, policy unknown" wording system-unit already had.
+  assert.equal(userMismatched, system,
+    `a mismatched user-unit must claim no more than a discovered unit does; got ${JSON.stringify(userMismatched)}`);
+  assert.ok(!/Restart=always/.test(userMismatched),
+    `a mismatched user-unit is not OCP's own, so Restart=always is a claim nobody verified; got ${JSON.stringify(userMismatched)}`);
   assert.match(system, /not\s+known|discovered/i, `it must say so; got ${JSON.stringify(system)}`);
   assert.ok(!/Restart=always/.test(launchd), `launchd has no such directive; got ${JSON.stringify(launchd)}`);
   // The launchd claim is hedged because the resolved bootout's exit status is discarded (`|| true`)
   // and this note only renders when a restart command already failed.
   assert.match(launchd, /If the bootout succeeded/, `got ${JSON.stringify(launchd)}`);
   // An unrecognised shape must fall to the "not known" answer, never to a claim.
-  assert.equal(restartOwnerRecoveryNote("some-future-shape"), system,
+  assert.equal(restartOwnerRecoveryNote({ action: "some-future-shape" }), system,
     "an unknown shape must claim no more than a discovered one does");
 });
 

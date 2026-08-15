@@ -988,9 +988,9 @@ export function planRestart(owner, opts = {}) {
         `"${opts.expectedUnit}"'s config in the first place (scripts/lib/snapshot.mjs). ${secondUnitClause}`
       );
       if (owner.platform === "darwin") {
-        return { action: "launchd", warnings, cmds: launchdCmds(opts) };
+        return { action: "launchd", mismatched: owner.mismatched, warnings, cmds: launchdCmds(opts) };
       }
-      return { action: "user-unit", warnings, cmds: [{ cmd: `systemctl --user restart -- ${opts.expectedUnit}`, label: "restart" }] };
+      return { action: "user-unit", mismatched: owner.mismatched, warnings, cmds: [{ cmd: `systemctl --user restart -- ${opts.expectedUnit}`, label: "restart" }] };
     }
     throw new Error(
       `restart aborted: nothing is currently listening on the OCP port, so there is nothing to ` +
@@ -1075,7 +1075,7 @@ export function planRestart(owner, opts = {}) {
   }
 
   if (owner.kind === "launchd") {
-    return { action: "launchd", warnings, cmds: launchdCmds(opts) };
+    return { action: "launchd", mismatched: owner.mismatched, warnings, cmds: launchdCmds(opts) };
   }
 
   if (owner.kind === "system-unit") {
@@ -1091,7 +1091,7 @@ export function planRestart(owner, opts = {}) {
       // OPTION rather than the restart argument. UNIT_NAME_RE already rejects a leading "-" —
       // this is defense in depth at the actual shell-out boundary, the same posture MED-5 took
       // for shell-metacharacter injection.
-      return { action: "system-unit", warnings, cmds: [{ cmd: `systemctl restart -- ${owner.unit}`, label: "restart" }] };
+      return { action: "system-unit", mismatched: owner.mismatched, warnings, cmds: [{ cmd: `systemctl restart -- ${owner.unit}`, label: "restart" }] };
     }
     if (!opts.sudoAuthorized) {
       throw new Error(
@@ -1103,14 +1103,14 @@ export function planRestart(owner, opts = {}) {
         `instead would repeat issue #215.`
       );
     }
-    return { action: "system-unit", warnings, cmds: [{ cmd: `sudo systemctl restart -- ${owner.unit}`, label: "restart" }] };
+    return { action: "system-unit", mismatched: owner.mismatched, warnings, cmds: [{ cmd: `sudo systemctl restart -- ${owner.unit}`, label: "restart" }] };
   }
 
   if (owner.kind === "user-unit") {
     if (!UNIT_NAME_RE.test(owner.unit)) {
       throw new Error(`restart aborted: resolved unit name "${owner.unit}" failed validation — refusing to shell out with it.`);
     }
-    return { action: "user-unit", warnings, cmds: [{ cmd: `systemctl --user restart -- ${owner.unit}`, label: "restart" }] };
+    return { action: "user-unit", mismatched: owner.mismatched, warnings, cmds: [{ cmd: `systemctl --user restart -- ${owner.unit}`, label: "restart" }] };
   }
 
   throw new Error(`restart aborted: unrecognized owner.kind "${owner.kind}"`);

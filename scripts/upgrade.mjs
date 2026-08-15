@@ -1080,16 +1080,22 @@ export function restoreRetryBudget(action, { attempts, backoffMs }) {
 //
 // Extracted rather than fixed twice: both ladders render this sentence, and a two-copy fix is how
 // #352's LOW-1 came to be fixed on one path and left asserted on the other for four days.
-export function restartOwnerRecoveryNote(action) {
+// #392: the note takes the FACTS, not the action tag. `action === "user-unit"` used to claim
+// "the unit OCP installs, Restart=always" — but user-unit is assigned from the cgroup SCOPE alone,
+// not authorship; a discovered user-scope unit that is NOT OCP's own gets the same tag. The claim
+// is now made only when the resolved unit is the expected one (`!mismatched`); a mismatched
+// user-unit gets the same honest "discovered, policy unknown" wording system-unit already had.
+export function restartOwnerRecoveryNote({ action, mismatched = false }) {
   if (action === "launchd") {
     return `If the bootout succeeded the job is unloaded and nothing will start it on its own — `
       + `the bootout's exit status is discarded (\`|| true\`), so that is not confirmed here.`;
   }
-  if (action === "user-unit") {
+  if (action === "user-unit" && !mismatched) {
     return `This is the unit OCP installs, configured Restart=always, so systemd may bring it back `
       + `by itself — but it has not within the probe budget.`;
   }
-  // `system-unit`, and any shape a future planRestart adds. Named as unknown rather than assumed.
+  // `system-unit`, a mismatched `user-unit`, and any shape a future planRestart adds. Named as
+  // unknown rather than assumed.
   return `This unit was discovered rather than installed by OCP, so its Restart= policy is not `
     + `known here; it may or may not come back on its own.`;
 }
@@ -2027,7 +2033,7 @@ async function runFullUpgrade({ doctor, opts }) {
             // #372 / #381 F4: "nothing will start it on its own" was asserted for BOTH shapes here
             // (#352's LOW-1 fixed only the rollback path), and the two-way fix that replaced it was
             // still a two-way split over a THREE-value domain. Per shape, from one shared helper.
-            + `${restartOwnerRecoveryNote(restartPlan.plan.action)} `
+            + `${restartOwnerRecoveryNote({ action: restartPlan.plan.action, mismatched: restartPlan.plan.mismatched })} `
             + `Bring it back with: ${recoveryCmds}  `
             + `Then, and only then, consider the working tree: it may be at the new version, and \`ocp update --rollback\` restores from the snapshot.` }
       );
@@ -2960,7 +2966,7 @@ async function runRollback(opts) {
           // LOW-1, now via the shared helper (#381 F4): the two-way form this replaces asserted
           // `Restart=always` for `system-unit` too, which OCP never installs and whose Restart=
           // directive it never reads.
-          + `${restartOwnerRecoveryNote(restartPlan.plan.action)} `
+          + `${restartOwnerRecoveryNote({ action: restartPlan.plan.action, mismatched: restartPlan.plan.mismatched })} `
           + `Bring it back with: ${recoveryCmds}  `
           + `The working tree is ALREADY rolled back to ${meta.fromVersion || meta.fromCommit} — do not run \`ocp update --rollback\` again; `
           + `the only thing missing is a running service.` }
