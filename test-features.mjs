@@ -20,6 +20,62 @@ import { AsyncLocalStorage } from "node:async_hooks";
 
 process.env.HOME = homedir(); // normalize HOME so homedir()-derived paths are stable across shells
 
+// ── #416: the suite mutex, in code ──────────────────────────────────────────────────────────
+// AGENTS.md used to carry this protocol as prose; five prescriptions in it failed measurement and
+// the full record lives in issue #416. This is the code version, and each failed prescription is a
+// spec of what NOT to do, called out inline:
+//   1. kill -0 SUCCEEDS ON A ZOMBIE — it cannot answer "is the owner gone". Used here ONLY for the
+//      ESRCH case ("definitively gone"); the owner record also carries a random NONCE and an EPOCH
+//      start time, and a lock is broken only when the pid is gone AND the record matches.
+//   2. ps column-padding on macOS ("Z    00:02") — NO ps rendering is used at all; identity is
+//      pid + nonce + epoch, never a formatted string.
+//   3. cwd comparison REJECTED A VALID OWNER (a driver that cds in a subshell keeps its launch
+//      cwd) — cwd is recorded as PROVENANCE ONLY, never a decision input.
+//   4. lstart is a LOCAL-TIME RENDERING (two TZs false-mismatch) — epoch ms is an identity.
+//   5. mkdir succeeds a moment before the owner file exists — closed by POPULATE-THEN-PUBLISH:
+//      the owner is written to a sibling path and rename()d into place, so there is no window in
+//      which the lock exists and its owner record does not.
+// Fairness (ticket/FIFO) is a separate increment on top of this; the plain retry loop is the
+// lotter-shaped base the issue measured (one contender waited ~40 min).
+// Class: not endpoint-touching — harness code; touches no server.mjs / lib/.
+import { mkdirSync as _lockMkdirSync, writeFileSync as _lockWriteFileSync, renameSync as _lockRenameSync, rmSync as _lockRmSync, readFileSync as _lockReadFileSync } from "node:fs";
+import { hostname as _lockHostname } from "node:os";
+
+const SUITE_LOCK_DIR = join(process.cwd(), "scratchpad", ".suite.lock");
+const SUITE_LOCK_OWNER = join(SUITE_LOCK_DIR, "owner.json");
+const SUITE_LOCK_NONCE = Math.random().toString(36).slice(2, 10);
+const _lockSleepBuf = new Int32Array(new SharedArrayBuffer(4));
+const _lockSleep = (ms) => Atomics.wait(_lockSleepBuf, 0, 0, ms);
+
+function suiteLockOwnerRecord() {
+  return { pid: process.pid, nonce: SUITE_LOCK_NONCE, startedAt: Date.now(), host: _lockHostname(), cwd: process.cwd() };
+}
+function suiteLockPublishOwner() {
+  const tmp = SUITE_LOCK_OWNER + ".tmp-" + process.pid;
+  _lockWriteFileSync(tmp, JSON.stringify(suiteLockOwnerRecord()));
+  _lockRenameSync(tmp, SUITE_LOCK_OWNER);
+}
+function suiteLockReadOwner() {
+  try { return JSON.parse(_lockReadFileSync(SUITE_LOCK_OWNER, "utf8")); } catch { return null; }
+}
+function suiteLockPidGone(owner) {
+  if (!owner || !Number.isInteger(owner.pid)) return true;
+  try { process.kill(owner.pid, 0); return false; } catch (e) { return e.code === "ESRCH"; }
+}
+function suiteLockAcquire() {
+  for (;;) {
+    try { _lockMkdirSync(SUITE_LOCK_DIR, { recursive: true }); suiteLockPublishOwner(); return; }
+    catch (e) { if (e.code !== "EEXIST") throw e; }
+    if (suiteLockPidGone(suiteLockReadOwner())) {
+      try { _lockRmSync(SUITE_LOCK_DIR, { recursive: true, force: true }); } catch {}
+    }
+    _lockSleep(500);
+  }
+}
+suiteLockAcquire();
+process.on("exit", () => { try { _lockRmSync(SUITE_LOCK_DIR, { recursive: true, force: true }); } catch {} });
+
+
 // The scaffolding that used to live here CLAIMED to use "a test database to avoid corrupting
 // real data" by setting an env var before the first getDb(). It never worked: keys.mjs read no
 // env var, and ESM hoisting meant the assignment ran after the import anyway. The redirect is
