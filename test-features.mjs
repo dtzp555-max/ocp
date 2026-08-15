@@ -57,18 +57,53 @@ function suiteLockOwnerRecord() {
 // and that directory is rename()d onto the lock path. rename is atomic, so the lock path either
 // does not exist or exists complete with its owner record — there is no window in which a
 // claimant can read "lock present, owner absent" and break a lock taken microseconds ago.
+function _lockTicketDir(dir) { return dir + ".tickets"; }
+function _lockTicketName() {
+  // Arrival-ordered: epoch ms padded, then pid, then the nonce. Sorting the names sorts by arrival.
+  return "ticket-" + String(Date.now()).padStart(15, "0") + "-" + process.pid + "-" + SUITE_LOCK_NONCE;
+}
+function _lockSweepStaleTickets(dir) {
+  // A crashed contender leaves its ticket behind forever; it would sit at the head of the queue
+  // and stall everyone. Sweep tickets whose owner pid is ESRCH-gone (same conservative signal the
+  // stale-lock break uses: a reused pid reads as alive -> livelock, never corruption).
+  let names = [];
+  try { names = _lockReaddirSync(_lockTicketDir(dir)); } catch { return; }
+  for (const n of names) {
+    const pid = Number(n.split("-")[2]);
+    if (!Number.isInteger(pid)) continue;
+    try { process.kill(pid, 0); } catch (e) {
+      if (e.code === "ESRCH") { try { _lockRmSync(join(_lockTicketDir(dir), n), { force: true }); } catch {} }
+    }
+  }
+}
+
 function suiteLockAcquire(dir) {
+  let myTicket = null;
   for (;;) {
     const tmpDir = dir + ".tmp-" + process.pid + "-" + SUITE_LOCK_NONCE;
     try {
       _lockMkdirSync(tmpDir, { recursive: true });
       _lockWriteFileSync(join(tmpDir, "owner.json"), JSON.stringify(suiteLockOwnerRecord()));
       _lockRenameSync(tmpDir, dir);
-      return;
+      if (myTicket) { try { _lockRmSync(myTicket, { force: true }); } catch {} }
+      return myTicket;
     } catch (e) {
       try { _lockRmSync(tmpDir, { recursive: true, force: true }); } catch {}
       if (e.code !== "EEXIST" && e.code !== "ENOTEMPTY") throw e; // rename onto a held lock
     }
+    // Fairness (issue #416 "Fairness"): the plain retry loop is a lottery — one contender waited
+    // ~40 min. Register a ticket once, then only the OLDEST ticket acts each cycle; everyone else
+    // sleeps. This is FIFO-by-arrival, not a strict ticket queue, and it is a throughput property
+    // only — never correctness.
+    if (!myTicket) {
+      _lockMkdirSync(_lockTicketDir(dir), { recursive: true });
+      myTicket = join(_lockTicketDir(dir), _lockTicketName());
+      _lockWriteFileSync(myTicket, "");
+    }
+    _lockSweepStaleTickets(dir);
+    let oldest = null;
+    try { oldest = _lockReaddirSync(_lockTicketDir(dir)).sort()[0]; } catch {}
+    if (oldest !== undefined && !myTicket.endsWith(oldest)) { _lockSleep(500); continue; }
     // Stale-break by ATOMIC RENAME-STEAL (review F3): rename the lock to a private name FIRST,
     // then inspect the renamed owner. A check-then-act here (read owner -> pid-gone -> rm) races:
     // a claimant that re-acquired between the read and the rm gets its LIVE lock deleted and two
@@ -98,8 +133,13 @@ function suiteLockPidGone(owner) {
   if (!owner || !Number.isInteger(owner.pid)) return true;
   try { process.kill(owner.pid, 0); return false; } catch (e) { return e.code === "ESRCH"; }
 }
-suiteLockAcquire(SUITE_LOCK_DIR);
-process.on("exit", () => { try { _lockRmSync(SUITE_LOCK_DIR, { recursive: true, force: true }); } catch {} });
+const _mySuiteTicket = suiteLockAcquire(SUITE_LOCK_DIR);
+process.on("exit", () => {
+  try { _lockRmSync(SUITE_LOCK_DIR, { recursive: true, force: true }); } catch {}
+  // Only OUR ticket, never the whole ticket dir: wiping it would re-order every waiting contender
+  // on every release, which is exactly the lottery this exists to remove.
+  if (_mySuiteTicket) { try { _lockRmSync(_mySuiteTicket, { force: true }); } catch {} }
+});
 
 
 // The scaffolding that used to live here CLAIMED to use "a test database to avoid corrupting
@@ -25927,5 +25967,31 @@ test("#327 part 4: a multi-instance host's plan reports each sibling with its ow
   assert.ok(report.some((l) => l.includes("(cd /opt/ocp-wifibot && ./ocp update)")),
     "the sibling's OWN tree and update command must be printed — report, never cross-identity act");
   assert.ok(!report.some((l) => l.includes("(tree unknown)")), "workingTree is in the record; an unknown tree would be a regression");
+});
+
+
+test("#416 fairness: a stale ticket (owner pid ESRCH-gone) is swept, so a crashed contender cannot stall the queue", () => {
+  const dir = lt416TmpDir();
+  const dead = spawnSync(process.execPath, ["-e", ""]);
+  const staleName = "ticket-000000000000001-" + dead.pid + "-dead";
+  _lockMkdirSync(_lockTicketDir(dir), { recursive: true });
+  _lockWriteFileSync(join(_lockTicketDir(dir), staleName), "");
+  _lockSweepStaleTickets(dir);
+  const remaining = _lockReaddirSync(_lockTicketDir(dir));
+  assert.deepEqual(remaining, [],
+    `a ticket whose owner is ESRCH-gone must be swept, or it sits at the queue head and stalls everyone: ${JSON.stringify(remaining)}`);
+  try { _lockRmSync(dir, { recursive: true, force: true }); } catch {}
+});
+
+test("#416 fairness: a LIVE owner's ticket is NOT swept (a reused-pid read is conservative, never corrupting)", () => {
+  const dir = lt416TmpDir();
+  const liveName = "ticket-000000000000001-" + process.pid + "-live";
+  _lockMkdirSync(_lockTicketDir(dir), { recursive: true });
+  _lockWriteFileSync(join(_lockTicketDir(dir), liveName), "");
+  _lockSweepStaleTickets(dir);
+  const remaining = _lockReaddirSync(_lockTicketDir(dir));
+  assert.deepEqual(remaining, [liveName],
+    `a LIVE owner's ticket must survive the sweep; got ${JSON.stringify(remaining)}`);
+  try { _lockRmSync(dir, { recursive: true, force: true }); } catch {}
 });
 
