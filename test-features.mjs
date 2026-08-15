@@ -43,7 +43,10 @@ import { mkdirSync as _lockMkdirSync, writeFileSync as _lockWriteFileSync, renam
 import { hostname as _lockHostname } from "node:os";
 
 const SUITE_LOCK_DIR = join(process.cwd(), "scratchpad", ".suite.lock");
-const SUITE_LOCK_NONCE = Math.random().toString(36).slice(2, 14); // 12 chars base36 ≈ 4.7e18 — no collision in suite lifetimes
+// randomBytes hex, NOT Math.random().toString(36): the latter emits the shortest round-trip
+// form, so its length is variable (measured min 7 chars) — a fixed-length identity must not
+// depend on a variable-length rendering (the re-review's F6; 12 hex chars ≈ 2.8e28).
+const SUITE_LOCK_NONCE = randomBytes(6).toString("hex");
 const _lockSleepBuf = new Int32Array(new SharedArrayBuffer(4));
 const _lockSleep = (ms) => Atomics.wait(_lockSleepBuf, 0, 0, ms);
 
