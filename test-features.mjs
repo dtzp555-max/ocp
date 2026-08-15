@@ -3111,8 +3111,34 @@ function _ltLoopDiagnosis(loop) {
 // Builds the record ltDrain pushes on a timeout. Separated from ltDrain so the calibration
 // controls can drive the instrument directly, with NO intervening await between the fault they
 // stage and the observation — which is the only way to make the zombie window deterministic.
+// #374 investigation: the swap hypothesis. The field captures read ~76-120s single stalls at
+// ~1% CPU duty ("NOT EXECUTING"), on a host whose swap was ~96% used — but the swap figure was
+// NEVER RECORDED AT THE STALL, only stated. This snapshot captures it at the record moment, so the
+// next reproduction either ties the stall to swap pressure or eliminates it. Best-effort: null when
+// the platform tooling is unreadable — a null field is an absence of measurement, not a zero.
+function _ltMemSnapshot() {
+  const mem = { rssBytes: process.memoryUsage().rss };
+  try {
+    const out = execFileSync("vm_stat", { encoding: "utf8", timeout: 3000 });
+    const get = (k) => { const m = out.match(new RegExp(k + ":\\s+(\\d+)")); return m ? Number(m[1]) : null; };
+    const used = get("Swapins") ?? get("Pages swapped");
+    mem.swapPagesIn = used;
+    const pressure = get("Pageouts");
+    mem.swapPagesOut = pressure;
+    mem.machPageSize = 4096; // macOS page size; multiplied by the counts for bytes
+  } catch { /* not macOS */ }
+  try {
+    const vmstat = _lockReadFileSync("/proc/vmstat", "utf8");
+    const get = (k) => { const m = vmstat.match(new RegExp(k + "\\s+(\\d+)")); return m ? Number(m[1]) : null; };
+    mem.swapPagesIn = get("pswpin");
+    mem.swapPagesOut = get("pswpout");
+  } catch { /* not Linux */ }
+  return mem;
+}
+
 function _ltObserveDrainTimeout(where, elapsedMs, t0, kind = "TIMED OUT", openAtStart = 0) {
   const loop = _ltStallSince(t0);
+  const mem = _ltMemSnapshot();
   const children = [];
   for (const rec of _ltOpenChildren.values()) {
     const probe = _ltProbePid(rec.pid);
@@ -3130,7 +3156,7 @@ function _ltObserveDrainTimeout(where, elapsedMs, t0, kind = "TIMED OUT", openAt
   // findings, and without openAtStart they print identically.
   const registry = children.length ? null
     : (openAtStart > 0 ? LT_PS_VERDICT.CLOSED_FIRST : LT_PS_VERDICT.NONE_OPEN);
-  return { where, kind, ms: elapsedMs, active: _ltActiveBoots, openAtStart, registry, loop, children };
+  return { where, kind, ms: elapsedMs, active: _ltActiveBoots, openAtStart, registry, loop, children, mem };
 }
 // Compact form, for the offender list inside the #358 summary's message.
 function _ltRenderDrainTimeout(r) {
@@ -3156,6 +3182,7 @@ function _ltExplainDrainTimeout(r) {
   lines.push(`    [#374]   loop: ${r.loop.verdict} — ${_ltLoopDiagnosis(r.loop)}`);
   lines.push(`    [#374]   loop: gaps >= ${LT_STALL_MIN_MS}ms: ${r.loop.nStalls} totalling ${r.loop.sumStallMs}ms; ` +
              `top=${JSON.stringify(r.loop.top)}; gaps in window=${r.loop.gapsInWindow}; ticks in ring=${r.loop.ticksInRing}`);
+  lines.push(`    [#374]   mem: ${JSON.stringify(r.mem)}`);
   if (!r.children.length) {
     lines.push(`    [#374]   ps: ${r.registry} (${r.openAtStart} open when the drain started, 0 now) — ` +
                `${LT_PS_DIAGNOSIS[r.registry]}`);
