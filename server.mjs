@@ -3544,6 +3544,35 @@ async function handleChatCompletions(req, res) {
     return jsonResponse(res, 400, { error: { message: "'messages' must be a non-empty array", type: "invalid_request_error" } });
   }
 
+  // #379 case 4: the guard above proves `messages` is a non-empty ARRAY, not that its ELEMENTS
+  // are message objects. `{"messages":[null]}` — a null element inside a valid object — passes
+  // every guard so far (the body is an object, `messages` is truthy, the array is non-empty) and
+  // then throws deep in the spawn path (`m.role` / `m.content` on null), which escapes the async
+  // router unanswered: the connection-exhaustion shape #379 is about. Measured before the fix on
+  // this tree: zero bytes, socket still open at a 4 s deadline, one unhandled_rejection.
+  //
+  // The same array with a PRIMITIVE element (42 / "str" / true) or an object with no string `role`
+  // did NOT hang — property access on a primitive boxes rather than throws, so the element flowed
+  // through as an empty prompt and paid for a real BILLED spawn, the #360 "empty-handed" shape one
+  // level down. Both halves are the same defect: the element was never validated.
+  //
+  // Class B.1: OpenAI's message schema is the authority
+  // (https://platform.openai.com/docs/api-reference/chat/create) — each message is an object with a
+  // REQUIRED string `role`. ADR 0006's grandfather provision (4th bullet) does not extend to B.1,
+  // so the spec compels the 400. `isJsonObject` is the shared predicate (non-null, non-array
+  // object); `role` is the schema's one load-bearing field — every later dereference is safe once
+  // the element is an object, and the system/non-system split below reads `m.role` as a string.
+  // `content` is deliberately NOT validated here: `contentToText` already handles missing/null
+  // content defensively, and OpenAI permits a null `content` on an assistant message carrying
+  // `tool_calls`/refusal, so requiring it would reject valid requests.
+  const badIndex = messages.findIndex((m) => !isJsonObject(m) || typeof m.role !== "string");
+  if (badIndex !== -1) {
+    return jsonResponse(res, 400, { error: {
+      message: `messages[${badIndex}] must be an object with a string 'role'`,
+      type: "invalid_request_error",
+    } });
+  }
+
   // Multimodal validation (issue #110): when a request carries OpenAI `image_url`
   // content parts, validate/parse them now so an invalid, unsupported, or oversized
   // image returns a clean 4xx BEFORE the cache/spawn path (rather than a silent drop

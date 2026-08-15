@@ -7497,6 +7497,103 @@ ltTest("integration (#379 cases 1+2): a malformed percent-escape in a /api/keys 
   } finally { child.kill("SIGKILL"); _ltRmRetry(dir); }
 });
 
+// ── #379 case 4: a non-object message ELEMENT must be ANSWERED, not walked into ───────────────
+//
+// The last of #379's four. Cases 1+2 (the router's decodeURIComponent) and case 3 (the NaN ?limit)
+// are fixed above and below; this is the one reached through a valid OBJECT body whose `messages`
+// array carries a bad ELEMENT. `{"messages":[null]}` passes every guard #360 added — the body is
+// an object, `messages` is truthy, the array is non-empty — and then throws deep in the spawn
+// path: extractSystemPrompt / messagesToPrompt dereference `m.role` / `m.content` on null, the
+// throw escapes the async router, and nothing answers or closes the socket. Measured before the
+// fix: zero bytes, socket still open at a 4 s deadline, one unhandled_rejection.
+//
+// The SAME array with a primitive element (42 / "str" / true) or an object with no string `role`
+// did NOT hang — property access on a primitive boxes rather than throws — so the element flowed
+// through as an empty prompt and paid for a real BILLED spawn, the #360 "empty-handed" shape one
+// level down. Both halves are the same defect: the element was never validated.
+//
+// Class B.1: OpenAI's message schema is the authority
+// (https://platform.openai.com/docs/api-reference/chat/create) — each message is an object with a
+// REQUIRED string `role`. ADR 0006's grandfather provision (4th bullet) does not extend to B.1, so
+// the spec compels the 400. `content` is NOT validated here: OpenAI permits a null content on an
+// assistant message carrying tool_calls/refusal, and contentToText already handles it defensively.
+const LT379C4_BUDGET = 15000;
+const LT379C4_BAD_ELEMENTS = [
+  ["{\"messages\":[null]}", "a null element — the issue's own case 4, which HUNG before the fix"],
+  ["{\"messages\":[42]}", "a numeric element — boxes, does not throw, so it bought a billed empty spawn"],
+  ["{\"messages\":[\"str\"]}", "a string element — same billed empty spawn"],
+  ["{\"messages\":[true]}", "a boolean element — same"],
+  ["{\"messages\":[{}]}", "an object with no role — same"],
+  ["{\"messages\":[{\"content\":\"x\"}]}", "an object with content but no role"],
+  ["{\"messages\":[{\"role\":42,\"content\":\"x\"}]}", "a non-string role"],
+];
+const LT379C4_STILL_VALID = [
+  ["{\"messages\":[{\"role\":\"user\",\"content\":\"probe-379c4\"}]}", "an ordinary user message"],
+  ["{\"messages\":[{\"role\":\"system\",\"content\":\"s\"},{\"role\":\"user\",\"content\":\"u\"}]}", "system + user — the system/non-system split still reads role"],
+];
+
+ltTest("integration (#379 case 4): every non-object / role-less message element is answered 400 within a bounded time, and valid messages still spawn", async () => {
+  if (!LT_POSIX) return;
+  const dir = ltMkdir(); const fake = ltFake(dir);
+  const counter = join(dir, "spawns.txt");
+  const { child, buf, port } = await ltBootFresh(
+    { CLAUDE_BIN: fake, SP_COUNTER: counter, SP_CAPTURE: join(dir, "sp.txt") }, dir);
+  try {
+    assert.ok(await ltWait(() => buf.out.includes("listening on") || buf.spawnErr, 20000) && !buf.spawnErr,
+      `did not start: ${buf.spawnErr ? buf.spawnErr.message : buf.err.slice(0, 300)}`);
+
+    // The counter must mean "spawns caused by the bad-element probes", so seed it to "0" now —
+    // the file must EXIST before it is read, and a rejected request never spawns, so nothing
+    // else would create it (the #360 money test does the same _ltWrite before its probes).
+    _ltWrite(counter, "0");
+
+    // ── THE DEFECT. null hung; the primitives / role-less objects bought a billed empty spawn.
+    // Every one must now answer 400 within the budget, and the message must name the index.
+    for (const [body, why] of LT379C4_BAD_ELEMENTS) {
+      const r = await ltRawSend(port, {
+        method: "POST", path: "/v1/chat/completions",
+        bytes: Buffer.from(body, "utf8"), timeoutMs: LT379C4_BUDGET,
+      });
+      assert.ok(!r.timedOut,
+        `${why}: ${body}: NO RESPONSE within ${LT379C4_BUDGET}ms and the socket was never closed. ` +
+        `This is #379 case 4 itself — the element was never validated, the throw escaped the async ` +
+        `router into unhandledRejection, and the client is left holding a connection the server will ` +
+        `never release.`);
+      assert.equal(r.status, 400,
+        `${why}: ${body}: expected 400, got ${r.status}: ${r.text.slice(0, 200)}`);
+      assert.match(r.text, /must be an object with a string 'role'/,
+        `${why}: ${body}: wrong error body: ${r.text.slice(0, 200)}`);
+    }
+
+    // ── MONEY. The primitive / role-less elements would have bought a billed empty spawn; the fix
+    // must refuse them before the spawn path, so the counter stays zero.
+    const spawns = Number(_ltRead(counter, "utf8").trim() || "0");
+    assert.equal(spawns, 0,
+      `no invalid message element may reach the upstream: ${spawns} spawn(s) happened. ` +
+      `Before this PR a primitive or role-less element became an empty prompt and was forwarded as ` +
+      `a real, billed call.`);
+
+    // ── CONTROL. Valid messages must still reach the model and spawn. A guard that rejected
+    // everything would pass every assertion above and break the product.
+    for (const [body, why] of LT379C4_STILL_VALID) {
+      _ltWrite(counter, "0");
+      const ok = await ltRawSend(port, {
+        method: "POST", path: "/v1/chat/completions",
+        bytes: Buffer.from(body, "utf8"), timeoutMs: LT379C4_BUDGET,
+      });
+      assert.equal(ok.status, 200,
+        `${why}: ${body} must still be served, got ${ok.status}: ${ok.text.slice(0, 200)}. ` +
+        `The guard must refuse only invalid ELEMENTS, not narrow the endpoint.`);
+      const n = Number(_ltRead(counter, "utf8").trim() || "0");
+      assert.equal(n, 1, `${why}: expected exactly one upstream spawn, got ${n}`);
+    }
+
+    // ── Not wedged, and nothing was swallowed.
+    assert.ok(!/\"event\":\"unhandled_rejection\"/.test(buf.err),
+      `no request in this test may produce an unhandled rejection; server stderr had: ${buf.err.slice(0, 400)}`);
+  } finally { child.kill("SIGKILL"); _ltRmRetry(dir); }
+});
+
 // ── #400: a FINITE ?hours / ?limit that the SINK refuses must be ANSWERED, not walked into ────
 //
 // The residue #398 could not reach. `usageQueryInt` guarantees only that its result is FINITE, and
