@@ -4350,6 +4350,22 @@ process.on("uncaughtException", (e) =>
 // don't accumulate as open file descriptors.
 server.on("clientError", (err, socket) => { try { socket.destroy(); } catch {} });
 
+// #412: a bind failure reaches the global uncaughtException handler and is swallowed, so the
+// process stays alive and never listens. "Up but not listening" is the worst of the three states:
+// a process-liveness check passes, Restart= never fires, and every client fails — nothing an
+// operator would check says anything is wrong. Class: not endpoint-touching (no request handler,
+// no response shape). Distinguish the boot-time bind from a later error: exit non-zero ONLY when
+// the server never began serving; a post-listen error (an established connection failing) is
+// logged, not fatal — conflating them would be a different change.
+let _listening = false;
+server.on("error", (err) => {
+  if (!_listening) {
+    console.error(`FATAL: failed to bind ${BIND_ADDRESS}:${PORT} — ${err.message}`);
+    process.exit(1);
+  }
+  logEvent("error", "server_error", { error: err.message });
+});
+
 // ── Graceful shutdown ────────────────────────────────────────────────────
 let shuttingDown = false;
 
@@ -4449,6 +4465,7 @@ process.on("SIGINT", () => gracefulShutdown("SIGINT"));
 
 // ── Start ───────────────────────────────────────────────────────────────
 server.listen(PORT, BIND_ADDRESS, () => {
+  _listening = true;
   const bindMsg = BIND_ADDRESS === "0.0.0.0" ? `http://0.0.0.0:${PORT} (LAN mode)` : `http://127.0.0.1:${PORT}`;
   console.log(`openclaw-claude-proxy v${VERSION} listening on ${bindMsg}`);
   console.log(`Architecture: on-demand spawning (no pool)`);

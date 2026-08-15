@@ -3287,13 +3287,12 @@ async function ltFreePort() {
 // exists to prevent). That leaves narrowing the window's IMPACT: detect a collision and retry
 // with a FRESH port rather than reusing the one that just lost the race.
 //
-// A collided child is silent, not crashed: server.mjs installs a process-wide
-// `uncaughtException` handler that logs and swallows (server.mjs:3553), so a failed
-// `server.listen()` never reaches "listening on", never exits, and never closes on its own —
-// it just hangs until something kills it. The only signal is on stderr, written by that
-// handler's `logEvent("error", "uncaught_exception", {...})`
-// (server.mjs:862-869 -> console.error(JSON.stringify({level:"error", event:"uncaught_exception",
-// error: "listen EADDRINUSE: ..."}))). LT_EADDRINUSE_RE below is that exact shape.
+// A collided child now prints FATAL and EXITS non-zero (#412): server.mjs's server.on("error")
+// handler distinguishes the boot-time bind from a later error, so a failed server.listen() prints
+// "FATAL: failed to bind …" and process.exit(1) — it no longer reaches the process-wide
+// uncaughtException handler that used to log-and-swallow (pre-#412 it never reached "listening
+// on", never exited, and hung until something killed it). LT_EADDRINUSE_RE below matches that
+// new FATAL shape, not the old uncaught_exception line.
 //
 // The probe window (LT_COLLISION_PROBE_MS) only has to catch the DEFINITIVE collision
 // signature, not decide whether a slow-but-healthy boot will eventually succeed. On any other
@@ -3311,7 +3310,12 @@ async function ltFreePort() {
 // 7/300 (~2.3%) on Linux CI at 4-way concurrency. Treating attempts as independent draws,
 // P(all 3 collide) ~= 0.023^3 ~= 1.2e-5 -- roughly a 2000x reduction in the residual failure
 // rate for the same host conditions that produced 7/300.
-const LT_EADDRINUSE_RE = /"event":"uncaught_exception"[^\n]*EADDRINUSE/;
+// #412: a bind failure no longer reaches uncaughtException — server.on("error") prints
+// "FATAL: failed to bind <addr>:<port> — listen EADDRINUSE …" and exits non-zero. The old regex
+// matched the uncaught_exception log line; this matches the new FATAL. Both are load-bearing:
+// ltBootFresh's retry-on-collision (#219/#204) depends on this matching, or a genuine port
+// collision is treated as a generic failure and never retried.
+const LT_EADDRINUSE_RE = /FATAL: failed to bind[^\n]*EADDRINUSE/;
 // Generous, not tight: reaching server.listen() at all needs the same startup work (module
 // load, sqlite open, etc.) that a successful boot needs, so under host contention the collision
 // signature can be just as slow to appear as "listening on" is. A too-short probe doesn't cause
@@ -3723,11 +3727,10 @@ ltTest("integration (#370): TUI + non-loopback bind → the isLoopbackBind gate 
 ltTest("integration (#370): OCP_TUI_ALLOW_LAN=1 is consulted — the documented escape hatch actually opens", async () => {
   if (!LT_POSIX) return;
   const dir = ltMkdir(); const fake = ltFake(dir);
-  // ltBoot directly, not ltBootFresh: this is the one boot in the suite that deliberately never
-  // reaches "listening on" and never exits, so ltBootFresh's liveness probe has no condition to
-  // satisfy and would burn its full LT_COLLISION_PROBE_MS (45s) before returning. Its other job —
-  // retrying an EADDRINUSE port collision — cannot apply here, because the bind fails on the
-  // ADDRESS regardless of which port it is given.
+  // ltBoot directly, not ltBootFresh: this boot never reaches "listening on" — it gets PAST the
+  // gate, attempts the bind, and (post-#412) EXITS non-zero with a FATAL bind error, so ltBootFresh's
+  // liveness probe has no "listening on" to satisfy. Its other job — retrying an EADDRINUSE port
+  // collision — cannot apply here, because the bind fails on the ADDRESS regardless of port.
   const port = await ltFreePort();
   const { child, buf } = ltBoot({
     CLAUDE_TUI_MODE: "true", CLAUDE_BIND: LT_NONLOOPBACK_BIND, OCP_TUI_ALLOW_LAN: "1",
@@ -3746,6 +3749,16 @@ ltTest("integration (#370): OCP_TUI_ALLOW_LAN=1 is consulted — the documented 
     assert.ok(await ltWait(() =>
       /EADDRNOTAVAIL/.test(buf.err) || buf.out.includes("listening on") || buf.closed || buf.spawnErr),
       `boot produced no bind attempt, no listener and no exit — ${ltDiag(buf)}`);
+    // #412: the bind failure must now terminate the process. Pre-#412 this child stayed alive with
+    // EADDRNOTAVAIL logged and nothing listening — "up but not listening", the state #412 is about.
+    // The wait above returns on the FIRST EADDRNOTAVAIL line, which may precede the exit, so this is
+    // its own wait for 'close' before the non-zero assertion — buf.exit !== 0 alone is satisfied by
+    // a child that NEVER exits (undefined !== 0, since buf.exit is unset until 'exit'), which is
+    // exactly the pre-#412 state this must catch.
+    assert.ok(await ltWait(() => buf.closed || buf.spawnErr, 20000),
+      `a bind failure must now TERMINATE the child (pre-#412 it stayed alive and never listened) — ${ltDiag(buf)}`);
+    assert.notEqual(buf.exit, 0,
+      `a bind failure must exit NON-ZERO — ${ltDiag(buf)}`);
     // The safety property this whole pair rests on: TEST-NET-1 is unroutable and unassigned, so
     // "past the gate" never becomes a real listener on this machine. This is the rung that says so
     // loudly on a host where that stops holding — an interface actually holding the address, or
@@ -3760,8 +3773,8 @@ ltTest("integration (#370): OCP_TUI_ALLOW_LAN=1 is consulted — the documented 
     // observation that proves the override was honoured. Past the guard above, a run with no
     // EADDRNOTAVAIL is one that closed or failed to spawn without ever attempting a bind.
     assert.ok(/EADDRNOTAVAIL/.test(buf.err),
-      `with the override set the boot must get PAST the gate and reach listen(), but this child ` +
-      `ended without ever attempting a bind — ${ltDiag(buf)}`);
+      `with the override set the boot must get PAST the gate and reach listen(), and its FATAL must ` +
+      `name the bind failure — ${ltDiag(buf)}`);
     assert.ok(!/is unsafe/.test(buf.err),
       `OCP_TUI_ALLOW_LAN=1 must suppress the LAN gate — ${ltDiag(buf)}`);
   } finally { child.kill("SIGKILL"); _ltRmRetry(dir); }
