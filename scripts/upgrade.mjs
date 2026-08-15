@@ -1441,9 +1441,14 @@ export async function runUpgrade(opts = {}) {
   // updating both). Each sibling gets its OWN update command printed, to run as its owner.
   if (Array.isArray(doctor.units) && doctor.units.length > 1) {
     for (const u of doctor.units) {
-      const label = u.instanceName === null ? "primary" : `instance ${JSON.stringify(u.instanceName)}`;
-      const tree = u.workingTree || "(tree unknown)";
-      plan.push(`[multi-instance] ${u.name} (${label}) at ${tree} — update separately: (cd ${tree} && ./ocp update)`);
+      // Labels match doctor's own vocabulary: null = no declaration, "" = the primary, else the name.
+      const label = u.instanceName === null ? "no OCP_INSTANCE_NAME declared" : (u.instanceName === "" ? "primary" : `instance ${JSON.stringify(u.instanceName)}`);
+      if (u.workingTree) {
+        plan.push(`[multi-instance] ${u.name} (${label}) at ${u.workingTree} — update it from its own tree: (cd ${u.workingTree} && ./ocp update)`);
+      } else {
+        // No tree known -> NO paste-able command (a "cd (tree unknown)" trap is worse than no command).
+        plan.push(`[multi-instance] ${u.name} (${label}) — tree unknown, update it from its own install tree`);
+      }
     }
   }
 
