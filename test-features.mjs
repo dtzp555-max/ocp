@@ -3117,15 +3117,22 @@ function _ltLoopDiagnosis(loop) {
 // next reproduction either ties the stall to swap pressure or eliminates it. Best-effort: null when
 // the platform tooling is unreadable — a null field is an absence of measurement, not a zero.
 function _ltMemSnapshot() {
-  const mem = { rssBytes: process.memoryUsage().rss };
+  // `at` is the wall-clock reference the cumulative vm_stat counters need: a single snapshot of
+  // cumulative counters is uninterpretable without it (review F2).
+  const mem = { at: Date.now(), rssBytes: process.memoryUsage().rss };
   try {
     const out = execFileSync("vm_stat", { encoding: "utf8", timeout: 3000 });
     const get = (k) => { const m = out.match(new RegExp(k + ":\\s+(\\d+)")); return m ? Number(m[1]) : null; };
-    const used = get("Swapins") ?? get("Pages swapped");
-    mem.swapPagesIn = used;
-    const pressure = get("Pageouts");
-    mem.swapPagesOut = pressure;
-    mem.machPageSize = 4096; // macOS page size; multiplied by the counts for bytes
+    // Swapins/Swapouts, NOT Pageouts: Pageouts counts file-backed page-outs too (21.6M vs 455.4M on
+    // the review host) — the swap hypothesis is about SWAP specifically (review F1).
+    mem.swapPagesIn = get("Swapins");
+    mem.swapPagesOut = get("Swapouts");
+    // The page size is read, never hardcoded: Apple Silicon reports 16 KiB pages (review F1).
+    try {
+      const ps = execFileSync("pagesize", { encoding: "utf8", timeout: 3000 }).trim();
+      const n = Number(ps);
+      if (Number.isInteger(n) && n > 0) mem.pageSize = n;
+    } catch {}
   } catch { /* not macOS */ }
   try {
     const vmstat = _lockReadFileSync("/proc/vmstat", "utf8");
