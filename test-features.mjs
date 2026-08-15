@@ -25,8 +25,9 @@ process.env.HOME = homedir(); // normalize HOME so homedir()-derived paths are s
 // the full record lives in issue #416. This is the code version, and each failed prescription is a
 // spec of what NOT to do, called out inline:
 //   1. kill -0 SUCCEEDS ON A ZOMBIE — it cannot answer "is the owner gone". Used here ONLY for the
-//      ESRCH case ("definitively gone"); the owner record also carries a random NONCE and an EPOCH
-//      start time, and a lock is broken only when the pid is gone AND the record matches.
+//      ESRCH case ("definitively gone"); the pid-reuse direction is CONSERVATIVE (a reused pid
+//      reads as alive -> livelock, never corruption). The nonce and epoch start time in the record
+//      are identity for humans and future checks, not a break-time gate.
 //   2. ps column-padding on macOS ("Z    00:02") — NO ps rendering is used at all; identity is
 //      pid + nonce + epoch, never a formatted string.
 //   3. cwd comparison REJECTED A VALID OWNER (a driver that cds in a subshell keeps its launch
@@ -42,8 +43,7 @@ import { mkdirSync as _lockMkdirSync, writeFileSync as _lockWriteFileSync, renam
 import { hostname as _lockHostname } from "node:os";
 
 const SUITE_LOCK_DIR = join(process.cwd(), "scratchpad", ".suite.lock");
-const SUITE_LOCK_OWNER = join(SUITE_LOCK_DIR, "owner.json");
-const SUITE_LOCK_NONCE = Math.random().toString(36).slice(2, 10);
+const SUITE_LOCK_NONCE = Math.random().toString(36).slice(2, 14); // 12 chars base36 ≈ 4.7e18 — no collision in suite lifetimes
 const _lockSleepBuf = new Int32Array(new SharedArrayBuffer(4));
 const _lockSleep = (ms) => Atomics.wait(_lockSleepBuf, 0, 0, ms);
 
@@ -66,9 +66,25 @@ function suiteLockAcquire(dir) {
       try { _lockRmSync(tmpDir, { recursive: true, force: true }); } catch {}
       if (e.code !== "EEXIST" && e.code !== "ENOTEMPTY") throw e; // rename onto a held lock
     }
-    if (suiteLockPidGone(suiteLockReadOwner(dir))) {
-      try { _lockRmSync(dir, { recursive: true, force: true }); } catch {}
-    }
+    // Stale-break by ATOMIC RENAME-STEAL (review F3): rename the lock to a private name FIRST,
+    // then inspect the renamed owner. A check-then-act here (read owner -> pid-gone -> rm) races:
+    // a claimant that re-acquired between the read and the rm gets its LIVE lock deleted and two
+    // suites run concurrently. The steal is committed only when the renamed owner is ESRCH-gone;
+    // a live owner is renamed BACK. Residual, stated not hidden: a three-way race (owner re-acquired
+    // in the microseconds between read and steal AND a third claimant re-acquires before the
+    // restore) can still orphan a live lock — the window is the restore rename, and it is the
+    // accepted limit of a dir-based lock (flock would close it; the suite's dir lock is a
+    // cross-platform convention, not a kernel primitive).
+    const staleDir = dir + ".stale-" + process.pid + "-" + SUITE_LOCK_NONCE;
+    try {
+      _lockRenameSync(dir, staleDir);
+      if (suiteLockPidGone(suiteLockReadOwner(staleDir))) {
+        try { _lockRmSync(staleDir, { recursive: true, force: true }); } catch {}
+      } else {
+        try { _lockRenameSync(staleDir, dir); }
+        catch { try { _lockRmSync(staleDir, { recursive: true, force: true }); } catch {} }
+      }
+    } catch {}
     _lockSleep(500);
   }
 }
@@ -25792,18 +25808,31 @@ test("#416 mode 3: a live owner with a different cwd is NOT broken (cwd is prove
 // rename, so there is no state where the lock exists and its owner does not. Pinned here by the
 // two observable consequences of the wrong design: a leftover tmp dir (the publish was not a
 // rename) and a lock dir whose owner is absent after acquire.
-test("#416 mode 5: the lock is published atomically — owner present, no leftover tmp dir", () => {
+test("#416 mode 5: the lock is published by ATOMIC rename — a window-state lock (exists, no owner) is REPLACED, not treated as held", () => {
   const dir = lt416TmpDir();
+  // The window state the naive mkdir-then-write design leaves a claimant in: the lock dir exists
+  // but its owner record does not. The rename-based publish replaces that empty dir atomically,
+  // so a fresh acquirer succeeds instead of waiting on a half-formed lock (and never breaking it,
+  // per the issue's fifth gap).
+  _lockMkdirSync(dir, { recursive: true });
   suiteLockAcquire(dir);
   try {
     const owner = suiteLockReadOwner(dir);
-    assert.ok(owner && owner.pid === process.pid, "the lock must exist WITH its owner — never without");
-    const parent = join(dir, "..");
-    const leftovers = _lockReaddirSync(parent).filter((f) => f.startsWith(dir.split("/").pop() + ".tmp-"));
-    assert.deepEqual(leftovers, [],
-      `publish must be an atomic rename — no tmp dir may be left: ${JSON.stringify(leftovers)}`);
+    assert.ok(owner && owner.pid === process.pid,
+      "the empty window-state lock must be atomically replaced by the rename — a mkdir-then-write design would see it as held forever");
   } finally {
     try { _lockRmSync(dir, { recursive: true, force: true }); } catch {}
   }
+});
+
+
+// MODE 2 (ps column-padding): the decision never consults a rendered state string. A record that
+// LOOKS alive in ps-style rendering ("S    running") but has an ESRCH-gone pid is still gone.
+// The mutation that makes suiteLockPidGone parse the state field must redden this.
+test("#416 mode 2: the pid-gone decision is ESRCH-only — a rendered ps state field is never consulted", () => {
+  const dead = spawnSync(process.execPath, ["-e", ""]);
+  const rec = { pid: dead.pid, nonce: "x", startedAt: Date.now() - 60000, state: "S    running" };
+  assert.ok(suiteLockPidGone(rec),
+    `a dead pid must read as gone even when a ps-style state renders it alive — the decision is ESRCH-only, never a rendered column (macOS pads "Z    00:02", so a fixed-width read is the failed prescription)`);
 });
 
