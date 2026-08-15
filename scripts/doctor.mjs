@@ -1140,9 +1140,9 @@ export async function runDoctor(opts = {}) {
     const multiUnit = detectMultiUnitBootRace(opts);
     if (multiUnit.state === "warn") {
       units = multiUnit.units;
+      push("multi_unit_boot_race", "WARN", describeMultiUnitConflict(multiUnit.groups, multiUnit.identityGroups));
     } else if (multiUnit.state === "clear") {
       units = multiUnit.units; // single-install host: enumeration SUCCEEDED, so the inventory is real
-      push("multi_unit_boot_race", "WARN", describeMultiUnitConflict(multiUnit.groups, multiUnit.identityGroups));
     } else if (multiUnit.state === "declared") {
       units = multiUnit.units;
       // #327. Kept under the SAME check id deliberately: this is the same check reaching
