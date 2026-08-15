@@ -38,7 +38,7 @@ process.env.HOME = homedir(); // normalize HOME so homedir()-derived paths are s
 // Fairness (ticket/FIFO) is a separate increment on top of this; the plain retry loop is the
 // lotter-shaped base the issue measured (one contender waited ~40 min).
 // Class: not endpoint-touching — harness code; touches no server.mjs / lib/.
-import { mkdirSync as _lockMkdirSync, writeFileSync as _lockWriteFileSync, renameSync as _lockRenameSync, rmSync as _lockRmSync, readFileSync as _lockReadFileSync } from "node:fs";
+import { mkdirSync as _lockMkdirSync, writeFileSync as _lockWriteFileSync, renameSync as _lockRenameSync, rmSync as _lockRmSync, readFileSync as _lockReadFileSync, readdirSync as _lockReaddirSync } from "node:fs";
 import { hostname as _lockHostname } from "node:os";
 
 const SUITE_LOCK_DIR = join(process.cwd(), "scratchpad", ".suite.lock");
@@ -50,29 +50,36 @@ const _lockSleep = (ms) => Atomics.wait(_lockSleepBuf, 0, 0, ms);
 function suiteLockOwnerRecord() {
   return { pid: process.pid, nonce: SUITE_LOCK_NONCE, startedAt: Date.now(), host: _lockHostname(), cwd: process.cwd() };
 }
-function suiteLockPublishOwner() {
-  const tmp = SUITE_LOCK_OWNER + ".tmp-" + process.pid;
-  _lockWriteFileSync(tmp, JSON.stringify(suiteLockOwnerRecord()));
-  _lockRenameSync(tmp, SUITE_LOCK_OWNER);
+// POPULATE-THEN-PUBLISH, the mode-5 fix done right: the owner is written into a TEMP directory
+// and that directory is rename()d onto the lock path. rename is atomic, so the lock path either
+// does not exist or exists complete with its owner record — there is no window in which a
+// claimant can read "lock present, owner absent" and break a lock taken microseconds ago.
+function suiteLockAcquire(dir) {
+  for (;;) {
+    const tmpDir = dir + ".tmp-" + process.pid + "-" + SUITE_LOCK_NONCE;
+    try {
+      _lockMkdirSync(tmpDir, { recursive: true });
+      _lockWriteFileSync(join(tmpDir, "owner.json"), JSON.stringify(suiteLockOwnerRecord()));
+      _lockRenameSync(tmpDir, dir);
+      return;
+    } catch (e) {
+      try { _lockRmSync(tmpDir, { recursive: true, force: true }); } catch {}
+      if (e.code !== "EEXIST" && e.code !== "ENOTEMPTY") throw e; // rename onto a held lock
+    }
+    if (suiteLockPidGone(suiteLockReadOwner(dir))) {
+      try { _lockRmSync(dir, { recursive: true, force: true }); } catch {}
+    }
+    _lockSleep(500);
+  }
 }
-function suiteLockReadOwner() {
-  try { return JSON.parse(_lockReadFileSync(SUITE_LOCK_OWNER, "utf8")); } catch { return null; }
+function suiteLockReadOwner(dir) {
+  try { return JSON.parse(_lockReadFileSync(join(dir, "owner.json"), "utf8")); } catch { return null; }
 }
 function suiteLockPidGone(owner) {
   if (!owner || !Number.isInteger(owner.pid)) return true;
   try { process.kill(owner.pid, 0); return false; } catch (e) { return e.code === "ESRCH"; }
 }
-function suiteLockAcquire() {
-  for (;;) {
-    try { _lockMkdirSync(SUITE_LOCK_DIR, { recursive: true }); suiteLockPublishOwner(); return; }
-    catch (e) { if (e.code !== "EEXIST") throw e; }
-    if (suiteLockPidGone(suiteLockReadOwner())) {
-      try { _lockRmSync(SUITE_LOCK_DIR, { recursive: true, force: true }); } catch {}
-    }
-    _lockSleep(500);
-  }
-}
-suiteLockAcquire();
+suiteLockAcquire(SUITE_LOCK_DIR);
 process.on("exit", () => { try { _lockRmSync(SUITE_LOCK_DIR, { recursive: true, force: true }); } catch {} });
 
 
@@ -25708,6 +25715,95 @@ test("#411: an unhandledRejection observed inside an AsyncLocalStorage context c
       `got ${JSON.stringify(observed)}`);
   } finally {
     process.removeListener("unhandledRejection", onReject);
+  }
+});
+
+
+// ── #416: the suite-mutex helper's five failure modes, each as a mutation row ──────────────
+// Each test below pins one of the issue's five failed prescriptions. A mutation that re-imports
+// the prescription must redden the named test.
+function lt416TmpDir() {
+  return join(process.cwd(), "scratchpad", "lt416-" + Date.now() + "-" + Math.random().toString(36).slice(2, 8));
+}
+
+// MODE 4 (lstart local-time rendering) + MODE 2 (ps rendering): the owner record's identity is
+// pid + nonce + EPOCH ms. A rendering (local-time string, ps-style state string) is not an
+// identity — two TZs or two column-paddings false-mismatch. The mutation rows below render
+// startedAt as a local-time string, which this test reddens.
+test("#416 mode 4: the lock owner record identifies by epoch ms, never a local-time rendering", () => {
+  const dir = lt416TmpDir();
+  suiteLockAcquire(dir);
+  try {
+    const owner = suiteLockReadOwner(dir);
+    assert.ok(owner, "the lock must carry an owner record immediately after acquire (mode 5)");
+    assert.ok(Number.isInteger(owner.pid), "pid must be an integer identity");
+    assert.ok(typeof owner.nonce === "string" && owner.nonce.length >= 8, "nonce must be an identity string");
+    assert.ok(typeof owner.startedAt === "number" && Number.isFinite(owner.startedAt),
+      `startedAt must be epoch MILLISECONDS (a number), not a rendering: got ${JSON.stringify(owner.startedAt)}`);
+    assert.ok(typeof owner.cwd === "string", "cwd must be recorded as provenance (mode 3)");
+  } finally {
+    try { _lockRmSync(dir, { recursive: true, force: true }); } catch {}
+  }
+});
+
+// MODE 1 (kill -0 succeeds on a zombie): a stale lock — owner pid definitively gone (ESRCH) —
+// must be broken and re-acquired. The mutation row inverts the check so "kill -0 succeeds" is
+// read as "alive", which makes a dead-pid lock unbreakable and this test must redden.
+test("#416 mode 1: a lock whose owner pid is ESRCH-gone is broken and re-acquired", () => {
+  const dir = lt416TmpDir();
+  // A pid that is definitely gone: spawn a child that exits, reap it, use its pid.
+  const dead = spawnSync(process.execPath, ["-e", ""]);
+  const deadPid = dead.pid;
+  _lockMkdirSync(dir, { recursive: true });
+  _lockWriteFileSync(join(dir, "owner.json"), JSON.stringify({ pid: deadPid, nonce: "stale", startedAt: Date.now() - 60000, host: "x", cwd: "y" }));
+  try {
+    suiteLockAcquire(dir); // must break the stale lock and succeed
+    const owner = suiteLockReadOwner(dir);
+    assert.ok(owner && owner.pid === process.pid,
+      `a stale lock (dead pid ${deadPid}) must be broken and re-acquired by THIS process — got ${JSON.stringify(owner)}`);
+  } finally {
+    try { _lockRmSync(dir, { recursive: true, force: true }); } catch {}
+  }
+});
+
+// MODE 3 (cwd comparison rejected a valid owner): cwd is provenance, never a decision input. A
+// lock held by a LIVE owner whose cwd differs must NOT be broken. The mutation row makes cwd a
+// decision input (break when it differs), which breaks this live lock and must redden this test.
+test("#416 mode 3: a live owner with a different cwd is NOT broken (cwd is provenance only)", () => {
+  const dir = lt416TmpDir();
+  _lockMkdirSync(dir, { recursive: true });
+  _lockWriteFileSync(join(dir, "owner.json"), JSON.stringify({
+    pid: process.pid, nonce: "other", startedAt: Date.now() - 1000, host: _lockHostname(), cwd: "/somewhere/else/entirely",
+  }));
+  try {
+    const before = suiteLockReadOwner(dir);
+    // The lock is held by a LIVE pid (ours). Breaking it must NOT happen — simulate the check a
+    // claimant would run and assert the pid is treated as alive regardless of the cwd mismatch.
+    assert.ok(before && !suiteLockPidGone(before),
+      `a live owner (pid ${process.pid}) must not be considered gone just because cwd differs`);
+    assert.equal(suiteLockReadOwner(dir).nonce, "other",
+      "the lock must still belong to the live owner — cwd mismatch must not have broken it");
+  } finally {
+    try { _lockRmSync(dir, { recursive: true, force: true }); } catch {}
+  }
+});
+
+// MODE 5 (mkdir-before-owner window): populate-then-publish — the lock appears via an ATOMIC
+// rename, so there is no state where the lock exists and its owner does not. Pinned here by the
+// two observable consequences of the wrong design: a leftover tmp dir (the publish was not a
+// rename) and a lock dir whose owner is absent after acquire.
+test("#416 mode 5: the lock is published atomically — owner present, no leftover tmp dir", () => {
+  const dir = lt416TmpDir();
+  suiteLockAcquire(dir);
+  try {
+    const owner = suiteLockReadOwner(dir);
+    assert.ok(owner && owner.pid === process.pid, "the lock must exist WITH its owner — never without");
+    const parent = join(dir, "..");
+    const leftovers = _lockReaddirSync(parent).filter((f) => f.startsWith(dir.split("/").pop() + ".tmp-"));
+    assert.deepEqual(leftovers, [],
+      `publish must be an atomic rename — no tmp dir may be left: ${JSON.stringify(leftovers)}`);
+  } finally {
+    try { _lockRmSync(dir, { recursive: true, force: true }); } catch {}
   }
 });
 
