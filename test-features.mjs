@@ -2003,6 +2003,15 @@ test("--only targeted selfcheck: a spawned targeted child registers exactly the 
     assert.equal(passNames.length, expected,
       "expected " + expected + " ✓ lines, got " + passNames.length + ": " + JSON.stringify(passNames) + " :: " + out);
     assert.ok(out.indexOf("  ✗ ") === -1, "a failed test appeared in the filtered run: " + out);
+    // #374: the end-of-run stall report must actually REACH stdout. Piggy-backed here because this
+    // is the only test that runs the real runner and captures its output — and without it, deleting
+    // the `_ltReportStallLedger()` call leaves the suite at 13/0 exit 0 with the report simply gone.
+    // That is the M8 class one function over, and worse: the deleted line is what makes a GREEN run
+    // report anything at all, so its absence is invisible by exactly the mechanism this PR exists to
+    // close. Matched on the header, which prints on every run — the child's ledger is normally empty
+    // (it registers 3 non-blocking tests), so this asserts the REPORT fired, not that a stall did.
+    assert.match(out, /=== \[#374\] loop stalls >= \d+ms this run: /,
+      "the #374 stall report did not reach stdout in a real run — a green run must still report it: " + out);
     // No ⊘ SKIP for a NON-matching name. The Linux CI regression was exactly a top-level
     // testSkipped() (the #366 case-fold test on ext4) bypassing the filter and printing a ⊘ SKIP
     // line whose name does not match the marker. A MATCHING name that is platform-skipped would
@@ -3216,20 +3225,38 @@ function _ltFaultCounters() {
   const r = process.resourceUsage();
   return { majflt: r.majorPageFault, invcsw: r.involuntaryContextSwitches, volcsw: r.voluntaryContextSwitches };
 }
-// EVERY stall this process suffers, whether or not a drain was watching. This exists because the
-// calibration run for this instrument MEASURED the blind spot: a solo, guarded, otherwise-green
-// suite (1273 passed, 0 failed) contained TWO contiguous gaps of 89620ms and 76260ms — the exact
-// 76-120s STALL-NO-CPU shape this issue is about — and produced ZERO drain records, because neither
-// landed inside a drain's window. The only records that run wrote were the seven EXPECTED-CONTROLs.
+// EVERY stall this process suffers, whether or not a drain was watching.
+//
+// THE ARGUMENT IS STRUCTURAL, NOT STATISTICAL. _ltObserveDrainTimeout is reachable from exactly six
+// places: ltDrain's two branches, and four direct calls in the calibration controls. So the only
+// production path to a record runs through ltDrain, and a stall that does not overlap a live drain
+// window is UNRECORDABLE BY CONSTRUCTION. That holds regardless of how often it happens, and it is
+// the reason this ledger exists; the measurements below are corroboration, not the case.
 //
 // #419 already found one layer of this: an instrument that fires only on a TIMED-OUT drain misses
 // the ok=true face, which is why _ltLateDrains exists. This is the same finding one layer further
-// out — a stall that coincides with no drain at all is invisible to both ledgers, and on the
-// evidence above that is the COMMON case rather than the exotic one. A lever that cannot fire on
-// the event it was built for is worthless, and 2-in-1-run versus 0-recorded is what that looks like.
+// out — a stall coinciding with no drain at all is invisible to BOTH ledgers.
+//
+// Measured, on this instrument's calibration runs: a solo, guarded, otherwise-green suite (1273
+// passed, 0 failed) contained TWO contiguous gaps of 89620ms and 76260ms — the exact 76-120s
+// STALL-NO-CPU shape this issue is about — and produced ZERO drain records; the only records that
+// run wrote were the EXPECTED-CONTROLs. Across the runs measured to date, most stalls landed outside
+// any drain window and at least one landed inside one (caught by _ltLateDrains). "Most" is a
+// property of a handful of runs on two hosts, NOT a property of the phenomenon — the structural
+// argument above is what does not depend on that sample.
 //
 // Bounded, and the bound is a REPORTED number rather than a silent truncation: an instrument that
 // quietly stops recording is how you get a green reading from a saturated buffer.
+//
+// TWO LIMITATIONS, RECORDED SO A READER DOES NOT HAVE TO DISCOVER THEM:
+//   - At saturation this drops the NEWEST entries, not the oldest. Measured headroom is wide (7 of
+//     64 used on a full run, 143 gaps examined), and _ltStallLedgerDropped names the loss rather
+//     than hiding it — but if a run ever saturates, the entries it lost are the LATE ones.
+//   - A ledgered stall carries no test name. The tracer is a timer and has no idea which test was
+//     running; the harness tracks no current-test global, and adding one would mean touching the
+//     shared registration path for a reporting nicety. `atIso` is the correlation handle: drain
+//     records print inline as they happen, so a ledger entry can be located against them, but a
+//     stall between tests cannot be attributed to a test by this record alone.
 const LT_STALL_LEDGER_MAX = 64;
 const _ltStallLedger = [];
 let _ltStallLedgerDropped = 0;
@@ -3355,9 +3382,16 @@ const LT_MEM_DIAGNOSIS = Object.freeze({
   [LT_MEM_VERDICT.UNMEASURED]:
     "no bracketing tick carried a fault counter -> ABSENCE OF MEASUREMENT, not a zero: do not read this as 'no faults'",
   [LT_MEM_VERDICT.QUIET]:
-    "[measured] this process took no major page faults across the gap -> it did not page anything back in -> SWAP OF THIS PROCESS IS EXCLUDED for this window, which narrows STALL-NO-CPU's four candidates to descheduled, QoS-throttled, or blocked in a syscall",
+    "[measured] this process took no major page faults across the gap -> it did not page anything back in -> SWAP OF THIS PROCESS IS EXCLUDED for this window. CAVEAT, UNSETTLED: whether ru_majflt counts COMPRESSOR decompressions on Apple Silicon is not established here, and if it does not, a window served entirely from the compressor would read quiet while still being memory-bound -- so read the narrowing to 'descheduled, QoS-throttled, or blocked in a syscall' as conditional on that, not as given",
+  // [reasoned], NOT [measured] -- the distinction this file's own convention exists for. Every
+  // other diagnosis string here was produced by a staged control; THIS ONE NEVER HAS BEEN. No
+  // deterministic >=LT_MEM_MAJFLT_FLOOR generator was found in pure Node on the calibration host:
+  // dlopen a 4.8MB dylib -> 0, a 256MB warm file read -> 6, 512MB anon alloc+touch -> 0, 2GB
+  // alloc + re-touch -> 0, 200 spawns -> 0, a fresh 2s busy spin -> 17 once and 0 on repeat.
+  // Escalating past 2GB was refused: the host runs a live proxy and a sibling worktree. So the
+  // FAULTING branch is proven by the band table (the mapping) and by nothing else (the measurement).
   [LT_MEM_VERDICT.FAULTING]:
-    "[measured] this process took major page faults across the gap -> it WAS blocking on page-ins -> the swap hypothesis is directly supported for this window, and the host gauges below say what pressure it happened under",
+    "[reasoned] this process took major page faults across the gap -> it WAS blocking on page-ins -> the swap hypothesis is directly supported for this window, and the host gauges below say what pressure it happened under. THIS VERDICT HAS NEVER BEEN PRODUCED BY A STAGED FAULT -- only by the band table -- so treat a field occurrence as a lead to verify, not as a calibrated reading",
 });
 // The floor is a COUNT across the gap, not a rate, because the quiet-state reading is 0 rather than
 // a small number.
@@ -3379,10 +3413,18 @@ const LT_MEM_DIAGNOSIS = Object.freeze({
 // spent blocked on page-ins is thousands of faults rather than tens. The gap between 68 and 4150 is
 // wide enough that the exact floor inside it is not load-bearing — what is load-bearing is that it
 // sits ABOVE the noise this suite generates by simply running.
+// WHOSE HOST, THOUGH. The 68/52 readings above come from ONE run on ONE machine. Independent review
+// could not re-derive them: on the reviewer's host no ordinary gap exceeded majflt 2, so 32 and 128
+// are indistinguishable there and that run cannot discriminate between them. Pooled across all six
+// stalls measured to date (majflt 5, 31, 7, 2, 2, 4) every one is at or below 31, so the floor is
+// the right way round on both hosts and a floor of 32 is redder than one of 128 on either. But the
+// evidence for THIS VALUE rather than some other value above the noise rests on a single run, and
+// should be re-derived rather than inherited if the suite's first-touch behaviour changes.
 const LT_MEM_MAJFLT_FLOOR = 128;
 // Pure, so the boundary is provable by a table rather than by staging a swap-thrashing host — the
-// same split #419 used for the loop bands, and for the same reason: the measurement side (do real
-// faults produce real numbers) is a staged control, and this is the mapping side.
+// same split #419 used for the loop bands. The asymmetry is deliberate and is NOT the same as the
+// loop bands', which have controls A and B on their measurement side: here the QUIET side has a
+// staged control (control H) and the FAULTING side has NONE. See LT_MEM_DIAGNOSIS.
 function _ltClassifyMemVerdict(majfltDelta) {
   if (majfltDelta === null || majfltDelta === undefined) return LT_MEM_VERDICT.UNMEASURED;
   return majfltDelta >= LT_MEM_MAJFLT_FLOOR ? LT_MEM_VERDICT.FAULTING : LT_MEM_VERDICT.QUIET;
@@ -3656,8 +3698,12 @@ function _ltReportStallLedger() {
   const worst = _ltStallLedger.slice().sort((a, b) => b.gapMs - a.gapMs);
   console.log(`=== [#374] loop stalls >= ${LT_STALL_MIN_MS}ms this run: ${n}` +
               `${_ltStallLedgerDropped ? ` (+${_ltStallLedgerDropped} past the ${LT_STALL_LEDGER_MAX}-slot cap, NOT recorded)` : ""} ===`);
-  console.log(`    Recorded by the TICK, not by a drain: a stall that coincides with no drain is ` +
-              `invisible to both drain ledgers, and that is the common case (measured).`);
+  // States the STRUCTURAL fact, not a frequency. An earlier revision of this line ended "and that is
+  // the common case (measured)" — a sample property printed as if it were a property of the
+  // phenomenon, and the same overclaim review caught in the comment above. The reachability fact
+  // needs no sample and cannot go stale.
+  console.log(`    Recorded by the TICK, not by a drain: the only production path to a drain record ` +
+              `is ltDrain, so a stall not overlapping a live drain window is unrecordable there.`);
   for (const s of worst.slice(0, 8)) {
     console.log(`    ${s.atIso} ${String(s.gapMs).padStart(7)}ms ${s.loopVerdict}/${s.memVerdict} ` +
                 `cpu=${s.cpuMs}ms (${s.ratio}x) majflt=${s.majflt} invcsw=${s.invcsw} volcsw=${s.volcsw}`);
@@ -8999,8 +9045,14 @@ ltTest("integration (#365): a stream that ends mid-character — stdout truncati
 //
 // A tracer that has never been shown to distinguish the cases cannot be trusted when it says
 // which one occurred, so the instrument above is calibrated against staged faults BEFORE any
-// field capture is read. SEVEN controls, each pinning a DIFFERENT named diagnostic — count them
-// from the ltTest registrations below, not from this list, which is the artifact and not the prose:
+// field capture is read — with ONE named exception, stated at the end of this block because a
+// calibration claim that quietly excludes a case is worse than no claim.
+//
+// Each control pins a DIFFERENT named diagnostic. THE COUNT IS DELIBERATELY NOT WRITTEN HERE:
+// count the registrations below. This sentence said "SEVEN" while the list held nine, which is the
+// THIRD time a control count in this file has been wrong, every time in the same way — the number
+// sat next to a list that then grew. A total stated next to its own enumeration is a second source
+// of truth for something the enumeration already answers, so it is removed rather than corrected.
 //
 //   A  parent blocked, burning CPU     -> ZOMBIE-UNREAPED + STALL-CPU-BOUND
 //   B  parent blocked, consuming none  -> ZOMBIE-UNREAPED + STALL-NO-CPU
@@ -9009,9 +9061,17 @@ ltTest("integration (#365): a stream that ends mid-character — stdout truncati
 //   E  drain overran its budget and SUCCEEDED -> the face the reproduction actually produced
 //   F  child closed WHILE the drain waited    -> CLOSED-BEFORE-PROBE
 //   G  drain was never waiting on a child     -> NO-CHILD-WAS-OPEN
+//   H  real record carries real per-window fault counters -> NO-PAGE-FAULTS, bracketed to the gap
+//   I  a stall NO drain was watching          -> ledgered by the tick alone
 //
 // A-D calibrate the tracer and the probe; E-G pin the drain-outcome NAMES, which is where an
-// earlier revision printed 'positively excludes both worlds' and 'we know nothing' identically.
+// earlier revision printed 'positively excludes both worlds' and 'we know nothing' identically;
+// H-I calibrate the per-window memory axis and the tick ledger.
+//
+// THE EXCEPTION: there is no control for SELF-PAGE-FAULTING. It is the one named diagnostic in this
+// instrument that no staged fault has ever produced — only the band table's mapping. The reasons and
+// the six failed attempts to stage it are recorded at LT_MEM_DIAGNOSIS. So "calibrated against
+// staged faults" is true of every control below and false of that one verdict.
 //
 // A and B are the two readings that "starvation" conflates and that have different fixes; C is
 // the pipe-holder world the thread refuted for server.mjs children but which remains the correct
@@ -9235,6 +9295,19 @@ test("#374: the mem bands map a per-window majflt delta to all three names, and 
     "the unmeasured diagnosis must say so in words, not just in its name");
   assert.match(LT_MEM_DIAGNOSIS[LT_MEM_VERDICT.QUIET], /EXCLUDED/,
     "the quiet diagnosis must state what it excludes, or it reads as 'nothing found'");
+  // The [measured]/[reasoned] convention (see the LT_PS_DIAGNOSIS block) is only worth anything if
+  // an upgrade from one to the other has to be deliberate. SELF-PAGE-FAULTING has no staged control
+  // — it shipped tagged [measured] and review caught it — so the tag is pinned here: re-tagging it
+  // [measured] without staging a fault reddens this.
+  assert.ok(LT_MEM_DIAGNOSIS[LT_MEM_VERDICT.FAULTING].startsWith("[reasoned]"),
+    `SELF-PAGE-FAULTING has no staged control, so its diagnosis must be tagged [reasoned]: ` +
+    JSON.stringify(LT_MEM_DIAGNOSIS[LT_MEM_VERDICT.FAULTING].slice(0, 40)));
+  assert.match(LT_MEM_DIAGNOSIS[LT_MEM_VERDICT.FAULTING], /NEVER BEEN PRODUCED BY A STAGED FAULT/,
+    "and must say so in words — the tag alone is a convention a reader may not know");
+  // The compressor caveat is load-bearing on the QUIET sentence: if ru_majflt does not count
+  // compressor decompressions, the three-candidate narrowing is wrong, and that is unsettled.
+  assert.match(LT_MEM_DIAGNOSIS[LT_MEM_VERDICT.QUIET], /CAVEAT, UNSETTLED/,
+    "the quiet diagnosis must carry the compressor caveat, or it overstates what a zero excludes");
 });
 
 // The measurement half: that a REAL record, through the real ring, carries real counters, and that
