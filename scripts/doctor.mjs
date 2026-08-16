@@ -322,7 +322,10 @@ function fingerprintSystemdUnit(props, scope) {
   const bindMatch = env.match(/CLAUDE_BIND=(\S+)/);
   const bind = bindMatch ? bindMatch[1].replace(/^"|"$/g, "") : "(default bind)";
 
-  return { name: props.Id, scope, platform: "linux", port, workingTree, bind, instanceName: parseSystemdInstanceName(env) };
+  // #327 part 6: the systemd unit's `User=` (who its process runs AS), defaulting to the
+  // empty string = "scope default" — the unit record already carries `scope`, so the empty
+  // string is unambiguous (a user-scope unit runs as the invoking user by definition).
+  return { name: props.Id, scope, platform: "linux", port, workingTree, bind, user: (props.User ?? ""), instanceName: parseSystemdInstanceName(env) };
 }
 
 // #327. `null` when the unit declares no OCP_INSTANCE_NAME at all; a (trimmed) string
@@ -404,6 +407,13 @@ function parsePlistCandidates(plistBlob) {
       port: portMatch ? portMatch[1] : String(DEFAULT_PORT),
       workingTree,
       bind: bindMatch ? bindMatch[1] : "(default bind)",
+      // #327 part 6: the plist's `UserName` (who launchd runs the job AS), defaulting to the
+      // empty string = "scope default", the same convention as the systemd side. A LaunchAgent
+      // that omits UserName runs as the loading user, so "" is unambiguous given `scope`.
+      user: (() => {
+        const m = content.match(/<key>UserName<\/key>\s*<string>([^<]*)<\/string>/);
+        return m ? m[1] : "";
+      })(),
       // #327, launchd side of parseSystemdInstanceName. `<string></string>` and a
       // self-closing `<string/>` are BOTH a declaration whose value is empty (plutil
       // writes the former, a hand-written plist may carry the latter) — matching only
@@ -735,7 +745,7 @@ export function gatherUnitCandidates(run, platform) {
       userShowOut = null;
     } else {
       try {
-        userShowOut = run(`systemctl --user show ${userNames.join(" ")} -p Id -p ExecStart -p Environment -p UnitFileState -p EnvironmentFiles --no-pager`);
+        userShowOut = run(`systemctl --user show ${userNames.join(" ")} -p Id -p ExecStart -p Environment -p UnitFileState -p EnvironmentFiles -p User --no-pager`);
       } catch { userShowOut = null; }
     }
   }
@@ -744,7 +754,7 @@ export function gatherUnitCandidates(run, platform) {
       systemShowOut = null;
     } else {
       try {
-        systemShowOut = run(`systemctl show ${systemNames.join(" ")} -p Id -p ExecStart -p Environment -p UnitFileState -p EnvironmentFiles --no-pager`);
+        systemShowOut = run(`systemctl show ${systemNames.join(" ")} -p Id -p ExecStart -p Environment -p UnitFileState -p EnvironmentFiles -p User --no-pager`);
       } catch { systemShowOut = null; }
     }
   }

@@ -15,8 +15,8 @@
  */
 import { runDoctor, detectMultiUnitBootRace } from "./doctor.mjs";
 import { resolveInstallDir, classifyInstallDir } from "./lib/install-dir.mjs";
-import { execSync, execFileSync } from "node:child_process";
-import { homedir } from "node:os";
+import { execSync, execFileSync, spawn } from "node:child_process";
+import { homedir, userInfo } from "node:os";
 import { join, dirname } from "node:path";
 import { existsSync, copyFileSync, realpathSync } from "node:fs";
 import { fileURLToPath } from "node:url";
@@ -1384,6 +1384,104 @@ function resolveUpgradeTarget({ target: rawTarget, currentVersion }) {
   return { target: requested, pinned: true };
 }
 
+// ═══════════════════════════════════════════════════════════════════════════
+// #327 part 6: version probing + same-user sibling exec.
+// ═══════════════════════════════════════════════════════════════════════════
+
+// Pure semver comparison. Strips a leading "v" from either side, splits on ".", and compares
+// numerically with missing parts treated as 0. Returns null (NOT 0) when EITHER side carries a
+// non-numeric part — "cannot compare" is a different fact from "equal", and a caller that
+// conflates the two would report an unparseable sibling version as "current".
+export function compareVersions(a, b) {
+  const split = (v) => String(v).replace(/^v/, "").split(".");
+  const A = split(a);
+  const B = split(b);
+  for (const part of A.concat(B)) {
+    if (!/^\d+$/.test(part)) return null;
+  }
+  const len = Math.max(A.length, B.length);
+  for (let i = 0; i < len; i++) {
+    const x = Number(A[i] ?? 0);
+    const y = Number(B[i] ?? 0);
+    if (x !== y) return x < y ? -1 : 1;
+  }
+  return 0;
+}
+
+// Which host a sibling's /health probe should target. unit.bind is only trusted when it is a
+// PLAUSIBLE IPv4/hostname: the default-bind sentinel and the wildcard/loopback forms that cannot
+// name a reachable host all fall back to 127.0.0.1.
+function probeSiblingHost(unit) {
+  const bind = unit && unit.bind != null ? String(unit.bind) : "";
+  const implausible =
+    bind === "" ||
+    bind === "(default bind)" ||
+    bind === "0.0.0.0" ||
+    bind === "::" ||
+    bind.startsWith("::1");
+  return implausible ? "127.0.0.1" : bind;
+}
+
+// Probe one sibling instance's running version over /health. Never throws — every failure mode
+// resolves to { ok: false, reason }. fetchImpl is an injectable seam (defaults to global fetch);
+// the probe is bounded by AbortSignal.timeout(timeoutMs).
+export async function probeSiblingVersion(unit, { fetchImpl, timeoutMs = 2000 } = {}) {
+  const fetchFn = fetchImpl || globalThis.fetch;
+  const host = probeSiblingHost(unit);
+  const port = (unit && unit.port) || DEFAULT_PORT;
+  const url = "http://" + host + ":" + port + "/health";
+  try {
+    const res = await fetchFn(url, { signal: AbortSignal.timeout(timeoutMs) });
+    if (!res || !res.ok) {
+      return { ok: false, reason: "HTTP " + (res && res.status != null ? res.status : "error") };
+    }
+    const body = await res.json();
+    if (!body || body.version == null) return { ok: false, reason: "no version in /health" };
+    return { ok: true, version: body.version };
+  } catch (err) {
+    const name = err && err.name;
+    if (name === "TimeoutError" || name === "AbortError") return { ok: false, reason: "timeout" };
+    const code = err && err.cause && err.cause.code;
+    return { ok: false, reason: code || (err && err.message) || String(err) };
+  }
+}
+
+// #327 part 4 decision: "ocp update executes only for same-user instances". A user-scope unit
+// belongs to the invoking user by definition. A system-scope unit is same-user exactly when its
+// User= is the invoking username or numeric uid, OR its User= is unset ("" = scope default) and
+// the invoking uid is root (0 — root may act on a default-User system unit). Everything else
+// (a null user, a cross-user name/uid, an unknown scope) is NOT same-user: report only, never exec.
+export function isSameUserUnit(unit, { username, uid }) {
+  if (!unit) return false;
+  if (unit.scope === "user") return true;
+  if (unit.scope === "system") {
+    return (unit.user === "" && uid === 0) || unit.user === username || unit.user === String(uid);
+  }
+  return false;
+}
+
+// Real spawn wrapper (production default for opts.spawnSibling). Spawns ./ocp update in the
+// sibling's own tree with OCP_NO_SIBLING_EXEC already set in the environment, and resolves to
+// { status, signal, error } — never throws, so a sibling's failure (including a spawn error) is
+// always a report line, never a primary-upgrade failure. The error listener resolves first on a
+// failed spawn (ENOENT etc.), where no exit event fires.
+function spawnSiblingUpdate(cwd, env) {
+  return new Promise((resolve) => {
+    let settled = false;
+    const done = (r) => { if (!settled) { settled = true; resolve(r); } };
+    let child;
+    try {
+      child = spawn("./ocp", ["update"], { cwd, env, stdio: "pipe" });
+    } catch (err) {
+      done({ status: null, signal: null, error: err && err.message ? err.message : String(err) });
+      return;
+    }
+    child.on("error", (err) => done({ status: null, signal: null, error: err && err.message ? err.message : String(err) }));
+    child.on("exit", (code, signal) => done({ status: code, signal, error: null }));
+  });
+}
+
+
 export async function runUpgrade(opts = {}) {
   const dryRun = !!opts.dryRun;
   const yes = !!opts.yes;
@@ -1439,15 +1537,38 @@ export async function runUpgrade(opts = {}) {
   // the instance it was invoked from — a sibling under another Unix identity cannot be written here
   // (the isolation that motivates a second instance is exactly what prevents one process from
   // updating both). Each sibling gets its OWN update command printed, to run as its owner.
+  //
+  // #327 part 6: also probe each sibling's running version (unless skipNetwork) and annotate the
+  // line with behind/current/ahead relative to doctor.current_version. A failed probe degrades to
+  // "version unknown (probe failed: …)" — the report line still stands on its own.
   if (Array.isArray(doctor.units) && doctor.units.length > 1) {
+    const probeSibling = opts.probeSibling || probeSiblingVersion;
+    const probing = !opts.skipNetwork;
     for (const u of doctor.units) {
       // Labels match doctor's own vocabulary: null = no declaration, "" = the primary, else the name.
       const label = u.instanceName === null ? "no OCP_INSTANCE_NAME declared" : (u.instanceName === "" ? "primary" : `instance ${JSON.stringify(u.instanceName)}`);
+      let suffix = "";
+      if (probing) {
+        const probe = await probeSibling(u);
+        if (probe && probe.ok) {
+          const v = "v" + String(probe.version).replace(/^v/, "");
+          const cmp = compareVersions(probe.version, doctor.current_version);
+          suffix = cmp === null
+            ? ` — running ${v}`
+            : cmp < 0
+              ? ` — running ${v} (behind)`
+              : cmp === 0
+                ? ` — running ${v} (current)`
+                : ` — running ${v} (ahead)`;
+        } else {
+          suffix = ` — version unknown (probe failed: ${probe ? probe.reason : "no probe result"})`;
+        }
+      }
       if (u.workingTree) {
-        plan.push(`[multi-instance] ${u.name} (${label}) at ${u.workingTree} — update it from its own tree: (cd ${u.workingTree} && ./ocp update)`);
+        plan.push(`[multi-instance] ${u.name} (${label}) at ${u.workingTree} — update it from its own tree: (cd ${u.workingTree} && ./ocp update)${suffix}`);
       } else {
         // No tree known -> NO paste-able command (a "cd (tree unknown)" trap is worse than no command).
-        plan.push(`[multi-instance] ${u.name} (${label}) — tree unknown, update it from its own install tree`);
+        plan.push(`[multi-instance] ${u.name} (${label}) — tree unknown, update it from its own install tree${suffix}`);
       }
     }
   }
@@ -1550,17 +1671,17 @@ export async function runUpgrade(opts = {}) {
   }
 
   if (kind === "upgrade") {
-    return await runFullUpgrade({ doctor, opts });
+    return await runFullUpgrade({ doctor, opts, prePlan: plan });
   }
 
   if (kind === "fresh_install") {
-    return await runFreshInstall({ doctor, opts });
+    return await runFreshInstall({ doctor, opts, prePlan: plan });
   }
 
   throw new Error(`path ${kind} not yet implemented`);
 }
 
-async function runFullUpgrade({ doctor, opts }) {
+async function runFullUpgrade({ doctor, opts, prePlan }) {
   const phases = [];
   let snapshotPath = null;
   // Issue #347 test seam. `opts.execFn(cmd)` — string in, throws on nonzero exit — replaces the
@@ -2266,7 +2387,34 @@ async function runFullUpgrade({ doctor, opts }) {
     // pin when one was given, doctor.latest_version otherwise. Observable/testable independent
     // of the real (non-mockExec) git/curl branches above, which this suite never exercises for
     // real (see this file's own test-features.mjs coverage note).
-    return { path: "upgrade", executed: true, changed: true, snapshotPath, phases, target: upgradeTarget };
+
+    // #327 part 6: same-user sibling exec (full-upgrade path ONLY — the recorded scope; noop/
+    // light/restart/dry-run keep the print-only report above). After the primary's own phases and
+    // post-flight succeed, update each same-user sibling by spawning "./ocp update" in its own tree.
+    // Cross-user siblings are NEVER exec'd — their command was already printed above for their owner
+    // to run. A sibling's failure (spawn error, nonzero exit, signal) is a report line, never a
+    // primary-upgrade failure. Sequential by design (one sibling at a time, no timeout).
+    const execSiblings = opts.execSiblings !== false && process.env.OCP_NO_SIBLING_EXEC !== "1";
+    if (execSiblings && Array.isArray(doctor.units) && doctor.units.length > 1) {
+      const spawnSibling = opts.spawnSibling || spawnSiblingUpdate;
+      const username = userInfo().username;
+      const uid = typeof process.getuid === "function" ? process.getuid() : null;
+      for (const u of doctor.units) {
+        if (!u.workingTree) continue;
+        if (u.workingTree === ocpDir) continue; // the very tree this update just mutated
+        if (!isSameUserUnit(u, { username, uid })) continue;
+        const r = await spawnSibling(u.workingTree, { ...process.env, OCP_NO_SIBLING_EXEC: "1" });
+        if (r && r.error) {
+          prePlan.push(`[multi-instance] ${u.name} spawn failed: ${r.error}`);
+        } else if (r && r.signal) {
+          prePlan.push(`[multi-instance] ${u.name} update executed: signal ${r.signal}`);
+        } else {
+          prePlan.push(`[multi-instance] ${u.name} update executed: exit ${r ? r.status : "unknown"}`);
+        }
+      }
+    }
+
+    return { path: "upgrade", executed: true, changed: true, snapshotPath, phases, target: upgradeTarget, plan: prePlan };
   } catch (err) {
     // Issue #347: `hint` is now set at the throw site for the restart-failure cells, and that
     // hint leads with SERVICE state. This generic one is about TREE state.
@@ -2294,7 +2442,7 @@ async function runFullUpgrade({ doctor, opts }) {
   }
 }
 
-async function runFreshInstall({ doctor, opts }) {
+async function runFreshInstall({ doctor, opts, prePlan }) {
   // Issue #227: doctor selecting kind="fresh_install" used to be enough, combined with the
   // SAME --yes flag every other non-interactive `ocp update` invocation already passes (see
   // `ocp update --yes` in `ocp`'s own help text, "AI agents pass this", and doctor.mjs's own
@@ -2401,7 +2549,7 @@ async function runFreshInstall({ doctor, opts }) {
       }
     }
   }
-  return { path: "fresh_install", executed: true, changed: true, steps };
+  return { path: "fresh_install", executed: true, changed: true, steps, plan: prePlan };
 }
 
 async function runRollback(opts) {

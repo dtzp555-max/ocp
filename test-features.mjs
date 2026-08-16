@@ -9000,7 +9000,7 @@ ltTest("integration: ltTest serialization keeps peak concurrent server.mjs child
 });
 
 // ── Upgrade Tests ──
-import { runUpgrade, postFlightOk, runPostFlightCheck, parseFlagValue, classifyPostFlightProbeFailure, postFlightFailureSuffix, probeLaunchdDomains, execRestartRetry, RESTART_ATTEMPTS, recoveryPlanCommands, postFlightOnlyCommand, classifyPostFlightBodyRejection, postFlightWant, postFlightRecheckClause, classifyRestartOutcome, RESTART_VERDICT, restartOwnerRecoveryNote, restoreRetryBudget } from "./scripts/upgrade.mjs";
+import { runUpgrade, postFlightOk, runPostFlightCheck, parseFlagValue, classifyPostFlightProbeFailure, postFlightFailureSuffix, probeLaunchdDomains, execRestartRetry, RESTART_ATTEMPTS, recoveryPlanCommands, postFlightOnlyCommand, classifyPostFlightBodyRejection, postFlightWant, postFlightRecheckClause, classifyRestartOutcome, RESTART_VERDICT, restartOwnerRecoveryNote, restoreRetryBudget, compareVersions, probeSiblingVersion, isSameUserUnit } from "./scripts/upgrade.mjs";
 
 console.log("\nUpgrade:");
 
@@ -19290,13 +19290,14 @@ function plistBlob(files) {
 // #327: `instance` emits a normal `<string>…</string>` declaration; `instanceXml` injects a raw
 // fragment so a test can produce the self-closing `<string/>` shape a hand-written plist can
 // carry. Both omitted → no OCP_INSTANCE_NAME key at all, which is a THIRD, distinct state.
-function ocpPlist({ label, port, bind, runAtLoad = true, serverPath = "/Users/opc/ocp/server.mjs", instance, instanceXml }) {
+function ocpPlist({ label, port, bind, runAtLoad = true, serverPath = "/Users/opc/ocp/server.mjs", instance, instanceXml, userName }) {
   const runAtLoadXml = runAtLoad === null ? "" : `<key>RunAtLoad</key><${runAtLoad ? "true" : "false"}/>`;
   return runAtLoadXml +
     (label != null ? `<key>Label</key><string>${label}</string>` : "") +
     `<key>ProgramArguments</key><array><string>/usr/bin/node</string><string>${serverPath}</string></array>` +
     (port ? `<key>CLAUDE_PROXY_PORT</key><string>${port}</string>` : "") +
     (bind ? `<key>CLAUDE_BIND</key><string>${bind}</string>` : "") +
+    (userName !== undefined ? `<key>UserName</key><string>${userName}</string>` : "") +
     (instanceXml ? instanceXml : instance !== undefined ? `<key>OCP_INSTANCE_NAME</key><string>${instance}</string>` : "");
 }
 function disabledLaunchctlBlob(entries) {
@@ -20005,12 +20006,15 @@ console.log("\n#327 — declared second instance vs leftover duplicate (classify
 // One `systemctl show` block. `instance` is three-valued on purpose, matching the three real
 // states the parser must keep apart: undefined → no OCP_INSTANCE_NAME directive at all, "" →
 // the directive present with an empty value, "name" → a declared name.
-function unitShow({ id, port = 3456, instance, tree = "/home/opc/ocp", bind = null, raw = null }) {
+function unitShow({ id, port = 3456, instance, tree = "/home/opc/ocp", bind = null, raw = null, user }) {
   const env = [`CLAUDE_PROXY_PORT=${port}`];
   if (bind) env.push(`CLAUDE_BIND=${bind}`);
   if (raw !== null) env.push(raw);
   else if (instance !== undefined) env.push(`OCP_INSTANCE_NAME=${instance}`);
-  return `Id=${id}\nExecStart={ argv[]=/usr/bin/node ${tree}/server.mjs ; }\nEnvironment=${env.join(" ")}`;
+  // #327 part 6: optional `User` line, so tests can assert the parsed `user` field. Absent → the
+  // parser must default to "" (scope default), which is the point of the absent-User test.
+  const userLine = user !== undefined ? `\nUser=${user}` : "";
+  return `Id=${id}\nExecStart={ argv[]=/usr/bin/node ${tree}/server.mjs ; }\nEnvironment=${env.join(" ")}${userLine}`;
 }
 const linuxRisk = (userShowOut, systemShowOut) =>
   classifyMultiUnitRisk({ platform: "linux", userShowOut, systemShowOut });
@@ -25952,7 +25956,10 @@ test("#327 part 5: runDoctor's --json result carries the structured per-host uni
 
 test("#327 part 4: a multi-instance host's plan reports each sibling with its own update command", async () => {
   const result = await runUpgrade({
-    dryRun: true, yes: true,
+    // #430 review F1: this pre-existing test must never fire the default sibling probe — that is a
+    // real GET /health at the unit's port, and its fixture's primary port is 3456, the LIVE
+    // production proxy. skipNetwork suppresses the probe (the suffix is not asserted here).
+    dryRun: true, yes: true, skipNetwork: true,
     mockDoctor: {
       ready_to_upgrade: true, next_action: { kind: "upgrade" },
       current_version: "v3.29.1", latest_version: "v3.29.2",
@@ -25970,6 +25977,274 @@ test("#327 part 4: a multi-instance host's plan reports each sibling with its ow
   assert.ok(report.some((l) => l.includes("(cd /opt/ocp-wifibot && ./ocp update)")),
     "the sibling's OWN tree and update command must be printed — report, never cross-identity act");
   assert.ok(!report.some((l) => l.includes("(tree unknown)")), "workingTree is in the record; an unknown tree would be a regression");
+});
+
+console.log("\n#327 part 6 — doctor.mjs unit records carry a `user` field:");
+
+test("#327 part 6: Linux systemd unit with User=otheruser parses user:\"otheruser\"", () => {
+  const result = linuxRisk(
+    unitShow({ id: "ocp.service", port: 3456, user: "otheruser" }),
+    unitShow({ id: "ocp-wifibot.service", port: 3457, instance: "wifibot" }),
+  );
+  const byName = Object.fromEntries(result.units.map(u => [u.name, u]));
+  assert.equal(byName["ocp.service"].user, "otheruser", "User= must be read off the show block, not defaulted away");
+});
+
+test("#327 part 6: absent User= on a systemd unit parses to the empty string (scope default)", () => {
+  const result = linuxRisk(
+    unitShow({ id: "ocp.service", port: 3456 }),
+    unitShow({ id: "ocp-wifibot.service", port: 3457, instance: "wifibot" }),
+  );
+  const byName = Object.fromEntries(result.units.map(u => [u.name, u]));
+  assert.equal(byName["ocp.service"].user, "", "absent User= means scope default, which is the empty string");
+});
+
+test("#327 part 6: macOS plist UserName is parsed into the user field", () => {
+  const blob = plistBlob([
+    ["/Users/opc/Library/LaunchAgents/dev.ocp.proxy.plist", ocpPlist({ label: "dev.ocp.proxy", port: "3456", userName: "opc" })],
+    ["/Library/LaunchDaemons/com.ocp.daemon.plist", ocpPlist({ label: "com.ocp.daemon", port: "3457", instance: "daemon", userName: "daemonuser" })],
+  ]);
+  const result = classifyMultiUnitRisk({ platform: "darwin", plistBlob: blob });
+  const byName = Object.fromEntries(result.units.map(u => [u.name, u]));
+  assert.equal(byName["dev.ocp.proxy"].user, "opc", "a personal LaunchAgent's UserName must be parsed");
+  assert.equal(byName["com.ocp.daemon"].user, "daemonuser", "a LaunchDaemon's UserName must be parsed too");
+});
+
+test("#327 part 6: absent UserName in a plist parses to the empty string (scope default)", () => {
+  const blob = plistBlob([
+    ["/Users/opc/Library/LaunchAgents/dev.ocp.proxy.plist", ocpPlist({ label: "dev.ocp.proxy", port: "3456" })],
+  ]);
+  const result = classifyMultiUnitRisk({ platform: "darwin", plistBlob: blob });
+  assert.equal(result.units[0].user, "", "absent UserName means scope default, which is the empty string");
+});
+
+console.log("\n#327 part 6 — compareVersions / probeSiblingVersion unit tests:");
+
+test("#327 part 6: compareVersions strips a leading v and compares numerically", () => {
+  assert.equal(compareVersions("v3.29.2", "3.29.2"), 0);
+  assert.equal(compareVersions("v3.29.1", "v3.29.2"), -1);
+  assert.equal(compareVersions("3.30.0", "v3.29.9"), 1);
+});
+
+test("#327 part 6: compareVersions treats missing parts as 0", () => {
+  assert.equal(compareVersions("v3.29", "3.29.0"), 0);
+  assert.equal(compareVersions("3", "3.0.0"), 0);
+  assert.equal(compareVersions("3.29", "3.29.1"), -1);
+  assert.equal(compareVersions("3.29.2", "3.29"), 1);
+});
+
+test("#327 part 6: compareVersions returns null when either side has a non-numeric part", () => {
+  assert.equal(compareVersions("v3.29.x", "3.29.2"), null, "a non-numeric part is un-comparable, never 'equal'");
+  assert.equal(compareVersions("3.29.2", "v3.29.2-rc1"), null);
+  assert.equal(compareVersions("not.a.version", "3.29.2"), null);
+  assert.equal(compareVersions("", "3.29.2"), null);
+});
+
+test("#327 part 6: probeSiblingVersion targets 127.0.0.1 for (default bind)", async () => {
+  const urls = [];
+  const r = await probeSiblingVersion(
+    { bind: "(default bind)", port: "3456" },
+    { fetchImpl: async (url) => { urls.push(url); return { ok: true, json: async () => ({ version: "3.29.2" }) }; } },
+  );
+  assert.equal(r.ok, true);
+  assert.equal(urls[0], "http://127.0.0.1:3456/health", `got ${JSON.stringify(urls)}`);
+});
+
+test("#327 part 6: probeSiblingVersion targets 127.0.0.1 for 0.0.0.0", async () => {
+  const urls = [];
+  await probeSiblingVersion(
+    { bind: "0.0.0.0", port: "3457" },
+    { fetchImpl: async (url) => { urls.push(url); return { ok: true, json: async () => ({ version: "3.29.2" }) }; } },
+  );
+  assert.equal(urls[0], "http://127.0.0.1:3457/health", `got ${JSON.stringify(urls)}`);
+});
+
+test("#327 part 6: probeSiblingVersion keeps a real IPv4 bind", async () => {
+  const urls = [];
+  await probeSiblingVersion(
+    { bind: "192.168.1.5", port: "3456" },
+    { fetchImpl: async (url) => { urls.push(url); return { ok: true, json: async () => ({ version: "3.29.2" }) }; } },
+  );
+  assert.equal(urls[0], "http://192.168.1.5:3456/health", `got ${JSON.stringify(urls)}`);
+});
+
+console.log("\n#327 part 6 — probe suffix on the [multi-instance] report lines:");
+
+function _p6Doctor() {
+  return {
+    ready_to_upgrade: true, next_action: { kind: "upgrade" },
+    current_version: "v3.29.1", latest_version: "v3.29.2",
+    units: [
+      { name: "ocp.service", port: 3456, instanceName: null, workingTree: "/home/opc/ocp", bind: "(default bind)" },
+      { name: "ocp-wifibot.service", port: 3457, instanceName: "wifibot", workingTree: "/opt/ocp-wifibot", bind: "127.0.0.1" },
+    ],
+  };
+}
+
+test("#327 part 6: a sibling running an OLDER version is reported (behind)", async () => {
+  const result = await runUpgrade({
+    dryRun: true, yes: true,
+    probeSibling: async () => ({ ok: true, version: "v3.29.0" }),
+    mockDoctor: _p6Doctor(),
+  });
+  const report = result.plan.filter(l => l.includes("[multi-instance]") && l.includes("running"));
+  assert.equal(report.length, 2, `both siblings get a running-version suffix; got ${JSON.stringify(report)}`);
+  assert.ok(report.every(l => l.includes("running v3.29.0 (behind)")), `v3.29.0 < v3.29.1 must read behind; got ${JSON.stringify(report)}`);
+});
+
+test("#327 part 6: a sibling running the SAME version is reported (current)", async () => {
+  const result = await runUpgrade({
+    dryRun: true, yes: true,
+    probeSibling: async () => ({ ok: true, version: "v3.29.1" }),
+    mockDoctor: _p6Doctor(),
+  });
+  const report = result.plan.filter(l => l.includes("[multi-instance]") && l.includes("running"));
+  assert.equal(report.length, 2, `both siblings get a running-version suffix; got ${JSON.stringify(report)}`);
+  assert.ok(report.every(l => l.includes("running v3.29.1 (current)")), `equal versions must read current; got ${JSON.stringify(report)}`);
+});
+
+test("#327 part 6: a sibling running a NEWER version is reported (ahead)", async () => {
+  const result = await runUpgrade({
+    dryRun: true, yes: true,
+    probeSibling: async () => ({ ok: true, version: "v3.29.2" }),
+    mockDoctor: _p6Doctor(),
+  });
+  const report = result.plan.filter(l => l.includes("[multi-instance]") && l.includes("running"));
+  assert.equal(report.length, 2, `both siblings get a running-version suffix; got ${JSON.stringify(report)}`);
+  assert.ok(report.every(l => l.includes("running v3.29.2 (ahead)")), `v3.29.2 > v3.29.1 must read ahead; got ${JSON.stringify(report)}`);
+});
+
+test("#327 part 6: a probe failure degrades to 'version unknown (probe failed: …)'", async () => {
+  const result = await runUpgrade({
+    dryRun: true, yes: true,
+    probeSibling: async () => ({ ok: false, reason: "ECONNREFUSED" }),
+    mockDoctor: _p6Doctor(),
+  });
+  const report = result.plan.filter(l => l.includes("[multi-instance]"));
+  assert.ok(report.every(l => l.includes("version unknown (probe failed: ECONNREFUSED)")), `got ${JSON.stringify(report)}`);
+});
+
+test("#327 part 6: skipNetwork:true → no probe called and no suffix", async () => {
+  let calls = 0;
+  const result = await runUpgrade({
+    dryRun: true, yes: true, skipNetwork: true,
+    probeSibling: async () => { calls += 1; return { ok: true, version: "v3.29.2" }; },
+    mockDoctor: _p6Doctor(),
+  });
+  assert.equal(calls, 0, "skipNetwork must suppress the probe entirely");
+  const report = result.plan.filter(l => l.includes("[multi-instance]"));
+  assert.ok(report.every(l => !l.includes("running") && !l.includes("version unknown")), `no probe suffix expected; got ${JSON.stringify(report)}`);
+});
+
+console.log("\n#327 part 6 — plan threading through the real full-upgrade path:");
+
+test("#327 part 6: the full-upgrade path returns result.plan with the [doctor] and [multi-instance] lines", async () => {
+  const result = await runUpgrade({
+    yes: true, dryRun: false, mockExec: true, skipNetwork: true, execSiblings: false,
+    mockDoctor: {
+      ready_to_upgrade: true, next_action: { kind: "upgrade" },
+      current_version: "v3.29.1", latest_version: "v3.29.2",
+      units: [
+        { name: "ocp.service", port: 3456, instanceName: null, workingTree: "/home/opc/ocp", bind: "(default bind)" },
+        { name: "ocp-wifibot.service", port: 3457, instanceName: "wifibot", workingTree: "/opt/ocp-wifibot", bind: "127.0.0.1" },
+      ],
+    },
+  });
+  assert.equal(result.path, "upgrade");
+  assert.ok(Array.isArray(result.plan), `the full-upgrade result must carry the threaded plan; got ${JSON.stringify(result.plan)}`);
+  assert.ok(result.plan.some(l => l.includes("[doctor]")), `[doctor] line must survive the full path; got ${JSON.stringify(result.plan)}`);
+  assert.ok(result.plan.some(l => l.includes("[multi-instance]")), `[multi-instance] lines must survive the full path; got ${JSON.stringify(result.plan)}`);
+});
+
+console.log("\n#327 part 6 — same-user sibling exec (full-upgrade path only):");
+
+test("#327 part 6: full upgrade execs same-user siblings, skips cross-user, records exit codes", async () => {
+  const spawns = [];
+  const result = await runUpgrade({
+    yes: true, mockExec: true, skipNetwork: true,
+    ocpDir: "/home/opc/ocp",
+    spawnSibling: (cwd, env) => { spawns.push({ cwd, env }); return { status: 0, signal: null, error: null }; },
+    mockDoctor: {
+      ready_to_upgrade: true, next_action: { kind: "upgrade" },
+      current_version: "v3.29.1", latest_version: "v3.29.2",
+      units: [
+        { name: "ocp.service", scope: "user", user: "", workingTree: "/home/opc/ocp" },
+        { name: "ocp-wifibot.service", scope: "user", user: "", workingTree: "/opt/ocp-wifibot" },
+        { name: "ocp-other.service", scope: "system", user: "otheruser", workingTree: "/opt/ocp-other" },
+      ],
+    },
+  });
+  assert.equal(result.path, "upgrade");
+  assert.equal(spawns.length, 1, `exactly one same-user sibling must be exec'd; got ${JSON.stringify(spawns.map(s => s.cwd))}`);
+  assert.equal(spawns[0].cwd, "/opt/ocp-wifibot", "the sibling's OWN tree must be the spawn cwd");
+  assert.equal(spawns[0].env.OCP_NO_SIBLING_EXEC, "1", "the child must inherit the recursion guard");
+  assert.ok(result.plan.some(l => l.includes("ocp-wifibot.service update executed: exit 0")), `got ${JSON.stringify(result.plan)}`);
+  assert.ok(!result.plan.some(l => l.includes("ocp-other.service update executed")), "a cross-user sibling must never be exec'd");
+});
+
+test("#327 part 6: a sibling spawn failure is recorded, and the primary upgrade still succeeds", async () => {
+  const result = await runUpgrade({
+    yes: true, mockExec: true, skipNetwork: true,
+    ocpDir: "/home/opc/ocp",
+    spawnSibling: () => ({ status: null, signal: null, error: "ENOENT" }),
+    mockDoctor: {
+      ready_to_upgrade: true, next_action: { kind: "upgrade" },
+      current_version: "v3.29.1", latest_version: "v3.29.2",
+      units: [
+        { name: "ocp.service", scope: "user", user: "", workingTree: "/home/opc/ocp" },
+        { name: "ocp-wifibot.service", scope: "user", user: "", workingTree: "/opt/ocp-wifibot" },
+      ],
+    },
+  });
+  assert.equal(result.path, "upgrade", "a sibling failure must never fail the primary upgrade");
+  assert.ok(result.plan.some(l => l.includes("ocp-wifibot.service spawn failed: ENOENT")), `got ${JSON.stringify(result.plan)}`);
+});
+
+test("#327 part 6: opts.execSiblings:false → no sibling spawns", async () => {
+  let spawns = 0;
+  const result = await runUpgrade({
+    yes: true, mockExec: true, skipNetwork: true, execSiblings: false,
+    ocpDir: "/home/opc/ocp",
+    spawnSibling: () => { spawns += 1; return { status: 0, signal: null, error: null }; },
+    mockDoctor: {
+      ready_to_upgrade: true, next_action: { kind: "upgrade" },
+      current_version: "v3.29.1", latest_version: "v3.29.2",
+      units: [
+        { name: "ocp.service", scope: "user", user: "", workingTree: "/home/opc/ocp" },
+        { name: "ocp-wifibot.service", scope: "user", user: "", workingTree: "/opt/ocp-wifibot" },
+      ],
+    },
+  });
+  assert.equal(spawns, 0, "execSiblings:false must suppress every spawn");
+  assert.ok(!result.plan.some(l => l.includes("update executed")), `got ${JSON.stringify(result.plan)}`);
+});
+
+console.log("\n#327 part 6 — isSameUserUnit unit tests:");
+
+test("#327 part 6: isSameUserUnit — user scope is always same-user", () => {
+  assert.equal(isSameUserUnit({ scope: "user", user: "" }, { username: "opc", uid: 1000 }), true);
+  assert.equal(isSameUserUnit({ scope: "user", user: "other" }, { username: "opc", uid: 1000 }), true, "user scope belongs to the invoking user regardless of any User= value");
+});
+
+test("#327 part 6: isSameUserUnit — system scope with empty user is same-user only for uid 0", () => {
+  assert.equal(isSameUserUnit({ scope: "system", user: "" }, { username: "root", uid: 0 }), true);
+  assert.equal(isSameUserUnit({ scope: "system", user: "" }, { username: "opc", uid: 1000 }), false);
+});
+
+test("#327 part 6: isSameUserUnit — system scope named-user match", () => {
+  assert.equal(isSameUserUnit({ scope: "system", user: "opc" }, { username: "opc", uid: 1000 }), true);
+  assert.equal(isSameUserUnit({ scope: "system", user: "otheruser" }, { username: "opc", uid: 1000 }), false);
+});
+
+test("#327 part 6: isSameUserUnit — system scope numeric-uid match", () => {
+  assert.equal(isSameUserUnit({ scope: "system", user: "1000" }, { username: "opc", uid: 1000 }), true);
+  assert.equal(isSameUserUnit({ scope: "system", user: "1001" }, { username: "opc", uid: 1000 }), false);
+});
+
+test("#327 part 6: isSameUserUnit — null user / unknown scope is never same-user", () => {
+  assert.equal(isSameUserUnit({ scope: "system", user: null }, { username: "opc", uid: 0 }), false, "a null user is not same-user even for root");
+  assert.equal(isSameUserUnit({ scope: "weird", user: "opc" }, { username: "opc", uid: 1000 }), false, "an unknown scope is not same-user");
+  assert.equal(isSameUserUnit(null, { username: "opc", uid: 1000 }), false);
 });
 
 
