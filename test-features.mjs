@@ -9719,9 +9719,19 @@ test("#374 mem snapshot: the record carries a wall-clock `at` and this process's
 // redden. That is a property of the host, not of the test — this repo's workstation reports 16384
 // (Apple Silicon), which is what made the original hardcode 4x wrong and what makes the row real
 // here. On Linux no pageSize is recorded — stated as the observation it is, not as "by design"
-// (#439 review F4): what the source shows is that the `pagesize` read sits nested inside the
-// `vm_stat` arm, so the Linux path never reaches it. Whether that placement was a decision or an
-// accident is not something the code evidences, and this comment should not claim it.
+// (#439 review F4). THE MECHANISM BEHIND THAT OBSERVATION CHANGED UNDER THIS COMMENT and is
+// corrected rather than left standing: #439 wrote that "the `pagesize` read sits nested inside the
+// `vm_stat` arm, so the Linux path never reaches it", which was true of the source it was written
+// against. There is no longer a `pagesize` read at all — the page size is parsed from `vm_stat`'s
+// OWN header ("page size of N bytes"), because spawning `pagesize` measured 3.7424 ms, the most
+// expensive probe in the set and 3.3x `vm_stat` itself, for a number already sitting in output the
+// snapshot had in hand. So the conclusion survives for a NEW reason: pageSize comes from `vm_stat`,
+// and `vm_stat` is a darwin tool, so the Linux path records none.
+//
+// #439's F4 point stands unchanged and is worth restating for the next reader: this is what the
+// source shows, not a claim about intent. What this test asserts is unaffected either way — that
+// the recorded page size equals what the platform reports — and it is now the CROSS-CHECK on the
+// vm_stat-header parse, which is a stronger thing to be pinning than it was when written.
 if (process.platform === "darwin") {
   test("#374 mem snapshot: pageSize is READ from the platform, never hardcoded", () => {
     const real = Number(execFileSync("pagesize", { encoding: "utf8", timeout: 3000 }).trim());
@@ -9733,7 +9743,7 @@ if (process.platform === "darwin") {
   });
 } else {
   testSkipped("#374 mem snapshot: pageSize is READ from the platform, never hardcoded",
-    `pageSize is recorded only on darwin (the pagesize read is nested in the vm_stat arm); this host is ${process.platform}`);
+    `pageSize is recorded only on darwin (it is parsed from vm_stat's own header, and vm_stat is a darwin tool); this host is ${process.platform}`);
 }
 
 // Direction. Registered conditionally on evidence gathered BEFORE registration, because the
