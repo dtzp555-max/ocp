@@ -26815,15 +26815,50 @@ lockTest("#423 F2: a LIVE owner's lock is not broken by a real contender, whatev
     // text BYTE-IDENTICAL to MA3's genuine red (both report `null`), which is the worst property a
     // flake can have: indistinguishable from the finding it would be mistaken for.
     //
-    // It cannot be told apart by VALUE, so it is told apart by DURATION. The window closes in
-    // microseconds; a lock that was actually broken never comes back. Re-reading across ~200 ms
-    // turns the flake into a pass and leaves a genuine break failing — with its own message, which
-    // is the second half of the fix: the two are no longer the same sentence.
+    // It cannot be told apart by VALUE, so it is told apart by WHETHER THE CONTENDER IS STILL
+    // RUNNING — not, as the first fix did, by a wall-clock budget.
+    //
+    // That first fix re-read 20 times across ~200 ms. It worked, and the #437 review measured its
+    // margin honestly (maximum CONTIGUOUS absence 1 ms idle, still 1 ms under 12 CPU loaders — 200x).
+    // But its residual was labelled reasoned-not-measured, and the residual was a **#374-class stall
+    // landing between the two renames**, which is the one host condition this repo knows it has. So
+    // the file would have been arguing against itself: LT_LOCK_WAIT_MS five lines up is 60 s
+    // precisely because "a timeout tuned to the 0.08 s happy path would report one of those as a
+    // lock defect", and a 200 ms budget here is exactly such a tuning.
+    //
+    // `c.exited` removes the assumption rather than sizing it. The steal window can only be open
+    // while a contender is RUNNING — it is bounded by two renames inside one live process — so:
+    //   contender alive  + record absent -> the window, however long the host stretches it: re-read
+    //   contender exited + record absent -> the lock was broken and then released: fail
+    // It is also FASTER on the real defect. Under MA3 the contender acquires, runs and exits in
+    // ~600 ms, so by this read at T+1500 ms it is already gone and the loop exits on its first
+    // condition check — where the wall-clock form burned 200 ms of retries first.
+    //
+    // The LT_LOCK_WAIT_MS backstop below is not a discriminator, it is a "this cannot happen"
+    // bound: absent record AND live contender for a full minute is neither the window nor a break,
+    // and it must surface as a named failure rather than a hang.
     let owner = suiteLockReadOwner(lockDir);
-    for (let i = 0; i < 20 && owner === null; i++) { await lt416Sleep(10); owner = suiteLockReadOwner(lockDir); }
+    const readStart = Date.now();
+    while (owner === null && c.exited === null) {
+      if (Date.now() - readStart > LT_LOCK_WAIT_MS) {
+        throw new Error(`the lock record stayed absent for ${LT_LOCK_WAIT_MS}ms while the contender was ` +
+          `STILL RUNNING — that is neither the steal window (bounded by two renames) nor a break ` +
+          `(which releases on exit), so the premise of this test no longer holds`);
+      }
+      await lt416Sleep(10);
+      owner = suiteLockReadOwner(lockDir);
+    }
     assert.ok(owner !== null,
-      `the lock record was ABSENT across 20 reads spanning ~200ms. The steal window closes in ~200us, ` +
-      `so this is a lock that is GONE, not one momentarily renamed aside — a live owner's lock was broken.`);
+      `the lock record is ABSENT and the contender has EXITED (${JSON.stringify(c.exited)}). The steal ` +
+      `window is only open while a contender is running, so this is a lock that was BROKEN and then ` +
+      `released on exit — not one momentarily renamed aside.`);
+    // NO MEASURED ROW REACHES THIS ONE, and that is worth saying rather than leaving a reader to
+    // assume otherwise (#437 review O1). Every mutation tried lands on the assertion above instead:
+    // the contender releases on exit within ~150 ms, so by this read at T+1500 ms the record is
+    // absent rather than replaced. The branch is NOT unreachable in principle — a contender that
+    // broke the lock and still HELD it at read time would satisfy the line above and only fail
+    // here — so it stays. It is the "unproven but load-bearing" case, not the "covered" case, and
+    // today's #438 finding is what a branch that reads as covered actually costs.
     assert.ok(owner.nonce === "live-other-cwd" && owner.pid === process.pid,
       `a LIVE owner's lock must survive every steal attempt — cwd is provenance, never a licence. ` +
       `The lock is now held by someone else: ${JSON.stringify(owner)}`);
