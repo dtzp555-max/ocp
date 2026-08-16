@@ -10,6 +10,7 @@ import { isLoopbackBind } from "./lib/net.mjs";
 import { classifyToolRequest } from "./lib/tool-support.mjs";
 import { randomBytes } from "node:crypto";
 import { createSerialMutex, createTtlCache, isTokenExpiring, orderLabelsLastGoodFirst, scrubInboundAuthEnv, INBOUND_AUTH_ENV_VARS, applyRequestVerdictTtl } from "./lib/spawn-auth.mjs";
+import { makeResolveSpawnToken } from "./lib/spawn-token.mjs";
 import { createHash } from "node:crypto";
 import { strict as assert } from "node:assert";
 import { join } from "node:path";
@@ -17600,6 +17601,50 @@ test("TTL cache respects expiry gate: cached creds still rejected once clock pas
   const c2 = cache.get(() => creds, 990_000);
   assert.equal(c2, c1, "cache returns the same creds object");
   assert.equal(isTokenExpiring(c2, 990_000, 300000), true, "expiry gate still fires on cached creds");
+});
+
+// F6 at the CALL SITE (#343): resolveSpawnToken's re-application of isTokenExpiring to CACHED creds
+// is the one correctness wire the sweep found unpinned. server.mjs cannot be imported (listen() at
+// top level), so the gate was extracted to makeResolveSpawnToken (lib/spawn-token.mjs) with an
+// injectable fixed "now" (flake-free) and an injectable "isExpiring" (the seam). Production passes
+// NEITHER → byte-for-byte identical to the inline gate. These pin the gate's contract; mutation-proof
+// below (delete the gate line → the within-buffer test reddens, the rest stay green).
+const _spawnTokenFixedNow = 1_800_000_000_000;
+
+test("makeResolveSpawnToken: cached creds within the 5-min buffer → null (the expiry gate FIRES)", () => {
+  const core = makeResolveSpawnToken({ now: _spawnTokenFixedNow });
+  assert.equal(
+    core({ accessToken: "t", expiresAt: _spawnTokenFixedNow + 4 * 60_000 }),
+    null,
+    "4 min to expiry is INSIDE the buffer — must be refused, not handed to a spawn that will 401",
+  );
+});
+
+test("makeResolveSpawnToken: cached creds outside the buffer → accessToken (gate passes)", () => {
+  const core = makeResolveSpawnToken({ now: _spawnTokenFixedNow });
+  assert.equal(core({ accessToken: "t", expiresAt: _spawnTokenFixedNow + 6 * 60_000 }), "t",
+    "6 min to expiry is OUTSIDE the buffer — token is usable");
+});
+
+test("makeResolveSpawnToken: missing accessToken → null", () => {
+  const core = makeResolveSpawnToken({ now: _spawnTokenFixedNow });
+  assert.equal(core({ expiresAt: _spawnTokenFixedNow + 6 * 60_000 }), null, "no token to resolve");
+  assert.equal(core(null), null, "null creds are not an error");
+});
+
+test("makeResolveSpawnToken: injected isExpiring override is honored (pins the INJECTION seam)", () => {
+  // A fake that always returns false must let a token 1ms from expiry pass — proves the override is
+  // actually consulted, not the real isTokenExpiring (which would refuse it).
+  const alwaysPass = makeResolveSpawnToken({ isExpiring: () => false, now: _spawnTokenFixedNow });
+  assert.equal(alwaysPass({ accessToken: "t", expiresAt: _spawnTokenFixedNow + 1 }), "t",
+    "override returning false always → token passes even at 1ms to expiry");
+});
+
+test("makeResolveSpawnToken: no override → REAL isTokenExpiring (default) path is consulted", () => {
+  // Exactly at the buffer edge: real isTokenExpiring is now+buffer >= expiresAt, so edge === true.
+  const core = makeResolveSpawnToken({ now: _spawnTokenFixedNow });
+  assert.equal(core({ accessToken: "t", expiresAt: _spawnTokenFixedNow + 300_000 }), null,
+    "default path uses the real isTokenExpiring's >= edge, not some looser substitute");
 });
 
 // ── Async: F3 real-HOME fallback serialization mutex ──

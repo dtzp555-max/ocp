@@ -52,7 +52,8 @@ import { detectTuiUpstreamError } from "./lib/tui/transcript.mjs";
 import { TuiSemaphore, SemaphoreAbortError, recordTuiEntrypoint, buildTuiHealthBlock } from "./lib/tui/semaphore.mjs";
 import { TuiPanePool, resolvePoolSize, POOL_MAX_SIZE } from "./lib/tui/pool.mjs";
 import { TuiDeltaAssembler, DEFAULT_HOLDBACK_CHARS, resolveStreamHoldback } from "./lib/tui/stream.mjs";
-import { createSerialMutex, createTtlCache, isTokenExpiring, orderLabelsLastGoodFirst, scrubInboundAuthEnv, applyRequestVerdictTtl } from "./lib/spawn-auth.mjs";
+import { createSerialMutex, createTtlCache, orderLabelsLastGoodFirst, scrubInboundAuthEnv, applyRequestVerdictTtl } from "./lib/spawn-auth.mjs";
+import { makeResolveSpawnToken } from "./lib/spawn-token.mjs";
 import { hasImageContent, buildImageBlocks, buildStreamJsonInput, MultimodalError } from "./lib/multimodal.mjs";
 import { parsePositiveInt } from "./lib/env.mjs";
 import { appendOperatorPrompt, promptCharBudgetFor, fallbackPromptCharBudget, resolveGlobalPromptCharOverride, selectPromptWrapper, localToolsSafetyError } from "./lib/prompt.mjs";
@@ -657,12 +658,13 @@ function ensureSpawnHome(dir = SPAWN_HOME_DIR) {
 // fall back to real HOME, where the spawned claude refreshes the credential natively and self-heals
 // (the keychain token is then fresh again → next spawn is fast). The env-token path (Linux) carries
 // no expiresAt → never expiry-gated (those tokens are long-lived).
+// The expiry gate is extracted to lib/spawn-token.mjs so a unit test can drive it without booting
+// server.mjs (#343). Production passes NO injection → byte-for-byte identical to the inline gate it
+// replaces (defaultIsTokenExpiring IS the real isTokenExpiring; now defaults to Date.now()).
+const resolveSpawnTokenCore = makeResolveSpawnToken();
 function resolveSpawnToken() {
   try {
-    const creds = getOAuthCredentials();
-    if (!creds?.accessToken) return null;
-    if (isTokenExpiring(creds)) return null; // 5-min buffer; applied to the CACHED creds every use
-    return creds.accessToken;
+    return resolveSpawnTokenCore(getOAuthCredentials());
   } catch { return null; }
 }
 

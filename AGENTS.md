@@ -73,6 +73,24 @@ Three rules that made it hold up, all learned the hard way:
 
 Allocate ports with `ltFreePort()`. Fixed ports have caused at least one flake here.
 
+## Wiring-pin ledger (issue #343)
+
+The #343 sweep looked for the #339 shape — a correct, well-tested helper whose CALL SITE silently drops or bypasses it. This is the first-pass inventory of every `lib/` boundary transform and whether its wiring is pinned by a test that reddens when the call site stops consulting it. "Performance-only" rows are recorded, not pinned: a silent drop costs latency, never a wrong answer.
+
+| helper | call site(s) | wiring pinned | evidence / why-not |
+|---|---|---|---|
+| `applyRequestVerdictTtl` | `server.mjs:1233` (`/health` via effectiveAuthStatus) | YES | #341 |
+| `scrubInboundAuthEnv` | `server.mjs:167/174/1259/1614/2890`, `lib/tui/session.mjs:442/677`, `setup.mjs:71/153/177` | PARTLY | #328 pins the child env at the server/setup sites; the TUI pane alias site (`lib/tui/session.mjs:442`) is unpinned — its own consequence |
+| `orderLabelsLastGoodFirst` | `server.mjs:2886` (keychain label order) | NO | performance-only — a drop costs one extra `security` exec, never a wrong answer |
+| `createTtlCache` | `server.mjs:2879` (keychain read cache) | NO | performance-only — re-reading the keychain per spawn is slower, never wrong |
+| `createSerialMutex` | `server.mjs:673` (real-HOME fallback serialization) | NO | a drop would race two fallbacks — low blast radius, recorded not pinned |
+| `isTokenExpiring` | `server.mjs:664` delegation → `lib/spawn-token.mjs:24` | YES | via this PR — `makeResolveSpawnToken` + fixed-`now` contrast test, mutation-proven |
+| image helpers (`hasImageContent` / `buildImageBlocks` / `buildStreamJsonInput`) | `handleChatCompletions` image path | YES | #110 / #154 |
+| `classifyToolRequest` | `handleChatCompletions` | YES | mutation-proven (#311 / #370-style) |
+| structured-output helpers (`detectStructuredOutput` / `extractJsonPayload` / `structuredSystemInstruction`) | structured-output path | YES | #153 / #181 |
+| `isLoopbackBind` | boot gates | YES | #370 |
+| `parsePositiveInt` | `server.mjs:1406` (`parseIntEnv`, 6 numeric caps); `lib/prompt.mjs:89` (`resolveGlobalPromptCharOverride`) | PARTLY | `lib/prompt.mjs:89` pinned behaviorally (`test-features.mjs:2491-2528`); `server.mjs:1406` `parseIntEnv` site unpinned — not importable and no live-server test feeds a garbage cap value to assert the fail-closed default |
+
 ## Testing discipline: what counts as a test
 
 Enforced as a review condition on recent test PRs (#204, #205, #208, #216, #218, #221), never written down. Its only written form was inside #210: "This is behavioral, so a mutation to the table or the fallback fails it. A source-grep test would not — and per this repo's standing rule, a test that greps source is not a test." Written down now (#223). Line numbers below are `test-features.mjs` unless noted.
