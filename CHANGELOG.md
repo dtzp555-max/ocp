@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## v3.29.3 — 2026-08-16
+
 ### Fixed
 
 - **`ocp update` now probes sibling instances' running versions and executes same-user sibling updates, and the multi-instance report no longer disappears on the real upgrade path (#327 part 6).** The outer `plan` (the `[doctor]` and `[multi-instance]` lines) was dropped on the full-upgrade and fresh-install paths — only dry-run/noop/light printed it — so a real `ocp update` on a multi-instance host reported nothing about its siblings; it is now threaded through both paths. Each sibling's `/health` `version` is probed (unless `--skip-network`) and annotated `behind`/`current`/`ahead` against the primary's `current_version`; a failed probe degrades to `version unknown (probe failed: …)`. Per the part-4 decision, the update now **executes only same-user siblings** — a user-scope sibling, or a system-scope sibling whose `User=` is the invoking user/uid (or unset and the invoking uid is root) — by spawning `./ocp update` in each sibling's own tree under an `OCP_NO_SIBLING_EXEC=1` guard so a child never re-execs *its* siblings; a cross-user sibling is still reported, never run, and a sibling's failure never fails the primary. Exec is scoped to the full-upgrade path only; noop/light/restart/dry-run keep the print-only report. **Not endpoint-touching** — `scripts/doctor.mjs` (unit records gain a `user` field), `scripts/upgrade.mjs`, and `test-features.mjs`.
@@ -356,6 +358,8 @@
   Measured on #405's M3 (drop `shq()` from the `--tools` value): **1193 passed / 2 failed against that branch's 1195/0 baseline**, reddening exactly the two tests carrying *"stays ONE argv element, not word-split"* and *"cannot break the shell string"* (quoted as the fragments invariant across the rename #405 applied after that run); co-located, one row is the most that could ever have appeared. The entry records two ways the first draft got its own subject wrong — a loud `sh` error was read as a process-level abort when it is an ordinary parent-side `AssertionError` from a `spawnSync` child, and the property that actually forces separation is that **one mutation breaks both claims**, not what the failure looked like.
 
   The same shape outside the suite, twice: #405's merge refusal (`Required status check … is expected` beside five green checks, with `strict_required_status_checks_policy: true` observed on ruleset `20181348`), and #404's `until ! gh pr checks | grep -q pending`, which exited immediately because the checks had not been **created** yet. Prescription: require a positive count before trusting a negative predicate, and derive it from what applies to *this* change — `alignment.yml` is path-filtered, and this PR hung its own wait loop on `≥5` when only 2 checks apply to a docs-only change. Not endpoint-touching; `AGENTS.md` and this file only.
+
+## v3.29.2 — 2026-08-10
 
 ### Fixed
 
