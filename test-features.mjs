@@ -9149,8 +9149,24 @@ test("#374 mem snapshot: the record carries a wall-clock `at` and this process's
   // of them is uninterpretable without a wall-clock reference to difference against.
   assert.ok(Number.isFinite(mem.at) && mem.at >= before && mem.at <= after,
     `the snapshot must carry the wall-clock moment it was taken, inside [${before}, ${after}]; got ${JSON.stringify(mem.at)}`);
+  // rssBytes is where this PR's own argument was weakest, and the #439 review caught it: the first
+  // version asserted only `Number.isInteger(x) && x > 0` — EXACTLY the existence check the header
+  // comment above says is not enough — while the body, the commit message and that comment all
+  // claimed every field "came from the source its NAME claims". Measured there:
+  // `process.memoryUsage().rss` -> `.heapUsed` survived at 3 passed / 0 failed, exit 0. That is a
+  // wrong SOURCE under a right-looking name, #427 review F1's shape precisely, on two metrics that
+  // differ by 11.7x on that host (44.6 MB vs 3.8 MB).
+  //
+  // Banded against an independent read instead. The band is deliberately LOOSE — rss genuinely
+  // moves between two reads and nothing here may pin the weather — but every other field of
+  // memoryUsage() sits far outside a factor of two of rss, so it separates the sources without
+  // pinning a value. Prototyped by the reviewer at 15/15 consecutive green.
+  const rssNow = process.memoryUsage().rss;
   assert.ok(Number.isInteger(mem.rssBytes) && mem.rssBytes > 0,
     `rssBytes must be this process's resident set in bytes; got ${JSON.stringify(mem.rssBytes)}`);
+  assert.ok(mem.rssBytes > rssNow / 2 && mem.rssBytes < rssNow * 2,
+    `rssBytes must come from RSS, not from another memoryUsage() field: got ${mem.rssBytes}, ` +
+    `which is outside +/-2x of an independent rss read (${rssNow}) taken microseconds later`);
 });
 
 // The page size is the one field whose CORRECT value is knowable at test time, so it is asserted
@@ -9158,8 +9174,10 @@ test("#374 mem snapshot: the record carries a wall-clock `at` and this process's
 // size IS 4096 the hardcode this replaced would agree with the platform and the mutation would not
 // redden. That is a property of the host, not of the test — this repo's workstation reports 16384
 // (Apple Silicon), which is what made the original hardcode 4x wrong and what makes the row real
-// here. Linux records no pageSize by design (the `pagesize` read is nested inside the macOS arm,
-// and pswpin/pswpout are page counts), so there is nothing to assert there.
+// here. On Linux no pageSize is recorded — stated as the observation it is, not as "by design"
+// (#439 review F4): what the source shows is that the `pagesize` read sits nested inside the
+// `vm_stat` arm, so the Linux path never reaches it. Whether that placement was a decision or an
+// accident is not something the code evidences, and this comment should not claim it.
 if (process.platform === "darwin") {
   test("#374 mem snapshot: pageSize is READ from the platform, never hardcoded", () => {
     const real = Number(execFileSync("pagesize", { encoding: "utf8", timeout: 3000 }).trim());
@@ -9194,10 +9212,19 @@ if (process.platform === "darwin") {
       // Counters are cumulative and monotonic, so the right one lands in its own bracket. The
       // brackets are checked disjoint at this instant too — the registration-time probe above can
       // go stale under live swapping, and a test that cannot fail must say so rather than pass.
-      assert.ok(Number.isInteger(b.in) && Number.isInteger(a.in) && Number.isInteger(b.out) && Number.isInteger(a.out),
-        `premise: both counters must read as integers on both sides of the snapshot; got ${JSON.stringify({ b, a })}`);
-      assert.ok(a.in < b.out || a.out < b.in,
-        `premise: the two brackets must be DISJOINT or this assertion cannot distinguish the mapping from its inverse; got in=[${b.in},${a.in}] out=[${b.out},${a.out}]`);
+      // These two are PREMISES about the host, not claims about the code, so they declare the run
+      // INCONCLUSIVE rather than failing it (#439 review F2; skipRemainingTest is the harness's own
+      // mechanism for this, precedent eb92e8f). The reviewer's argument for why that distinction is
+      // load-bearing here rather than stylistic: the host class where these premises are least
+      // unlikely to fail is a heavily-swapping one — which is exactly the host #374 exists to
+      // investigate. Failing red there would report "the code is broken" on the one machine where
+      // the honest answer is "the conditions for this measurement were not available".
+      if (!(Number.isInteger(b.in) && Number.isInteger(a.in) && Number.isInteger(b.out) && Number.isInteger(a.out))) {
+        skipRemainingTest(name, `a counter stopped reading as an integer across the snapshot: ${JSON.stringify({ b, a })}`);
+      }
+      if (!(a.in < b.out || a.out < b.in)) {
+        skipRemainingTest(name, `the two brackets overlap, so this run cannot distinguish the mapping from its inverse: in=[${b.in},${a.in}] out=[${b.out},${a.out}]`);
+      }
       assert.ok(b.in <= mem.swapPagesIn && mem.swapPagesIn <= a.in,
         `swapPagesIn must come from the swap-IN counter: expected inside [${b.in}, ${a.in}], got ${mem.swapPagesIn} (the swap-OUT bracket was [${b.out}, ${a.out}])`);
       assert.ok(b.out <= mem.swapPagesOut && mem.swapPagesOut <= a.out,
