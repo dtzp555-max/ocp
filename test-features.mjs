@@ -9651,6 +9651,132 @@ ltTest("#374 control D: a real ltDrain timeout carries the probe and the tracer,
   child.kill("SIGKILL");
   assert.ok(await ltWait(() => buf.closed, 5000), "control D must clean up its own child");
 });
+// ── #374 mem snapshot: STRUCTURE, never values ───────────────────────────────────────────────
+// The #427 audit of 6978505 measured this feature at ZERO test coverage — three mutations, three
+// green runs at 1239/0: the Swapins/Swapouts mapping swapped, `pageSize` hardcoded back to 4096 on
+// a 16384-byte-page host, and the `at` timestamp deleted. Every field the two review rounds
+// argued into existence could be silently undone.
+//
+// WHAT IS PINNED AND WHAT MUST NOT BE. The snapshot's VALUES are observational — rss moves, the
+// vm_stat counters are cumulative and monotonic — so pinning any of them would be pinning the
+// weather. What is pinned is the WIRING: that each field is present, that it holds a number of the
+// right kind, and that it came from the source its NAME claims. A name is a claim (AGENTS.md), and
+// the whole of review F1 was a field named for swap that carried Pageouts — a wrong SOURCE under a
+// right-looking name, which existence checks cannot see.
+//
+// Direction is therefore pinned by BRACKETING an independent read of the same counter around the
+// snapshot: a value that came from the counter its name claims must lie between that counter's
+// before and after readings. Monotonic counters make that robust to real swap activity during the
+// test, which a straight equality would not be.
+const _lt427Swap = () => {
+  // Read the same two counters the snapshot reads, by an independent path, per platform.
+  try {
+    if (process.platform === "darwin") {
+      const out = execFileSync("vm_stat", { encoding: "utf8", timeout: 3000 });
+      const g = (k) => { const m = out.match(new RegExp(k + ":\\s+(\\d+)")); return m ? Number(m[1]) : null; };
+      return { in: g("Swapins"), out: g("Swapouts") };
+    }
+    if (process.platform === "linux") {
+      const vm = _lockReadFileSync("/proc/vmstat", "utf8");
+      const g = (k) => { const m = vm.match(new RegExp(k + "\\s+(\\d+)")); return m ? Number(m[1]) : null; };
+      return { in: g("pswpin"), out: g("pswpout") };
+    }
+  } catch {}
+  return { in: null, out: null };
+};
+
+test("#374 mem snapshot: the record carries a wall-clock `at` and this process's RSS", () => {
+  const before = Date.now();
+  const mem = _ltMemSnapshot();
+  const after = Date.now();
+  // `at` exists because review F2 asked for it: the vm_stat counters are CUMULATIVE, so a snapshot
+  // of them is uninterpretable without a wall-clock reference to difference against.
+  assert.ok(Number.isFinite(mem.at) && mem.at >= before && mem.at <= after,
+    `the snapshot must carry the wall-clock moment it was taken, inside [${before}, ${after}]; got ${JSON.stringify(mem.at)}`);
+  // rssBytes is where this PR's own argument was weakest, and the #439 review caught it: the first
+  // version asserted only `Number.isInteger(x) && x > 0` — EXACTLY the existence check the header
+  // comment above says is not enough — while the body, the commit message and that comment all
+  // claimed every field "came from the source its NAME claims". Measured there:
+  // `process.memoryUsage().rss` -> `.heapUsed` survived at 3 passed / 0 failed, exit 0. That is a
+  // wrong SOURCE under a right-looking name, #427 review F1's shape precisely, on two metrics that
+  // differ by 11.7x on that host (44.6 MB vs 3.8 MB).
+  //
+  // Banded against an independent read instead. The band is deliberately LOOSE — rss genuinely
+  // moves between two reads and nothing here may pin the weather — but every other field of
+  // memoryUsage() sits far outside a factor of two of rss, so it separates the sources without
+  // pinning a value. Prototyped by the reviewer at 15/15 consecutive green.
+  const rssNow = process.memoryUsage().rss;
+  assert.ok(Number.isInteger(mem.rssBytes) && mem.rssBytes > 0,
+    `rssBytes must be this process's resident set in bytes; got ${JSON.stringify(mem.rssBytes)}`);
+  assert.ok(mem.rssBytes > rssNow / 2 && mem.rssBytes < rssNow * 2,
+    `rssBytes must come from RSS, not from another memoryUsage() field: got ${mem.rssBytes}, ` +
+    `which is outside +/-2x of an independent rss read (${rssNow}) taken microseconds later`);
+});
+
+// The page size is the one field whose CORRECT value is knowable at test time, so it is asserted
+// against the platform rather than merely type-checked. Its stated limit: on a host whose real page
+// size IS 4096 the hardcode this replaced would agree with the platform and the mutation would not
+// redden. That is a property of the host, not of the test — this repo's workstation reports 16384
+// (Apple Silicon), which is what made the original hardcode 4x wrong and what makes the row real
+// here. On Linux no pageSize is recorded — stated as the observation it is, not as "by design"
+// (#439 review F4): what the source shows is that the `pagesize` read sits nested inside the
+// `vm_stat` arm, so the Linux path never reaches it. Whether that placement was a decision or an
+// accident is not something the code evidences, and this comment should not claim it.
+if (process.platform === "darwin") {
+  test("#374 mem snapshot: pageSize is READ from the platform, never hardcoded", () => {
+    const real = Number(execFileSync("pagesize", { encoding: "utf8", timeout: 3000 }).trim());
+    assert.ok(Number.isInteger(real) && real > 0,
+      `premise: this host's pagesize must be readable, or the comparison below is against nothing; got ${JSON.stringify(real)}`);
+    const mem = _ltMemSnapshot();
+    assert.equal(mem.pageSize, real,
+      `pageSize must equal what the platform reports (${real}), not a constant compiled into the harness`);
+  });
+} else {
+  testSkipped("#374 mem snapshot: pageSize is READ from the platform, never hardcoded",
+    `pageSize is recorded only on darwin (the pagesize read is nested in the vm_stat arm); this host is ${process.platform}`);
+}
+
+// Direction. Registered conditionally on evidence gathered BEFORE registration, because the
+// discriminator is a property of the host: if the two counters happen to hold the same value, a
+// swapped mapping satisfies both brackets and the test would pass while proving nothing. That is
+// the vacuous-green shape AGENTS.md keeps recording, so it is declared as a SKIP with its reason
+// rather than run as a pass.
+{
+  const name = "#374 mem snapshot: swapPagesIn/Out are wired to swap IN and swap OUT, not to each other";
+  const probe = _lt427Swap();
+  if (!Number.isInteger(probe.in) || !Number.isInteger(probe.out)) {
+    testSkipped(name, `this platform exposes no swap-in/out counters to read independently (${process.platform})`);
+  } else if (probe.in === probe.out) {
+    testSkipped(name, `this host's swap-in and swap-out counters are equal (${probe.in}); a swapped mapping would satisfy both brackets, so the test could not fail`);
+  } else {
+    test(name, () => {
+      const b = _lt427Swap();
+      const mem = _ltMemSnapshot();
+      const a = _lt427Swap();
+      // Counters are cumulative and monotonic, so the right one lands in its own bracket. The
+      // brackets are checked disjoint at this instant too — the registration-time probe above can
+      // go stale under live swapping, and a test that cannot fail must say so rather than pass.
+      // These two are PREMISES about the host, not claims about the code, so they declare the run
+      // INCONCLUSIVE rather than failing it (#439 review F2; skipRemainingTest is the harness's own
+      // mechanism for this, precedent eb92e8f). The reviewer's argument for why that distinction is
+      // load-bearing here rather than stylistic: the host class where these premises are least
+      // unlikely to fail is a heavily-swapping one — which is exactly the host #374 exists to
+      // investigate. Failing red there would report "the code is broken" on the one machine where
+      // the honest answer is "the conditions for this measurement were not available".
+      if (!(Number.isInteger(b.in) && Number.isInteger(a.in) && Number.isInteger(b.out) && Number.isInteger(a.out))) {
+        skipRemainingTest(name, `a counter stopped reading as an integer across the snapshot: ${JSON.stringify({ b, a })}`);
+      }
+      if (!(a.in < b.out || a.out < b.in)) {
+        skipRemainingTest(name, `the two brackets overlap, so this run cannot distinguish the mapping from its inverse: in=[${b.in},${a.in}] out=[${b.out},${a.out}]`);
+      }
+      assert.ok(b.in <= mem.swapPagesIn && mem.swapPagesIn <= a.in,
+        `swapPagesIn must come from the swap-IN counter: expected inside [${b.in}, ${a.in}], got ${mem.swapPagesIn} (the swap-OUT bracket was [${b.out}, ${a.out}])`);
+      assert.ok(b.out <= mem.swapPagesOut && mem.swapPagesOut <= a.out,
+        `swapPagesOut must come from the swap-OUT counter: expected inside [${b.out}, ${a.out}], got ${mem.swapPagesOut} (the swap-IN bracket was [${b.in}, ${a.in}])`);
+    });
+  }
+}
+
 // ── end #374 calibration controls ────────────────────────────────────────────────────────────
 
 // Deterministic close for the ltTest serialization claim: a fact about how many server.mjs
