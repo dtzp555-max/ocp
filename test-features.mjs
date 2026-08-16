@@ -26695,6 +26695,41 @@ test("#327 part 5: runDoctor's --json result carries the structured per-host uni
   assert.strictEqual(byName["ocp.service"].instanceName, null, "an absent directive is null");
 });
 
+// #425 review finding 1: the CLEAR-state inventory carry (scripts/doctor.mjs, groupAndAssessConflicts'
+// `units.length < 2` return) was unpinned. The reviewer measured it: reverting that return to
+// `{ state: "clear" }` left the suite at 1239/0. It matters because a single-install host is the
+// MOST COMMON shape, so this is the branch most consumers of `--json`.units actually hit, and part
+// 4's report is built from that field. The fix the reviewer named is one assertion; this is it.
+test("#327 part 5: a SINGLE-install host still gets an inventory — `clear` enumerated successfully, so units is [that unit], never null", async () => {
+  const result = await runDoctor({
+    mockPlatform: "linux", skipNetwork: false,
+    mockVersion: "v3.29.2", mockLatest: "v3.29.2",
+    // Carried over from the part-5 test above rather than left implicit (#438 review). With
+    // `skipNetwork: false` this is what keeps the run off the wire: the mocked body is read by the
+    // health check AND by the oauth check via classifyAuthOk, so without it this test would issue a
+    // real request to the documented default port — the LIVE production proxy on the host running
+    // the suite. `mockLatest` closes the other live surface (it skips the git fetch), and the `run`
+    // mock below THROWS on any unexpected command, so a newly-added probe fails loudly here instead
+    // of silently reading the host.
+    mockHealth: { status: 200, body: { version: "3.29.2", auth: { ok: true } } },
+    run: (cmd) => {
+      if (cmd.includes("--user list-unit-files")) return "ocp.service enabled";
+      if (cmd.includes("list-unit-files")) return ""; // system scope: nothing enabled -> ONE unit total
+      if (cmd.includes("systemctl --user show")) return unitShow({ id: "ocp.service", port: 3456 });
+      throw new Error("unexpected cmd: " + cmd);
+    },
+  });
+  // Premise, stated as its own assertion rather than assumed: this fixture must actually reach the
+  // CLEAR branch. `warn`/`declared` also carry units, so a fixture that drifted into one of those
+  // would satisfy everything below while testing a different branch entirely.
+  assert.ok(!result.checks.some(c => c.id === "multi_unit_boot_race"),
+    "premise: one enabled unit must reach the `clear` branch, which pushes no multi_unit check");
+  assert.ok(Array.isArray(result.units),
+    `a host with one enabled unit ENUMERATED fine — null would say "could not enumerate", which is a different and false statement; got ${JSON.stringify(result.units)}`);
+  assert.equal(result.units.length, 1, "the one enabled unit must be in the inventory");
+  assert.equal(result.units[0].name, "ocp.service", "and it must be that unit, not a placeholder");
+});
+
 
 test("#327 part 4: a multi-instance host's plan reports each sibling with its own update command", async () => {
   const result = await runUpgrade({
@@ -26714,11 +26749,91 @@ test("#327 part 4: a multi-instance host's plan reports each sibling with its ow
   assert.equal(result.executed, false, "dry-run premise: nothing may execute");
   const report = result.plan.filter((l) => l.includes("[multi-instance]"));
   assert.equal(report.length, 2, `each sibling gets its own report line; got ${JSON.stringify(report)}`);
+  // "tree unknown" WITHOUT the parentheses, and MOVED AHEAD of the two positives below.
+  //
+  // The parenthesised form this line used to grep for — `(tree unknown)` — stopped being producible
+  // when the review's F1 fix landed in 7ab0ced: the fallback branch was rewritten to emit
+  // "— tree unknown, update it from its own install tree" precisely so no `(cd (tree unknown) && …)`
+  // paste trap could be printed. The guard was not updated with it, so from that commit until this
+  // one it forbade a string no branch could emit — green for the same reason an unexecuted
+  // assertion is green. Verified before changing it: `grep -rn '(tree unknown)' scripts/ ocp
+  // server.mjs lib/` matches ONLY a comment in scripts/upgrade.mjs.
+  //
+  // The move is not tidying. The mutation that reaches this guard is inverting the branch condition
+  // (`if (u.workingTree)` -> `if (!u.workingTree)`), which sends BOTH fixture units down the
+  // fallback — and that also empties the `(cd …)` line the third assertion below looks for. Behind
+  // that assertion this guard would never execute, so it would be exactly as unprovable as the
+  // parenthesised version it replaces, and for a second, independent reason. AGENTS.md's ordering
+  // remedy for the asymmetric case.
+  assert.ok(!report.some((l) => l.includes("tree unknown")), "workingTree is in the record; an unknown tree would be a regression");
   assert.ok(report.some((l) => l.includes("ocp-wifibot.service") && l.includes("(instance \"wifibot\")")),
     "the sibling's declared identity must be named, not conflated with the primary");
   assert.ok(report.some((l) => l.includes("(cd /opt/ocp-wifibot && ./ocp update)")),
     "the sibling's OWN tree and update command must be printed — report, never cross-identity act");
-  assert.ok(!report.some((l) => l.includes("(tree unknown)")), "workingTree is in the record; an unknown tree would be a regression");
+});
+
+// #426 review finding 1: the `instanceName === ""` arm of the label ternary was unpinned — the
+// part-4 fixture drives a `null` unit and a NAMED unit, so nothing ever rendered "primary" and a
+// mutation garbling only that arm stayed green. The three arms are three DIFFERENT statements about
+// a host ("nothing was declared" / "declared itself the primary" / "declared this name"), which is
+// why the review asked for the empty-string one rather than treating it as cosmetic: conflating an
+// undeclared unit with one that explicitly claims the primary is the exact confusion #327 exists to
+// remove.
+test("#327 part 4: an instance that declared itself the PRIMARY (OCP_INSTANCE_NAME=\"\") is labelled `primary`, not conflated with an undeclared one", async () => {
+  const result = await runUpgrade({
+    // skipNetwork is not optional here: without it the sibling probe issues a real GET /health at
+    // each unit's port, and this fixture's 3456 is the documented default — the LIVE proxy on the
+    // host running the suite (#430 review F1).
+    dryRun: true, yes: true, skipNetwork: true,
+    mockDoctor: {
+      ready_to_upgrade: true, next_action: { kind: "upgrade" },
+      current_version: "v3.29.1", latest_version: "v3.29.2",
+      units: [
+        { name: "ocp.service", port: 3456, instanceName: "", workingTree: "/home/opc/ocp" },
+        { name: "ocp-wifibot.service", port: 3457, instanceName: "wifibot", workingTree: "/opt/ocp-wifibot" },
+      ],
+    },
+  });
+  assert.equal(result.executed, false, "dry-run premise: nothing may execute");
+  const report = result.plan.filter((l) => l.includes("[multi-instance]"));
+  assert.equal(report.length, 2, `premise: both units must be reported; got ${JSON.stringify(report)}`);
+  const primary = report.find((l) => l.includes("ocp.service (")) || "";
+  assert.ok(primary.includes("(primary)"),
+    `a unit that declared OCP_INSTANCE_NAME="" claims the primary and must be labelled so; got ${JSON.stringify(primary)}`);
+  assert.ok(!primary.includes("no OCP_INSTANCE_NAME declared"),
+    "an explicit empty declaration is NOT an absent one — that conflation is the thing #327 removes");
+});
+
+// #426 review finding 2: the unknown-tree fallback was pinned only by ABSENCE — the part-4 fixture
+// gives every unit a workingTree, so the branch never ran and a mutation to its wording, or its
+// deletion, stayed green. Its content is the point rather than decoration: F1 rewrote it
+// specifically so that a unit with no known tree gets NO paste-able command, because
+// `(cd (tree unknown) && ./ocp update)` is a line an operator can paste and have do something
+// wrong. That is what this asserts.
+test("#327 part 4: a unit with NO known workingTree is reported with a name and no paste-able command", async () => {
+  const result = await runUpgrade({
+    dryRun: true, yes: true, skipNetwork: true,
+    mockDoctor: {
+      ready_to_upgrade: true, next_action: { kind: "upgrade" },
+      current_version: "v3.29.1", latest_version: "v3.29.2",
+      units: [
+        { name: "ocp.service", port: 3456, instanceName: null, workingTree: "/home/opc/ocp" },
+        // The reachable shape, not a contrivance: a unit whose ExecStart is a bare `server.mjs`
+        // parses to an empty workingTree on both the systemd and the launchd path.
+        { name: "ocp-wifibot.service", port: 3457, instanceName: "wifibot", workingTree: "" },
+      ],
+    },
+  });
+  assert.equal(result.executed, false, "dry-run premise: nothing may execute");
+  const report = result.plan.filter((l) => l.includes("[multi-instance]"));
+  assert.equal(report.length, 2, `premise: both units must be reported; got ${JSON.stringify(report)}`);
+  const orphan = report.find((l) => l.includes("ocp-wifibot.service")) || "";
+  assert.ok(orphan.includes("tree unknown"),
+    `a unit whose tree could not be resolved must say so; got ${JSON.stringify(orphan)}`);
+  assert.ok(orphan.includes("(instance \"wifibot\")"),
+    "and it must still be identified — an unknown tree is not an unknown instance");
+  assert.ok(!orphan.includes("cd "),
+    `no paste-able cd command may be printed for a unit whose tree is unknown; got ${JSON.stringify(orphan)}`);
 });
 
 console.log("\n#327 part 6 — doctor.mjs unit records carry a `user` field:");
