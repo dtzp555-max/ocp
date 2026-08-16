@@ -3203,9 +3203,60 @@ const LT_TICK_SLOTS = 256;
 const _ltTicks = new Array(LT_TICK_SLOTS);
 let _ltTickN = 0;
 let _ltTracerTimer = null;
+// PROCESS-LOCAL memory-fault counters, sampled on the same tick as the CPU figure so every gap the
+// tracer already computes carries its own paging evidence. See the PER-WINDOW block below for why
+// these and not the host's swap counters; the short version is that these are attributable to THIS
+// process and cost 0.0003ms, so they can ride the 500ms tick without a spawn.
+//
+// swappedOut (ru_nswap) is deliberately NOT among them: measured 0 in every staged condition on
+// this host, which is BSD/macOS not populating the field rather than a process that never swapped.
+// A field that is structurally always zero would read as "no swapping" on the one capture that
+// mattered, which is the exact failure mode #374's original instrument had.
+function _ltFaultCounters() {
+  const r = process.resourceUsage();
+  return { majflt: r.majorPageFault, invcsw: r.involuntaryContextSwitches, volcsw: r.voluntaryContextSwitches };
+}
+// EVERY stall this process suffers, whether or not a drain was watching. This exists because the
+// calibration run for this instrument MEASURED the blind spot: a solo, guarded, otherwise-green
+// suite (1273 passed, 0 failed) contained TWO contiguous gaps of 89620ms and 76260ms — the exact
+// 76-120s STALL-NO-CPU shape this issue is about — and produced ZERO drain records, because neither
+// landed inside a drain's window. The only records that run wrote were the seven EXPECTED-CONTROLs.
+//
+// #419 already found one layer of this: an instrument that fires only on a TIMED-OUT drain misses
+// the ok=true face, which is why _ltLateDrains exists. This is the same finding one layer further
+// out — a stall that coincides with no drain at all is invisible to both ledgers, and on the
+// evidence above that is the COMMON case rather than the exotic one. A lever that cannot fire on
+// the event it was built for is worthless, and 2-in-1-run versus 0-recorded is what that looks like.
+//
+// Bounded, and the bound is a REPORTED number rather than a silent truncation: an instrument that
+// quietly stops recording is how you get a green reading from a saturated buffer.
+const LT_STALL_LEDGER_MAX = 64;
+const _ltStallLedger = [];
+let _ltStallLedgerDropped = 0;
 function _ltTracerTick() {
   const c = process.cpuUsage();
-  _ltTicks[_ltTickN++ % LT_TICK_SLOTS] = { wall: Date.now(), cpuUs: c.user + c.system };
+  const now = Date.now();
+  const cur = { wall: now, cpuUs: c.user + c.system, ..._ltFaultCounters() };
+  // Compare against the PREVIOUS tick before overwriting the slot. The first tick has no
+  // predecessor, and the process-start-to-first-tick interval is not a stall.
+  const prev = _ltTickN > 0 ? _ltTicks[(_ltTickN - 1) % LT_TICK_SLOTS] : null;
+  if (prev) {
+    const gapMs = now - prev.wall;
+    if (gapMs >= LT_STALL_MIN_MS) {
+      if (_ltStallLedger.length < LT_STALL_LEDGER_MAX) {
+        const cpuMs = Math.round((cur.cpuUs - prev.cpuUs) / 1000);
+        const majflt = cur.majflt - prev.majflt;
+        _ltStallLedger.push({
+          atIso: new Date(prev.wall).toISOString(), gapMs, cpuMs,
+          ratio: Number((cpuMs / gapMs).toFixed(3)),
+          loopVerdict: _ltClassifyLoopVerdict(gapMs, cpuMs / gapMs),
+          memVerdict: _ltClassifyMemVerdict(majflt),
+          majflt, invcsw: cur.invcsw - prev.invcsw, volcsw: cur.volcsw - prev.volcsw,
+        });
+      } else _ltStallLedgerDropped++;
+    }
+  }
+  _ltTicks[_ltTickN++ % LT_TICK_SLOTS] = cur;
   _ltTracerTimer = setTimeout(_ltTracerTick, LT_TICK_MS).unref();
 }
 _ltTracerTimer = setTimeout(_ltTracerTick, LT_TICK_MS).unref();
@@ -3242,6 +3293,100 @@ function _ltClassifyLoopVerdict(maxGapMs, ratio) {
   if (ratio >= LT_STALL_CPU_BOUND) return LT_LOOP_VERDICT.CPU;
   return LT_LOOP_VERDICT.MIXED;
 }
+
+// ── PER-WINDOW memory attribution ────────────────────────────────────────────────────────────
+//
+// STALL-NO-CPU names four causes it cannot tell apart: "descheduled, swapped, QoS-throttled, or
+// blocked in a syscall". This splits SWAPPED off from the other three, per window, and it is the
+// lever #374's thread recorded as the next step. The recorded plan was "per-window SWAP deltas,
+// sampled at suite start and differenced at the stall". What is built here differs from that plan
+// in the counter it differences, and the reason is a measurement rather than a preference.
+//
+// WHY NOT THE HOST'S SWAP COUNTERS, AS THE PLAN SAID. #427 already records vm_stat Swapins/Swapouts
+// at the record moment, and the two reproduction campaigns ran an external 10s vm_stat sampler
+// throughout. Those logs still exist, and re-read here they refute the delta they were collected to
+// support. Across 1787 ten-second intervals spanning both campaigns — campaigns that produced ZERO
+// stalls in 45 attempts:
+//
+//     dSwapins  zero in   2/1304 and   0/483 intervals — nonzero 99.8% of the time,
+//               p50 183 and 443 pages, p99 14108 and 26012, max 101727
+//     dSwapouts zero in 1132/1304 and 340/483, p99 20190 and 39712, max 135608
+//
+// This host swaps CONTINUOUSLY. A nonzero host swap delta across a stall window is therefore the
+// base state and carries no information; it would have "fired" on essentially every window in two
+// campaigns that never stalled. The host counters also cannot be attributed to this process at all
+// — every other process on the box contributes to them, including the sibling agents whose suites
+// are the contention being investigated.
+//
+// WHAT IS DISCRIMINATING, MEASURED. This process's OWN major page faults. Staged on this host:
+//
+//     2s Atomics.wait (not executing)  -> majflt 0, invcsw 1,    volcsw 0
+//     2s busy spin    (executing)      -> majflt 16, invcsw 1833, volcsw 4
+//     nothing at all                   -> majflt 0, invcsw 0,    volcsw 0
+//
+// The base rate is ZERO across a window in which the process is not executing, which is exactly
+// the window shape #374 is about. That is the property the host counters lack, and it is what makes
+// a DELTA the right shape here: a counter whose quiet-state delta is zero says something when it
+// moves. LEVEL was the other candidate and it is recorded (below) but NOT classified on — see the
+// mem snapshot's comment for the measurement that decided that.
+//
+// COST, MEASURED, because a sampler that perturbs its subject is worthless here:
+//     process.resourceUsage()          0.0003 ms   <- rides the 500ms tick, no spawn
+//     execFileSync vm_stat             1.1262 ms
+//     execFileSync sysctl vm.swapusage 1.0125 ms
+//     execFileSync pagesize            3.7424 ms
+// A PERIODIC host-counter ring was designed and REJECTED on that table. Bracketing the stall window
+// with host samples needs a spawn every ~10s, and a fork/exec is the single most likely operation
+// to block under the host thrash being investigated — an instrument that stalls the loop it is
+// watching would manufacture the STALL-NO-CPU reading it exists to explain. The host counters are
+// therefore sampled only where they already were: once at suite start, once at the record.
+//
+// So the record carries BOTH shapes, at the resolution each can honestly claim:
+//   - per-WINDOW (the stall's own gap, ~76-120s): process-local fault deltas. Attributable, free.
+//   - per-SUITE (module load -> record, ~273s): host swap deltas. Diluted 2-4x by construction and
+//     labelled as such, because it is what the plan asked for and it costs one spawn that was
+//     already being made.
+const LT_MEM_VERDICT = Object.freeze({
+  UNMEASURED: "MEM-UNMEASURED",
+  QUIET: "NO-PAGE-FAULTS",
+  FAULTING: "SELF-PAGE-FAULTING",
+});
+const LT_MEM_DIAGNOSIS = Object.freeze({
+  [LT_MEM_VERDICT.UNMEASURED]:
+    "no bracketing tick carried a fault counter -> ABSENCE OF MEASUREMENT, not a zero: do not read this as 'no faults'",
+  [LT_MEM_VERDICT.QUIET]:
+    "[measured] this process took no major page faults across the gap -> it did not page anything back in -> SWAP OF THIS PROCESS IS EXCLUDED for this window, which narrows STALL-NO-CPU's four candidates to descheduled, QoS-throttled, or blocked in a syscall",
+  [LT_MEM_VERDICT.FAULTING]:
+    "[measured] this process took major page faults across the gap -> it WAS blocking on page-ins -> the swap hypothesis is directly supported for this window, and the host gauges below say what pressure it happened under",
+});
+// The floor is a COUNT across the gap, not a rate, because the quiet-state reading is 0 rather than
+// a small number.
+//
+// 128 IS SET FROM A MEASUREMENT, AND THE FIRST VALUE HERE WAS WRONG IN THE DIRECTION THAT MATTERS.
+// It was 32, reasoned from a 2s busy block costing 16 first-touch faults. Then a full solo run was
+// instrumented and the distribution measured across 147 inter-tick gaps:
+//
+//     zero in 130/147 gaps, p50 0, p90 1, p99 52, max 68, sum 205
+//
+// The two largest majflt readings in that run were ORDINARY ~500ms gaps at 68 and 52 — first-touch
+// cost as the suite reaches new code — while the two REAL 76-90s stalls in the same run measured
+// majflt 5 and 31. So at a floor of 32 the instrument would have called a routine half-second
+// window "SELF-PAGE-FAULTING" and a 76-second stall "quiet": exactly backwards, and it would have
+// sent the next reader to the swap hypothesis on the strength of a module load.
+//
+// 128 sits above the measured non-stall maximum (68) and far below any genuine paging event: this
+// process's RSS is ~68MB, so a full eviction and fault-back is ~4150 pages of 16KiB, and a window
+// spent blocked on page-ins is thousands of faults rather than tens. The gap between 68 and 4150 is
+// wide enough that the exact floor inside it is not load-bearing — what is load-bearing is that it
+// sits ABOVE the noise this suite generates by simply running.
+const LT_MEM_MAJFLT_FLOOR = 128;
+// Pure, so the boundary is provable by a table rather than by staging a swap-thrashing host — the
+// same split #419 used for the loop bands, and for the same reason: the measurement side (do real
+// faults produce real numbers) is a staged control, and this is the mapping side.
+function _ltClassifyMemVerdict(majfltDelta) {
+  if (majfltDelta === null || majfltDelta === undefined) return LT_MEM_VERDICT.UNMEASURED;
+  return majfltDelta >= LT_MEM_MAJFLT_FLOOR ? LT_MEM_VERDICT.FAULTING : LT_MEM_VERDICT.QUIET;
+}
 function _ltStallSince(t0) {
   const now = Date.now();
   const c = process.cpuUsage();
@@ -3256,14 +3401,23 @@ function _ltStallSince(t0) {
   // and ltWait's overdue 40ms timer are BOTH expired; libuv runs expired timers in due order, so
   // the tick that would close the gap is not guaranteed to have run by the time ltWait gives up
   // and this is read. Sampling here closes the gap deterministically, whichever timer won.
-  samples.push({ wall: now, cpuUs: c.user + c.system, virtual: true });
+  samples.push({ wall: now, cpuUs: c.user + c.system, ..._ltFaultCounters(), virtual: true });
   const gaps = [];
+  // A counter delta is null — never 0 — when either endpoint did not carry the counter. The two
+  // are opposite findings and the whole point of the fault axis is that 0 MEANS something here.
+  const d = (a, b, k) => (typeof a[k] === "number" && typeof b[k] === "number" ? b[k] - a[k] : null);
   for (let i = 1; i < samples.length; i++) {
     const a = samples[i - 1], b = samples[i];
     // A gap counts if it ENDS after the window opened: a stall that began before the drain did is
     // still the stall the drain paid for. (t0 is the drain's start; the window closes at `now`.)
     if (b.wall <= t0) continue;
-    gaps.push({ gapMs: b.wall - a.wall, cpuMs: Math.round((b.cpuUs - a.cpuUs) / 1000), atMs: a.wall - t0 });
+    gaps.push({ gapMs: b.wall - a.wall, cpuMs: Math.round((b.cpuUs - a.cpuUs) / 1000), atMs: a.wall - t0,
+                // Per-window paging evidence, bracketed by the SAME two samples that define the
+                // gap — so this is the stall's own window, not the suite's. The closing sample is
+                // taken synchronously at read time, which matters: the faults a stalled process
+                // takes are incurred as it RESUMES and touches its evicted pages, and those land
+                // inside this bracket rather than after it.
+                majflt: d(a, b, "majflt"), invcsw: d(a, b, "invcsw"), volcsw: d(a, b, "volcsw") });
   }
   gaps.sort((x, y) => y.gapMs - x.gapMs);
   // WHERE THIS VERDICT IS THIN, stated because a LOOP-LIVE read from no data would send a reader
@@ -3275,13 +3429,21 @@ function _ltStallSince(t0) {
   // synchronous child processes. Each gap is still a real observation (the loop demonstrably ran at
   // both ends of it); there are simply few of them, which is why the record carries gapsInWindow
   // and ticksInRing rather than only a verdict.
-  const max = gaps[0] || { gapMs: 0, cpuMs: 0, atMs: 0 };
+  // majflt is null in the default, not 0: an empty gap list is no measurement, and the mem verdict
+  // must read MEM-UNMEASURED there rather than announcing that nothing faulted.
+  const max = gaps[0] || { gapMs: 0, cpuMs: 0, atMs: 0, majflt: null, invcsw: null, volcsw: null };
   const ratio = max.gapMs > 0 ? max.cpuMs / max.gapMs : 0;
   const stalls = gaps.filter(g => g.gapMs >= LT_STALL_MIN_MS);
   const verdict = _ltClassifyLoopVerdict(max.gapMs, ratio);
   return {
     verdict, maxGapMs: max.gapMs, cpuMs: max.cpuMs, ratio: Number(ratio.toFixed(3)),
     atMs: max.atMs, windowMs: now - t0,
+    // The per-window memory reading, on the SAME max gap the loop verdict is computed from, so the
+    // two names are always about one window. Named independently of the loop verdict because they
+    // are independent axes: STALL-NO-CPU + NO-PAGE-FAULTS and STALL-NO-CPU + SELF-PAGE-FAULTING
+    // are the two readings #374 needs told apart, and they share a loop verdict.
+    memVerdict: _ltClassifyMemVerdict(max.majflt),
+    majflt: max.majflt, invcsw: max.invcsw, volcsw: max.volcsw,
     // Two different counts, because one of them was briefly printed under the other's name.
     // ticksInRing is EVERY sample the ring still holds (128s of history at most) plus the virtual
     // closing one; gapsInWindow is how many consecutive pairs actually ended inside this window.
@@ -3331,6 +3493,16 @@ function _ltLoopDiagnosis(loop) {
 // NEVER RECORDED AT THE STALL, only stated. This snapshot captures it at the record moment, so the
 // next reproduction either ties the stall to swap pressure or eliminates it. Best-effort: null when
 // the platform tooling is unreadable — a null field is an absence of measurement, not a zero.
+//
+// THE LEVEL IS RECORDED BUT NOT CLASSIFIED ON, and that is a measurement rather than an omission.
+// #374's one positive sample is characterised by a LEVEL — "host swap ~96% used" — so the level
+// was the obvious thing to threshold. It cannot carry that weight: macOS grows and shrinks the swap
+// FILE on demand, so used/total is a fraction of a moving denominator. #419's captures recorded a
+// 17.4GB total, and this host now reports 12288.00M total with 10927.94M used — 88.9% — while idle
+// enough to be running no suite at all, at kern.memorystatus_vm_pressure_level 2 (warning) with
+// zero stalls. A threshold at 96% would sit a few percent above a routine reading of a denominator
+// that itself moves by 30%. So used/total goes in as CONTEXT next to the verdict, and the verdict is
+// computed from the per-window fault delta, which has a measured quiet-state of zero.
 function _ltMemSnapshot() {
   // `at` is the wall-clock reference the cumulative vm_stat counters need: a single snapshot of
   // cumulative counters is uninterpretable without it (review F2).
@@ -3342,13 +3514,29 @@ function _ltMemSnapshot() {
     // the review host) — the swap hypothesis is about SWAP specifically (review F1).
     mem.swapPagesIn = get("Swapins");
     mem.swapPagesOut = get("Swapouts");
-    // The page size is read, never hardcoded: Apple Silicon reports 16 KiB pages (review F1).
-    try {
-      const ps = execFileSync("pagesize", { encoding: "utf8", timeout: 3000 }).trim();
-      const n = Number(ps);
-      if (Number.isInteger(n) && n > 0) mem.pageSize = n;
-    } catch {}
+    // A GAUGE, unlike the two counters above: on modern macOS memory pressure lands in the
+    // compressor before it reaches swap at all, so a stall under compressor growth and no swap
+    // movement is a state the swap counters alone would report as quiet.
+    mem.compressorPages = get("Pages occupied by compressor");
+    // The page size is read, never hardcoded: Apple Silicon reports 16 KiB pages (review F1). It is
+    // read from vm_stat's OWN header — "(page size of 16384 bytes)" — rather than from a second
+    // `pagesize` spawn, which measured 3.7424 ms, the most expensive probe in the set and 3.3x
+    // vm_stat itself. Same number from output already in hand; the agreement is asserted by a test
+    // rather than assumed, which is also the structure-level coverage #427's review asked for.
+    const pm = out.match(/page size of (\d+) bytes/);
+    if (pm) mem.pageSize = Number(pm[1]);
   } catch { /* not macOS */ }
+  // The LEVEL, and the only gauge that is a direct statement of pressure rather than a proxy for
+  // it. 1 = normal, 2 = warning, 4 = critical.
+  try {
+    const su = execFileSync("/usr/sbin/sysctl", ["-n", "vm.swapusage"], { encoding: "utf8", timeout: 3000 });
+    const mt = su.match(/total\s*=\s*([\d.]+)M/), mu = su.match(/used\s*=\s*([\d.]+)M/);
+    if (mt) mem.swapTotalBytes = Math.round(Number(mt[1]) * 1024 * 1024);
+    if (mu) mem.swapUsedBytes = Math.round(Number(mu[1]) * 1024 * 1024);
+    const pl = execFileSync("/usr/sbin/sysctl", ["-n", "kern.memorystatus_vm_pressure_level"],
+                            { encoding: "utf8", timeout: 3000 }).trim();
+    if (/^\d+$/.test(pl)) mem.pressureLevel = Number(pl);
+  } catch { /* no sysctl, or not macOS */ }
   try {
     const vmstat = _lockReadFileSync("/proc/vmstat", "utf8");
     const get = (k) => { const m = vmstat.match(new RegExp(k + "\\s+(\\d+)")); return m ? Number(m[1]) : null; };
@@ -3357,10 +3545,27 @@ function _ltMemSnapshot() {
   } catch { /* not Linux */ }
   return mem;
 }
+// The suite-start baseline the recorded plan asks for. Taken at module load — which IS suite start
+// — so a record can difference the host's cumulative counters over the run instead of printing an
+// absolute that nothing can interpret. One spawn set, once, and only the ones already being made.
+//
+// Read the resulting delta for what it is: the window is the whole suite (~273s, or ~0.15s under
+// --only), while the stall it is attached to is 76-120s of it. It is DILUTED BY CONSTRUCTION and
+// cannot be attributed to the stall window — that is the fault axis's job. It is here because it is
+// the plan's own lever, it costs nothing extra, and a suite whose entire lifetime was quiet on swap
+// is still worth being able to say.
+const _ltMemBaseline = _ltMemSnapshot();
+function _ltMemSinceSuiteStart(mem) {
+  const d = (k) => (typeof mem[k] === "number" && typeof _ltMemBaseline[k] === "number"
+                    ? mem[k] - _ltMemBaseline[k] : null);
+  return { windowMs: mem.at - _ltMemBaseline.at, swapPagesIn: d("swapPagesIn"), swapPagesOut: d("swapPagesOut"),
+           compressorPages: d("compressorPages") };
+}
 
 function _ltObserveDrainTimeout(where, elapsedMs, t0, kind = "TIMED OUT", openAtStart = 0) {
   const loop = _ltStallSince(t0);
   const mem = _ltMemSnapshot();
+  mem.sinceSuiteStart = _ltMemSinceSuiteStart(mem);
   const children = [];
   for (const rec of _ltOpenChildren.values()) {
     const probe = _ltProbePid(rec.pid);
@@ -3394,7 +3599,11 @@ function _ltRenderDrainTimeout(r) {
   // the stall floor. A negative atMs is the tell, so it has to be on the same line as the number.
   return `${r.where}(${r.ms}ms, active=${r.active}, ps=[${kids}], ` +
          `loop=${r.loop.verdict} maxGap=${r.loop.maxGapMs}ms@${r.loop.atMs >= 0 ? "+" : ""}${r.loop.atMs}ms ` +
-         `of ${r.loop.windowMs}ms cpu=${r.loop.cpuMs}ms n>=${LT_STALL_MIN_MS}ms=${r.loop.nStalls})`;
+         `of ${r.loop.windowMs}ms cpu=${r.loop.cpuMs}ms n>=${LT_STALL_MIN_MS}ms=${r.loop.nStalls} ` +
+         // Carried into the compact form too: this is the line that reaches the #358 summary's
+         // offender list, and an offender whose window is named STALL-NO-CPU should not need the
+         // full record opened to learn whether it was paging.
+         `mem=${r.loop.memVerdict} majflt=${r.loop.majflt})`;
 }
 // Full form, printed at the MOMENT of the timeout rather than only in the end-of-block summary:
 // four of the six drain sites are outside the ltTest block, and a recurrence should carry its own
@@ -3404,7 +3613,16 @@ function _ltExplainDrainTimeout(r) {
   lines.push(`    [#374]   loop: ${r.loop.verdict} — ${_ltLoopDiagnosis(r.loop)}`);
   lines.push(`    [#374]   loop: gaps >= ${LT_STALL_MIN_MS}ms: ${r.loop.nStalls} totalling ${r.loop.sumStallMs}ms; ` +
              `top=${JSON.stringify(r.loop.top)}; gaps in window=${r.loop.gapsInWindow}; ticks in ring=${r.loop.ticksInRing}`);
-  lines.push(`    [#374]   mem: ${JSON.stringify(r.mem)}`);
+  // The per-WINDOW reading first, because it is the attributable one; the host figures below it are
+  // context for it, not a second verdict. `majflt=null` prints as MEM-UNMEASURED and must never be
+  // read as a quiet window — the diagnosis sentence says so in words.
+  lines.push(`    [#374]   mem: ${r.loop.memVerdict} — ${LT_MEM_DIAGNOSIS[r.loop.memVerdict]}`);
+  lines.push(`    [#374]   mem: across the ${r.loop.maxGapMs}ms gap this process took ` +
+             `majflt=${r.loop.majflt} major page faults (floor ${LT_MEM_MAJFLT_FLOOR}), ` +
+             `invcsw=${r.loop.invcsw} involuntary and volcsw=${r.loop.volcsw} voluntary context switches`);
+  lines.push(`    [#374]   mem: host at the record: ${JSON.stringify(r.mem)}`);
+  lines.push(`    [#374]   mem: host since suite start (DILUTED — this window is the whole suite, ` +
+             `not the gap): ${JSON.stringify(r.mem.sinceSuiteStart)}`);
   if (!r.children.length) {
     lines.push(`    [#374]   ps: ${r.registry} (${r.openAtStart} open when the drain started, 0 now) — ` +
                `${LT_PS_DIAGNOSIS[r.registry]}`);
@@ -3420,6 +3638,32 @@ function _ltExplainDrainTimeout(r) {
     }
   }
   return lines.join("\n");
+}
+// Printed once at end of run, whatever the verdict — a green run is exactly the case this exists
+// for. Silence here is a RESULT ("no stall reached the floor"), which is the same discipline the
+// release_kit's B.2 audit uses: an audit that prints nothing when it finds nothing cannot be told
+// apart from one nobody ran. No "✗": flake-hunt.yml histograms stdout ✗ lines.
+//
+// The seven calibration controls each stage a deliberate block, so a NORMAL run's ledger is never
+// empty — which makes the ledger self-checking. An empty ledger on a run that executed the controls
+// means the ledger is broken, not that the host was calm.
+function _ltReportStallLedger() {
+  const n = _ltStallLedger.length;
+  if (!n) {
+    console.log(`=== [#374] loop stalls >= ${LT_STALL_MIN_MS}ms this run: NONE ===\n`);
+    return;
+  }
+  const worst = _ltStallLedger.slice().sort((a, b) => b.gapMs - a.gapMs);
+  console.log(`=== [#374] loop stalls >= ${LT_STALL_MIN_MS}ms this run: ${n}` +
+              `${_ltStallLedgerDropped ? ` (+${_ltStallLedgerDropped} past the ${LT_STALL_LEDGER_MAX}-slot cap, NOT recorded)` : ""} ===`);
+  console.log(`    Recorded by the TICK, not by a drain: a stall that coincides with no drain is ` +
+              `invisible to both drain ledgers, and that is the common case (measured).`);
+  for (const s of worst.slice(0, 8)) {
+    console.log(`    ${s.atIso} ${String(s.gapMs).padStart(7)}ms ${s.loopVerdict}/${s.memVerdict} ` +
+                `cpu=${s.cpuMs}ms (${s.ratio}x) majflt=${s.majflt} invcsw=${s.invcsw} volcsw=${s.volcsw}`);
+  }
+  if (n > 8) console.log(`    ... and ${n - 8} more`);
+  console.log("");
 }
 // ── end #374 instrumentation ─────────────────────────────────────────────────────────────────
 
@@ -8957,6 +9201,193 @@ test("#374: the loop-verdict bands map gap and CPU ratio to all four names", () 
   }
   // All four names reachable — a band table that can only ever produce three is a silent hole.
   assert.equal(new Set(rows.map(r => r[2])).size, 4, "every verdict name must be exercised");
+});
+
+// The deterministic half of the PER-WINDOW memory calibration, and the half that carries the trap.
+// A fault counter's whole value here is that its quiet-state reading is a real 0, which means the
+// difference between "0 faults" and "no measurement" is the difference between excluding the swap
+// hypothesis for a window and knowing nothing about it. Those two must never share a name.
+test("#374: the mem bands map a per-window majflt delta to all three names, and null is NOT zero", () => {
+  const rows = [
+    [null, LT_MEM_VERDICT.UNMEASURED, "no bracketing sample carried a counter"],
+    [undefined, LT_MEM_VERDICT.UNMEASURED, "the empty-gap default, which is undefined and not 0"],
+    [0, LT_MEM_VERDICT.QUIET, "a measured zero EXCLUDES paging for the window — the opposite of null"],
+    [1, LT_MEM_VERDICT.QUIET, "one fault is not a paging event"],
+    [17, LT_MEM_VERDICT.QUIET, "the measured first-touch cost of a fresh 2s busy block on this host"],
+    // The two rows that moved the floor from 32 to 128. Both are MEASURED, in the same solo run:
+    // an ordinary half-second window faulting 68 times, and a genuine 76-second stall faulting 31.
+    // A floor between them classifies them backwards, which is what the first value did.
+    [68, LT_MEM_VERDICT.QUIET, "the measured max majflt of an ORDINARY ~500ms gap in a real run"],
+    [31, LT_MEM_VERDICT.QUIET, "measured across a REAL 76260ms stall — a stall is not a paging event here"],
+    [LT_MEM_MAJFLT_FLOOR - 1, LT_MEM_VERDICT.QUIET, "just under the floor"],
+    [LT_MEM_MAJFLT_FLOOR, LT_MEM_VERDICT.FAULTING, "the floor is INCLUSIVE"],
+    [4150, LT_MEM_VERDICT.FAULTING, "a full fault-back of this process's ~68MB RSS at 16KiB pages"],
+    [100000, LT_MEM_VERDICT.FAULTING, "a real paging stall is orders of magnitude above the floor"],
+  ];
+  for (const [majflt, want, why] of rows) {
+    assert.equal(_ltClassifyMemVerdict(majflt), want, `majflt=${majflt} (${why}) must read ${want}`);
+  }
+  assert.equal(new Set(rows.map(r => r[1])).size, 3, "every mem verdict name must be exercised");
+  // A name is a claim, and this one is load-bearing enough to assert in words: the UNMEASURED
+  // sentence must not be readable as a quiet window. #419 shipped a comment asserting a
+  // classification its constants no longer produced; this is the same guard one axis over.
+  assert.match(LT_MEM_DIAGNOSIS[LT_MEM_VERDICT.UNMEASURED], /ABSENCE OF MEASUREMENT/,
+    "the unmeasured diagnosis must say so in words, not just in its name");
+  assert.match(LT_MEM_DIAGNOSIS[LT_MEM_VERDICT.QUIET], /EXCLUDED/,
+    "the quiet diagnosis must state what it excludes, or it reads as 'nothing found'");
+});
+
+// The measurement half: that a REAL record, through the real ring, carries real counters, and that
+// the delta is bracketed to the GAP rather than accumulated from process start. Bracketing is
+// asserted on invcsw rather than majflt because invcsw is the counter that moves reliably and
+// LARGELY under a staged busy block on this host (measured: 520-1833 across 2s of spinning, against
+// 1 across a 2s idle block), so the two windows are separable by a wide margin. The bracketing
+// logic is shared — one `d(a, b, k)` over the same two samples — so proving it on the counter that
+// can be moved on demand proves it for the one that cannot.
+ltTest("#374 control H: a staged gap carries REAL per-window fault counters, bracketed to the gap and not to the process", async () => {
+  const where = "#374-control-H-EXPECTED-CONTROL";
+  // Burn BEFORE the fresh tick, so the burn is outside the measured gap by construction. If the
+  // delta were cumulative-from-start (the bug this control exists to catch), the gap would carry
+  // the burn's switches too.
+  const cum0 = process.resourceUsage().involuntaryContextSwitches;
+  _ltBlockBusy(LT_CONTROL_BLOCK_MS);
+  const burn = process.resourceUsage().involuntaryContextSwitches - cum0;
+  await _ltAwaitFreshTick(where);
+  const t0 = Date.now();
+  _ltBlockIdle(LT_CONTROL_BLOCK_MS);
+  const rec = _ltObserveDrainTimeout(where, Date.now() - t0, t0);
+
+  assert.equal(typeof rec.loop.majflt, "number",
+    `the gap must carry a MEASURED major-fault delta, not null: ${JSON.stringify(rec.loop)}`);
+  assert.equal(typeof rec.loop.invcsw, "number",
+    `the gap must carry a measured context-switch delta: ${JSON.stringify(rec.loop)}`);
+  assert.equal(rec.loop.memVerdict, LT_MEM_VERDICT.QUIET,
+    `an idle block pages nothing in, so the window must read ${LT_MEM_VERDICT.QUIET}: ${JSON.stringify(rec.loop)}`);
+  // The premise of the bracketing assertion, checked rather than assumed — a burn that moved
+  // nothing would make the comparison below pass vacuously.
+  assert.ok(burn >= 20,
+    `premise: the staged CPU burn must move invcsw enough to be separable, got ${burn}`);
+  assert.ok(rec.loop.invcsw < burn,
+    `the gap's invcsw (${rec.loop.invcsw}) must exclude the ${burn} switches burned BEFORE the ` +
+    `window opened — otherwise the delta is cumulative and every window would look identical`);
+  // The two axes are independent and must be printed independently: this record is a STALL on the
+  // loop axis and QUIET on the memory axis, which is precisely the pair #374 needs to be able to
+  // read. If the mem verdict were derived from the loop verdict this assertion would be impossible.
+  assert.equal(rec.loop.verdict, LT_LOOP_VERDICT.NO_CPU,
+    `the same window must still read STALL-NO-CPU on the loop axis: ${JSON.stringify(rec.loop)}`);
+  // The CALL SITE, not the helper. Mutation M8 deleted this line from _ltObserveDrainTimeout and the
+  // suite stayed green at 12/0, because the snapshot test below attaches sinceSuiteStart itself
+  // before asserting on it — so it was pinning the helper while the wiring was free to rot. The
+  // render line stayed green too: it prints the literal "DILUTED" whatever the value is, so
+  // JSON.stringify(undefined) went past every assertion in the file. Asserted here, on a record that
+  // came out of the real observer.
+  assert.equal(typeof rec.mem.sinceSuiteStart, "object",
+    `the RECORD must carry the suite-start delta, not just the helper that computes it: ${JSON.stringify(rec.mem)}`);
+  assert.equal(typeof rec.mem.sinceSuiteStart.windowMs, "number",
+    `and that delta must be populated: ${JSON.stringify(rec.mem.sinceSuiteStart)}`);
+  const out = _ltExplainDrainTimeout(rec);
+  assert.ok(out.includes(LT_MEM_DIAGNOSIS[LT_MEM_VERDICT.QUIET]),
+    "the printed output must carry the memory diagnosis SENTENCE, not just the verdict label");
+  assert.ok(out.includes("DILUTED"),
+    "the suite-window host delta must be printed with its dilution stated, or it reads as per-window evidence");
+  assert.ok(_ltRenderDrainTimeout(rec).includes(LT_MEM_VERDICT.QUIET),
+    "the compact offender line must carry the mem verdict too — that is the line the #358 summary prints");
+});
+
+// The blind spot this PR's own calibration run measured: a stall that coincides with no drain is
+// recorded by NOTHING in the two drain ledgers. This control stages exactly that — a block with no
+// drain anywhere near it — and asserts the tick ledgered it anyway. It is the difference between a
+// lever that fires on the event and one that watched two 76-90s stalls go past in a green run.
+ltTest("#374 control I: a stall with NO drain watching is still ledgered, by the tick itself", async () => {
+  const where = "#374-control-I-EXPECTED-CONTROL";
+  await _ltAwaitFreshTick(where);
+  // Premise, checked rather than assumed: a saturated ledger silently stops recording, and this
+  // control would then fail for a reason that has nothing to do with the wiring it tests.
+  assert.ok(_ltStallLedger.length < LT_STALL_LEDGER_MAX,
+    `premise: the ledger must not already be at its ${LT_STALL_LEDGER_MAX}-slot cap, got ${_ltStallLedger.length}`);
+  const before = _ltStallLedger.length;
+  _ltBlockIdle(LT_CONTROL_BLOCK_MS);
+  // Deliberately NO ltDrain, no _ltObserveDrainTimeout, no child: nothing observes this block except
+  // the tracer's own next tick. That is the whole point.
+  await _ltAwaitFreshTick(where);
+
+  const fresh = _ltStallLedger.slice(before);
+  const mine = fresh.find(s => s.gapMs >= LT_CONTROL_BLOCK_MS);
+  assert.ok(mine, `a ${LT_CONTROL_BLOCK_MS}ms block with no drain watching must still be ledgered; ` +
+                  `new entries were ${JSON.stringify(fresh)}`);
+  assert.equal(mine.loopVerdict, LT_LOOP_VERDICT.NO_CPU,
+    `the ledgered stall must carry the loop verdict: ${JSON.stringify(mine)}`);
+  assert.equal(mine.memVerdict, LT_MEM_VERDICT.QUIET,
+    `and the per-window memory verdict: ${JSON.stringify(mine)}`);
+  assert.equal(typeof mine.majflt, "number",
+    `with a MEASURED fault delta rather than null: ${JSON.stringify(mine)}`);
+  assert.equal(typeof mine.atIso, "string",
+    "a ledgered stall needs its wall-clock stamp, or it cannot be correlated with anything else");
+});
+
+// The end-of-run report is the only way a ledgered stall reaches a human, so it gets a behavioural
+// test rather than being trusted because it is "just a print". Both branches: an empty ledger must
+// SAY it found nothing (silence and "not run" must not look alike), and a populated one must name
+// the stall with both verdicts.
+test("#374: the end-of-run stall report states an empty result and names a ledgered stall", () => {
+  const said = [];
+  const realLog = console.log;
+  console.log = (...a) => said.push(a.join(" "));
+  const savedLedger = _ltStallLedger.splice(0, _ltStallLedger.length);
+  const savedDropped = _ltStallLedgerDropped;
+  try {
+    _ltReportStallLedger();
+    assert.match(said.join("\n"), /loop stalls >= \d+ms this run: NONE/,
+      "an empty ledger must print a RESULT, not nothing — silence cannot be told from a report that never ran");
+    said.length = 0;
+    _ltStallLedger.push({ atIso: "2026-08-16T00:00:00.000Z", gapMs: 76260, cpuMs: 644, ratio: 0.008,
+      loopVerdict: LT_LOOP_VERDICT.NO_CPU, memVerdict: LT_MEM_VERDICT.QUIET,
+      majflt: 31, invcsw: 2148, volcsw: 874 });
+    _ltReportStallLedger();
+    const out = said.join("\n");
+    // The figures are the REAL 76260ms stall this PR's calibration run measured, so the report is
+    // exercised on the shape it exists for rather than on a toy.
+    assert.match(out, /76260ms/, "the report must carry the gap length");
+    assert.match(out, new RegExp(LT_LOOP_VERDICT.NO_CPU), "and the loop verdict");
+    assert.match(out, new RegExp(LT_MEM_VERDICT.QUIET), "and the per-window memory verdict");
+    assert.match(out, /majflt=31/, "and the raw fault count the verdict was computed from");
+  } finally {
+    console.log = realLog;
+    _ltStallLedger.length = 0;
+    _ltStallLedger.push(...savedLedger);
+    _ltStallLedgerDropped = savedDropped;
+  }
+});
+
+// The suite-start baseline exists and differences the host's cumulative counters over the run. This
+// is the plan's own lever, and what it pins is the WIRING (a baseline was taken, the window is the
+// suite's, the subtraction happens) — never the values, which are observational by design.
+test("#374: the host snapshot carries the level gauges and a suite-start delta, and its page size agrees with pagesize(1)", () => {
+  const mem = _ltMemSnapshot();
+  mem.sinceSuiteStart = _ltMemSinceSuiteStart(mem);
+  assert.equal(typeof mem.at, "number", "the wall-clock reference must be present");
+  assert.ok(mem.sinceSuiteStart.windowMs >= 0,
+    `the suite window must be non-negative, got ${mem.sinceSuiteStart.windowMs}`);
+  if (process.platform === "darwin") {
+    // The page size now comes from vm_stat's own header instead of a 3.7424ms `pagesize` spawn.
+    // Same number or the change was wrong, so the agreement is measured here rather than assumed —
+    // this is also the structure-level coverage #427's post-merge review asked for.
+    assert.equal(typeof mem.pageSize, "number", "vm_stat's header must yield a page size on darwin");
+    const authoritative = Number(execFileSync("pagesize", { encoding: "utf8" }).trim());
+    assert.equal(mem.pageSize, authoritative,
+      `vm_stat's header page size (${mem.pageSize}) must equal pagesize(1) (${authoritative})`);
+    assert.equal(typeof mem.swapUsedBytes, "number", "the swap LEVEL must be recorded as context");
+    assert.equal(typeof mem.swapTotalBytes, "number", "the level's denominator must be recorded WITH it");
+    // The denominator is why the level is context and not a verdict: it moves. Recording used
+    // without total would print a percentage of an unstated base, which is how "~96% used" became
+    // a number nobody could compare against anything.
+    assert.ok(mem.swapTotalBytes > 0, "a used-without-total figure is uninterpretable");
+    assert.equal(typeof mem.compressorPages, "number",
+      "compressor occupancy is a gauge the swap counters cannot see — on modern macOS pressure lands there first");
+    assert.equal(typeof mem.swapPagesIn, "number", "the cumulative counter the delta is taken against");
+    assert.equal(typeof mem.sinceSuiteStart.swapPagesIn, "number",
+      "the suite-start delta must be a number once a baseline exists");
+  }
 });
 
 ltTest("#374 control C: a grandchild holding stdout reads REAPED-GONE on a LIVE loop, and the scan names the holder", async () => {
@@ -26009,6 +26440,7 @@ runAsyncTests().then(() => Promise.all(pendingAsync)).then(() => {
     console.log(`${skipped} test(s) did not run on this platform — search the output for "⊘ SKIP" ` +
                 `to see which coverage this run did NOT provide.\n`);
   }
+  _ltReportStallLedger();
   // --only with ZERO registered tests is a FAILURE, not a green run. A typo'd filter that matched
   // nothing would otherwise print "0 passed, 0 failed" and exit 0 — exactly the false-confidence
   // class this mode exists to kill (a mutation check could "pass" because the filter matched
