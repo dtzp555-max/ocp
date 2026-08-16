@@ -9239,19 +9239,27 @@ test("#374: the mem bands map a per-window majflt delta to all three names, and 
 
 // The measurement half: that a REAL record, through the real ring, carries real counters, and that
 // the delta is bracketed to the GAP rather than accumulated from process start. Bracketing is
-// asserted on invcsw rather than majflt because invcsw is the counter that moves reliably and
-// LARGELY under a staged busy block on this host (measured: 520-1833 across 2s of spinning, against
-// 1 across a 2s idle block), so the two windows are separable by a wide margin. The bracketing
-// logic is shared — one `d(a, b, k)` over the same two samples — so proving it on the counter that
-// can be moved on demand proves it for the one that cannot.
+// asserted on invcsw rather than majflt because invcsw is the counter that can be made to move on
+// demand; the bracketing logic is shared — one `d(a, b, k)` over the same two samples — so proving
+// it on the counter that moves proves it for the one that cannot be staged.
+//
+// THE COMPARISON IS AGAINST THE CUMULATIVE TOTAL, NOT AGAINST THE BURN, AND CI IS WHY.
+// The first version asserted the gap's invcsw was smaller than the switches burned by a staged 2s
+// busy block, with a premise that the burn had moved the counter at least 20. That premise is a
+// HOST CONSTANT wearing a portable disguise: measured 520-1833 on the darwin workstation and 12 on
+// the Linux CI runner, where it failed the build. Same shape as this repo's `ps` column-padding
+// bug, inverted — a guard that is right on the workstation and wrong on CI.
+//
+// The cumulative total has no such constant in it. Everything this process accumulated before the
+// window opened is excluded from the gap by definition, so if the delta were cumulative-from-start
+// — exactly the bug this control exists to catch — it would read AT LEAST the pre-window total
+// rather than below it. The staged burn is kept because it adds margin for free, but nothing is
+// asserted about its size.
 ltTest("#374 control H: a staged gap carries REAL per-window fault counters, bracketed to the gap and not to the process", async () => {
   const where = "#374-control-H-EXPECTED-CONTROL";
-  // Burn BEFORE the fresh tick, so the burn is outside the measured gap by construction. If the
-  // delta were cumulative-from-start (the bug this control exists to catch), the gap would carry
-  // the burn's switches too.
-  const cum0 = process.resourceUsage().involuntaryContextSwitches;
+  // Burn BEFORE the fresh tick, so it is outside the measured gap by construction.
   _ltBlockBusy(LT_CONTROL_BLOCK_MS);
-  const burn = process.resourceUsage().involuntaryContextSwitches - cum0;
+  const cumBefore = process.resourceUsage().involuntaryContextSwitches;
   await _ltAwaitFreshTick(where);
   const t0 = Date.now();
   _ltBlockIdle(LT_CONTROL_BLOCK_MS);
@@ -9263,13 +9271,14 @@ ltTest("#374 control H: a staged gap carries REAL per-window fault counters, bra
     `the gap must carry a measured context-switch delta: ${JSON.stringify(rec.loop)}`);
   assert.equal(rec.loop.memVerdict, LT_MEM_VERDICT.QUIET,
     `an idle block pages nothing in, so the window must read ${LT_MEM_VERDICT.QUIET}: ${JSON.stringify(rec.loop)}`);
-  // The premise of the bracketing assertion, checked rather than assumed — a burn that moved
-  // nothing would make the comparison below pass vacuously.
-  assert.ok(burn >= 20,
-    `premise: the staged CPU burn must move invcsw enough to be separable, got ${burn}`);
-  assert.ok(rec.loop.invcsw < burn,
-    `the gap's invcsw (${rec.loop.invcsw}) must exclude the ${burn} switches burned BEFORE the ` +
-    `window opened — otherwise the delta is cumulative and every window would look identical`);
+  // The premise, checked rather than assumed — against zero the comparison below passes vacuously.
+  // Unlike the burn it replaced, this is whole-process accumulation over every test that ran before
+  // this one, so it is not a figure that can differ by two orders of magnitude between hosts.
+  assert.ok(cumBefore >= 20,
+    `premise: this process must have accumulated some involuntary switches before the window, got ${cumBefore}`);
+  assert.ok(rec.loop.invcsw < cumBefore,
+    `the gap's invcsw (${rec.loop.invcsw}) must EXCLUDE the ${cumBefore} switches this process had ` +
+    `already accumulated before the window opened — a cumulative delta would read at least that`);
   // The two axes are independent and must be printed independently: this record is a STALL on the
   // loop axis and QUIET on the memory axis, which is precisely the pair #374 needs to be able to
   // read. If the mem verdict were derived from the loop verdict this assertion would be impossible.
