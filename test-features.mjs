@@ -9060,17 +9060,28 @@ ltTest("integration (#365): a stream that ends mid-character — stdout truncati
 // looser forms were each MEASURED to be wrong. Stated as WHY and BY HOW MUCH rather than as totals,
 // because a total here would be the very thing this header was fixed for:
 //
-//   "the registrations below"     every registration in the rest of the file — four figures, and
-//                                 not remotely the controls
-//   bare ltTest                   OVER by exactly one: #358's serialization test is an ltTest
-//                                 registered below here and is not a control
-//   ltTest("#374 control          OVER by exactly one: it matches ITS OWN QUOTATION in this
-//                                 comment. A predicate a comment names is a predicate the comment
-//                                 then contains
+//   "the registrations below"     every registration in the rest of the file — not remotely the
+//                                 controls
+//   bare ltTest                   OVER: #358's serialization test is an ltTest registered below
+//                                 here and is not a control — and this comment's own prose is
+//                                 counted too
+//   ltTest("#374 control          OVER: it matches ITS OWN QUOTATION in this comment. A predicate
+//                                 a comment names is a predicate the comment then contains
 //   ^ltTest("#374 control         right number, WRONG METHOD: this file contains INDENTED
 //                                 registrations, so ^ is the habit that silently undercounts —
 //                                 and undercounting is the failure that does not look like one
 //   ltTest("#374 control [A-Z]:   the controls, and nothing else
+//
+// NO MAGNITUDES IN THIS TABLE, AND THAT RULE WAS PAID FOR. Two rows above carried "OVER by exactly
+// one" until the commit whose subject was "the registration pointer matched its own quotation"
+// added three further quotations of the predicate and left both numbers standing. By then the loose
+// form matched thirteen lines, not ten. The sentence carrying the stale figure was the one reading
+// "a predicate a comment names is a predicate the comment then contains" — it went stale by
+// precisely the mechanism it describes, in the commit written to fix that mechanism.
+//
+// So a magnitude here is not a fact about the code; it is a live count of THIS COMMENT'S OWN
+// WORDING, which changes whenever anyone edits the explanation. The mechanism is what stays true,
+// and the count is always one grep away.
 //
 // TWO PROPERTIES MAKE THE LAST ONE SAFE, both measured rather than reasoned:
 //   - [A-Z] and NOT [A-I]. A bounded range encodes TODAY'S HIGHEST LETTER, so a later control J
