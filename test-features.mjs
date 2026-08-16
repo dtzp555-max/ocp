@@ -9056,11 +9056,30 @@ ltTest("integration (#365): a stream that ends mid-character — stdout truncati
 // calibration claim that quietly excludes a case is worse than no claim.
 //
 // Each control pins a DIFFERENT named diagnostic. THE COUNT IS DELIBERATELY NOT WRITTEN HERE:
-// count `ltTest("#374 control` below — that exact predicate, not "the registrations" and not bare
-// `ltTest`. Measured, because the looser forms mislead by different amounts: everything registered
-// after this header is 1018 registrations, the `ltTest`s among them are 10, and the controls are 9.
-// The extra `ltTest` is the #358 serialization test, which is not a control. A pointer that resolves
-// to the wrong number is the same defect as a stale total, one level of indirection out.
+// count  ltTest("#374 control [A-Z]:  below. Every part of that predicate is load-bearing, and the
+// looser forms were each MEASURED to be wrong. Stated as WHY and BY HOW MUCH rather than as totals,
+// because a total here would be the very thing this header was fixed for:
+//
+//   "the registrations below"     every registration in the rest of the file — four figures, and
+//                                 not remotely the controls
+//   bare ltTest                   OVER by exactly one: #358's serialization test is an ltTest
+//                                 registered below here and is not a control
+//   ltTest("#374 control          OVER by exactly one: it matches ITS OWN QUOTATION in this
+//                                 comment. A predicate a comment names is a predicate the comment
+//                                 then contains
+//   ^ltTest("#374 control         right number, WRONG METHOD: this file contains INDENTED
+//                                 registrations, so ^ is the habit that silently undercounts —
+//                                 and undercounting is the failure that does not look like one
+//   ltTest("#374 control [A-Z]:   the controls, and nothing else
+//
+// TWO PROPERTIES MAKE THE LAST ONE SAFE, both measured rather than reasoned:
+//   - [A-Z] and NOT [A-I]. A bounded range encodes TODAY'S HIGHEST LETTER, so a later control J
+//     would leave the predicate silently short. Against a staged `control J` line, [A-I] matches 0
+//     and [A-Z] matches 1.
+//   - The class CANNOT MATCH ITS OWN SPELLING. This comment writes the predicate twice, literally,
+//     and neither line is a hit: `[A-Z]` matches one character in A..Z, and the text "[A-Z]" begins
+//     with "[". So quoting it is safe BY CONSTRUCTION, not because the wording happens to dodge it.
+//
 // This sentence said "SEVEN" while the list held nine, which is the
 // THIRD time a control count in this file has been wrong, every time in the same way — the number
 // sat next to a list that then grew. A total stated next to its own enumeration is a second source
