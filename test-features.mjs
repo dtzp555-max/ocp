@@ -3415,11 +3415,18 @@ const LT_MEM_DIAGNOSIS = Object.freeze({
 // sits ABOVE the noise this suite generates by simply running.
 // WHOSE HOST, THOUGH. The 68/52 readings above come from ONE run on ONE machine. Independent review
 // could not re-derive them: on the reviewer's host no ordinary gap exceeded majflt 2, so 32 and 128
-// are indistinguishable there and that run cannot discriminate between them. Pooled across all six
-// stalls measured to date (majflt 5, 31, 7, 2, 2, 4) every one is at or below 31, so the floor is
-// the right way round on both hosts and a floor of 32 is redder than one of 128 on either. But the
-// evidence for THIS VALUE rather than some other value above the noise rests on a single run, and
-// should be re-derived rather than inherited if the suite's first-touch behaviour changes.
+// are indistinguishable there and that run cannot discriminate between them.
+//
+// THE INVARIANT, STATED WITHOUT A TALLY BECAUSE THE TALLY GROWS EVERY RUN: every stall measured so
+// far, on either host, reads majflt WELL UNDER this floor — the largest observed to date is 31. A
+// running count of how many stalls that is would be stale by the next suite run, which is the same
+// defect the calibration header below had and the reason it no longer states its own total. Re-derive
+// rather than trust: every run prints its stalls with majflt per stall in the end-of-run ledger, so
+// `=== [#374] loop stalls` in any run's output is the current evidence.
+//
+// So the floor is the right way round on both hosts and a floor of 32 is redder than one of 128 on
+// either. But the evidence for THIS VALUE rather than some other value above the noise rests on a
+// single run, and should be re-derived rather than inherited if first-touch behaviour changes.
 const LT_MEM_MAJFLT_FLOOR = 128;
 // Pure, so the boundary is provable by a table rather than by staging a swap-thrashing host — the
 // same split #419 used for the loop bands. The asymmetry is deliberate and is NOT the same as the
@@ -9049,7 +9056,12 @@ ltTest("integration (#365): a stream that ends mid-character — stdout truncati
 // calibration claim that quietly excludes a case is worse than no claim.
 //
 // Each control pins a DIFFERENT named diagnostic. THE COUNT IS DELIBERATELY NOT WRITTEN HERE:
-// count the registrations below. This sentence said "SEVEN" while the list held nine, which is the
+// count `ltTest("#374 control` below — that exact predicate, not "the registrations" and not bare
+// `ltTest`. Measured, because the looser forms mislead by different amounts: everything registered
+// after this header is 1018 registrations, the `ltTest`s among them are 10, and the controls are 9.
+// The extra `ltTest` is the #358 serialization test, which is not a control. A pointer that resolves
+// to the wrong number is the same defect as a stale total, one level of indirection out.
+// This sentence said "SEVEN" while the list held nine, which is the
 // THIRD time a control count in this file has been wrong, every time in the same way — the number
 // sat next to a list that then grew. A total stated next to its own enumeration is a second source
 // of truth for something the enumeration already answers, so it is removed rather than corrected.
