@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+### Added
+
+- **`node test-features.mjs --only <substring>[,<substring>...]` runs only the tests whose registered NAME contains any of the comma-separated substrings (case-sensitive; comma = OR).** The defense-cost directive's targeted test-run mode: a filtered run registers only the matching subset, so a mutation campaign or reviewer spot-check costs seconds instead of the ~4-minute full run, while the FULL suite remains the final gate (implementer final run + CI). The filter lives at the registration layer — `test` / `testAsync` / `ltTest` / `testSkipped` short-circuit a non-matching name before any counting, `pendingAsync` queueing, or ✓/✗/⊘ logging (a non-matching platform-gated skip is suppressed entirely; a matching one still records its skip) — so a run with no flag (npm test / CI) is byte-identical to today. A filter that matches NOTHING exits non-zero (exit 1) with `no tests matched --only filter: <subs>`, so a typo'd `--only` can never masquerade as a green run; the no-flag contract is untouched. Three self-checks spawn the real runner as a subprocess and assert the contract end to end — exit 0 + the exact count for a matching filter, non-zero + the message for a zero-match filter, no non-matching test name in the output, and a platform-gated test still accounted for (run or skipped) — and each is mutation-proven. **Not endpoint-touching** — `test-features.mjs`, `AGENTS.md`, and this file only; `server.mjs` / `lib/` / `keys.mjs` are 0 lines changed.
+
 ## v3.29.3 — 2026-08-16
 
 ### Fixed

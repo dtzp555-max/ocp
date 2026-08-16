@@ -21,6 +21,29 @@ import { AsyncLocalStorage } from "node:async_hooks";
 
 process.env.HOME = homedir(); // normalize HOME so homedir()-derived paths are stable across shells
 
+// ── --only <substring>[,<substring>...]: targeted test-run mode (defense-cost directive) ─────────
+// Parsed BEFORE any registration so a filtered run registers only tests whose NAME contains at
+// least one substring (case-sensitive; comma = OR). `null` when the flag is absent, so the
+// unfiltered path (npm test / CI) is byte-identical to today. `--only=a,b` is accepted alongside
+// the space form. The filter itself lives at the REGISTRATION layer — see the wrapped test /
+// testAsync / ltTest below — NOT inside createHarness(), because the #402/#415 self-checks
+// fabricate further instances whose synthetic fixture names never match and must never be filtered.
+const _onlySubstrings = (() => {
+  const argv = process.argv.slice(2);
+  let value = null;
+  for (let i = 0; i < argv.length; i++) {
+    if (argv[i] === "--only") { value = argv[i + 1] ?? ""; break; }
+    if (argv[i].startsWith("--only=")) { value = argv[i].slice("--only=".length); break; }
+  }
+  if (value === null) return null;
+  const parts = value.split(",").filter((s) => s.length > 0);
+  return parts.length > 0 ? parts : null;
+})();
+function _onlyMatches(name) {
+  if (_onlySubstrings === null) return true; // no filter -> the unfiltered path
+  return _onlySubstrings.some((sub) => name.includes(sub));
+}
+
 // ── #416: the suite mutex, in code ──────────────────────────────────────────────────────────
 // AGENTS.md used to carry this protocol as prose; five prescriptions in it failed measurement and
 // the full record lives in issue #416. This is the code version, and each failed prescription is a
@@ -394,8 +417,30 @@ function createHarness({ log = console.log } = {}) {
 
 // The one instance the suite itself runs on. Everything below binds to it.
 const _harness = createHarness();
-const { test, testAsync, testSkipped, skipRemainingTest, passedNames, failedNames, pendingAsync } = _harness;
+const { test: _rawTest, testAsync: _rawTestAsync, testSkipped: _rawTestSkipped, skipRemainingTest, passedNames, failedNames, pendingAsync } = _harness;
 const _m366Counts = _harness.counts;
+
+// --only filter, applied at the registration layer. It wraps the LIVE harness bindings rather than
+// living inside createHarness(): a non-matching registration is a NO-OP — no counting, no
+// pendingAsync entry, no ✓/✗/⊘ logging — while the #402/#415 self-checks below keep using
+// createHarness()'s raw test/testAsync/testSkipped for their synthetic fixtures, which must never
+// be filtered. testSkipped() gets the same treatment because the TOP-LEVEL platform gates (the
+// #366 case-fold/readdir and root-only tests) reach testSkipped() directly and would otherwise
+// bypass the filter: a NON-matching name must be suppressed entirely (no skip count, no ⊘ SKIP log,
+// no misuse bookkeeping), while a MATCHING name that is platform-skipped still records its skip —
+// the honest coverage signal for the test the operator asked for.
+function test(name, fn) {
+  if (!_onlyMatches(name)) return;
+  _rawTest(name, fn);
+}
+async function testAsync(name, fn) {
+  if (!_onlyMatches(name)) return;
+  await _rawTestAsync(name, fn);
+}
+function testSkipped(name, reason) {
+  if (!_onlyMatches(name)) return;
+  _rawTestSkipped(name, reason);
+}
 
 console.log("\n=== OCP Feature Tests (Quota + Cache) ===\n");
 
@@ -1907,6 +1952,132 @@ test("#402: every counter the harness prints is accounted for by name — passed
   assert.deepEqual(h.failedNames.slice().sort(), ["async-fail", "misuse", "sync-fail"],
     "control: the failure ledger holds both real failures and the misuse verdict");
   assert.equal(c.skipped, 2, "control: the misuse and the in-body skip both counted as skips");
+});
+
+
+// ── --only targeted-run mode: the registration-layer filter, proven end to end ─────────────────
+// The filter wraps the live test/testAsync/ltTest bindings (see above). This proves it BEHAVIORALLY,
+// by running the REAL runner as a subprocess: node test-features.mjs --only compareVersions must
+// register exactly the 3 tests whose names contain "compareVersions", pass them, and print no other
+// test name. A subprocess — not a second createHarness instance — is the only shape that exercises
+// the actual argv parse + filter wiring end to end; a second instance would prove createHarness,
+// not the flag.
+//
+// The child is spawned with a FRESH cwd so it does not contend on THIS process's suite lock
+// (SUITE_LOCK_DIR is cwd-scoped), and it still proves the filtered run takes/releases its OWN lock
+// and cleans up (its scratch db is a separate mkdtemp via test-env.mjs). Expected count is 3 —
+// re-derive: grep -n "compareVersions" test-features.mjs → exactly three test( names, none in
+// testAsync/ltTest. The marker is deliberately NOT in this test's own name, so the child cannot
+// recurse back into this selfcheck.
+test("--only targeted selfcheck: a spawned targeted child registers exactly the matching subset and nothing else", () => {
+  const marker = "compareVersions";
+  const expected = 3;
+  const selfPath = _ltF2P(new URL("./test-features.mjs", import.meta.url));
+  const childCwd = mkdtempSync(join(tmpdir(), "ocp-only-selfcheck-"));
+  let out = "";
+  try {
+    const res = spawnSync(process.execPath, [selfPath, "--only", marker],
+      { encoding: "utf8", cwd: childCwd, timeout: 120000, maxBuffer: 16 * 1024 * 1024 });
+    out = (res.stdout || "") + (res.stderr || "");
+    assert.equal(res.error, undefined,
+      "spawned --only run failed to complete: " + (res.error && res.error.message) + " — output: " + out);
+    assert.equal(res.status, 0, "spawned --only run exited " + res.status + " — output: " + out);
+    const results = out.match(/=== Results: ([0-9]+) passed, ([0-9]+) failed ===/);
+    assert.ok(results, "no === Results === line in the spawned --only run: " + out);
+    // 1. No non-matching name. Extract the ✓ verdict lines and assert each name contains the
+    //    marker BEFORE any count check, so a leak that also changes the count is attributed to
+    //    THIS assertion rather than masked by a count assertion that fires first (a non-matching
+    //    name in the output is a registration the filter let through).
+    const passNames = [];
+    const passRe = /^  ✓ (.+)$/gm;
+    let pm;
+    while ((pm = passRe.exec(out)) !== null) passNames.push(pm[1]);
+    for (const name of passNames) {
+      assert.ok(name.includes(marker),
+        "a test name NOT matching the filter was registered: " + JSON.stringify(name));
+    }
+    // 2. The summary count equals the expected subset count, and no failure/skip verdict leaked in.
+    assert.equal(Number(results[1]), expected,
+      "the spawned --only run counted " + results[1] + " passes; expected " + expected + ": " + out);
+    assert.equal(Number(results[2]), 0, "the spawned --only run reported failures: " + out);
+    assert.equal(passNames.length, expected,
+      "expected " + expected + " ✓ lines, got " + passNames.length + ": " + JSON.stringify(passNames) + " :: " + out);
+    assert.ok(out.indexOf("  ✗ ") === -1, "a failed test appeared in the filtered run: " + out);
+    // No ⊘ SKIP for a NON-matching name. The Linux CI regression was exactly a top-level
+    // testSkipped() (the #366 case-fold test on ext4) bypassing the filter and printing a ⊘ SKIP
+    // line whose name does not match the marker. A MATCHING name that is platform-skipped would
+    // still be allowed through — so this checks the LINE carries the marker, not that all skips are
+    // absent. (Checked on the full line: the name/reason separator is " — ", and a test name may
+    // itself contain that separator, so extracting the name alone would truncate it.)
+    const skipLines = out.match(/^  ⊘ SKIP .+$/gm) || [];
+    for (const line of skipLines) {
+      assert.ok(line.includes(marker),
+        "a NON-matching test name was SKIPPED in the filtered run: " + JSON.stringify(line) + " :: " + out);
+    }
+  } finally {
+    rmSync(childCwd, { recursive: true, force: true });
+  }
+});
+
+
+// The second half of the testSkipped() fix: a MATCHING name that goes down a top-level platform
+// gate must still be accounted for — a ✓ when the test runs, a ⊘ SKIP when the platform cannot
+// supply the premise — while a NON-matching name must never appear. The marker is the #366 case-fold
+// test, which skips on a case-SENSITIVE filesystem (Linux CI ext4) and runs on case-insensitive
+// (macOS APFS), so this exercises both halves of the testSkipped() wrapper on exactly one platform
+// per run without needing to know which one it is on.
+test("--only targeted selfcheck: a platform-gated test for a MATCHING name is still accounted for (run or skipped), never a non-matching name", () => {
+  const marker = "case-insensitive filesystem they disagree";
+  const selfPath = _ltF2P(new URL("./test-features.mjs", import.meta.url));
+  const childCwd = mkdtempSync(join(tmpdir(), "ocp-only-skipcheck-"));
+  let out = "";
+  try {
+    const res = spawnSync(process.execPath, [selfPath, "--only", marker],
+      { encoding: "utf8", cwd: childCwd, timeout: 120000, maxBuffer: 16 * 1024 * 1024 });
+    out = (res.stdout || "") + (res.stderr || "");
+    assert.equal(res.error, undefined,
+      "spawned --only run failed to complete: " + (res.error && res.error.message) + " — output: " + out);
+    assert.equal(res.status, 0, "spawned --only run exited " + res.status + " — output: " + out);
+    const passLines = out.match(/^  ✓ .+$/gm) || [];
+    const skipLines = out.match(/^  ⊘ SKIP .+$/gm) || [];
+    const failLines = out.match(/^  ✗ .+$/gm) || [];
+    assert.equal(failLines.length, 0, "the matching platform-gated test must never FAIL: " + out);
+    assert.equal(passLines.length + skipLines.length, 1,
+      "the matching platform-gated test must be accounted for exactly once (run OR skipped); got " +
+      "passes=" + passLines.length + " skips=" + skipLines.length + " :: " + out);
+    for (const line of passLines.concat(skipLines)) {
+      assert.ok(line.includes(marker),
+        "a NON-matching verdict appeared in the filtered run: " + JSON.stringify(line) + " :: " + out);
+    }
+  } finally {
+    rmSync(childCwd, { recursive: true, force: true });
+  }
+});
+
+
+// The zero-match contract: a filter that matches NOTHING must exit non-zero and say so, so a
+// typo'd --only can never masquerade as a green run (a mutation check "passing" because the filter
+// matched nothing is exactly the false confidence this mode exists to kill). The marker is chosen
+// to match no real test name on any platform.
+test("--only targeted selfcheck: a filter that matches nothing exits non-zero and names the filter", () => {
+  const marker = "definitely-no-such-test-xyz";
+  const selfPath = _ltF2P(new URL("./test-features.mjs", import.meta.url));
+  const childCwd = mkdtempSync(join(tmpdir(), "ocp-only-nomatch-"));
+  let out = "";
+  try {
+    const res = spawnSync(process.execPath, [selfPath, "--only", marker],
+      { encoding: "utf8", cwd: childCwd, timeout: 120000, maxBuffer: 16 * 1024 * 1024 });
+    out = (res.stdout || "") + (res.stderr || "");
+    assert.equal(res.error, undefined,
+      "spawned --only run failed to complete: " + (res.error && res.error.message) + " — output: " + out);
+    assert.equal(res.status, 1,
+      "a filter that matches nothing must exit non-zero (documented contract: exit 1); got status " +
+      res.status + " — output: " + out);
+    assert.ok(out.includes("no tests matched --only filter: " + marker),
+      "the zero-match message must name the filter — output: " + out);
+  } finally {
+    rmSync(childCwd, { recursive: true, force: true });
+  }
 });
 
 
@@ -3574,6 +3745,10 @@ async function ltPost(port, body) {
 // above exists, not a gap this queue is meant to close by itself.
 let _ltQueue = Promise.allSettled([...pendingAsync]).then(() => {});
 function ltTest(name, fn) {
+  // Same registration-layer filter as test()/testAsync(): a non-matching live-server test must not
+  // even build its _ltQueue link, so a filtered run leaves no trace of it and never advances the
+  // queue for a test that did not register.
+  if (!_onlyMatches(name)) return;
   test(name, () => {
     const run = _ltQueue.then(fn, fn);
     // A test's own promise settles as soon as its assertions finish; its `finally { child.kill
@@ -25833,6 +26008,14 @@ runAsyncTests().then(() => Promise.all(pendingAsync)).then(() => {
     console.log(`=== Skipped: ${skipped} ===`);
     console.log(`${skipped} test(s) did not run on this platform — search the output for "⊘ SKIP" ` +
                 `to see which coverage this run did NOT provide.\n`);
+  }
+  // --only with ZERO registered tests is a FAILURE, not a green run. A typo'd filter that matched
+  // nothing would otherwise print "0 passed, 0 failed" and exit 0 — exactly the false-confidence
+  // class this mode exists to kill (a mutation check could "pass" because the filter matched
+  // nothing). No-flag runs are untouched: npm test / CI keep their exit-0-on-green contract.
+  if (_onlySubstrings !== null && passed + failed + skipped === 0) {
+    console.error(`no tests matched --only filter: ${_onlySubstrings.join(",")}`);
+    process.exit(1);
   }
   process.exit(failed > 0 ? 1 : 0);
 }).catch((e) => {
