@@ -26190,6 +26190,13 @@ test("#327 part 5: a SINGLE-install host still gets an inventory — `clear` enu
   const result = await runDoctor({
     mockPlatform: "linux", skipNetwork: false,
     mockVersion: "v3.29.2", mockLatest: "v3.29.2",
+    // Carried over from the part-5 test above rather than left implicit (#438 review). With
+    // `skipNetwork: false` this is what keeps the run off the wire: the mocked body is read by the
+    // health check AND by the oauth check via classifyAuthOk, so without it this test would issue a
+    // real request to the documented default port — the LIVE production proxy on the host running
+    // the suite. `mockLatest` closes the other live surface (it skips the git fetch), and the `run`
+    // mock below THROWS on any unexpected command, so a newly-added probe fails loudly here instead
+    // of silently reading the host.
     mockHealth: { status: 200, body: { version: "3.29.2", auth: { ok: true } } },
     run: (cmd) => {
       if (cmd.includes("--user list-unit-files")) return "ocp.service enabled";
