@@ -26097,6 +26097,12 @@ test("#416 mode 1: a lock whose owner pid is ESRCH-gone is broken and re-acquire
       `a stale lock (dead pid ${deadPid}) must be broken and re-acquired by THIS process — got ${JSON.stringify(owner)}`);
   } finally {
     try { _lockRmSync(dir, { recursive: true, force: true }); } catch {}
+    // The ticket dir is a SIBLING path (`dir + ".tickets"`), not a child, so removing `dir` never
+    // reached it and this test leaked one directory into scratchpad/ per suite run (#437 review F6,
+    // which also measured the leak as mode 1's ALONE — mode 5 pre-creates an EMPTY lock dir, which
+    // rename() replaces on iteration 1, so it never tickets and leaks 0). Same cleanup the fairness
+    // tests below already do.
+    try { _lockRmSync(_lockTicketDir(dir), { recursive: true, force: true }); } catch {}
   }
 });
 
@@ -26522,23 +26528,38 @@ test("#416 fairness: a LIVE owner's ticket is NOT swept (a reused-pid read is co
 //     could not fail, because nothing in that body attempted a break.
 //   * the exit-handler release (#423 audit F3). Measured: removing it left the suite at 1237/0.
 //
-// THE SECOND PROCESS IS THE REAL SUITE. `node test-features.mjs --only <a filter that matches no
-// test>` in a scratch cwd runs the real module-level suiteLockAcquire against that cwd's
-// `scratchpad/.suite.lock` and runs no test at all — measured 0.08 s wall on this host. That is
-// AGENTS.md's "use a second instance, never a miniature copy" (#402): re-implementing the acquire
-// loop inside the test would pass while the real one was broken, which is the whole failure this
-// section exists to catch.
+// THE SECOND PROCESS IS THE REAL SUITE. `node test-features.mjs --only <one trivially fast test>`
+// in a scratch cwd runs the real module-level suiteLockAcquire against that cwd's
+// `scratchpad/.suite.lock`, runs exactly that one test, and exits. That is AGENTS.md's "use a
+// second instance, never a miniature copy" (#402): re-implementing the acquire loop inside the
+// test would pass while the real one was broken, which is the whole failure this section exists
+// to catch.
 //
-// RECURSION IS CLOSED BY CONSTRUCTION, TWICE. The child is always given a filter that matches no
-// test name, AND it is given OCP_SUITE_LOCK_CHILD=1, which is the condition these three tests are
-// registered under. Either alone suffices; neither is a prohibition a future edit can violate by
-// forgetting it, because a child that ran these tests would have to both match the filter and
-// clear the env guard.
+// WHY THE FILTER NAMES A REAL TEST RATHER THAN MATCHING NOTHING (#437 review F3). The first
+// version pointed the child at a deliberately unmatchable filter and waited for the
+// `=== Results: 0 passed, 0 failed ===` line. That line is printed only because of the defect
+// #434 reports — the zero-match path emits a results line before its warning — and #434's leading
+// candidate fix DELETES it. These tests would then have broken silently: the child would still
+// exit 1, still register zero tests, still leave its scratch dir behind, and only the line the
+// parent waits on would be gone. Waiting on `Results: 1 passed, 0 failed` from an ordinary run
+// depends on no behaviour that is scheduled to change, and it is a strictly stronger signal —
+// it says a test ran AND passed, where the old one said only that the runner reached its summary.
+// If the named test below is ever renamed, every assertion here fails with the filter quoted in
+// its message, so the coupling announces itself rather than going quiet.
+//
+// RECURSION IS CLOSED BY CONSTRUCTION, TWICE, and both were verified independently sufficient by
+// the #437 review. The child is given a filter naming ONE test that is not any of these three,
+// AND it is given OCP_SUITE_LOCK_CHILD=1, which turns these three into counted skips. Neither is
+// a prohibition a future edit can violate by forgetting it.
 //
 // The child's stdout/stderr are PIPED, never inherited: `.github/workflows/flake-hunt.yml`
 // histograms `✗` lines on the suite's stdout, and a child's output on the parent's stream would
 // be read as the parent's result.
-const LT_LOCK_CHILD_FILTER = "__ocp_suite_lock_child_matches_no_test__";
+// One real test, chosen for being the cheapest in this section (a spawnSync of `node -e ""` and one
+// assert) and for sitting next to the code under test, so a reader of the lock section sees the
+// coupling without leaving it. The expected line below is what makes the choice checkable.
+const LT_LOCK_CHILD_FILTER = "#416 mode 2";
+const LT_LOCK_CHILD_DONE = "=== Results: 1 passed, 0 failed ===";
 const LT_LOCK_SUITE_PATH = fileURLToPath(import.meta.url);
 // Generous, because it is only ever paid on failure: this host has recorded 78–120 s whole-process
 // stalls (#374), and a timeout tuned to the 0.08 s happy path would report one of those as a lock
@@ -26583,9 +26604,18 @@ function lt416Tickets(lockDir) {
   try { return _lockReaddirSync(_lockTicketDir(lockDir)).sort(); } catch { return []; }
 }
 
-if (!process.env.OCP_SUITE_LOCK_CHILD) {
+// A COUNTED skip, not a silent non-registration (#437 review F5). The first version wrapped these
+// three in `if (!process.env.OCP_SUITE_LOCK_CHILD)`, so in a contender child they simply did not
+// exist — and this repo's standing position (#366) is that an unregistered test and a passing one
+// are the same green tick unless the skip is counted and named.
+function lockTest(name, fn) {
+  if (process.env.OCP_SUITE_LOCK_CHILD) {
+    return testSkipped(name, "this process IS a contender child spawned by the lock tests (OCP_SUITE_LOCK_CHILD=1); running them here would recurse");
+  }
+  return test(name, fn);
+}
 
-test("#416 F2: only the OLDEST ticket acts — a real contender holds off a lock it is otherwise entitled to break", async () => {
+lockTest("#416 F2: only the OLDEST ticket acts — a real contender holds off a lock it is otherwise entitled to break", async () => {
   const base = lt416ChildDir();
   const lockDir = join(base, "scratchpad", ".suite.lock");
   // A lock the contender IS entitled to break: its owner pid is definitively gone (ESRCH), which
@@ -26616,30 +26646,38 @@ test("#416 F2: only the OLDEST ticket acts — a real contender holds off a lock
     assert.ok(owner && owner.pid === dead.pid,
       `a contender that is not the oldest ticket must not act — not even on an ESRCH-breakable lock. ` +
       `Expected the stale owner (pid ${dead.pid}) untouched; got ${JSON.stringify(owner)}`);
-    // THE POSITIVE CONTROL, and that is all it is — read this before treating it as a second
-    // pinned claim. Release the queue and the contender must get in: without this half, "the lock
-    // was not broken" above is equally satisfied by a contender that could never acquire under any
-    // circumstances, which is the shape AGENTS.md warns about (a negative predicate satisfied by an
-    // empty world).
+    // THE POSITIVE CONTROL — and, correcting what this comment said when it shipped, a claim with
+    // rows of its own. Release the queue and the contender must get in: without this half, "the
+    // lock was not broken" above is equally satisfied by a contender that could never acquire under
+    // any circumstances, which is the shape AGENTS.md warns about.
     //
-    // It has no mutation row of its own and cannot have one. Every mutation that closes the gate
-    // permanently — the only way to break this half — also blocks `#416 mode 1` above, which calls
-    // suiteLockAcquire IN-PROCESS on a NON-EMPTY stale lock and therefore must go through the
-    // ticket path. Measured: `if (oldest && !myTicket.endsWith(oldest))` -> `if (oldest)` produced
-    // no `=== Results:` line in 7 minutes, which per AGENTS.md is VOID, not red. The wait below is
-    // bounded and throws so that THIS test would report a named failure; the pre-existing test that
-    // hangs first is what makes the run unusable.
+    // The shipped version claimed no mutation could redden this half, on the grounds that closing
+    // the gate permanently also hangs `#416 mode 1`. THAT WAS AN OVER-GENERALISATION FROM ONE
+    // MUTATION, found by the #437 review, and the correction is worth more than the claim was:
+    // mode 1's in-process acquire evaluates the gate EXACTLY ONCE — iteration 1, one ticket present
+    // — and returns on iteration 2. So any defect that first manifests on iteration >= 2 is
+    // invisible to it, and two such mutations redden this assertion while mode 1 stays green:
+    //
+    //   MA6  `if (!myTicket) {` -> `if (true) {`   a fresh ticket every cycle, so `myTicket` is
+    //        never the oldest again once the queue drains
+    //   MA7  `sort()[0]` -> `sort().reverse()[0]`  FIFO becomes LIFO
+    //
+    // Only "gate closed from iteration 1" hangs, and that is one member of the family, not the
+    // family. Recorded here because "no row is possible" is the most dangerous exception to this
+    // repo's rule that a claim of guaranteed behaviour must cite the mutation that proves it, and
+    // it has to be earned by more than one attempt.
     _lockRmSync(olderTicket, { force: true });
     await lt416Until(() => c.exited !== null, "the contender to acquire and finish once its ticket is the oldest");
-    assert.ok(c.out.includes("=== Results:"),
-      `once oldest, the contender must get through acquire and run to completion; its stdout carried no results line: ${JSON.stringify(c.out.slice(-400))}`);
+    assert.ok(c.out.includes(LT_LOCK_CHILD_DONE),
+      `once oldest, the contender must get through acquire and RUN TO COMPLETION — expected ${JSON.stringify(LT_LOCK_CHILD_DONE)} ` +
+      `from --only ${JSON.stringify(LT_LOCK_CHILD_FILTER)}; its stdout ended: ${JSON.stringify(c.out.slice(-400))}`);
   } finally {
     try { c.child.kill("SIGKILL"); } catch {}
     try { _lockRmSync(base, { recursive: true, force: true }); } catch {}
   }
 });
 
-test("#423 F2: a LIVE owner's lock is not broken by a real contender, whatever the record's cwd says", async () => {
+lockTest("#423 F2: a LIVE owner's lock is not broken by a real contender, whatever the record's cwd says", async () => {
   const base = lt416ChildDir();
   const lockDir = join(base, "scratchpad", ".suite.lock");
   // Live owner (this process), and a cwd deliberately unlike the contender's — the combination
@@ -26655,20 +26693,41 @@ test("#423 F2: a LIVE owner's lock is not broken by a real contender, whatever t
     // on disk plus the settle window below means steal attempts have happened and been declined.
     await lt416Until(() => lt416Tickets(lockDir).length === 1, "the contender to publish its ticket");
     await lt416Sleep(LT_LOCK_SETTLE_MS);
-    const owner = suiteLockReadOwner(lockDir);
-    assert.ok(owner && owner.nonce === "live-other-cwd" && owner.pid === process.pid,
+    // THE STEAL WINDOW, and why this is a retry rather than a single read (#437 review F4). A
+    // contender's steal renames the lock aside, inspects the moved record, and renames it back —
+    // roughly 200 us inside every 500 ms cycle. A single read therefore has a MEASURED ~1-in-2,400
+    // chance of landing in that window and seeing no record at all. That flake used to fail with
+    // text BYTE-IDENTICAL to MA3's genuine red (both report `null`), which is the worst property a
+    // flake can have: indistinguishable from the finding it would be mistaken for.
+    //
+    // It cannot be told apart by VALUE, so it is told apart by DURATION. The window closes in
+    // microseconds; a lock that was actually broken never comes back. Re-reading across ~200 ms
+    // turns the flake into a pass and leaves a genuine break failing — with its own message, which
+    // is the second half of the fix: the two are no longer the same sentence.
+    let owner = suiteLockReadOwner(lockDir);
+    for (let i = 0; i < 20 && owner === null; i++) { await lt416Sleep(10); owner = suiteLockReadOwner(lockDir); }
+    assert.ok(owner !== null,
+      `the lock record was ABSENT across 20 reads spanning ~200ms. The steal window closes in ~200us, ` +
+      `so this is a lock that is GONE, not one momentarily renamed aside — a live owner's lock was broken.`);
+    assert.ok(owner.nonce === "live-other-cwd" && owner.pid === process.pid,
       `a LIVE owner's lock must survive every steal attempt — cwd is provenance, never a licence. ` +
-      `Got ${JSON.stringify(owner)}`);
-    // No second assertion that the contender is still waiting: it would add no reachable failure
-    // the line above does not already have (a contender that got in necessarily replaced this
-    // record), and one mutation reddening two claims in one body leaves the second unproven.
+      `The lock is now held by someone else: ${JSON.stringify(owner)}`);
+    // AND THE NEGATIVE ABOVE ONLY MEANS SOMETHING IF THE CONTENDER WAS STILL TRYING (#437 review
+    // F2). Measured there: a contender that dies right after publishing its ticket leaves this
+    // record untouched for the most boring reason available, and the test went GREEN inside a 6/2
+    // run. Placed AFTER the two assertions deliberately — a mutation that lets the contender in
+    // (MA3) makes it exit, so a premise placed first would swallow MA3's red and re-report it under
+    // this message instead.
+    assert.equal(c.exited, null,
+      `premise: the contender must still be RUNNING for "the lock survived" to be evidence of anything — ` +
+      `it exited ${JSON.stringify(c.exited)}, so the lock survived a contender that was no longer contending`);
   } finally {
     try { c.child.kill("SIGKILL"); } catch {}
     try { _lockRmSync(base, { recursive: true, force: true }); } catch {}
   }
 });
 
-test("#423 F3: the exit handler releases the lock — a finished run leaves no lock behind", async () => {
+lockTest("#423 F3: the exit handler releases the lock — a finished run leaves no lock behind", async () => {
   const base = lt416ChildDir();
   const lockDir = join(base, "scratchpad", ".suite.lock");
   const c = lt416Contender(base); // uncontended: nothing else holds this path
@@ -26677,8 +26736,10 @@ test("#423 F3: the exit handler releases the lock — a finished run leaves no l
     // Two premises, because "no lock dir" is exactly what a child that never took one leaves.
     // The results line is only reachable PAST the module-level acquire, and `scratchpad/` exists
     // only because the acquire's populate-then-publish mkdir -p'd its temp dir into it.
-    assert.ok(c.out.includes("=== Results:"),
-      `premise: the child must have run past the module-level acquire; stdout: ${JSON.stringify(c.out.slice(-400))}`);
+    assert.ok(c.out.includes(LT_LOCK_CHILD_DONE),
+      `premise: the child must have run past the module-level acquire and completed its one test — ` +
+      `expected ${JSON.stringify(LT_LOCK_CHILD_DONE)} from --only ${JSON.stringify(LT_LOCK_CHILD_FILTER)}; ` +
+      `stdout ended: ${JSON.stringify(c.out.slice(-400))}`);
     assert.ok(_lockExistsSync(join(base, "scratchpad")),
       "premise: the child's acquire must have created the scratchpad dir its lock lives in");
     assert.ok(!_lockExistsSync(lockDir),
@@ -26690,6 +26751,4 @@ test("#423 F3: the exit handler releases the lock — a finished run leaves no l
     try { _lockRmSync(base, { recursive: true, force: true }); } catch {}
   }
 });
-
-}
 
