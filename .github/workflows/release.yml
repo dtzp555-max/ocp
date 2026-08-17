@@ -15,6 +15,15 @@ jobs:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
+      # Pinned for the same reason test.yml pins it, and to the same version: the release body is
+      # now built by scripts/release-notes.mjs, and the node that builds it in production should be
+      # the node `npm test` proves it on. Leaving it to whatever the runner image ships would make
+      # a runner-image bump able to break a release — a failure on the one path where nobody is
+      # watching, which is the whole of #441.
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '24'
       - name: Extract version from tag
         id: ver
         run: echo "version=${GITHUB_REF#refs/tags/v}" >> $GITHUB_OUTPUT

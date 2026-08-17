@@ -16,11 +16,12 @@
 // Both still WRITE THE FILE. That is #202: the create step consumes a file, so an early exit
 // that skipped the write turned "degrade to minimal notes" into a failed release job.
 //
-// Node API floor: this file and scripts/lib/release-notes.mjs use only `node:fs`, `node:buffer`,
-// `node:process` and ES2020 syntax, so they run on whatever `node` the GitHub-hosted runner
-// image ships without a `setup-node` step. That is a constraint on what may be written here, not
-// a claim about a version number — if this ever needs a newer API, the workflow needs a
-// `setup-node` step in the same commit.
+// Which node runs this: release.yml pins `actions/setup-node@v4` at the SAME version test.yml
+// pins, so the node that builds a release body in production is the node `npm test` proves it on.
+// That pin is the guarantee; it is not a licence to reach for anything. This file and
+// scripts/lib/release-notes.mjs stay on `node:fs`, `node:url`, `node:buffer`, `node:process` and
+// ES2020 syntax, because the cheaper this is to run the fewer ways a release can fail — and a
+// release failing is the one failure nobody watches (#441).
 
 import { readFileSync, writeFileSync, realpathSync } from "node:fs";
 import { fileURLToPath } from "node:url";

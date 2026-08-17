@@ -27790,6 +27790,20 @@ test("#441 WIRING: release.yml's own `run:` body, executed verbatim, produces a 
     `the notes step must declare VERSION and NOTES_FILE in its env:, because its run: body reads ` +
     `them and this test injects them; got ${JSON.stringify(stepEnv)}`);
 
+  // SECOND PREMISE THE EXECUTED SLICE CANNOT SEE, and textual for the same reason: this test runs
+  // the slice under whatever `node` is on the local PATH, so it is blind to which node the JOB
+  // gets. Every other workflow here that runs node pins it with actions/setup-node; release.yml
+  // now runs node too, and an unpinned one would put a release at the mercy of a runner-image
+  // bump — a failure on the one path nobody watches, which is the whole of #441.
+  // Checked for POSITION as well as presence: a setup-node step that runs after the node call
+  // pins nothing. `< s` is the anchor offset of the run: body this test executes.
+  const setupNode = yml.indexOf("uses: actions/setup-node");
+  assert.ok(setupNode > -1 && /^\s+node-version:\s*'?\d/m.test(yml),
+    "release.yml runs node and must pin it with actions/setup-node + a node-version, as test.yml and flake-hunt.yml do");
+  assert.ok(setupNode < s,
+    `the setup-node step must come BEFORE the step that runs node, or it pins nothing ` +
+    `(setup-node at ${setupNode}, the node call at ${s})`);
+
   const dir = mkdtempSync(testJoin(tmpdir(), "ocp-441-wire-"));
   try {
     const sh = testJoin(dir, "step.sh");
