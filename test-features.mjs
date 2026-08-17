@@ -27637,14 +27637,35 @@ test("#441: extractChangelogSection returns one version's section and stops at t
   assert.equal(extractChangelogSection(_D441_FIXTURE, "9.9.9"), "", "an absent version is \"\", not a throw");
 });
 
-test("#441: a version is not a PREFIX match — v1.0.0 must not select `## v1.0.0-rc1` or `## v1.0.05`", () => {
+// TWO TESTS, NOT ONE BODY, for the two ways a version can be a prefix of another heading. The
+// first draft had them in one body with a single fixture, and independent review found that the
+// NAME claimed the prerelease case while only the numeric case was exercised — and that the
+// prerelease case was measurably FALSE at the time (`-` was in neither character class). Separate
+// bodies also mean one mutation can redden one row: co-located, the first assertion to throw ends
+// the body and the second claim ships unproven.
+test("#441: a NUMERIC suffix does not match — v1.0.0 must not select `## v1.0.05`", () => {
   // The awk this replaced matched with `$0 ~ "^## " ver`, an unbounded right edge: `v3.29.3` also
-  // matched the heading `## v3.29.30` and would have taken whichever came first in the file. Fixed
-  // here because the function is now testable and the case costs one assertion.
+  // matched the heading `## v3.29.30` and would have taken whichever came first in the file.
   const cl = ["## v1.0.05 — later", "", "- wrong one", "", "## v1.0.0 — right", "", "- right one", ""].join("\n");
   const s = extractChangelogSection(cl, "1.0.0");
   assert.ok(s.includes("- right one"), `must select the exact heading; got ${JSON.stringify(s.slice(0, 60))}`);
   assert.ok(!s.includes("- wrong one"), "must not select the longer version that shares its prefix");
+});
+
+test("#441: a PRERELEASE suffix does not match either — v1.0.0 must not select `## v1.0.0-rc1`", () => {
+  // FOUND BY INDEPENDENT REVIEW, as a false claim in a test NAME rather than as a code bug: the
+  // guard was `[0-9.]`, `-` is in neither class, and `v1.0.0` selected `## v1.0.0-rc1`. It is
+  // reachable — release.yml triggers on `v*`, so a prerelease tag cuts a release — and the notes
+  // for v1.0.0 would have been the RC's. The class is now `[0-9.+-]`; `+` is semver build
+  // metadata by the same argument.
+  const cl = ["## v1.0.0-rc1 — pre", "", "- rc one", "", "## v1.0.0 — final", "", "- final one", ""].join("\n");
+  const s = extractChangelogSection(cl, "1.0.0");
+  assert.ok(s.includes("- final one"), `v1.0.0 must select its own section; got ${JSON.stringify(s.slice(0, 60))}`);
+  assert.ok(!s.includes("- rc one"), "v1.0.0 must not select the prerelease section that shares its prefix");
+  // And the prerelease tag must still find ITS OWN section — the guard may narrow, never blind.
+  const rc = extractChangelogSection(cl, "1.0.0-rc1");
+  assert.ok(rc.includes("- rc one") && !rc.includes("- final one"),
+    `v1.0.0-rc1 must still select the RC section; got ${JSON.stringify(rc.slice(0, 60))}`);
 });
 
 test("#441: a section UNDER the limit is returned byte-identical — no footer, no truncation", () => {
@@ -27696,6 +27717,48 @@ test("#441 REGRESSION: this repo's own v3.29.3 section is over the cap and comes
   assert.ok(/^(#{1,6} |[-*+] )/.test(dropped),
     `the first dropped line must start a block, so the kept part ends at an entry boundary; it began ` +
     `${JSON.stringify(dropped.slice(0, 60))}`);
+});
+
+test("#441: no block start fits but whole lines do — the `line` arm, which had no test at all", () => {
+  // FOUND BY INDEPENDENT REVIEW. This arm is live — review's fuzz reached it 1 503 times out of
+  // 52 820 truncations — and deleting its entire loop left the suite GREEN, because control fell
+  // through to the `hard` arm which still produced a fitting body. A comment claiming "both arms
+  // are tested directly" was therefore false in the direction that matters.
+  //
+  // The fixture is a heading followed only by INDENTED SUB-BULLETS — deliberately bullets, not
+  // plain text, because BLOCK_START anchors its marker at column 0 and the claim under test is
+  // that indentation disqualifies an otherwise-valid marker. An earlier version of this fixture
+  // used indented plain text and pinned nothing: relaxing BLOCK_START to `/^\s*(…)/` left it
+  // green, since "continuation" is not a marker at any indentation. Mutation M16 is that row.
+  const body = Array.from({ length: 20 }, (_, i) => "    - continuation " + String(i).padStart(3, "0") + " " + "x".repeat(180));
+  const cl = ["## v8.8.8 — line-arm", ...body, ""].join("\n");
+  const section = extractChangelogSection(cl, "8.8.8");
+  assert.ok(Buffer.byteLength(section, "utf8") > 1500, "premise: the fixture must exceed the limit used below");
+  const r = buildReleaseBody({ changelog: cl, version: "8.8.8", repo: "o/r", limit: 1500 });
+  assert.equal(r.kind, "truncated");
+  assert.equal(r.boundary, "line", "no indented line may count as a block start, so the cut must be the line arm");
+  assert.ok(r.bodyBytes <= 1500, `must still fit: ${r.bodyBytes} > 1500`);
+  const kept = r.body.slice(0, r.body.indexOf("\n\n---\n\n*Release notes truncated"));
+  assert.ok(section.startsWith(kept), "the retained part must be a verbatim prefix of the section");
+  assert.equal(section.charAt(kept.length), "\n",
+    `the cut must land on a WHOLE line boundary, not inside one; it landed before ` +
+    `${JSON.stringify(section.slice(kept.length, kept.length + 30))}`);
+});
+
+test("#441: `*` and `+` are block starts too, not just `-`", () => {
+  // The BLOCK_START comment names all three CommonMark top-level list markers; this repo's own
+  // CHANGELOG only ever uses `-`, so without this the other two are design intent rather than
+  // pinned behaviour (independent review, note 7).
+  for (const marker of ["*", "+"]) {
+    const items = Array.from({ length: 12 }, (_, i) => marker + " item " + i + " " + "y".repeat(180));
+    const cl = ["## v7.7.7 — markers", "", ...items, ""].join("\n");
+    const r = buildReleaseBody({ changelog: cl, version: "7.7.7", repo: "o/r", limit: 1200 });
+    assert.equal(r.kind, "truncated", `${marker}: premise — the fixture must exceed the limit`);
+    assert.equal(r.boundary, "block", `a "${marker} " line must count as a block start`);
+    const kept = r.body.slice(0, r.body.indexOf("\n\n---\n\n*Release notes truncated"));
+    const dropped = extractChangelogSection(cl, "7.7.7").slice(kept.length).replace(/^\n+/, "");
+    assert.ok(dropped.startsWith(marker + " "), `the first dropped line must be a "${marker} " item; got ${JSON.stringify(dropped.slice(0, 30))}`);
+  }
 });
 
 test("#441: a section with NO interior block start still fits — the byte-safe hard cut", () => {
@@ -27763,6 +27826,37 @@ test("#441: the CLI refuses an unreadable CHANGELOG instead of degrading to mini
   }
 });
 
+test("#441 WIRING: the CLI actually CALLS assertWithinLimit — over-budget body, exit 1, named error", () => {
+  // THE FINDING THAT PRODUCED THIS TEST, recorded because the gap was created by a false claim
+  // rather than by an oversight. The comment on assertWithinLimit said the guard was "unreachable
+  // through the builder", so it was only ever tested as a unit — and deleting the CALL from
+  // scripts/release-notes.mjs left the suite 9/0 GREEN. The PR's headline guard had no wiring pin,
+  // which is the #343 shape the ledger in AGENTS.md exists for.
+  //
+  // The claim was also just wrong: buildReleaseBody's `minimal:*` arms never consult `limit`, so
+  // `Release v1.2.3\n` (15 bytes) comes back for `--limit 10` and the guard fires. That reachable
+  // input is what makes this test possible at all.
+  const dir = mkdtempSync(testJoin(tmpdir(), "ocp-441-limit-"));
+  try {
+    const out = testJoin(dir, "notes.md");
+    const r = spawnSync(process.execPath, [
+      testJoin(_D441_ROOT, "scripts/release-notes.mjs"),
+      "--version", "1.2.3", "--out", out,
+      "--changelog", testJoin(_D441_ROOT, "CHANGELOG.md"),
+      "--limit", "10",
+    ], { encoding: "utf8" });
+    assert.equal(r.status, 1, `must exit non-zero; stdout=${JSON.stringify(r.stdout)} stderr=${JSON.stringify(r.stderr)}`);
+    assert.ok(/FATAL: release body is \d+ bytes, over the 10-byte budget by \d+/.test(r.stderr),
+      `the error must name both numbers, not just fail; stderr=${JSON.stringify(r.stderr)}`);
+    assert.ok(/#441/.test(r.stderr), `and it must name the issue; stderr=${JSON.stringify(r.stderr)}`);
+    // The file is still written — deliberately, so the offending body is on disk for whoever reads
+    // the failed run. Asserted so a later "tidy up" that moves the write after the assert reddens.
+    assert.ok(testExistsSync(out), "the oversized body must still be on disk for diagnosis");
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test("#441 WIRING: release.yml's own `run:` body, executed verbatim, produces a body under the cap", () => {
   // The one test that can fail if release.yml stops calling any of this. Everything above proves a
   // helper; this proves the CALL SITE, which is the #343 shape the wiring-pin ledger exists for.
@@ -27785,7 +27879,13 @@ test("#441 WIRING: release.yml's own `run:` body, executed verbatim, produces a 
   // the slice would still run here while the real job died under `set -u`. This assertion is the
   // only thing standing between those two worlds; it is a premise of the harness, not the behaviour
   // under test.
-  const stepEnv = yml.slice(yml.indexOf("id: notes"), s);
+  // THIRD ANCHOR, CHECKED BY INDEX LIKE THE OTHER TWO (independent review, note 5). The first
+  // draft asserted START and END by index and then sliced on `id: notes` without one, five lines
+  // under a comment invoking that very rule. It degraded safely by accident of ordering, which is
+  // not a guard.
+  const iNotes = yml.indexOf("id: notes");
+  assert.ok(iNotes > -1 && iNotes < s, `the notes step's id must be present and precede its run: body (id at ${iNotes}, run at ${s})`);
+  const stepEnv = yml.slice(iNotes, s);
   assert.ok(/^\s+VERSION:\s/m.test(stepEnv) && /^\s+NOTES_FILE:\s/m.test(stepEnv),
     `the notes step must declare VERSION and NOTES_FILE in its env:, because its run: body reads ` +
     `them and this test injects them; got ${JSON.stringify(stepEnv)}`);

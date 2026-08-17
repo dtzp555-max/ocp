@@ -4,8 +4,10 @@
 //
 // `.github/workflows/release.yml` used to pipe the CHANGELOG section verbatim into
 // `gh release create --notes-file`. GitHub caps a release body at 125 000 characters.
-// v3.29.3's section is 169 670 bytes — 36 % over — so the API answered
-// `HTTP 422: Validation Failed … body is too long` and NO RELEASE WAS CREATED. The tag, the
+// v3.29.3's section is 169 670 bytes as #441 measured it (`wc -c` on the awk's output, which
+// carries one trailing newline this function does not — see divergence 4 below; the same
+// section is 169 669 bytes through `Buffer.byteLength` here). Either way ~36 % over, so the API
+// answered `HTTP 422: Validation Failed … body is too long` and NO RELEASE WAS CREATED. The tag,
 // code and the fleet were all correct; only the Releases page was wrong, and it stayed wrong
 // for a day showing v3.29.2 as Latest.
 //
@@ -14,7 +16,7 @@
 // from GitHub Releases, so `ocp update` was unaffected and the whole fleet took 3.29.3
 // correctly. The only remaining observer was a human reading the Releases page.
 //
-// **The fix is not to shorten the record.** The section is 5x v3.29.2's (31 964 bytes) because
+// **The fix is not to shorten the record.** The section is 5x v3.29.2's (31 963 bytes) because
 // this cycle's entries carry the measurements behind each change; that convention is working
 // and the next cycle has no reason to be smaller. So the body becomes a PREFIX plus a pointer,
 // and only when it has to be.
@@ -24,10 +26,12 @@
 // A UTF-8 byte count is never SMALLER than a character count, under either meaning of
 // "character": a code point costs 1-4 bytes, and a UTF-16 code unit costs at least 1. So
 // `byteLength(body) <= 125000` implies the body is under the cap however GitHub counts it,
-// while the reverse does not hold. Measured on the v3.29.3 section, which is full of em dashes
-// and arrows: 169 670 bytes against 168 661 code points and 168 661 UTF-16 units. Counting
-// bytes is therefore the conservative direction, and it is the one instrument (`wc -c`,
-// `Buffer.byteLength`) that agrees with itself in bash and in node.
+// while the reverse does not hold. Measured on the v3.29.3 section as THIS function returns it
+// (`Buffer.byteLength`, so one byte under #441's `wc -c` figure), which is full of em dashes and
+// arrows: 169 669 bytes against 168 660 code points and 168 660 UTF-16 units. Counting bytes is
+// therefore the conservative direction, and `wc -c` and `Buffer.byteLength` measure the same
+// quantity — so a number taken in bash and a number taken in node are comparable once you know
+// which string was handed to each.
 //
 // This costs headroom, never correctness. If GitHub ever counts code points, this refuses a
 // body it could have accepted; it never accepts one it should have refused.
@@ -89,14 +93,32 @@ function bytes(s) {
  * `version` is accepted with or without its leading `v`, because the workflow derives it as
  * `${GITHUB_REF#refs/tags/v}` (no `v`) while every heading in CHANGELOG.md carries one.
  *
- * ONE DELIBERATE BEHAVIOUR CHANGE from the awk (`$0 ~ "^## " ver`): that pattern is a regex
- * with an unbounded right edge, so `v3.29.3` also matches the heading `## v3.29.30` — it would
- * have picked whichever came first in the file. Here the character after the version must not
- * continue it (`[0-9.]`). Nothing in this repo's history hit that; it is fixed because this
- * function is now testable and the test costs one case.
+ * FOUR DIVERGENCES FROM THE awk IT REPLACES (`$0 ~ "^## " ver`), enumerated because the first
+ * draft of this comment claimed there was one, and independent review measured four. Three are
+ * fixes and one is why two different byte counts for the same section appear in this commit:
+ *
+ *   1. RIGHT EDGE (fix, and the one with a test). The awk's pattern is a REGEX with an unbounded
+ *      right edge, so `v3.29.3` also matched `## v3.29.30` and would have taken whichever came
+ *      first in the file. Here the character after the version must not continue it. The class is
+ *      `[0-9.+-]` and NOT `[0-9.]`: review measured that `[0-9.]` still let `v1.0.0` select
+ *      `## v1.0.0-rc1`, because `-` is in neither class — and `release.yml` triggers on `v*`, so a
+ *      prerelease tag is reachable. `+` is there for semver build metadata, by the same argument.
+ *   2. THE `.` IN THE VERSION (fix). `ver` went into that awk pattern as a regex, so `.` was a
+ *      wildcard: `v1.0.0` also matched `## v1X0Y0`. `String.startsWith` is literal.
+ *   3. A REPEATED HEADING (divergence, immaterial). The awk's start rule ran BEFORE its
+ *      terminator, so a second `## v1.0.0` later in the file was absorbed into the first section.
+ *      Here `found` short-circuits and the second heading terminates. Neither is more correct; a
+ *      CHANGELOG with two headings for one version is broken either way.
+ *   4. THE TRAILING NEWLINE (divergence, immaterial, and READ THIS BEFORE COMPARING NUMBERS).
+ *      awk's `print` appends ORS to every line, so its output always ends with "\n"; `join("\n")`
+ *      does not. **The awk's byte count is therefore always exactly 1 higher than this
+ *      function's, for the same section.** #441 quotes `wc -c` on the awk output — 169 670 for
+ *      v3.29.3, 31 964 for v3.29.2 — while `Buffer.byteLength` on what this returns gives
+ *      169 669 and 31 963. Both figures are correct; they are different instruments. Every
+ *      number in this file is the second kind unless it says otherwise.
  *
  * The terminator stays `^## v` rather than `^## ` for exact fidelity with the awk. Widening it
- * would be a second behaviour change on a release-critical path in the same commit, with
+ * would be a further behaviour change on a release-critical path in the same commit, with
  * nothing asking for it: `## Unreleased` is above the newest section, never inside one.
  */
 export function extractChangelogSection(changelog, version) {
@@ -107,7 +129,7 @@ export function extractChangelogSection(changelog, version) {
   let found = false;
   for (const line of lines) {
     if (!found) {
-      if (line.startsWith("## " + ver) && !/[0-9.]/.test(line.charAt(3 + ver.length))) {
+      if (line.startsWith("## " + ver) && !/[0-9.+-]/.test(line.charAt(3 + ver.length))) {
         found = true;
         out.push(line);
       }
@@ -145,19 +167,30 @@ function truncationFooter({ version, repo, sectionBytes, limit }) {
  *
  * Returns `{ body, kind, boundary, sectionBytes, bodyBytes, limit }`:
  *
- *   kind "minimal:no-changelog" — no CHANGELOG contents were supplied
- *   kind "minimal:no-section"   — a CHANGELOG, but no heading for this version
- *   kind "section"              — the section fits; `body` is it, BYTE-IDENTICAL
- *   kind "truncated"            — a prefix of the section plus the pointer footer
+ *   kind "minimal:no-changelog"   — no CHANGELOG contents were supplied
+ *   kind "minimal:no-section"     — a CHANGELOG, but no heading for this version
+ *   kind "minimal:limit-too-small"— a section was found, but `limit` cannot hold even the pointer
+ *   kind "section"                — the section fits; `body` is it, BYTE-IDENTICAL
+ *   kind "truncated"              — a prefix of the section plus the pointer footer
  *
  * `boundary` says how the cut was chosen when kind is "truncated": "block" (a heading or
  * top-level list marker — the normal case), "line" (no block start fit, so the last whole line
  * that did), or "hard" (not even one line fit, so a byte-safe prefix of the first line).
  *
- * The "line" and "hard" arms are not decoration. A section whose FIRST entry is itself over the
- * budget has no interior block start to snap to, and this function's contract is that the body
- * it returns is always within the limit — a contract with an unreachable-looking exception is
- * the shape that shipped #324. Both arms are tested directly.
+ * THE EXACT SCOPE OF THE SIZE GUARANTEE, because the first draft of this comment overstated it
+ * and independent review disproved it with a one-line command. On the "section" and "truncated"
+ * arms the returned body is ALWAYS within `limit` — that is the arithmetic below, and review
+ * fuzzed 260 000 random sections (astral characters, mixed list markers, limits 1–3300) without
+ * producing an over-limit body or a lone surrogate. **The three `minimal:*` arms do NOT consult
+ * `limit` at all**: they return `Release v<version>\n`, which is 15 bytes for a three-part
+ * version, so `limit: 10` returns 15. That is deliberate — there is no honest body shorter than
+ * naming the release — and it is precisely what makes `assertWithinLimit` a REACHABLE guard
+ * rather than dead code, which is how its call site in scripts/release-notes.mjs gets a test.
+ *
+ * All three `boundary` arms are live and each has its own test. "line" is not a theoretical arm:
+ * review's fuzz reached it 1 503 times out of 52 820 truncations, and it had no test until that
+ * was found — deleting its loop left the suite green because control fell through to "hard",
+ * which still produced a fitting body.
  *
  * Never throws.
  */
@@ -185,8 +218,10 @@ export function buildReleaseBody({ changelog, version, repo = "", limit = GITHUB
   const footer = truncationFooter({ version, repo, sectionBytes, limit });
   const budget = limit - bytes(footer);
   // A limit so small that the pointer alone does not fit. Nothing useful can be said inside it,
-  // so say the one true thing that does fit. Reachable only from a caller-supplied `limit`;
-  // tested, because "can't happen" is not a property this file gets to assert about its callers.
+  // so say the one true thing there is to say. NOTE WHAT THIS DOES NOT CLAIM: `Release v<x.y.z>`
+  // is ~15 bytes and is NOT clamped to `limit` either — a limit under that has no honest answer,
+  // and inventing one would be worse than failing. `assertWithinLimit` in the CLI is what turns
+  // that into a loud refusal, and this arm is how a test can reach it.
   // Its own `kind`, NOT "minimal:no-section": those two states differ in what an operator should
   // go look at, and collapsing them would report a present section as an absent one.
   if (budget <= 0) return minimal("minimal:limit-too-small", sectionBytes);
@@ -246,15 +281,17 @@ export function buildReleaseBody({ changelog, version, repo = "", limit = GITHUB
 /**
  * Throw unless `body` fits the limit, with a message that names the issue and both numbers.
  *
- * WHAT THIS IS, STATED HONESTLY: `buildReleaseBody` already guarantees its result fits, so on
- * today's code path this never fires. It is a BACKSTOP against a future change to the builder,
- * and it exists because #441's actual cost was that the only thing checking the size was the
- * GitHub API — a `422 Validation Failed` inside a red workflow run on a tag ref, which nothing
- * routinely reads. Turning that into a named, local failure is the whole ask.
+ * WHAT THIS IS. It exists because #441's actual cost was that the only thing checking the size
+ * was the GitHub API — a `422 Validation Failed` inside a red workflow run on a tag ref, which
+ * nothing routinely reads. Turning that into a named, local failure is the whole ask.
  *
- * Because it is unreachable through the builder, it is tested DIRECTLY with an over-limit
- * string rather than through `buildReleaseBody`. A guard whose only test drives it through a
- * caller that cannot reach it is a guard nobody has ever seen fire.
+ * IT IS REACHABLE, and the first draft of this comment said it was not. That claim was wrong and
+ * it was load-bearing: believing the guard unreachable is what left its CALL SITE in
+ * scripts/release-notes.mjs untested, and deleting that call left the suite 9/0 green — the
+ * #343 shape, on this PR's own headline guard. `buildReleaseBody`'s `minimal:*` arms do not
+ * consult `limit`, so `--limit 10` against any CHANGELOG produces a 15-byte body and this
+ * throws. The suite drives it BOTH ways: directly with an over-limit string (the unit), and
+ * through the real CLI with `--limit 10` (the wiring).
  */
 export function assertWithinLimit(body, limit = GITHUB_RELEASE_BODY_LIMIT) {
   const n = bytes(body);

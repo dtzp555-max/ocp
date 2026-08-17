@@ -141,13 +141,31 @@ release_kit:
   release_channel:
     type: github-release
     tag_format: v{semver}
+    # #441's "Secondary observation" asked for this to be DECIDED rather than left to whoever runs
+    # the next release. It is recorded here rather than argued, because it is not a new convention:
+    # it is the one already in force, written down.
+    #
+    #   git cat-file -t v3.28.0 v3.29.0 v3.29.1 v3.29.2  -> tag     (annotated)
+    #   git cat-file -t v3.29.3                          -> commit  (lightweight)
+    #
+    # Four of the last five are annotated; v3.29.3 is the deviation, and it is also the one that
+    # shipped with no Release. Not causally — the body length caused that — but they share a root:
+    # `git grep 'git tag'` returns NOTHING anywhere in this repo (positive control: `git push`
+    # matches two files), so every tag is hand-typed and nothing enforces either property.
+    #
+    # Annotated, because a lightweight tag carries no tagger, no date and no message, and
+    # `git describe` prefers annotated ones. EXPIRY CONDITION: if a scripted release path is ever
+    # added, this line stops being the authority and that script becomes it — at which point this
+    # entry should say so instead of restating it.
+    tag_style: annotated       # git tag -a v{semver} -m "v{semver}"
     auto_create_on_tag_push: true   # via .github/workflows/release.yml
     # A TAG PUSH IS NOT A RELEASE, and until #441 nothing here could tell the two apart.
     #
     # v3.29.3's tag, code and fleet were all correct while `release.yml` had FAILED with
     # `422 Validation Failed: body is too long` — the CHANGELOG section it pipes into
-    # `--notes-file` was 169 670 bytes against GitHub's 125 000-character cap. No release was
-    # created, and the Releases page said v3.29.2 was Latest for a day.
+    # `--notes-file` was 169 670 bytes (as #441 measured it, with `wc -c`) against GitHub's
+    # 125 000-character cap. No release was created, and the Releases page said v3.29.2 was
+    # Latest for a day.
     #
     # Three things hid it, and all three are structural rather than bad luck:
     #   1. nothing operational broke — the tag and the code were fine;
@@ -160,8 +178,15 @@ release_kit:
     # #441 fixed the length: scripts/release-notes.mjs truncates to a block boundary plus a
     # pointer to CHANGELOG.md at the tag, refuses loudly if the result is still over budget,
     # and `npm test` pins all of it INCLUDING release.yml's own `run:` body. THIS clause is the
-    # other half — the failure now has a consumer. Run both after every tag push. The first is
-    # the one that cannot be satisfied by a job that never ran.
+    # other half — the failure now has a consumer. RUN BOTH after every tag push.
+    #
+    # WHICH ONE IS LOAD-BEARING: the SECOND. An earlier draft of this comment said the first was
+    # "the one that cannot be satisfied by a job that never ran", and v3.29.3 is the counterexample
+    # sitting four lines below it — that release exists because it was made BY HAND after the job
+    # failed, so check 1 passes on it today while check 2 prints `failure`. Corrected here rather
+    # than reworded, because a reader who trusts a wrong rationale runs only the first check and
+    # lands exactly where #441 started. Check 1 answers "do users have their release"; check 2
+    # answers "will the next tag get one".
     post_release_checks:
       - name: the GitHub Release exists for this tag
         run: gh release view "v$(node -p 'require("./package.json").version')" --json tagName,createdAt
