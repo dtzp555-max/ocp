@@ -141,7 +141,76 @@ release_kit:
   release_channel:
     type: github-release
     tag_format: v{semver}
+    # #441's "Secondary observation" asked for this to be DECIDED rather than left to whoever runs
+    # the next release. It is recorded here rather than argued, because it is not a new convention:
+    # it is the one already in force, written down.
+    #
+    #   git cat-file -t v3.28.0 v3.29.0 v3.29.1 v3.29.2  -> tag     (annotated)
+    #   git cat-file -t v3.29.3                          -> commit  (lightweight)
+    #
+    # Four of the last five are annotated; v3.29.3 is the deviation, and it is also the one that
+    # shipped with no Release. Not causally — the body length caused that — but they share a root:
+    # `git grep 'git tag'` returns NOTHING anywhere in this repo (positive control: `git push`
+    # matches two files), so every tag is hand-typed and nothing enforces either property.
+    #
+    # Annotated, because a lightweight tag carries no tagger, no date and no message, and
+    # `git describe` prefers annotated ones. EXPIRY CONDITION: if a scripted release path is ever
+    # added, this line stops being the authority and that script becomes it — at which point this
+    # entry should say so instead of restating it.
+    tag_style: annotated       # git tag -a v{semver} -m "v{semver}"
     auto_create_on_tag_push: true   # via .github/workflows/release.yml
+    # A TAG PUSH IS NOT A RELEASE, and until #441 nothing here could tell the two apart.
+    #
+    # v3.29.3's tag, code and fleet were all correct while `release.yml` had FAILED with
+    # `422 Validation Failed: body is too long` — the CHANGELOG section it pipes into
+    # `--notes-file` was 169 670 bytes (as #441 measured it, with `wc -c`) against GitHub's
+    # 125 000-character cap. No release was created, and the Releases page said v3.29.2 was
+    # Latest for a day.
+    #
+    # Three things hid it, and all three are structural rather than bad luck:
+    #   1. nothing operational broke — the tag and the code were fine;
+    #   2. `ocp update` was unaffected, because scripts/doctor.mjs resolves `latest_version`
+    #      from `git show origin/main:package.json` and NEVER from GitHub Releases — so the one
+    #      mechanism that would have noticed does not consult this surface at all; and
+    #   3. the failure's only trace is a red workflow run on a TAG ref, which nothing reads.
+    # The sole remaining observer was a human noticing the Releases page. That took a day.
+    #
+    # #441 fixed the length: scripts/release-notes.mjs truncates to a block boundary plus a
+    # pointer to CHANGELOG.md at the tag, refuses loudly if the result is still over budget,
+    # and `npm test` pins all of it INCLUDING release.yml's own `run:` body. THIS clause is the
+    # other half — the failure now has a consumer. RUN BOTH after every tag push.
+    #
+    # WHICH ONE IS LOAD-BEARING: the SECOND. An earlier draft of this comment said the first was
+    # "the one that cannot be satisfied by a job that never ran", and v3.29.3 is the counterexample
+    # sitting four lines below it — that release exists because it was made BY HAND after the job
+    # failed, so check 1 passes on it today while check 2 prints `failure`. Corrected here rather
+    # than reworded, because a reader who trusts a wrong rationale runs only the first check and
+    # lands exactly where #441 started. Check 1 answers "do users have their release"; check 2
+    # answers "will the next tag get one".
+    post_release_checks:
+      - name: the GitHub Release exists for this tag
+        run: gh release view "v$(node -p 'require("./package.json").version')" --json tagName,createdAt
+        expect: exits 0 and names this version's tag
+        on_failure: |
+          Read the job: gh run list --workflow=release.yml --limit 3 --json headBranch,conclusion
+          RE-RUNNING IT DOES NOT PICK UP A FIX. The workflow file is read from the TAG ref, so a
+          corrected release.yml on main only reaches the NEXT tag. Recover by creating the release
+          by hand and SAY ON THE RELEASE that it was a recovery: AGENTS.md's "do not create
+          releases manually" assumes the automation works, and that assumption is what failed.
+      - name: the release job itself went green
+        run: gh run list --workflow=release.yml --limit 1 --json headBranch,conclusion --jq '.[]|"\(.headBranch) \(.conclusion)"'
+        expect: |
+          this version's tag followed by `success`. READ THE OUTPUT, NOT THE EXIT CODE — `gh run
+          list` exits 0 while printing `failure`, so an exit-status check here is green on exactly
+          the case it exists to catch. Measured on 2026-08-17 against v3.29.3: the command prints
+          `v3.29.3 failure` and exits 0.
+        why: |
+          The check above passes on a hand-made release too, which is correct — the release is
+          what users need — but it would then report green on a workflow that is still broken for
+          the NEXT tag. These two are not redundant: the first asks whether the artifact exists,
+          the second whether the mechanism that should have produced it works. Measured together
+          on v3.29.3, they answer differently — release present, job red — which is precisely the
+          state that went unnoticed for a day.
   docs_source: README.md
   resource_lists:
     - name: Available Models table

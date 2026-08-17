@@ -27594,3 +27594,338 @@ lockTest("#423 F3: the exit handler releases the lock — a finished run leaves 
   }
 });
 
+
+// ── Issue #441: the release body must fit GitHub's cap, and the workflow must be the thing tested ──
+//
+// v3.29.3 shipped with NO GitHub Release. `release.yml` piped the CHANGELOG section verbatim into
+// `gh release create --notes-file`; the section is 169 669 bytes and the cap is 125 000, so the API
+// answered `422 Validation Failed: body is too long`. The tag, the code and the fleet were all
+// correct — `scripts/doctor.mjs` resolves `latest_version` from `git show origin/main:package.json`,
+// never from Releases — so the one mechanism that could have noticed does not consult this surface,
+// and the failure sat in a red workflow run on a tag ref that nothing routinely reads.
+//
+// WHY THESE TESTS EXIST IN THIS SHAPE: the release step cannot be exercised except by cutting a tag,
+// and a tag is not re-cuttable. So the decision moved into scripts/lib/release-notes.mjs (imported
+// below and tested directly) and the workflow's `run:` body was made free of `${{ }}` so that the
+// LAST test here can slice it out and EXECUTE IT VERBATIM. Without that last one, every test here
+// would prove a helper works while saying nothing about whether release.yml still calls it — the
+// #343 shape.
+import { buildReleaseBody, extractChangelogSection, assertWithinLimit, GITHUB_RELEASE_BODY_LIMIT as _D441_LIMIT }
+  from "./scripts/lib/release-notes.mjs";
+
+const _D441_ROOT = import.meta.dirname;
+const _d441Bytes = (s) => Buffer.byteLength(s, "utf8");
+// A single fixture shape reused by the small cases, so a change to the extractor cannot pass here
+// by accident of a hand-tuned string.
+const _D441_FIXTURE = [
+  "# Changelog", "", "## Unreleased", "",
+  "## v2.0.0 — 2026-01-02", "", "### Added", "", "- second release entry", "",
+  "## v1.0.0 — 2026-01-01", "", "### Added", "", "- first release entry", "",
+].join("\n");
+
+console.log("\nRelease-notes body budget (#441):");
+
+test("#441: extractChangelogSection returns one version's section and stops at the next `## v`", () => {
+  const s = extractChangelogSection(_D441_FIXTURE, "2.0.0");
+  assert.ok(s.startsWith("## v2.0.0 — 2026-01-02"), `must start at the heading; got ${JSON.stringify(s.slice(0, 40))}`);
+  assert.ok(s.includes("- second release entry"), "must carry its own body");
+  assert.ok(!s.includes("v1.0.0") && !s.includes("first release entry"),
+    `must stop at the next "## v" heading; got ${JSON.stringify(s)}`);
+  // The leading `v` is optional on the way in — the workflow derives it as ${GITHUB_REF#refs/tags/v}
+  // and so never has one, while every heading does.
+  assert.equal(extractChangelogSection(_D441_FIXTURE, "v2.0.0"), s);
+  assert.equal(extractChangelogSection(_D441_FIXTURE, "9.9.9"), "", "an absent version is \"\", not a throw");
+});
+
+// TWO TESTS, NOT ONE BODY, for the two ways a version can be a prefix of another heading. The
+// first draft had them in one body with a single fixture, and independent review found that the
+// NAME claimed the prerelease case while only the numeric case was exercised — and that the
+// prerelease case was measurably FALSE at the time (`-` was in neither character class). Separate
+// bodies also mean one mutation can redden one row: co-located, the first assertion to throw ends
+// the body and the second claim ships unproven.
+test("#441: a NUMERIC suffix does not match — v1.0.0 must not select `## v1.0.05`", () => {
+  // The awk this replaced matched with `$0 ~ "^## " ver`, an unbounded right edge: `v3.29.3` also
+  // matched the heading `## v3.29.30` and would have taken whichever came first in the file.
+  const cl = ["## v1.0.05 — later", "", "- wrong one", "", "## v1.0.0 — right", "", "- right one", ""].join("\n");
+  const s = extractChangelogSection(cl, "1.0.0");
+  assert.ok(s.includes("- right one"), `must select the exact heading; got ${JSON.stringify(s.slice(0, 60))}`);
+  assert.ok(!s.includes("- wrong one"), "must not select the longer version that shares its prefix");
+});
+
+test("#441: a PRERELEASE suffix does not match either — v1.0.0 must not select `## v1.0.0-rc1`", () => {
+  // FOUND BY INDEPENDENT REVIEW, as a false claim in a test NAME rather than as a code bug: the
+  // guard was `[0-9.]`, `-` is in neither class, and `v1.0.0` selected `## v1.0.0-rc1`. It is
+  // reachable — release.yml triggers on `v*`, so a prerelease tag cuts a release — and the notes
+  // for v1.0.0 would have been the RC's. The class is now `[0-9.+-]`; `+` is semver build
+  // metadata by the same argument.
+  const cl = ["## v1.0.0-rc1 — pre", "", "- rc one", "", "## v1.0.0 — final", "", "- final one", ""].join("\n");
+  const s = extractChangelogSection(cl, "1.0.0");
+  assert.ok(s.includes("- final one"), `v1.0.0 must select its own section; got ${JSON.stringify(s.slice(0, 60))}`);
+  assert.ok(!s.includes("- rc one"), "v1.0.0 must not select the prerelease section that shares its prefix");
+  // And the prerelease tag must still find ITS OWN section — the guard may narrow, never blind.
+  const rc = extractChangelogSection(cl, "1.0.0-rc1");
+  assert.ok(rc.includes("- rc one") && !rc.includes("- final one"),
+    `v1.0.0-rc1 must still select the RC section; got ${JSON.stringify(rc.slice(0, 60))}`);
+});
+
+test("#441: a section UNDER the limit is returned byte-identical — no footer, no truncation", () => {
+  // The regression this fix must not cause. Every release before v3.29.3 fit, and their bodies
+  // must keep coming out of this function unchanged.
+  const section = extractChangelogSection(_D441_FIXTURE, "2.0.0");
+  const r = buildReleaseBody({ changelog: _D441_FIXTURE, version: "2.0.0", repo: "o/r" });
+  assert.equal(r.kind, "section");
+  assert.equal(r.boundary, null);
+  assert.equal(r.body, section, "the body must be the section itself, byte for byte");
+  assert.ok(!r.body.includes("truncated"), "an in-budget body must carry no truncation footer");
+  assert.equal(r.bodyBytes, _d441Bytes(section));
+});
+
+test("#441 REGRESSION: this repo's own v3.29.3 section is over the cap and comes back UNDER it", () => {
+  // The actual #441 event, against the actual file. Reading CHANGELOG.md textually is legitimate
+  // here because it is the INPUT, not the behaviour under test.
+  const cl = _ltRead(testJoin(_D441_ROOT, "CHANGELOG.md"), "utf8");
+  const section = extractChangelogSection(cl, "3.29.3");
+
+  // PREMISE FIRST, so this cannot pass vacuously. If v3.29.3's section ever shrinks under the cap
+  // (an edit, a rewrite), this test stops being a regression test and says so instead of going
+  // green while proving nothing.
+  assert.ok(section.length > 0, "premise: CHANGELOG.md must still carry a `## v3.29.3` section");
+  assert.ok(_d441Bytes(section) > _D441_LIMIT,
+    `premise: the v3.29.3 section must still be OVER the ${_D441_LIMIT}-byte cap for this to be a ` +
+    `regression test; it is ${_d441Bytes(section)} bytes. If the section was legitimately shortened, ` +
+    `this test needs a synthetic oversized input instead of being deleted.`);
+
+  const r = buildReleaseBody({ changelog: cl, version: "3.29.3", repo: "dtzp555-max/ocp" });
+  assert.equal(r.kind, "truncated");
+  assert.ok(r.bodyBytes <= _D441_LIMIT,
+    `the whole point: ${r.bodyBytes} bytes must be <= ${_D441_LIMIT}. This is what the GitHub API ` +
+    `rejected with 422 and what shipped v3.29.3 with no Release.`);
+
+  // It must be a PREFIX of the real section plus the pointer — not a summary, not a reflow.
+  const cut = r.body.indexOf("\n\n---\n\n*Release notes truncated");
+  assert.ok(cut > 0, `the footer must be present and not at position 0; body ended ${JSON.stringify(r.body.slice(-120))}`);
+  const kept = r.body.slice(0, cut);
+  assert.ok(section.startsWith(kept), "the retained part must be a verbatim prefix of the section");
+  assert.ok(r.body.includes("Full notes: https://github.com/dtzp555-max/ocp/blob/v3.29.3/CHANGELOG.md"),
+    "the footer must point at the full notes at the tag");
+
+  // And the cut must land on a BLOCK start, not mid-entry. Measured while designing this: snapping
+  // to a heading instead would fall back to `### Changed` at byte 89 829 and throw away 33 885
+  // bytes of notes; snapping to a bullet keeps up to byte 123 714.
+  assert.equal(r.boundary, "block");
+  const dropped = section.slice(kept.length).replace(/^\n+/, "");
+  assert.ok(/^(#{1,6} |[-*+] )/.test(dropped),
+    `the first dropped line must start a block, so the kept part ends at an entry boundary; it began ` +
+    `${JSON.stringify(dropped.slice(0, 60))}`);
+});
+
+test("#441: no block start fits but whole lines do — the `line` arm, which had no test at all", () => {
+  // FOUND BY INDEPENDENT REVIEW. This arm is live — review's fuzz reached it 1 503 times out of
+  // 52 820 truncations — and deleting its entire loop left the suite GREEN, because control fell
+  // through to the `hard` arm which still produced a fitting body. A comment claiming "both arms
+  // are tested directly" was therefore false in the direction that matters.
+  //
+  // The fixture is a heading followed only by INDENTED SUB-BULLETS — deliberately bullets, not
+  // plain text, because BLOCK_START anchors its marker at column 0 and the claim under test is
+  // that indentation disqualifies an otherwise-valid marker. An earlier version of this fixture
+  // used indented plain text and pinned nothing: relaxing BLOCK_START to `/^\s*(…)/` left it
+  // green, since "continuation" is not a marker at any indentation. Mutation M16 is that row.
+  const body = Array.from({ length: 20 }, (_, i) => "    - continuation " + String(i).padStart(3, "0") + " " + "x".repeat(180));
+  const cl = ["## v8.8.8 — line-arm", ...body, ""].join("\n");
+  const section = extractChangelogSection(cl, "8.8.8");
+  assert.ok(Buffer.byteLength(section, "utf8") > 1500, "premise: the fixture must exceed the limit used below");
+  const r = buildReleaseBody({ changelog: cl, version: "8.8.8", repo: "o/r", limit: 1500 });
+  assert.equal(r.kind, "truncated");
+  assert.equal(r.boundary, "line", "no indented line may count as a block start, so the cut must be the line arm");
+  assert.ok(r.bodyBytes <= 1500, `must still fit: ${r.bodyBytes} > 1500`);
+  const kept = r.body.slice(0, r.body.indexOf("\n\n---\n\n*Release notes truncated"));
+  assert.ok(section.startsWith(kept), "the retained part must be a verbatim prefix of the section");
+  assert.equal(section.charAt(kept.length), "\n",
+    `the cut must land on a WHOLE line boundary, not inside one; it landed before ` +
+    `${JSON.stringify(section.slice(kept.length, kept.length + 30))}`);
+});
+
+test("#441: `*` and `+` are block starts too, not just `-`", () => {
+  // The BLOCK_START comment names all three CommonMark top-level list markers; this repo's own
+  // CHANGELOG only ever uses `-`, so without this the other two are design intent rather than
+  // pinned behaviour (independent review, note 7).
+  for (const marker of ["*", "+"]) {
+    const items = Array.from({ length: 12 }, (_, i) => marker + " item " + i + " " + "y".repeat(180));
+    const cl = ["## v7.7.7 — markers", "", ...items, ""].join("\n");
+    const r = buildReleaseBody({ changelog: cl, version: "7.7.7", repo: "o/r", limit: 1200 });
+    assert.equal(r.kind, "truncated", `${marker}: premise — the fixture must exceed the limit`);
+    assert.equal(r.boundary, "block", `a "${marker} " line must count as a block start`);
+    const kept = r.body.slice(0, r.body.indexOf("\n\n---\n\n*Release notes truncated"));
+    const dropped = extractChangelogSection(cl, "7.7.7").slice(kept.length).replace(/^\n+/, "");
+    assert.ok(dropped.startsWith(marker + " "), `the first dropped line must be a "${marker} " item; got ${JSON.stringify(dropped.slice(0, 30))}`);
+  }
+});
+
+test("#441: a section with NO interior block start still fits — the byte-safe hard cut", () => {
+  // The degenerate arm. A section that is one enormous line has no boundary to snap to, and this
+  // function's contract is that its result always fits. Built from astral characters (4 UTF-8
+  // bytes, 2 UTF-16 units) so a naive `slice(0, budget)` would both overflow the budget AND cut a
+  // surrogate pair in half.
+  const cl = "## v9.9.9 " + "\u{1F600}".repeat(4000) + "\n";
+  const r = buildReleaseBody({ changelog: cl, version: "9.9.9", repo: "o/r", limit: 4000 });
+  assert.equal(r.kind, "truncated");
+  assert.equal(r.boundary, "hard");
+  assert.ok(r.bodyBytes <= 4000, `hard cut must still fit: ${r.bodyBytes} > 4000`);
+  const kept = r.body.slice(0, r.body.indexOf("\n\n---\n\n*Release notes truncated"));
+  assert.ok(!/[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/.test(kept),
+    "the cut must land on a code-point boundary — a lone surrogate half is a mojibake release body");
+  assert.ok(kept.startsWith("## v9.9.9 "), "the prefix is still the section's own text");
+  assert.ok(Array.from(kept.slice("## v9.9.9 ".length)).every(c => c === "\u{1F600}"),
+    "every retained code point after the heading must be a whole emoji");
+});
+
+test("#441: degrade-to-minimal keeps its two shapes, and a too-small limit gets its OWN shape", () => {
+  // The two the awk had (#202: both must still produce a body, because the create step consumes a
+  // FILE and an early exit that skipped it turned "minimal notes" into a failed release job).
+  const a = buildReleaseBody({ changelog: null, version: "1.2.3" });
+  assert.equal(a.kind, "minimal:no-changelog");
+  assert.equal(a.body, "Release v1.2.3\n");
+  const b = buildReleaseBody({ changelog: _D441_FIXTURE, version: "7.7.7" });
+  assert.equal(b.kind, "minimal:no-section");
+  assert.equal(b.body, "Release v7.7.7\n");
+  // And the third, which is NOT one of those two: a limit so small the pointer itself does not fit.
+  // Reported separately because the two states send an operator to different places — an absent
+  // section is a CHANGELOG problem, a too-small limit is a caller problem.
+  const c = buildReleaseBody({ changelog: _D441_FIXTURE, version: "2.0.0", limit: 40 });
+  assert.equal(c.kind, "minimal:limit-too-small");
+  assert.ok(c.sectionBytes > 0, "the section was found — reporting it as absent would be a lie");
+});
+
+test("#441: assertWithinLimit is the pre-flight backstop, and it fires", () => {
+  // TESTED DIRECTLY, ON PURPOSE. buildReleaseBody guarantees its result fits, so this guard is
+  // unreachable THROUGH the builder — driving it through a caller that cannot reach it would be a
+  // guard nobody has ever seen fire. It exists because #441's only size check was the GitHub API.
+  assert.equal(assertWithinLimit("abc", 3), 3, "an exactly-at-limit body is allowed and returns its size");
+  assert.throws(() => assertWithinLimit("abcd", 3), (e) =>
+    /release body is 4 bytes, over the 3-byte budget by 1/.test(e.message) && /#441/.test(e.message),
+    "the message must name both numbers and the issue — a nameless failure is what this replaces");
+});
+
+test("#441: the CLI refuses an unreadable CHANGELOG instead of degrading to minimal notes", () => {
+  // "I could not look" must not become "there is nothing there". ENOENT is a documented degrade;
+  // every other read error has to be loud, or a release whose CHANGELOG was merely unreadable
+  // ships with a one-line body and nobody finds out.
+  const dir = mkdtempSync(testJoin(tmpdir(), "ocp-441-cli-"));
+  try {
+    const r = spawnSync(process.execPath, [
+      testJoin(_D441_ROOT, "scripts/release-notes.mjs"),
+      "--version", "1.2.3", "--out", testJoin(dir, "notes.md"),
+      "--changelog", dir, // a DIRECTORY -> EISDIR, not ENOENT
+    ], { encoding: "utf8" });
+    assert.equal(r.status, 1, `must exit non-zero; stdout=${JSON.stringify(r.stdout)} stderr=${JSON.stringify(r.stderr)}`);
+    assert.ok(/^FATAL: /m.test(r.stderr), `must name the failure; stderr=${JSON.stringify(r.stderr)}`);
+    assert.ok(!testExistsSync(testJoin(dir, "notes.md")),
+      "and it must NOT have written minimal notes for a CHANGELOG it could not read");
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("#441 WIRING: the CLI actually CALLS assertWithinLimit — over-budget body, exit 1, named error", () => {
+  // THE FINDING THAT PRODUCED THIS TEST, recorded because the gap was created by a false claim
+  // rather than by an oversight. The comment on assertWithinLimit said the guard was "unreachable
+  // through the builder", so it was only ever tested as a unit — and deleting the CALL from
+  // scripts/release-notes.mjs left the suite 9/0 GREEN. The PR's headline guard had no wiring pin,
+  // which is the #343 shape the ledger in AGENTS.md exists for.
+  //
+  // The claim was also just wrong: buildReleaseBody's `minimal:*` arms never consult `limit`, so
+  // `Release v1.2.3\n` (15 bytes) comes back for `--limit 10` and the guard fires. That reachable
+  // input is what makes this test possible at all.
+  const dir = mkdtempSync(testJoin(tmpdir(), "ocp-441-limit-"));
+  try {
+    const out = testJoin(dir, "notes.md");
+    const r = spawnSync(process.execPath, [
+      testJoin(_D441_ROOT, "scripts/release-notes.mjs"),
+      "--version", "1.2.3", "--out", out,
+      "--changelog", testJoin(_D441_ROOT, "CHANGELOG.md"),
+      "--limit", "10",
+    ], { encoding: "utf8" });
+    assert.equal(r.status, 1, `must exit non-zero; stdout=${JSON.stringify(r.stdout)} stderr=${JSON.stringify(r.stderr)}`);
+    assert.ok(/FATAL: release body is \d+ bytes, over the 10-byte budget by \d+/.test(r.stderr),
+      `the error must name both numbers, not just fail; stderr=${JSON.stringify(r.stderr)}`);
+    assert.ok(/#441/.test(r.stderr), `and it must name the issue; stderr=${JSON.stringify(r.stderr)}`);
+    // The file is still written — deliberately, so the offending body is on disk for whoever reads
+    // the failed run. Asserted so a later "tidy up" that moves the write after the assert reddens.
+    assert.ok(testExistsSync(out), "the oversized body must still be on disk for diagnosis");
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("#441 WIRING: release.yml's own `run:` body, executed verbatim, produces a body under the cap", () => {
+  // The one test that can fail if release.yml stops calling any of this. Everything above proves a
+  // helper; this proves the CALL SITE, which is the #343 shape the wiring-pin ledger exists for.
+  const yml = _ltRead(testJoin(_D441_ROOT, ".github/workflows/release.yml"), "utf8");
+
+  // ANCHORS BY INDEX BEFORE SLICING (#347). `indexOf` returns -1 on a miss and `slice(a, -1)` is
+  // neither an error nor empty — it runs to one before the end of the string, producing a LONGER,
+  // healthier-looking slice than the correct one. A length floor or a substring check on the result
+  // cannot catch that; only checking both indices first can.
+  const START = "# >>> #441 release-notes build";
+  const END = "# <<< #441 release-notes build";
+  const s = yml.indexOf(START);
+  const e = yml.indexOf(END);
+  assert.ok(s > -1, `the start anchor ${JSON.stringify(START)} is gone from release.yml — the slice below would be garbage`);
+  assert.ok(e > s, `the end anchor ${JSON.stringify(END)} must follow the start anchor (start=${s}, end=${e})`);
+  const script = yml.slice(s, e + END.length);
+
+  // A PREMISE, and textual on purpose: the sliced script reads $VERSION and $NOTES_FILE from the
+  // step's env, and this test supplies them itself. So if the YAML's `env:` block lost either one,
+  // the slice would still run here while the real job died under `set -u`. This assertion is the
+  // only thing standing between those two worlds; it is a premise of the harness, not the behaviour
+  // under test.
+  // THIRD ANCHOR, CHECKED BY INDEX LIKE THE OTHER TWO (independent review, note 5). The first
+  // draft asserted START and END by index and then sliced on `id: notes` without one, five lines
+  // under a comment invoking that very rule. It degraded safely by accident of ordering, which is
+  // not a guard.
+  const iNotes = yml.indexOf("id: notes");
+  assert.ok(iNotes > -1 && iNotes < s, `the notes step's id must be present and precede its run: body (id at ${iNotes}, run at ${s})`);
+  const stepEnv = yml.slice(iNotes, s);
+  assert.ok(/^\s+VERSION:\s/m.test(stepEnv) && /^\s+NOTES_FILE:\s/m.test(stepEnv),
+    `the notes step must declare VERSION and NOTES_FILE in its env:, because its run: body reads ` +
+    `them and this test injects them; got ${JSON.stringify(stepEnv)}`);
+
+  // SECOND PREMISE THE EXECUTED SLICE CANNOT SEE, and textual for the same reason: this test runs
+  // the slice under whatever `node` is on the local PATH, so it is blind to which node the JOB
+  // gets. Every other workflow here that runs node pins it with actions/setup-node; release.yml
+  // now runs node too, and an unpinned one would put a release at the mercy of a runner-image
+  // bump — a failure on the one path nobody watches, which is the whole of #441.
+  // Checked for POSITION as well as presence: a setup-node step that runs after the node call
+  // pins nothing. `< s` is the anchor offset of the run: body this test executes.
+  const setupNode = yml.indexOf("uses: actions/setup-node");
+  assert.ok(setupNode > -1 && /^\s+node-version:\s*'?\d/m.test(yml),
+    "release.yml runs node and must pin it with actions/setup-node + a node-version, as test.yml and flake-hunt.yml do");
+  assert.ok(setupNode < s,
+    `the setup-node step must come BEFORE the step that runs node, or it pins nothing ` +
+    `(setup-node at ${setupNode}, the node call at ${s})`);
+
+  const dir = mkdtempSync(testJoin(tmpdir(), "ocp-441-wire-"));
+  try {
+    const sh = testJoin(dir, "step.sh");
+    const notes = testJoin(dir, "release-notes.md");
+    const ghOut = testJoin(dir, "github_output");
+    testWriteFile(sh, script);
+    testWriteFile(ghOut, "");
+    const r = spawnSync("bash", [sh], {
+      cwd: _D441_ROOT, // the runner's cwd after actions/checkout: the repo root
+      encoding: "utf8",
+      env: { ...process.env, VERSION: "3.29.3", NOTES_FILE: notes, GITHUB_OUTPUT: ghOut, GITHUB_REPOSITORY: "dtzp555-max/ocp" },
+    });
+    assert.equal(r.status, 0, `the step must succeed; stdout=${JSON.stringify(r.stdout)} stderr=${JSON.stringify(r.stderr)}`);
+    assert.ok(testExistsSync(notes), "the step must WRITE the notes file the create step consumes (#202)");
+    const body = _ltRead(notes, "utf8");
+    assert.ok(_d441Bytes(body) <= _D441_LIMIT,
+      `release.yml must not hand gh a body over the cap: ${_d441Bytes(body)} > ${_D441_LIMIT}`);
+    assert.ok(body.includes("Full notes: https://github.com/dtzp555-max/ocp/blob/v3.29.3/CHANGELOG.md"),
+      "and the repo slug must reach the pointer through $GITHUB_REPOSITORY");
+    assert.ok(_ltRead(ghOut, "utf8").includes(`notes_file=${notes}`),
+      `the step must publish notes_file for the create step's --notes-file; got ${JSON.stringify(_ltRead(ghOut, "utf8"))}`);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
