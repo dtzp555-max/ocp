@@ -137,6 +137,14 @@ ADR 0006 retroactively authorizes the B.2 endpoints listed in the inventory tabl
 
 > The citation above is anchored on a **grep-able marker**, not on a bare line number, because the bare line number is what rotted: this note cited `server.mjs` line 845–849 from before v3.16.4 until #292, and by then those lines were the `OCP_LOCAL_TOOLS` boot gate — a reviewer following the citation as instructed landed on unrelated code. The block had moved to 2374–2379, and even #292's own corrected range (2349–2354) was stale again by the time the fix was written. `// ALIGNMENT:` appears exactly once in `server.mjs` and marks this block deliberately, so it survives the drift a line number cannot. Line numbers in this document are always secondary to a named anchor, and are pinned to a stated version so that staleness is visible rather than silent.
 
+**Cross-cutting authorization (ADR 0019).** The table above maps each endpoint to the ADR that
+authorized *its existence*. One authorization is not endpoint-scoped and therefore has no row:
+[ADR 0019](docs/adr/0019-inbound-origin-gate.md) refuses any request carrying a non-allowlisted
+`Origin` header on a method other than `GET`/`HEAD`, before auth and before routing. It changes
+**semantics** for every endpoint in this table — a request that previously executed now receives
+`403` — which is why it is ADR 0006 route **(b)** and not the grandfather clause. It adds no field
+and no endpoint, so it is deliberately **not** filed under ADR 0012.
+
 ### Class B citation requirement
 
 Class B PRs cite **the relevant specification section + the authorizing ADR**, in place of `cli.js:NNNN`. Examples:

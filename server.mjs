@@ -3880,6 +3880,90 @@ async function handleRequest(req, res) {
   res.setHeader("Access-Control-Allow-Origin", isAllowedOrigin ? origin : `http://127.0.0.1:${PORT}`);
   res.setHeader("Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS, PATCH");
   res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization, X-Session-Id, X-Conversation-Id");
+  // ── ADR 0019: a foreign Origin may not reach anything that changes state ──────────────
+  //
+  // Until this gate there was NO CSRF defense here and none had been considered: `git grep -niE
+  // 'csrf|cross-site request'` over the repo returned ZERO hits (positive control: `Allow-Origin`
+  // returned one). `isAllowedOrigin` above decides which value goes in the RESPONSE header; it has
+  // never rejected a request.
+  //
+  // What that cost, MEASURED against a live default-configuration instance rather than reasoned
+  // about (2026-08-23): the server does not look at the inbound Content-Type — `text/plain` with a
+  // malformed body answers `400 Invalid JSON`, not `415`, so the body reached JSON.parse — and
+  // `text/plain` is CORS-safelisted, so a cross-origin POST carrying it needs NO PREFLIGHT. The
+  // localhost branch below admits it unconditionally ("never reject"). ALLOWED_TOOLS defaults to a
+  // set containing Bash/Write/Edit. And the spawned `claude` runs them WITHOUT PROMPTING: a nonce
+  // file was written locally and a request through the live proxy asking it to `cat` that file came
+  // back carrying the nonce — an output only execution can produce.
+  //
+  // So the exposure was not "a web page can burn quota". It was a web page running commands as the
+  // operator, blind. NOT gated by LAN/multi-user mode — this is the default loopback deployment.
+  //
+  // WHY THIS SHAPE, and why it is free: a cross-origin browser request ALWAYS carries `Origin`, so
+  // rejecting on it closes the chain at the first link. An ABSENT `Origin` changes nothing, which is
+  // what makes the gate cost nothing — curl, the OpenAI SDKs and ocp-connect send none, so no client
+  // has to change and no request shape moves. `Origin: null` (sandboxed iframe, file://) does not
+  // match the allowlist and is refused, which is the intended direction.
+  //
+  // GET/HEAD are exempt. Not because GET is side-effect-free here — it is not: GET /usage and
+  // GET /status reach fetchUsageFromApi, which POSTs a real (haiku, max_tokens:1) request to
+  // api.anthropic.com and can trigger an OAuth refresh, bounded by USAGE_CACHE_TTL. The reason is
+  // that an Origin gate CANNOT defend that surface in either configuration: the same effect is
+  // reachable with an `<img>` whose src points at this server's own /usage, which sends NO Origin
+  // at all (the literal port is deliberately not written here — see the port-literal SPOT gate in
+  // alignment.yml, which exists because a stray one cascaded into a production outage). Gating
+  // GET would close only the strictly narrower fetch-with-Origin shape while breaking cross-origin
+  // dashboards, and would close nothing an attacker needs. No endpoint that runs a USER-SUPPLIED
+  // prompt is a GET, which is the property that matters for the chain above.
+  // OPTIONS is NOT exempt, so a foreign preflight fails at the preflight rather than one round trip
+  // later — same outcome, earlier.
+  //
+  // A Content-Type requirement was designed and deliberately NOT taken; ADR 0019 records why, with
+  // the measured cost (it would rewrite ~20 malformed-body assertions and break dashboard.html's
+  // body-less DELETE) and the fact that it adds nothing to THIS chain.
+  // SAME-ORIGIN IS ADMITTED SEPARATELY, and this half was missing from the first version of this
+  // gate — caught by independent review, as a REGRESSION IT INTRODUCED rather than as a bypass.
+  // Browsers send `Origin` on same-origin requests too whenever the method is not GET/HEAD (Fetch
+  // Standard, "append a request Origin header", step 3 — the same-origin case is not excluded).
+  // dashboard.html sets `BASE = window.location.origin` and POSTs/DELETEs to it, so an operator
+  // who opens the dashboard at any address the literal allowlist above does not spell — a hostname
+  // like `ocp-host.local`, `[::1]`, a Tailscale CGNAT address, a public IP, or through a TLS
+  // reverse proxy, all of which README/docs tell them to do — would have had "add key" and
+  // "revoke key" start returning 403. And SILENTLY: apiPost/apiDelete return `resp.json()` without
+  // looking at the status, so revoking a compromised key would show a confirm, refresh the list,
+  // and leave the key there with no error anywhere. A security control failing invisibly on the
+  // operator's side is the wrong failure.
+  //
+  // Comparing the Origin's host to this request's `Host` is STRICTLY STRONGER than the allowlist
+  // for the CROSS-ORIGIN case: a browser sets both headers itself and `Host` is a forbidden header
+  // name, so an attacker page cannot make them match FROM A DIFFERENT ORIGIN. (A non-browser client
+  // could forge both — and could equally send no `Origin` at all, so nothing is lost.)
+  // `Origin: null` still fails here, because `new URL("null")` throws.
+  //
+  // WHAT IT DOES NOT STOP, and an earlier version of this comment claimed it did: DNS REBINDING.
+  // An attacker who serves their page on this port and flips the A record to 127.0.0.1 produces a
+  // request the browser considers GENUINELY SAME-ORIGIN — `Host` and `Origin` are the attacker's
+  // domain and are equal by construction, so this arm admits it. Measured: `Host:` and
+  // `Origin: http://r.attacker.net:PORT` on the same port returns 200; the same pair on DIFFERENT
+  // ports (a real cross-origin request) returns 403. NO ORIGIN CHECK CAN CLOSE THIS — rebinding's
+  // whole point is that the request is same-origin. Closing it needs `Host` validated against
+  // hostnames the OPERATOR HAS DECLARED, which is config this project does not have yet; see
+  // ADR 0019 § "What this does not do". Found by external review (prime), whose rebuttal is exact:
+  // under rebinding the attacker page genuinely IS that origin.
+  let isSameOrigin = false;
+  if (origin) {
+    try { isSameOrigin = new URL(origin).host === String(req.headers.host || ""); } catch { /* opaque or malformed */ }
+  }
+  if (origin && !isAllowedOrigin && !isSameOrigin && req.method !== "GET" && req.method !== "HEAD") {
+    logEvent("warn", "origin_rejected", { origin, method: req.method, path: req.url.split("?")[0] });
+    return jsonResponse(res, 403, {
+      error: {
+        message: "Forbidden: cross-origin request rejected. This proxy only accepts browser requests from loopback and private-range origins (ADR 0019).",
+        type: "forbidden_origin",
+      },
+    });
+  }
+
   if (req.method === "OPTIONS") { res.writeHead(204); res.end(); return; }
 
   // 3-mode auth: none | shared | multi

@@ -27929,3 +27929,176 @@ test("#441 WIRING: release.yml's own `run:` body, executed verbatim, produces a 
     rmSync(dir, { recursive: true, force: true });
   }
 });
+
+// ── ADR 0019: a foreign Origin may not reach anything that changes state ──────────────────
+//
+// WHY THIS EXISTS. `server.mjs` had no CSRF defense and none had been considered — `git grep -niE
+// 'csrf|cross-site request'` returned ZERO over the repo (positive control: `Allow-Origin`, one
+// hit). The chain was measured end to end against a live default-configuration instance, not
+// reasoned about: no inbound Content-Type check (so a CORS-safelisted `text/plain` POST needs no
+// preflight), no Origin rejection, localhost admitted unconditionally, `ALLOWED_TOOLS` defaulting
+// to a set containing Bash/Write/Edit, and — the link that decides the severity — the spawned
+// `claude` executing those tools WITHOUT PROMPTING, proven with a locally-written nonce that came
+// back through the proxy. So the exposure was a web page running commands as the operator, blind.
+//
+// EVERY TEST HERE CARRIES ITS OWN CONTROL. "The request was refused" and "the server is broken /
+// the fake never booted" are the same observation from the outside, and this whole block asserts
+// refusals. Each test therefore also asserts a NON-refused request on the same instance.
+import * as _lt19Net from "node:net";
+const LT19_EVIL = "https://evil.example.com";
+
+// Raw send with an arbitrary method + Origin. `fetch` refuses to set `Origin` (it is a forbidden
+// header name), so this goes through a raw socket — the only way to reproduce what a browser sends.
+function lt19Send(port, { method = "POST", path = "/v1/chat/completions", origin = null, body = null, host = null }) {
+  return new Promise((resolve) => {
+    const payload = body === null ? "" : body;
+    const lines = [`${method} ${path} HTTP/1.1`, `Host: ${host ?? `127.0.0.1:${port}`}`, "Connection: close"];
+    if (origin !== null) lines.push(`Origin: ${origin}`);
+    if (payload) lines.push("Content-Type: application/json", `Content-Length: ${Buffer.byteLength(payload)}`);
+    const req = lines.join("\r\n") + "\r\n\r\n" + payload;
+    const sock = _lt19Net.connect(port, "127.0.0.1", () => sock.write(req));
+    let raw = "";
+    sock.on("data", (d) => { raw += d; });
+    sock.on("error", () => resolve({ status: 0, raw: "" }));
+    sock.on("close", () => {
+      const m = raw.match(/^HTTP\/1\.1 (\d{3})/);
+      resolve({ status: m ? Number(m[1]) : 0, raw });
+    });
+  });
+}
+
+ltTest("ADR 0019: a foreign Origin on POST is refused 403 — and the same POST without one is not", async () => {
+  if (!LT_POSIX) return; // sh fake — skip on Windows CI
+  const dir = ltMkdir(); const fake = ltFake(dir);
+  const { child, buf, port } = await ltBootFresh({ CLAUDE_BIN: fake }, dir);
+  try {
+    assert.ok(await ltWait(() => buf.out.includes("listening on") || buf.exit != null), `server did not start: ${buf.err.slice(0, 200)}`);
+
+    const evil = await lt19Send(port, { origin: LT19_EVIL, body: "not-json" });
+    assert.equal(evil.status, 403, `a cross-origin POST must be refused; got ${evil.status}`);
+    assert.match(evil.raw, /forbidden_origin/, "the refusal must be machine-identifiable, not a bare 403");
+
+    // THE CONTROL, and it is what makes the 403 above mean anything. Byte-identical request minus
+    // the Origin header: it must reach the handler and fail on its CONTENT (400 Invalid JSON), not
+    // on the gate. A broken server, a dead fake or a wrong port would refuse both.
+    const plain = await lt19Send(port, { origin: null, body: "not-json" });
+    assert.equal(plain.status, 400,
+      `control: the identical POST with NO Origin must reach JSON parsing; got ${plain.status}. ` +
+      `If this is also 403 the gate is rejecting on absence, and every "refused" assertion here is vacuous.`);
+  } finally { child.kill("SIGKILL"); _ltRmRetry(dir); }
+});
+
+ltTest("ADR 0019: loopback and private-range Origins still pass; `null` does not", async () => {
+  if (!LT_POSIX) return;
+  const dir = ltMkdir(); const fake = ltFake(dir);
+  const { child, buf, port } = await ltBootFresh({ CLAUDE_BIN: fake }, dir);
+  try {
+    assert.ok(await ltWait(() => buf.out.includes("listening on") || buf.exit != null), `server did not start: ${buf.err.slice(0, 200)}`);
+    // The allowlist is the one already in server.mjs; these are the shapes a real browser client of
+    // this proxy sends — the dashboard on loopback, a LAN browser on a private range.
+    for (const ok of [`http://127.0.0.1:${port}`, "http://localhost:8080", "http://192.168.1.5:3000", "http://10.0.0.9"]) {
+      const r = await lt19Send(port, { origin: ok, body: "not-json" });
+      assert.equal(r.status, 400, `allowed origin ${ok} must not be gated; got ${r.status}`);
+    }
+    // `Origin: null` is what a sandboxed iframe and a file:// page send. It matches no allowlist
+    // entry and must be refused — the direction that fails closed.
+    const nul = await lt19Send(port, { origin: "null", body: "not-json" });
+    assert.equal(nul.status, 403, `Origin: null must be refused; got ${nul.status}`);
+  } finally { child.kill("SIGKILL"); _ltRmRetry(dir); }
+});
+
+ltTest("ADR 0019: GET is exempt, OPTIONS is not, and a body-less DELETE with no Origin still works", async () => {
+  if (!LT_POSIX) return;
+  const dir = ltMkdir(); const fake = ltFake(dir);
+  const { child, buf, port } = await ltBootFresh({ CLAUDE_BIN: fake }, dir);
+  try {
+    assert.ok(await ltWait(() => buf.out.includes("listening on") || buf.exit != null), `server did not start: ${buf.err.slice(0, 200)}`);
+
+    // GET exempt: no endpoint that runs a prompt is a GET, and a cross-origin GET is already
+    // unreadable to the caller. Gating it would break LAN dashboards for nothing.
+    const get = await lt19Send(port, { method: "GET", path: "/health", origin: LT19_EVIL });
+    assert.equal(get.status, 200, `a cross-origin GET /health must still answer; got ${get.status}`);
+
+    // OPTIONS NOT exempt: a foreign preflight fails at the preflight rather than one round trip
+    // later. 204 here would mean the gate sits after the OPTIONS short-circuit.
+    const pre = await lt19Send(port, { method: "OPTIONS", origin: LT19_EVIL });
+    assert.equal(pre.status, 403, `a foreign preflight must be refused, not answered 204; got ${pre.status}`);
+
+    // dashboard.html's exact shape: DELETE, auth header only, NO body and NO Content-Type. This is
+    // the client the gate must not break, and it is why the rule keys on Origin rather than on
+    // method or content type.
+    const del = await lt19Send(port, { method: "DELETE", path: "/cache", origin: null });
+    assert.equal(del.status, 200, `a body-less DELETE with no Origin is the dashboard's shape; got ${del.status}`);
+  } finally { child.kill("SIGKILL"); _ltRmRetry(dir); }
+});
+
+ltTest("ADR 0019: a SAME-ORIGIN request is admitted even when the allowlist does not spell its host", async () => {
+  if (!LT_POSIX) return;
+  // THE REGRESSION THE FIRST VERSION OF THIS GATE INTRODUCED, found by independent review rather
+  // than by me. Browsers send `Origin` on same-origin non-GET/HEAD requests too, and dashboard.html
+  // POSTs/DELETEs to `window.location.origin` — so an operator reaching the dashboard at any
+  // address the LITERAL allowlist does not spell (a hostname, [::1], a Tailscale CGNAT address, a
+  // public IP, a TLS reverse proxy) would have had "add key" and "revoke key" start returning 403.
+  // Silently: apiPost/apiDelete return resp.json() without reading the status, so revoking a
+  // compromised key would confirm, refresh, and leave the key listed with no error anywhere.
+  const dir = ltMkdir(); const fake = ltFake(dir);
+  const { child, buf, port } = await ltBootFresh({ CLAUDE_BIN: fake }, dir);
+  try {
+    assert.ok(await ltWait(() => buf.out.includes("listening on") || buf.exit != null), `server did not start: ${buf.err.slice(0, 200)}`);
+    // Each of these is refused by the allowlist regex and admitted only by the Origin-vs-Host check.
+    for (const h of ["ocp-host.local:8443", "[::1]:8443", "100.101.102.103:8443", "ocp.example.com"]) {
+      const r = await lt19Send(port, { method: "DELETE", path: "/cache", host: h, origin: `http://${h}` });
+      assert.equal(r.status, 200, `same-origin Host=${h} must be admitted; got ${r.status}`);
+    }
+    // THE CONTROL, and it is the whole point: the SAME hosts must still be refused when the Origin
+    // does not match the Host. Without this, "admitted" above would be indistinguishable from a
+    // gate that had simply been removed.
+    for (const h of ["ocp-host.local:8443", "ocp.example.com"]) {
+      const r = await lt19Send(port, { method: "DELETE", path: "/cache", host: h, origin: LT19_EVIL });
+      assert.equal(r.status, 403, `Host=${h} with a FOREIGN Origin must still be refused; got ${r.status}`);
+    }
+    // And a same-host-different-scheme/port origin is NOT same-origin by this check's own rule.
+    const wrongPort = await lt19Send(port, { method: "DELETE", path: "/cache", host: "ocp-host.local:8443", origin: "http://ocp-host.local:9999" });
+    assert.equal(wrongPort.status, 403, `a different port is a different origin; got ${wrongPort.status}`);
+  } finally { child.kill("SIGKILL"); _ltRmRetry(dir); }
+});
+
+ltTest("ADR 0019 BOUNDARY: a DNS-rebinding shape is admitted — the documented limit, pinned so it reddens if it moves", async () => {
+  if (!LT_POSIX) return;
+  // THIS TEST PINS A WEAKNESS, NOT A DESIRED PROPERTY, and it is written down rather than left to
+  // prose so that the limit is executable. Found by external review (prime) as a P1 against the
+  // first version's claim, not against its behaviour.
+  //
+  // An attacker who serves their page on this port and flips the A record to 127.0.0.1 produces a
+  // request the browser considers GENUINELY SAME-ORIGIN: `Host` and `Origin` both carry the
+  // attacker's domain and are equal by construction. The same-origin arm therefore admits it. NO
+  // ORIGIN CHECK CAN CLOSE THIS — the property the gate keys on is genuinely true. Closing it needs
+  // `Host` validated against hostnames the OPERATOR HAS DECLARED, which is configuration this
+  // project does not have; reusing the existing allowlist for `Host` would refuse exactly the
+  // hostname dashboards the same-origin arm exists to keep working.
+  //
+  // IF THIS TEST EVER REDDENS, someone has added Host validation — which is good, and ADR 0019 §
+  // "What this does not do" must be updated in the same change, because this file is where the
+  // boundary is stated in a form that cannot silently rot.
+  const dir = ltMkdir(); const fake = ltFake(dir);
+  const { child, buf, port } = await ltBootFresh({ CLAUDE_BIN: fake }, dir);
+  try {
+    assert.ok(await ltWait(() => buf.out.includes("listening on") || buf.exit != null), `server did not start: ${buf.err.slice(0, 200)}`);
+    const rebind = await lt19Send(port, {
+      method: "DELETE", path: "/cache",
+      host: `r.attacker.example:${port}`, origin: `http://r.attacker.example:${port}`,
+    });
+    assert.equal(rebind.status, 200,
+      `DOCUMENTED LIMIT: a rebinding-shaped request (Host === Origin, host outside the allowlist) is ` +
+      `admitted, because it is genuinely same-origin. Got ${rebind.status} — if this is now 403, Host ` +
+      `validation was added and ADR 0019's "What this does not do" must be updated with it.`);
+    // THE CONTROL that keeps the assertion above from being read as "the gate is off": the SAME
+    // attacker host on a DIFFERENT port is a real cross-origin request, and must still be refused.
+    const crossPort = await lt19Send(port, {
+      method: "DELETE", path: "/cache",
+      host: `r.attacker.example:${port}`, origin: "http://r.attacker.example",
+    });
+    assert.equal(crossPort.status, 403,
+      `control: the same host on a different port is genuinely cross-origin and must still be refused; got ${crossPort.status}`);
+  } finally { child.kill("SIGKILL"); _ltRmRetry(dir); }
+});
