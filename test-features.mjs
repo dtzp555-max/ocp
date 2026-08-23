@@ -28102,3 +28102,212 @@ ltTest("ADR 0019 BOUNDARY: a DNS-rebinding shape is admitted — the documented 
       `control: the same host on a different port is genuinely cross-origin and must still be refused; got ${crossPort.status}`);
   } finally { child.kill("SIGKILL"); _ltRmRetry(dir); }
 });
+
+// ── The Node prerequisite: one table, and everything else derived from it ─────────────────
+//
+// WHAT WAS WRONG. `package.json` declared `>=22.5` and `setup.mjs` gated on
+// `parseInt(process.versions.node) < 18`, while `keys.mjs` imports `node:sqlite` at module load
+// and `server.mjs` imports `keys.mjs` at module load. Nothing on any launch path passes
+// `--experimental-sqlite` — `npm start` is `node server.mjs`, and the only two occurrences of that
+// flag in the repo were prose. So the installer said "prerequisites OK" on 18.x/20.x/22.0–22.12
+// and the operator met the real constraint later, as an opaque node:sqlite error at first boot.
+//
+// The repo's own docs were wrong too, twice in one sentence: "fully stable without flags from
+// 23.0; on 22.5–22.x it works behind --experimental-sqlite". Node's history says the flag came off
+// at v22.13.0 AND v23.4.0, and "stable" is Release Candidate from v25.7.0 — so 22.13–22.x needs no
+// flag, and 23.0–23.3 does.
+//
+// WHY A TABLE. A single lower bound cannot express a rule that changed on two lines at two points:
+// `>=22.13.0`, the obvious fix, admits 23.0–23.3. That is the same defect one version down, and it
+// was caught by this file's own boundary cases before it shipped. `NODE_SQLITE_UNFLAGGED` is the
+// single source; `ENGINES_NODE` is derived from it; the tests below pin package.json, the docs and
+// setup.mjs's gate to that derivation, so these seven files cannot drift apart again:
+// package.json, setup.mjs, README.md, docs/troubleshooting.md, docs/lan-mode.md,
+// .github/workflows/test.yml and AGENTS.md. A FILE LIST, not a count of claims: three different
+// claim-counts shipped in the first draft of this change and none matched the diff, because
+// nothing connected the number to what it counted. The list is checkable against `--stat`.
+import { supportsUnflaggedSqlite, ENGINES_NODE, NODE_SQLITE_UNFLAGGED, deriveEnginesRange } from "./scripts/lib/node-floor.mjs";
+
+const D22_DOCS = ["README.md", "docs/lan-mode.md", "docs/troubleshooting.md", "AGENTS.md"];
+// Only forms that STATE a prerequisite. README's troubleshooting entry says "…and not 22.5
+// because…" as explanatory prose about the change; that shape deliberately does not match.
+//
+// THE TRAILING `+` IS OPTIONAL, and getting that wrong is why this guard shipped blind in its own
+// first draft. The `≥\s*v?` alternative was added specifically to cover `≥ v22.5` — the spelling
+// that had defeated the first manual sweep — and then a MANDATORY `\s*\+` was required, which that
+// spelling does not have. Independent review demonstrated it: reverting
+// docs/troubleshooting.md's `node --version` line to `should be ≥ v22.5` left this test GREEN. A
+// guard that cannot see the case its own entry says it was built for is worse than no guard,
+// because it reads as coverage.
+const D22_CLAIM = /(?:Node\.?js\s+|node\s+|≥\s*v?)(\d+\.\d+(?:\.\d+)?)\s*\+?/g;
+
+console.log("\nNode prerequisite (node:sqlite unflagged):");
+
+test("supportsUnflaggedSqlite: the boundaries Node actually documents, not a single floor", () => {
+  // Each row is a version Node's own history table makes a boundary. 23.0.0/23.3.9 are the pair
+  // that a `>=22.13.0` floor would wrongly admit — the mutation that shipped in this file's first
+  // draft, kept here as a case rather than as a memory.
+  for (const [v, want] of [
+    ["18.20.0", false], ["20.11.0", false], ["22.5.0", false], ["22.12.9", false],
+    ["22.13.0", true],  ["22.20.0", true],
+    ["23.0.0", false],  ["23.3.9", false],  ["23.4.0", true], ["23.9.0", true],
+    ["24.0.0", true],   ["26.5.0", true],
+    ["v22.13.0", true], ["", false], ["garbage", false],
+  ]) {
+    assert.equal(supportsUnflaggedSqlite(v), want, `supportsUnflaggedSqlite(${JSON.stringify(v)}) must be ${want}`);
+  }
+});
+
+test("package.json's engines.node is DERIVED from that table, not a second copy of it", () => {
+  const pkg = JSON.parse(_ltRead(testJoin(_D348_REPO_ROOT, "package.json"), "utf8"));
+  assert.equal(pkg.engines?.node, ENGINES_NODE,
+    `engines.node must equal the range derived from NODE_SQLITE_UNFLAGGED. Adding a row to that ` +
+    `table must move this string too — that is what stops the two from drifting.`);
+  // A premise, because an empty/degenerate table would make the assertion above trivially true.
+  assert.ok(NODE_SQLITE_UNFLAGGED.length >= 2 && ENGINES_NODE.includes("||"),
+    `premise: the table must still encode more than one line (got ${JSON.stringify(ENGINES_NODE)})`);
+});
+
+test("every Node version stated in the docs is one this table supports", () => {
+  const found = [];
+  for (const rel of D22_DOCS) {
+    // Newlines flattened before matching. One of the two sites the first sweep missed had wrapped
+    // onto its own line as `22.5+, git, Claude CLI`, and a single-line grep is blind to exactly
+    // that — which is why this reads the file the way it does.
+    const flat = _ltRead(testJoin(_D348_REPO_ROOT, rel), "utf8").replace(/\s*\n\s*/g, " ");
+    for (const m of flat.matchAll(D22_CLAIM)) {
+      if (!/^(2[2-9]|[3-9]\d)\./.test(m[1])) continue; // Node-version-shaped values only
+      found.push({ rel, v: m[1], ctx: flat.slice(Math.max(0, m.index - 45), m.index + 45).trim() });
+    }
+  }
+  // PREMISE FIRST, AND PER DOC. It used to be `found.length >= D22_DOCS.length` — a TOTAL, while
+  // the message promised "at least one per doc". Independent review broke it: rewrite BOTH of
+  // docs/troubleshooting.md's statements into unmatched spellings and the total still cleared the
+  // bar on the other files' matches, so that doc could revert entirely and this stayed green. An
+  // assertion whose message claims more than it checks is the defect this repo names most often.
+  for (const rel of D22_DOCS) {
+    assert.ok(found.some(f => f.rel === rel),
+      `premise: ${rel} states no Node version this guard can see — it can therefore drift freely. ` +
+      `Either it lost its prerequisite line, or D22_CLAIM cannot match the spelling it uses.`);
+  }
+  const wrong = found.filter(f => !supportsUnflaggedSqlite(f.v.split(".").length === 2 ? f.v + ".0" : f.v));
+  assert.deepEqual(wrong.map(f => `${f.rel}: ${f.v} (…${f.ctx}…)`), [],
+    "these docs state a Node version that cannot load node:sqlite unflagged");
+});
+
+test("WIRING: setup.mjs's prerequisite gate CONSULTS the table — refuses 22.12, passes 24", () => {
+  // The #343 shape: a correct helper whose call site does not consult it. Driven behaviourally,
+  // not by grepping setup.mjs, by overriding `process.versions.node` in a child before importing
+  // it. What makes it safe is the containment below, NOT the gate's position — see there.
+  const home = mkdtempSync(testJoin(tmpdir(), "ocp-nodefloor-"));
+  // THE CHILD MUST DIE AT THE VERY NEXT CHECK, and this is not tidiness. The first draft let the
+  // supported-version control run on, and setup.mjs is an INSTALLER: it cleared the version gate,
+  // ran its claude auth probe — `claude -p … "ping"`, which setup.mjs's own comment says COSTS A
+  // METERED CREDIT — reached Step 4 and wrote `start.sh` into the repo root
+  // (`join(__dirname, "start.sh")`, so cwd cannot move it), and then reached STEP 7, which calls
+  // `installAutoStart` -> `launchctl bootout` + `launchctl bootstrap`. That TOOK DOWN AND RELOADED
+  // THE OPERATOR'S PRODUCTION SERVICE — and because the job label is the same `dev.ocp.proxy`, the
+  // bootstrap loaded the plist setup.mjs had just written INSIDE THE SCRATCH HOME. The live proxy
+  // then ran from a job definition in a temp directory that this very test deletes in its
+  // `finally`, logging to a path that no longer existed. `/health` reported `ok` throughout; the
+  // only symptoms were the real log silently ceasing to grow and `launchctl print`'s `path`. It
+  // would not have survived a reboot: launchd cannot load a plist that is gone. A scratch HOME does not prevent the spend: on a host whose credentials
+  // live in the keychain, auth is HOME-independent. So: an empty PATH makes the `claude --version`
+  // check immediately after the gate throw, which `fail()`s and exits — before the probe and before
+  // any write. OCP_SKIP_AUTH_TEST=1 is belt-and-braces for the day someone reorders those checks.
+  // The pre-gate `which claude` is already inside a try/catch that swallows, so an empty PATH is
+  // inert there.
+  const emptyPath = mkdtempSync(testJoin(tmpdir(), "ocp-nopath-"));
+  const drive = (fakeVersion) => spawnSync(process.execPath, [
+    "-e",
+    `Object.defineProperty(process.versions,"node",{value:${JSON.stringify(fakeVersion)},configurable:true});` +
+    `import("./setup.mjs").catch(e=>{console.error("IMPORT-THREW:"+e.message);process.exit(9)});`,
+  ], { cwd: _D348_REPO_ROOT, encoding: "utf8", timeout: 60000,
+       env: { ...process.env, HOME: home, PATH: emptyPath, OCP_SKIP_AUTH_TEST: "1" } });
+
+  try {
+    const bad = drive("22.12.0");
+    assert.equal(bad.status, 1, `22.12.0 must be refused; status=${bad.status} stderr=${JSON.stringify((bad.stderr||"").slice(0,300))}`);
+    // THE TWO DRIVES ARE EACH OTHER'S CONTROL, which is what makes both stop-point assertions
+    // discriminating WITHOUT a mutation that disables the containment. A row that removes the
+    // empty-PATH containment to prove the containment matters PERFORMS THE VERY HARM the
+    // containment exists to prevent — it ran the real installer through to Step 7's `launchctl
+    // bootout`/`bootstrap` and redefined the operator's production service. It was removed from
+    // the mutation table for that reason, and this pair replaces it: 22.12 must stop at the
+    // version gate (so it must NOT carry the next check's message) and 24.0 must stop at the next
+    // check (so it MUST). Either assertion going vacuous makes the other fail.
+    assert.ok(!/Claude CLI not found/.test(bad.stderr || ""),
+      `22.12.0 must stop AT the version gate, before the claude check — its message must not appear; ` +
+      `stderr=${JSON.stringify((bad.stderr||"").slice(0,300))}`);
+    assert.match(bad.stderr, /node:sqlite/, "the refusal must say WHY, not just name a number");
+    assert.ok(bad.stderr.includes(ENGINES_NODE), `the refusal must quote the derived range; got ${JSON.stringify(bad.stderr.slice(0,300))}`);
+
+    // THE CONTROL. "setup.mjs exited 1" is also what a setup.mjs that fails for any other reason
+    // looks like. On a supported version it must get PAST this gate — it will still fail later on
+    // some other prerequisite in a scratch HOME, which is fine; what must be absent is THIS message.
+    const startShBefore = testExistsSync(testJoin(_D348_REPO_ROOT, "start.sh"));
+    const good = drive("24.0.0");
+    assert.ok(!/node:sqlite/.test(good.stderr || ""),
+      `control: 24.0.0 must clear the version gate, but it hit it: ${JSON.stringify((good.stderr||"").slice(0,300))}`);
+    assert.ok((good.stdout || "").includes("Node.js 24.0.0"),
+      `control: a supported version must be LOGGED as accepted; stdout=${JSON.stringify((good.stdout||"").slice(0,300))}`);
+    // AND IT MUST HAVE STOPPED IMMEDIATELY AFTER. This is the positive evidence that the child died
+    // at the next prerequisite rather than running the installer: "Claude CLI not found" is the
+    // check that follows the version log, and reaching it means the gate was cleared.
+    assert.match(good.stderr || "", /Claude CLI not found/,
+      `control: the child must stop at the NEXT check, not run on into the auth probe (which spends a ` +
+      `metered credit) and Step 4; stderr=${JSON.stringify((good.stderr||"").slice(0,300))}`);
+    // POLLUTION GUARD. setup.mjs Step 4 writes join(__dirname, "start.sh") — into the repo. If a
+    // reordering ever lets the child get that far, this reddens instead of the suite quietly
+    // dirtying the working tree on every run, which is what the first draft did.
+    assert.equal(testExistsSync(testJoin(_D348_REPO_ROOT, "start.sh")), startShBefore,
+      "the control must not have run setup.mjs far enough to write start.sh into the repo");
+  } finally { rmSync(home, { recursive: true, force: true }); rmSync(emptyPath, { recursive: true, force: true }); }
+});
+
+test("supportsUnflaggedSqlite agrees with ENGINES_NODE for a table whose rows are NOT adjacent majors", () => {
+  // FOUND BY INDEPENDENT REVIEW as an unstated invariant. The predicate and ENGINES_NODE are two
+  // derivations of one table, and the first version of the predicate agreed with the range only
+  // because the two shipped rows happen to be adjacent majors. With [22.13, 23.4, 26.2] the range
+  // admits 24.x and 25.x (`>=23.4.0 <26.0.0`) while the old predicate answered false for both —
+  // a silent disagreement waiting for whoever adds a third row. `rows` is a parameter precisely so
+  // this can be MEASURED on that table rather than asserted about it.
+  const odd = [{ major: 22, minor: 13 }, { major: 23, minor: 4 }, { major: 26, minor: 2 }];
+  for (const [v, want] of [
+    ["22.12.0", false], ["22.13.0", true],
+    ["23.3.0", false],  ["23.4.0", true],
+    ["24.0.0", true],   ["25.9.0", true],   // inside `>=23.4.0 <26.0.0` — the arm that regressed
+    ["26.1.0", false],  ["26.2.0", true], ["27.0.0", true],
+  ]) {
+    assert.equal(supportsUnflaggedSqlite(v, odd), want,
+      `with a non-adjacent table, supportsUnflaggedSqlite(${v}) must be ${want} to match the range derived from it`);
+  }
+  // And the shipped table must still be the one the rest of the suite pins.
+  assert.deepEqual(NODE_SQLITE_UNFLAGGED, [{ major: 22, minor: 13 }, { major: 23, minor: 4 }],
+    "premise: the shipped table is what the other tests derive from");
+});
+
+test("deriveEnginesRange REFUSES a malformed table instead of emitting an empty range arm", () => {
+  // FOUND BY AN EXTERNAL REVIEW (prime, stealth/ox-alpha via OpenRouter) as the last unstated
+  // invariant in this module. The predicate had already been generalised for non-adjacent majors;
+  // the RANGE half still rested on "the rows happen to be strictly increasing". With a repeated
+  // major the arm for the earlier row takes its upper bound from the next row's major and becomes
+  // an EMPTY SET, while supportsUnflaggedSqlite keeps answering true for those versions — because
+  // its scan keeps the first row of a tied major (strict `>`). Reproduced before fixing:
+  //   [{22,13},{22,20},{23,4}] -> ">=22.13.0 <22.0.0 || >=22.20.0 <23.0.0 || >=23.4.0"
+  //   supportsUnflaggedSqlite("22.15.0", thatTable) -> true
+  // A tied major is malformed input — two rows cannot both say when major 22 became unflagged —
+  // so this refuses rather than picking a winner, and refuses at module load so a bad table stops
+  // the build instead of shipping a range nobody checked.
+  assert.throws(() => deriveEnginesRange([{ major: 22, minor: 13 }, { major: 22, minor: 20 }]),
+    /strictly increasing/, "a repeated major must be refused, not silently turned into an empty arm");
+  assert.throws(() => deriveEnginesRange([{ major: 23, minor: 4 }, { major: 22, minor: 13 }]),
+    /strictly increasing/, "a decreasing major must be refused too");
+  // And it must still derive correctly for the shapes that ARE well-formed — otherwise the guard
+  // above could be satisfied by a function that refuses everything.
+  assert.equal(deriveEnginesRange([{ major: 22, minor: 13 }, { major: 23, minor: 4 }]),
+    ">=22.13.0 <23.0.0 || >=23.4.0");
+  assert.equal(deriveEnginesRange([{ major: 22, minor: 13 }, { major: 23, minor: 4 }, { major: 26, minor: 2 }]),
+    ">=22.13.0 <23.0.0 || >=23.4.0 <26.0.0 || >=26.2.0");
+  assert.equal(deriveEnginesRange([{ major: 24, minor: 0 }]), ">=24.0.0", "a single row has no upper bound");
+});

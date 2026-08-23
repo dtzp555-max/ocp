@@ -27,10 +27,18 @@ jobs:
       - name: Setup Node
         uses: actions/setup-node@v4
         with:
-          # Node 24 ships `node:sqlite` as stable. The test imports keys.mjs,
-          # which uses `import { DatabaseSync } from "node:sqlite"`.
-          # Node 22 also works with `--experimental-sqlite`, but we run on 24
-          # to keep the CI step simple and to match what released OCP runs on.
+          # The suite imports keys.mjs, which does `import { DatabaseSync } from
+          # "node:sqlite"` at module load. Node removed that module's
+          # `--experimental-sqlite` requirement in v22.13.0 and v23.4.0
+          # (nodejs.org/api/sqlite.html § History), which is where package.json's
+          # `engines: >=22.13.0` floor comes from.
+          #
+          # This pin is 24, ABOVE that floor, to match the reference fleet. Say so
+          # plainly rather than implying the floor is tested: CI exercises 24 and
+          # ONLY 24, so 22.13–23.x is a floor derived from Node's documentation and
+          # not from a run. An earlier version of this comment called node:sqlite
+          # "stable" on 24 — it is not; Node marks it Release Candidate only from
+          # v25.7.0. Unflagged is the property that matters here, not stable.
           node-version: '24'
 
       # OCP has zero runtime npm dependencies (package-lock.json shows only

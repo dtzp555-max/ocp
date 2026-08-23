@@ -96,7 +96,7 @@ The simplest path: ask your AI.
 
 The AI will run `git clone`, `npm install`, `node setup.mjs`, and tell you when to OAuth.
 
-**Prerequisites:** macOS or Linux (Windows is not supported), Node.js 22.5+ (Node 23+ recommended), `git`, and the [Claude CLI](https://docs.anthropic.com/en/docs/claude-cli), authenticated:
+**Prerequisites:** macOS or Linux (Windows is not supported), Node.js 22.13+ or 23.4+ (Node 24+ is what CI and the reference fleet run), `git`, and the [Claude CLI](https://docs.anthropic.com/en/docs/claude-cli), authenticated:
 
 ```bash
 npm install -g @anthropic-ai/claude-code
@@ -615,7 +615,7 @@ The simplest path: ask your AI — paste `Run `ocp doctor` and follow its `next_
 **Most common issues:**
 
 - **`EADDRINUSE: port 3456 already in use`** — an old OCP instance is bound. Find it (`lsof -nP -iTCP:3456 -sTCP:LISTEN`) and stop it (`launchctl bootout gui/$(id -u)/dev.ocp.proxy` on macOS, `systemctl --user stop ocp-proxy` on Linux). There is no `ocp stop` — the proxy is a service; `ocp restart` bounces it.
-- **`node: command not found` / version error** — OCP needs Node.js 22.5+ (`node --version`).
+- **`node: command not found` / version error** — OCP needs Node.js 22.13+ (`node --version`). The floor is 22.13 and not 22.5 because `keys.mjs` imports `node:sqlite` at module load and `server.mjs` imports `keys.mjs` at module load, so a Node that needs `--experimental-sqlite` cannot start OCP at all — and nothing on the launch path passes that flag. Node removed the flag requirement in **v22.13.0** and **v23.4.0** (see nodejs.org/api/sqlite.html § History) — so **23.0–23.3 are also excluded**, which is why the declared range is `>=22.13.0 <23.0.0 || >=23.4.0` and not a single floor.
 - **`claude: command not found`** — install the Claude CLI, run `claude auth login`, then re-run `node setup.mjs`.
 - **Usage shows "unknown" / 401** — usually an expired Claude CLI session: `claude auth login && ocp restart`. For the *permanent* TUI-mode `Please run /login · API Error: 401` that re-login can't fix, see [docs/troubleshooting.md § permanent TUI-mode 401](docs/troubleshooting.md#tui-401).
 - **`ocp update` refuses to restart** (`could not determine what ... owns the OCP port`, `not managed by any systemd unit`, `nothing is currently listening`, a sudo message, or a rollback-scope message) — deliberate: the restart phase resolves which unit actually owns the port and refuses rather than guesses when it can't tell, or when guessing would be unsafe. See [docs/troubleshooting.md § restart refusal](docs/troubleshooting.md#restart-target-refusal) for what each message means and how to proceed.

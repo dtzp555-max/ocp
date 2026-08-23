@@ -19,6 +19,7 @@ import { readFileSync, writeFileSync, existsSync, mkdirSync, readdirSync } from 
 import { resolveServicePlan } from "./scripts/lib/service-mode.mjs";
 import { installAutoStart } from "./scripts/lib/install-autostart.mjs";
 import { buildStartSh, classifyBindCheck } from "./scripts/lib/start-sh.mjs";
+import { supportsUnflaggedSqlite, ENGINES_NODE } from "./scripts/lib/node-floor.mjs";
 import { execSync } from "node:child_process";
 import { join, dirname } from "node:path";
 import { homedir } from "node:os";
@@ -139,9 +140,16 @@ function writeJSON(path, data) {
 // ── Step 1: Verify prerequisites ────────────────────────────────────────
 console.log("\n🔍 Checking prerequisites...\n");
 
-// Check node version
-const nodeVer = parseInt(process.versions.node.split(".")[0], 10);
-if (nodeVer < 18) fail(`Node.js >= 18 required (found ${process.versions.node})`);
+// Check node version. The gate is "can this Node load node:sqlite unflagged", NOT a major-only
+// floor: keys.mjs imports node:sqlite at module load and server.mjs imports keys.mjs at module
+// load, so a Node that needs --experimental-sqlite cannot start the proxy at all — and nothing
+// on any launch path passes it. This used to read `< 18`, which passed 18.x/20.x/22.0-22.12 and
+// deferred the real failure to first boot, as an opaque node:sqlite error rather than a
+// prerequisite one. A single lower bound cannot express it either: 23.0-23.3 still need the flag.
+if (!supportsUnflaggedSqlite(process.versions.node)) {
+  fail(`Node.js ${ENGINES_NODE} required (found ${process.versions.node}) — OCP loads node:sqlite `
+     + `at startup and this Node still needs --experimental-sqlite, which no launch path passes`);
+}
 log(`Node.js ${process.versions.node}`);
 
 // Check claude CLI

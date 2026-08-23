@@ -17,7 +17,7 @@ Runtime: Node.js (ESM, `.mjs` throughout). No build step. No bundler. `server.mj
 
 ## Stack
 
-- Node.js >=18, native ESM modules
+- Node.js 22.13+ (or 23.4+ on the 23 line), native ESM modules — `keys.mjs` imports `node:sqlite` at module load and nothing on any launch path passes `--experimental-sqlite`; see `scripts/lib/node-floor.mjs`
 - `http`/`https` built-ins for the proxy core (no Express, no Fastify)
 - `models.json` as the single source of truth for model metadata
 - GitHub Actions for CI (`alignment.yml`, `release.yml`)

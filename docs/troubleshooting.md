@@ -40,14 +40,14 @@ systemctl --user stop ocp-proxy                         # Linux systemd (install
 
 ### Setup fails with "node: command not found" or version error
 
-OCP requires Node.js 22.5+. Install:
+OCP requires Node.js 22.13+ or 23.4+. Install:
 
 ```bash
 brew install node          # macOS
 # Linux: see https://nodejs.org/en/download for current install commands
 ```
 
-Confirm with `node --version` (should be ≥ v22.5).
+Confirm with `node --version` (≥ v22.13.0, or ≥ v23.4.0 on the 23 line).
 
 ### Requests fail or agents stuck
 
