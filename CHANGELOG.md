@@ -2,6 +2,21 @@
 
 ## Unreleased
 
+### Fixed
+
+- **A `--only` filter that matches nothing no longer prints a results line (#434).** The exit code was already 1 — that was never the defect. The defect was the line printed immediately above it: `=== Results: 0 passed, 0 failed ===`. `AGENTS.md`'s own rule is that **a verdict comes from the suite's own `=== Results:` line, never from an exit code**, so a driver following the documented rule read a typo'd filter as a clean run — and a mutation campaign whose filter silently stopped matching would have reported a table of greens.
+
+  **The fix prints no results line rather than a different one**, because `AGENTS.md` already defines the semantics that makes that correct: *"a run with no `=== Results:` line is VOID rather than red."* A zero-match run **is** void — nothing was measured — so suppressing the line makes an existing rule do the work instead of adding a second one readers must learn. An unmistakable `=== VOID: nothing ran …` line goes to stderr so the run does not merely fall silent.
+
+  **Consumers were checked, not assumed.** `.github/workflows/flake-hunt.yml:134` counts completed runs with `grep -l '=== Results:'`, and a void run correctly stops counting as completed — it also never takes this path, being unfiltered. Both in-suite parsers spawn filters that **match**; the second had already been migrated off the zero-match shape by #437's review, explicitly so this fix would not break it silently. The pinning assertion is that the line is **absent** — asserting the exit code again would re-prove the half that already worked.
+
+### Changed
+
+- **`AGENTS.md` § "Testing discipline": two amendments, each carrying a measured instance (#440).**
+
+  - **A mutation must have LANDED and must MEAN something — two claims, and the second has no cheap check.** `String.replace` with a pattern that does not occur returns the string unchanged without throwing, so `mutated !== original` is required. **That is necessary and not sufficient**: a row replacing `id: notes` with `id: notesX` changed the file — so the check held — while the assertion under test does `indexOf("id: notes")`, which **still matches the longer string**. Zero red, and a row with no red reads exactly like *"this assertion is redundant"*. New rule: **the replacement must not contain the original**, and ask how the code under test **reads** the string. Plus the sharpest form: **ask whether running the row performs the act the guard prevents** — a row that removed a test's containment to prove the containment mattered ran a real installer through to `launchctl bootout`/`bootstrap` and redefined a live service, twice. Replace such rows with assertions that are **each other's control**.
+  - **The registration-count grep is a cross-check, not the authority, and widening it keeps failing.** Measured against four registrations (flat `test`, indented `test`, indented `ltTest`, flat `testAsync`): the shipped `^\+(test|ltTest)\(` counts **1**; adding `testAsync` alone counts **2**; **#440's own proposed `^\+\s*(test|ltTest)\(` counts 3 — it fixes indentation and still misses `testAsync`**; only `^\+\s*(test|ltTest|testAsync)\(` counts 4. Three successive widenings, each short — and **a grep over a diff cannot see a registration a conditional adds at all**, so no pattern closes it. The authoritative derivation is behavioural: `--only "<filter>"` against base and head. Same ceiling the ADR 0012 marker grep hit before #346 replaced the mechanism rather than the pattern.
+
 ## v3.30.0 — 2026-08-24
 
 ### Fixed

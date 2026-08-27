@@ -2084,6 +2084,17 @@ test("--only targeted selfcheck: a filter that matches nothing exits non-zero an
       res.status + " — output: " + out);
     assert.ok(out.includes("no tests matched --only filter: " + marker),
       "the zero-match message must name the filter — output: " + out);
+    // #434, and this is the assertion the issue is actually about. The exit code was ALREADY 1
+    // before the fix; that was never the defect. The defect was the line printed just above it:
+    // `=== Results: 0 passed, 0 failed ===`. AGENTS.md's own rule is that the verdict comes from
+    // that line and NEVER from an exit code, so a driver following the documented rule read a
+    // typo'd filter as a clean run. Asserting the exit code again would re-prove the half that
+    // already worked.
+    assert.ok(!/=== Results:/.test(out),
+      "a zero-match run must print NO results line — AGENTS.md defines a run without one as VOID, " +
+      "which is exactly what a filter matching nothing is. Got: " + out);
+    assert.match(out, /=== VOID: nothing ran/,
+      "and it must say so unmistakably rather than just falling silent — output: " + out);
   } finally {
     rmSync(childCwd, { recursive: true, force: true });
   }
@@ -26694,6 +26705,33 @@ runAsyncTests().then(() => Promise.all(pendingAsync)).then(() => {
   // against instead of teaching three call sites a new format, and it is why this must not be
   // "fixed" by editing flake-hunt.yml.
   const { passed, failed, skipped } = _m366Counts();
+
+  // --only with ZERO registered tests is VOID, and this check runs BEFORE the results line rather
+  // than after it (#434). The exit code was already 1; that was never the problem. The problem was
+  // that the line above it said `=== Results: 0 passed, 0 failed ===`, and THIS REPO'S OWN RULE is
+  // that "a verdict comes from the suite's own `=== Results:` line, never from an exit code". So a
+  // driver following the documented rule read a typo'd filter as a clean run — and a mutation
+  // campaign whose filter silently stopped matching would have reported a table of greens.
+  //
+  // The fix is to print NO results line, not to print a different one. AGENTS.md already defines
+  // the semantics that makes that correct: "a run with no `=== Results:` line is VOID rather than
+  // red." A zero-match run IS void — nothing was measured — so suppressing the line makes an
+  // existing rule do the work instead of adding a second one that readers must learn.
+  //
+  // Consumers were checked rather than assumed. `.github/workflows/flake-hunt.yml:134` counts
+  // completed runs with `grep -l '=== Results:'`, and a void run correctly stops counting as
+  // completed — it also never takes this path, since it runs unfiltered. The two in-suite parsers
+  // both spawn filters that MATCH (`compareVersions`, and the lock child's own test), the second
+  // having been migrated off the zero-match shape by #437's review precisely so this fix would not
+  // break it silently.
+  if (_onlySubstrings !== null && passed + failed + skipped === 0) {
+    console.error(`no tests matched --only filter: ${_onlySubstrings.join(",")}`);
+    console.error(`=== VOID: nothing ran, so no Results line was printed — a filter that matches ` +
+                  `nothing is not a green run. ===`);
+    _ltReportStallLedger();
+    process.exit(1);
+  }
+
   console.log(`\n=== Results: ${passed} passed, ${failed} failed ===\n`);
   if (skipped) {
     console.log(`=== Skipped: ${skipped} ===`);
@@ -26701,14 +26739,6 @@ runAsyncTests().then(() => Promise.all(pendingAsync)).then(() => {
                 `to see which coverage this run did NOT provide.\n`);
   }
   _ltReportStallLedger();
-  // --only with ZERO registered tests is a FAILURE, not a green run. A typo'd filter that matched
-  // nothing would otherwise print "0 passed, 0 failed" and exit 0 — exactly the false-confidence
-  // class this mode exists to kill (a mutation check could "pass" because the filter matched
-  // nothing). No-flag runs are untouched: npm test / CI keep their exit-0-on-green contract.
-  if (_onlySubstrings !== null && passed + failed + skipped === 0) {
-    console.error(`no tests matched --only filter: ${_onlySubstrings.join(",")}`);
-    process.exit(1);
-  }
   process.exit(failed > 0 ? 1 : 0);
 }).catch((e) => {
   console.error("async test runner crashed:", e);
