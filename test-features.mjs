@@ -11,6 +11,7 @@ import { classifyToolRequest } from "./lib/tool-support.mjs";
 import { randomBytes } from "node:crypto";
 import { createSerialMutex, createTtlCache, isTokenExpiring, orderLabelsLastGoodFirst, scrubInboundAuthEnv, INBOUND_AUTH_ENV_VARS, applyRequestVerdictTtl } from "./lib/spawn-auth.mjs";
 import { makeResolveSpawnToken } from "./lib/spawn-token.mjs";
+import { parseAuthority, isRebindSafe, matchesDeclared, parseAllowedHosts, evaluateOriginGate } from "./lib/host-gate.mjs";
 import { createHash } from "node:crypto";
 import { strict as assert } from "node:assert";
 import { join } from "node:path";
@@ -28076,9 +28077,14 @@ ltTest("ADR 0019: a SAME-ORIGIN request is admitted even when the allowlist does
   try {
     assert.ok(await ltWait(() => buf.out.includes("listening on") || buf.exit != null), `server did not start: ${buf.err.slice(0, 200)}`);
     // Each of these is refused by the allowlist regex and admitted only by the Origin-vs-Host check.
-    for (const h of ["ocp-host.local:8443", "[::1]:8443", "100.101.102.103:8443", "ocp.example.com"]) {
+    // ADR 0020 NARROWED THIS LIST BY ONE, and the one it removed is the point of the whole design:
+    // every host below is REBIND-SAFE — an IP literal (no DNS lookup happened, so there is no
+    // record to flip) or an RFC 6761/6762 reserved name (no public record exists). A public DNS
+    // name is NOT, and `ocp.example.com` used to be in this list; it now needs declaring. See the
+    // three-way contrast in the ADR 0020 tests below.
+    for (const h of ["ocp-host.local:8443", "[::1]:8443", "100.101.102.103:8443"]) {
       const r = await lt19Send(port, { method: "DELETE", path: "/cache", host: h, origin: `http://${h}` });
-      assert.equal(r.status, 200, `same-origin Host=${h} must be admitted; got ${r.status}`);
+      assert.equal(r.status, 200, `same-origin Host=${h} must be admitted with NO config; got ${r.status}`);
     }
     // THE CONTROL, and it is the whole point: the SAME hosts must still be refused when the Origin
     // does not match the Host. Without this, "admitted" above would be indistinguishable from a
@@ -28093,23 +28099,17 @@ ltTest("ADR 0019: a SAME-ORIGIN request is admitted even when the allowlist does
   } finally { child.kill("SIGKILL"); _ltRmRetry(dir); }
 });
 
-ltTest("ADR 0019 BOUNDARY: a DNS-rebinding shape is admitted — the documented limit, pinned so it reddens if it moves", async () => {
+ltTest("ADR 0020: the DNS-rebinding shape is REFUSED — a public DNS name may not vouch for itself", async () => {
   if (!LT_POSIX) return;
-  // THIS TEST PINS A WEAKNESS, NOT A DESIRED PROPERTY, and it is written down rather than left to
-  // prose so that the limit is executable. Found by external review (prime) as a P1 against the
-  // first version's claim, not against its behaviour.
+  // THIS TEST REPLACED ONE THAT PINNED THE OPPOSITE. Its predecessor asserted 200 here and said, in
+  // as many words, "if this ever reddens someone has added Host validation — which is good". #446
+  // added it. The predecessor is not deleted so much as inverted, which is the value of having
+  // written the limit as an executable assertion rather than as a paragraph nobody re-reads.
   //
   // An attacker who serves their page on this port and flips the A record to 127.0.0.1 produces a
   // request the browser considers GENUINELY SAME-ORIGIN: `Host` and `Origin` both carry the
-  // attacker's domain and are equal by construction. The same-origin arm therefore admits it. NO
-  // ORIGIN CHECK CAN CLOSE THIS — the property the gate keys on is genuinely true. Closing it needs
-  // `Host` validated against hostnames the OPERATOR HAS DECLARED, which is configuration this
-  // project does not have; reusing the existing allowlist for `Host` would refuse exactly the
-  // hostname dashboards the same-origin arm exists to keep working.
-  //
-  // IF THIS TEST EVER REDDENS, someone has added Host validation — which is good, and ADR 0019 §
-  // "What this does not do" must be updated in the same change, because this file is where the
-  // boundary is stated in a form that cannot silently rot.
+  // attacker's domain and are equal by construction. No Origin check can close that, so ADR 0020
+  // moved the check to the OTHER header — a name that could have been rebound must be declared.
   const dir = ltMkdir(); const fake = ltFake(dir);
   const { child, buf, port } = await ltBootFresh({ CLAUDE_BIN: fake }, dir);
   try {
@@ -28118,19 +28118,219 @@ ltTest("ADR 0019 BOUNDARY: a DNS-rebinding shape is admitted — the documented 
       method: "DELETE", path: "/cache",
       host: `r.attacker.example:${port}`, origin: `http://r.attacker.example:${port}`,
     });
-    assert.equal(rebind.status, 200,
-      `DOCUMENTED LIMIT: a rebinding-shaped request (Host === Origin, host outside the allowlist) is ` +
-      `admitted, because it is genuinely same-origin. Got ${rebind.status} — if this is now 403, Host ` +
-      `validation was added and ADR 0019's "What this does not do" must be updated with it.`);
-    // THE CONTROL that keeps the assertion above from being read as "the gate is off": the SAME
-    // attacker host on a DIFFERENT port is a real cross-origin request, and must still be refused.
+    assert.equal(rebind.status, 403,
+      `a rebinding-shaped request (Host === Origin, a public DNS name, undeclared) must be refused ` +
+      `even though it is genuinely same-origin; got ${rebind.status}`);
+    // THE 403 MUST BE THE RIGHT 403. Both refusal arms return the same status, so asserting only
+    // the status would pass if this had been refused as an ordinary foreign origin — a different
+    // mechanism reaching the same number, which is the shape that makes a test decorative.
+    assert.match(rebind.raw, /indistinguishable from DNS rebinding/,
+      `the refusal must come from the undeclared-host arm specifically; got: ${rebind.raw.slice(0, 400)}`);
+    assert.match(rebind.raw, /OCP_ALLOWED_HOSTS/,
+      `and it must name the setting that fixes it, or an operator who hits this legitimately has ` +
+      `no way out of it`);
+    // CONTROL A: the same host on a DIFFERENT port is genuinely cross-origin, refused by the OTHER
+    // arm — so it must NOT carry the undeclared-host message.
     const crossPort = await lt19Send(port, {
       method: "DELETE", path: "/cache",
       host: `r.attacker.example:${port}`, origin: "http://r.attacker.example",
     });
-    assert.equal(crossPort.status, 403,
-      `control: the same host on a different port is genuinely cross-origin and must still be refused; got ${crossPort.status}`);
+    assert.equal(crossPort.status, 403, `control: a different port is genuinely cross-origin; got ${crossPort.status}`);
+    assert.ok(!/indistinguishable from DNS rebinding/.test(crossPort.raw),
+      `control: a plain cross-origin refusal must NOT be reported as an undeclared host — if both ` +
+      `arms produce the same body, the assertion above proves nothing. (Both DO name ` +
+      `OCP_ALLOWED_HOSTS, deliberately: it is a way out of either. That is why this control keys ` +
+      `on the diagnosis rather than on the setting — the first version of it keyed on the setting ` +
+      `and failed, correctly.)`);
+    // CONTROL B: the gate has not simply been turned into "refuse everything". A rebind-safe host
+    // in the same shape is still admitted with no configuration at all.
+    const safe = await lt19Send(port, {
+      method: "DELETE", path: "/cache",
+      host: `ocp-host.local:${port}`, origin: `http://ocp-host.local:${port}`,
+    });
+    assert.equal(safe.status, 200, `control: an mDNS same-origin request must still be admitted; got ${safe.status}`);
   } finally { child.kill("SIGKILL"); _ltRmRetry(dir); }
+});
+
+ltTest("ADR 0020: a DECLARED host is admitted as an Origin outright — the Host-rewriting reverse proxy", async () => {
+  if (!LT_POSIX) return;
+  // THE MIRROR OF THE TEST ABOVE, and the reason `OCP_ALLOWED_HOSTS` is ONE setting rather than
+  // two. nginx's minimal `proxy_pass http://127.0.0.1:PORT;` does NOT preserve `Host` (Caddy does),
+  // so a legitimate dashboard at https://ocp.example.com arrives with `Host: 127.0.0.1:PORT` and an
+  // `Origin` that can NEVER equal it. The same-origin arm cannot fire, and every mutation 403s —
+  // silently, because dashboard.html's apiPost/apiDelete return resp.json() without reading status.
+  // Found by external review (prime) as the mirror of the rebinding finding: `Host` is pulled in
+  // opposite directions by the two, and only the operator can say which direction is theirs.
+  const dir = ltMkdir(); const fake = ltFake(dir);
+  const { child, buf, port } = await ltBootFresh(
+    { CLAUDE_BIN: fake, OCP_ALLOWED_HOSTS: "ocp.example.com, dash.example.com:8443" }, dir);
+  try {
+    assert.ok(await ltWait(() => buf.out.includes("listening on") || buf.exit != null), `server did not start: ${buf.err.slice(0, 200)}`);
+    // The proxy shape: Host is the upstream address, Origin is the public name. Nothing about this
+    // request is same-origin; it is admitted because the operator said so.
+    const proxied = await lt19Send(port, {
+      method: "DELETE", path: "/cache", host: `127.0.0.1:${port}`, origin: "https://ocp.example.com",
+    });
+    assert.equal(proxied.status, 200,
+      `a declared Origin must be admitted even when the proxy rewrote Host; got ${proxied.status}`);
+    // AND THE BROWSER MUST BE ABLE TO READ THE ANSWER. Admitting the request while echoing someone
+    // else's origin in Access-Control-Allow-Origin moves the same invisible failure one layer out,
+    // where it is harder to diagnose rather than fixed.
+    assert.match(proxied.raw, /access-control-allow-origin: https:\/\/ocp\.example\.com/i,
+      `the declared origin must be echoed back, or the fetch fails in the browser after the server ` +
+      `allowed it; got headers: ${proxied.raw.slice(0, 400)}`);
+    // A declared entry WITHOUT a port matches any port; one WITH a port matches only that port.
+    const withPort = await lt19Send(port, {
+      method: "DELETE", path: "/cache", host: `127.0.0.1:${port}`, origin: "https://dash.example.com:8443",
+    });
+    assert.equal(withPort.status, 200, `declared host:port must match that port; got ${withPort.status}`);
+    const wrongPort = await lt19Send(port, {
+      method: "DELETE", path: "/cache", host: `127.0.0.1:${port}`, origin: "https://dash.example.com:9999",
+    });
+    assert.equal(wrongPort.status, 403,
+      `a declared entry that names a port must not admit a DIFFERENT port; got ${wrongPort.status}`);
+    // THE CONTROL WITHOUT WHICH "admitted" IS INDISTINGUISHABLE FROM "the gate is off": a name that
+    // was NOT declared, in the identical shape, must still be refused on this same instance.
+    const undeclared = await lt19Send(port, {
+      method: "DELETE", path: "/cache", host: `127.0.0.1:${port}`, origin: "https://not-declared.example.com",
+    });
+    assert.equal(undeclared.status, 403,
+      `an UNDECLARED origin in the same shape must still be refused; got ${undeclared.status}`);
+    // And declaring a host must not have re-opened the rebinding shape for some OTHER name.
+    const rebind = await lt19Send(port, {
+      method: "DELETE", path: "/cache",
+      host: `r.attacker.example:${port}`, origin: `http://r.attacker.example:${port}`,
+    });
+    assert.equal(rebind.status, 403,
+      `declaring one host must not admit a different undeclared one vouching for itself; got ${rebind.status}`);
+  } finally { child.kill("SIGKILL"); _ltRmRetry(dir); }
+});
+
+ltTest("ADR 0020: an unparseable OCP_ALLOWED_HOSTS entry is REPORTED at boot, not silently dropped", async () => {
+  if (!LT_POSIX) return;
+  // A token that did not parse is a name the operator BELIEVES they declared. Dropping it in
+  // silence means the gate is narrower than the config says and the first evidence arrives as a
+  // 403 on somebody else's screen. It is deliberately NOT fatal — refusing to boot would take the
+  // proxy down to fix a misspelling — so the boot line is the whole of the signal.
+  const dir = ltMkdir(); const fake = ltFake(dir);
+  const { child, buf, port } = await ltBootFresh(
+    { CLAUDE_BIN: fake, OCP_ALLOWED_HOSTS: "good.example.com, bad host!, evil.com/path" }, dir);
+  try {
+    assert.ok(await ltWait(() => buf.out.includes("listening on") || buf.exit != null), `server did not start: ${buf.err.slice(0, 200)}`);
+    const all = buf.out + buf.err;
+    assert.match(all, /OCP_ALLOWED_HOSTS — ignored 2 unparseable entries/,
+      `both bad entries must be counted in the boot warning; got: ${all.slice(-600)}`);
+    assert.match(all, /bad host!/, "and the warning must name them, or the operator cannot find the typo");
+    assert.match(all, /evil\.com\/path/, "including the one that looks like a URL rather than a host");
+    // THE BEHAVIOURAL HALF, without which this is a test of a log line: the GOOD entry in the same
+    // string is still declared, and the bad ones did not become declarations of their own.
+    const good = await lt19Send(port, { method: "DELETE", path: "/cache", host: `127.0.0.1:${port}`, origin: "https://good.example.com" });
+    assert.equal(good.status, 200, `the parseable entry must still be declared; got ${good.status}`);
+    for (const bad of ["http://bad", "http://host", "http://evil.com"]) {
+      const r = await lt19Send(port, { method: "DELETE", path: "/cache", host: `127.0.0.1:${port}`, origin: bad });
+      assert.equal(r.status, 403,
+        `a fragment of an invalid entry must NOT become a declaration of its own (${bad}); got ${r.status}`);
+    }
+  } finally { child.kill("SIGKILL"); _ltRmRetry(dir); }
+});
+
+// ── ADR 0020 unit level: the decision, without a socket ───────────────────────────────────
+//
+// The live-server tests above prove the gate is WIRED. These prove it DECIDES correctly across a
+// matrix no boot could afford — and they are where a reader can see the actual rule, which is not
+// "is this local" but "could an attacker with public DNS point this name at 127.0.0.1".
+
+test("ADR 0020: parseAuthority refuses what a lenient parser would quietly accept", () => {
+  // Hand-rolled rather than `new URL("http://" + raw)` ON PURPOSE, and these are the reasons:
+  // the URL parser normalises a default port away, percent-escapes some invalid hostnames instead
+  // of rejecting them, and accepts a trailing path — each turning a malformed header into a
+  // plausible parse. Every one of these must be a refusal, because callers read null as "refuse".
+  for (const bad of ["evil.com/path", "a b", "::1", "[::1", "host:99999", "host:0", "host:abc",
+                     "", "   ", "-lead.example", "trail-.example", "999.1.1.1", "01.2.3.4",
+                     "a:1:2", "host:", "[::1]x", "[::1]:80:80"]) {
+    assert.equal(parseAuthority(bad), null, `parseAuthority(${JSON.stringify(bad)}) must refuse`);
+  }
+  // POSITIVE CONTROL — without it, a parser that refused EVERYTHING would pass the loop above.
+  assert.deepEqual(parseAuthority("Ocp.Example.COM:8443"), { hostname: "ocp.example.com", port: "8443", literal: false },
+    "a valid authority must parse, and case must fold");
+  assert.deepEqual(parseAuthority("[::1]:8443"), { hostname: "[::1]", port: "8443", literal: true });
+  assert.deepEqual(parseAuthority("127.0.0.1"), { hostname: "127.0.0.1", port: "", literal: true });
+  assert.deepEqual(parseAuthority(" ocp-host.local "), { hostname: "ocp-host.local", port: "", literal: false });
+});
+
+test("ADR 0020: isRebindSafe splits names by whether public DNS could point them at loopback", () => {
+  // IP literals: the browser connected without a lookup, so there is no record to flip. This is
+  // what keeps [::1], Tailscale CGNAT, a LAN address and a public IP working with zero config.
+  for (const h of ["127.0.0.1", "[::1]", "100.101.102.103", "203.0.113.7", "192.168.1.9"])
+    assert.equal(isRebindSafe(parseAuthority(`${h}:8443`)), true, `${h} is an IP literal and cannot be rebound`);
+  // RFC 6761 §6.3 / RFC 6762 §3 reserved names: a resolver must not send these to public DNS.
+  for (const h of ["localhost", "app.localhost", "ocp-host.local", "a.b.local"])
+    assert.equal(isRebindSafe(parseAuthority(h)), true, `${h} is a reserved name`);
+  // EVERYTHING ELSE, and the pair that matters is the last two: from inside a request the
+  // operator's own domain and the attacker's are INDISTINGUISHABLE. That is the attack, not a gap
+  // in this function — which is exactly why the operator, and only the operator, declares theirs.
+  for (const h of ["example.com", "localhost.evil.com", "local.evil.com", "notlocalhost",
+                   "ocp.example.com", "r.attacker.example"])
+    assert.equal(isRebindSafe(parseAuthority(h)), false, `${h} is a public DNS name and must be declared`);
+  assert.equal(isRebindSafe(null), false, "an unparseable authority is never safe (fail closed)");
+});
+
+test("ADR 0020: matchesDeclared — a bare entry matches any port, an entry with a port does not", () => {
+  const { hosts, invalid } = parseAllowedHosts("ocp.example.com, dash.example.com:8443");
+  assert.deepEqual(invalid, [], "both entries must parse, or the rest of this test measures nothing");
+  const m = (a) => matchesDeclared(parseAuthority(a), hosts);
+  assert.equal(m("ocp.example.com"), true);
+  assert.equal(m("ocp.example.com:9999"), true, "a bare declaration matches any port");
+  assert.equal(m("dash.example.com:8443"), true);
+  assert.equal(m("dash.example.com"), false, "a declaration WITH a port does not match a bare host");
+  assert.equal(m("dash.example.com:9999"), false, "nor a different port");
+  assert.equal(m("evil.example.com"), false);
+  assert.equal(m("ocp.example.com.evil.com"), false, "a suffix match is not a match");
+  assert.equal(m("sub.ocp.example.com"), false, "and declaring a host does not declare its subdomains");
+  assert.equal(matchesDeclared(parseAuthority("ocp.example.com"), []), false, "an empty list matches nothing");
+});
+
+test("ADR 0020: OCP_ALLOWED_HOSTS splits on COMMA ONLY — a typo may not widen the allowlist", () => {
+  // If this split whitespace too, `my host.tld` would silently DECLARE `my`. An operator's slip
+  // widening the allowlist is the precise opposite of what this setting exists to do.
+  const r = parseAllowedHosts("a.example.com, my host.tld ,, b.example.com");
+  assert.deepEqual(r.hosts.map((h) => h.hostname), ["a.example.com", "b.example.com"]);
+  assert.deepEqual(r.invalid, ["my host.tld"], "the whole field is one invalid entry, not two declarations");
+  assert.deepEqual(parseAllowedHosts("").hosts, [], "unset declares nothing");
+  assert.deepEqual(parseAllowedHosts(undefined).hosts, [], "and neither does an absent variable");
+});
+
+test("ADR 0020: the gate's verdict and its REASON across the whole matrix", () => {
+  const { hosts } = parseAllowedHosts("ocp.example.com");
+  const priv = (o) => /^https?:\/\/(127\.0\.0\.1|localhost|192\.168\.\d+\.\d+|10\.\d+\.\d+\.\d+)(:\d+)?$/.test(o);
+  const g = (origin, hostHeader, method = "DELETE") =>
+    evaluateOriginGate({ origin, hostHeader, method, declaredHosts: hosts, isPrivateOrigin: priv(origin) });
+  // THE REASON IS ASSERTED, NOT JUST THE VERDICT. "admitted because same-origin" and "admitted
+  // because the operator declared it" are identical on the wire and must not be identical in
+  // evidence — otherwise a mutation that collapses the two arms is invisible here.
+  const rows = [
+    ["", "anything", "POST", true, "no-origin"],
+    ["https://evil.example", "127.0.0.1:1", "GET", true, "method-exempt"],
+    ["https://evil.example", "127.0.0.1:1", "HEAD", true, "method-exempt"],
+    ["https://evil.example", "127.0.0.1:1", "OPTIONS", false, "foreign-origin"],
+    ["http://127.0.0.1:1", "127.0.0.1:1", "POST", true, "private-origin"],
+    ["https://ocp.example.com", "127.0.0.1:8787", "POST", true, "declared-origin"],
+    ["https://ocp.example.com", "ocp.example.com", "POST", true, "declared-origin"],
+    ["http://ocp-host.local:1", "ocp-host.local:1", "DELETE", true, "same-origin"],
+    ["http://[::1]:1", "[::1]:1", "DELETE", true, "same-origin"],
+    ["http://r.attacker.example:1", "r.attacker.example:1", "DELETE", false, "undeclared-host"],
+    ["https://evil.example", "127.0.0.1:1", "DELETE", false, "foreign-origin"],
+    ["null", "127.0.0.1:1", "DELETE", false, "foreign-origin"],
+    ["http://ocp-host.local:1", "ocp-host.local:2", "DELETE", false, "foreign-origin"],
+    ["not a url", "not a url", "DELETE", false, "foreign-origin"],
+  ];
+  for (const [origin, host, method, allow, reason] of rows) {
+    const v = g(origin, host, method);
+    assert.deepEqual({ allow: v.allow, reason: v.reason }, { allow, reason },
+      `${method} Origin=${JSON.stringify(origin)} Host=${JSON.stringify(host)}`);
+  }
+  // A malformed Host cannot vouch for anything, even for an Origin that stringifies the same way.
+  assert.equal(g("http://a b", "a b").allow, false, "an unparseable pair must fail closed");
 });
 
 // ── The Node prerequisite: one table, and everything else derived from it ─────────────────

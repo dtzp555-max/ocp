@@ -134,22 +134,20 @@ This touches the shared request pipeline, so it is **Hybrid** and each class is 
   - It does not defend against a **non-browser local process**, which can send requests with no
     `Origin` at all. Anything running as the operator can already reach the spawned `claude`
     directly; different threat model, out of scope.
-  - **It does not stop DNS REBINDING, and this is the one boundary that is NOT pre-existing** —
-    it is the shape the same-origin arm admits. An attacker who serves their page on this port and
-    flips the A record to `127.0.0.1` produces a request the browser considers **genuinely
-    same-origin**: `Host` and `Origin` both carry the attacker's domain and are equal by
-    construction. Measured on a live instance: `Host: r.attacker.net:PORT` +
-    `Origin: http://r.attacker.net:PORT` returns **200**; the same pair on *different* ports (a real
-    cross-origin request) returns **403**. **No `Origin` check can close this** — rebinding's whole
-    point is that the request is same-origin, so the property the gate keys on is genuinely true.
-    Closing it requires validating `Host` against hostnames **the operator has declared**, which is
-    configuration this project does not have; reusing the existing allowlist for `Host` would refuse
-    exactly the hostname dashboards the same-origin arm was added to keep working, so the two cannot
-    be reconciled without that declaration. Tracked as follow-up rather than folded in: this change
-    is a **strict reduction** (before it, every cross-origin request executed; after it, only this
-    shape does), and holding a strict reduction while designing a config surface is the worse trade.
-    Found by external review; its rebuttal of the first draft's comment is exact — *under rebinding
-    the attacker page genuinely IS that origin*.
+  - ~~**It does not stop DNS REBINDING**~~ — **SUPERSEDED BY [ADR 0020](0020-declared-hosts.md)
+    (#446), which closed it.** Kept struck through rather than deleted because this is the entry a
+    reader arrives at from the code comments and the issue thread, and a boundary that silently
+    disappears reads like one that was never there. What it said: an attacker who serves their page
+    on this port and flips the A record to `127.0.0.1` produces a request the browser considers
+    **genuinely same-origin**, so **no `Origin` check can close it**. That remains true, and is why
+    ADR 0020 checks the **other** header instead: a `Host` that could have been rebound must be
+    declared in `OCP_ALLOWED_HOSTS`. The prediction made here — *"reusing the existing allowlist for
+    `Host` would refuse exactly the hostname dashboards the same-origin arm was added to keep
+    working"* — was **correct, and is the reason ADR 0020 does not reuse it**; it partitions names by
+    whether public DNS could point them at loopback instead. The test that pinned this limit
+    (`ADR 0019 BOUNDARY:`) asserted **200** and said in as many words that reddening would mean Host
+    validation had been added; it now asserts **403** under an ADR 0020 name. That inversion is the
+    argument for writing limits as executable assertions rather than as paragraphs.
   - It does not defend against a page served from an origin the allowlist **admits** — any other
     loopback port, or any host on the operator's LAN. `http://192.168.1.99:8080`, a compromised IoT
     device, or a router admin page with an XSS is both admitted here **and** echoed into

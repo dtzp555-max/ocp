@@ -2,6 +2,18 @@
 
 ## Unreleased
 
+### Security
+
+- **`OCP_ALLOWED_HOSTS` — an undeclared public DNS name may no longer vouch for itself (#446, [ADR 0020](docs/adr/0020-declared-hosts.md)).** ADR 0019's same-origin arm admitted any request whose `Origin` host equalled its `Host`. **DNS rebinding produces exactly that equality** — the attacker serves their page on this port, flips the A record to `127.0.0.1`, and the browser sends their domain in both headers, equal by construction. Measured against a live default-configuration instance: `Host: r.attacker.example:PORT` + the matching `Origin` returned **200**. No `Origin` check can refuse that, because the request genuinely *is* same-origin.
+
+  **So the check moved to the other header, and the discriminator is not "is this local".** It is: *could an attacker who controls public DNS point this name at `127.0.0.1`?* An **IP literal** means the browser connected with no DNS lookup at all, so there is no record to flip; `localhost`, `*.localhost` (RFC 6761 §6.3) and `*.local` (RFC 6762 §3) are reserved names with no public record. Both families stay config-free — `[::1]`, Tailscale CGNAT, LAN and public IPs, and mDNS dashboards are untouched. **Every other name must be declared in `OCP_ALLOWED_HOSTS`**, because from inside a request the operator's domain and the attacker's are indistinguishable. That is the attack, not a gap in the implementation.
+
+  **The same setting closes the opposite failure**, which is why it is one setting and not two. A reverse proxy that does not preserve `Host` (nginx's minimal `proxy_pass`; Caddy preserves) makes a legitimate dashboard *never* same-origin, so every mutation 403s — silently, since `dashboard.html`'s `apiPost`/`apiDelete` never read the status. A declared origin is admitted outright, **and echoed into `Access-Control-Allow-Origin`** — without that the gate would allow the request and the browser would discard the response, the same invisible failure moved one layer out.
+
+  **Breaking for exactly one shape**: a dashboard at a real public DNS name resolving straight to the box, with no proxy. One line of config, and the 403 body names the setting. That this is the same shape rebinding imitates is the finding, not a coincidence. Both findings came from external review (`prime` / `stealth/ox-alpha`; **that backend's vendor is undisclosed**, so this is "not the author's harness" rather than a cross-vendor review).
+
+  The `ADR 0019 BOUNDARY:` test that pinned this weakness asserted **200** and stated that reddening would mean Host validation had been added. It now asserts **403** — the argument for writing limits as executable assertions rather than as paragraphs nobody re-reads.
+
 ### Fixed
 
 - **A `--only` filter that matches nothing no longer prints a results line (#434).** The exit code was already 1 — that was never the defect. The defect was the line printed immediately above it: `=== Results: 0 passed, 0 failed ===`. `AGENTS.md`'s own rule is that **a verdict comes from the suite's own `=== Results:` line, never from an exit code**, so a driver following the documented rule read a typo'd filter as a clean run — and a mutation campaign whose filter silently stopped matching would have reported a table of greens.

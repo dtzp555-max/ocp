@@ -46,6 +46,7 @@ import { validateKey, recordUsage, getUsageByKey, getUsageTimeline, getRecentUsa
 import { DEFAULT_PORT } from "./lib/constants.mjs";
 import { StructuredOutputError, detectStructuredOutput, validateJsonSchemaSafe, extractJsonPayload, structuredSystemInstruction, resolveMaxAttempts } from "./lib/structured-output.mjs";
 import { isLoopbackBind } from "./lib/net.mjs";
+import { parseAllowedHosts, parseAuthority, matchesDeclared, evaluateOriginGate } from "./lib/host-gate.mjs";
 import { classifyToolRequest } from "./lib/tool-support.mjs";
 import { runTuiTurn, reapStaleTuiSessions, resolveTuiHome, bootTuiPane, tuiPaneHealthy, poolPaneName, killLiveTurnPanes, POOL_BOOT_MS } from "./lib/tui/session.mjs";
 import { detectTuiUpstreamError } from "./lib/tui/transcript.mjs";
@@ -385,6 +386,11 @@ const BREAKER_WINDOW = parseInt(process.env.CLAUDE_BREAKER_WINDOW || "300000", 1
 const BREAKER_HALF_OPEN_MAX = parseInt(process.env.CLAUDE_BREAKER_HALF_OPEN_MAX || "2", 10);
 const HEARTBEAT_INTERVAL = parseInt(process.env.CLAUDE_HEARTBEAT_INTERVAL || "0", 10);
 const BIND_ADDRESS = process.env.CLAUDE_BIND || "127.0.0.1";
+// ADR 0020 (#446). Public DNS names that may vouch for a same-origin request, and that are
+// admitted as an Origin outright. Empty by default: IP literals and RFC 6761/6762 reserved names
+// need no declaration, so the ONLY deployment that has to set this is one reached by a real public
+// DNS name — which is also the only deployment DNS rebinding can imitate. See lib/host-gate.mjs.
+const ALLOWED_HOSTS = parseAllowedHosts(process.env.OCP_ALLOWED_HOSTS);
 const NO_CONTEXT = process.env.CLAUDE_NO_CONTEXT === "true";
 // Config epoch for the response cache (issue #176). The cache key hashes model + messages +
 // sampling params, but the ANSWER also depends on boot-time server config that shapes the
@@ -3876,7 +3882,13 @@ const requestContext = new AsyncLocalStorage();
 async function handleRequest(req, res) {
   // Dynamic CORS: allow localhost and LAN origins
   const origin = req.headers["origin"] || "";
-  const isAllowedOrigin = /^https?:\/\/(127\.0\.0\.1|localhost|192\.168\.\d+\.\d+|172\.(1[6-9]|2\d|3[01])\.\d+\.\d+|10\.\d+\.\d+\.\d+)(:\d+)?$/.test(origin);
+  const isPrivateOrigin = /^https?:\/\/(127\.0\.0\.1|localhost|192\.168\.\d+\.\d+|172\.(1[6-9]|2\d|3[01])\.\d+\.\d+|10\.\d+\.\d+\.\d+)(:\d+)?$/.test(origin);
+  // ADR 0020: a DECLARED origin gets its own value echoed back. Without this the gate would admit
+  // the reverse-proxy dashboard's request and the BROWSER would then discard the response — the
+  // same invisible failure, moved one layer out.
+  let originAuthority = null;
+  if (origin) { try { originAuthority = parseAuthority(new URL(origin).host); } catch { /* opaque */ } }
+  const isAllowedOrigin = isPrivateOrigin || matchesDeclared(originAuthority, ALLOWED_HOSTS.hosts);
   res.setHeader("Access-Control-Allow-Origin", isAllowedOrigin ? origin : `http://127.0.0.1:${PORT}`);
   res.setHeader("Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS, PATCH");
   res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization, X-Session-Id, X-Conversation-Id");
@@ -3940,25 +3952,35 @@ async function handleRequest(req, res) {
   // could forge both — and could equally send no `Origin` at all, so nothing is lost.)
   // `Origin: null` still fails here, because `new URL("null")` throws.
   //
-  // WHAT IT DOES NOT STOP, and an earlier version of this comment claimed it did: DNS REBINDING.
-  // An attacker who serves their page on this port and flips the A record to 127.0.0.1 produces a
-  // request the browser considers GENUINELY SAME-ORIGIN — `Host` and `Origin` are the attacker's
-  // domain and are equal by construction, so this arm admits it. Measured: `Host:` and
-  // `Origin: http://r.attacker.net:PORT` on the same port returns 200; the same pair on DIFFERENT
-  // ports (a real cross-origin request) returns 403. NO ORIGIN CHECK CAN CLOSE THIS — rebinding's
-  // whole point is that the request is same-origin. Closing it needs `Host` validated against
-  // hostnames the OPERATOR HAS DECLARED, which is config this project does not have yet; see
-  // ADR 0019 § "What this does not do". Found by external review (prime), whose rebuttal is exact:
-  // under rebinding the attacker page genuinely IS that origin.
-  let isSameOrigin = false;
-  if (origin) {
-    try { isSameOrigin = new URL(origin).host === String(req.headers.host || ""); } catch { /* opaque or malformed */ }
-  }
-  if (origin && !isAllowedOrigin && !isSameOrigin && req.method !== "GET" && req.method !== "HEAD") {
-    logEvent("warn", "origin_rejected", { origin, method: req.method, path: req.url.split("?")[0] });
+  // DNS REBINDING — what ADR 0019 could not stop, and what ADR 0020 (#446) closes. An attacker who
+  // serves their page on this port and flips the A record to 127.0.0.1 produces a request the
+  // browser considers GENUINELY SAME-ORIGIN: `Host` and `Origin` are the attacker's domain and are
+  // equal by construction. NO ORIGIN CHECK CAN CLOSE THAT, so the check moved to the OTHER header:
+  // a `Host` that is an IP literal or an RFC 6761/6762 reserved name cannot have been rebound at
+  // all, and any other name must appear in `OCP_ALLOWED_HOSTS`. lib/host-gate.mjs carries the
+  // reasoning; the three-way behavioural split is pinned in test-features.mjs.
+  //
+  // THE SAME CONFIG CLOSES THE OPPOSITE FAILURE, which is why it is one setting and not two. A
+  // reverse proxy that does NOT preserve `Host` (nginx's default `proxy_pass` sends the upstream's
+  // address; Caddy preserves) makes `Origin` and `Host` differ for a legitimate dashboard, so the
+  // same-origin arm can never fire and every mutation 403s — silently, per apiPost/apiDelete above.
+  // Declaring the public name admits it as an Origin outright, before the same-origin arm is even
+  // reached. Found by external review (prime) as the mirror of the rebinding finding: `Host` was
+  // being pulled in opposite directions by the two, and only an operator can say which is theirs.
+  const gate = evaluateOriginGate({
+    origin,
+    hostHeader: req.headers.host,
+    method: req.method,
+    declaredHosts: ALLOWED_HOSTS.hosts,
+    isPrivateOrigin,
+  });
+  if (!gate.allow) {
+    logEvent("warn", "origin_rejected", { origin, host: String(req.headers.host || ""), reason: gate.reason, method: req.method, path: req.url.split("?")[0] });
     return jsonResponse(res, 403, {
       error: {
-        message: "Forbidden: cross-origin request rejected. This proxy only accepts browser requests from loopback and private-range origins (ADR 0019).",
+        message: gate.reason === "undeclared-host"
+          ? "Forbidden: this request is same-origin, but its Host is a public DNS name that has not been declared — which is indistinguishable from DNS rebinding. Set OCP_ALLOWED_HOSTS to the hostname you serve this proxy on (ADR 0020)."
+          : "Forbidden: cross-origin request rejected. This proxy only accepts browser requests from loopback and private-range origins, from its own origin, or from a host declared in OCP_ALLOWED_HOSTS (ADR 0019, ADR 0020).",
         type: "forbidden_origin",
       },
     });
@@ -4575,6 +4597,13 @@ server.listen(PORT, BIND_ADDRESS, () => {
   _listening = true;
   const bindMsg = BIND_ADDRESS === "0.0.0.0" ? `http://0.0.0.0:${PORT} (LAN mode)` : `http://127.0.0.1:${PORT}`;
   console.log(`openclaw-claude-proxy v${VERSION} listening on ${bindMsg}`);
+  // ADR 0020: a token that did not parse is a name the operator BELIEVES they declared. Say so at
+  // boot rather than at the 403, because the 403 arrives on someone else's screen. Not fatal — a
+  // refusing boot would take the proxy down to fix a misspelling.
+  if (ALLOWED_HOSTS.invalid.length) {
+    console.warn(`WARNING: OCP_ALLOWED_HOSTS — ignored ${ALLOWED_HOSTS.invalid.length} unparseable entr${ALLOWED_HOSTS.invalid.length === 1 ? "y" : "ies"}: ${ALLOWED_HOSTS.invalid.join(", ")}`);
+    console.warn(`         Expected a comma-separated list of host[:port], e.g. "ocp.example.com,dash.example.com:8443".`);
+  }
   console.log(`Architecture: on-demand spawning (no pool)`);
   console.log(`Models: ${MODELS.map((m) => m.id).join(", ")}`);
   console.log(`Claude binary: ${CLAUDE}`);

@@ -228,6 +228,7 @@ The canonical list lives in [`models.json`](./models.json) — the single source
 | `CLAUDE_PROXY_PORT` | `3456` | Listen port (server-side). Also consumed by the OpenClaw `ocp-plugin` to dial the local proxy. |
 | `OCP_PROXY_URL` | *(unset)* | Plugin-side full URL override (e.g. `http://10.0.0.5:3456`). Wins over `CLAUDE_PROXY_PORT` when both are set. Read by `ocp-plugin/index.js` only — server ignores it. |
 | `CLAUDE_BIND` | `127.0.0.1` | Bind address (`0.0.0.0` for LAN access) |
+| `OCP_ALLOWED_HOSTS` | *(empty)* | Comma-separated `host[:port]` this proxy is served on. Only needed when a browser reaches it at a **public DNS name** — IP literals, `localhost` and `*.local` need no declaration because neither can be pointed at loopback by public DNS. Also required behind a reverse proxy that rewrites `Host` (nginx's default `proxy_pass`; Caddy preserves it). See [ADR 0020](docs/adr/0020-declared-hosts.md). |
 | `CLAUDE_AUTH_MODE` | `none` | Auth mode: `none`, `shared`, or `multi` |
 | `OCP_ADMIN_KEY` | *(unset)* | Admin key for key management (multi mode) |
 | `CLAUDE_BIN` | *(auto-detect)* | Path to claude binary |
@@ -620,8 +621,17 @@ The simplest path: ask your AI — paste `Run `ocp doctor` and follow its `next_
 - **Usage shows "unknown" / 401** — usually an expired Claude CLI session: `claude auth login && ocp restart`. For the *permanent* TUI-mode `Please run /login · API Error: 401` that re-login can't fix, see [docs/troubleshooting.md § permanent TUI-mode 401](docs/troubleshooting.md#tui-401).
 - **`ocp update` refuses to restart** (`could not determine what ... owns the OCP port`, `not managed by any systemd unit`, `nothing is currently listening`, a sudo message, or a rollback-scope message) — deliberate: the restart phase resolves which unit actually owns the port and refuses rather than guesses when it can't tell, or when guessing would be unsafe. See [docs/troubleshooting.md § restart refusal](docs/troubleshooting.md#restart-target-refusal) for what each message means and how to proceed.
 
+- **The dashboard's "add key" / "revoke key" silently does nothing, or returns 403 `forbidden_origin`** — you are reaching OCP at a **public DNS name** (`ocp.example.com`), or through a reverse proxy that rewrites `Host`. Declare the name you serve it on:
+
+  ```
+  OCP_ALLOWED_HOSTS=ocp.example.com
+  ```
+
+  Loopback, LAN addresses, `[::1]`, Tailscale addresses, `localhost` and `*.local` names need **no** declaration — none of them can be pointed at your loopback by public DNS, which is the thing this setting exists to stop ([ADR 0020](docs/adr/0020-declared-hosts.md)). Behind nginx you likely also want `proxy_set_header Host $host;`; Caddy preserves `Host` already.
+
 **Bootstrap quirks (one-time migrations):**
 
+- **Dashboard mutations started returning 403 after upgrading to v3.31.0** — v3.31.0 stopped letting an **undeclared public DNS name** vouch for itself, because that shape is indistinguishable from DNS rebinding ([ADR 0020](docs/adr/0020-declared-hosts.md), #446). If your dashboard lives at a real domain, set `OCP_ALLOWED_HOSTS` to it once and restart. Nothing reached by IP, `localhost`, `*.local` or Tailscale is affected.
 - **A TUI session vanished right after upgrading OCP** — if a pre-3.21.1 and a post-3.21.1 instance ran on the same host at the same time during an upgrade, the new instance's one-time boot reap can, once, kill an old-format (`ocp-tui-<8hex>`) live TUI session belonging to the still-running old instance. Restart the affected session (`ocp restart` or re-run your TUI turn) and it returns under the new instance's port-scoped naming.
 - **OpenClaw shows old models after `ocp update` (v3.10→v3.11 only)** — the running shell had the old `cmd_update` cached, so the sync hook doesn't fire on that single jump. Run once: `node ~/ocp/scripts/sync-openclaw.mjs && openclaw gateway restart`. Every future update syncs automatically.
 - **Response-cache hit rate drops once after upgrading to v3.25.0** — only if you run with the cache on (`CLAUDE_CACHE_TTL > 0`; it is off by default). v3.25.0 keys the cache on the resolved model instead of the string the client sent, so alias-addressed rows (and *all* structured-output rows) orphan and are reaped by the TTL cleanup within one window. **No action required.** Details: [docs/troubleshooting.md#cache-rekey-v3250](docs/troubleshooting.md#cache-rekey-v3250).
