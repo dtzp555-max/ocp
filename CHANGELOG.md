@@ -2,6 +2,18 @@
 
 ## Unreleased
 
+## v3.31.0 — 2026-08-27
+
+> **Governance audit for this section**, per `CLAUDE.md`'s `release_kit.governance_audits`:
+> **no B.2 key-set change this cycle** — `git diff v3.30.0..HEAD -- docs/governance/b2-response-keys.json`
+> is empty in both profiles, verified with a positive control on a range known to have changed (31 lines)
+> because an empty diff and a command that never ran are the same output. Recorded rather than omitted:
+> a reader cannot otherwise tell a cycle that was audited and added nothing from a cycle nobody audited.
+> **No ADR 0012 additions this cycle; the cumulative count stays at 2** (`instanceName`, `auth.consecutiveInconclusive`,
+> both on `/health`, both v3.29.0). ADR 0020 changes B.2 **semantics** without adding a field, which is why it is
+> ADR 0006 route (b) and why the key-set snapshot is silent on it — the two audits answer different questions and
+> this release is the case that shows it.
+
 ### Security
 
 - **`OCP_ALLOWED_HOSTS` — an undeclared public DNS name may no longer vouch for itself (#446, [ADR 0020](docs/adr/0020-declared-hosts.md)).** ADR 0019's same-origin arm admitted any request whose `Origin` host equalled its `Host`. **DNS rebinding produces exactly that equality** — the attacker serves their page on this port, flips the A record to `127.0.0.1`, and the browser sends their domain in both headers, equal by construction. Measured against a live default-configuration instance: `Host: r.attacker.example:PORT` + the matching `Origin` returned **200**. No `Origin` check can refuse that, because the request genuinely *is* same-origin.
