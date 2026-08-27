@@ -12,6 +12,8 @@
 
   **Breaking for exactly one shape**: a dashboard at a real public DNS name resolving straight to the box, with no proxy. One line of config, and the 403 body names the setting. That this is the same shape rebinding imitates is the finding, not a coincidence. Both findings came from external review (`prime` / `stealth/ox-alpha`; **that backend's vendor is undisclosed**, so this is "not the author's harness" rather than a cross-vendor review).
 
+  One usability trap is flagged rather than silently accepted: **`Origin` never carries a default port**, so a declaration of `ocp.example.com:443` can never match `https://ocp.example.com` — measured against a real `URL`, not reasoned about. The entry is kept exactly as written (normalising it away would widen it to *any* port) and named at boot with what to write instead.
+
   The `ADR 0019 BOUNDARY:` test that pinned this weakness asserted **200** and stated that reddening would mean Host validation had been added. It now asserts **403** — the argument for writing limits as executable assertions rather than as paragraphs nobody re-reads.
 
 ### Fixed

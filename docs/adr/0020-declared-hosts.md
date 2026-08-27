@@ -48,7 +48,8 @@ Concretely:
 3. **`Access-Control-Allow-Origin` echoes a declared origin.** Without this the gate would admit the request and the *browser* would discard the response — the same invisible failure moved one layer out, where it is harder to diagnose rather than fixed.
 4. An entry **without** a port matches any port; **with** a port, only that port.
 5. The list splits on **comma only, never whitespace** — otherwise the typo `my host.tld` would silently declare `my`, an operator's slip *widening* the allowlist.
-6. Unparseable entries are **reported at boot** and dropped. Not fatal: refusing to boot would take the proxy down to fix a misspelling. But not silent either — a dropped entry is a name the operator believes they declared, and the alternative first evidence is a 403 on somebody else's screen.
+6. **A declared entry naming a default port (`:443`, `:80`) is kept but flagged at boot.** Measured: `Origin` never carries a default port and `new URL(origin).host` drops it, so `https://ocp.example.com` yields the bare host and a declaration of `ocp.example.com:443` **can never match** — the operator gets a 403 telling them to declare a host they *did* declare. The entry is kept exactly as written rather than normalised, because silently dropping the port would widen it to *any* port, which they did not ask for. The boot line says what to write instead. Found by checking the parse against a real `URL`, not by reading the code.
+7. Unparseable entries are **reported at boot** and dropped. Not fatal: refusing to boot would take the proxy down to fix a misspelling. But not silent either — a dropped entry is a name the operator believes they declared, and the alternative first evidence is a 403 on somebody else's screen.
 
 ## Class mapping
 

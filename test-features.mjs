@@ -28214,7 +28214,7 @@ ltTest("ADR 0020: an unparseable OCP_ALLOWED_HOSTS entry is REPORTED at boot, no
   // proxy down to fix a misspelling — so the boot line is the whole of the signal.
   const dir = ltMkdir(); const fake = ltFake(dir);
   const { child, buf, port } = await ltBootFresh(
-    { CLAUDE_BIN: fake, OCP_ALLOWED_HOSTS: "good.example.com, bad host!, evil.com/path" }, dir);
+    { CLAUDE_BIN: fake, OCP_ALLOWED_HOSTS: "good.example.com, bad host!, evil.com/path, tls.example.com:443" }, dir);
   try {
     assert.ok(await ltWait(() => buf.out.includes("listening on") || buf.exit != null), `server did not start: ${buf.err.slice(0, 200)}`);
     const all = buf.out + buf.err;
@@ -28222,6 +28222,15 @@ ltTest("ADR 0020: an unparseable OCP_ALLOWED_HOSTS entry is REPORTED at boot, no
       `both bad entries must be counted in the boot warning; got: ${all.slice(-600)}`);
     assert.match(all, /bad host!/, "and the warning must name them, or the operator cannot find the typo");
     assert.match(all, /evil\.com\/path/, "including the one that looks like a URL rather than a host");
+    // A SECOND, QUIETER MISTAKE: an entry that parses fine and can still never match, because
+    // Origin never carries a default port. It must be flagged separately from the unparseable
+    // ones — folding it into "ignored N entries" would be a lie, since it is NOT ignored.
+    assert.match(all, /tls\.example\.com:443 names a DEFAULT port/,
+      `a default-port entry must be flagged on its own; got: ${all.slice(-800)}`);
+    assert.match(all, /Declare the bare host instead, e\.g\. "tls\.example\.com"/,
+      "and the warning must show what to write instead, or it only tells the operator they are wrong");
+    assert.ok(!/ignored 3 unparseable/.test(all),
+      `control: the default-port entry must NOT be counted as unparseable — it parsed, and it is kept`);
     // THE BEHAVIOURAL HALF, without which this is a test of a log line: the GOOD entry in the same
     // string is still declared, and the bad ones did not become declarations of their own.
     const good = await lt19Send(port, { method: "DELETE", path: "/cache", host: `127.0.0.1:${port}`, origin: "https://good.example.com" });
@@ -28298,6 +28307,23 @@ test("ADR 0020: OCP_ALLOWED_HOSTS splits on COMMA ONLY — a typo may not widen 
   assert.deepEqual(r.invalid, ["my host.tld"], "the whole field is one invalid entry, not two declarations");
   assert.deepEqual(parseAllowedHosts("").hosts, [], "unset declares nothing");
   assert.deepEqual(parseAllowedHosts(undefined).hosts, [], "and neither does an absent variable");
+});
+
+test("ADR 0020: a declared entry naming a DEFAULT port is kept but flagged — it can never match", () => {
+  // MEASURED: `Origin` never carries a default port and `new URL(origin).host` drops it, so
+  // `https://ocp.example.com` yields the BARE host. An operator who writes the port they think of
+  // therefore gets a 403 telling them to declare a host they DID declare.
+  const declared = parseAllowedHosts("ocp.example.com:443").hosts;
+  assert.equal(matchesDeclared(parseAuthority(new URL("https://ocp.example.com").host), declared), false,
+    "this is the trap itself — if this ever becomes true, the flag below is obsolete and should go");
+  const r = parseAllowedHosts("a.example.com:443, b.example.com:80, c.example.com:8443, d.example.com");
+  assert.deepEqual(r.defaultPort, ["a.example.com:443", "b.example.com:80"],
+    "both default ports must be flagged, and neither a non-default port nor a bare host may be");
+  assert.deepEqual(r.invalid, [], "flagging is not rejection");
+  assert.deepEqual(r.hosts.map((h) => `${h.hostname}:${h.port}`),
+    ["a.example.com:443", "b.example.com:80", "c.example.com:8443", "d.example.com:"],
+    "and the entry is kept EXACTLY as written — dropping the port would widen it to any port, " +
+    "which the operator did not ask for");
 });
 
 test("ADR 0020: the gate's verdict and its REASON across the whole matrix", () => {

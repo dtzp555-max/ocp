@@ -627,6 +627,8 @@ The simplest path: ask your AI — paste `Run `ocp doctor` and follow its `next_
   OCP_ALLOWED_HOSTS=ocp.example.com
   ```
 
+  Write the **bare host** for standard ports — `Origin` never carries `:443` or `:80`, so `ocp.example.com:443` can never match (OCP says so at boot). Use `host:port` only for a non-standard port.
+
   Loopback, LAN addresses, `[::1]`, Tailscale addresses, `localhost` and `*.local` names need **no** declaration — none of them can be pointed at your loopback by public DNS, which is the thing this setting exists to stop ([ADR 0020](docs/adr/0020-declared-hosts.md)). Behind nginx you likely also want `proxy_set_header Host $host;`; Caddy preserves `Host` already.
 
 **Bootstrap quirks (one-time migrations):**

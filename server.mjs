@@ -4604,6 +4604,10 @@ server.listen(PORT, BIND_ADDRESS, () => {
     console.warn(`WARNING: OCP_ALLOWED_HOSTS — ignored ${ALLOWED_HOSTS.invalid.length} unparseable entr${ALLOWED_HOSTS.invalid.length === 1 ? "y" : "ies"}: ${ALLOWED_HOSTS.invalid.join(", ")}`);
     console.warn(`         Expected a comma-separated list of host[:port], e.g. "ocp.example.com,dash.example.com:8443".`);
   }
+  if (ALLOWED_HOSTS.defaultPort.length) {
+    console.warn(`WARNING: OCP_ALLOWED_HOSTS — ${ALLOWED_HOSTS.defaultPort.join(", ")} names a DEFAULT port, which no browser sends in Origin.`);
+    console.warn(`         Such an entry can never match. Declare the bare host instead, e.g. "${ALLOWED_HOSTS.defaultPort[0].split(":")[0]}".`);
+  }
   console.log(`Architecture: on-demand spawning (no pool)`);
   console.log(`Models: ${MODELS.map((m) => m.id).join(", ")}`);
   console.log(`Claude binary: ${CLAUDE}`);
