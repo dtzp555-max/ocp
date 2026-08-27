@@ -1376,21 +1376,36 @@ function buildCliArgs(cliModel, systemPrompt, opts = {}) {
   // For AUTH_MODE !== "multi" (none/shared — single-operator/trusted), preserve
   // existing behaviour unchanged.
   if (AUTH_MODE === "multi") {
-    // Disallow the full operator-FS + web + agent surface. "--disallowedTools" may
-    // be repeated; claude accepts multiple occurrences (TUI path already uses it).
-    args.push(
-      "--disallowedTools", "Bash",
-      "--disallowedTools", "Read",
-      "--disallowedTools", "Write",
-      "--disallowedTools", "Edit",
-      "--disallowedTools", "Glob",
-      "--disallowedTools", "Grep",
-      "--disallowedTools", "WebFetch",
-      "--disallowedTools", "WebSearch",
-      "--disallowedTools", "Agent",
-      "--disallowedTools", "mcp__*",
-    );
-    // Do NOT push --allowedTools in multi mode.
+    // EMPTY THE SCHEMA; DO NOT ENUMERATE WHAT TO REMOVE.
+    //
+    // `--tools` is the tool-AVAILABILITY registry -- `claude --help`: "Specify the list of
+    // available tools from the built-in set. Use \"\" to disable all tools". `--disallowedTools`
+    // is a DENY LIST: it can only ever deny the tools whoever wrote it knew about, so it goes
+    // stale on every CLI release that adds one, silently and with no error.
+    //
+    // This branch used to be a hardcoded ten-entry deny-list (Bash/Read/Write/Edit/Glob/Grep/
+    // WebFetch/WebSearch/Agent/mcp__*), which is the shape ADR 0007 already ruled out. Grep it
+    // for "The B-path (multi-tenant isolation) requires:" -- item 1 of the 3 is `--tools ""`
+    // (:138 at the time of writing; the string is the citation, the number is decorative, per
+    // AGENTS.md on cross-file line references). The comment on this branch cited that B-path
+    // while the code did something else.
+    //
+    // MEASURED 2026-08-27 on claude 2.1.247, by asking a child spawned under each flag set to
+    // name its own tools: the ten-entry deny-list left 20 tools available (Monitor, Workflow,
+    // NotebookEdit, CronCreate, SendMessage, EnterWorktree, Skill, LSP, ToolSearch and more);
+    // `--tools "" --strict-mcp-config` left NONE. That 20 is a DATED READING, not a constant --
+    // it is whatever the CLI ships minus ten names, so it moves with every release. Do not
+    // refresh the number; the reason the fix is structural is that the number is unknowable.
+    //
+    // `--strict-mcp-config` is not redundant with the retained `--disallowedTools mcp__*`:
+    // --tools governs built-ins only, so account-level MCP servers survive it, and the two
+    // close that from opposite sides (ignore foreign servers / deny their tools).
+    //
+    // Reported by an external fork (princelundgren/ocp, FLEET-32) that hit it on its own fleet
+    // and never opened a PR; reproduced here before adopting rather than taken on its word.
+    args.push("--tools", "", "--strict-mcp-config", "--disallowedTools", "mcp__*");
+    // Do NOT push --allowedTools in multi mode: it is a PRE-APPROVAL list ("tool names to
+    // allow", per --help), not a restriction, so it could only ever widen this.
   } else if (SKIP_PERMISSIONS) {
     args.push("--dangerously-skip-permissions");
   } else if (ALLOWED_TOOLS.length > 0) {
@@ -4615,7 +4630,14 @@ server.listen(PORT, BIND_ADDRESS, () => {
   console.log(`Claude binary: ${CLAUDE}`);
   console.log(`Timeout: ${TIMEOUT / 1000}s | Max concurrent: ${MAX_CONCURRENT} | Queue: ${CLAUDE_MAX_QUEUE} (429 on overflow)`);
   console.log(`Circuit breaker: disabled`);
-  console.log(`Tools: ${SKIP_PERMISSIONS ? "all (skip-permissions)" : ALLOWED_TOOLS.join(", ")}`);
+  // Multi-tenant is its own arm because ALLOWED_TOOLS is NOT what that mode passes: the branch in
+  // buildCliArgs pushes `--tools ""` and never `--allowedTools`, so printing the ALLOWED_TOOLS
+  // list here told an operator running a multi-tenant instance that guests had Bash/Read/Write.
+  // Console banner only. `/status`'s config.allowedTools is deliberately NOT touched: that is a
+  // grandfathered Class B.2 response field, and changing the rule that determines its value is a
+  // contract change needing its own ADR (CLAUDE.md § Class B.2), not a truthfulness fix.
+  console.log(`Tools: ${AUTH_MODE === "multi" ? 'none (multi-tenant: --tools "" empties the built-in schema)'
+                      : SKIP_PERMISSIONS ? "all (skip-permissions)" : ALLOWED_TOOLS.join(", ")}`);
   if (SYSTEM_PROMPT) console.log(`System prompt: "${SYSTEM_PROMPT.slice(0, 80)}..."`);
   if (MCP_CONFIG) console.log(`MCP config: ${MCP_CONFIG}`);
   console.log(`Auth: ${PROXY_API_KEY ? "enabled (PROXY_API_KEY set)" : "disabled (no PROXY_API_KEY)"}`);

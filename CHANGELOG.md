@@ -2,6 +2,18 @@
 
 ## Unreleased
 
+### Security
+
+- **`AUTH_MODE=multi` now EMPTIES the tool schema instead of enumerating what to deny (#450).** The multi-tenant branch of `buildCliArgs` passed a hardcoded ten-entry `--disallowedTools` list (`Bash`/`Read`/`Write`/`Edit`/`Glob`/`Grep`/`WebFetch`/`WebSearch`/`Agent`/`mcp__*`). A deny list can only deny what its author knew about, so it went stale on every `claude` release that added a tool — silently, and with no test reading the argv at all. **`docs/adr/0007-tui-interactive-mode.md`:138 already listed `--tools ""` as requirement 1 of 3 for this B-path**, and the comment on that branch cited the B-path while the code did something else. Measured on `claude 2.1.247` (2026-08-27) by asking a child spawned under each flag set to name its own tools: the deny list left **20** tools available (`Monitor`, `Workflow`, `NotebookEdit`, `CronCreate`, `SendMessage`, `EnterWorktree`, `Skill`, `ToolSearch`, …); `--tools "" --strict-mcp-config` left **`NONE`**. End to end through a real `multi`-mode OCP with a real `claude`, an anonymous guest got `ListAgents`/`ReportFindings`/`ScheduleWakeup`/`Skill`/`ToolSearch`/`Workflow` before and `NONE` after. Both numbers are **dated readings, not constants** — each is whatever the CLI ships that day minus ten names, which is precisely why the fix is structural. `--strict-mcp-config` is not redundant with the retained `--disallowedTools mcp__*`: `--tools` governs built-ins only, so account-level MCP servers survive it. Found by the fork `princelundgren/ocp` (their `FLEET-32`), which never opened a PR; reproduced here before adopting. **This closes 1 of ADR 0007's 3 requirements — a per-key ephemeral `HOME` and an OS sandbox remain unimplemented, so `multi` is still not a security boundary.**
+
+### Fixed
+
+- **The boot banner no longer advertises a tool set that `multi` mode does not pass (#450).** `Tools: Bash, Read, Write, …` was printed in every mode from `ALLOWED_TOOLS`, but the multi-tenant branch never passes `--allowedTools`, so a multi-tenant instance announced a filesystem surface it was not granting — and would now contradict the fix above. It prints `Tools: none (multi-tenant: --tools "" empties the built-in schema)` in that mode. **Console banner only**: `/status`'s `config.allowedTools` is deliberately untouched, because changing the rule that determines a grandfathered Class B.2 field's value is a contract change needing its own ADR (`CLAUDE.md` § Class B.2), not a truthfulness fix.
+
+### Tests
+
+- **The multi-tenant tool argv is now pinned behaviourally, from the wire (#450).** `LT_FAKE` gained an `ARGV_CAPTURE` hook that records the spawned `claude`'s complete argv (`<<ARG>>`-prefixed records, because the `--system-prompt` value legitimately contains newlines and precedes the tool flags). Two live-boot tests read what a real `server.mjs` child really spawned: `multi` must be exactly `--tools "" --strict-mcp-config --disallowedTools mcp__*`, and the non-multi path must still be exactly the default `--allowedTools` list. A single `deepEqual` over the whole tool tail rather than several narrow `includes` checks, per `AGENTS.md` — the broader assertion strictly implies the narrower ones, and two narrow claims in one body that one mutation breaks can only ever produce one mutation row. Nothing in the suite read this argv before, which is why the divergence between ADR 0007 and the code could not go red.
+
 ## v3.31.0 — 2026-08-27
 
 > **Governance audit for this section**, per `CLAUDE.md`'s `release_kit.governance_audits`:
