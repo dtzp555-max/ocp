@@ -1390,15 +1390,30 @@ function buildCliArgs(cliModel, systemPrompt, opts = {}) {
     // AGENTS.md on cross-file line references). The comment on this branch cited that B-path
     // while the code did something else.
     //
-    // MEASURED 2026-08-27 on claude 2.1.247, by asking a child spawned under each flag set to
-    // name its own tools: the ten-entry deny-list left 20 tools available (Monitor, Workflow,
-    // NotebookEdit, CronCreate, SendMessage, EnterWorktree, Skill, LSP, ToolSearch and more);
-    // `--tools "" --strict-mcp-config` left NONE. That 20 is a DATED READING, not a constant --
-    // it is whatever the CLI ships minus ten names, so it moves with every release. Do not
-    // refresh the number; the reason the fix is structural is that the number is unknowable.
+    // MEASURED 2026-08-27 on claude 2.1.247. THE INSTRUMENT MATTERS MORE THAN THE NUMBER, so
+    // read this before quoting either. The authority is the `tools` array on the `system` init
+    // event of `--output-format stream-json --verbose` -- the schema the CLI actually built. An
+    // earlier pass asked the spawned model to name its own tools instead; the reviewer showed
+    // that instrument lies, in the direction that matters: under these very flags it answered
+    // "Read, Edit, Write, Glob, Grep, Bash, PowerShell" while the wire, same model same flags,
+    // answered [].
     //
-    // `--strict-mcp-config` is not redundant with the retained `--disallowedTools mcp__*`:
-    // --tools governs built-ins only, so account-level MCP servers survive it, and the two
+    // What the wire says, varying ONE thing at a time from one baseline on one host:
+    //
+    //   old deny-list, default model                        -> 20 tools
+    //   old deny-list, + --model haiku                      -> 24
+    //   old deny-list, + CLAUDE_CONFIG_DIR set              -> 16
+    //   old deny-list, baseline repeated                    -> 20   (deterministic, not flaky)
+    //   THIS branch's flags, default model AND haiku        ->  0
+    //
+    // So the exposure is not a number at all: it is a FUNCTION OF THE INVOCATION -- the model
+    // and the config dir move it without any CLI release. Do not "update the 20"; there is no
+    // single value to update, and that is the argument for emptying the schema rather than
+    // enumerating it. The right-hand column is the only stable one.
+    //
+    // `--strict-mcp-config` is not redundant with the retained `--disallowedTools mcp__*`, and
+    // this is measured rather than reasoned: `--tools ""` ALONE left 49 tools in the schema,
+    // ALL of them mcp__* from account-level servers. --tools governs built-ins only, so the two
     // close that from opposite sides (ignore foreign servers / deny their tools).
     //
     // Reported by an external fork (princelundgren/ocp, FLEET-32) that hit it on its own fleet
@@ -4633,9 +4648,14 @@ server.listen(PORT, BIND_ADDRESS, () => {
   // Multi-tenant is its own arm because ALLOWED_TOOLS is NOT what that mode passes: the branch in
   // buildCliArgs pushes `--tools ""` and never `--allowedTools`, so printing the ALLOWED_TOOLS
   // list here told an operator running a multi-tenant instance that guests had Bash/Read/Write.
-  // Console banner only. `/status`'s config.allowedTools is deliberately NOT touched: that is a
+  // Console banner only. `/health`'s config.allowedTools -- grep this file for `allowedTools:`,
+  // the sole hit, inside the /health handler -- is deliberately NOT touched: that is a
   // grandfathered Class B.2 response field, and changing the rule that determines its value is a
   // contract change needing its own ADR (CLAUDE.md § Class B.2), not a truthfulness fix.
+  // An earlier revision of this comment said `/status`. It was wrong, and wrong in the way
+  // AGENTS.md names as its own defect class: the reasoning survived (both endpoints are equally
+  // grandfathered) while the NAME it rested on did not, so a maintainer following the instruction
+  // would have grepped /status, found nothing, and been unable to tell whether it applied.
   console.log(`Tools: ${AUTH_MODE === "multi" ? 'none (multi-tenant: --tools "" empties the built-in schema)'
                       : SKIP_PERMISSIONS ? "all (skip-permissions)" : ALLOWED_TOOLS.join(", ")}`);
   if (SYSTEM_PROMPT) console.log(`System prompt: "${SYSTEM_PROMPT.slice(0, 80)}..."`);
