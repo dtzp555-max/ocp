@@ -1402,7 +1402,10 @@ function buildCliArgs(cliModel, systemPrompt, opts = {}) {
     // "Read, Edit, Write, Glob, Grep, Bash, PowerShell" while the wire, same model same flags,
     // answered [].
     //
-    // What the wire says, varying ONE thing at a time from one baseline on one host:
+    // What the wire says, varying ONE thing at a time from ONE BASELINE ON ONE HOST -- and the
+    // baseline's own conditions have to be named, because the table below is precisely a proof
+    // that they move the answer: default model (no --model), CLAUDE_CONFIG_DIR unset, cwd inside
+    // this repo's worktree, claude 2.1.247:
     //
     //   old deny-list, default model                        -> 20 tools
     //   old deny-list, + --model haiku                      -> 24
@@ -1425,10 +1428,16 @@ function buildCliArgs(cliModel, systemPrompt, opts = {}) {
     // `--disallowedTools mcp__*` takes that to 0 -- so on the SCHEMA axis they are
     // interchangeable, not complementary. An earlier revision of this comment claimed they were
     // "not redundant" and called that measured; the measurement cited (49 under `--tools ""`
-    // alone) does not discriminate between them at all, and the claim was wrong. [reasoned, from
-    // --help and ADR 0007's "Belt-and-braces" paragraph, NOT measured here] They are both kept
-    // because they act at different stages: --strict-mcp-config stops account-attached servers
-    // being CONNECTED, while --disallowedTools denies their tools after a connection is made.
+    // alone) does not discriminate between them at all, and the claim was wrong.
+    //
+    // [measured] They are BOTH kept because they are NOT interchangeable on a second axis, and
+    // that axis is visible one field over in the same init event -- `mcp_servers`, next to
+    // `tools`. With `--tools "" --disallowedTools 'mcp__*'` the schema is empty AND three
+    // account-level MCP servers report "status":"connected"; with `--strict-mcp-config` the
+    // list is empty. So the deny-list alone would leave the operator's own OAuth'd connectors
+    // ESTABLISHED inside a multi-tenant guest's session while exposing zero tools. Two limits,
+    // stated because they bound what was actually observed: the connection was measured, a
+    // guest REACHING it was not; and the counts are one host under the invocation below.
     // [measured, and the reason none of this can be reasoned from the flags] --disallowedTools is
     // not a subtraction the CLI passively applies: `--disallowedTools Bash` yields 77 tools where
     // the unrestricted baseline is 76, because removing Bash makes the CLI ADD Glob and Grep.
