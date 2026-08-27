@@ -207,8 +207,12 @@ const OCP_SYSTEM_PROMPT_WRAPPER = `You are accessed via the OCP HTTP proxy. You 
 // where the operator's own model legitimately has tools (the `-p` path passes --allowedTools). Tells
 // the model it MAY use them instead of disclaiming access it actually holds. Off by default; the
 // default wrapper above is byte-for-byte unchanged. Selecting the positive wrapper does NOT expand
-// the tool surface (governed independently by --allowedTools/--disallowedTools) — it only changes the
-// prompt — and is boot-gated below (multi/non-loopback/anon → refuse) mirroring OCP_TUI_FULL_TOOLS.
+// the tool surface (governed independently by --tools/--disallowedTools, and NOT by --allowedTools,
+// which only pre-approves; see lib/prompt.mjs for the measurements) — it only changes the prompt —
+// and is boot-gated below (multi/non-loopback/anon → refuse) mirroring OCP_TUI_FULL_TOOLS.
+// The `--tools` half was added when an independent review found this the THIRD copy of the same
+// omission, after README.md and lib/prompt.mjs. It was the least wrong of the three -- it carries
+// no over-claim, only a gap -- which is exactly why it survived two passes.
 const OCP_LOCAL_TOOLS_WRAPPER = `You are accessed via the OCP HTTP proxy running on the operator's own machine. Unlike the shared-gateway posture, you may use your available local tools to act on the operator's machine as the task requires. Use only the tools you actually have — do not assume filesystem, shell, or other access beyond the tool set provided to you in this session.`;
 
 // OCP_LOCAL_TOOLS is inert in TUI mode: the interactive (non-`-p`) path composes its own prompt via
@@ -1406,15 +1410,28 @@ function buildCliArgs(cliModel, systemPrompt, opts = {}) {
     //   old deny-list, baseline repeated                    -> 20   (deterministic, not flaky)
     //   THIS branch's flags, default model AND haiku        ->  0
     //
-    // So the exposure is not a number at all: it is a FUNCTION OF THE INVOCATION -- the model
-    // and the config dir move it without any CLI release. Do not "update the 20"; there is no
-    // single value to update, and that is the argument for emptying the schema rather than
-    // enumerating it. The right-hand column is the only stable one.
+    // Each row repeated identically is stable (baseline 4x, deny-list 3x, this branch 3x), so
+    // these are conditions, not noise. But the exposure is still not a number: it is a FUNCTION
+    // OF THE INVOCATION -- the model and the config dir move it without any CLI release, and
+    // those are merely the two knobs that turned up, not a claim that they are the only two.
+    // Do not "update the 20"; there is no single value to update, and that is the argument for
+    // emptying the schema rather than enumerating it. THE LAST ROW is the stable one -- the
+    // right-hand column is precisely what varies. (An earlier revision of this comment said
+    // "the right-hand column is the only stable one", which asserts the opposite of its table.)
     //
-    // `--strict-mcp-config` is not redundant with the retained `--disallowedTools mcp__*`, and
-    // this is measured rather than reasoned: `--tools ""` ALONE left 49 tools in the schema,
-    // ALL of them mcp__* from account-level servers. --tools governs built-ins only, so the two
-    // close that from opposite sides (ignore foreign servers / deny their tools).
+    // Why BOTH mcp-closing flags, when either alone would do. [measured] `--tools ""` governs
+    // built-ins ONLY: alone it leaves 49 tools in the schema, all of them mcp__* from
+    // account-level servers. [measured] Adding EITHER `--strict-mcp-config` OR
+    // `--disallowedTools mcp__*` takes that to 0 -- so on the SCHEMA axis they are
+    // interchangeable, not complementary. An earlier revision of this comment claimed they were
+    // "not redundant" and called that measured; the measurement cited (49 under `--tools ""`
+    // alone) does not discriminate between them at all, and the claim was wrong. [reasoned, from
+    // --help and ADR 0007's "Belt-and-braces" paragraph, NOT measured here] They are both kept
+    // because they act at different stages: --strict-mcp-config stops account-attached servers
+    // being CONNECTED, while --disallowedTools denies their tools after a connection is made.
+    // [measured, and the reason none of this can be reasoned from the flags] --disallowedTools is
+    // not a subtraction the CLI passively applies: `--disallowedTools Bash` yields 77 tools where
+    // the unrestricted baseline is 76, because removing Bash makes the CLI ADD Glob and Grep.
     //
     // Reported by an external fork (princelundgren/ocp, FLEET-32) that hit it on its own fleet
     // and never opened a PR; reproduced here before adopting rather than taken on its word.
@@ -4648,8 +4665,12 @@ server.listen(PORT, BIND_ADDRESS, () => {
   // Multi-tenant is its own arm because ALLOWED_TOOLS is NOT what that mode passes: the branch in
   // buildCliArgs pushes `--tools ""` and never `--allowedTools`, so printing the ALLOWED_TOOLS
   // list here told an operator running a multi-tenant instance that guests had Bash/Read/Write.
-  // Console banner only. `/health`'s config.allowedTools -- grep this file for `allowedTools:`,
-  // the sole hit, inside the /health handler -- is deliberately NOT touched: that is a
+  // Console banner only. The B.2 field is the `allowedTools` member of the `config` object in
+  // the /health response body; find the /health handler and read its config block. NO GREP STRING
+  // IS GIVEN ON PURPOSE: two earlier revisions of this comment named one, and each time the
+  // comment itself became a second hit, falsifying its own "the sole hit" claim. A locator that
+  // must not appear in the locator is not a string, it is a place. That field is deliberately
+  // NOT touched: it is a
   // grandfathered Class B.2 response field, and changing the rule that determines its value is a
   // contract change needing its own ADR (CLAUDE.md § Class B.2), not a truthfulness fix.
   // An earlier revision of this comment said `/status`. It was wrong, and wrong in the way
