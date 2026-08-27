@@ -4605,8 +4605,10 @@ server.listen(PORT, BIND_ADDRESS, () => {
     console.warn(`         Expected a comma-separated list of host[:port], e.g. "ocp.example.com,dash.example.com:8443".`);
   }
   if (ALLOWED_HOSTS.defaultPort.length) {
-    console.warn(`WARNING: OCP_ALLOWED_HOSTS — ${ALLOWED_HOSTS.defaultPort.join(", ")} names a DEFAULT port, which no browser sends in Origin.`);
-    console.warn(`         Such an entry can never match. Declare the bare host instead, e.g. "${ALLOWED_HOSTS.defaultPort[0].split(":")[0]}".`);
+    console.warn(`WARNING: OCP_ALLOWED_HOSTS — ${ALLOWED_HOSTS.defaultPort.join(", ")} names a port that Origin usually omits.`);
+    console.warn(`         If you serve HTTPS on 443 (or HTTP on 80) this entry cannot match — declare the bare host, e.g. "${ALLOWED_HOSTS.defaultPort[0].split(":")[0]}".`);
+    console.warn(`         If you serve PLAIN HTTP on 443 (or HTTPS on 80) the entry is correct as written and this warning does not apply.`);
+    console.warn(`         Kept either way: OCP cannot tell which, because a declaration carries no scheme.`);
   }
   console.log(`Architecture: on-demand spawning (no pool)`);
   console.log(`Models: ${MODELS.map((m) => m.id).join(", ")}`);

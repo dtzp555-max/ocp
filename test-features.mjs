@@ -28225,10 +28225,17 @@ ltTest("ADR 0020: an unparseable OCP_ALLOWED_HOSTS entry is REPORTED at boot, no
     // A SECOND, QUIETER MISTAKE: an entry that parses fine and can still never match, because
     // Origin never carries a default port. It must be flagged separately from the unparseable
     // ones — folding it into "ignored N entries" would be a lie, since it is NOT ignored.
-    assert.match(all, /tls\.example\.com:443 names a DEFAULT port/,
-      `a default-port entry must be flagged on its own; got: ${all.slice(-800)}`);
-    assert.match(all, /Declare the bare host instead, e\.g\. "tls\.example\.com"/,
+    assert.match(all, /tls\.example\.com:443 names a port that Origin usually omits/,
+      `a default-port entry must be flagged on its own; got: ${all.slice(-900)}`);
+    assert.match(all, /declare the bare host, e\.g\. "tls\.example\.com"/,
       "and the warning must show what to write instead, or it only tells the operator they are wrong");
+    // THE HALF THE FIRST VERSION GOT WRONG. It said the entry "can never match", which is false
+    // for plain HTTP on 443 — so the warning has to state BOTH cases, or it tells an operator with
+    // a working config that their config is broken.
+    assert.match(all, /PLAIN HTTP on 443 .* the entry is correct as written/,
+      `the warning must name its own false positive; got: ${all.slice(-900)}`);
+    assert.ok(!/can never match/.test(all),
+      `control: the absolute claim must be GONE, not merely accompanied by the caveat`);
     assert.ok(!/ignored 3 unparseable/.test(all),
       `control: the default-port entry must NOT be counted as unparseable — it parsed, and it is kept`);
     // THE BEHAVIOURAL HALF, without which this is a test of a log line: the GOOD entry in the same
@@ -28297,6 +28304,17 @@ test("ADR 0020: matchesDeclared — a bare entry matches any port, an entry with
   assert.equal(m("ocp.example.com.evil.com"), false, "a suffix match is not a match");
   assert.equal(m("sub.ocp.example.com"), false, "and declaring a host does not declare its subdomains");
   assert.equal(matchesDeclared(parseAuthority("ocp.example.com"), []), false, "an empty list matches nothing");
+  // THE ROOT DOT IS THE SAME NAME, and Node's URL PRESERVES it — measured:
+  // `new URL("http://ocp.example.com.").host === "ocp.example.com."` — so a browser at a
+  // fully-qualified URL reaches the gate with one. `isRebindSafe` stripped it and `matchesDeclared`
+  // did not, ten lines apart, and the visible consequence was a 403 telling the operator to declare
+  // a host they HAD declared. Normalised once in parseAuthority so the two cannot drift again.
+  assert.equal(new URL("http://ocp.example.com.").host, "ocp.example.com.", "premise: URL keeps the root dot");
+  assert.equal(m("ocp.example.com."), true, "a fully-qualified form of a declared name must match");
+  assert.equal(matchesDeclared(parseAuthority("ocp.example.com"), parseAllowedHosts("ocp.example.com.").hosts), true,
+    "and symmetrically: declaring the fully-qualified form must admit the bare one");
+  assert.equal(isRebindSafe(parseAuthority("ocp-host.local.")), true, "the same normalisation reaches rebind-safety");
+  assert.equal(m("ocp.example.com.."), false, "a DOUBLE dot is not a name, and must not normalise into one");
 });
 
 test("ADR 0020: OCP_ALLOWED_HOSTS splits on COMMA ONLY — a typo may not widen the allowlist", () => {
@@ -28309,13 +28327,20 @@ test("ADR 0020: OCP_ALLOWED_HOSTS splits on COMMA ONLY — a typo may not widen 
   assert.deepEqual(parseAllowedHosts(undefined).hosts, [], "and neither does an absent variable");
 });
 
-test("ADR 0020: a declared entry naming a DEFAULT port is kept but flagged — it can never match", () => {
-  // MEASURED: `Origin` never carries a default port and `new URL(origin).host` drops it, so
-  // `https://ocp.example.com` yields the BARE host. An operator who writes the port they think of
-  // therefore gets a 403 telling them to declare a host they DID declare.
+test("ADR 0020: a declared entry naming a default port is flagged, and the flag is a SCHEME-BLIND heuristic", () => {
+  // THE NAME OF THIS TEST USED TO SAY "it can never match", AND THAT WAS FALSE — caught by
+  // independent review. The default port is PER SCHEME and a declaration carries no scheme, so the
+  // flag is a heuristic with a reachable false positive. AGENTS.md: a name is a claim.
   const declared = parseAllowedHosts("ocp.example.com:443").hosts;
   assert.equal(matchesDeclared(parseAuthority(new URL("https://ocp.example.com").host), declared), false,
-    "this is the trap itself — if this ever becomes true, the flag below is obsolete and should go");
+    "the trap itself: https drops :443 from Origin, so the declaration cannot match");
+  // THE FALSE POSITIVE, measured. Plain HTTP on 443 (TLS terminated upstream) KEEPS the port in
+  // Origin, so this same declaration works — which is exactly why the flag warns and must never
+  // become a rejection. If this assertion ever flips, the warning may be promoted to an error.
+  assert.equal(matchesDeclared(parseAuthority(new URL("http://ocp.example.com:443").host), declared), true,
+    "plain HTTP on 443 keeps the port, so the flagged entry is CORRECT for that deployment");
+  assert.equal(new URL("https://h.example:80").host, "h.example:80",
+    "and the mirror: https on 80 keeps the port too — the rule is per-scheme, not per-number");
   const r = parseAllowedHosts("a.example.com:443, b.example.com:80, c.example.com:8443, d.example.com");
   assert.deepEqual(r.defaultPort, ["a.example.com:443", "b.example.com:80"],
     "both default ports must be flagged, and neither a non-default port nor a bare host may be");
