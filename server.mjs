@@ -1430,14 +1430,29 @@ function buildCliArgs(cliModel, systemPrompt, opts = {}) {
     // "not redundant" and called that measured; the measurement cited (49 under `--tools ""`
     // alone) does not discriminate between them at all, and the claim was wrong.
     //
-    // [measured] They are BOTH kept because they are NOT interchangeable on a second axis, and
-    // that axis is visible one field over in the same init event -- `mcp_servers`, next to
-    // `tools`. With `--tools "" --disallowedTools 'mcp__*'` the schema is empty AND three
-    // account-level MCP servers report "status":"connected"; with `--strict-mcp-config` the
-    // list is empty. So the deny-list alone would leave the operator's own OAuth'd connectors
-    // ESTABLISHED inside a multi-tenant guest's session while exposing zero tools. Two limits,
-    // stated because they bound what was actually observed: the connection was measured, a
-    // guest REACHING it was not; and the counts are one host under the invocation below.
+    // They are BOTH kept because they are not interchangeable on a second axis -- `mcp_servers`,
+    // one field over in the same init event. WHERE that matters depends on the spawn's HOME, and
+    // an earlier revision of this comment got that wrong, so the conditions come first. All rows
+    // are `--tools "" --disallowedTools 'mcp__*'` versus adding --strict-mcp-config:
+    //
+    //   HOME = the operator's REAL home        deny-list alone: schema empty, but 3 account-level
+    //                                          connectors report "status":"connected".
+    //                                          --strict-mcp-config: mcp_servers [].
+    //   HOME = <realHome>/.ocp/spawn-home      deny-list ALONE already gives 0 connected.
+    //   HOME = a fresh empty directory         0 connected.
+    //
+    // The middle row is what THIS FILE hands the -p spawn by default (`env.HOME = decision.home`
+    // below, when an OAuth token is resolvable), so under the default configuration the deny-list
+    // alone already suffices and --strict-mcp-config costs nothing. It is load-bearing on the
+    // REAL-HOME path, which is not hypothetical: it is the documented fallback when no token is
+    // resolvable -- the boot banner then prints "Spawn home: real-home" -- and it is what
+    // OCP_SPAWN_REAL_HOME=1 selects.
+    //
+    // An earlier revision asserted the connectors were "ESTABLISHED inside a multi-tenant guest's
+    // session" full stop. That was measured under the real HOME and is FALSE for the default
+    // spawn home; it was the THIRD time this block claimed more than was observed, which is why
+    // the rows above lead with their HOME rather than with a number. Limits that remain: one
+    // host, one operator's account, and a guest REACHING a connected server was never measured.
     // [measured, and the reason none of this can be reasoned from the flags] --disallowedTools is
     // not a subtraction the CLI passively applies: `--disallowedTools Bash` yields 77 tools where
     // the unrestricted baseline is 76, because removing Bash makes the CLI ADD Glob and Grep.
