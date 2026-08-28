@@ -2827,6 +2827,23 @@ fi
 # (secrets "absent" because cut off). Measured by an independent reviewer: 4/25 partial reads at a
 # 4794-byte environment, 18/40 at 10938. rename(2) is atomic, so the reader sees all or nothing.
 if [ -n "$ENV_CAPTURE" ]; then env > "$ENV_CAPTURE.tmp" && mv "$ENV_CAPTURE.tmp" "$ENV_CAPTURE"; fi
+# Capture this spawn's COMPLETE argv, one element per record, so a test can assert on what was
+# actually passed rather than on what server.mjs's source says it passes. Additive: every
+# pre-existing call site leaves ARGV_CAPTURE unset and gets a byte-identical fake.
+#
+# Records are <<ARG>>-PREFIXED rather than newline-separated because an element legitimately
+# contains newlines -- the --system-prompt value always does, and it is spawned BEFORE the tool
+# flags, so a line-oriented reader would mis-index every element after it. Write-then-rename for
+# the reason the ENV_CAPTURE line above already records: a plain redirect is chunked, and a reader
+# that unblocks on "non-empty" can read a TRUNCATED argv, which makes an absence assertion pass
+# VACUOUSLY.
+# NOTE: no backticks anywhere in this heredoc -- it is a JS template literal, and one backtick
+# ends the string, which is exactly how this block failed the first time it was written.
+if [ -n "$ARGV_CAPTURE" ]; then
+  : > "$ARGV_CAPTURE.tmp"
+  for a in "$@"; do printf '<<ARG>>%s' "$a" >> "$ARGV_CAPTURE.tmp"; done
+  mv "$ARGV_CAPTURE.tmp" "$ARGV_CAPTURE"
+fi
 prev=""
 for a in "$@"; do
   if [ "$prev" = "--system-prompt" ]; then printf '%s' "$a" > "$SP_CAPTURE"; fi
@@ -2840,6 +2857,19 @@ exit 0
 
 function ltMkdir() { return _ltMkdtemp(join(_ltTmp(), "ocp-lt-")); }
 function ltFake(dir) { const p = join(dir, "claude"); _ltWrite(p, LT_FAKE); _ltChmod(p, 0o755); return p; }
+
+// Read back what LT_FAKE's ARGV_CAPTURE recorded: the spawned argv, one element per `<<ARG>>`
+// record. Returns [] when the file is absent, so a caller MUST assert non-empty before trusting
+// any absence claim -- a fake that never ran and a fake that ran with no args are the same [].
+// Caveat, stated rather than guarded: an argv element containing the literal `<<ARG>>` would
+// split wrong. Every caller here spawns a prompt it wrote itself, so that is reachable only by a
+// test author who put the marker in on purpose.
+function ltArgvCalls(file) {
+  if (!_ltExists(file)) return [];
+  const raw = _ltRead(file, "utf8");
+  if (!raw) return [];
+  return raw.split("<<ARG>>").slice(1);
+}
 
 // ── #384: the harness's own `tmux` ───────────────────────────────────────────────────────
 // `lib/tui/session.mjs:54` resolves `process.env.OCP_TUI_TMUX_BIN || "tmux"` at module load,
@@ -4285,6 +4315,113 @@ ltTest("integration: boot gate REFUSES each unsafe config (multi / non-loopback 
         // a false "two at once".
         await ltDrain(() => buf.closed, "boot-gate-loop", 5000);
       }
+    }
+  } finally { _ltRmRetry(dir); }
+});
+
+console.log("\nAUTH_MODE=multi tool surface (ADR 0007 B-path requirement 1):");
+
+// ── AUTH_MODE=multi must EMPTY the tool schema, not enumerate what to remove ──────────────────
+//
+// ADR 0007:138 lists `--tools ""` as requirement 1 of 3 for the multi-tenant B-path, and
+// server.mjs's own comment on this branch cites that B-path. What it shipped instead was a
+// hardcoded ten-entry `--disallowedTools` enumeration, and NOTHING in this suite read the argv,
+// so the divergence between the ADR and the code could not go red.
+//
+// Why an enumeration cannot hold: `--disallowedTools` names tools to deny, so it can only ever
+// deny the tools its author knew about. MEASURED 2026-08-27 against `claude 2.1.247` by asking a
+// child spawned under this exact flag set to name its own tools:
+//
+//   the ten-entry deny-list        -> 20 tools still available (Monitor, Workflow, NotebookEdit,
+//                                     CronCreate, SendMessage, EnterWorktree, Skill, LSP, ...)
+//   --tools "" --strict-mcp-config -> NONE
+//
+// That 20 is a MEASUREMENT, not a constant: it is whatever `claude` shipped that day minus ten
+// names, so it moves with every CLI release -- which is the whole point, and the reason the fix
+// is structural rather than a longer list. Do not update the number here; it is a dated reading.
+//
+// This is behavioural: it reads the argv a REAL server.mjs child really spawned, via LT_FAKE's
+// ARGV_CAPTURE. A source grep would pass on code that computes the right flags and then never
+// pushes them -- the #339 call-site shape this repo keeps re-finding.
+ltTest("integration: AUTH_MODE=multi spawns `--tools \"\"` so the built-in schema is EMPTY, not enumerated", async () => {
+  if (!LT_POSIX) return;
+  const dir = ltMkdir(); const fake = ltFake(dir);
+  const argvFile = join(dir, "argv-multi.txt");
+  try {
+    const { child, buf, port } = await ltBootFresh({ CLAUDE_AUTH_MODE: "multi", CLAUDE_BIN: fake, ARGV_CAPTURE: argvFile }, dir);
+    try {
+      assert.ok(await ltWait(() => buf.out.includes("listening on")), `server never listened — ${ltDiag(buf)}`);
+      // AUTH_MODE=multi admits an un-tokened caller as anonymous (server.mjs:4036 "if not, allow
+      // as anonymous"), so no key setup is needed to reach the spawn path.
+      const r = await ltPostStatus(port, { model: "sonnet", messages: [{ role: "user", content: "hi" }] });
+      assert.equal(r.status, 200, `expected the spawn to succeed — ${r.status} ${r.text.slice(0, 200)}`);
+
+      const argv = ltArgvCalls(argvFile);
+      // Vacuity guard FIRST: [] would satisfy every absence claim below. #405's rule -- require a
+      // POSITIVE count before trusting anything negative.
+      assert.ok(argv.length > 0, `no argv captured: the fake never ran, so nothing below means anything — ${ltDiag(buf)}`);
+      assert.ok(argv.includes("--model"), `argv has no --model, so this is not the spawn we think it is: ${JSON.stringify(argv.slice(0, 8))}`);
+
+      // Anchor BY INDEX before slicing (#347): indexOf returns -1 on a miss and slice(-1+2) is a
+      // valid, non-empty, wrong-looking slice rather than an error.
+      const spIdx = argv.indexOf("--system-prompt");
+      assert.ok(spIdx > -1, `argv has no --system-prompt: ${JSON.stringify(argv.slice(0, 8))}`);
+      assert.ok(argv.length > spIdx + 2, `argv ends at the system prompt; no tool flags were pushed at all: ${JSON.stringify(argv)}`);
+
+      // ONE total assertion over the whole tool tail rather than several narrow ones. Two reasons,
+      // both from AGENTS.md: a deepEqual strictly implies every `includes` check it replaces, so
+      // keeping both would leave the broader one permanently unprovable; and two narrow assertions
+      // in one body that a SINGLE mutation breaks can only ever produce one mutation row, leaving
+      // the second claim shipped-but-unproven.
+      const tail = argv.slice(spIdx + 2);
+      assert.deepEqual(tail, ["--tools", "", "--strict-mcp-config", "--disallowedTools", "mcp__*"],
+        `multi-mode tool flags are not the empty-schema form: ${JSON.stringify(tail)}`);
+
+      // The operator-facing half of the same defect: the boot banner printed the ALLOWED_TOOLS
+      // list in EVERY mode, so a multi-tenant instance announced "Tools: Bash, Read, Write, ..."
+      // while passing none of them. Asserted AFTER the deepEqual deliberately -- the two are
+      // killed by DIFFERENT mutations (one in buildCliArgs, one in the banner), so neither hides
+      // the other; co-locating claims is only unsafe when ONE mutation breaks both.
+      const banner = buf.out.split("\n").find(l => l.startsWith("Tools: "));
+      assert.ok(banner, `no "Tools:" banner line at all — ${ltDiag(buf)}`);
+      assert.equal(banner, 'Tools: none (multi-tenant: --tools "" empties the built-in schema)',
+        `the multi-mode boot banner still advertises a tool set: ${banner}`);
+    } finally {
+      child.kill("SIGKILL");
+      await ltDrain(() => buf.closed, "multi-tools", 5000);
+    }
+  } finally { _ltRmRetry(dir); }
+});
+
+// The other side of the same fix: the single-user path must be untouched. Its own test rather than
+// a second assertion above, because it needs a different server config -- and because a mutation
+// that wrongly applied `--tools ""` to EVERY mode would leave the test above green.
+ltTest("integration: the non-multi path still passes --allowedTools and never --tools", async () => {
+  if (!LT_POSIX) return;
+  const dir = ltMkdir(); const fake = ltFake(dir);
+  const argvFile = join(dir, "argv-none.txt");
+  try {
+    const { child, buf, port } = await ltBootFresh({ CLAUDE_AUTH_MODE: "none", CLAUDE_BIN: fake, ARGV_CAPTURE: argvFile }, dir);
+    try {
+      assert.ok(await ltWait(() => buf.out.includes("listening on")), `server never listened — ${ltDiag(buf)}`);
+      const r = await ltPostStatus(port, { model: "sonnet", messages: [{ role: "user", content: "hi" }] });
+      assert.equal(r.status, 200, `expected the spawn to succeed — ${r.status} ${r.text.slice(0, 200)}`);
+
+      const argv = ltArgvCalls(argvFile);
+      assert.ok(argv.length > 0, `no argv captured: the fake never ran — ${ltDiag(buf)}`);
+      const spIdx = argv.indexOf("--system-prompt");
+      assert.ok(spIdx > -1, `argv has no --system-prompt: ${JSON.stringify(argv.slice(0, 8))}`);
+      assert.ok(argv.length > spIdx + 2, `argv ends at the system prompt: ${JSON.stringify(argv)}`);
+
+      // The default CLAUDE_ALLOWED_TOOLS set, spelled out. Pinning the exact list is deliberate:
+      // this is the surface a single-user instance actually grants, and a silent change to it
+      // should redden something.
+      const tail = argv.slice(spIdx + 2);
+      assert.deepEqual(tail, ["--allowedTools", "Bash", "Read", "Write", "Edit", "Glob", "Grep", "WebSearch", "WebFetch", "Agent"],
+        `the non-multi tool flags changed: ${JSON.stringify(tail)}`);
+    } finally {
+      child.kill("SIGKILL");
+      await ltDrain(() => buf.closed, "none-tools", 5000);
     }
   } finally { _ltRmRetry(dir); }
 });

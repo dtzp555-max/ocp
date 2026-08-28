@@ -207,8 +207,12 @@ const OCP_SYSTEM_PROMPT_WRAPPER = `You are accessed via the OCP HTTP proxy. You 
 // where the operator's own model legitimately has tools (the `-p` path passes --allowedTools). Tells
 // the model it MAY use them instead of disclaiming access it actually holds. Off by default; the
 // default wrapper above is byte-for-byte unchanged. Selecting the positive wrapper does NOT expand
-// the tool surface (governed independently by --allowedTools/--disallowedTools) — it only changes the
-// prompt — and is boot-gated below (multi/non-loopback/anon → refuse) mirroring OCP_TUI_FULL_TOOLS.
+// the tool surface (governed independently by --tools/--disallowedTools, and NOT by --allowedTools,
+// which only pre-approves; see lib/prompt.mjs for the measurements) — it only changes the prompt —
+// and is boot-gated below (multi/non-loopback/anon → refuse) mirroring OCP_TUI_FULL_TOOLS.
+// The `--tools` half was added when an independent review found this the THIRD copy of the same
+// omission, after README.md and lib/prompt.mjs. It was the least wrong of the three -- it carries
+// no over-claim, only a gap -- which is exactly why it survived two passes.
 const OCP_LOCAL_TOOLS_WRAPPER = `You are accessed via the OCP HTTP proxy running on the operator's own machine. Unlike the shared-gateway posture, you may use your available local tools to act on the operator's machine as the task requires. Use only the tools you actually have — do not assume filesystem, shell, or other access beyond the tool set provided to you in this session.`;
 
 // OCP_LOCAL_TOOLS is inert in TUI mode: the interactive (non-`-p`) path composes its own prompt via
@@ -1376,21 +1380,88 @@ function buildCliArgs(cliModel, systemPrompt, opts = {}) {
   // For AUTH_MODE !== "multi" (none/shared — single-operator/trusted), preserve
   // existing behaviour unchanged.
   if (AUTH_MODE === "multi") {
-    // Disallow the full operator-FS + web + agent surface. "--disallowedTools" may
-    // be repeated; claude accepts multiple occurrences (TUI path already uses it).
-    args.push(
-      "--disallowedTools", "Bash",
-      "--disallowedTools", "Read",
-      "--disallowedTools", "Write",
-      "--disallowedTools", "Edit",
-      "--disallowedTools", "Glob",
-      "--disallowedTools", "Grep",
-      "--disallowedTools", "WebFetch",
-      "--disallowedTools", "WebSearch",
-      "--disallowedTools", "Agent",
-      "--disallowedTools", "mcp__*",
-    );
-    // Do NOT push --allowedTools in multi mode.
+    // EMPTY THE SCHEMA; DO NOT ENUMERATE WHAT TO REMOVE.
+    //
+    // `--tools` is the tool-AVAILABILITY registry -- `claude --help`: "Specify the list of
+    // available tools from the built-in set. Use \"\" to disable all tools". `--disallowedTools`
+    // is a DENY LIST: it can only ever deny the tools whoever wrote it knew about, so it goes
+    // stale on every CLI release that adds one, silently and with no error.
+    //
+    // This branch used to be a hardcoded ten-entry deny-list (Bash/Read/Write/Edit/Glob/Grep/
+    // WebFetch/WebSearch/Agent/mcp__*), which is the shape ADR 0007 already ruled out. Grep it
+    // for "The B-path (multi-tenant isolation) requires:" -- item 1 of the 3 is `--tools ""`
+    // (:138 at the time of writing; the string is the citation, the number is decorative, per
+    // AGENTS.md on cross-file line references). The comment on this branch cited that B-path
+    // while the code did something else.
+    //
+    // MEASURED 2026-08-27 on claude 2.1.247. THE INSTRUMENT MATTERS MORE THAN THE NUMBER, so
+    // read this before quoting either. The authority is the `tools` array on the `system` init
+    // event of `--output-format stream-json --verbose` -- the schema the CLI actually built. An
+    // earlier pass asked the spawned model to name its own tools instead; the reviewer showed
+    // that instrument lies, in the direction that matters: under these very flags it answered
+    // "Read, Edit, Write, Glob, Grep, Bash, PowerShell" while the wire, same model same flags,
+    // answered [].
+    //
+    // What the wire says, varying ONE thing at a time from ONE BASELINE ON ONE HOST -- and the
+    // baseline's own conditions have to be named, because the table below is precisely a proof
+    // that they move the answer: default model (no --model), CLAUDE_CONFIG_DIR unset, cwd inside
+    // this repo's worktree, claude 2.1.247:
+    //
+    //   old deny-list, default model                        -> 20 tools
+    //   old deny-list, + --model haiku                      -> 24
+    //   old deny-list, + CLAUDE_CONFIG_DIR set              -> 16
+    //   old deny-list, baseline repeated                    -> 20   (deterministic, not flaky)
+    //   THIS branch's flags, default model AND haiku        ->  0
+    //
+    // Each row repeated identically is stable (baseline 4x, deny-list 3x, this branch 3x), so
+    // these are conditions, not noise. But the exposure is still not a number: it is a FUNCTION
+    // OF THE INVOCATION -- the model and the config dir move it without any CLI release, and
+    // those are merely the two knobs that turned up, not a claim that they are the only two.
+    // Do not "update the 20"; there is no single value to update, and that is the argument for
+    // emptying the schema rather than enumerating it. THE LAST ROW is the stable one -- the
+    // right-hand column is precisely what varies. (An earlier revision of this comment said
+    // "the right-hand column is the only stable one", which asserts the opposite of its table.)
+    //
+    // Why BOTH mcp-closing flags, when either alone would do. [measured] `--tools ""` governs
+    // built-ins ONLY: alone it leaves 49 tools in the schema, all of them mcp__* from
+    // account-level servers. [measured] Adding EITHER `--strict-mcp-config` OR
+    // `--disallowedTools mcp__*` takes that to 0 -- so on the SCHEMA axis they are
+    // interchangeable, not complementary. An earlier revision of this comment claimed they were
+    // "not redundant" and called that measured; the measurement cited (49 under `--tools ""`
+    // alone) does not discriminate between them at all, and the claim was wrong.
+    //
+    // They are BOTH kept because they are not interchangeable on a second axis -- `mcp_servers`,
+    // one field over in the same init event. WHERE that matters depends on the spawn's HOME, and
+    // an earlier revision of this comment got that wrong, so the conditions come first. All rows
+    // are `--tools "" --disallowedTools 'mcp__*'` versus adding --strict-mcp-config:
+    //
+    //   HOME = the operator's REAL home        deny-list alone: schema empty, but 3 account-level
+    //                                          connectors report "status":"connected".
+    //                                          --strict-mcp-config: mcp_servers [].
+    //   HOME = <realHome>/.ocp/spawn-home      deny-list ALONE already gives 0 connected.
+    //   HOME = a fresh empty directory         0 connected.
+    //
+    // The middle row is what THIS FILE hands the -p spawn by default (`env.HOME = decision.home`
+    // below, when an OAuth token is resolvable), so under the default configuration the deny-list
+    // alone already suffices and --strict-mcp-config costs nothing. It is load-bearing on the
+    // REAL-HOME path, which is not hypothetical: it is the documented fallback when no token is
+    // resolvable -- the boot banner then prints "Spawn home: real-home" -- and it is what
+    // OCP_SPAWN_REAL_HOME=1 selects.
+    //
+    // An earlier revision asserted the connectors were "ESTABLISHED inside a multi-tenant guest's
+    // session" full stop. That was measured under the real HOME and is FALSE for the default
+    // spawn home; it was the THIRD time this block claimed more than was observed, which is why
+    // the rows above lead with their HOME rather than with a number. Limits that remain: one
+    // host, one operator's account, and a guest REACHING a connected server was never measured.
+    // [measured, and the reason none of this can be reasoned from the flags] --disallowedTools is
+    // not a subtraction the CLI passively applies: `--disallowedTools Bash` yields 77 tools where
+    // the unrestricted baseline is 76, because removing Bash makes the CLI ADD Glob and Grep.
+    //
+    // Reported by an external fork (princelundgren/ocp, FLEET-32) that hit it on its own fleet
+    // and never opened a PR; reproduced here before adopting rather than taken on its word.
+    args.push("--tools", "", "--strict-mcp-config", "--disallowedTools", "mcp__*");
+    // Do NOT push --allowedTools in multi mode: it is a PRE-APPROVAL list ("tool names to
+    // allow", per --help), not a restriction, so it could only ever widen this.
   } else if (SKIP_PERMISSIONS) {
     args.push("--dangerously-skip-permissions");
   } else if (ALLOWED_TOOLS.length > 0) {
@@ -4615,7 +4686,23 @@ server.listen(PORT, BIND_ADDRESS, () => {
   console.log(`Claude binary: ${CLAUDE}`);
   console.log(`Timeout: ${TIMEOUT / 1000}s | Max concurrent: ${MAX_CONCURRENT} | Queue: ${CLAUDE_MAX_QUEUE} (429 on overflow)`);
   console.log(`Circuit breaker: disabled`);
-  console.log(`Tools: ${SKIP_PERMISSIONS ? "all (skip-permissions)" : ALLOWED_TOOLS.join(", ")}`);
+  // Multi-tenant is its own arm because ALLOWED_TOOLS is NOT what that mode passes: the branch in
+  // buildCliArgs pushes `--tools ""` and never `--allowedTools`, so printing the ALLOWED_TOOLS
+  // list here told an operator running a multi-tenant instance that guests had Bash/Read/Write.
+  // Console banner only. The B.2 field is the `allowedTools` member of the `config` object in
+  // the /health response body; find the /health handler and read its config block. NO GREP STRING
+  // IS GIVEN ON PURPOSE: two earlier revisions of this comment named one, and each time the
+  // comment itself became a second hit, falsifying its own "the sole hit" claim. A locator that
+  // must not appear in the locator is not a string, it is a place. That field is deliberately
+  // NOT touched: it is a
+  // grandfathered Class B.2 response field, and changing the rule that determines its value is a
+  // contract change needing its own ADR (CLAUDE.md § Class B.2), not a truthfulness fix.
+  // An earlier revision of this comment said `/status`. It was wrong, and wrong in the way
+  // AGENTS.md names as its own defect class: the reasoning survived (both endpoints are equally
+  // grandfathered) while the NAME it rested on did not, so a maintainer following the instruction
+  // would have grepped /status, found nothing, and been unable to tell whether it applied.
+  console.log(`Tools: ${AUTH_MODE === "multi" ? 'none (multi-tenant: --tools "" empties the built-in schema)'
+                      : SKIP_PERMISSIONS ? "all (skip-permissions)" : ALLOWED_TOOLS.join(", ")}`);
   if (SYSTEM_PROMPT) console.log(`System prompt: "${SYSTEM_PROMPT.slice(0, 80)}..."`);
   if (MCP_CONFIG) console.log(`MCP config: ${MCP_CONFIG}`);
   console.log(`Auth: ${PROXY_API_KEY ? "enabled (PROXY_API_KEY set)" : "disabled (no PROXY_API_KEY)"}`);
