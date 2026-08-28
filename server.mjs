@@ -192,14 +192,18 @@ function resolveClaude() {
 }
 
 // ── OCP system prompt wrapper (Phase 6c port — ADR 0009 Amendment 1 analogue) ─
-// Injected via `--system-prompt` flag, replacing claude CLI's default system
-// prompt (which normally includes cwd, OS, tool descriptions, and git status —
-// all irrelevant and potentially misleading when the model is accessed via the
-// OCP HTTP proxy).
+// Injected via `--system-prompt-file` (#453; it was `--system-prompt` until then, and the value
+// is no longer in argv), replacing claude CLI's default system prompt (which normally includes
+// cwd, OS, tool descriptions, and git status — all irrelevant and potentially misleading when the
+// model is accessed via the OCP HTTP proxy).
 //
-// Authority: claude CLI § --system-prompt (ported from OLP, verified v2.1.104;
-// behavior stable through v2.1.158 — OLP ADR 0009 Amendment 1 §
-// "OLP system prompt wrapper"; ported to OCP 2026-05-30).
+// Authority: claude CLI § --system-prompt (ported from OLP, verified v2.1.104; behavior stable
+// through v2.1.158 — OLP ADR 0009 Amendment 1 § "OLP system prompt wrapper"; ported to OCP
+// 2026-05-30). THAT VERIFICATION IS FOR --system-prompt AND DOES NOT TRANSFER: --system-prompt-file
+// was verified separately and much later, and carries a narrower measured range. See
+// spawnClaudeProcess's write site for it -- the version note lives with the code that depends on
+// it rather than here, because this comment is 1400 lines away and the last time a citation sat
+// that far from its subject it went stale without anything noticing.
 // Reference: https://github.com/dtzp555-max/olp commit 97e7d16 (Phase 6c)
 const OCP_SYSTEM_PROMPT_WRAPPER = `You are accessed via the OCP HTTP proxy. You do NOT have access to any local filesystem, working directory, shell, git status, or machine environment. Do not infer or invent such information from any context you observe. Respond only based on the conversation provided.`;
 
@@ -1344,11 +1348,13 @@ const authCheckInterval = setInterval(checkAuth, AUTH_CHECK_INTERVAL_MS);
 // ── Build CLI arguments ─────────────────────────────────────────────────
 // Phase 6c port (2026-05-30): removed `-p` / `--output-format text`.
 // Now uses `--output-format stream-json --verbose --no-session-persistence
-// --system-prompt <OCP_SYSTEM_PROMPT_WRAPPER + client system messages>`.
+// --system-prompt-file <path to a 0600 temp file holding OCP_SYSTEM_PROMPT_WRAPPER + client
+// system messages>` (#453 moved that value out of argv).
 //
 // Authority: claude CLI § --output-format stream-json, § --verbose,
-//   § --no-session-persistence, § --system-prompt (ported from OLP, verified v2.1.104;
-//   behavior stable through v2.1.158).
+//   § --no-session-persistence (ported from OLP, verified v2.1.104; behavior stable through
+//   v2.1.158). --system-prompt-file is NOT covered by that verification and is dated separately
+//   at the write site below.
 // Reference: OLP ADR 0009 Amendment 1 + commit 97e7d16.
 //
 // Session flags (--resume, --session-id) are dropped: they are incompatible
@@ -1753,9 +1759,28 @@ function spawnClaudeProcess(model, messages, conversationId, keyName, releaseSlo
   //
   // mode 0o600 is what makes the file a fix rather than a lateral move: tmpdir() is /tmp on Linux
   // (mode 777) and writeFileSync's default is 0666 & ~umask = 644, so the naive form would have
-  // relocated the disclosure, not closed it. `flag: "wx"` is O_CREAT|O_EXCL, which refuses to
-  // follow a pre-planted symlink of the same name; the name carries a randomUUID, so this is
-  // belt-and-braces over an already-unguessable path.
+  // relocated the disclosure, not closed it. [measured] A umask sweep (000/002/022/027/077/177 ->
+  // 0600; 200/277/377 -> 0400; 777 -> 0000) confirms no umask can make this file MORE permissive
+  // than 0600, because umask only clears bits.
+  //
+  // `flag: "wx"` (O_CREAT|O_EXCL) does more than refuse a pre-planted symlink, which is how an
+  // earlier revision of this comment undersold it. [measured] With `flag: "w"` the `mode` is
+  // SILENTLY IGNORED on a path that already exists -- a pre-created 0666 file stayed 0666 -- so
+  // `wx` is what makes the 0600 guarantee TOTAL rather than conditional on the path being fresh.
+  // The name carries a randomUUID, so reaching that case requires guessing it.
+  //
+  // CLI VERSION. --system-prompt-file is NOT in `claude --help`'s option list (0 hits; positive
+  // controls: --append-system-prompt 2, --system-prompt 1), so a reader cannot confirm it from
+  // --help and the older `--system-prompt` verification 1400 lines up does NOT cover it.
+  // [measured] It works on 2.1.233, 2.1.243 and 2.1.247; the discriminator is the error text --
+  // an unknown flag gives `error: unknown option '<flag>'` while this one gives `Error: System
+  // prompt file not found: <path>`. NOT MEASURED: anything older, including the 2.1.104 / 2.1.158
+  // the comments above cite for the old flag. OCP has no `claude` version gate at all (setup.mjs
+  // only records `claude --version`; the only floor machinery in this repo is for Node). What
+  // makes that survivable rather than silent: [measured] on a claude that lacks the flag, every
+  // request 500s with the child's own stderr passed through verbatim --
+  // {"error":{"message":"error: unknown option '--system-prompt-file'"}} -- so the failure names
+  // the flag and the remedy. Total outage, but not a mystery. See #455.
   //
   // RESIDUAL, stated rather than hidden: a SIGKILL of the server leaves the file behind, because
   // cleanup() never runs. At 0600 that is litter, not a leak.
@@ -1767,6 +1792,17 @@ function spawnClaudeProcess(model, messages, conversationId, keyName, releaseSlo
     // Covers BOTH the write failing and spawn() throwing synchronously (the #193 shape). Every
     // later exit path -- including a FAILED spawn, which emits 'error'/'close' -- reaches
     // cleanup(). force:true makes this a no-op when the write itself is what failed.
+    //
+    // UNTESTED, and this is the SECOND untested guard here rather than the first (`flag: "wx"` is
+    // the other) -- an independent review found the count wrong by deleting this line and getting
+    // 5 passed / 0 failed. Only the write-failure arm is exercised (the TMPDIR test), where no
+    // file exists and this is a no-op; nothing reaches a SUCCESSFUL write followed by a
+    // synchronous spawn() throw. That is not for want of looking. The two levers this repo already
+    // owns are both closed: a NUL byte in argv does make spawn() throw synchronously
+    // (ERR_INVALID_ARG_VALUE, measured) but the model is validated and rejected as "Unknown model"
+    // long before the spawn, and #193's --stack-size spread throw fires inside buildCliArgs, which
+    // runs BEFORE the write. Reaching this line needs a production fault hook, which AGENTS.md
+    // says not to add; recorded here so the next reader does not re-derive it.
     try { rmSync(systemPromptFile, { force: true }); } catch { /* never mask the real error */ }
     throw e;
   }
