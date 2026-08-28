@@ -1980,6 +1980,10 @@ async function callClaude(model, messages, conversationId, keyName, res) {
     spawnDecision = await resolveSpawnDecision();
   } catch (err) {
     releaseSlot();
+    // #458, same lane one step earlier: resolveSpawnDecision can throw (it rethrows after
+    // releasing its fallback mutex), and that also 500s uncounted. BY INSPECTION, not measured --
+    // the TMPDIR lever reaches the spawn catch below, not this one.
+    trackError(err.message);
     throw err;
   }
   return new Promise((resolve, reject) => {
@@ -1990,6 +1994,19 @@ async function callClaude(model, messages, conversationId, keyName, res) {
       releaseSlot();
       // Spawn threw before cleanup() was wired → release the fallback mutex here so it never leaks.
       try { spawnDecision.releaseFallback?.(); } catch { /* best effort */ }
+      // #458: count it. Every OTHER failure of this lane reaches trackError through a child-process
+      // event ('exit'/'error'), but a SYNCHRONOUS throw here happens before those listeners exist,
+      // so the request 500s while stats.errors and recentErrors both stay silent. Measured: three
+      // requests under an unwritable TMPDIR gave totalRequests=3, oneOffRequests=3, errors=0 and
+      // recentErrors=[] -- an operator's /health showed three requests and no errors while all
+      // three had failed. Same shape as #180/#193's activeRequests leak, one counter over.
+      //
+      // Counted HERE and not in the caller's catch: the child-process paths already call
+      // trackError and THEN reject (server.mjs, the `claude_exit` and proc.on("error") arms), so a
+      // trackError in the outer catch would double-count the common case. RequestDisconnectedError
+      // cannot reach here -- acquireClaudeSlot runs before this try -- so no exclusion is needed;
+      // adding one would be dead code.
+      trackError(err.message);
       return reject(err);
     }
 
@@ -2506,6 +2523,7 @@ async function callClaudeStreaming(model, messages, conversationId, res, authInf
     spawnDecision = await resolveSpawnDecision();
   } catch (err) {
     releaseSlot();
+    trackError(err.message); // #458 — by inspection, as in callClaude's twin.
     return jsonResponse(res, 500, { error: { message: sanitizeError(err.message), type: "proxy_error" } });
   }
   let ctx;
@@ -2515,6 +2533,8 @@ async function callClaudeStreaming(model, messages, conversationId, res, authInf
     releaseSlot();
     // Spawn threw before cleanup() was wired → release the fallback mutex here so it never leaks.
     try { spawnDecision.releaseFallback?.(); } catch { /* best effort */ }
+    // #458 — see the twin in callClaude for why this is counted here rather than in the caller.
+    trackError(err.message);
     return jsonResponse(res, 500, { error: { message: sanitizeError(err.message), type: "proxy_error" } });
   }
 

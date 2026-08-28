@@ -4328,6 +4328,104 @@ ltTest("integration: boot gate REFUSES each unsafe config (multi / non-loopback 
   } finally { _ltRmRetry(dir); }
 });
 
+console.log("\na synchronous pre-spawn throw is COUNTED (#458):");
+
+// ── #458: every failure of the -p lane must reach stats.errors ────────────────────────────────
+//
+// stats.errors++ happens in exactly one place, trackError(), and all six of its pre-existing call
+// sites are on CHILD-PROCESS events. A synchronous throw before those listeners exist -- the
+// #180/#193 shape, one counter over -- 500s the request and increments totalRequests while errors
+// and recentErrors both stay silent. An operator's /health then reads "N requests, 0 errors, no
+// recent errors" for requests that all failed.
+//
+// The lever is the same unwritable TMPDIR the #453 tests use: os.tmpdir() honours TMPDIR, so the
+// --system-prompt-file write throws ENOENT before spawn(). No production fault hook.
+
+ltTest("integration (#458): a 500 from a synchronous pre-spawn throw increments stats.errors and recentErrors", async () => {
+  if (!LT_POSIX) return;
+  const dir = ltMkdir(); const fake = ltFake(dir);
+  try {
+    const { child, buf, port } = await ltBootFresh({ CLAUDE_BIN: fake, TMPDIR: join(dir, "no-such-dir") }, dir);
+    try {
+      assert.ok(await ltWait(() => buf.out.includes("listening on")), `did not start — ${ltDiag(buf)}`);
+      const before = await fetch(`http://127.0.0.1:${port}/health`).then(x => x.json());
+      // Premise: the counter must START at 0, or "it went up" proves nothing about this request.
+      assert.equal(before.stats.errors, 0, `errors was already ${before.stats.errors} before any request`);
+
+      const r = await ltPostStatus(port, { model: "sonnet", messages: [{ role: "user", content: "hi" }] });
+      assert.equal(r.status, 500, `expected the unwritable TMPDIR to fail the spawn — got ${r.status}: ${r.text.slice(0, 160)}`);
+      // Premise: the 500 must be the write failing, not something incidental, or the counter claim
+      // below is attached to an unknown event.
+      assert.match(r.text, /ENOENT|no such file/i, `the 500 is not the temp-file write failing: ${r.text.slice(0, 160)}`);
+
+      const after = await fetch(`http://127.0.0.1:${port}/health`).then(x => x.json());
+      assert.equal(after.stats.totalRequests, 1, `totalRequests should have counted the attempt: ${JSON.stringify(after.stats)}`);
+      assert.equal(after.stats.errors, 1,
+        `the request 500'd but stats.errors is ${after.stats.errors}. Every trackError call site is ` +
+        `wired to a child-process event, and a synchronous throw happens before those listeners ` +
+        `exist — so /health reports "1 request, 0 errors" for a request that failed. Stats: ` +
+        JSON.stringify(after.stats));
+      assert.equal((after.recentErrors || []).length, 1,
+        `recentErrors is the other half of trackError and is also empty: ${JSON.stringify(after.recentErrors)}`);
+    } finally { child.kill("SIGKILL"); await ltDrain(() => buf.closed, "prespawn-counted", 5000); }
+  } finally { _ltRmRetry(dir); }
+});
+
+// The control, and it is not ceremony: a fix that counted EVERY request, or counted twice, would
+// pass the test above. Its own test body because the mutation that breaks it (count in the outer
+// handler's catch, which double-counts the child-process paths) leaves the one above green.
+ltTest("integration (#458 control): a SUCCESSFUL request leaves stats.errors at 0, and a child-process failure counts exactly once", async () => {
+  if (!LT_POSIX) return;
+  const dir = ltMkdir();
+  // One fake, two behaviours by argv: the default spawn succeeds, but a request naming the
+  // sentinel model exits non-zero — which is the OTHER path to trackError, the one that already
+  // worked. Counting it twice is the failure mode a caller-side fix would introduce.
+  // Selected by the SYSTEM PROMPT's content, not by the model name: a bogus model name is rejected
+  // by model validation BEFORE any spawn, so the child never runs and the assertion below would be
+  // satisfied by a 400 from a request that never reached the lane under test. That is exactly what
+  // the first draft of this test did -- `assert.notEqual(status, 200)` passed on an empty world.
+  const fake = join(dir, "claude-dual");
+  _ltWrite(fake, `#!/bin/sh
+cat >/dev/null
+prev=""
+for a in "$@"; do
+  if [ "$prev" = "--system-prompt-file" ] && grep -q FAIL-ME "$a"; then
+    echo "deliberate child failure" >&2
+    exit 3
+  fi
+  prev="$a"
+done
+printf '%s\\n' '{"type":"assistant","message":{"content":[{"type":"text","text":"OK"}]}}'
+printf '%s\\n' '{"type":"result"}'
+exit 0
+`);
+  _ltChmod(fake, 0o755);
+  try {
+    const { child, buf, port } = await ltBootFresh({ CLAUDE_BIN: fake }, dir);
+    try {
+      assert.ok(await ltWait(() => buf.out.includes("listening on")), `did not start — ${ltDiag(buf)}`);
+
+      const ok = await ltPostStatus(port, { model: "sonnet", messages: [{ role: "user", content: "hi" }] });
+      assert.equal(ok.status, 200, `the success path must succeed — ${ok.status}: ${ok.text.slice(0, 160)}`);
+      const afterOk = await fetch(`http://127.0.0.1:${port}/health`).then(x => x.json());
+      assert.equal(afterOk.stats.errors, 0,
+        `a SUCCESSFUL request incremented stats.errors to ${afterOk.stats.errors} — the counter is ` +
+        `counting requests, not failures.`);
+
+      // Now the child-process failure path, which already reached trackError before #458.
+      const bad = await ltPostStatus(port, { model: "sonnet", messages: [{ role: "system", content: "FAIL-ME" }, { role: "user", content: "hi" }] });
+      // 500 specifically, not merely "not 200": a 400 would mean the request was rejected before
+      // the spawn and this lane was never exercised at all.
+      assert.equal(bad.status, 500, `expected the CHILD to fail — got ${bad.status}: ${bad.text.slice(0, 160)}`);
+      const afterBad = await fetch(`http://127.0.0.1:${port}/health`).then(x => x.json());
+      assert.equal(afterBad.stats.errors, 1,
+        `a child-process failure must count EXACTLY once, got ${afterBad.stats.errors}. Two means ` +
+        `the fix was placed in the caller's catch, where the child-process paths already called ` +
+        `trackError and then rejected.`);
+    } finally { child.kill("SIGKILL"); await ltDrain(() => buf.closed, "prespawn-control", 5000); }
+  } finally { _ltRmRetry(dir); }
+});
+
 console.log("\nsystem prompt travels as a FILE, not in argv (#453):");
 
 // ── #453: the system prompt is written to a 0600 temp file and passed by path ─────────────────
