@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+### Fixed
+
+- **`--disallowedTools` is only "a permission layer" for *scoped* patterns — two texts stated the wrong reason (#452).** `lib/tui/session.mjs` and `docs/tui-mode.md` both justified choosing `--tools` for `OCP_TUI_TOOLS` by contrasting it against "`--allowedTools` / `--disallowedTools`, a **permission** layer". That is accurate for `--allowedTools` and **wrong for `--disallowedTools`**: the split runs between a **bare name** and a **scoped pattern**, not between the two flags. Measured from the wire (the `tools` array on the `system` init event of `--output-format stream-json --verbose`; `claude` 2.1.250, default model, `CLAUDE_CONFIG_DIR` unset, 76-tool unrestricted baseline): `--disallowedTools Bash` → **77 tools, `Bash` absent** (removed from the schema, so it *also* can never prompt); `--disallowedTools 'Bash(git *)'` → **76, `Bash` present** (stays in the schema, acts at invocation, so it **can**); `--allowedTools Read` → **76, `Bash` present** (pre-approval only). `77 > 76` is not a typo — removing `Bash` makes the CLI *add* `Glob` and `Grep`, which is the sharpest reason the resulting schema has to be read off the wire rather than reasoned from the flag set. **The decision is unaffected**: `--tools` remains right because it is an allow-list, and expressing "only these built-ins" with a deny-list would mean enumerating everything else — the staleness #450 was about. Only the stated reason was wrong, the same shape as #451's own F1. Found by the independent reviewer of #454 while reviewing something else. The identical sentence in a **shipped** CHANGELOG section is deliberately left alone: that is history.
 ## v3.32.0 — 2026-08-28
 
 > **Governance audit for this section**, per `CLAUDE.md`'s `release_kit.governance_audits`:
