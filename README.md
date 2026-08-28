@@ -96,7 +96,7 @@ The simplest path: ask your AI.
 
 The AI will run `git clone`, `npm install`, `node setup.mjs`, and tell you when to OAuth.
 
-**Prerequisites:** macOS or Linux (Windows is not supported), Node.js 22.13+ or 23.4+ (Node 24+ is what CI and the reference fleet run), `git`, and the [Claude CLI](https://docs.anthropic.com/en/docs/claude-cli), authenticated:
+**Prerequisites:** macOS or Linux (Windows is not supported), Node.js 22.13+ or 23.4+ (Node 24+ is what CI and the reference fleet run), `git`, and the [Claude CLI](https://docs.anthropic.com/en/docs/claude-cli) — new enough to have `--system-prompt-file`, which OCP passes on every spawn since v3.32.0 and which has **no version gate** ([#455](https://github.com/dtzp555-max/ocp/issues/455)); no minimum has been established, so the statement is deliberately version-free — authenticated:
 
 ```bash
 npm install -g @anthropic-ai/claude-code
