@@ -2844,9 +2844,18 @@ if [ -n "$ARGV_CAPTURE" ]; then
   for a in "$@"; do printf '<<ARG>>%s' "$a" >> "$ARGV_CAPTURE.tmp"; done
   mv "$ARGV_CAPTURE.tmp" "$ARGV_CAPTURE"
 fi
+# --system-prompt-FILE (#453): the value is no longer in argv, so the capture reads the file the
+# server wrote and ALSO records its octal mode -- the mode is the whole point of the change on a
+# multi-user host, and a test cannot stat the file itself because cleanup() removes it as soon as
+# this fake exits. Every pre-existing SP_CAPTURE consumer keeps asserting on the same CONTENT and
+# thereby becomes a wiring pin: drop the flag, or pass a path that was never written, and they red.
 prev=""
 for a in "$@"; do
-  if [ "$prev" = "--system-prompt" ]; then printf '%s' "$a" > "$SP_CAPTURE"; fi
+  if [ "$prev" = "--system-prompt-file" ]; then
+    [ -n "$SP_CAPTURE" ] && cat "$a" > "$SP_CAPTURE"
+    [ -n "$SP_MODE_CAPTURE" ] && ls -l "$a" | cut -c1-10 > "$SP_MODE_CAPTURE"
+    [ -n "$SP_PATH_CAPTURE" ] && printf '%s' "$a" > "$SP_PATH_CAPTURE"
+  fi
   prev="$a"
 done
 if [ -n "$SP_COUNTER" ]; then c=$(cat "$SP_COUNTER" 2>/dev/null || echo 0); echo $((c+1)) > "$SP_COUNTER"; fi
@@ -4319,6 +4328,150 @@ ltTest("integration: boot gate REFUSES each unsafe config (multi / non-loopback 
   } finally { _ltRmRetry(dir); }
 });
 
+console.log("\nsystem prompt travels as a FILE, not in argv (#453):");
+
+// ── #453: the system prompt is written to a 0600 temp file and passed by path ─────────────────
+//
+// TWO defects, one change. The first is the one that gets noticed and the second is the one that
+// argues for a file rather than a bigger budget:
+//
+//   SIZE  `--system-prompt <string>` sat under the OS argv ceiling while nothing bounded the
+//         value -- promptCharBudget applies to messagesToPrompt, never to extractSystemPrompt --
+//         so CLAUDE_MAX_BODY_SIZE (5 MiB) was the only gate. Measured single-argv ceiling:
+//         131 071 bytes on Linux, ~1 045 424 on macOS. Same client, 200 KiB system message:
+//         fine on a Mac, `spawn E2BIG` on a Pi.
+//   READ  argv is world-readable on Linux (/proc/<pid>/cmdline is -r--r--r--, no hidepid on the
+//         reference fleet, verified cross-user on a real deployment). The conversation already
+//         went via stdin and the OAuth token via env; the system prompt was the one sensitive
+//         thing still in the open.
+//
+// The mode is the half a naive fix misses: tmpdir() is /tmp on Linux (777) and writeFileSync
+// defaults to 644, so a file without `mode: 0o600` RELOCATES the disclosure instead of closing it.
+//
+// Every pre-existing SP_CAPTURE test is now also a wiring pin for this: the fakes read the FILE,
+// so dropping the flag or passing an unwritten path reddens them too.
+
+ltTest("integration (#453): the system prompt is passed by PATH — argv carries --system-prompt-file and never the value", async () => {
+  if (!LT_POSIX) return;
+  const dir = ltMkdir(); const fake = ltFake(dir);
+  const argvFile = join(dir, "argv.txt"); const cap = join(dir, "sp.txt");
+  const MARK = "SYSPROMPT-SENTINEL-453";
+  try {
+    const { child, buf, port } = await ltBootFresh({ CLAUDE_BIN: fake, ARGV_CAPTURE: argvFile, SP_CAPTURE: cap }, dir);
+    try {
+      assert.ok(await ltWait(() => buf.out.includes("listening on")), `did not start — ${ltDiag(buf)}`);
+      const r = await ltPostStatus(port, { model: "sonnet", messages: [{ role: "system", content: MARK }, { role: "user", content: "hi" }] });
+      assert.equal(r.status, 200, `expected the spawn to succeed — ${r.status} ${r.text.slice(0, 200)}`);
+
+      const argv = ltArgvCalls(argvFile);
+      assert.ok(argv.length > 0, `no argv captured: the fake never ran — ${ltDiag(buf)}`);
+      // Anchor by INDEX before reading the neighbour (#347): indexOf returns -1 and argv[1] is a
+      // real, wrong-looking element rather than an error.
+      const i = argv.indexOf("--system-prompt-file");
+      assert.ok(i > -1, `argv has no --system-prompt-file: ${JSON.stringify(argv.slice(0, 10))}`);
+      assert.ok(argv.length > i + 1, `--system-prompt-file is the last argv element, so no path followed: ${JSON.stringify(argv)}`);
+      assert.ok(!argv.includes("--system-prompt"), `the old value-in-argv flag is still passed: ${JSON.stringify(argv)}`);
+      // The point of the change: the VALUE must not be anywhere in argv. Asserted over the whole
+      // argv rather than over the one neighbouring element, because a partial revert could put it
+      // back somewhere else.
+      assert.ok(!argv.some(x => x.includes(MARK)),
+        `the system prompt's CONTENT is still in argv, which is what this change exists to stop: ${JSON.stringify(argv.filter(x => x.includes(MARK)))}`);
+      // ...and it did arrive, via the file. Without this the assertion above passes vacuously on a
+      // build that simply stopped passing the system prompt at all.
+      assert.ok(await ltWait(() => _ltExists(cap)), "the fake never wrote SP_CAPTURE, so nothing proves the file reached it");
+      assert.ok(_ltRead(cap, "utf8").includes(MARK), `the file the child read does not contain the system message: ${_ltRead(cap, "utf8").slice(0, 120)}`);
+    } finally { child.kill("SIGKILL"); await ltDrain(() => buf.closed, "sysprompt-argv", 5000); }
+  } finally { _ltRmRetry(dir); }
+});
+
+ltTest("integration (#453): that file is mode 0600 — a 644 file in a 777 /tmp would only MOVE the disclosure", async () => {
+  if (!LT_POSIX) return;
+  const dir = ltMkdir(); const fake = ltFake(dir);
+  const modeFile = join(dir, "mode.txt");
+  try {
+    const { child, buf, port } = await ltBootFresh({ CLAUDE_BIN: fake, SP_MODE_CAPTURE: modeFile }, dir);
+    try {
+      assert.ok(await ltWait(() => buf.out.includes("listening on")), `did not start — ${ltDiag(buf)}`);
+      const r = await ltPostStatus(port, { model: "sonnet", messages: [{ role: "user", content: "hi" }] });
+      assert.equal(r.status, 200, `expected the spawn to succeed — ${r.status} ${r.text.slice(0, 200)}`);
+      // The fake stats the file while it still exists; cleanup() removes it the moment the fake
+      // exits, so the TEST cannot stat it afterwards and must not try.
+      assert.ok(await ltWait(() => _ltExists(modeFile)), `the fake never recorded a mode — ${ltDiag(buf)}`);
+      const mode = _ltRead(modeFile, "utf8").trim();
+      assert.equal(mode, "-rw-------",
+        `the system-prompt file is not owner-only. On Linux tmpdir() is /tmp (mode 777) and the ` +
+        `default write mode is 0666 & ~umask = 644, so anything but -rw------- means any local ` +
+        `user can read every system prompt this proxy handles. Got: ${JSON.stringify(mode)}`);
+    } finally { child.kill("SIGKILL"); await ltDrain(() => buf.closed, "sysprompt-mode", 5000); }
+  } finally { _ltRmRetry(dir); }
+});
+
+ltTest("integration (#453): the file is removed when the turn ends — no accumulation in tmp", async () => {
+  if (!LT_POSIX) return;
+  const dir = ltMkdir(); const fake = ltFake(dir);
+  const pathFile = join(dir, "path.txt");
+  try {
+    const { child, buf, port } = await ltBootFresh({ CLAUDE_BIN: fake, SP_PATH_CAPTURE: pathFile }, dir);
+    try {
+      assert.ok(await ltWait(() => buf.out.includes("listening on")), `did not start — ${ltDiag(buf)}`);
+      const r = await ltPostStatus(port, { model: "sonnet", messages: [{ role: "user", content: "hi" }] });
+      assert.equal(r.status, 200, `expected the spawn to succeed — ${r.status} ${r.text.slice(0, 200)}`);
+      assert.ok(await ltWait(() => _ltExists(pathFile)), `the fake never recorded the path — ${ltDiag(buf)}`);
+      const spPath = _ltRead(pathFile, "utf8").trim();
+      // Premise first: a path the fake never saw would make the absence below vacuous.
+      assert.ok(spPath.length > 0, "the recorded path is empty, so its absence proves nothing");
+      assert.ok(await ltWait(() => !_ltExists(spPath), 6000),
+        `the temp system-prompt file survived the turn: ${spPath}. cleanup() is the sole removal ` +
+        `site and is reached on 'exit' plus the callers' 'close'/'error'; if it is still here, one ` +
+        `file per request accumulates for the life of the process.`);
+    } finally { child.kill("SIGKILL"); await ltDrain(() => buf.closed, "sysprompt-unlink", 5000); }
+  } finally { _ltRmRetry(dir); }
+});
+
+// The regression this change exists for. Sized ABOVE BOTH measured ceilings (131 071 B Linux,
+// ~1 045 424 B macOS) so the pre-fix build fails on either platform rather than only on CI, and
+// below CLAUDE_MAX_BODY_SIZE's 5 MiB default so the body gate is not what is being tested.
+ltTest("integration (#453): a system prompt larger than the OS argv ceiling no longer returns spawn E2BIG", async () => {
+  if (!LT_POSIX) return;
+  const dir = ltMkdir(); const fake = ltFake(dir);
+  const BIG = "A".repeat(1_500_000);
+  try {
+    const { child, buf, port } = await ltBootFresh({ CLAUDE_BIN: fake, CLAUDE_TIMEOUT: "20000" }, dir);
+    try {
+      assert.ok(await ltWait(() => buf.out.includes("listening on")), `did not start — ${ltDiag(buf)}`);
+      const r = await ltPostStatus(port, { model: "sonnet", messages: [{ role: "system", content: BIG }, { role: "user", content: "hi" }] });
+      assert.equal(r.status, 200,
+        `a ${BIG.length}-char system prompt still fails. Before #453 this was HTTP 500 ` +
+        `{"error":{"message":"spawn E2BIG"}} — the value went in argv, and nothing bounded it. ` +
+        `Got ${r.status}: ${r.text.slice(0, 200)}`);
+    } finally { child.kill("SIGKILL"); await ltDrain(() => buf.closed, "sysprompt-big", 8000); }
+  } finally { _ltRmRetry(dir); }
+});
+
+// The new failure mode the change introduces: the write itself can fail. It must answer 500 and
+// leave stats.activeRequests where it found it -- the #180/#193 counter-drift shape, one call site
+// earlier. TMPDIR is what os.tmpdir() reads, so an unwritable value reaches writeFileSync without
+// any production fault hook.
+ltTest("integration (#453): a temp-file write failure answers 500 and does not leak stats.activeRequests", async () => {
+  if (!LT_POSIX) return;
+  const dir = ltMkdir(); const fake = ltFake(dir);
+  try {
+    const { child, buf, port } = await ltBootFresh({ CLAUDE_BIN: fake, TMPDIR: join(dir, "no-such-dir") }, dir);
+    try {
+      assert.ok(await ltWait(() => buf.out.includes("listening on")), `did not start — ${ltDiag(buf)}`);
+      const r = await ltPostStatus(port, { model: "sonnet", messages: [{ role: "user", content: "hi" }] });
+      assert.equal(r.status, 500, `expected the unwritable TMPDIR to fail the spawn — got ${r.status}: ${r.text.slice(0, 200)}`);
+      // The premise: the failure must be the WRITE, not something incidental. Without this the
+      // 500 above could come from any unrelated breakage and the counter claim would be untethered.
+      assert.match(r.text, /ENOENT|no such file/i, `the 500 is not the temp-file write failing: ${r.text.slice(0, 200)}`);
+      const h = await fetch(`http://127.0.0.1:${port}/health`).then(x => x.json());
+      assert.equal(h.stats.activeRequests, 0,
+        `activeRequests leaked to ${h.stats.activeRequests} on a pre-spawn throw. The write must ` +
+        `stay ahead of the increment (#180, #193): nothing is attached yet that could undo it.`);
+    } finally { child.kill("SIGKILL"); await ltDrain(() => buf.closed, "sysprompt-writefail", 5000); }
+  } finally { _ltRmRetry(dir); }
+});
+
 console.log("\nAUTH_MODE=multi tool surface (ADR 0007 B-path requirement 1):");
 
 // ── AUTH_MODE=multi must EMPTY the tool schema, not enumerate what to remove ──────────────────
@@ -4363,10 +4516,13 @@ ltTest("integration: AUTH_MODE=multi spawns `--tools \"\"` so the built-in schem
       assert.ok(argv.includes("--model"), `argv has no --model, so this is not the spawn we think it is: ${JSON.stringify(argv.slice(0, 8))}`);
 
       // Anchor BY INDEX before slicing (#347): indexOf returns -1 on a miss and slice(-1+2) is a
-      // valid, non-empty, wrong-looking slice rather than an error.
-      const spIdx = argv.indexOf("--system-prompt");
-      assert.ok(spIdx > -1, `argv has no --system-prompt: ${JSON.stringify(argv.slice(0, 8))}`);
-      assert.ok(argv.length > spIdx + 2, `argv ends at the system prompt; no tool flags were pushed at all: ${JSON.stringify(argv)}`);
+      // valid, non-empty, wrong-looking slice rather than an error. #453 renamed this flag from
+      // --system-prompt to --system-prompt-file, and this guard is what caught it: the anchor
+      // simply stopped matching and the test said so, where a length floor or a substring check
+      // would have sliced from -1 and asserted on garbage.
+      const spIdx = argv.indexOf("--system-prompt-file");
+      assert.ok(spIdx > -1, `argv has no --system-prompt-file: ${JSON.stringify(argv.slice(0, 8))}`);
+      assert.ok(argv.length > spIdx + 2, `argv ends at the system-prompt file path; no tool flags were pushed at all: ${JSON.stringify(argv)}`);
 
       // ONE total assertion over the whole tool tail rather than several narrow ones. Two reasons,
       // both from AGENTS.md: a deepEqual strictly implies every `includes` check it replaces, so
@@ -4409,8 +4565,8 @@ ltTest("integration: the non-multi path still passes --allowedTools and never --
 
       const argv = ltArgvCalls(argvFile);
       assert.ok(argv.length > 0, `no argv captured: the fake never ran — ${ltDiag(buf)}`);
-      const spIdx = argv.indexOf("--system-prompt");
-      assert.ok(spIdx > -1, `argv has no --system-prompt: ${JSON.stringify(argv.slice(0, 8))}`);
+      const spIdx = argv.indexOf("--system-prompt-file");
+      assert.ok(spIdx > -1, `argv has no --system-prompt-file: ${JSON.stringify(argv.slice(0, 8))}`);
       assert.ok(argv.length > spIdx + 2, `argv ends at the system prompt: ${JSON.stringify(argv)}`);
 
       // The default CLAUDE_ALLOWED_TOOLS set, spelled out. Pinning the exact list is deliberate:
@@ -5510,7 +5666,7 @@ if [ "$1" = "auth" ] && [ "$2" = "status" ]; then
 fi
 prev=""
 for a in "$@"; do
-  if [ "$prev" = "--system-prompt" ] && [ -n "$SP_CAPTURE" ]; then printf '%s' "$a" > "$SP_CAPTURE"; fi
+  if [ "$prev" = "--system-prompt-file" ] && [ -n "$SP_CAPTURE" ]; then cat "$a" > "$SP_CAPTURE"; fi
   prev="$a"
 done
 if [ -n "$SP_COUNTER" ]; then c=$(cat "$SP_COUNTER" 2>/dev/null || echo 0); echo $((c+1)) > "$SP_COUNTER"; fi

@@ -41,7 +41,7 @@ import { randomUUID, timingSafeEqual, createHash as cryptoCreateHash } from "nod
 import { readFileSync, readdirSync, accessSync, existsSync, constants, chmodSync, statSync, mkdirSync, writeFileSync, rmSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
-import { homedir } from "node:os";
+import { homedir, tmpdir } from "node:os";
 import { validateKey, recordUsage, getUsageByKey, getUsageTimeline, getRecentUsage, createKey, listKeys, revokeKey, closeDb, checkQuota, updateKeyQuota, getKeyQuota, findKey, cacheHash, getCachedResponse, setCachedResponse, clearCache, getCacheStats, hasCacheControl, singleflight, getInflightStats } from "./keys.mjs";
 import { DEFAULT_PORT } from "./lib/constants.mjs";
 import { StructuredOutputError, detectStructuredOutput, validateJsonSchemaSafe, extractJsonPayload, structuredSystemInstruction, resolveMaxAttempts } from "./lib/structured-output.mjs";
@@ -1357,13 +1357,16 @@ const authCheckInterval = setInterval(checkAuth, AUTH_CHECK_INTERVAL_MS);
 // CLAUDE_SYSTEM_PROMPT env var is absorbed into the system prompt via
 // extractSystemPrompt() at the caller level; APPEND_SYSTEM_PROMPT no longer used.
 // Note: ALLOWED_TOOLS / SKIP_PERMISSIONS / MCP_CONFIG are preserved as before.
-function buildCliArgs(cliModel, systemPrompt, opts = {}) {
+function buildCliArgs(cliModel, systemPromptFile, opts = {}) {
   const args = [
     "--model", cliModel,
     "--output-format", "stream-json",
     "--verbose",
     "--no-session-persistence",
-    "--system-prompt", systemPrompt,
+    // --system-prompt-FILE, not --system-prompt. The value used to travel in argv, which put it
+    // under the OS argv ceiling AND on a channel other local users can read. Both were measured;
+    // see the block at the write site in spawnClaudeProcess for the numbers and the limits.
+    "--system-prompt-file", systemPromptFile,
   ];
 
   // Multimodal path (issue #110): images are fed as Anthropic content blocks over
@@ -1632,12 +1635,16 @@ function spawnClaudeProcess(model, messages, conversationId, keyName, releaseSlo
   // Circuit breaker: disabled (see comment at top of breaker section)
 
   // Phase 6c: always serialize full conversation via stdin (no session resume).
-  // System messages are extracted and passed via --system-prompt; the remaining
+  // System messages are extracted and passed via --system-prompt-file; the remaining
   // messages (user/assistant/tool) are serialized for stdin.
   const systemPrompt = extractSystemPrompt(messages);
 
+  // The path is computed here (a pure string) but the file is NOT written until immediately
+  // before spawn(), so the window in which an orphan can exist is one function call wide.
+  const systemPromptFile = join(tmpdir(), `ocp-sysprompt-${randomUUID()}.txt`);
+
   // messagesToPrompt / buildStreamJsonInput skip system messages (they go via
-  // --system-prompt). Filter them out first to avoid double-injection.
+  // --system-prompt-file). Filter them out first to avoid double-injection.
   const nonSystemMessages = messages.filter(m => m.role !== "system");
 
   // Multimodal (issue #110): when any message carries an OpenAI image_url part,
@@ -1676,7 +1683,7 @@ function spawnClaudeProcess(model, messages, conversationId, keyName, releaseSlo
     console.log(`[session] stateless conv=${conversationId.slice(0, 12)}... key=${keyName || "anon"} msgs=${messages.length} prompt_chars=${promptChars}`);
   }
 
-  const cliArgs = buildCliArgs(cliModel, systemPrompt, { streamJsonInput: useStreamJson });
+  const cliArgs = buildCliArgs(cliModel, systemPromptFile, { streamJsonInput: useStreamJson });
 
   const env = { ...process.env };
   delete env.CLAUDECODE;
@@ -1716,7 +1723,53 @@ function spawnClaudeProcess(model, messages, conversationId, keyName, releaseSlo
     spawnOpts.cwd = decision.home; // neutral cwd: no project CLAUDE.md/skills
   }
 
-  const proc = spawn(CLAUDE, cliArgs, spawnOpts);
+  // ── The system prompt travels as a FILE, not as argv (#453) ────────────────────────────────
+  //
+  // Written HERE, one call before spawn(), and removed in cleanup() below. Two things were wrong
+  // with argv, and only the first is the one that gets noticed:
+  //
+  // 1. SIZE. `--system-prompt <string>` put the whole value under the OS argv ceiling, while
+  //    nothing bounded the value itself -- promptCharBudget applies to messagesToPrompt, never to
+  //    extractSystemPrompt -- so the only gate was CLAUDE_MAX_BODY_SIZE (5 MiB default). MEASURED
+  //    single-argv ceiling: 131 071 bytes on Linux (MAX_ARG_STRLEN = 32 pages; note `getconf
+  //    ARG_MAX` reports 2 MiB there and is the WRONG number), ~1 045 424 bytes on macOS. A 200 KiB
+  //    system prompt therefore worked on a Mac and returned `spawn E2BIG` on a Pi, from the same
+  //    client. Reproduced end to end before fixing: 1.5 MiB system message -> HTTP 500
+  //    {"error":{"message":"spawn E2BIG"}}, with no counter leak and the server still healthy.
+  //
+  // 2. DISCLOSURE, which is the half that argues for a FILE rather than a bigger budget. argv is
+  //    world-readable on Linux: /proc/<pid>/cmdline is mode -r--r--r-- and the reference fleet's
+  //    /proc carries no hidepid, VERIFIED CROSS-USER on a real deployment (a non-owning local
+  //    account read the OCP service's own argv; the same host's /proc/<pid>/environ is -r-------- 
+  //    and refused). And the value really is there: a sentinel placed in a `system` message was
+  //    caught with `ps -ww` in the spawned child's command line during a live request. So this was
+  //    the one sensitive channel OCP had NOT already routed safely -- the conversation goes via
+  //    stdin and the OAuth token via env (protected by that same environ mode), and only the
+  //    system prompt sat in the open.
+  //
+  //    NOT MEASURED, and therefore not claimed: a capture from a PRODUCTION instance. The
+  //    mechanism was shown locally and the cross-user readability on the fleet host; composing
+  //    them is a short inference, not an observation.
+  //
+  // mode 0o600 is what makes the file a fix rather than a lateral move: tmpdir() is /tmp on Linux
+  // (mode 777) and writeFileSync's default is 0666 & ~umask = 644, so the naive form would have
+  // relocated the disclosure, not closed it. `flag: "wx"` is O_CREAT|O_EXCL, which refuses to
+  // follow a pre-planted symlink of the same name; the name carries a randomUUID, so this is
+  // belt-and-braces over an already-unguessable path.
+  //
+  // RESIDUAL, stated rather than hidden: a SIGKILL of the server leaves the file behind, because
+  // cleanup() never runs. At 0600 that is litter, not a leak.
+  let proc;
+  try {
+    writeFileSync(systemPromptFile, systemPrompt, { encoding: "utf8", mode: 0o600, flag: "wx" });
+    proc = spawn(CLAUDE, cliArgs, spawnOpts);
+  } catch (e) {
+    // Covers BOTH the write failing and spawn() throwing synchronously (the #193 shape). Every
+    // later exit path -- including a FAILED spawn, which emits 'error'/'close' -- reaches
+    // cleanup(). force:true makes this a no-op when the write itself is what failed.
+    try { rmSync(systemPromptFile, { force: true }); } catch { /* never mask the real error */ }
+    throw e;
+  }
   // #365 (the other half of #359): decode the child's stdout/stderr as UTF-8 ONCE, here, at the
   // shared spawn boundary — this function is the SOLE spawn site for the -p/stream-json path and
   // callClaude + callClaudeStreaming are its only two callers, so these two lines cover all four
@@ -1788,6 +1841,10 @@ function spawnClaudeProcess(model, messages, conversationId, keyName, releaseSlo
     // queued fallback waiter re-checks resolveSpawnToken() and proceeds ISOLATED with the now-fresh
     // token instead of piling into the real HOME. Idempotent; cleanup() is guarded by `cleaned`.
     try { if (decision.releaseFallback) decision.releaseFallback(); } catch { /* never throw out of cleanup */ }
+    // The --system-prompt-file temp file is single-use. cleanup() is the sole removal site for
+    // every path past a successful spawn, and it is reached on 'exit' (wired below) as well as on
+    // the 'close'/'error' the CALLERS wire -- which is why a failed spawn also removes it.
+    try { rmSync(systemPromptFile, { force: true }); } catch { /* a missing file is the success case */ }
   }
 
   // Guarantee slot release on ANY exit path (normal close, error, timeout kill,
@@ -1825,7 +1882,7 @@ function spawnClaudeProcess(model, messages, conversationId, keyName, releaseSlo
   proc.stdin.end();
 
   recordModelRequest(cliModel, promptChars);
-  logEvent("info", "claude_spawned", { model: cliModel, promptChars, inputFormat: useStreamJson ? "stream-json" : "text", timeout: TIMEOUT, tier: getModelTier(cliModel), session: conversationId ? conversationId.slice(0, 12) + "..." : "none" });
+  logEvent("info", "claude_spawned", { model: cliModel, promptChars, systemPromptChars: systemPrompt.length, inputFormat: useStreamJson ? "stream-json" : "text", timeout: TIMEOUT, tier: getModelTier(cliModel), session: conversationId ? conversationId.slice(0, 12) + "..." : "none" });
 
   // Single request timeout — no separate first-byte timer.
   // Claude tool-use causes long pauses in the token stream (30s-5min),
