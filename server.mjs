@@ -1777,10 +1777,16 @@ function spawnClaudeProcess(model, messages, conversationId, keyName, releaseSlo
   // prompt file not found: <path>`. NOT MEASURED: anything older, including the 2.1.104 / 2.1.158
   // the comments above cite for the old flag. OCP has no `claude` version gate at all (setup.mjs
   // only records `claude --version`; the only floor machinery in this repo is for Node). What
-  // makes that survivable rather than silent: [measured] on a claude that lacks the flag, every
-  // request 500s with the child's own stderr passed through verbatim --
-  // {"error":{"message":"error: unknown option '--system-prompt-file'"}} -- so the failure names
-  // the flag and the remedy. Total outage, but not a mystery. See #455.
+  // makes that survivable rather than silent, and the SUBJECT of the measurement matters more
+  // than the result: [measured] against a STUB that rejects the flag the way commander does --
+  // no claude lacking the flag exists on this host to test -- every request 500s and the child's
+  // stderr reaches the caller, on the non-streaming path AND as a data: frame on the SSE path:
+  // {"error":{"message":"error: unknown option '--system-prompt-file'"}}. sanitizeError leaves it
+  // intact because its rewrite needs a leading `/` and this message carries no path, so "passed
+  // through" is accurate here and is NOT a general property of stderr. [reasoned, from three real
+  // binaries -- 2.1.233/2.1.243/2.1.247 -- all emitting commander's `error: unknown option '<x>'`
+  // format] a real older claude would say the same, so the failure names the flag and the remedy.
+  // Total outage, but not a mystery. See #455.
   //
   // RESIDUAL, stated rather than hidden: a SIGKILL of the server leaves the file behind, because
   // cleanup() never runs. At 0600 that is litter, not a leak.
@@ -1801,8 +1807,10 @@ function spawnClaudeProcess(model, messages, conversationId, keyName, releaseSlo
     // owns are both closed: a NUL byte in argv does make spawn() throw synchronously
     // (ERR_INVALID_ARG_VALUE, measured) but the model is validated and rejected as "Unknown model"
     // long before the spawn, and #193's --stack-size spread throw fires inside buildCliArgs, which
-    // runs BEFORE the write. Reaching this line needs a production fault hook, which AGENTS.md
-    // says not to add; recorded here so the next reader does not re-derive it.
+    // runs BEFORE the write. So NO LEVER IN THIS REPO REACHES IT and one would have to be built
+    // -- a production fault hook, which AGENTS.md says not to add. That is the scope actually
+    // established: two levers checked and closed, NOT a proof that no lever exists. Recorded so
+    // the next reader does not re-derive the two, and knows what is still open.
     try { rmSync(systemPromptFile, { force: true }); } catch { /* never mask the real error */ }
     throw e;
   }
