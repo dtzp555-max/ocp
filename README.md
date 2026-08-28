@@ -96,7 +96,7 @@ The simplest path: ask your AI.
 
 The AI will run `git clone`, `npm install`, `node setup.mjs`, and tell you when to OAuth.
 
-**Prerequisites:** macOS or Linux (Windows is not supported), Node.js 22.13+ or 23.4+ (Node 24+ is what CI and the reference fleet run), `git`, and the [Claude CLI](https://docs.anthropic.com/en/docs/claude-cli), authenticated:
+**Prerequisites:** macOS or Linux (Windows is not supported), Node.js 22.13+ or 23.4+ (Node 24+ is what CI and the reference fleet run), `git`, and the [Claude CLI](https://docs.anthropic.com/en/docs/claude-cli) — new enough to have `--system-prompt-file`, which OCP passes on every spawn since v3.32.0 and which has **no version gate** ([#455](https://github.com/dtzp555-max/ocp/issues/455)); no minimum has been established, so the statement is deliberately version-free — authenticated:
 
 ```bash
 npm install -g @anthropic-ai/claude-code
@@ -635,6 +635,7 @@ The simplest path: ask your AI — paste `Run `ocp doctor` and follow its `next_
 
 **Bootstrap quirks (one-time migrations):**
 
+- **Every request started returning 500 `error: unknown option '--system-prompt-file'` after upgrading to v3.32.0** — v3.32.0 stopped putting the system prompt on the command line, because argv is world-readable on Linux (`/proc/<pid>/cmdline`), and passes it as a `0600` file instead ([#453](https://github.com/dtzp555-max/ocp/issues/453)). Your Claude CLI predates the `--system-prompt-file` flag. Run `claude update` (or reinstall the CLI) and restart OCP. Measured working on `claude` **2.1.233+**; the flag is absent from `claude --help`'s option list, so you cannot confirm it there, and OCP has **no CLI version gate** today ([#455](https://github.com/dtzp555-max/ocp/issues/455)) — the proxy starts fine and only fails per request.
 - **Dashboard mutations started returning 403 after upgrading to v3.31.0** — v3.31.0 stopped letting an **undeclared public DNS name** vouch for itself, because that shape is indistinguishable from DNS rebinding ([ADR 0020](docs/adr/0020-declared-hosts.md), #446). If your dashboard lives at a real domain, set `OCP_ALLOWED_HOSTS` to it once and restart. Nothing reached by IP, `localhost`, `*.local` or Tailscale is affected.
 - **A TUI session vanished right after upgrading OCP** — if a pre-3.21.1 and a post-3.21.1 instance ran on the same host at the same time during an upgrade, the new instance's one-time boot reap can, once, kill an old-format (`ocp-tui-<8hex>`) live TUI session belonging to the still-running old instance. Restart the affected session (`ocp restart` or re-run your TUI turn) and it returns under the new instance's port-scoped naming.
 - **OpenClaw shows old models after `ocp update` (v3.10→v3.11 only)** — the running shell had the old `cmd_update` cached, so the sync hook doesn't fire on that single jump. Run once: `node ~/ocp/scripts/sync-openclaw.mjs && openclaw gateway restart`. Every future update syncs automatically.
