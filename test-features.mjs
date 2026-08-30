@@ -4332,8 +4332,10 @@ console.log("\na synchronous pre-spawn throw is COUNTED (#458):");
 
 // ── #458: every failure of the -p lane must reach stats.errors ────────────────────────────────
 //
-// stats.errors++ happens in exactly one place, trackError(), and all six of its pre-existing call
-// sites are on CHILD-PROCESS events. A synchronous throw before those listeners exist -- the
+// stats.errors++ happens in exactly one place, trackError(). Of its six pre-existing call sites
+// FIVE are child-process events on the -p lanes; the sixth is callClaudeTui's catch, added by
+// ADR 0018 -- which is also where the rule these tests enforce is written down: stats.errors counts
+// "any upstream failure on either lane". A synchronous throw before those listeners exist -- the
 // #180/#193 shape, one counter over -- 500s the request and increments totalRequests while errors
 // and recentErrors both stay silent. An operator's /health then reads "N requests, 0 errors, no
 // recent errors" for requests that all failed.
@@ -4361,20 +4363,42 @@ ltTest("integration (#458): a 500 from a synchronous pre-spawn throw increments 
       const after = await fetch(`http://127.0.0.1:${port}/health`).then(x => x.json());
       assert.equal(after.stats.totalRequests, 1, `totalRequests should have counted the attempt: ${JSON.stringify(after.stats)}`);
       assert.equal(after.stats.errors, 1,
-        `the request 500'd but stats.errors is ${after.stats.errors}. Every trackError call site is ` +
-        `wired to a child-process event, and a synchronous throw happens before those listeners ` +
-        `exist — so /health reports "1 request, 0 errors" for a request that failed. Stats: ` +
+        `the request 500'd but stats.errors is ${after.stats.errors}. Five of trackError's six ` +
+        `pre-existing call sites are child-process events and the sixth is callClaudeTui's catch, ` +
+        `so a synchronous throw on THIS lane happens before any listener exists — /health then ` +
+        `reports "1 request, 0 errors" for a request that failed. Stats: ` +
         JSON.stringify(after.stats));
       assert.equal((after.recentErrors || []).length, 1,
         `recentErrors is the other half of trackError and is also empty: ${JSON.stringify(after.recentErrors)}`);
+
+      // The SAME lever on the streaming lane. callClaudeStreaming's spawn catch is a separate
+      // site, and while this test drove only the non-streaming lane a mutation deleting that
+      // site's trackError produced no red anywhere -- an unproven claim wearing a green suite
+      // (AGENTS.md: "an assertion that never EXECUTED is indistinguishable from one that passed").
+      // The spawn throws before any header is written, so this 500s as JSON rather than as SSE.
+      const rs = await ltPostStatus(port, { model: "sonnet", stream: true, messages: [{ role: "user", content: "hi" }] });
+      assert.equal(rs.status, 500, `the streaming lane should fail on the same unwritable TMPDIR — got ${rs.status}: ${rs.text.slice(0, 160)}`);
+      assert.match(rs.text, /ENOENT|no such file/i, `the streaming 500 is not the temp-file write failing: ${rs.text.slice(0, 160)}`);
+      const afterStream = await fetch(`http://127.0.0.1:${port}/health`).then(x => x.json());
+      assert.equal(afterStream.stats.errors, 2,
+        `the streaming lane's pre-spawn throw did not reach trackError: errors is ` +
+        `${afterStream.stats.errors}, expected 2 (one per lane). Stats: ${JSON.stringify(afterStream.stats)}`);
+      assert.equal((afterStream.recentErrors || []).length, 2,
+        `recentErrors did not follow the streaming lane: ${JSON.stringify(afterStream.recentErrors)}`);
     } finally { child.kill("SIGKILL"); await ltDrain(() => buf.closed, "prespawn-counted", 5000); }
   } finally { _ltRmRetry(dir); }
 });
 
 // The control, and it is not ceremony: a fix that counted EVERY request, or counted twice, would
-// pass the test above. Its own test body because the mutation that breaks it (count in the outer
-// handler's catch, which double-counts the child-process paths) leaves the one above green.
-ltTest("integration (#458 control): a SUCCESSFUL request leaves stats.errors at 0, and a child-process failure counts exactly once", async () => {
+// pass the test above. It gets its own test body because ONE mutation -- counting in the outer
+// handler's catch, which double-counts the child-process paths -- breaks a claim in each of them.
+// Co-located, the first assert to throw would end the body and the second claim would never run:
+// AGENTS.md's "Mutual" case, where ordering cannot help and only separate test() bodies can. The
+// measured M2 row is TWO failures rather than one, and that is the evidence for the separation.
+// (An earlier revision of this comment said the mutation "leaves the one above green". That was
+// true before the streaming lane and the exact-count assertions were added to it, and carrying it
+// forward would have been a rationale describing a superseded predicate.)
+ltTest("integration (#458 control): a SUCCESSFUL request leaves stats.errors at 0, and a NON-ZERO-EXIT child failure counts exactly once", async () => {
   if (!LT_POSIX) return;
   const dir = ltMkdir();
   // One fake, two behaviours by argv: the default spawn succeeds, but a request naming the
@@ -4413,6 +4437,14 @@ exit 0
         `counting requests, not failures.`);
 
       // Now the child-process failure path, which already reached trackError before #458.
+      //
+      // "NON-ZERO-EXIT" in this test's name is a deliberate scope limit, not filler. #460 measured
+      // two OTHER child failure kinds that this fake does not produce and that do NOT count once:
+      // a child that exits 0 while emitting {"type":"result","is_error":true} counts 0 here and 2
+      // on the streaming lane, and a spawn that fails asynchronously fires both 'error' and
+      // 'close' so one request counts 2. Both are pre-existing -- reproduced on v3.32.0 -- and
+      // neither is touched by #458. A control named "a child-process failure counts exactly once"
+      // would be asserting something false about the field it guards.
       const bad = await ltPostStatus(port, { model: "sonnet", messages: [{ role: "system", content: "FAIL-ME" }, { role: "user", content: "hi" }] });
       // 500 specifically, not merely "not 200": a 400 would mean the request was rejected before
       // the spawn and this lane was never exercised at all.

@@ -1980,9 +1980,21 @@ async function callClaude(model, messages, conversationId, keyName, res) {
     spawnDecision = await resolveSpawnDecision();
   } catch (err) {
     releaseSlot();
-    // #458, same lane one step earlier: resolveSpawnDecision can throw (it rethrows after
-    // releasing its fallback mutex), and that also 500s uncounted. BY INSPECTION, not measured --
-    // the TMPDIR lever reaches the spawn catch below, not this one.
+    // #458, same lane one step earlier. DEFENSIVE, AND UNREACHABLE IN THIS TREE -- it covers
+    // nothing today and no mutation can redden it, which is exactly why it has to say so. An
+    // earlier draft of this comment claimed resolveSpawnDecision "can throw", read straight off
+    // the rethrow arm: the AGENTS.md defect of describing a branch from its shape rather than
+    // from what can reach it. That rethrow is its only `throw`, and none of its five callees gets
+    // there -- getSpawnHomeMode wraps its one fallible call in try/catch, resolveSpawnToken is
+    // `try { ... } catch { return null }`, ensureSpawnHome delegates to prepareSpawnHome whose
+    // ENTIRE body is one try/catch, invalidateKeychainReadCache is a Map.clear(), and
+    // createSerialMutex's acquire() chains on a promise that is only ever RESOLVED.
+    //
+    // Negative control for the most plausible of the five, measured rather than argued: with
+    // $HOME/.ocp at 0500 and spawn-home deleted at runtime -- so prepareSpawnHome's mkdirSync
+    // takes EACCES -- the request gets PAST this catch and 500s downstream on `spawn ... ENOENT`.
+    // Kept because the rethrow exists so a FUTURE fallible call inside that try still releases the
+    // mutex; if one is ever added, this counts it.
     trackError(err.message);
     throw err;
   }
@@ -1994,18 +2006,29 @@ async function callClaude(model, messages, conversationId, keyName, res) {
       releaseSlot();
       // Spawn threw before cleanup() was wired → release the fallback mutex here so it never leaks.
       try { spawnDecision.releaseFallback?.(); } catch { /* best effort */ }
-      // #458: count it. Every OTHER failure of this lane reaches trackError through a child-process
-      // event ('exit'/'error'), but a SYNCHRONOUS throw here happens before those listeners exist,
-      // so the request 500s while stats.errors and recentErrors both stay silent. Measured: three
-      // requests under an unwritable TMPDIR gave totalRequests=3, oneOffRequests=3, errors=0 and
-      // recentErrors=[] -- an operator's /health showed three requests and no errors while all
-      // three had failed. Same shape as #180/#193's activeRequests leak, one counter over.
+      // #458: count it. trackError() is the ONLY place stats.errors++ happens. Of its six
+      // pre-existing call sites FIVE are child-process events on the -p lanes (two here, three in
+      // callClaudeStreaming); the sixth is callClaudeTui's catch, added by ADR 0018 -- which is
+      // also where the governing rule is written: stats.errors counts "any upstream failure on
+      // either lane". A SYNCHRONOUS throw here happens before any of those listeners exist, so the
+      // request 500s while stats.errors and recentErrors both stay silent, and that rule goes
+      // unmet. Measured: three requests under an unwritable TMPDIR gave totalRequests=3,
+      // oneOffRequests=3, errors=0 and recentErrors=[] -- /health read "three requests, no errors"
+      // for three requests that had all failed. #180/#193's activeRequests leak, one counter over.
       //
       // Counted HERE and not in the caller's catch: the child-process paths already call
-      // trackError and THEN reject (server.mjs, the `claude_exit` and proc.on("error") arms), so a
-      // trackError in the outer catch would double-count the common case. RequestDisconnectedError
-      // cannot reach here -- acquireClaudeSlot runs before this try -- so no exclusion is needed;
-      // adding one would be dead code.
+      // trackError and THEN reject (the `claude_exit` and proc.on("error") arms), so a trackError
+      // in the outer catch would double-count them -- proven by mutation, which reddens the
+      // control test rather than the main one.
+      //
+      // That is NOT the stronger claim that every child failure is counted exactly once today.
+      // #460 records three kinds where stats.errors is already wrong, all pre-existing and none of
+      // them touched here: an is_error result (child exits 0) counts 0 on this lane and 2 on the
+      // streaming one, and a spawn that fails ASYNCHRONOUSLY fires both 'error' and 'close', so
+      // one request counts 2 -- measured identically on v3.32.0, which is the attribution.
+      //
+      // RequestDisconnectedError cannot reach here -- acquireClaudeSlot runs before this try -- so
+      // no exclusion is needed; adding one would be dead code.
       trackError(err.message);
       return reject(err);
     }
@@ -2523,7 +2546,7 @@ async function callClaudeStreaming(model, messages, conversationId, res, authInf
     spawnDecision = await resolveSpawnDecision();
   } catch (err) {
     releaseSlot();
-    trackError(err.message); // #458 — by inspection, as in callClaude's twin.
+    trackError(err.message); // #458 — defensive and unreachable in this tree; see callClaude's twin.
     return jsonResponse(res, 500, { error: { message: sanitizeError(err.message), type: "proxy_error" } });
   }
   let ctx;
