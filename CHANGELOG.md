@@ -2,6 +2,40 @@
 
 ## Unreleased
 
+### Fixed
+
+- **`stats.errors` now moves by exactly one per failed request — it was wrong in both directions (#460).** [ADR 0018](docs/adr/0018-aggregate-counters-count-every-lane.md) defines the field as *"any upstream failure on either lane"*. Measured, one failed request moved it by **0, 1 or 2** depending on how it failed:
+
+  | failure | before | after |
+  |---|---|---|
+  | `is_error` result, **non-streaming** | **0** | 1 |
+  | `is_error` result, **streaming** | **2** | 1 |
+  | spawn fails **asynchronously** (`'error'` then `'close'`) | **2** | 1 |
+
+  All three predate #459 — the third reproduces identically against `server.mjs` at **v3.32.0**, with the same two `recentErrors` entries, which is the attribution rather than an assumption.
+
+  **The non-streaming case was worse than a miscount.** An `is_error` result is a *protocol* failure with a **zero exit code**, and `callClaude` had no `errored` flag — the one `callClaudeStreaming` already had. So its `close` handler read `code === 0` and took the **success** branch for a request that had just returned HTTP 500: measured, it logged **`claude_ok`**, recorded a per-model **success**, and told the **circuit breaker** the model was healthy. A model failing every request this way would never have tripped the breaker. Adding the flag fixes the counter and all three of those together.
+
+  **The double-counts are fixed by a per-request guard**, because that is the unit the field counts. `trackError()` is global and every arm of a lane calls it independently, so a failure tripping two arms counted twice. The guard is deliberately **not** inside `trackError()` — that function is also reached from `callClaudeTui` and from paths outside a request, and giving it hidden per-call-site state would make it lie to those callers.
+
+  **Class B.2, [ADR 0006](docs/adr/0006-openai-shim-scope.md) route (a).** No field is added, removed or renamed, and no documented *meaning* changes — the values stop being wrong under ADR 0018's unchanged rule. The #193 `activeRequests` precedent, not ADR 0010's changed-rule case. `docs/governance/b2-response-keys.json` is unaffected and ADR 0012 is not engaged. The counter reaches the wire on three surfaces (`/health`'s `stats.errors`, `/status`'s `requests.errors`, `/usage`'s `proxy.errors`), which were all wrong together.
+
+### Tests
+
+- **Three live-boot tests, and the third is the load-bearing one (#460).** Two drive an `is_error` result — a child that exits **0** while reporting failure, which is a different kind from #459's non-zero-exit fake and takes a different branch — and assert each lane counts exactly one. The non-streaming test additionally asserts the **log**, because `stats.errors` alone cannot distinguish "counted once" from "counted once *and still recorded a success*": it waits for `claude_exit` on **stderr** and asserts `claude_ok` is absent from **stdout**. Those are different streams because `logEvent` routes by level, and the first draft of that test asserted both against stdout and reported a missing `claude_exit` for a run where it had fired correctly.
+
+  The third is the control, and it guards against a fix far worse than the bug: **a *global* "already counted" flag would pass both tests above and then silence every subsequent request's error for the life of the process.** It drives failure → success → failure and asserts 1 → 1 → 2.
+
+  | row | mutation | reddens | `=== Results:` |
+  |---|---|---|---|
+  | — | baseline | — | **3 passed, 0 failed** |
+  | M1 | revert `server.mjs` to pre-fix | all three | 0 passed, 3 failed |
+  | M2 | drop only `callClaude`'s `errored = true` | the non-streaming test + the control | 1 passed, 2 failed |
+  | M3 | make the guard **global** instead of per-request | **the control alone**, on *"the SECOND failure did not count"* | 2 passed, 1 failed |
+
+  M3 is the row the control exists for: it is invisible to every single-request test.
+
+
 ### Added
 
 - **A boot-time `claude` capability gate — OCP now refuses to start against a CLI missing a flag it passes (#455).** OCP spawns `claude` on every request and had **no** gate for it. #453 sharpened that by depending on `--system-prompt-file`, which does not appear in `claude --help`'s option list at all. If a host's CLI lacked any flag OCP passes, every request 500s — loudly and self-namingly, but **per request**; nothing said so at boot, so the first person to notice was a user rather than the operator.

@@ -1969,6 +1969,23 @@ function spawnClaudeProcess(model, messages, conversationId, keyName, releaseSlo
 // can be cancelled the moment the client disconnects, instead of spawning claude for a dead
 // socket once a slot finally frees up.
 async function callClaude(model, messages, conversationId, keyName, res) {
+  // #460: stats.errors must move by exactly ONE per failed request, and before this it moved by
+  // 0, 1 or 2 depending on HOW the request failed. trackError() is global and every arm of this
+  // lane calls it independently, so a failure that trips two arms counted twice -- MEASURED: a
+  // spawn that fails asynchronously fires both 'error' and 'close', and one request moved the
+  // counter by 2 (reproduced identically on v3.32.0, so it long predates #459). ADR 0018 defines
+  // the field as "any upstream failure on either lane" -- one failure, one count.
+  //
+  // The guard is per-REQUEST because that is the unit the field counts. A global flag would
+  // silence concurrent requests' errors; a per-arm flag would not compose across arms, which is
+  // exactly the bug. It is deliberately NOT inside trackError(): that function is also reached
+  // from callClaudeTui and from paths outside a request, and giving it hidden per-call-site state
+  // would make it lie to those callers.
+  let errorCounted = false;
+  const countError = (msg) => { if (errorCounted) return; errorCounted = true; trackError(msg); };
+  // Mirrors callClaudeStreaming's flag of the same name: an is_error result is a PROTOCOL
+  // failure with a zero exit code, so the close handler cannot see it from `code` alone.
+  let errored = false;
   // FIX ⑥: acquire a concurrency slot first (queues up to CLAUDE_MAX_QUEUE; rejects with a
   // ConcurrencyOverflowError → 429 when the queue is full, or a RequestDisconnectedError (F2)
   // if the client goes away first). The release fn is passed into the spawn so the idempotent
@@ -2004,7 +2021,7 @@ async function callClaude(model, messages, conversationId, keyName, res) {
     // takes EACCES -- the request gets PAST this catch and 500s downstream on `spawn ... ENOENT`.
     // Kept because the rethrow exists so a FUTURE fallible call inside that try still releases the
     // mutex; if one is ever added, this counts it.
-    trackError(err.message);
+    countError(err.message);
     throw err;
   }
   return new Promise((resolve, reject) => {
@@ -2038,7 +2055,7 @@ async function callClaude(model, messages, conversationId, keyName, res) {
       //
       // RequestDisconnectedError cannot reach here -- acquireClaudeSlot runs before this try -- so
       // no exclusion is needed; adding one would be dead code.
-      trackError(err.message);
+      countError(err.message);
       return reject(err);
     }
 
@@ -2076,7 +2093,16 @@ async function callClaude(model, messages, conversationId, keyName, res) {
         } else if (parsed.stop) {
           resultEventSeen = true;
         } else if (parsed.error) {
-          // is_error result — treat as process error
+          // is_error result — treat as process error.
+          //
+          // #460: `errored` is set here for the same reason callClaudeStreaming sets it, and its
+          // absence on THIS lane was the whole defect. The child exits 0 (an is_error result is a
+          // PROTOCOL failure, not a process one), so without it the close handler below reads
+          // `code === 0` and takes the SUCCESS branch for a request that just 500'd -- measured:
+          // one such request logged `claude_ok`, recorded a per-model SUCCESS, told the circuit
+          // breaker the model was healthy, and left stats.errors at 0. A model failing every
+          // request this way would never trip the breaker.
+          errored = true;
           reject(new Error(String(parsed.error)));
         }
       }
@@ -2093,10 +2119,10 @@ async function callClaude(model, messages, conversationId, keyName, res) {
       cleanup();
       // Tolerate null exit code when result event was seen (sandbox-wrap noise, same
       // as OLP commit 2864275 — bwrap shell exits null after model completes).
-      if (code !== 0 && !resultEventSeen) {
+      if ((code !== 0 && !resultEventSeen) || errored) {
         recordModelError(cliModel, false);
-        logEvent("error", "claude_exit", { model: cliModel, code, signal: signal || "none", elapsed, stderr: stderr.slice(0, 300) });
-        trackError(stderr.slice(0, 300) || assembledText.slice(0, 300) || `claude exit ${code}`);
+        logEvent("error", "claude_exit", { model: cliModel, code, signal: signal || "none", elapsed, errored, stderr: stderr.slice(0, 300) });
+        countError(stderr.slice(0, 300) || assembledText.slice(0, 300) || `claude exit ${code}`);
         handleSessionFailure();
         reject(new Error(stderr.slice(0, 300) || assembledText.slice(0, 300) || `claude exit ${code}`));
       } else {
@@ -2111,7 +2137,7 @@ async function callClaude(model, messages, conversationId, keyName, res) {
     proc.on("error", (err) => {
       console.error(`[claude] spawn error: ${err.message}`);
       cleanup();
-      trackError(err.message);
+      countError(err.message);
       handleSessionFailure();
       reject(err);
     });
@@ -2527,6 +2553,20 @@ function startHeartbeat(res, intervalMs, sessionId) {
 // The result event triggers the stop/[DONE] sequence.
 // Reference: OLP ADR 0009 Amendment 1 + commits 97e7d16, 65f945c.
 async function callClaudeStreaming(model, messages, conversationId, res, authInfo = {}) {
+  // #460: stats.errors must move by exactly ONE per failed request, and before this it moved by
+  // 0, 1 or 2 depending on HOW the request failed. trackError() is global and every arm of this
+  // lane calls it independently, so a failure that trips two arms counted twice -- MEASURED: a
+  // spawn that fails asynchronously fires both 'error' and 'close', and one request moved the
+  // counter by 2 (reproduced identically on v3.32.0, so it long predates #459). ADR 0018 defines
+  // the field as "any upstream failure on either lane" -- one failure, one count.
+  //
+  // The guard is per-REQUEST because that is the unit the field counts. A global flag would
+  // silence concurrent requests' errors; a per-arm flag would not compose across arms, which is
+  // exactly the bug. It is deliberately NOT inside trackError(): that function is also reached
+  // from callClaudeTui and from paths outside a request, and giving it hidden per-call-site state
+  // would make it lie to those callers.
+  let errorCounted = false;
+  const countError = (msg) => { if (errorCounted) return; errorCounted = true; trackError(msg); };
   const id = `chatcmpl-${randomUUID()}`;
   const created = Math.floor(Date.now() / 1000);
 
@@ -2555,7 +2595,7 @@ async function callClaudeStreaming(model, messages, conversationId, res, authInf
     spawnDecision = await resolveSpawnDecision();
   } catch (err) {
     releaseSlot();
-    trackError(err.message); // #458 — defensive and unreachable in this tree; see callClaude's twin.
+    countError(err.message); // #458 — defensive and unreachable in this tree; see callClaude's twin.
     return jsonResponse(res, 500, { error: { message: sanitizeError(err.message), type: "proxy_error" } });
   }
   let ctx;
@@ -2566,7 +2606,7 @@ async function callClaudeStreaming(model, messages, conversationId, res, authInf
     // Spawn threw before cleanup() was wired → release the fallback mutex here so it never leaks.
     try { spawnDecision.releaseFallback?.(); } catch { /* best effort */ }
     // #458 — see the twin in callClaude for why this is counted here rather than in the caller.
-    trackError(err.message);
+    countError(err.message);
     return jsonResponse(res, 500, { error: { message: sanitizeError(err.message), type: "proxy_error" } });
   }
 
@@ -2664,7 +2704,7 @@ async function callClaudeStreaming(model, messages, conversationId, res, authInf
         errored = true;
         const errStr = String(parsed.error);
         logEvent("error", "claude_result_error", { model: cliModel, error: errStr.slice(0, 200) });
-        trackError(errStr.slice(0, 200));
+        countError(errStr.slice(0, 200));
         if (!headersSent && !res.writableEnded && !res.destroyed) {
           jsonResponse(res, 500, { error: { message: sanitizeError(errStr), type: "provider_error" } });
         } else if (!res.writableEnded && !res.destroyed) {
@@ -2697,7 +2737,7 @@ async function callClaudeStreaming(model, messages, conversationId, res, authInf
       recordModelError(cliModel, false);
       try { recordUsage({ keyId: authInfo.keyId, keyName: authInfo.keyName, model, promptChars: messages.reduce((a, m) => a + contentToText(m.content).length, 0), responseChars: 0, elapsedMs: elapsed, success: false }); } catch (e) { logEvent("error", "usage_record_failed", { error: e.message }); }
       logEvent("error", "claude_exit", { model: cliModel, code, signal: signal || "none", elapsed, errored, stderr: stderr.slice(0, 300) });
-      trackError(stderr.slice(0, 300) || `claude exit ${code}`);
+      countError(stderr.slice(0, 300) || `claude exit ${code}`);
       handleSessionFailure();
 
       // If the error was already sent inline (parsed.error branch above), the
@@ -2743,7 +2783,7 @@ async function callClaudeStreaming(model, messages, conversationId, res, authInf
     console.error(`[claude] spawn error: ${err.message}`);
     hb.stop();
     cleanup();
-    trackError(err.message);
+    countError(err.message);
     handleSessionFailure();
     if (!headersSent && !res.writableEnded && !res.destroyed) {
       jsonResponse(res, 500, { error: { message: sanitizeError(err.message), type: "proxy_error" } });
