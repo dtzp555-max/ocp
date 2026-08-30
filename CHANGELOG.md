@@ -2,6 +2,56 @@
 
 ## Unreleased
 
+### Added
+
+- **A boot-time `claude` capability gate — OCP now refuses to start against a CLI missing a flag it passes (#455).** OCP spawns `claude` on every request and had **no** gate for it. #453 sharpened that by depending on `--system-prompt-file`, which does not appear in `claude --help`'s option list at all. If a host's CLI lacked any flag OCP passes, every request 500s — loudly and self-namingly, but **per request**; nothing said so at boot, so the first person to notice was a user rather than the operator.
+
+  **Why a capability probe rather than a version floor.** A floor is a hard-coded number, and nobody has measured the real minimum — doing so means installing old CLI builds — so any floor written today would be a guess wearing a number, and 规则 5 asks what makes it stop being true. It would also be blind to the case that matters most: an upstream release that keeps the version climbing while removing or renaming a flag. The probe asks the question the code actually depends on, and cannot go stale. (Of the four options recorded on #455 — do nothing / floors-as-data / capability probe / version floor — this is option 3.)
+
+  **The instrument.** `claude` parses options *before* it validates their values, so pointing `--system-prompt-file` at a path that does not exist yields two cleanly distinguishable outcomes — and **both exit 1, so the message discriminates and the exit code does not**. Measured on `claude` 2.1.250, across all three argv shapes `buildCliArgs` can produce:
+
+  | outcome | text | time |
+  |---|---|---|
+  | every flag known | `Error: System prompt file not found: <path>` | 0.18–0.21 s |
+  | any flag unknown | `error: unknown option '--<flag>'` | 0.11 s |
+
+  No model turn is started, so the probe costs **no quota** — the CLI stops at argument validation.
+
+  **The argv is built by `buildCliArgs`, not retyped.** That is the load-bearing design choice rather than tidiness: a hand-written flag list is the #339 shape — it would drift from the call site silently, and would test flags this instance does not send while missing the ones it does. `buildCliArgs` reads `AUTH_MODE` and the tool settings at call time, so the probe covers exactly what **this** instance will spawn, including the `AUTH_MODE=multi` tool flags and the image-path `--input-format`. Add a flag there and it is gated with no second edit. Pinned by mutation **M5**: replacing the derivation with a hardcoded list reddens on `--tools`.
+
+  **Three verdicts, not two, and the asymmetry is the whole design.** Only an **observed** `unknown option` refuses a boot. A missing binary, a slow host, or an upstream rewording of the message is `inconclusive` — logged as `claude_capability_probe_inconclusive` and **booted**. So this gate can never brick a fleet on an ambiguous reading, and if `claude` reworders its message the gate degrades to a warning carrying the unrecognised text, which is the signal to update it. `AGENTS.md` asks of every branch whether it fires on something **observed** or something **absent**; the only branch here that can refuse fires on observation.
+
+  Opt out with **`OCP_SKIP_CAPABILITY_PROBE=1`**. The pure classifier lives in `lib/claude-capability.mjs` (unit-tested per verdict); the spawn and the exit stay in `server.mjs`, following `localToolsSafetyError` / `lib/host-gate.mjs`.
+
+  **Not endpoint-touching**: no request handler is modified and no response gains a field, so `docs/governance/b2-response-keys.json` is unaffected and ADR 0012 is not engaged.
+
+### Tests
+
+- **Four unit tests for the classifier and three live boots for the wiring (#455).** The unit tests give every verdict its own row, including the two that decide whether the gate is safe: **an empty world is `inconclusive`, never `present`** (a probe that never ran produces empty output, and empty output must not read as "the flags are fine"), and **`absent` wins over `present`** when both strings appear, because `absent` is the only verdict that refuses a boot and must not be reachable merely by falling through the success check.
+
+  The live boots pin the **wiring**, which is what #343's sweep is about — a correct helper whose call site silently stops consulting it would pass every unit test. One asserts a rejecting CLI refuses the boot **and that the `FATAL` names the flag**; one asserts an unrecognised result **boots** and logs the warning with the unrecognised text; one captures the probe's argv and asserts it carries `--input-format` and `--tools`, which only the real `buildCliArgs` would supply.
+
+  Mutation table, every row landing asserted (`mutated !== original`) and every restore from a `cmp`-verified file backup:
+
+  | row | mutation | reddens | `=== Results:` |
+  |---|---|---|---|
+  | M1 | delete the whole boot gate | both live boots + the argv pin | 4 passed, 3 failed |
+  | M2 | check `present` before `absent` | the ordering unit test | 6 passed, 1 failed |
+  | M3 | make `inconclusive` fatal too | the boots-anyway control | 6 passed, 1 failed |
+  | M4 | drop `streamJsonInput` from the probe | the argv pin, on `--input-format` | 6 passed, 1 failed |
+  | M5 | hardcode the probe argv (the #339 shape) | the argv pin, on `--tools` | 6 passed, 1 failed |
+  | M6 | let an empty world read as `present` | the empty-world test + the control | 5 passed, 2 failed |
+  | M7 | route `ETIMEDOUT` back through `error` | the budget-overrun boot | 8 passed, 1 failed |
+
+  `ltBoot` sets `OCP_SKIP_CAPABILITY_PROBE=1` in its base env **before** the `...env` spread, deliberately unlike `OCP_TUI_TMUX_BIN` which is pinned *after* it. The two want opposite things: the tmux pin exists so a test **cannot** reach the operator's real tmux, so it must win; this one exists only to keep an extra fake-`claude` spawn out of every other test's argv capture, and the tests that pin the gate have to be able to turn it back on. An unconditional pin here would make the gate untestable.
+
+  **A coverage claim that was exactly backwards, and is worth recording as such.** An earlier revision of this entry named `spawn-failed` as the unreachable branch. Measured: `spawnSync` reports a blown `timeout` as `error.code === "ETIMEDOUT"`, and the classifier checks `error` **before** `timedOut` — so `spawn-failed` was the branch a loaded host would hit *most often*, and `timeout` was the dead one. The call site now separates them (`ETIMEDOUT` → `timedOut`), `CLAUDE_CAPABILITY_PROBE_TIMEOUT_MS` makes the budget configurable so the branch is reachable from a test at a tolerable cost, and both halves are pinned — a unit test on the classifier and a live boot against a `sleep 30` stub at a 400 ms budget, asserting the log carries `"reason":"timeout"`. Mutation **M7** (route `ETIMEDOUT` back through `error`, the pre-fix shape) reddens that boot: `8 passed, 1 failed`.
+
+  **`-p x` was removed from the probe argv.** It appeared in exactly one place — the probe — and `buildCliArgs`' own header records that OCP stopped passing `-p` in the Phase 6c port. So the probe was depending on a flag production never sends, and a CLI that renamed `-p` would have refused a boot over it: the fail-closed direction this gate exists to avoid, introduced by hand-carrying an argv sketch from the issue into the one place this design argues nothing should be hand-carried. Measured without it: identical message, 174 ms, and an unknown flag still answers in 95 ms.
+
+  **Still not covered, stated so a green run is not mistaken for coverage:** the `spawn-failed` branch proper. An unreadable or missing `CLAUDE_BIN` is caught by an **earlier** boot gate (`is set but not executable`) — measured — so what remains is a spawn failure of some other kind, and no lever in this repo reaches it.
+
+
 ### Fixed
 
 - **A synchronous pre-spawn throw is now counted (#458).** `stats.errors++` happens in exactly one place, `trackError()`. Of its six pre-existing call sites **five** are child-process events on the `-p` lanes and the sixth is `callClaudeTui`'s `catch`, added by **[ADR 0018](docs/adr/0018-aggregate-counters-count-every-lane.md)** — which is also where the governing rule is written down: `stats.errors` counts *“any upstream failure on either lane”*. A throw out of `spawnClaudeProcess` — or out of `resolveSpawnDecision` one step earlier — happens *before* any of those listeners exist, so the request 500s while `stats.errors` and `recentErrors` both stay silent, and that rule goes unmet. Measured: three requests under an unwritable `TMPDIR` gave `totalRequests: 3`, `oneOffRequests: 3`, **`errors: 0`** and **`recentErrors: []`** — an operator's `/health` read *“three requests, no errors”* for three requests that had all failed. Same shape as #180/#193's `activeRequests` leak, one counter over; the counter reaches the wire on three surfaces (`/health`'s `stats.errors`, `/status`'s `requests.errors`, `/usage`'s `proxy.errors`), which all under-reported together. **Class B.2, [ADR 0006](docs/adr/0006-openai-shim-scope.md) route (a)**: the field's documented meaning — set by ADR 0018 — is unchanged and only its value stops under-reporting; the #193 precedent, not ADR 0010's changed-rule case. No field added, removed or renamed, so `docs/governance/b2-response-keys.json` is unaffected and ADR 0012 is not engaged. **Counted at the four `catch` sites that counted nothing, deliberately NOT in the caller's catch**: the child-process paths already call `trackError` and *then* reject, so counting in the handler would double-count them — proven by mutation (**M2**, which now reddens *both* tests; it reddened only the control before the main test gained its exact-count assertions). **Two of the four are `resolveSpawnDecision`'s, and they are unreachable in this tree** — defensive only, no mutation can redden them, and the comment says so rather than claiming coverage; the negative control is `$HOME/.ocp` at `0500`, which gets *past* that catch. No `RequestDisconnectedError` exclusion is added either: `acquireClaudeSlot` runs before all four sites, so an RDE cannot reach them and the guard would be dead code. **This is not a claim that every child failure now counts once** — #460 records three pre-existing kinds where `stats.errors` is still wrong (an `is_error` result counts **0** on the non-streaming lane and **2** on the streaming one; an asynchronously-failing spawn counts **2**, reproduced identically against `server.mjs` at v3.32.0), none of them touched here.

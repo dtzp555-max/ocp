@@ -3827,7 +3827,15 @@ async function ltDrain(cond, where, ms = 5000) {
   return ok;
 }
 function ltBoot(env, dir, nodeArgs = []) {
+  // #455: the boot capability probe is OFF for the harness by default, and deliberately BEFORE
+  // the `...env` spread rather than after it -- unlike OCP_TUI_TMUX_BIN below, which is pinned
+  // after. The two want opposite things. The tmux pin exists so a test CANNOT reach the
+  // operator's real tmux, so it must win. This one exists only to keep an extra fake-claude
+  // spawn out of every other test's argv capture, and the tests that PIN the gate have to be
+  // able to turn it back on -- an unconditional pin here would make the gate untestable, which
+  // is the failure this repo cares about more.
   const childEnv = { ...process.env, NODE_ENV: "test", OCP_DIR_OVERRIDE: dir, OCP_SKIP_AUTH_TEST: "1",
+           OCP_SKIP_CAPABILITY_PROBE: "1",
            CLAUDE_BIND: "127.0.0.1", CLAUDE_AUTH_MODE: "none", CLAUDE_CACHE_TTL: "0", CLAUDE_TIMEOUT: "4000", ...env };
   // #384: pinned here, in the BASE env, and applied AFTER the `...env` spread — deliberately,
   // on both counts.
@@ -4325,6 +4333,157 @@ ltTest("integration: boot gate REFUSES each unsafe config (multi / non-loopback 
         await ltDrain(() => buf.closed, "boot-gate-loop", 5000);
       }
     }
+  } finally { _ltRmRetry(dir); }
+});
+
+console.log("\nboot-time `claude` capability gate (#455):");
+
+// ── #455: OCP spawns `claude` on every request and had no gate for the flags it passes ────────
+//
+// The pure classifier is unit-tested first (cheap, and every verdict gets a row), then the WIRING
+// is pinned by live boots -- because #343's sweep is exactly about a correct helper whose call
+// site silently stops consulting it, and a classifier nobody calls would pass every unit test.
+
+import { classifyCapabilityProbe, capabilityBootError } from "./lib/claude-capability.mjs";
+
+test("#455 classifier: an observed `unknown option` is ABSENT, and names the flag", () => {
+  const v = classifyCapabilityProbe({ stderr: "error: unknown option '--no-session-persistence'\n" });
+  assert.equal(v.verdict, "absent");
+  // The flag NAME is the whole value of the gate: the operator has to learn WHICH flag at boot
+  // instead of a user learning it per request. A verdict without it would be no better than the
+  // per-request 500 this replaces.
+  assert.equal(v.flag, "--no-session-persistence");
+  assert.match(capabilityBootError({ flag: v.flag, bin: "/x/claude" }), /--no-session-persistence/);
+});
+
+test("#455 classifier: the success message is PRESENT", () => {
+  assert.equal(classifyCapabilityProbe({ stderr: "Error: System prompt file not found: /a/b.txt\n" }).verdict, "present");
+});
+
+test("#455 classifier: a blown BUDGET is reported as a timeout, not as a generic spawn failure", () => {
+  // The distinction is not cosmetic: `spawn-failed` and `timeout` mean different things to an
+  // operator, and spawnSync reports a blown budget as error.code === "ETIMEDOUT" -- which
+  // classifyCapabilityProbe checks BEFORE `timedOut`. Routing it through `error` would make every
+  // overrun read as a spawn failure and leave this branch dead. server.mjs separates them at the
+  // call site; this pins the classifier half.
+  assert.equal(classifyCapabilityProbe({ timedOut: true }).reason, "timeout");
+  assert.equal(classifyCapabilityProbe({ error: new Error("spawn ENOENT") }).reason, "spawn-failed");
+});
+
+ltTest("integration (#455): a probe that OVERRUNS its budget warns and boots, reported as a timeout", async () => {
+  if (!LT_POSIX) return;
+  const dir = ltMkdir();
+  try {
+    const fake = join(dir, "claude-slow");
+    _ltWrite(fake, `#!/bin/sh\nsleep 30\n`);
+    _ltChmod(fake, 0o755);
+    // The budget is env-configurable precisely so this branch is reachable at a tolerable cost;
+    // at the 10s default this test would dominate the suite.
+    const { child, buf } = await ltBootFresh(
+      { CLAUDE_BIN: fake, OCP_SKIP_CAPABILITY_PROBE: "0", CLAUDE_CAPABILITY_PROBE_TIMEOUT_MS: "400" }, dir);
+    try {
+      assert.ok(await ltWait(() => buf.out.includes("listening on")), `a slow probe must not block the boot — ${ltDiag(buf)}`);
+      const log = buf.out + buf.err;
+      assert.match(log, /claude_capability_probe_inconclusive/, `— ${ltDiag(buf)}`);
+      // The REASON is the claim: "timeout", not "spawn-failed". An earlier revision of this change
+      // routed ETIMEDOUT through `error` and would have logged the latter.
+      assert.match(log, /"reason":"timeout"/, `a budget overrun must be reported as a timeout — ${ltDiag(buf)}`);
+    } finally { child.kill("SIGKILL"); await ltDrain(() => buf.closed, "capability-slow", 5000); }
+  } finally { _ltRmRetry(dir); }
+});
+
+test("#455 classifier: an EMPTY world is inconclusive, never present", () => {
+  // The one that matters most. A probe that never ran produces empty output, and empty output
+  // must not be readable as "the flags are fine" -- AGENTS.md's negative-checks rule, at the
+  // exact place where a wrong answer would disarm the gate silently.
+  for (const [label, r] of [
+    ["no output at all", { stdout: "", stderr: "" }],
+    ["spawn failed", { error: new Error("spawn ENOENT") }],
+    ["timed out", { timedOut: true }],
+    ["a fake claude's canned JSON", { stdout: '{"type":"result"}\n' }],
+    ["a future rewording", { stderr: "the system prompt file could not be located\n" }],
+  ]) {
+    const v = classifyCapabilityProbe(r);
+    assert.equal(v.verdict, "inconclusive", `${label} should be inconclusive, got ${JSON.stringify(v)}`);
+    assert.notEqual(v.verdict, "present", `${label} must never read as present`);
+  }
+});
+
+test("#455 classifier: ABSENT wins over PRESENT when both strings appear", () => {
+  // Ordering is load-bearing: `absent` is the only verdict that refuses a boot, so it must not be
+  // reachable only by falling through the success check.
+  const v = classifyCapabilityProbe({ stderr: "error: unknown option '--tools'\nError: System prompt file not found: /x\n" });
+  assert.equal(v.verdict, "absent");
+  assert.equal(v.flag, "--tools");
+});
+
+ltTest("integration (#455): a `claude` that REJECTS a flag OCP passes refuses the boot and names it", async () => {
+  if (!LT_POSIX) return;
+  const dir = ltMkdir();
+  try {
+    const fake = join(dir, "claude-absent");
+    _ltWrite(fake, `#!/bin/sh\necho "error: unknown option '--system-prompt-file'" >&2\nexit 1\n`);
+    _ltChmod(fake, 0o755);
+    // OCP_SKIP_CAPABILITY_PROBE is "1" in ltBoot's base env; this test turns the gate back ON.
+    const { child, buf } = await ltBootFresh({ CLAUDE_BIN: fake, OCP_SKIP_CAPABILITY_PROBE: "0" }, dir);
+    try {
+      assert.ok(await ltWait(() => buf.closed || /FATAL/.test(buf.err)), `no verdict — ${ltDiag(buf)}`);
+      await ltDrain(() => buf.closed, "capability-absent", 5000);
+      assert.notEqual(buf.exit, 0, `must exit non-zero — ${ltDiag(buf)}`);
+      assert.match(buf.err, /FATAL[\s\S]*--system-prompt-file/, `the FATAL must NAME the flag — ${ltDiag(buf)}`);
+      assert.match(buf.err, /Refusing to start/, `— ${ltDiag(buf)}`);
+      assert.ok(!/listening on/.test(buf.out), `it must not have served anything — ${ltDiag(buf)}`);
+    } finally { child.kill("SIGKILL"); }
+  } finally { _ltRmRetry(dir); }
+});
+
+ltTest("integration (#455 control): an UNRECOGNISED probe result warns and BOOTS — only observed absence refuses", async () => {
+  if (!LT_POSIX) return;
+  const dir = ltMkdir();
+  try {
+    const fake = join(dir, "claude-weird");
+    _ltWrite(fake, `#!/bin/sh\necho "some future wording nobody planned for" >&2\nexit 1\n`);
+    _ltChmod(fake, 0o755);
+    const { child, buf } = await ltBootFresh({ CLAUDE_BIN: fake, OCP_SKIP_CAPABILITY_PROBE: "0" }, dir);
+    try {
+      assert.ok(await ltWait(() => buf.out.includes("listening on")), `it must still boot — ${ltDiag(buf)}`);
+      // Positive evidence that the probe RAN and reached the inconclusive arm, not merely that
+      // nothing went wrong: an assertion satisfied by a gate that never executed would be the
+      // same silence as one that passed.
+      assert.match(buf.out + buf.err, /claude_capability_probe_inconclusive/, `— ${ltDiag(buf)}`);
+      assert.match(buf.out + buf.err, /some future wording/, `the warning must carry the unrecognised text — ${ltDiag(buf)}`);
+    } finally { child.kill("SIGKILL"); await ltDrain(() => buf.closed, "capability-weird", 5000); }
+  } finally { _ltRmRetry(dir); }
+});
+
+ltTest("integration (#455): the probe reads the REAL buildCliArgs, so a flag added there is gated with no second edit", async () => {
+  if (!LT_POSIX) return;
+  const dir = ltMkdir();
+  try {
+    // The fake echoes its own argv and then answers as a capable claude would. That pins the
+    // WIRING rather than the classifier: it proves the probe spawns the argv production builds,
+    // including the AUTH_MODE-conditional tool flags and the image-path --input-format, instead
+    // of a hand-written list that would drift from the call site (the #339 shape).
+    const fake = join(dir, "claude-argv");
+    const log = join(dir, "argv.log");
+    _ltWrite(fake, `#!/bin/sh\nprintf '%s\\n' "$@" >> ${JSON.stringify(log)}\necho "Error: System prompt file not found: /x" >&2\nexit 1\n`);
+    _ltChmod(fake, 0o755);
+    const { child, buf } = await ltBootFresh(
+      { CLAUDE_BIN: fake, OCP_SKIP_CAPABILITY_PROBE: "0", CLAUDE_AUTH_MODE: "multi", PROXY_ANONYMOUS_KEY: "" }, dir);
+    try {
+      assert.ok(await ltWait(() => buf.out.includes("listening on")), `— ${ltDiag(buf)}`);
+      assert.ok(await ltWait(() => _ltExists(log)), `the probe never spawned the binary — ${ltDiag(buf)}`);
+      const argv = _ltRead(log, "utf8").split("\n").filter(Boolean);
+      // Premise first: the capture must be non-empty, or every absence assertion below is
+      // satisfied by an empty world.
+      assert.ok(argv.length > 0, `empty argv capture — ${ltDiag(buf)}`);
+      assert.ok(argv.includes("--system-prompt-file"), `argv: ${JSON.stringify(argv)}`);
+      // The two that prove it came from buildCliArgs rather than a literal list: --input-format
+      // is the per-request image path, and --tools is AUTH_MODE-conditional. A hand-written
+      // probe would have had to know about both.
+      assert.ok(argv.includes("--input-format"), `--input-format missing, so streamJsonInput was not requested: ${JSON.stringify(argv)}`);
+      assert.ok(argv.includes("--tools"), `--tools missing, so the AUTH_MODE=multi branch was not consulted: ${JSON.stringify(argv)}`);
+    } finally { child.kill("SIGKILL"); await ltDrain(() => buf.closed, "capability-argv", 5000); }
   } finally { _ltRmRetry(dir); }
 });
 
