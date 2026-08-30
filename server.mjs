@@ -1987,8 +1987,11 @@ async function callClaude(model, messages, conversationId, keyName, res) {
     // from what can reach it. That rethrow is its only `throw`, and none of its five callees gets
     // there -- getSpawnHomeMode wraps its one fallible call in try/catch, resolveSpawnToken is
     // `try { ... } catch { return null }`, ensureSpawnHome delegates to prepareSpawnHome whose
-    // ENTIRE body is one try/catch, invalidateKeychainReadCache is a Map.clear(), and
-    // createSerialMutex's acquire() chains on a promise that is only ever RESOLVED.
+    // ENTIRE body is one try/catch, invalidateKeychainReadCache is `_keychainCache.clear()` --
+    // createTtlCache's clear (lib/spawn-auth.mjs), three closure-variable assignments, NOT a Map
+    // despite the `.clear()` shape, which is this file's own "read what assigns the value, not what
+    // it is called" applied to an enumeration meant to be re-derived -- and createSerialMutex's
+    // acquire() chains on a promise that is only ever RESOLVED.
     //
     // Negative control for the most plausible of the five, measured rather than argued: with
     // $HOME/.ocp at 0500 and spawn-home deleted at runtime -- so prepareSpawnHome's mkdirSync
