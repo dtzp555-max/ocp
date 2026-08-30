@@ -4360,6 +4360,38 @@ test("#455 classifier: the success message is PRESENT", () => {
   assert.equal(classifyCapabilityProbe({ stderr: "Error: System prompt file not found: /a/b.txt\n" }).verdict, "present");
 });
 
+test("#455 classifier: a blown BUDGET is reported as a timeout, not as a generic spawn failure", () => {
+  // The distinction is not cosmetic: `spawn-failed` and `timeout` mean different things to an
+  // operator, and spawnSync reports a blown budget as error.code === "ETIMEDOUT" -- which
+  // classifyCapabilityProbe checks BEFORE `timedOut`. Routing it through `error` would make every
+  // overrun read as a spawn failure and leave this branch dead. server.mjs separates them at the
+  // call site; this pins the classifier half.
+  assert.equal(classifyCapabilityProbe({ timedOut: true }).reason, "timeout");
+  assert.equal(classifyCapabilityProbe({ error: new Error("spawn ENOENT") }).reason, "spawn-failed");
+});
+
+ltTest("integration (#455): a probe that OVERRUNS its budget warns and boots, reported as a timeout", async () => {
+  if (!LT_POSIX) return;
+  const dir = ltMkdir();
+  try {
+    const fake = join(dir, "claude-slow");
+    _ltWrite(fake, `#!/bin/sh\nsleep 30\n`);
+    _ltChmod(fake, 0o755);
+    // The budget is env-configurable precisely so this branch is reachable at a tolerable cost;
+    // at the 10s default this test would dominate the suite.
+    const { child, buf } = await ltBootFresh(
+      { CLAUDE_BIN: fake, OCP_SKIP_CAPABILITY_PROBE: "0", CLAUDE_CAPABILITY_PROBE_TIMEOUT_MS: "400" }, dir);
+    try {
+      assert.ok(await ltWait(() => buf.out.includes("listening on")), `a slow probe must not block the boot — ${ltDiag(buf)}`);
+      const log = buf.out + buf.err;
+      assert.match(log, /claude_capability_probe_inconclusive/, `— ${ltDiag(buf)}`);
+      // The REASON is the claim: "timeout", not "spawn-failed". An earlier revision of this change
+      // routed ETIMEDOUT through `error` and would have logged the latter.
+      assert.match(log, /"reason":"timeout"/, `a budget overrun must be reported as a timeout — ${ltDiag(buf)}`);
+    } finally { child.kill("SIGKILL"); await ltDrain(() => buf.closed, "capability-slow", 5000); }
+  } finally { _ltRmRetry(dir); }
+});
+
 test("#455 classifier: an EMPTY world is inconclusive, never present", () => {
   // The one that matters most. A probe that never ran produces empty output, and empty output
   // must not be readable as "the flags are fine" -- AGENTS.md's negative-checks rule, at the

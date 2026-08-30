@@ -3114,7 +3114,10 @@ const KEYCHAIN_CACHE_TTL_MS = 30 * 1000;
 // silently turn the gate off on a loaded host rather than failing visibly. EXPIRY: if the probe
 // ever starts a model turn -- i.e. if `claude` stops validating options before values -- this
 // budget is the wrong shape entirely and the probe needs rethinking, not a bigger number.
-const CAPABILITY_PROBE_TIMEOUT_MS = 10000;
+// Env-configurable for the same reason the other *_TIMEOUT_MS here are: without it the `timeout`
+// verdict is unreachable from a test at any tolerable cost, and an unreachable branch is one this
+// repo has been bitten by twice (#324, ADR 0014).
+const CAPABILITY_PROBE_TIMEOUT_MS = parseIntEnv("CLAUDE_CAPABILITY_PROBE_TIMEOUT_MS", 10000);
 const _keychainCache = createTtlCache({ ttlMs: KEYCHAIN_CACHE_TTL_MS });
 let _lastGoodKeychainLabel = null;
 
@@ -4851,28 +4854,42 @@ if (process.env.OCP_SKIP_CAPABILITY_PROBE !== "1") {
   // the same ordering the probe relies on for its verdict -- but a hardcoded id would be a second
   // place model names live, and this repo has exactly one.
   const probeModel = MODEL_MAP["sonnet"] || MODELS[0]?.id || "sonnet";
-  const probeArgs = [...buildCliArgs(probeModel, probePath, { streamJsonInput: true }), "-p", "x"];
+  // buildCliArgs' output VERBATIM, with nothing appended. An earlier revision added `-p x`,
+  // carried over by hand from the argv sketched in #455 -- into the one place this design argues
+  // nothing should be hand-carried. `grep -n '"-p"' server.mjs` returns only that line: OCP does
+  // NOT pass -p in production (buildCliArgs' header records its removal in the Phase 6c port), so
+  // the probe was depending on a flag the proxy never sends, and a CLI that renamed -p would have
+  // refused a boot over it -- the fail-closed direction this gate exists to avoid. [measured]
+  // without it the probe is unchanged: 174ms, same `System prompt file not found`, status 1, and
+  // an unknown flag still answers `unknown option` in 95ms.
+  const probeArgs = buildCliArgs(probeModel, probePath, { streamJsonInput: true });
   let probe;
   try {
     probe = spawnSync(CLAUDE, probeArgs, {
       encoding: "utf8",
       timeout: CAPABILITY_PROBE_TIMEOUT_MS,
-      // Measured at 0.18-0.21s for the success path; the timeout is two orders of magnitude
-      // above that so a loaded host warns rather than refusing. stdin closed: the CLI must not
-      // wait on it (--input-format stream-json would).
+      // The budget is ~50x the observed cost (see CAPABILITY_PROBE_TIMEOUT_MS), so a loaded host
+      // warns rather than refusing. An earlier revision said "two orders of magnitude" here while
+      // the constant's own comment said ~50x -- two numbers for one ratio, in one commit, and the
+      // one here was the wrong one. stdin closed: the CLI must not wait on it, which
+      // --input-format stream-json otherwise would.
       stdio: ["ignore", "pipe", "pipe"],
       env: scrubInboundAuthEnv(process.env),
     });
   } catch (e) {
     probe = { error: e };
   }
+  // [measured] spawnSync reports a blown `timeout` as error.code === "ETIMEDOUT" (with signal
+  // SIGTERM and status null), and classifyCapabilityProbe checks `error` BEFORE `timedOut` -- so
+  // routing it through `error` would label every budget overrun `spawn-failed` and leave the
+  // `timeout` branch dead. An earlier revision did exactly that and then claimed the OPPOSITE in
+  // its coverage note. Separate them here, at the only place that can tell them apart.
+  const timedOut = probe?.error?.code === "ETIMEDOUT";
   const verdict = classifyCapabilityProbe({
     stdout: probe?.stdout || "",
     stderr: probe?.stderr || "",
-    error: probe?.error || null,
-    // spawnSync reports a timeout as signal SIGTERM with an error; check both so a kill that
-    // arrives without an error object is still not read as output.
-    timedOut: probe?.signal === "SIGTERM" && !probe?.stdout && !probe?.stderr,
+    error: timedOut ? null : (probe?.error || null),
+    timedOut,
   });
   if (verdict.verdict === "absent") {
     console.error(`FATAL: ${capabilityBootError({ flag: verdict.flag, bin: CLAUDE })}\n  Refusing to start.`);

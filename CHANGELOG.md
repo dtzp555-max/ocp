@@ -41,10 +41,15 @@
   | M4 | drop `streamJsonInput` from the probe | the argv pin, on `--input-format` | 6 passed, 1 failed |
   | M5 | hardcode the probe argv (the #339 shape) | the argv pin, on `--tools` | 6 passed, 1 failed |
   | M6 | let an empty world read as `present` | the empty-world test + the control | 5 passed, 2 failed |
+  | M7 | route `ETIMEDOUT` back through `error` | the budget-overrun boot | 8 passed, 1 failed |
 
   `ltBoot` sets `OCP_SKIP_CAPABILITY_PROBE=1` in its base env **before** the `...env` spread, deliberately unlike `OCP_TUI_TMUX_BIN` which is pinned *after* it. The two want opposite things: the tmux pin exists so a test **cannot** reach the operator's real tmux, so it must win; this one exists only to keep an extra fake-`claude` spawn out of every other test's argv capture, and the tests that pin the gate have to be able to turn it back on. An unconditional pin here would make the gate untestable.
 
-  **Not covered, stated so a green run is not mistaken for coverage:** the classifier's `spawn-failed` branch. An unreadable or missing `CLAUDE_BIN` is caught by an **earlier** boot gate (`is set but not executable`), measured — so that branch is defensive against a spawn failure of some other kind, and no lever in this repo reaches it.
+  **A coverage claim that was exactly backwards, and is worth recording as such.** An earlier revision of this entry named `spawn-failed` as the unreachable branch. Measured: `spawnSync` reports a blown `timeout` as `error.code === "ETIMEDOUT"`, and the classifier checks `error` **before** `timedOut` — so `spawn-failed` was the branch a loaded host would hit *most often*, and `timeout` was the dead one. The call site now separates them (`ETIMEDOUT` → `timedOut`), `CLAUDE_CAPABILITY_PROBE_TIMEOUT_MS` makes the budget configurable so the branch is reachable from a test at a tolerable cost, and both halves are pinned — a unit test on the classifier and a live boot against a `sleep 30` stub at a 400 ms budget, asserting the log carries `"reason":"timeout"`. Mutation **M7** (route `ETIMEDOUT` back through `error`, the pre-fix shape) reddens that boot: `8 passed, 1 failed`.
+
+  **`-p x` was removed from the probe argv.** It appeared in exactly one place — the probe — and `buildCliArgs`' own header records that OCP stopped passing `-p` in the Phase 6c port. So the probe was depending on a flag production never sends, and a CLI that renamed `-p` would have refused a boot over it: the fail-closed direction this gate exists to avoid, introduced by hand-carrying an argv sketch from the issue into the one place this design argues nothing should be hand-carried. Measured without it: identical message, 174 ms, and an unknown flag still answers in 95 ms.
+
+  **Still not covered, stated so a green run is not mistaken for coverage:** the `spawn-failed` branch proper. An unreadable or missing `CLAUDE_BIN` is caught by an **earlier** boot gate (`is set but not executable`) — measured — so what remains is a spawn failure of some other kind, and no lever in this repo reaches it.
 
 
 ### Fixed
