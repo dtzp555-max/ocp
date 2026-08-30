@@ -2098,11 +2098,31 @@ async function callClaude(model, messages, conversationId, keyName, res) {
           // #460: `errored` is set here for the same reason callClaudeStreaming sets it, and its
           // absence on THIS lane was the whole defect. The child exits 0 (an is_error result is a
           // PROTOCOL failure, not a process one), so without it the close handler below reads
-          // `code === 0` and takes the SUCCESS branch for a request that just 500'd -- measured:
-          // one such request logged `claude_ok`, recorded a per-model SUCCESS, told the circuit
-          // breaker the model was healthy, and left stats.errors at 0. A model failing every
-          // request this way would never trip the breaker.
+          // `code === 0` and takes the SUCCESS branch for a request that just 500'd. [measured]
+          // one such request left stats.errors at 0, logged `claude_ok`, recorded a per-model
+          // SUCCESS, and called noteAuthVerifiedByRequest() -- which is wire-visible: /health
+          // reported auth.ok=true, okSource="request", "verified by a completed request", for a
+          // request that returned 500. ADR 0014 is the authority and its rule is ONE SENTENCE with
+          // two halves: "A request that reaches the model AND SUCCEEDS proves the credential is
+          // valid. A request that FAILS proves something, and OCP already counts those
+          // (stats.errors, recentErrors)." This flag brings both halves into conformance at once.
+          //
+          // NOT a claim about the circuit breaker. breakerRecordSuccess is an EMPTY STUB
+          // (server.mjs, `function breakerRecordSuccess(_cliModel) {}`; the breaker was removed in
+          // v2.5.0 and /health reports circuitBreaker "disabled"), and there is no failure
+          // recorder at all -- so "this would never trip the breaker" is true of EVERY failure and
+          // says nothing about this one. An earlier revision of this comment claimed it as a
+          // consequence of the missing flag, stamped [measured], with no observable that would
+          // differ. Read what assigns the value, not what it is called.
           errored = true;
+          // #460 F5: count it HERE, with the upstream's own message, mirroring
+          // callClaudeStreaming's parsed.error arm. Without this the close handler counts it
+          // instead and records `claude exit 0` -- an operator-facing string that carries no
+          // diagnostic and reads as a SUCCESSFUL exit, for the failure it is reporting. Free of
+          // double-counting precisely because of the per-request guard above: the close handler's
+          // countError becomes a no-op. That is the guard paying for itself rather than merely
+          // preventing a regression.
+          countError(String(parsed.error).slice(0, 200));
           reject(new Error(String(parsed.error)));
         }
       }

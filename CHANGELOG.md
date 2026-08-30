@@ -14,26 +14,44 @@
 
   All three predate #459 — the third reproduces identically against `server.mjs` at **v3.32.0**, with the same two `recentErrors` entries, which is the attribution rather than an assumption.
 
-  **The non-streaming case was worse than a miscount.** An `is_error` result is a *protocol* failure with a **zero exit code**, and `callClaude` had no `errored` flag — the one `callClaudeStreaming` already had. So its `close` handler read `code === 0` and took the **success** branch for a request that had just returned HTTP 500: measured, it logged **`claude_ok`**, recorded a per-model **success**, and told the **circuit breaker** the model was healthy. A model failing every request this way would never have tripped the breaker. Adding the flag fixes the counter and all three of those together.
+  **The non-streaming case was worse than a miscount.** An `is_error` result is a *protocol* failure with a **zero exit code**, and `callClaude` had no `errored` flag — the one `callClaudeStreaming` already had. So its `close` handler read `code === 0` and took the **success** branch for a request that had just returned HTTP 500. Measured, that request also logged **`claude_ok`**, recorded a per-model **success**, and called `noteAuthVerifiedByRequest()` — which is **wire-visible**:
+
+  | after one `is_error` request that returned **500** | `/health` `auth` |
+  |---|---|
+  | before | `ok: true`, `okSource: "request"`, *"verified by a completed request"* |
+  | after | `ok: null`, `okSource: "none"` |
+
+  That last one is governed by **[ADR 0014](docs/adr/0014-auth-verdict-measures-what-it-measured.md)**, whose rule is a single sentence with two halves: *"A request that reaches the model **and succeeds** proves the credential is valid. A request that **fails** proves something, and OCP already counts those (`stats.errors`, `recentErrors`)."* This one flag brings **both halves** into conformance — which is a stronger argument for the change than the one an earlier draft of this entry made, and is route (a) for the same reason: the rule is unchanged and the code was not implementing it.
+
+  **A retraction, recorded rather than quietly dropped.** That earlier draft also said the request *"told the **circuit breaker** the model was healthy"* and that *"a model failing every request this way would never have tripped the breaker."* **False as a consequence of this bug.** `breakerRecordSuccess` is an **empty stub** — the breaker was removed in v2.5.0, `/health` reports `circuitBreaker: "disabled"`, and there is no failure recorder anywhere (`grep -rnE 'breakerRecord(Error|Failure)|breakerTrip|breakerOpen'` exits 1, with `breakerRecordSuccess` as a positive control at exit 0). So the sentence is true of **every** failure in **every** lane and says nothing about this one. It was read off the function's *name*, and stamped `[measured]` with no observable that would differ.
 
   **The double-counts are fixed by a per-request guard**, because that is the unit the field counts. `trackError()` is global and every arm of a lane calls it independently, so a failure tripping two arms counted twice. The guard is deliberately **not** inside `trackError()` — that function is also reached from `callClaudeTui` and from paths outside a request, and giving it hidden per-call-site state would make it lie to those callers.
+
+  **`recentErrors` now carries the upstream's own message on both lanes.** The non-streaming arm counted from the `close` handler, so an `is_error` failure was recorded as `"claude exit 0"` — a string with no diagnostic value that reads as a *successful* exit, for the failure it is reporting. It now counts in the `parsed.error` arm with the upstream text, mirroring the streaming lane. **This is free of double-counting precisely because of the per-request guard** — the `close` handler's later call becomes a no-op — which is the guard paying for itself rather than merely preventing a regression.
 
   **Class B.2, [ADR 0006](docs/adr/0006-openai-shim-scope.md) route (a).** No field is added, removed or renamed, and no documented *meaning* changes — the values stop being wrong under ADR 0018's unchanged rule. The #193 `activeRequests` precedent, not ADR 0010's changed-rule case. `docs/governance/b2-response-keys.json` is unaffected and ADR 0012 is not engaged. The counter reaches the wire on three surfaces (`/health`'s `stats.errors`, `/status`'s `requests.errors`, `/usage`'s `proxy.errors`), which were all wrong together.
 
 ### Tests
 
-- **Three live-boot tests, and the third is the load-bearing one (#460).** Two drive an `is_error` result — a child that exits **0** while reporting failure, which is a different kind from #459's non-zero-exit fake and takes a different branch — and assert each lane counts exactly one. The non-streaming test additionally asserts the **log**, because `stats.errors` alone cannot distinguish "counted once" from "counted once *and still recorded a success*": it waits for `claude_exit` on **stderr** and asserts `claude_ok` is absent from **stdout**. Those are different streams because `logEvent` routes by level, and the first draft of that test asserted both against stdout and reported a missing `claude_exit` for a run where it had fired correctly.
+- **Five live-boot tests (#460).** Two drive an `is_error` result — a child that exits **0** while reporting failure, which is a different kind from #459's non-zero-exit fake and takes a different branch — and assert each lane counts exactly one. The non-streaming test additionally asserts the **log**, because `stats.errors` alone cannot distinguish "counted once" from "counted once *and still recorded a success*": it waits for `claude_exit` on **stderr** and asserts `claude_ok` is absent from **stdout**. Those are different streams because `logEvent` routes by level, and the first draft of that test asserted both against stdout and reported a missing `claude_exit` for a run where it had fired correctly.
 
   The third is the control, and it guards against a fix far worse than the bug: **a *global* "already counted" flag would pass both tests above and then silence every subsequent request's error for the life of the process.** It drives failure → success → failure and asserts 1 → 1 → 2.
 
   | row | mutation | reddens | `=== Results:` |
   |---|---|---|---|
-  | — | baseline | — | **3 passed, 0 failed** |
-  | M1 | revert `server.mjs` to pre-fix | all three | 0 passed, 3 failed |
-  | M2 | drop only `callClaude`'s `errored = true` | the non-streaming test + the control | 1 passed, 2 failed |
-  | M3 | make the guard **global** instead of per-request | **the control alone**, on *"the SECOND failure did not count"* | 2 passed, 1 failed |
+  | — | baseline | — | **5 passed, 0 failed** |
+  | M1 | revert `server.mjs` to pre-fix | **all five** | 0 passed, 5 failed |
+  | M2 | drop only `callClaude`'s `errored = true` | **the success test alone** | 4 passed, 1 failed |
+  | M3 | make the guard **global** instead of per-request | **the control alone** | 4 passed, 1 failed |
+  | M4 | neuter **only** `callClaude`'s guard | non-streaming + **spawn-failure** + control | 2 passed, 3 failed |
+  | M5 | drop `\|\| errored` from the close condition | **the success test alone** | 4 passed, 1 failed |
 
-  M3 is the row the control exists for: it is invisible to every single-request test.
+  Every row was re-measured against the final five tests rather than carried forward, and **M2's reach shrank in the process** — worth recording, because it is exactly what a carried-forward table hides. Before the `recentErrors` change below, dropping `errored` also broke the counter; after it the `parsed.error` arm counts directly, so `errored`'s only remaining job is suppressing the success branch, and M2 now reddens precisely the test for that.
+
+  **M3 is the row the control exists for** — invisible to every single-request test. **M4 and M5 exist because the first draft of this change had neither**, and both gaps were found by the independent reviewer running mutations the author's own table did not suggest:
+
+  - **M4** showed the third row of the table above — the asynchronously-failing spawn — was **claimed fixed and pinned by nothing**: neutering `callClaude`'s guard alone left the entire suite green at `1340 passed, 0 failed`. It now has its own test, using the lever recorded on #460 (force the isolated spawn HOME, warm it, then delete it and make its parent unwritable, so the spawn proceeds with a `cwd` that does not exist).
+  - **M5** showed the log assertions could **never execute**: co-located with the counter assertion, the mutation that breaks them breaks the counter too, the counter's `assert` throws first, and execution never reaches them — `AGENTS.md`'s **"Mutual"** case, whose stated remedy is separate `test()` bodies. Split out, M5 reddens that test alone.
 
 
 ### Added

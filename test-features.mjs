@@ -4344,8 +4344,9 @@ console.log("\nstats.errors moves by exactly one per failed request (#460):");
 // change, one failed request moved it by 0, 1 or 2:
 //
 //   is_error result, non-streaming  -> 0   the close handler saw code===0 and took the SUCCESS
-//                                          branch, so it also logged claude_ok and recorded a
-//                                          per-model success and a circuit-breaker success
+//                                          branch, so it also logged claude_ok, recorded a
+//                                          per-model success, and marked the credential verified
+//                                          (ADR 0014) for a request that returned 500
 //   is_error result, streaming      -> 2   parsed.error counted, then close re-entered on errored
 //   spawn fails asynchronously      -> 2   'error' and 'close' both fired
 //
@@ -4382,26 +4383,40 @@ ltTest("integration (#460): an is_error result counts ONCE on the non-streaming 
         `without the 'errored' flag the close handler reads code===0 and takes the SUCCESS ` +
         `branch: ${JSON.stringify(after.stats)}`);
       assert.equal((after.recentErrors || []).length, 1, `recentErrors: ${JSON.stringify(after.recentErrors)}`);
-      // The counter is not the only thing that was wrong. A request that 500'd was also logged as
-      // claude_ok and recorded as a per-model SUCCESS and a circuit-breaker success -- so a model
-      // failing every request this way would never trip the breaker. Assert the log directly,
-      // because stats.errors alone cannot distinguish "counted once" from "counted once AND still
-      // recorded a success".
-      // Wait for the line being asserted, not for a proxy for it: the HTTP response returns
-      // before the child's close handler has necessarily reached the parent's stdout pipe, and
-      // asserting on an unflushed buffer is a race that fails intermittently for the wrong reason.
-      // Waiting for the POSITIVE line first also makes the negative assertion below meaningful --
-      // "no claude_ok" is satisfied by an empty buffer.
-      // The two events land on DIFFERENT streams, because logEvent routes by level:
-      // claude_exit is level "error" -> console.error -> stderr, claude_ok is level "info" ->
-      // console.log -> stdout. Asserting both against buf.out reports "claude_exit missing" for a
-      // run where it fired correctly, which is what the first draft of this test did.
+    } finally { child.kill("SIGKILL"); await ltDrain(() => buf.closed, "err460-nonstream", 5000); }
+  } finally { _ltRmRetry(dir); }
+});
+
+// SEPARATE BODY, and not for tidiness. The missing `errored` flag broke more than the counter:
+// the same close handler took the whole SUCCESS branch. But co-located with the counter assertion
+// above, these could never report -- the mutation that breaks them (dropping `errored`) breaks the
+// counter too, the counter's assert throws first, and execution never reaches here. AGENTS.md's
+// "Mutual" case, whose stated remedy is separate test() bodies, because ordering cannot help when
+// ONE mutation breaks both claims.
+ltTest("integration (#460): a request that 500s must not ALSO be recorded as a success", async () => {
+  if (!LT_POSIX) return;
+  const dir = ltMkdir();
+  try {
+    const fake = join(dir, "claude-iserr"); _ltWrite(fake, LT460_FAKE); _ltChmod(fake, 0o755);
+    const { child, buf, port } = await ltBootFresh({ CLAUDE_BIN: fake }, dir);
+    try {
+      assert.ok(await ltWait(() => buf.out.includes("listening on")), `— ${ltDiag(buf)}`);
+      assert.equal((await ltPostStatus(port, { model: "sonnet", messages: [{ role: "user", content: "hi" }] })).status, 500,
+        `— ${ltDiag(buf)}`);
+      // The two events land on DIFFERENT streams, because logEvent routes by level: claude_exit is
+      // level "error" -> console.error -> stderr; claude_ok is level "info" -> console.log ->
+      // stdout. Asserting both against buf.out reports "claude_exit missing" for a run where it
+      // fired correctly -- which is what this test's first draft did.
+      //
+      // Wait for the POSITIVE line first: the response returns before the close handler has
+      // necessarily reached the parent's pipe, and "no claude_ok" is satisfied by an empty buffer,
+      // so the negative assertion below means nothing without it.
       assert.ok(await ltWait(() => /"event":"claude_exit"/.test(buf.err)),
         `the close handler never logged claude_exit — ${ltDiag(buf)}`);
       assert.ok(!/"event":"claude_ok"/.test(buf.out),
-        `a request that 500'd also logged claude_ok, so it recorded a per-model success and a ` +
-        `circuit-breaker success — ${ltDiag(buf)}`);
-    } finally { child.kill("SIGKILL"); await ltDrain(() => buf.closed, "err460-nonstream", 5000); }
+        `a request that returned 500 also logged claude_ok, so the close handler took the SUCCESS ` +
+        `branch: it recorded a per-model success and marked the credential verified — ${ltDiag(buf)}`);
+    } finally { child.kill("SIGKILL"); await ltDrain(() => buf.closed, "err460-success", 5000); }
   } finally { _ltRmRetry(dir); }
 });
 
@@ -4421,6 +4436,55 @@ ltTest("integration (#460): an is_error result counts ONCE on the streaming lane
         `one streaming failure moved stats.errors by ${after.stats.errors}, not 1: ${JSON.stringify(after.stats)}`);
       assert.equal((after.recentErrors || []).length, 1, `recentErrors: ${JSON.stringify(after.recentErrors)}`);
     } finally { child.kill("SIGKILL"); await ltDrain(() => buf.closed, "err460-stream", 5000); }
+  } finally { _ltRmRetry(dir); }
+});
+
+ltTest("integration (#460): an ASYNCHRONOUSLY-failing spawn counts ONCE, not once per handler (was 2)", async () => {
+  if (!LT_POSIX) return;
+  const dir = ltMkdir();
+  try {
+    // The third kind, and until this test it was claimed fixed and pinned by nothing: neutering
+    // callClaude's guard alone left the whole suite green. It is also the most reachable kind in
+    // production -- it needs only a `claude` that is not where OCP expects it -- and it is the one
+    // that reproduces identically on v3.32.0, i.e. it long predates #459.
+    //
+    // LEVER: force the isolated spawn HOME (a resolvable token does that), let one request create
+    // it, then delete it and make its parent unwritable. ensureSpawnHome's mkdir then fails and is
+    // swallowed by prepareSpawnHome, so the spawn goes ahead with a cwd that does not exist ->
+    // node emits 'error' AND 'close', and both handlers used to call trackError.
+    const fake = join(dir, "claude-ok");
+    _ltWrite(fake, `#!/bin/sh\ncat >/dev/null\nprintf '%s\\n' '{"type":"assistant","message":{"content":[{"type":"text","text":"OK"}]}}'\nprintf '%s\\n' '{"type":"result"}'\nexit 0\n`);
+    _ltChmod(fake, 0o755);
+    const { child, buf, port } = await ltBootFresh(
+      { CLAUDE_BIN: fake, CLAUDE_CODE_OAUTH_TOKEN: "sk-fake-forces-isolated-spawn-home" }, dir);
+    const health = () => fetch(`http://127.0.0.1:${port}/health`).then(x => x.json());
+    try {
+      assert.ok(await ltWait(() => buf.out.includes("listening on")), `— ${ltDiag(buf)}`);
+      const pre = await health();
+      // Premise, and it is not ceremony: if isolation is OFF this fixture cannot arm the lever at
+      // all, and every assertion below would be measuring a different failure.
+      assert.equal(pre.spawn?.isolated, true, `the fixture must run isolated to arm this lever: ${JSON.stringify(pre.spawn)}`);
+      assert.equal((await ltPostStatus(port, { model: "sonnet", messages: [{ role: "user", content: "hi" }] })).status, 200,
+        `the warm-up request must succeed — ${ltDiag(buf)}`);
+      assert.equal((await health()).stats.errors, 0, "premise: the warm-up left the counter at 0");
+
+      const spawnHome = pre.spawn.home;
+      assert.ok(_ltExists(spawnHome), `the warm-up should have created ${spawnHome}`);
+      _ltRmRetry(spawnHome);
+      _ltChmod(join(spawnHome, ".."), 0o500);
+      try {
+        assert.equal((await ltPostStatus(port, { model: "sonnet", messages: [{ role: "user", content: "hi" }] })).status, 500,
+          `the spawn should fail with an unusable cwd — ${ltDiag(buf)}`);
+        const after = await health();
+        assert.equal(after.stats.errors, 1,
+          `one asynchronously-failing spawn moved stats.errors by ${after.stats.errors}. Two means ` +
+          `'error' and 'close' each counted the same failure: ${JSON.stringify((after.recentErrors || []).map(e => e.message.slice(0, 40)))}`);
+        assert.equal((after.recentErrors || []).length, 1, `recentErrors: ${JSON.stringify(after.recentErrors)}`);
+      } finally {
+        // Restore the mode before the fixture teardown tries to remove the tree.
+        try { _ltChmod(join(spawnHome, ".."), 0o700); } catch { /* best effort */ }
+      }
+    } finally { child.kill("SIGKILL"); await ltDrain(() => buf.closed, "err460-spawnfail", 5000); }
   } finally { _ltRmRetry(dir); }
 });
 
