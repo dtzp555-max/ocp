@@ -55,6 +55,7 @@ import { TuiPanePool, resolvePoolSize, POOL_MAX_SIZE } from "./lib/tui/pool.mjs"
 import { TuiDeltaAssembler, DEFAULT_HOLDBACK_CHARS, resolveStreamHoldback } from "./lib/tui/stream.mjs";
 import { createSerialMutex, createTtlCache, orderLabelsLastGoodFirst, scrubInboundAuthEnv, applyRequestVerdictTtl } from "./lib/spawn-auth.mjs";
 import { makeResolveSpawnToken } from "./lib/spawn-token.mjs";
+import { classifyCapabilityProbe, capabilityBootError } from "./lib/claude-capability.mjs";
 import { hasImageContent, buildImageBlocks, buildStreamJsonInput, MultimodalError } from "./lib/multimodal.mjs";
 import { parsePositiveInt } from "./lib/env.mjs";
 import { appendOperatorPrompt, promptCharBudgetFor, fallbackPromptCharBudget, resolveGlobalPromptCharOverride, selectPromptWrapper, localToolsSafetyError } from "./lib/prompt.mjs";
@@ -1775,9 +1776,14 @@ function spawnClaudeProcess(model, messages, conversationId, keyName, releaseSlo
   // [measured] It works on 2.1.233, 2.1.243 and 2.1.247; the discriminator is the error text --
   // an unknown flag gives `error: unknown option '<flag>'` while this one gives `Error: System
   // prompt file not found: <path>`. NOT MEASURED: anything older, including the 2.1.104 / 2.1.158
-  // the comments above cite for the old flag. OCP has no `claude` version gate at all (setup.mjs
-  // only records `claude --version`; the only floor machinery in this repo is for Node). What
-  // makes that survivable rather than silent, and the SUBJECT of the measurement matters more
+  // the comments above cite for the old flag. OCP still has no `claude` VERSION gate (setup.mjs
+  // only records `claude --version`; the only floor machinery in this repo is for Node) -- but
+  // since #455 it has a boot-time CAPABILITY gate, which is the better question to ask: it spawns
+  // the argv buildCliArgs actually produces and refuses to start if the CLI answers `unknown
+  // option`. See the block above server.listen(). That gate does NOT make the paragraph below
+  // obsolete: it is skippable (OCP_SKIP_CAPABILITY_PROBE=1) and it deliberately boots on any
+  // verdict it cannot classify, so the per-request failure below is still the fallback path.
+  // What makes that survivable rather than silent, and the SUBJECT of the measurement matters more
   // than the result: [measured] against a STUB that rejects the flag the way commander does --
   // no claude lacking the flag exists on this host to test -- every request 500s and the child's
   // stderr reaches the caller, on the non-streaming path AND as a data: frame on the SSE path:
@@ -3100,6 +3106,15 @@ let oauthRefreshBackoff = { nextAttemptAt: 0, currentDelay: OAUTH_REFRESH_MIN_BA
 // short-TTL keychain cache + a per-use expiry check does not reintroduce the forever-stale bug.
 const KEYCHAIN_LABELS = ["claude-code-credentials", "Claude Code-credentials"];
 const KEYCHAIN_CACHE_TTL_MS = 30 * 1000;
+
+// #455: budget for the boot-time `claude` capability probe. MEASURED at 0.18-0.21s for the
+// success path and 0.11s for the unknown-option path (claude 2.1.250, all three argv shapes
+// buildCliArgs can produce), so this is ~50x the observed cost. Sized generously ON PURPOSE:
+// blowing the budget yields `inconclusive`, which WARNS AND BOOTS, so an over-tight value would
+// silently turn the gate off on a loaded host rather than failing visibly. EXPIRY: if the probe
+// ever starts a model turn -- i.e. if `claude` stops validating options before values -- this
+// budget is the wrong shape entirely and the probe needs rethinking, not a bigger number.
+const CAPABILITY_PROBE_TIMEOUT_MS = 10000;
 const _keychainCache = createTtlCache({ ttlMs: KEYCHAIN_CACHE_TTL_MS });
 let _lastGoodKeychainLabel = null;
 
@@ -4809,6 +4824,68 @@ function gracefulShutdown(signal) {
 
 process.on("SIGTERM", () => gracefulShutdown("SIGTERM"));
 process.on("SIGINT", () => gracefulShutdown("SIGINT"));
+
+// ── Boot-time `claude` capability gate (#455) ────────────────────────────
+//
+// OCP had no version or capability gate for the binary it spawns on every request. #453 made
+// that sharper by depending on --system-prompt-file, which `claude --help` does not list. If a
+// host's claude lacks any flag OCP passes, every request 500s -- loudly and self-namingly, but
+// PER REQUEST. Nothing said so at boot, so the first person to notice was a user.
+//
+// THE ARGV IS BUILT BY buildCliArgs, NOT RETYPED HERE, and that is the load-bearing part of this
+// design rather than a tidiness choice. A hand-written flag list is the #339 shape: it would
+// drift from the call site silently, and it would test flags this instance does not actually
+// send while missing the ones it does. buildCliArgs reads AUTH_MODE and the tool settings at
+// call time, so the probe covers exactly what THIS instance will spawn -- add a flag there and
+// the probe picks it up with no second edit.
+//
+// streamJsonInput:true is passed so --input-format is included: it is conditional per request
+// (images only), so a probe without it would leave that flag ungated.
+//
+// The path is inside a directory that does not exist, so nothing can race it into existence and
+// turn the probe's own failure signal into a success.
+if (process.env.OCP_SKIP_CAPABILITY_PROBE !== "1") {
+  const probePath = join(tmpdir(), `ocp-capability-probe-${randomUUID()}`, "absent.txt");
+  // The model comes from the models.json SPOT via MODEL_MAP, not a literal (ADR 0003). Its VALUE
+  // is inert here -- the CLI rejects the missing prompt file before it resolves a model, which is
+  // the same ordering the probe relies on for its verdict -- but a hardcoded id would be a second
+  // place model names live, and this repo has exactly one.
+  const probeModel = MODEL_MAP["sonnet"] || MODELS[0]?.id || "sonnet";
+  const probeArgs = [...buildCliArgs(probeModel, probePath, { streamJsonInput: true }), "-p", "x"];
+  let probe;
+  try {
+    probe = spawnSync(CLAUDE, probeArgs, {
+      encoding: "utf8",
+      timeout: CAPABILITY_PROBE_TIMEOUT_MS,
+      // Measured at 0.18-0.21s for the success path; the timeout is two orders of magnitude
+      // above that so a loaded host warns rather than refusing. stdin closed: the CLI must not
+      // wait on it (--input-format stream-json would).
+      stdio: ["ignore", "pipe", "pipe"],
+      env: scrubInboundAuthEnv(process.env),
+    });
+  } catch (e) {
+    probe = { error: e };
+  }
+  const verdict = classifyCapabilityProbe({
+    stdout: probe?.stdout || "",
+    stderr: probe?.stderr || "",
+    error: probe?.error || null,
+    // spawnSync reports a timeout as signal SIGTERM with an error; check both so a kill that
+    // arrives without an error object is still not read as output.
+    timedOut: probe?.signal === "SIGTERM" && !probe?.stdout && !probe?.stderr,
+  });
+  if (verdict.verdict === "absent") {
+    console.error(`FATAL: ${capabilityBootError({ flag: verdict.flag, bin: CLAUDE })}\n  Refusing to start.`);
+    process.exit(1);
+  }
+  if (verdict.verdict === "inconclusive") {
+    // NOT fatal, and the asymmetry is the design: only OBSERVED absence refuses a boot. A missing
+    // binary, a slow host, or an upstream rewording of the message must not take a fleet down.
+    logEvent("warn", "claude_capability_probe_inconclusive", { reason: verdict.reason, detail: verdict.detail });
+  } else {
+    logEvent("info", "claude_capability_probe_ok", { bin: CLAUDE });
+  }
+}
 
 // ── Start ───────────────────────────────────────────────────────────────
 server.listen(PORT, BIND_ADDRESS, () => {
