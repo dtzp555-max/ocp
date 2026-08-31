@@ -6304,10 +6304,9 @@ async function ltHealth(port) {
 // precisely because the failure message reports PROCESS state (ltDiag) rather than the body the
 // waiter just read. This makes the next occurrence self-diagnosing rather than another data point.
 //
-// Deliberately module-level rather than a changed return shape: ltWaitHealth has 30 callers, and
+// Deliberately module-level rather than a changed return shape: ltWaitHealth has 29 call sites, and
 // every one of them relies on `null`-on-timeout being falsy and on the success value being the
 // body itself.
-let _ltLastHealth = null;     // the last body, which MAY be null
 let _ltEverHealth = null;     // the last NON-null body, or null if /health never answered at all
 let _ltHealthPolls = 0;
 let _ltLastPollFailed = false;
@@ -6338,13 +6337,11 @@ async function ltWaitHealth(port, pred, ms = 9000) {
   let deadline = start + ms;
   const hardCap = start + ms * 10;
   let body = null;
-  _ltLastHealth = null;
   _ltEverHealth = null;
   _ltHealthPolls = 0;
   _ltLastPollFailed = false;
   for (;;) {
     body = await ltHealth(port);
-    _ltLastHealth = body;
     // #457 review P1: these two must be kept SEPARATELY. An earlier revision recorded only the
     // last body, so the discriminator was "did the LAST poll return one" -- and ltHealth catches
     // EVERY exception and returns null, so a single transient fetch failure on the final poll made
