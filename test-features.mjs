@@ -6307,21 +6307,30 @@ async function ltHealth(port) {
 // Deliberately module-level rather than a changed return shape: ltWaitHealth has 30 callers, and
 // every one of them relies on `null`-on-timeout being falsy and on the success value being the
 // body itself.
-let _ltLastHealth = null;
+let _ltLastHealth = null;     // the last body, which MAY be null
+let _ltEverHealth = null;     // the last NON-null body, or null if /health never answered at all
 let _ltHealthPolls = 0;
+let _ltLastPollFailed = false;
 
 // Render the last body a waiter saw. `null` vs a body is the discriminator, so the two cases are
 // worded differently on purpose -- a caller pasting this into an issue should not have to know
 // the helper to tell them apart.
 function ltHealthDiag() {
   if (_ltHealthPolls === 0) return "healthDiag: ltWaitHealth never polled";
-  if (_ltLastHealth === null) {
+  if (_ltEverHealth === null) {
     return `healthDiag: ${_ltHealthPolls} poll(s), /health NEVER returned a body — the server was ` +
            `unreachable or not answering, so the predicate was never evaluated`;
   }
-  const auth = _ltLastHealth.auth;
+  // A final failed poll is real information (the server may have died mid-wait), so it is said
+  // rather than hidden -- but it does NOT turn this into the unreachable case, because the
+  // predicate demonstrably ran against the bodies that did arrive.
+  const tail = _ltLastPollFailed
+    ? ` NOTE: the FINAL poll returned no body (server may have gone away mid-wait); the values ` +
+      `below are from the last poll that DID answer.`
+    : "";
+  const auth = _ltEverHealth.auth;
   return `healthDiag: ${_ltHealthPolls} poll(s), last body READ and predicate still false. ` +
-         `auth=${JSON.stringify(auth)} stats=${JSON.stringify(_ltLastHealth.stats)}`;
+         `auth=${JSON.stringify(auth)} stats=${JSON.stringify(_ltEverHealth.stats)}${tail}`;
 }
 
 async function ltWaitHealth(port, pred, ms = 9000) {
@@ -6330,10 +6339,21 @@ async function ltWaitHealth(port, pred, ms = 9000) {
   const hardCap = start + ms * 10;
   let body = null;
   _ltLastHealth = null;
+  _ltEverHealth = null;
   _ltHealthPolls = 0;
+  _ltLastPollFailed = false;
   for (;;) {
     body = await ltHealth(port);
     _ltLastHealth = body;
+    // #457 review P1: these two must be kept SEPARATELY. An earlier revision recorded only the
+    // last body, so the discriminator was "did the LAST poll return one" -- and ltHealth catches
+    // EVERY exception and returns null, so a single transient fetch failure on the final poll made
+    // the diagnostic report "/health NEVER returned a body" for a server that had been answering
+    // throughout. That is the false sentence this helper exists to prevent, in the case it is
+    // MOST likely to occur: a transient failure is more probable under host load, which is the
+    // only condition #457 is about.
+    if (body) _ltEverHealth = body;
+    _ltLastPollFailed = !body;
     _ltHealthPolls++;
     if (body && pred(body)) return body;
     if (Date.now() >= deadline) return null;
@@ -6387,6 +6407,38 @@ ltTest("integration (#457): a timeout that DID read /health reports the body, no
       assert.match(d, /auth=/, `must include the auth block: ${d}`);
       assert.match(d, /stats=/, `must include stats: ${d}`);
     } finally { child.kill("SIGKILL"); await ltDrain(() => buf.closed, "healthdiag", 5000); }
+  } finally { _ltRmRetry(dir); }
+});
+
+ltTest("integration (#457): the MIXED case — answered, then the last poll failed — is not reported as unreachable", async () => {
+  if (!LT_POSIX) return;
+  // The case the first revision of this helper got wrong, and the one it is MOST likely to meet:
+  // ltHealth catches every exception and returns null, so one transient fetch failure on the
+  // final poll used to print "/health NEVER returned a body" for a server that had been answering
+  // throughout. Under host load -- the only condition #457 is about -- a transient failure is
+  // MORE probable, not less. Driven here by killing the child mid-wait.
+  const dir = ltMkdir(); const fake = ltFake(dir);
+  try {
+    const { child, buf, port } = await ltBootFresh({ CLAUDE_BIN: fake }, dir);
+    try {
+      assert.ok(await ltWait(() => buf.out.includes("listening on")), `— ${ltDiag(buf)}`);
+      // Start an unsatisfiable wait, let a few polls succeed, then take the server away.
+      const waiting = ltWaitHealth(port, () => false, 1500);
+      await new Promise(r => setTimeout(r, 300));
+      child.kill("SIGKILL");
+      const r = await waiting;
+      assert.equal(r, null, "premise: an unsatisfiable predicate must still time out");
+
+      const d = ltHealthDiag();
+      // The whole point: earlier polls DID answer, so this is not the unreachable case.
+      assert.ok(!/NEVER returned a body/.test(d),
+        `answered-then-died must NOT be reported as unreachable — that sentence would be false in ` +
+        `every clause: bodies were returned, the server was answering, and the predicate ran. Got: ${d}`);
+      assert.match(d, /predicate still false/, `should report the read-but-rejected case: ${d}`);
+      // And the final failure is real information, so it is said rather than hidden.
+      assert.match(d, /FINAL poll returned no body/, `should disclose that the last poll failed: ${d}`);
+      assert.match(d, /auth=/, `must still carry the last body that DID answer: ${d}`);
+    } finally { child.kill("SIGKILL"); await ltDrain(() => buf.closed, "healthdiag-mixed", 5000); }
   } finally { _ltRmRetry(dir); }
 });
 
