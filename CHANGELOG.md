@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+### Governance
+
+- **`AGENTS.md` gains the WRITE side of the anchored-slice rules (#464).** Both existing anchor-drift prescriptions are about slices used for **reading** — an empty slice (`#218`), or one running to `-1` because `indexOf` missed (`#347`). An index-slice **write**, `s[:i] + new + s[j:]`, fails differently: **it succeeds**, and deletes everything between the anchors. Measured here — a CHANGELOG rewrite anchored on `## Unreleased` and `## v3.32.0` removed three merged PRs' entries in one edit (1521 → 1425 lines; `#460` from 5 occurrences to 0), and nothing caught it because the file still parsed, still rendered, and the heading was still there. `scripts/release-notes.mjs` pipes that section into `gh release create --notes-file`, so the next release would have shipped with empty notes for three merged changes. Three prescriptions, strongest first: prefer **insert** over **replace**; read the span before replacing it; and verify with `diff … | grep -c '^<'` **= 0** plus the added-line count as a positive control, rather than with the belief that you only touched your own section. Filed separately from #464 per Iron Rule 11, and because that section's own standing rule is that a rule living only in a thread cannot be followed by someone reading the repo.
+
 ### Tests
 
 - **`ltWaitHealth` now reports *why* it timed out (#457).** It returns `null` on timeout, and that `null` was identical whether `/health` was **unreachable** or answered repeatedly with a body the **predicate kept rejecting**. Those have unrelated root causes, and `#324, P1 from review` has now flaked several times with every occurrence undiagnosable for exactly this reason — the failure message reported `ltDiag(buf)`, the *child process's* state, while the open question was what the health body said.
