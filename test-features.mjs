@@ -6296,13 +6296,45 @@ async function ltHealth(port) {
 // too, so feed the measured overshoot back into the deadline — see ltWait's comment for the
 // measurements behind the 10x cap), but the predicate needs a real HTTP GET /health per poll,
 // which ltWait's synchronous cond() cannot express. Returns the matching body, or null.
+// #457: the LAST /health body ltWaitHealth read, kept so a timeout can say WHY it timed out.
+//
+// On timeout ltWaitHealth returns null, which is falsy for `assert.ok(...)` -- and that null is
+// the same whether the server was unreachable or answered 30 times with a body the predicate
+// kept rejecting. Those two have unrelated root causes, and #457 is currently stuck between them
+// precisely because the failure message reports PROCESS state (ltDiag) rather than the body the
+// waiter just read. This makes the next occurrence self-diagnosing rather than another data point.
+//
+// Deliberately module-level rather than a changed return shape: ltWaitHealth has 30 callers, and
+// every one of them relies on `null`-on-timeout being falsy and on the success value being the
+// body itself.
+let _ltLastHealth = null;
+let _ltHealthPolls = 0;
+
+// Render the last body a waiter saw. `null` vs a body is the discriminator, so the two cases are
+// worded differently on purpose -- a caller pasting this into an issue should not have to know
+// the helper to tell them apart.
+function ltHealthDiag() {
+  if (_ltHealthPolls === 0) return "healthDiag: ltWaitHealth never polled";
+  if (_ltLastHealth === null) {
+    return `healthDiag: ${_ltHealthPolls} poll(s), /health NEVER returned a body — the server was ` +
+           `unreachable or not answering, so the predicate was never evaluated`;
+  }
+  const auth = _ltLastHealth.auth;
+  return `healthDiag: ${_ltHealthPolls} poll(s), last body READ and predicate still false. ` +
+         `auth=${JSON.stringify(auth)} stats=${JSON.stringify(_ltLastHealth.stats)}`;
+}
+
 async function ltWaitHealth(port, pred, ms = 9000) {
   const start = Date.now();
   let deadline = start + ms;
   const hardCap = start + ms * 10;
   let body = null;
+  _ltLastHealth = null;
+  _ltHealthPolls = 0;
   for (;;) {
     body = await ltHealth(port);
+    _ltLastHealth = body;
+    _ltHealthPolls++;
     if (body && pred(body)) return body;
     if (Date.now() >= deadline) return null;
     const before = Date.now();
@@ -6311,6 +6343,52 @@ async function ltWaitHealth(port, pred, ms = 9000) {
     if (overshoot > 0) deadline = Math.min(deadline + overshoot, hardCap);
   }
 }
+
+console.log("\nltWaitHealth reports WHY it timed out (#457):");
+
+// ── #457: a timeout that cannot say why is another data point, not a diagnosis ────────────────
+//
+// ltWaitHealth returns null on timeout, and that null is identical whether /health was
+// unreachable or answered repeatedly with a body the predicate kept rejecting. Those have
+// unrelated root causes. #324 has flaked repeatedly and every occurrence was undiagnosable for
+// exactly this reason. Both branches are driven here, because the whole value of the helper is
+// telling them APART -- a test of only one branch would pass while the other printed nonsense.
+
+ltTest("integration (#457): a timeout with NO reachable /health says so", async () => {
+  if (!LT_POSIX) return;
+  // Nothing is listening on this port: ltHealth returns null every poll.
+  const dead = await ltFreePort();
+  const r = await ltWaitHealth(dead, () => true, 300);
+  assert.equal(r, null, "premise: an unreachable /health must time out");
+  const d = ltHealthDiag();
+  assert.match(d, /NEVER returned a body/, `should name the unreachable case: ${d}`);
+  // The poll count is the premise for the sentence: "never returned a body" from zero polls would
+  // mean the waiter never ran, which is a different fault with the same words.
+  assert.match(d, /[1-9]\d* poll\(s\)/, `must report a NON-ZERO poll count: ${d}`);
+  assert.ok(!/predicate still false/.test(d), `must not claim it read a body: ${d}`);
+});
+
+ltTest("integration (#457): a timeout that DID read /health reports the body, not the process", async () => {
+  if (!LT_POSIX) return;
+  const dir = ltMkdir(); const fake = ltFake(dir);
+  try {
+    const { child, buf, port } = await ltBootFresh({ CLAUDE_BIN: fake }, dir);
+    try {
+      assert.ok(await ltWait(() => buf.out.includes("listening on")), `— ${ltDiag(buf)}`);
+      // A predicate that can never be true against a live server: /health answers, the predicate
+      // rejects every time.
+      const r = await ltWaitHealth(port, () => false, 300);
+      assert.equal(r, null, "premise: an unsatisfiable predicate must time out");
+      const d = ltHealthDiag();
+      assert.match(d, /predicate still false/, `should name the read-but-rejected case: ${d}`);
+      assert.ok(!/NEVER returned a body/.test(d), `must not claim /health was unreachable: ${d}`);
+      // And it must carry the block these waiters actually predicate on -- a diagnostic that omits
+      // it sends the reader back to the process state this exists to replace.
+      assert.match(d, /auth=/, `must include the auth block: ${d}`);
+      assert.match(d, /stats=/, `must include stats: ${d}`);
+    } finally { child.kill("SIGKILL"); await ltDrain(() => buf.closed, "healthdiag", 5000); }
+  } finally { _ltRmRetry(dir); }
+});
 
 console.log("\nAuth probe: non-blocking + verdict semantics (#232 / ADR 0010):");
 
@@ -6513,10 +6591,14 @@ ltTest("integration (#324, P1 from review): a conclusive rejection RESETS a coun
   }, dir);
   try {
     const climbed = await ltWaitHealth(port, b => (b.auth?.consecutiveInconclusive ?? 0) >= 3, 20000);
-    assert.ok(climbed, `the inconclusive tally never climbed — ${ltDiag(buf)}`);
+    // #457: ltHealthDiag() first. This test has flaked repeatedly and every occurrence so far has
+    // been undiagnosable, because ltDiag reports the CHILD's state while the question is what the
+    // tally actually reached. "Probes ran but never yielded `inconclusive`" and "probes were slow
+    // but climbing" need different fixes, and only the body tells them apart.
+    assert.ok(climbed, `the inconclusive tally never climbed — ${ltHealthDiag()} — ${ltDiag(buf)}`);
     assert.equal(climbed.auth.ok, null, "no conclusive probe has happened yet, so ok is still null");
     const reset = await ltWaitHealth(port, b => b.auth?.lastOutcome === "rejected", 20000);
-    assert.ok(reset, `the conclusive rejection never landed — ${ltDiag(buf)}`);
+    assert.ok(reset, `the conclusive rejection never landed — ${ltHealthDiag()} — ${ltDiag(buf)}`);
     assert.equal(reset.auth.consecutiveInconclusive, 0,
       "a conclusive rejection must RESET the tally. Preserving it produces {ok:false, " +
       "lastOutcome:'rejected', consecutiveInconclusive:>=3} — a rejection seconds old that the " +

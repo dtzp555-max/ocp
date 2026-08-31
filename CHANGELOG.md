@@ -2,6 +2,25 @@
 
 ## Unreleased
 
+### Tests
+
+- **`ltWaitHealth` now reports *why* it timed out (#457).** It returns `null` on timeout, and that `null` was identical whether `/health` was **unreachable** or answered repeatedly with a body the **predicate kept rejecting**. Those have unrelated root causes, and `#324, P1 from review` has now flaked several times with every occurrence undiagnosable for exactly this reason — the failure message reported `ltDiag(buf)`, the *child process's* state, while the open question was what the health body actually said.
+
+  `ltHealthDiag()` renders the last body the waiter saw, wording the two cases differently on purpose so a reader pasting it into an issue does not need to know the helper to tell them apart, and reporting a **non-zero poll count** as the premise for "never returned a body" (that sentence from zero polls would mean the waiter never ran — a different fault with the same words). Wired into the `#324` test's two messages. Deliberately module-level rather than a changed return shape: `ltWaitHealth` has **30 callers**, all relying on `null`-on-timeout being falsy and on the success value being the body itself.
+
+  | row | mutation | reddens |
+  |---|---|---|
+  | M1 | stop capturing the body | the read-but-rejected test |
+  | M2 | collapse the two branches into one message | the unreachable test |
+  | M3 | drop the `auth` block from the diagnostic | the read-but-rejected test |
+
+  **Not pinned, stated so a green run is not mistaken for coverage:** that the `#324` test's *message* still calls `ltHealthDiag()`. Removing it there would be caught by no test — the same call-site-drift shape as #339 — and the blast radius is a worse diagnostic, not a wrong result.
+
+  **This is not a fix for #457** and does not attempt one; it makes the next occurrence self-diagnosing. What it does close is a wrong lead of my own: [an earlier comment](https://github.com/dtzp555-max/ocp/issues/457) blamed *"many short `security` execs"* and pointed at `orderLabelsLastGoodFirst` and the keychain TTL cache. Measured on a host at load **19.66** — worse than the failing run — the exact production command runs **46 times in 1584 ms**, producing **4232 B** of stderr against the failing run's 4192 B. So the byte count reconciles, the execs are **7.9 %** of the 20 s budget, and they are a byproduct rather than a cost. `KEYCHAIN_LABELS` holds **two** entries, so a cache miss is 2 execs, not "many".
+
+  Two further corrections that came out of reading rather than measuring: `ltDiag` does **not** truncate `buf.err` (only the *displayed* slice is capped at 240 chars), so `stderr(4192B)` is the real length and proves the child was **alive and probing** right to the timeout; and `ltWaitHealth` **already extends its own deadline** by each poll's timer overshoot up to **10×**, so this issue's title — *"a 20 s `ltWaitHealth` that expires under suite load"* — is not sufficient as stated. That compensation covers **test-process** descheduling and not **server-side** delay, which is the asymmetry the next investigation should start from.
+
+
 ### Fixed
 
 - **`stats.errors` now moves by exactly one per failed request — it was wrong in both directions (#460).** [ADR 0018](docs/adr/0018-aggregate-counters-count-every-lane.md) defines the field as *"any upstream failure on either lane"*. Measured, one failed request moved it by **0, 1 or 2** depending on how it failed:
