@@ -2,6 +2,41 @@
 
 ## Unreleased
 
+### Tests
+
+- **`ltWaitHealth` now reports *why* it timed out (#457).** It returns `null` on timeout, and that `null` was identical whether `/health` was **unreachable** or answered repeatedly with a body the **predicate kept rejecting**. Those have unrelated root causes, and `#324, P1 from review` has now flaked several times with every occurrence undiagnosable for exactly this reason — the failure message reported `ltDiag(buf)`, the *child process's* state, while the open question was what the health body said.
+
+  `ltHealthDiag()` renders the last body the waiter saw, wording the two cases differently on purpose so a reader pasting it into an issue does not need to know the helper to tell them apart, and reporting a **non-zero poll count** as the premise for "never returned a body". Wired into the `#324` test's two messages. Deliberately module-level rather than a changed return shape: `ltWaitHealth` has **29 call sites**, all relying on `null`-on-timeout being falsy and on the success value being the body itself. Safe because `ltTest` chains every body onto one queue, so at most one runs at a time, and the capture is reset at the top of each wait.
+
+  **A defect the first revision shipped, found in review and worth recording.** It kept only the *last* body, so the discriminator was "did the **last** poll return one" — and `ltHealth` catches **every** exception and returns `null`. One transient `fetch` failure on the final poll therefore printed *"/health NEVER returned a body"* for a server that had been answering throughout: a sentence false in every clause, in the case it is **most** likely to meet, since a transient failure is more probable under exactly the host load `#457` is about. "Ever saw a body" and "last body" are now recorded separately, and a failed final poll is disclosed rather than hidden.
+
+  | row | mutation | reddens |
+  |---|---|---|
+  | M1 | stop capturing the body | the read-but-rejected test |
+  | M2 | collapse the two branches into one message | the unreachable test |
+  | M3 | drop the `auth` block from the diagnostic | the read-but-rejected test |
+  | M4 | make the body capture unconditional again (the original defect) | the mixed-case test |
+
+  **Not pinned, stated so a green run is not mistaken for coverage:** that the `#324` test's *message* still calls `ltHealthDiag()`. Removing it there would be caught by no test — the same call-site-drift shape as #339 — and the blast radius is a worse diagnostic, not a wrong result.
+
+- **A wrong lead on #457, retracted — and the retraction's own first version was wrong too (#457).** This is not a fix for #457; it makes the next occurrence self-diagnosing.
+
+  An [earlier comment](https://github.com/dtzp555-max/ocp/issues/457) read the 4192 B of repeated `SecKeychainSearchCopyNext` as *"many short `security` execs"* and pointed at `orderLabelsLastGoodFirst` and the keychain TTL cache. **Measured on a faithful replication of the `#324` boot** — same `AUTH_PROBE_*` knobs, real `server.mjs`, scratch `HOME`, ~20 s lifetime — the stderr is **4236 B**, and its composition is:
+
+  | lines | source |
+  |---|---|
+  | **65** | `[auth] check rejected: fake claude: not au…` |
+  | 3 | `[auth] check timeout: …` |
+  | **2** | `security: SecKeychainSearchCopyNext: …` |
+
+  **Two** keychain lines, not ~46 — both emitted during **boot**, none inside the 20 s window. `KEYCHAIN_LABELS` holds two entries, so one cache miss is 2 execs; with a 30 s TTL over a ~20.2 s child lifetime and no path to `invalidateKeychainReadCache`, **one** read is all that is permitted. The retraction's own paragraph cited that cache and then contradicted it.
+
+  **And the "byte count reconciles" line was a fitted parameter presented as a prediction**: `N = 46` was chosen *because* `4192 / 92 ≈ 45.6`, so its agreement with 4232 B confirmed nothing about the attribution. Recorded because it is a methodological error, not a typo.
+
+  **The conclusion survives and is stronger than first argued.** The real cost is one boot-time cache miss: 12 samples at load 16.39 give **median 30 ms, worst 638 ms** — at most **3.2 %** of the budget, not the 7.9 % first claimed. But the distribution is heavy-tailed and `readKeychainCreds` is `execFileSync` **on the server's event loop**, so this is an *instance* of server-side delay rather than an alternative to it.
+
+  Two further corrections. `ltDiag` does **not** truncate `buf.err` (only the *displayed* slice is capped at 240 chars), so `stderr(4192B)` is a real length — but a **cumulative byte count carries no timing information**, so "alive right up to the timeout" comes from `closed=false`, not from it. And `ltWaitHealth`'s deadline extension is partitioned by **where in the loop the delay lands**, not by whose it is: only the `setTimeout(40)` window is instrumented, so test-process starvation *inside* `await ltHealth()` is **not** compensated, while server-side delay accompanied by poller overshoot effectively **is**. The directional advice that follows from the issue's own numbers is stronger and directly measurable: the three recorded failures ran **20224 / 20568 / 20236 ms** against a 20 000 ms nominal with 180 s of extension available, so the deadline was extended by **≈0** — the poller's timers were on time throughout.
+
 ### Fixed
 
 - **`stats.errors` now moves by exactly one per failed request — it was wrong in both directions (#460).** [ADR 0018](docs/adr/0018-aggregate-counters-count-every-lane.md) defines the field as *"any upstream failure on either lane"*. Measured, one failed request moved it by **0, 1 or 2** depending on how it failed:
