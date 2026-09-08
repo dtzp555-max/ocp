@@ -5862,7 +5862,11 @@ ltTest("integration (#467 control): a request with NO tools counts nothing, and 
         assert.equal(await dropped(), 0,
           `[${label}] a REFUSED request must not be counted as a silent drop. It is the loud case, ` +
           `and the counter exists to measure the quiet one — counting it also lets ` +
-          `toolRequestsDropped exceed totalRequests, which is visible nonsense on /health.`);
+          `toolRequestsDropped exceed totalRequests on THIS path, which is visible nonsense on ` +
+          `/health. (Scoped to "this path" on purpose: concurrency-backpressure 429s are raised ` +
+          `INSIDE spawnClaudeProcess, below the counter, and are a measured and deliberately ` +
+          `accepted residual — see the comment at the counting site. An unscoped claim here would ` +
+          `be one this PR itself violates.)`);
       }
 
       // The positive control for the whole loop above: a request that IS served must still count,

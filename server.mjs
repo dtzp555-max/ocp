@@ -3975,8 +3975,22 @@ async function handleChatCompletions(req, res) {
   // Measured: two malformed-but-tool-carrying requests gave `toolRequestsDropped: 2` with
   // `totalRequests: 0`, an arithmetic contradiction visible on /health, while the control (same
   // 400, no tools) stayed at 0. Those 400s are the LOUD case; counting them makes one number mean
-  // two things exactly when someone is trying to read it. Everything above this line can still
-  // reject; nothing below it can.
+  // two things exactly when someone is trying to read it. Every gate above this line that can
+  // reject now does so BEFORE the count.
+  //
+  // ONE REJECTION PATH REMAINS BELOW, stated rather than left for someone to find in a green run.
+  // Concurrency backpressure -- acquireClaudeSlot throwing ConcurrencyOverflowError when the wait
+  // queue is full -- lives inside spawnClaudeProcess, which is dispatched further down. [measured]
+  // with MAX_CONCURRENT=1, MAX_QUEUE=0 and a slow fake claude, a four-way burst carrying tools
+  // gives `toolRequestsDropped: 4` against `totalRequests: 1`; the same burst WITHOUT tools leaves
+  // the counter untouched, so the over-count is attributable to `tools + 429` and not to 429.
+  //
+  // NOT FIXED BY MOVING FURTHER DOWN, and that is a decision rather than an omission: the only
+  // position below the slot acquire is inside the spawn, which has two lanes (-p and TUI) and is
+  // RETRIED by the structured-output path -- one response_format request was measured taking
+  // totalRequests from 4 to 7. Counting there would silently convert this from "requests whose
+  // tools were dropped" into "spawns", which is a worse defect than the one it fixes. The residual
+  // needs a queue overflow to appear, and when it appears it inflates in bursts.
   //
   // THE RESPONSE IS DELIBERATELY UNCHANGED. ADR 0013's Alternatives rejected "refuse whenever
   // `tools` is present" because it would have taken down every OpenClaw agent on the fleet the day
