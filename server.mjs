@@ -3847,33 +3847,6 @@ async function handleChatCompletions(req, res) {
     } });
   }
 
-  // #467 / ADR 0021: the request is SUPPORTED, which means any tools it declared are about to be
-  // dropped and the client gets a text answer it cannot distinguish from a real one. That is the
-  // silent degradation, and until now it left no trace anywhere: HTTP 200, finish_reason "stop",
-  // /health ok, recentErrors empty, clean logs on BOTH sides. It has cost hours twice -- ADR 0013's
-  // own Context is the first occurrence, #467 the second.
-  //
-  // THE RESPONSE IS DELIBERATELY UNCHANGED. ADR 0013's Alternatives rejected "refuse whenever
-  // `tools` is present" because it would have taken down every OpenClaw agent on the fleet the day
-  // it shipped -- they all send tools and all accept text -- and ADR 0021 keeps that constraint by
-  // name. So this makes the failure OBSERVABLE without making it a failure.
-  //
-  // Logged per request rather than latched or throttled, deliberately: every one of these requests
-  // IS degraded, so per-request is the accurate volume, and OCP already emits one line per request
-  // (claude_ok / claude_exit). A first-time-only latch would be quieter and would also be the shape
-  // this repo has been bitten by twice (ADR 0014, #324) -- a clearing condition nobody can reach.
-  // The counter carries the running magnitude; the log carries the event.
-  const declaredTools = countDeclaredTools(parsed);
-  if (declaredTools > 0) {
-    stats.toolRequestsDropped++;
-    logEvent("warn", "openai_tools_dropped", {
-      model,
-      declaredTools,
-      toolChoice: typeof parsed.tool_choice === "string" ? parsed.tool_choice : (parsed.tool_choice?.type ?? "absent"),
-      note: "declared tools are not callable (ADR 0013); answered as text",
-    });
-  }
-
   // Validate model against known models
   if (!VALID_MODELS.has(model)) {
     return jsonResponse(res, 400, { error: { message: `Unknown model: ${model}. Valid models: ${[...VALID_MODELS].join(", ")}`, type: "invalid_request_error" } });
@@ -3987,6 +3960,40 @@ async function handleChatCompletions(req, res) {
         },
       });
     }
+  }
+
+  // #467 / ADR 0021: the request is about to be SERVED, and any tools it declared are being
+  // dropped -- the client will get a text answer it cannot distinguish from a real one. That is the
+  // silent degradation, and until now it left no trace anywhere: HTTP 200, finish_reason "stop",
+  // /health ok, recentErrors empty, clean logs on both sides. It has cost hours twice; ADR 0013's
+  // own Context is the first occurrence, #467 the second.
+  //
+  // PLACED HERE, AFTER EVERY GATE THAT CAN REJECT, and that position is the whole correctness of
+  // the counter rather than a detail. The first version of this sat immediately after
+  // classifyToolRequest -- before model validation, messages validation, image validation and the
+  // quota gate -- so a `tools` request that 400'd for ANY of those reasons still incremented it.
+  // Measured: two malformed-but-tool-carrying requests gave `toolRequestsDropped: 2` with
+  // `totalRequests: 0`, an arithmetic contradiction visible on /health, while the control (same
+  // 400, no tools) stayed at 0. Those 400s are the LOUD case; counting them makes one number mean
+  // two things exactly when someone is trying to read it. Everything above this line can still
+  // reject; nothing below it can.
+  //
+  // THE RESPONSE IS DELIBERATELY UNCHANGED. ADR 0013's Alternatives rejected "refuse whenever
+  // `tools` is present" because it would have taken down every OpenClaw agent on the fleet the day
+  // it shipped -- they all send tools and all accept text -- and ADR 0021 keeps that by name. So
+  // this makes the failure OBSERVABLE without making it a failure.
+  //
+  // Logged per request rather than latched: every one of these requests IS degraded, so per-request
+  // is the accurate volume, and it keeps the log and the counter agreeing.
+  const declaredTools = countDeclaredTools(parsed);
+  if (declaredTools > 0) {
+    stats.toolRequestsDropped++;
+    logEvent("warn", "openai_tools_dropped", {
+      model,
+      declaredTools,
+      toolChoice: typeof parsed.tool_choice === "string" ? parsed.tool_choice : (parsed.tool_choice?.type ?? "absent"),
+      note: "declared tools are not callable (ADR 0013); answered as text",
+    });
   }
 
   // Structured output (OpenAI response_format / json_mode): its own path — the response must be

@@ -8,11 +8,15 @@
 
   ADR 0013 refuses exactly the four shapes the OpenAI specification *obliges* a tool call for (`tool_choice: "required"`, a named `tool_choice`, `allowed_tools.mode: "required"`, and the deprecated `function_call`). Everything else — `tool_choice` absent, `"none"`, `"auto"` — is satisfiable by text, so it is served unchanged and the declared tools are dropped. **That let-through path is the case ADR 0013 explicitly declined to answer**, and it is what this change addresses.
 
+  **The counter sits after every gate that can reject, and that placement is the whole correctness of it.** The first version sat immediately after `classifyToolRequest` — *before* model, messages, image and quota validation — so a `tools` request that 400'd for any of those still incremented it. Measured: two malformed-but-tool-carrying requests gave **`toolRequestsDropped: 2` with `totalRequests: 0`**, an arithmetic contradiction visible on `/health`, while the control (same 400, no tools) stayed at 0. Found by independent review; the test meant to catch it checked only the one refusal path its author had thought of, and now checks **four**.
+
   **Additive under [ADR 0012](docs/adr/0012-additive-fields-on-grandfathered-b2.md).** New read-only field on `/health`: **`stats.toolRequestsDropped`** — requests that declared tools which OCP then dropped. Two probe profiles, `+2` key paths, `0` removed. It counts **requests, not tools**, and deliberately **does not count refusals**: a forcing `tool_choice` already 400s loudly and was never the invisible case, so counting it would make one number mean two things. Also logs `openai_tools_dropped` at `warn` per request, carrying `declaredTools` and the `toolChoice` that reached it.
 
   **The response is deliberately unchanged, and that is the load-bearing constraint.** ADR 0013's Alternatives rejected *"refuse whenever `tools` is present"* because it **would have taken down every OpenClaw agent on the maintainer's fleet the day it shipped** — they all send tools and all accept text. [ADR 0021](docs/adr/0021-ocp-is-an-agent-backend.md) keeps that constraint by name. So this makes the failure **observable without making it a failure**, and the control test asserts HTTP **200** by exact status rather than `!== 500`.
 
   Logged per request rather than latched, on purpose: every one of these requests *is* degraded, so per-request is the accurate volume, and OCP already emits one line per request. A first-time-only latch would be quieter and would also be the shape this repo has been bitten by twice (ADR 0014, #324) — a clearing condition nobody can reach. The counter carries the running magnitude; the log carries the event.
+
+  **One operational cost, measured and stated rather than discovered later.** `/logs` filters *after* slicing (`entries = lines.slice(-n * 3)` precedes the `filter`), so a third log line per request shrinks the error-lookback window of `/logs?level=error&n=30` from roughly 45 requests to roughly 30 — about a **third less depth**, precisely on the tools-on-every-turn agent traffic this feature is for. `level=error` itself is **not** polluted (that filter is a strict `===`, so `warn` is excluded). Pre-existing `/logs` slice-before-filter behaviour being amplified, not a defect introduced here; raise `n` to compensate.
 
   This is **step 1 of ADR 0021**'s three, and none of the three implements tool calling.
 
@@ -27,6 +31,10 @@
   | M1 | delete the call site (back to silence) | the counting boot |
   | M2 | stop counting the deprecated `functions` form | the deprecated-form unit test |
   | M3 | **turn it into a refusal** — the thing ADR 0013 forbids | the boot, on *"must still be ANSWERED"* |
+  | M4 | rename the `declaredTools` log field | the boot, on *"must carry HOW MANY"* |
+  | M5 | **move the counter back before the rejection gates** | the control, on `[unknown model]` |
+
+  M4 and M5 were written by the **reviewer**, not the author, and both exist because the author's own table could not reach the assertions they cover: under M1 the counter assertion throws before the log assertions run (`AGENTS.md`'s **"Mutual"** case), and the control's second half had no row at all. **M5 is the F1 defect below, as a mutation** — it is the row that would have caught it.
 
 ## v3.33.0 — 2026-09-01
 

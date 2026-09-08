@@ -5842,17 +5842,36 @@ ltTest("integration (#467 control): a request with NO tools counts nothing, and 
       assert.equal((await ltPostStatus(port, { model: "sonnet", messages: [{ role: "user", content: "hi" }] })).status, 200);
       assert.equal(await dropped(), 0, "a request declaring NO tools must not move the counter");
 
-      // A FORCING tool_choice is refused by ADR 0013 and 400s. It must not be counted here: it was
-      // never the invisible case, and counting it would make the number mean two things at once.
-      const forced = await ltPostStatus(port, {
-        model: "sonnet", tool_choice: "required",
-        tools: [{ type: "function", function: { name: "read_file", parameters: {} } }],
-        messages: [{ role: "user", content: "hi" }],
+      // EVERY rejection path, not just the one I thought of. The first version of this test checked
+      // only the forcing `tool_choice`, and that is exactly why it missed the defect an independent
+      // reviewer found: the counter sat BEFORE model, messages, image and quota validation, so a
+      // `tools` request that 400'd for any of those still incremented it. Measured then:
+      // `toolRequestsDropped: 2` with `totalRequests: 0` — an arithmetic contradiction on /health.
+      //
+      // A refused request is the LOUD case. Counting it makes one number mean two things exactly
+      // when someone is trying to read it.
+      const TOOL = { type: "function", function: { name: "read_file", parameters: {} } };
+      for (const [label, body] of [
+        ["forcing tool_choice (ADR 0013)", { model: "sonnet", tool_choice: "required", tools: [TOOL], messages: [{ role: "user", content: "hi" }] }],
+        ["unknown model", { model: "gpt-9-turbo", tools: [TOOL], messages: [{ role: "user", content: "hi" }] }],
+        ["malformed messages element", { model: "sonnet", tools: [TOOL], messages: ["not-an-object"] }],
+        ["empty messages", { model: "sonnet", tools: [TOOL], messages: [] }],
+      ]) {
+        const r = await ltPostStatus(port, body);
+        assert.equal(r.status, 400, `[${label}] must be refused — got ${r.status}: ${r.text.slice(0, 140)}`);
+        assert.equal(await dropped(), 0,
+          `[${label}] a REFUSED request must not be counted as a silent drop. It is the loud case, ` +
+          `and the counter exists to measure the quiet one — counting it also lets ` +
+          `toolRequestsDropped exceed totalRequests, which is visible nonsense on /health.`);
+      }
+
+      // The positive control for the whole loop above: a request that IS served must still count,
+      // or the four assertions are satisfied by a counter that never increments at all.
+      const served = await ltPostStatus(port, {
+        model: "sonnet", tool_choice: "auto", tools: [TOOL], messages: [{ role: "user", content: "hi" }],
       });
-      assert.equal(forced.status, 400, `a forcing tool_choice must still be refused — got ${forced.status}`);
-      assert.equal(await dropped(), 0,
-        "a REFUSED request must not be counted as a silent drop — it is the loud case, and the " +
-        "counter exists to measure the quiet one");
+      assert.equal(served.status, 200, `the served request must succeed — ${served.status}`);
+      assert.equal(await dropped(), 1, "a SERVED tools request must count — otherwise the four checks above prove nothing");
     } finally { child.kill("SIGKILL"); await ltDrain(() => buf.closed, "tools-control", 5000); }
   } finally { _ltRmRetry(dir); }
 });
