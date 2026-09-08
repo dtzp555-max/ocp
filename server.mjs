@@ -47,7 +47,7 @@ import { DEFAULT_PORT } from "./lib/constants.mjs";
 import { StructuredOutputError, detectStructuredOutput, validateJsonSchemaSafe, extractJsonPayload, structuredSystemInstruction, resolveMaxAttempts } from "./lib/structured-output.mjs";
 import { isLoopbackBind } from "./lib/net.mjs";
 import { parseAllowedHosts, parseAuthority, matchesDeclared, evaluateOriginGate } from "./lib/host-gate.mjs";
-import { classifyToolRequest } from "./lib/tool-support.mjs";
+import { classifyToolRequest, countDeclaredTools } from "./lib/tool-support.mjs";
 import { runTuiTurn, reapStaleTuiSessions, resolveTuiHome, bootTuiPane, tuiPaneHealthy, poolPaneName, killLiveTurnPanes, POOL_BOOT_MS } from "./lib/tui/session.mjs";
 import { detectTuiUpstreamError } from "./lib/tui/transcript.mjs";
 import { TuiSemaphore, SemaphoreAbortError, recordTuiEntrypoint, buildTuiHealthBlock } from "./lib/tui/semaphore.mjs";
@@ -1054,6 +1054,16 @@ const activeProcesses = new Set();
 // ── Stats & diagnostics ─────────────────────────────────────────────────
 const stats = {
   totalRequests: 0,
+  // #467 / ADR 0021. Requests that DECLARED tools which OCP then dropped -- the silent
+  // degradation, counted. NOT a count of tools, and NOT a count of refusals: the refused shapes
+  // (ADR 0013's four forcing forms) already 400 loudly and are not counted here, because they were
+  // never the invisible case. This is the `tool_choice: "auto"`/absent path, where text is a legal
+  // answer, the request is served exactly as before, and the declared tools quietly never existed.
+  //
+  // Additive read-only field on a grandfathered B.2 endpoint, under ADR 0012. It reaches the wire
+  // through GET /health's bare `stats,` shorthand -- see the ADR 0016 Amendment 1 note below, which
+  // is the same mechanism working in the other direction.
+  toolRequestsDropped: 0,
   activeRequests: 0,
   errors: 0,
   timeouts: 0,
@@ -3835,6 +3845,33 @@ async function handleChatCompletions(req, res) {
       param: toolSupport.parameter,
       code: "unsupported_parameter",
     } });
+  }
+
+  // #467 / ADR 0021: the request is SUPPORTED, which means any tools it declared are about to be
+  // dropped and the client gets a text answer it cannot distinguish from a real one. That is the
+  // silent degradation, and until now it left no trace anywhere: HTTP 200, finish_reason "stop",
+  // /health ok, recentErrors empty, clean logs on BOTH sides. It has cost hours twice -- ADR 0013's
+  // own Context is the first occurrence, #467 the second.
+  //
+  // THE RESPONSE IS DELIBERATELY UNCHANGED. ADR 0013's Alternatives rejected "refuse whenever
+  // `tools` is present" because it would have taken down every OpenClaw agent on the fleet the day
+  // it shipped -- they all send tools and all accept text -- and ADR 0021 keeps that constraint by
+  // name. So this makes the failure OBSERVABLE without making it a failure.
+  //
+  // Logged per request rather than latched or throttled, deliberately: every one of these requests
+  // IS degraded, so per-request is the accurate volume, and OCP already emits one line per request
+  // (claude_ok / claude_exit). A first-time-only latch would be quieter and would also be the shape
+  // this repo has been bitten by twice (ADR 0014, #324) -- a clearing condition nobody can reach.
+  // The counter carries the running magnitude; the log carries the event.
+  const declaredTools = countDeclaredTools(parsed);
+  if (declaredTools > 0) {
+    stats.toolRequestsDropped++;
+    logEvent("warn", "openai_tools_dropped", {
+      model,
+      declaredTools,
+      toolChoice: typeof parsed.tool_choice === "string" ? parsed.tool_choice : (parsed.tool_choice?.type ?? "absent"),
+      note: "declared tools are not callable (ADR 0013); answered as text",
+    });
   }
 
   // Validate model against known models

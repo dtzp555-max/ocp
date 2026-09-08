@@ -2,6 +2,32 @@
 
 ## Unreleased
 
+### Added
+
+- **Dropped tools are now counted and logged — the silent degradation is observable (#467).** An OpenAI-protocol agent pointed at OCP did not fail; it **degraded into a chatbot**, and the degradation left no trace on any signal either side exposes: HTTP 200, `finish_reason: "stop"`, `ocp health` ok, `recentErrors` empty, clean logs on both sides. This is the **second** occurrence of that shape — [ADR 0013](docs/adr/0013-no-openai-tool-calling.md)'s own Context records the first, an agent on a group chat going quiet for hours with every health signal green. The first occurrence produced an ADR explaining *why* OCP refuses tool calling and **nothing that makes the failure observable when a client walks into it**, which is why the second cost hours again.
+
+  ADR 0013 refuses exactly the four shapes the OpenAI specification *obliges* a tool call for (`tool_choice: "required"`, a named `tool_choice`, `allowed_tools.mode: "required"`, and the deprecated `function_call`). Everything else — `tool_choice` absent, `"none"`, `"auto"` — is satisfiable by text, so it is served unchanged and the declared tools are dropped. **That let-through path is the case ADR 0013 explicitly declined to answer**, and it is what this change addresses.
+
+  **Additive under [ADR 0012](docs/adr/0012-additive-fields-on-grandfathered-b2.md).** New read-only field on `/health`: **`stats.toolRequestsDropped`** — requests that declared tools which OCP then dropped. Two probe profiles, `+2` key paths, `0` removed. It counts **requests, not tools**, and deliberately **does not count refusals**: a forcing `tool_choice` already 400s loudly and was never the invisible case, so counting it would make one number mean two things. Also logs `openai_tools_dropped` at `warn` per request, carrying `declaredTools` and the `toolChoice` that reached it.
+
+  **The response is deliberately unchanged, and that is the load-bearing constraint.** ADR 0013's Alternatives rejected *"refuse whenever `tools` is present"* because it **would have taken down every OpenClaw agent on the maintainer's fleet the day it shipped** — they all send tools and all accept text. [ADR 0021](docs/adr/0021-ocp-is-an-agent-backend.md) keeps that constraint by name. So this makes the failure **observable without making it a failure**, and the control test asserts HTTP **200** by exact status rather than `!== 500`.
+
+  Logged per request rather than latched, on purpose: every one of these requests *is* degraded, so per-request is the accurate volume, and OCP already emits one line per request. A first-time-only latch would be quieter and would also be the shape this repo has been bitten by twice (ADR 0014, #324) — a clearing condition nobody can reach. The counter carries the running magnitude; the log carries the event.
+
+  This is **step 1 of ADR 0021**'s three, and none of the three implements tool calling.
+
+### Tests
+
+- **Two unit tests and two live boots (#467).** The unit tests pin that `countDeclaredTools` counts the **deprecated `functions` form** as well as `tools` — a client on the old spelling has the identical silent failure, and omitting it would read 0 on exactly the setup least likely to have been updated — and that a malformed body counts **0 rather than throwing**, since a counter that throws would turn a silent degradation into a 500.
+
+  The live boots pin the **wiring** (#343's shape: a correct helper whose call site stops consulting it). The control is the one that matters: a request declaring no tools must not move the counter, and a **refused** request must not be counted either.
+
+  | row | mutation | reddens |
+  |---|---|---|
+  | M1 | delete the call site (back to silence) | the counting boot |
+  | M2 | stop counting the deprecated `functions` form | the deprecated-form unit test |
+  | M3 | **turn it into a refusal** — the thing ADR 0013 forbids | the boot, on *"must still be ANSWERED"* |
+
 ## v3.33.0 — 2026-09-01
 
 > **Governance audit for this section**, per `CLAUDE.md`'s `release_kit.governance_audits`:
