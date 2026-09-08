@@ -60,6 +60,51 @@ ocp restart
 openclaw gateway restart
 ```
 
+### An agent answers, but never actually uses its tools
+
+The hardest shape in this project's history, because **nothing goes red**. Symptoms:
+
+- simple questions answer in ~4 s; anything needing a tool takes 30 s – 13 min, **non-deterministically for the same class of task**;
+- occasional confidently-wrong answers of the form *"I don't have filesystem access"* for a file that exists;
+- **no error anywhere** — `finish_reason: "stop"`, HTTP 200, `ocp health` ok, `recentErrors` empty, agent-side logs clean.
+
+The agent looks alive and is answering. It just cannot do anything. See
+[#467](https://github.com/dtzp555-max/ocp/issues/467) and
+[ADR 0021](adr/0021-ocp-is-an-agent-backend.md).
+
+**First check — is OCP dropping the declared tools?** Since #468 it says so, on both surfaces:
+
+```bash
+curl -s localhost:3456/health | jq .stats.toolRequestsDropped   # non-zero ⇒ tools are being dropped
+ocp logs | grep openai_tools_dropped                            # one line per affected request
+```
+
+**Then confirm from the client's side**, because the counter above cannot see what the client got:
+
+```bash
+node scripts/probes/tools-dropped.mjs      # exit 1 ⇒ prose came back where tool_calls was expected
+```
+
+**If a turn is simply taking a long time**, do not guess from the duration — a legitimate
+tool-using turn measured 248 s here:
+
+```bash
+scripts/probes/wedged-or-working.sh        # STAT=U + flat ~0.2% CPU ⇒ wedged; STAT=S + varying ⇒ working
+```
+
+**Neither instrument is sufficient alone**, and the one that actually separates *"the client's agent
+loop ran"* from *"OCP's inner CLI did the work and narrated it"* is a third one that is not a
+script: the client's own per-session **tool-call counter** (OCP: `0`; a native tool-calling API:
+`1`). **Capability tests pass either way** — which is why this went unnoticed for days, twice. Read
+[`scripts/probes/README.md`](../scripts/probes/README.md) before concluding anything.
+
+**Already ruled out — do not re-measure:** context length (none / 20 KB / 100 KB / 300 KB →
+4.1 / 2.8 / 4.9 / 4.5 s) and the network.
+
+**Timeout ordering matters too.** `CLAUDE_TIMEOUT` defaults to 600 s, which is *shorter* than some
+client defaults (1800 s in the reported case), so the client never fails first and never fails
+over — a wedged turn is ten minutes of total silence before anything happens at all.
+
 ### Env var change (e.g. `CLAUDE_BIND`, `CLAUDE_CODE_OAUTH_TOKEN`) doesn't take effect after restart
 
 On **macOS**, `ocp restart` does a full `launchctl bootout` + `bootstrap` of the agent, which **re-reads the plist `EnvironmentVariables`** — so an env change you made (in `~/Library/LaunchAgents/dev.ocp.proxy.plist`) actually takes effect:

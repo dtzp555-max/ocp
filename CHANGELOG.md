@@ -2,6 +2,20 @@
 
 ## Unreleased
 
+### Added
+
+- **Two probes and a troubleshooting entry for the #467 shape (#467).** The failure that produced [ADR 0021](docs/adr/0021-ocp-is-an-agent-backend.md) is the hardest kind this project has: an agent answers, looks alive, and cannot do anything, while **nothing goes red**. `scripts/probes/` now carries the two instruments that diagnosed it, and `docs/troubleshooting.md` gains *"An agent answers, but never actually uses its tools"* pointing at them.
+
+  **`tools-dropped.mjs`** — the wire-level criterion. Asks OCP for a tool call the model provably cannot answer from knowledge, with `tool_choice: "auto"`. **Three** exits, all verified reachable: `0` (tool_calls came back — against a stub), `1` (prose came back — against a live OCP), `2` (**the request itself failed, so neither state was established** — against a dead port). That third exit is not a detail: reporting a failed request as "tools were dropped" would be a negative predicate satisfied by an empty world. It asserts on `message.tool_calls` and `finish_reason` and **never on the prose**, because the prose varies run to run and that variance *is* layer 2 of the bug — a fixture asserting on it would flake for the wrong reason and get "fixed" by loosening the wrong assertion.
+
+  **`wedged-or-working.sh`** — the triage criterion, `STAT` + `%CPU` over N samples, with a third `inconclusive` verdict rather than forcing every reading into two buckets. It exists to prevent two confident wrong answers: **one sample is not enough** (a working turn spends most of its wall clock waiting upstream, so a single reading is indistinguishable from a wedged one — the signal is the *variance*), and **duration is not the criterion** (a legitimate tool-using turn measured **248 s**; the wedged one ran 9 min at 0.2 % CPU).
+
+  **The point the README leads with, because it is why this survived days of green checks: none of the instruments is sufficient alone.** `tools-dropped.mjs` reads what the **client got** and cannot see that OCP knows it dropped something; `stats.toolRequestsDropped` (#468) reads what the **server dropped** and cannot see that the client had nothing to branch on. Both were run against the same request and both reported `1` — two instruments pointing at one event from opposite ends. The third criterion, the client's own per-session **tool-call counter**, is **not scriptable against OCP at all**, because it measures *which side ran the loop*; a `curl` cannot see it. **Capability tests pass either way.**
+
+  Also recorded so nobody re-measures them: **not context length** (none / 20 KB / 100 KB / 300 KB → 4.1 / 2.8 / 4.9 / 4.5 s) and **not the network**.
+
+  **Provenance**, in the form a reader can check rather than a session handle: designed and verified in both directions by **Claude Opus 5 on 2026-09-09 against OCP 3.32.0**. `tools-dropped.mjs` was originally Python and is ported to `.mjs` here — the repo is native ESM throughout and it would otherwise have been its first `.py` file — with its assertions and fixture design unchanged, and all three exits re-verified after the port rather than carried forward.
+
 ## v3.33.0 — 2026-09-01
 
 > **Governance audit for this section**, per `CLAUDE.md`'s `release_kit.governance_audits`:
