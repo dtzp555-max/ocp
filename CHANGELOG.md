@@ -46,6 +46,14 @@
 
 ### Fixed
 
+- **The resolution-limit warning understated its own interval by 2x, in the unsafe direction (#467).** Eighth round of independent review, and the only finding in it.
+
+  The line read *"the true rate is somewhere in `(0, rate]`"*. `ps` **truncates**, so a reported one-quantum increment means the true readings were `t0 ∈ [C0, C0+q)` and `t1 ∈ [C0+q, C0+2q)` — the true delta is therefore in **`(0, 2q)`**, open at both ends, and the true rate in **`(0, 2×rate)`**. Worked: Linux at the default 20 s window reporting `5.00 %`, the process may be consuming just under 2 s over 20 s, i.e. approaching **10 %** — while the line told the operator *at most* 5 %.
+
+  **The error was in the unsafe direction**: it understates how much CPU the process may be using. Bounded in practice, since the verdict already says `UNRESOLVED` and points at bytes received, but it is a quantitative claim in operator output that was arithmetically wrong. The conclusion holds whether `ps` truncates or rounds. Now prints the doubled ceiling and says why.
+
+  The reviewer's note on how they caught it is the transferable part: they nearly accepted it **by reading**, because `(0, rate]` is the intuitive thing to write and every sentence around it is correct. What caught it was working the truncation bounds out explicitly rather than checking whether the claim sounded right — the same move as re-deriving a mutation's reach instead of trusting its label.
+
 - **The operator page kept asserting 0.3 % as *the* floor, contradicting the tool's own output on Linux (#467).** Seventh round of independent review, and the **sixth** occurrence of one shape in this PR: the block was corrected in three files and the fourth was left. `docs/troubleshooting.md` was the only one of the four with zero mentions of the quantum or the effective floor, and its sentence — *"above a 0.3 % floor — the point at which it can see CPU being consumed at all"* — is **exactly the macOS-property-written-as-instrument-property framing this same change had just removed from the script comment**, surviving one document over. On Linux the tool prints `below the 5.00% effective floor` while that page said 0.3 %. The page now states the derivation, gives both platforms' values, and tells the reader to take the floor off the verdict line rather than off the page.
 
   **And the floor is now printed on every verdict branch, not just the negative one.** It appeared only in `inconclusive`, while `README.md` claimed *"the verdict line prints the one in force"* — true for the branch that explains why nothing was found, not for the branch an operator reaches whenever anything is happening.

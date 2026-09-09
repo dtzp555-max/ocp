@@ -246,8 +246,17 @@ for pid in $PIDS; do
     # at the default window that is 5.00%, and nothing else on the line distinguishes it from a
     # precise 5%. Said here rather than left for the operator to infer from the quantum.
     if awk -v d="$delta" -v q="$TIME_QUANTUM" 'BEGIN{exit !(d <= q * 1.0001)}'; then
-      echo "      ⚠ AT THE RESOLUTION LIMIT: ${delta}s is one quantum. The true rate is somewhere in"
-      echo "        (0, ${rate}%] and this instrument cannot narrow it. Lengthen the window to refine."
+      # THE INTERVAL IS (0, 2*rate), NOT (0, rate]. `ps` TRUNCATES, so a reported one-quantum
+      # increment means the true readings were t0 in [C0, C0+q) and t1 in [C0+q, C0+2q) -- the true
+      # delta is therefore in (0, 2q), open at both ends. An earlier version of this line wrote
+      # (0, rate], which is the intuitive thing to write and understates the ceiling by 2x, IN THE
+      # UNSAFE DIRECTION: it tells the operator the process may be using at most `rate` when it may
+      # be using nearly twice that. The conclusion holds whether ps truncates or rounds.
+      hi_rate=$(awk -v r="$rate" 'BEGIN{ printf "%.2f", r * 2 }')
+      echo "      ⚠ AT THE RESOLUTION LIMIT: ${delta}s is one quantum, the smallest increment this"
+      echo "        platform can report. The true rate is somewhere in (0, ${hi_rate}%) -- up to TWICE"
+      echo "        the figure above, because ps truncates at both ends of the window. This"
+      echo "        instrument cannot narrow it; lengthen the window to refine."
     fi
     echo "      Consuming CPU is not progress. Measured: wedged clients running ordinary timers span"
     echo "      0.05-5.00%, genuinely working streams 0.55-2.25% -- overlapping, and the wedged side"
