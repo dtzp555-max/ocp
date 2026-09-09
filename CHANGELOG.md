@@ -2,6 +2,43 @@
 
 ## Unreleased
 
+### Changed
+
+- **The system prompt no longer denies tools the same spawn grants (#467, ADR 0021 item 2).** The default wrapper told the model *"You do NOT have access to any local filesystem, working directory, shell, git status, or machine environment"* while `buildCliArgs` passed `--allowedTools Bash,Read,Write,Edit,Glob,Grep,WebSearch,WebFetch,Agent` on the same spawn. `server.mjs`'s own comment had recorded the contradiction since the `OCP_LOCAL_TOOLS` flag shipped — that flag exists because the default wrapper makes the model *"disclaim access it actually holds"* — and a default-off flag was shipped past it rather than a fix.
+
+  **The denial was measured, not argued.** Instrument: the `tools` array on the `system` init event of `--output-format stream-json --verbose`, which is the authority `server.mjs`'s multi-mode block already established (asking the model its own tools was measured there to lie). Replicating exactly the flags each branch pushes, on `claude 2.1.260`:
+
+  | branch | flags | tools in the schema |
+  |---|---|---|
+  | `AUTH_MODE=multi` | `--tools "" --strict-mcp-config --disallowedTools 'mcp__*'` | **0** |
+  | every other branch | `--allowedTools Bash Read Write …` | **27**, incl. `Bash`, `Edit`, `Glob`, `Grep` |
+
+  So the denial is **true in multi mode and false everywhere else**. The multi row is the control: it proves the instrument can return 0, so the 27 is not a tautology.
+
+  **Three wrappers now, selected from the tool surface the spawn actually grants** (`lib/prompt.mjs` § `selectPromptWrapper`), because there are three distinct truths and collapsing any two re-creates a lie:
+
+  - **negative** — the schema is empty (`multi`). The denial is accurate. **Byte-identical** to what shipped before: the untrusted-caller path is deliberately untouched.
+  - **neutral** *(new)* — tools are granted and OCP is not inviting their use. Makes no capability claim, and keeps the anti-invention clause the negative wrapper carried.
+  - **positive** — `OCP_LOCAL_TOOLS=1`, an explicit invitation. Its boot gate (`localToolsSafetyError`) is **unchanged**; `localToolsInvited` is only ever true after that gate has passed.
+
+  **BEFORE/AFTER, measured** — ADR 0021's Consequences required this rather than an assertion. Same question, six runs per arm, asked so it names no tool and is answerable only by looking: *"How many entries are in your current working directory?"* Classification is exact-match against **that arm's own** ground truth, which differ by one (29/23 vs 30/24), so a number carried over from the other arm would be caught:
+
+  | arm | wrapper | looked at the filesystem |
+  |---|---|---|
+  | `origin/main` | denies tools | **3 / 6** |
+  | this branch | neutral | **6 / 6** |
+
+  The *shape* is more telling than the count. Under the denying wrapper **all six** responses — including the three that answered — stopped to report the contradiction as a rules conflict between the system prompt and the tool list. Under the neutral wrapper **none** did; they answered. Two bounds stated rather than left implicit: N=6 per arm is small, and these boots ran with `Spawn home: real-home`, so the child inherited the operator's own `CLAUDE.md` and had a vocabulary for reporting conflicts. On a token-resolvable production instance the spawn home is isolated and that vocabulary is absent — the contradiction remains, the *reporting* of it would not look like this.
+
+  **What did NOT change: the tool surface.** `--allowedTools` is still passed on exactly the same branches, `--tools ""` still only in `multi`, and every existing boot gate is where it was. This is a prompt-truthfulness fix, not a permissions change. That is a decision the maintainer made explicitly when the alternative was put to them: emptying the schema on network-exposed instances would make the denial true, but it contradicts the deployment design already in force, where the spawned `claude` is treated as a prompt-injection surface and contained at the **Unix identity** layer rather than by removing its tools. **Consequence, stated plainly:** on a network-exposed instance the false denial was the only thing standing between a caller and the operator's tools — and ADR 0021 records it being declined out loud, so it was never a control. Removing it makes the model act more reliably; the containment is, and was, elsewhere.
+
+  Pinned by the two branch integration tests, which now assert the prompt and the tool flags **from the same spawn** — separate tests would pass on a build where each is individually right but they came from different configurations, and drifting apart is precisely the defect. Mutation rows: reverting the selection to always-negative reddens the non-multi test on *"a tools-granting spawn must carry the NEUTRAL wrapper"* while multi stays green; mutating `buildCliArgs`'s flags reddens the same test on *"the non-multi tool flags changed"* — two claims, two different mutations, so co-locating them leaves both provable.
+
+  `selectPromptWrapper`'s signature changed from three positional arguments to `(surface, wrappers)`, and a stale positional call now **throws**: destructuring `false` does not throw in JavaScript, so the old shape would have silently returned the negative wrapper on every surface. Unreachable by construction rather than prohibited in a comment. The boot banner gained a `Prompt wrapper:` line reading the **selected** value, so a wrong selection shows up there rather than being re-derived correctly for the banner.
+
+  `CONFIG_EPOCH` folds the chosen wrapper into every cache key, so this is a whole-cache invalidation on upgrade — the intended behaviour when the composed prompt changes. It and the selection moved ~190 lines down to sit next to `AUTH_MODE`, which the selection now depends on; both remain module-level consts evaluated once.
+
+
 ## v3.33.0 — 2026-09-01
 
 > **Governance audit for this section**, per `CLAUDE.md`'s `release_kit.governance_audits`:

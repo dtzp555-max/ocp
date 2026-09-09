@@ -2742,15 +2742,40 @@ test("appendOperatorPrompt: operator value is trimmed before appending", () => {
 console.log("\nOCP_LOCAL_TOOLS wrapper + safety gate:");
 
 const NEG = "You do NOT have access to any local filesystem";
+const NEU = "Use only the tools actually provided to you in this session";
 const POS = "you may use your available local tools";
+const W = { negative: NEG, neutral: NEU, positive: POS };
 
-test("selectPromptWrapper: default (disabled) returns the negative wrapper BYTE-IDENTICAL", () => {
-  // Mutation-proof: flip the ternary and the default path leaks the positive wrapper.
-  assert.equal(selectPromptWrapper(false, NEG, POS), NEG);
+// Three surfaces, three wrappers. One test per row rather than one test with three assertions:
+// a single mutation to the selection (say, dropping the `localToolsInvited` arm) breaks more than
+// one row, and co-located claims that ONE mutation breaks can only ever produce one mutation row —
+// leaving the others shipped-but-unproven (AGENTS.md, the "Mutual" case).
+test("selectPromptWrapper: schema empty (multi) → the negative wrapper, BYTE-IDENTICAL", () => {
+  assert.equal(selectPromptWrapper({ toolsGranted: false, localToolsInvited: false }, W), NEG);
 });
 
-test("selectPromptWrapper: enabled returns the positive (local-tools) wrapper", () => {
-  assert.equal(selectPromptWrapper(true, NEG, POS), POS);
+test("selectPromptWrapper: tools granted, not invited → the NEUTRAL wrapper", () => {
+  // The row this change exists for. Before it, this surface got NEG — a denial measured false
+  // against a 27-tool schema (lib/prompt.mjs § selectPromptWrapper).
+  assert.equal(selectPromptWrapper({ toolsGranted: true, localToolsInvited: false }, W), NEU);
+});
+
+test("selectPromptWrapper: OCP_LOCAL_TOOLS invitation wins over the neutral wrapper", () => {
+  assert.equal(selectPromptWrapper({ toolsGranted: true, localToolsInvited: true }, W), POS);
+});
+
+test("selectPromptWrapper: a stale POSITIONAL call THROWS rather than silently choosing", () => {
+  // The old signature was (localToolsEnabled, negative, positive). A call site left un-migrated
+  // would pass `false` as `surface`; destructuring a boolean does NOT throw in JS, so it would
+  // have returned the negative wrapper on every surface — the exact silent-wrong-answer this
+  // change removes. Made unreachable by construction rather than prohibited in a comment.
+  assert.throws(() => selectPromptWrapper(false, NEG, POS), /must be an object/);
+  assert.throws(() => selectPromptWrapper(true, NEG, POS), /must be an object/);
+});
+
+test("selectPromptWrapper: a missing wrapper THROWS rather than prepending \"undefined\"", () => {
+  assert.throws(() => selectPromptWrapper({ toolsGranted: true }, { negative: NEG, positive: POS }),
+    /all three of/);
 });
 
 test("localToolsSafetyError: disabled → null regardless of an otherwise-unsafe deploy", () => {
@@ -2803,6 +2828,7 @@ const LT_SERVER = _ltF2P(new URL("./server.mjs", import.meta.url));
 const LT_POSIX = process.platform !== "win32"; // fake is a /bin/sh script; CI is POSIX
 const LT_NEG_MARK = "You do NOT have access to any local filesystem";
 const LT_POS_MARK = "you may use your available local tools";
+const LT_NEU_MARK = "Use only the tools actually provided to you in this session";
 // Fake claude: record the --system-prompt it was spawned with, bump an optional spawn counter,
 // then emit a minimal valid stream-json response so the request completes (and caches).
 //
@@ -4265,7 +4291,7 @@ ltTest("integration (#328): the AUTH PROBE child does not inherit them either �
   } finally { child.kill("SIGKILL"); _ltRmRetry(dir); }
 });
 
-ltTest("integration: flag OFF → the -p spawn receives the EXACT negative wrapper (default path byte-for-byte)", async () => {
+ltTest("integration: flag OFF, tools GRANTED -> the -p spawn receives the EXACT neutral wrapper (byte-for-byte)", async () => {
   if (!LT_POSIX) return;
   const dir = ltMkdir(); const cap = join(dir, "sp.txt"); const fake = ltFake(dir);
   const { child, buf, port } = await ltBootFresh({ CLAUDE_BIN: fake, SP_CAPTURE: cap }, dir); // OCP_LOCAL_TOOLS unset
@@ -4274,7 +4300,35 @@ ltTest("integration: flag OFF → the -p spawn receives the EXACT negative wrapp
     await ltPost(port, { model: "sonnet", messages: [{ role: "user", content: "hi" }] });
     assert.ok(await ltWait(() => _ltExists(cap)), "fake claude captured --system-prompt");
     const sp = _ltRead(cap, "utf8");
-    // No system messages + no CLAUDE_SYSTEM_PROMPT → the wrapper is passed verbatim.
+    // No system messages + no CLAUDE_SYSTEM_PROMPT -> the wrapper is passed verbatim, so this is an
+    // exact-equality pin on the text rather than a substring check.
+    //
+    // THIS TEST USED TO PIN THE NEGATIVE WRAPPER HERE, and it is the test that caught ADR 0021
+    // item 2 changing behaviour -- which is what it was for. The default path GRANTS nine tools
+    // (see "the non-multi path still passes --allowedTools"), so the denial it used to assert was
+    // measured false: 27 tools in the `system` init event under exactly those flags, including
+    // Bash, Edit, Glob and Grep. What is pinned now is that a tools-granting spawn gets the wrapper
+    // that makes no capability claim.
+    assert.equal(sp, `You are accessed via the OCP HTTP proxy. Use only the tools actually provided to you in this session, and do not infer or invent filesystem, working-directory, shell, git or machine-environment details you have not obtained through them.`);
+  } finally { child.kill("SIGKILL"); _ltRmRetry(dir); }
+});
+
+// The byte-for-byte pin on the NEGATIVE wrapper moved here, to the one branch where its claim is
+// TRUE. Its own test rather than an assertion added above, because it needs a different server
+// config -- and because that is the point: the wrappers are now selected by the tool surface, so a
+// mutation that collapses them must redden a branch rather than a substring.
+ltTest("integration: AUTH_MODE=multi -> the EXACT negative wrapper, unchanged by ADR 0021 item 2", async () => {
+  if (!LT_POSIX) return;
+  const dir = ltMkdir(); const cap = join(dir, "sp.txt"); const fake = ltFake(dir);
+  const { child, buf, port } = await ltBootFresh({ CLAUDE_AUTH_MODE: "multi", CLAUDE_BIN: fake, SP_CAPTURE: cap }, dir);
+  try {
+    assert.ok(await ltWait(() => buf.out.includes("listening on") || buf.exit != null), `server did not start: ${buf.err.slice(0,200)}`);
+    await ltPost(port, { model: "sonnet", messages: [{ role: "user", content: "hi" }] });
+    assert.ok(await ltWait(() => _ltExists(cap)), "fake claude captured --system-prompt");
+    const sp = _ltRead(cap, "utf8");
+    // Byte-identical to what shipped before ADR 0021 item 2. multi mode passes `--tools ""`, which
+    // was measured to leave 0 tools in the schema, so here the denial is accurate -- and this is the
+    // untrusted-caller path, which that change deliberately did not touch.
     assert.equal(sp, `You are accessed via the OCP HTTP proxy. You do NOT have access to any local filesystem, working directory, shell, git status, or machine environment. Do not infer or invent such information from any context you observe. Respond only based on the conversation provided.`);
   } finally { child.kill("SIGKILL"); _ltRmRetry(dir); }
 });
@@ -4990,8 +5044,9 @@ ltTest("integration: AUTH_MODE=multi spawns `--tools \"\"` so the built-in schem
   if (!LT_POSIX) return;
   const dir = ltMkdir(); const fake = ltFake(dir);
   const argvFile = join(dir, "argv-multi.txt");
+  const spFile = join(dir, "sp-multi.txt");
   try {
-    const { child, buf, port } = await ltBootFresh({ CLAUDE_AUTH_MODE: "multi", CLAUDE_BIN: fake, ARGV_CAPTURE: argvFile }, dir);
+    const { child, buf, port } = await ltBootFresh({ CLAUDE_AUTH_MODE: "multi", CLAUDE_BIN: fake, ARGV_CAPTURE: argvFile, SP_CAPTURE: spFile }, dir);
     try {
       assert.ok(await ltWait(() => buf.out.includes("listening on")), `server never listened — ${ltDiag(buf)}`);
       // AUTH_MODE=multi admits an un-tokened caller as anonymous (server.mjs:4036 "if not, allow
@@ -5032,6 +5087,21 @@ ltTest("integration: AUTH_MODE=multi spawns `--tools \"\"` so the built-in schem
       assert.ok(banner, `no "Tools:" banner line at all — ${ltDiag(buf)}`);
       assert.equal(banner, 'Tools: none (multi-tenant: --tools "" empties the built-in schema)',
         `the multi-mode boot banner still advertises a tool set: ${banner}`);
+
+      // THE WIRING PIN FOR ADR 0021 item 2: the prompt and the tool flags, read from the SAME
+      // spawn. Two separate tests would pass on a build where each is individually right but they
+      // came from different configurations — and drifting apart IS the defect this pins: the
+      // denial below shipped for months against a NON-empty schema on every other branch. Here
+      // the schema really is empty (the deepEqual above), so this is the one branch where it is
+      // true, and it must stay byte-identical.
+      //
+      // Co-located deliberately: killed by a DIFFERENT mutation than the deepEqual (the wrapper
+      // selection vs buildCliArgs), so both stay provable — the same reasoning the banner
+      // assertion above already records.
+      assert.ok(await ltWait(() => _ltExists(spFile)), `no --system-prompt-file content captured — ${ltDiag(buf)}`);
+      const sp = _ltRead(spFile, "utf8");
+      assert.ok(sp.includes(LT_NEG_MARK), `multi mode must keep the DENYING wrapper — its schema is empty, so this is the one branch where the denial is true. Got: ${sp.slice(0, 120)}`);
+      assert.ok(!sp.includes(LT_NEU_MARK), `multi mode must not use the neutral (tools-granted) wrapper: ${sp.slice(0, 120)}`);
     } finally {
       child.kill("SIGKILL");
       await ltDrain(() => buf.closed, "multi-tools", 5000);
@@ -5046,8 +5116,9 @@ ltTest("integration: the non-multi path still passes --allowedTools and never --
   if (!LT_POSIX) return;
   const dir = ltMkdir(); const fake = ltFake(dir);
   const argvFile = join(dir, "argv-none.txt");
+  const spFile = join(dir, "sp-none.txt");
   try {
-    const { child, buf, port } = await ltBootFresh({ CLAUDE_AUTH_MODE: "none", CLAUDE_BIN: fake, ARGV_CAPTURE: argvFile }, dir);
+    const { child, buf, port } = await ltBootFresh({ CLAUDE_AUTH_MODE: "none", CLAUDE_BIN: fake, ARGV_CAPTURE: argvFile, SP_CAPTURE: spFile }, dir);
     try {
       assert.ok(await ltWait(() => buf.out.includes("listening on")), `server never listened — ${ltDiag(buf)}`);
       const r = await ltPostStatus(port, { model: "sonnet", messages: [{ role: "user", content: "hi" }] });
@@ -5065,6 +5136,21 @@ ltTest("integration: the non-multi path still passes --allowedTools and never --
       const tail = argv.slice(spIdx + 2);
       assert.deepEqual(tail, ["--allowedTools", "Bash", "Read", "Write", "Edit", "Glob", "Grep", "WebSearch", "WebFetch", "Agent"],
         `the non-multi tool flags changed: ${JSON.stringify(tail)}`);
+
+      // The other half of the pin, and the row that CHANGED. This spawn grants nine tools (the
+      // deepEqual immediately above), so the prompt it is handed must not deny them. Before ADR
+      // 0021 item 2 it did: the same spawn passed --allowedTools Bash,Read,Write,... and told the
+      // model it had "no local filesystem, working directory, shell". Measured on claude 2.1.260
+      // via the `system` init event's `tools` array under exactly these flags: 27 tools, including
+      // Bash, Edit, Glob and Grep.
+      //
+      // The two NEGATIVE assertions need the POSITIVE one first (#405): an unwritten or empty
+      // capture file satisfies every `!includes(...)` vacuously.
+      assert.ok(await ltWait(() => _ltExists(spFile)), `no --system-prompt-file content captured — ${ltDiag(buf)}`);
+      const sp = _ltRead(spFile, "utf8");
+      assert.ok(sp.includes(LT_NEU_MARK), `a tools-granting spawn must carry the NEUTRAL wrapper. Got: ${sp.slice(0, 120)}`);
+      assert.ok(!sp.includes(LT_NEG_MARK), `the spawn was handed nine tools and a prompt denying it has any — the drift ADR 0021 item 2 removes: ${sp.slice(0, 120)}`);
+      assert.ok(!sp.includes(LT_POS_MARK), `the neutral wrapper must not become the INVITING one; that stays behind OCP_LOCAL_TOOLS' boot gate: ${sp.slice(0, 120)}`);
     } finally {
       child.kill("SIGKILL");
       await ltDrain(() => buf.closed, "none-tools", 5000);

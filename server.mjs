@@ -220,6 +220,19 @@ const OCP_SYSTEM_PROMPT_WRAPPER = `You are accessed via the OCP HTTP proxy. You 
 // no over-claim, only a gap -- which is exactly why it survived two passes.
 const OCP_LOCAL_TOOLS_WRAPPER = `You are accessed via the OCP HTTP proxy running on the operator's own machine. Unlike the shared-gateway posture, you may use your available local tools to act on the operator's machine as the task requires. Use only the tools you actually have — do not assume filesystem, shell, or other access beyond the tool set provided to you in this session.`;
 
+// Used on every branch that GRANTS tools without inviting their use — i.e. everything except
+// AUTH_MODE=multi (where the schema is genuinely empty) and OCP_LOCAL_TOOLS=1 (which is an explicit
+// invitation, still boot-gated to loopback/single-user). It exists because the negative wrapper
+// above was measured FALSE on this path: under the flags buildCliArgs pushes here the `system` init
+// event carries a non-empty tool schema including Bash/Edit/Glob/Grep, while the text told the model
+// it had none. See lib/prompt.mjs § selectPromptWrapper for the measurement and its instrument, and
+// ADR 0021 item 2 for the authorization.
+//
+// It states NO capability — neither granting nor denying — because OCP is not the right layer to
+// decide how a granted tool gets used: the client's own instructions are. What it keeps is the half
+// of the negative wrapper that was always true and always useful, the anti-invention clause.
+const OCP_NEUTRAL_TOOLS_WRAPPER = `You are accessed via the OCP HTTP proxy. Use only the tools actually provided to you in this session, and do not infer or invent filesystem, working-directory, shell, git or machine-environment details you have not obtained through them.`;
+
 // OCP_LOCAL_TOOLS is inert in TUI mode: the interactive (non-`-p`) path composes its own prompt via
 // callClaudeTui/messagesToPrompt and never calls extractSystemPrompt, so the wrapper is only ever
 // applied on the `-p` path. LOCAL_TOOLS_ACTIVE is the single source of truth (hoisted once, house
@@ -229,8 +242,12 @@ const OCP_LOCAL_TOOLS_WRAPPER = `You are accessed via the OCP HTTP proxy running
 const LOCAL_TOOLS = process.env.OCP_LOCAL_TOOLS === "1";
 const LOCAL_TOOLS_ACTIVE = LOCAL_TOOLS && process.env.CLAUDE_TUI_MODE !== "true";
 
-// The wrapper actually prepended to each request's system prompt, chosen once at startup.
-const SYSTEM_PROMPT_WRAPPER = selectPromptWrapper(LOCAL_TOOLS_ACTIVE, OCP_SYSTEM_PROMPT_WRAPPER, OCP_LOCAL_TOOLS_WRAPPER);
+// The wrapper actually prepended to each request's system prompt is chosen once at startup — but
+// BELOW, next to AUTH_MODE, not here. It now depends on the tool surface the spawn grants, and
+// AUTH_MODE is declared ~190 lines further down (it depends on PROXY_API_KEY). CONFIG_EPOCH, which
+// folds the chosen wrapper into every cache key, moved with it for the same reason. Both are still
+// module-level consts evaluated once; only their position changed. `extractSystemPrompt` below
+// reads SYSTEM_PROMPT_WRAPPER from inside a function body, so it is unaffected by the order.
 
 // Build the full system-prompt string: SYSTEM_PROMPT_WRAPPER prepended,
 // then any system-role messages from the request appended (separated by blank line),
@@ -411,9 +428,6 @@ const NO_CONTEXT = process.env.CLAUDE_NO_CONTEXT === "true";
 // Deliberately boot-time-only: runtime-mutable settings (e.g. maxPromptChars via the settings
 // API) are excluded because a const epoch cannot track them; truncation also only drops
 // context rather than changing the instruction set.
-const CONFIG_EPOCH = cryptoCreateHash("sha256")
-  .update(JSON.stringify([SYSTEM_PROMPT, SYSTEM_PROMPT_WRAPPER, ALLOWED_TOOLS, NO_CONTEXT]))
-  .digest("hex").slice(0, 16);
 // Kill-switch for the FIX-③ default-path spawn-home isolation (see resolveSpawnHome /
 // spawnHomeMode below). When "1", the -p/stream-json spawn always runs in the operator's
 // real HOME with no cwd override — byte-for-byte the pre-isolation behaviour — even if an
@@ -421,6 +435,24 @@ const CONFIG_EPOCH = cryptoCreateHash("sha256")
 // HOME's claude config for the spawned process.
 const SPAWN_REAL_HOME = process.env.OCP_SPAWN_REAL_HOME === "1";
 const AUTH_MODE = process.env.CLAUDE_AUTH_MODE || (PROXY_API_KEY ? "shared" : "none");
+
+// ── system-prompt wrapper selection (moved here from ~line 233) ─────────────────────────────────
+// Chosen from the tool surface the spawn ACTUALLY grants, so the prompt and the flags cannot drift
+// apart — which they had: see lib/prompt.mjs § selectPromptWrapper for the measurement.
+//
+// `AUTH_MODE === "multi"` is exactly buildCliArgs's own test for the branch that empties the schema
+// (`--tools ""`); every other branch leaves the model holding tools. Reading AUTH_MODE rather than
+// the env var is deliberate — it is the same value buildCliArgs branches on, so there is one
+// derivation, not two that could disagree.
+const TOOLS_GRANTED = AUTH_MODE !== "multi";
+const SYSTEM_PROMPT_WRAPPER = selectPromptWrapper(
+  { toolsGranted: TOOLS_GRANTED, localToolsInvited: LOCAL_TOOLS_ACTIVE },
+  { negative: OCP_SYSTEM_PROMPT_WRAPPER, neutral: OCP_NEUTRAL_TOOLS_WRAPPER, positive: OCP_LOCAL_TOOLS_WRAPPER },
+);
+
+const CONFIG_EPOCH = cryptoCreateHash("sha256")
+  .update(JSON.stringify([SYSTEM_PROMPT, SYSTEM_PROMPT_WRAPPER, ALLOWED_TOOLS, NO_CONTEXT]))
+  .digest("hex").slice(0, 16);
 const ADMIN_KEY = process.env.OCP_ADMIN_KEY || "";
 const PROXY_ANONYMOUS_KEY = process.env.PROXY_ANONYMOUS_KEY || "";
 // When set to "1", advertise PROXY_ANONYMOUS_KEY in the public /health body so
@@ -5009,6 +5041,14 @@ server.listen(PORT, BIND_ADDRESS, () => {
   console.log(`Auth: ${PROXY_API_KEY ? "enabled (PROXY_API_KEY set)" : "disabled (no PROXY_API_KEY)"}`);
   console.log(`Auth mode: ${AUTH_MODE}${AUTH_MODE === "shared" ? " (PROXY_API_KEY)" : AUTH_MODE === "multi" ? " (per-user keys)" : " (open)"}`);
   console.log(`Bind: ${BIND_ADDRESS}${BIND_ADDRESS === "0.0.0.0" ? " ⚠ LAN-accessible" : ""}`);
+  // Which of the three system-prompt wrappers this boot selected. Operator-facing because the
+  // choice is invisible otherwise (the prompt travels in a 0600 temp file, #453) and because the
+  // defect it replaces was exactly a mismatch between what the operator believed the model was
+  // told and what it was actually handed. Reads the SELECTED value, not the inputs, so a wrong
+  // selection shows up here rather than being re-derived correctly for the banner.
+  console.log(`Prompt wrapper: ${SYSTEM_PROMPT_WRAPPER === OCP_SYSTEM_PROMPT_WRAPPER ? "denies local tools (schema is empty)"
+                              : SYSTEM_PROMPT_WRAPPER === OCP_NEUTRAL_TOOLS_WRAPPER ? "neutral (tools granted, use not invited)"
+                              : "invites local tools (OCP_LOCAL_TOOLS=1)"}`);
   if (LOCAL_TOOLS_ACTIVE) console.log(`Local tools: ON (OCP_LOCAL_TOOLS=1) — model told it may use local tools; single-user/loopback only`);
   else if (LOCAL_TOOLS) console.warn(`⚠ OCP_LOCAL_TOOLS=1 is ignored in TUI mode (the -p system-prompt wrapper is not used). The TUI tool surface is governed by OCP_TUI_FULL_TOOLS.`);
   if (NO_CONTEXT) console.log(`Context: suppressed (CLAUDE_NO_CONTEXT=true — no CLAUDE.md, no auto-memory)`);
