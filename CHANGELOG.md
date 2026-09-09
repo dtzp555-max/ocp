@@ -15,6 +15,8 @@
 
   M2 is the row that matters: it shows the old form converts "the fixture never armed" into "the code is wrong", which is the error the failing run actually made. This is `AGENTS.md`'s *"wait for the thing you are about to assert"* applied to a test that #464 added two days earlier — the rule caught its own author.
 
+  **A second premise was still unasserted, and an independent review found it.** The behaviour assertions equally depend on `ltWaitHealth` *still polling* when the kill lands — if its own budget expires first, the last poll SUCCEEDED and `FINAL poll returned no body` fails, again a behaviour message for a fixture-timing cause. Reachable: squeezing that budget to 1 ms reproduces it. It is now asserted from `_ltHealthPolls`, which the comment had been *naming* while nothing read it — the prose was describing a guard that did not exist. Mutation row: with the budget squeezed, the test used to fail on `should disclose that the last poll failed` (behaviour) and now fails on `premise: ltWaitHealth must still be polling when the server dies (polls 1 -> 1)`.
+
 ## v3.33.0 — 2026-09-01
 
 > **Governance audit for this section**, per `CLAUDE.md`'s `release_kit.governance_audits`:

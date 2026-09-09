@@ -6429,16 +6429,37 @@ ltTest("integration (#457): the MIXED case — answered, then the last poll fail
       // that has nothing to do with what it is testing. Measured: green 5/5 in isolation, red
       // inside the loaded suite — the signature of a premise, not of the behaviour under test.
       //
-      // `_ltHealthPolls` counts polls and `_ltEverHealth` records the last non-null body, so the
-      // premise is OBSERVABLE rather than timed. Waiting on the thing the assertion depends on is
-      // the rule this suite already states; this is that rule applied to its own new helper.
+      // `_ltEverHealth` records the last non-null body and `_ltHealthPolls` counts polls, so BOTH
+      // premises this test rests on are OBSERVABLE rather than timed. Waiting on the thing the
+      // assertion depends on is the rule this suite already states; this is that rule applied to its
+      // own new helper.
+      //
+      // THERE ARE TWO PREMISES, and an independent review found the first fix asserted only one:
+      //   (a) a poll SUCCEEDED before the kill -- otherwise this is the unreachable case, and the
+      //       `/NEVER returned a body/` assertion below fails with the BEHAVIOUR message for a fixture
+      //       that never armed. That is what the 300 ms sleep got wrong.
+      //   (b) a poll RAN AFTER the kill -- otherwise ltWaitHealth's own budget expired while the server
+      //       was still alive, the LAST poll succeeded, and `/FINAL poll returned no body/` fails:
+      //       again a behaviour message for a fixture-timing cause. Reachable -- squeezing that budget
+      //       reproduces it.
+      // Both are asserted below, so neither can fail silently wearing the other's diagnosis.
       const waiting = ltWaitHealth(port, () => false, 1500);
       assert.ok(await ltWait(() => _ltEverHealth !== null, 5000),
         `premise: /health must answer at least once before the server is killed, or this test is ` +
         `measuring the unreachable case instead of the mixed one — ${ltDiag(buf)}`);
+      const pollsAtKill = _ltHealthPolls;
       child.kill("SIGKILL");
       const r = await waiting;
       assert.equal(r, null, "premise: an unsatisfiable predicate must still time out");
+      // Premise (b), asserted rather than assumed. Read AFTER `await waiting`, so the wait has
+      // stopped polling; `pollsAtKill` was sampled synchronously before the signal, so any growth
+      // is a poll issued after the server was taken away.
+      assert.ok(_ltHealthPolls > pollsAtKill,
+        `premise: ltWaitHealth must still be polling when the server dies (polls ${pollsAtKill} ` +
+        `-> ${_ltHealthPolls}). If its own budget expired first, the LAST poll succeeded and the ` +
+        `"FINAL poll returned no body" assertion below would fail for a fixture-timing reason ` +
+        `while reading as a behaviour defect — the exact confusion this test was rewritten to ` +
+        `remove — ${ltDiag(buf)}`);
 
       const d = ltHealthDiag();
       // The whole point: earlier polls DID answer, so this is not the unreachable case.
