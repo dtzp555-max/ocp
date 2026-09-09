@@ -6453,7 +6453,15 @@ ltTest("integration (#457): the MIXED case — answered, then the last poll fail
       assert.equal(r, null, "premise: an unsatisfiable predicate must still time out");
       // Premise (b), asserted rather than assumed. Read AFTER `await waiting`, so the wait has
       // stopped polling; `pollsAtKill` was sampled synchronously before the signal, so any growth
-      // is a poll issued after the server was taken away.
+      // is a poll that COMPLETED after the server was taken away — not one issued after it.
+      // The distinction is not pedantry: `_ltHealthPolls++` runs AFTER `await ltHealth(port)`
+      // resolves, so a poll already in flight at the sample point increments post-kill. The guard
+      // is therefore very slightly weaker than "issued after" would promise — if the ONLY growth
+      // were an in-flight pre-kill poll that SUCCEEDED, premise (b) passes while the behaviour
+      // assertion below fails. Measured margin: growth is 36-37 polls across 5 runs, so that case
+      // was not reachable here; it is reasoned from the source rather than constructed, and it is
+      // recorded because a later reader deciding whether the residual is closed would trust this
+      // sentence.
       assert.ok(_ltHealthPolls > pollsAtKill,
         `premise: ltWaitHealth must still be polling when the server dies (polls ${pollsAtKill} ` +
         `-> ${_ltHealthPolls}). If its own budget expired first, the LAST poll succeeded and the ` +
