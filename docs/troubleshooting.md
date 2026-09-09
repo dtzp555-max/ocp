@@ -100,15 +100,21 @@ reasons that have nothing to do with whether the process is doing anything. The 
 uninterruptible-sleep `STAT` character from `uname` (`U` on macOS/BSD, `D` on Linux) and **refuses on
 a platform it does not know** rather than probing with a letter that can never match.
 
-`working` requires CPU consumed at **at least 2 % of wall time** across the sampling window — not
-merely a counter that moved. A wedged Node process still runs timers and GC, and on macOS that
-registers; asking only "did it grow" was measured reporting `working` for a permanently wedged
-process in 7 of 14 runs. Override the floor with `MIN_RATE_PCT`.
+`working` requires CPU consumed at a minimum **rate** — at least **0.3 % of wall time** across the
+sampling window — not merely a counter that moved. A wedged Node process still runs timers and GC,
+and on macOS that registers; asking only "did it grow" was measured reporting `working` for a
+permanently wedged process in 7 of 14 runs. Override the floor with `MIN_RATE_PCT`.
 
-A consequence worth knowing before you read a verdict: a turn that is genuinely working but spends
-its wall clock **waiting on the upstream API** consumes little CPU and is reported *inconclusive*,
-not `working`. `working` means *observably computing*; for a quiet process this instrument honestly
-cannot tell working from wedged, which is what the third verdict is for.
+The floor was **2 %** in a first pass and that was wrong: a genuinely working streaming turn measures
+**0.50 – 1.30 %** (20–100 tok/s), i.e. the floor had been placed *above* the signal it exists to
+detect. A wedged in-flight `fetch` measures 0.00 – 0.10 %. 0.3 sits between them with ~3x below and
+~1.7x above — a narrow margin on the working side, which is why **any rate within 3x of the floor
+prints a `⚠ THIN MARGIN` line** telling you to corroborate with whether the client actually received
+bytes before acting on the verdict.
+
+A turn that is genuinely idle — waiting on the upstream with nothing arriving — consumes essentially
+nothing and is reported *inconclusive*. A wedged process lives in that same band, which is why
+*inconclusive* is a real answer here rather than a failure to reach one.
 
 **Neither instrument is sufficient alone**, and the one that actually separates *"the client's agent
 loop ran"* from *"OCP's inner CLI did the work and narrated it"* is a third one that is not a

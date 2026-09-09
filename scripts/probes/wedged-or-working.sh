@@ -27,12 +27,31 @@
 # it was the expensive error, not an edge case. The refuting evidence was already
 # on the verdict line, which printed `%CPU 0.0-0.0` beside the word WORKING.
 #
-# MIN_RATE_PCT is 2, deliberately the same number the pre-rate versions of this
-# script used as their %CPU threshold, so there is one constant rather than two
-# that can disagree. It separates the measured cases by ~500x: a busy loop ran at
-# 27 % of wall time, the wedged Node fixture at 0.05 %. EXPIRY: if a genuinely
-# working turn is ever observed below 2 %, this number is wrong -- re-measure it,
-# do not nudge it, and note that lowering it walks back toward the boolean.
+# MIN_RATE_PCT IS 0.3, AND THE FIRST NUMBER HERE WAS 2, WHICH WAS WRONG.
+# 2 was chosen to match the %CPU threshold the pre-rate versions used. An
+# independent review then measured what a genuinely WORKING streaming turn costs
+# and it sits BELOW 2 -- i.e. the floor had been placed above the signal it exists
+# to detect. Re-measured here, one run, a Node SSE client parsing tokens off a real
+# socket over a 20 s window:
+#
+#     20 tok/s  -> 0.50 %      wedged (in-flight fetch to a black hole) -> 0.00-0.10 %
+#     40 tok/s  -> 0.65 %      busy loop                                -> 99.80 %
+#    100 tok/s  -> 1.30 %
+#
+# 0.3 sits ~3x above the highest observed wedged rate and ~1.7x below the slowest
+# observed working one. STATE THE THINNESS RATHER THAN DRESS IT UP: 1.7x is a
+# narrow margin, the fixture does LESS per-token work than a real client (no
+# rendering, no tool deltas) so a real turn sits higher, and a wedged client with a
+# busier retry loop would sit higher too. The verdict line says so whenever the
+# measured rate is within 3x of the floor.
+#
+# EXPIRY -- keyed on the SEPARATION, not on any single observation. An earlier
+# revision said "if a genuinely working turn is ever observed below 2 %, this
+# number is wrong", and four lines later called exactly that outcome intended.
+# Both cannot hold, and the review made the observation. So: if a WEDGED process is
+# ever measured at or above this rate, or a WORKING one below it, the separation
+# this constant rests on has collapsed -- re-measure BOTH fixtures and record the
+# pair, rather than nudging the number toward whichever case you just saw.
 #
 # Why a single sample is not enough: a working turn spends most of its wall clock
 # waiting on the upstream API, so ONE sample of a healthy turn looks identical to
@@ -61,20 +80,32 @@
 # non-zero value forever. Two platforms, two different ways for the same test to
 # answer WORKING about a wedged process.
 #
-# ACCUMULATED CPU TIME (`ps -o time=`) has neither problem: it is MONOTONIC, so
-# growth across the window is positive evidence that the process ran, and no
-# growth is positive evidence that it did not. That is the discriminator now.
+# ACCUMULATED CPU TIME (`ps -o time=`) has neither problem: it is MONOTONIC. The
+# discriminator is the RATE at which it grows across this script's own window --
+# NOT whether it grew, which was a separate defect with its own history below.
 # %CPU is still printed, as context for a human, and is no longer tested.
 #
-# WHAT THIS STILL CANNOT SEE: a process using less CPU than the `time` column's
-# resolution over the whole window. Darwin reports hundredths (measured:
-# `0:00.50` -> `0:02.50` across 2 s of busy-work); Linux reports whole seconds,
-# so at the default 6x4 s window a process must accumulate >= 1 s of CPU to
-# register. Below that it is reported inconclusive, never WORKING.
+# THE RESOLUTION FLOOR, and the claim about it that was RETRACTED. Darwin reports
+# hundredths (measured `0:00.50` -> `0:02.50` across 2 s of busy-work); Linux
+# reports whole seconds. An earlier revision concluded from the Linux half that a
+# process below that resolution "is reported inconclusive, never WORKING" -- FALSE,
+# and falsified in one run: fed 0.40 s of CPU across a 20 s window this script
+# answers WORKING, because 0.40/20 clears the rate floor. What resolution actually
+# costs is precision in the rate near the floor, not a guarantee about the verdict.
 
 set -uo pipefail
 N=${1:-6}; IV=${2:-4}
-MIN_RATE_PCT=${MIN_RATE_PCT:-2}   # see header: one constant, measured separation ~500x
+# A zero interval makes the window zero, and a rate over a zero window is not a
+# small number -- it is not a number. The guard below would substitute 0.00% and
+# print it as though it had been measured, which is the exact shape this script
+# keeps removing. Refuse, the way N=1 is refused, and say why.
+if [ "$IV" -le 0 ] 2>/dev/null || ! [ "$IV" -ge 1 ] 2>/dev/null; then
+  echo "interval_seconds must be >= 1 (got '${IV}'): the rate is CPU seconds per WALL" >&2
+  echo "second, so a zero or non-numeric interval has no window to measure over. It would" >&2
+  echo "print 0.00% and look like a measurement." >&2
+  exit 3
+fi
+MIN_RATE_PCT=${MIN_RATE_PCT:-0.3}   # see header for the measured pair this sits between
 PAT='[c]laude --model'          # the bracket stops the GREP process matching itself in ps output (not this script's argv)
 
 # Uninterruptible-sleep STAT character, chosen rather than assumed. Refuses on an
@@ -124,7 +155,8 @@ for pid in $PIDS; do
   # WORKING branch fired on "%CPU varied", and a decaying average varies while the
   # process does nothing at all.
   #
-  #   grew   -> the process consumed CPU during the window. It ran. WORKING.
+  #   rate >= MIN_RATE_PCT -> the process is consuming CPU fast enough to be doing
+#        something. WORKING.
   #   !grew + uninterruptible seen -> blocked in the kernel and not computing. WEDGED.
   #   !grew + no uninterruptible   -> INCONCLUSIVE. This is the honest answer, not a
   #        weaker WORKING: a turn waiting on the upstream API and a turn blocked on a
@@ -156,6 +188,15 @@ for pid in $PIDS; do
   elif [ "$grew" = "1" ]; then
     echo "    ⇒ WORKING — consumed ${delta}s of CPU over ${window}s = ${rate}% of wall time (>= ${MIN_RATE_PCT}%)."
     echo "      Sampled %CPU ${lo}–${hi} is printed as context and is NOT what this verdict rests on."
+    # Say when the margin is thin, at the moment the operator is reading the verdict --
+    # not only in a header they may never open. A measured working streaming turn is
+    # 0.5-1.3% and a wedged client's timers are 0.0-0.1%, so a rate just over the floor
+    # is inside the band where this instrument cannot separate them on its own.
+    if awk -v r="$rate" -v m="$MIN_RATE_PCT" 'BEGIN{exit !(r < m * 3)}'; then
+      echo "      ⚠ THIN MARGIN: ${rate}% is within 3x of the ${MIN_RATE_PCT}% floor. A slow but working"
+      echo "        turn and a wedged client running timers both live near here. Corroborate with"
+      echo "        whether the client has actually received bytes before acting on this."
+    fi
   elif printf '%s' "$stats" | grep -q "$UNINT"; then
     echo "    ⇒ WEDGED — uninterruptible wait (STAT contains '${UNINT}'), and CPU consumed at only"
     echo "      ${rate}% of wall time (${delta}s over ${window}s). Blocked in the kernel, not computing."

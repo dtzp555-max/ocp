@@ -46,11 +46,35 @@
 
 ### Fixed
 
+- **The rate floor was set at 2 %, above the signal it exists to detect (#467).** Third round of independent review on this file, and the third defect it found was in the fix for the second.
+
+  `WORKING` requires a minimum **rate**, which was right. **2 % was wrong.** It was chosen to match the `%CPU` threshold the pre-rate versions used — a tidy-looking reason that was never a measurement. The reviewer then measured what a genuinely *working* streaming turn costs and it sits **below** 2 %, i.e. the floor had been placed above the thing it was meant to catch. Re-measured here, one run, one host, a Node SSE client parsing tokens off a real socket over a 20 s window:
+
+  | fixture | CPU as % of wall time |
+  |---|---|
+  | wedged — in-flight `fetch` to a black hole | **0.00 – 0.10 %** |
+  | working — streaming at 20 tok/s | **0.50 %** |
+  | working — streaming at 40 tok/s | 0.65 % |
+  | working — streaming at 100 tok/s | 1.30 % |
+  | busy loop | 99.80 % |
+
+  The floor is now **0.3 %**, ~3x above the highest observed wedged rate and ~1.7x below the slowest observed working one, overridable with `MIN_RATE_PCT`. Verified end to end: the same streaming fixture that was reported *inconclusive* under the 2 % floor now reports `WORKING — 0.50 %`, while the wedged fixture stays *inconclusive* at 0.00 %.
+
+  **1.7x is a narrow margin and it is stated as one rather than dressed up.** The fixture does *less* per-token work than a real client (no rendering, no tool deltas) so a real turn sits higher; a wedged client with a busier retry loop would sit higher too. So the verdict line now prints a **`⚠ THIN MARGIN`** warning whenever the measured rate is within 3x of the floor, pointing at whether the client actually received bytes — disclosed where the operator reads the verdict, not only in a header they may never open.
+
+  **The `[measured]` figures now agree across all four places.** An earlier revision of this entry quoted a busy loop at 89.11 % and a wedged fixture at 0.10 % ("~900x"), while the script header and README quoted 27 % and 0.05 % ("~500x") — the same two quantities, one commit, two sets of numbers, each presented as *the* measured pair. Both were probably real runs on different days; nothing told the reader that, which is the defect. One run, quoted everywhere.
+
+  **The expiry clause said the opposite of the paragraph four lines below it.** It read *"if a genuinely working turn is ever observed below 2 %, this number is wrong"*, while the next paragraph called exactly that outcome intended — and the reviewer made the observation (0.67 %). It is now keyed on the **separation** rather than on a single observation: if a wedged process is measured at or above the floor, or a working one below it, the separation the constant rests on has collapsed — re-measure *both* fixtures and record the pair, rather than nudging the number toward whichever case you just saw. That is what a Rule-5 expiry has to survive: contact with a real measurement.
+
+  **Three stale blocks in the script header, including a sentence the README already records as retracted.** `README.md` and `docs/troubleshooting.md` were corrected in the previous round; the script header — which the previous round's own entry named *first* — kept *"a process must accumulate >= 1 s of CPU to register. Below that it is reported inconclusive, never `WORKING`"*, and the reviewer falsified it in one run: fed 0.40 s across a 20 s window the script answers `WORKING`, because 0.40/20 clears the rate floor. Also gone: the "growth is the discriminator" framing that the rate fix had already superseded, and the verdict key that still described the boolean.
+
+  **`interval_seconds` of 0 fabricated a measurement.** It is the second positional argument, so `./wedged-or-working.sh 4 0` is as reachable as `1` was. The zero-window guard correctly avoided the division and then substituted `0.00 %`, printing it as though it had been measured — a busy loop at 100 % CPU read as `inconclusive`. It now refuses with exit 3 and says why, the way `N=1` already did.
+
 - **The first fix's own instrument reported a wedged process as `WORKING` in 7 of 14 runs (#467).** Found by independent review of that fix, measured, and it landed on exactly the class the probe exists for.
 
   Replacing `%CPU` with accumulated CPU time was right; asking only **whether the counter moved** was not. A Node process blocked mid-`fetch` on a server that never replies still runs undici's timers and GC, accumulating ~0.01 s per ~30 s — and Darwin's `time` column has hundredths resolution, so a boolean "grew" records that as work. An OCP-spawned `claude` wedged on the Anthropic API *is* that process. The verdict line printed `%CPU 0.0–0.0` immediately beside the word `WORKING`: the refuting evidence was in hand and not consulted.
 
-  Reproduced here before fixing, with a fixture faithful enough to be the thing under test — `process.title` set so the *matched* process is the one holding the in-flight `fetch`, not a shell wrapping it: CPU time `0.12s → 0.14s` across the window, i.e. **0.02 s of growth**, which the boolean answers `WORKING` for (verified by running it). The verdict is now a **rate**: `WORKING` requires CPU consumed at **>= 2 % of wall time** across the window. Same fixture: **0.10 %** → *inconclusive*. Positive control, so this is not just "everything is inconclusive now": a busy loop measures **89.11 %** → `WORKING`. Roughly 900x of separation around the threshold.
+  Reproduced here before fixing, with a fixture faithful enough to be the thing under test — `process.title` set so the *matched* process is the one holding the in-flight `fetch`, not a shell wrapping it: CPU time `0.12s → 0.14s` across the window, i.e. **0.02 s of growth**, which the boolean answers `WORKING` for (verified by running it). The verdict is now a **rate**: `WORKING` requires CPU consumed at **>= 2 % of wall time** across the window. Same fixture: **0.10 %** → *inconclusive*. Positive control, so this is not just "everything is inconclusive now": a busy loop measures far above the floor → `WORKING`. **The separation figures from this round are superseded** — that run quoted 89.11 % and "~900x" while the script and README quoted 27 % and "~500x" for the same two quantities, and both extremes turned out to be the wrong pair to characterise the threshold anyway. The entry above carries the one measured set that all four places now agree on, including the operationally common middle case that neither extreme described.
 
   2 % is deliberately the number the pre-rate versions used as their `%CPU` threshold — one constant rather than two that can disagree — and it is overridable with `MIN_RATE_PCT`. **Expiry:** if a genuinely working turn is ever seen below 2 %, the number is wrong; re-measure it rather than nudging it, and note that lowering it walks back toward the boolean that failed.
 

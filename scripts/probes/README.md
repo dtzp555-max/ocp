@@ -99,30 +99,47 @@ code on Linux** — the platform OCP is normally deployed on — while `docs/tro
 the command with no platform note at all. The character now comes from `uname`, and an unrecognised
 platform **exits 3** rather than probing with a letter that can never match.
 
-**The threshold, and why it is a rate.** `WORKING` requires CPU consumed at **>= 2 % of wall time**
-across the sampling window, not merely a counter that moved. A first version of this fix asked only
-whether the counter moved, and an independent review measured it answering `WORKING` for a
-permanently wedged process in **7 of 14** default runs: a Node process blocked mid-`fetch` on a
-server that never replies still runs undici's timers and GC, accumulating ~0.01 s per ~30 s, and
-Darwin's hundredths resolution records it. That is the *target* class — an OCP-spawned `claude`
-wedged on the Anthropic API — so it was the expensive error rather than an edge case. The refuting
-evidence was already on the verdict line, which printed `%CPU 0.0–0.0` next to the word `WORKING`.
+**Why it is a rate.** `WORKING` requires CPU consumed at a minimum **rate**, not merely a counter
+that moved. An earlier version asked only whether the counter moved, and an independent review
+measured it answering `WORKING` for a permanently wedged process in **7 of 14** default runs: a Node
+process blocked mid-`fetch` on a server that never replies still runs undici's timers and GC,
+accumulating ~0.01 s per ~30 s, and Darwin's hundredths resolution records it. That is the *target*
+class — an OCP-spawned `claude` wedged on the Anthropic API. The refuting evidence was already on the
+verdict line, which printed `%CPU 0.0–0.0` next to the word `WORKING`.
 
-2 % is deliberately the same number the pre-rate versions used as their `%CPU` threshold, so there
-is one constant rather than two that can disagree, and it separates the measured cases by roughly
-**500x** (busy loop 27 % of wall time; wedged Node fixture 0.05 %). Override with `MIN_RATE_PCT`.
-**Expiry:** if a genuinely working turn is ever observed below 2 %, this number is wrong — re-measure
-it rather than nudging it, and note that lowering it walks back toward the boolean that failed.
+**The threshold is 0.3 %, and the first number here was 2, which was wrong.** 2 was chosen to match
+the `%CPU` threshold the pre-rate versions used. The same review then measured what a genuinely
+*working* streaming turn costs, and it sits **below 2** — the floor had been placed above the signal
+it exists to detect. Re-measured, one run, a Node SSE client parsing tokens off a real socket over a
+20 s window:
 
-**What this means for a quiet turn.** A turn that is genuinely working but spends its wall clock
-waiting on the upstream API consumes little CPU and is reported *inconclusive*, not `WORKING`. That
-is intended: `WORKING` here means *observably computing*, and the honest answer for a quiet process
-is that this instrument cannot tell it from a wedged one.
+| fixture | CPU as % of wall time |
+|---|---|
+| wedged — in-flight `fetch` to a black hole | **0.00 – 0.10 %** |
+| working — streaming at 20 tok/s | **0.50 %** |
+| working — streaming at 40 tok/s | 0.65 % |
+| working — streaming at 100 tok/s | 1.30 % |
+| busy loop | 99.80 % |
 
-**An earlier version of this paragraph promised something false**, and it is recorded rather than
-quietly replaced: it said a process below the `time` column's resolution lands in *inconclusive*,
-"never *`WORKING`*". The conclusion followed only from the Linux half of its own sentence; on macOS,
-0.01 s across the window is exactly what produced the seven false `WORKING`s above.
+0.3 sits ~3x above the highest observed wedged rate and ~1.7x below the slowest observed working one.
+**The thinness is stated rather than dressed up:** 1.7x is narrow, the fixture does *less* per-token
+work than a real client (no rendering, no tool deltas) so a real turn sits higher, and a wedged
+client with a busier retry loop would sit higher too. **The verdict line says so at the moment you
+read it** — any rate within 3x of the floor prints a `⚠ THIN MARGIN` line telling you to corroborate
+with whether the client actually received bytes. Override with `MIN_RATE_PCT`.
+
+**Expiry — keyed on the separation, not on a single observation.** An earlier version of this
+paragraph said *"if a genuinely working turn is ever observed below 2 %, this number is wrong"* and
+then, four lines later, called exactly that outcome intended. Both cannot hold, and the review made
+the observation. So: if a **wedged** process is ever measured at or above this rate, or a **working**
+one below it, the separation this constant rests on has collapsed — re-measure *both* fixtures and
+record the pair, rather than nudging the number toward whichever case you just saw.
+
+**A retracted claim, recorded rather than quietly replaced.** An earlier version said a process below
+the `time` column's resolution lands in *inconclusive*, "never `WORKING`". That followed only from the
+Linux half of its own sentence, and it is false: fed 0.40 s of CPU across a 20 s window this script
+answers `WORKING`, because 0.40/20 clears the rate floor. What resolution costs is precision in the
+rate near the floor, not a guarantee about the verdict.
 
 
 Verified in both directions against constructed processes, not read:
