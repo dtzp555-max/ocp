@@ -18,13 +18,24 @@ green checks.
 
 | instrument | reads | blind to |
 |---|---|---|
-| `tools-dropped.mjs` | what the **client got** | whether OCP knows it dropped anything |
-| `/health`'s `stats.toolRequestsDropped` (#468) | what the **server dropped** | whether the client had anything to branch on |
+| `tools-dropped.mjs` | what the **client got** | whether OCP knows it dropped anything — it never reads `/health` |
+| `/health`'s `stats.toolRequestsDropped` (#468) | what the **server dropped** | anything the client experienced that OCP did not cause |
 | the client's per-session **tool-call counter** | **which side ran the loop** | everything else |
 
-The first two were run against the same request during #468's review and both reported `1` —
-pointing at the same event from opposite ends. **Neither alone would have been enough**, and the
-third is not a script at all. Use them together.
+**The asymmetry is real but it does not run both ways, and an earlier version of this table claimed
+it did.** On this codebase `server.mjs` emits no `tool_calls` anywhere, so `toolRequestsDropped > 0`
+**entails** the client got none — that direction is an entailment, not a second independent
+instrument.
+
+The genuine one-way gap is the other direction, and it is the reason the probe alone is not enough:
+**probe exit 1 does NOT entail OCP dropped anything.** Under `tool_choice: "auto"` a prose answer is
+spec-legal (`lib/tool-support.mjs` says so in as many words), so exit 1 is also what a *correct*
+backend returns when the model simply declines to call. The unanswerable-nonce design narrows that
+window; it does not close it. Only `stats.toolRequestsDropped` distinguishes "OCP dropped the tools"
+from "the model chose not to use them".
+
+So: **use them together**, and note that an exit code and a count are different quantities — their
+both being `1` in #468's cross-check is a coincidence of value, not evidence of agreement.
 
 ---
 
@@ -61,8 +72,9 @@ Three deliberate choices, so a fixture built on it does not drift:
 Classifies a long-running OCP-spawned `claude` child.
 
 ```
-WEDGED  = STAT contains U (uninterruptible wait) AND %CPU stays near zero across samples
-WORKING = STAT S/R AND %CPU fluctuates
+WEDGED       = uninterruptible wait (U), AND peak %CPU < 2
+WORKING      = no uninterruptible wait, AND (%CPU varied OR peak %CPU >= 2)
+inconclusive = anything else — including a FLAT NEAR-ZERO %CPU with no U
 ```
 
 Verified both ways: **WORKING** against a live 600-word generation (`STAT=S`, %CPU 0.1 → 8.7); the
@@ -71,10 +83,17 @@ OCP's 600 s timer would have fired.
 
 Two things it is built to avoid, both of which produce a confident wrong answer:
 
-- **One sample is not enough.** A working turn spends most of its wall clock waiting on the
-  upstream, so a single reading of a healthy turn is indistinguishable from a wedged one. **The
-  signal is the variance**, which is why it takes several samples and prints them all rather than a
-  verdict from one.
+- **One sample is not enough — for a turn that is WAITING.** A working turn spends most of its wall
+  clock waiting on the upstream, and a single reading of *that* is indistinguishable from a wedged
+  one. Variance across samples is what separates them, which is why the script takes several and
+  prints them all rather than a verdict from one.
+
+  It is **not** the only signal, and an earlier version of this page said it was: a turn actually
+  *computing* is distinguishable from **one** sample, because its `%CPU` is simply high. The
+  predicate is therefore `varied OR peak >= 2`, not `varied` alone — measured, a strict
+  variance-only rule reported a process pegged at **83.2 %** as `inconclusive — %CPU never moved`,
+  because at `N=1` the low and the high are the same number and `samples` is this script's first
+  positional argument.
 - **Duration is not the criterion.** A legitimate tool-using turn measured **248 s**; the wedged one
   ran 9 min. Long is not wedged.
 

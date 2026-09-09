@@ -72,11 +72,11 @@ The agent looks alive and is answering. It just cannot do anything. See
 [#467](https://github.com/dtzp555-max/ocp/issues/467) and
 [ADR 0021](adr/0021-ocp-is-an-agent-backend.md).
 
-**First check — is OCP dropping the declared tools?** Since #468 it says so, on both surfaces:
+**First check — is OCP dropping the declared tools?** Since **#468** it says so, on both surfaces. **Both commands need #468**: before it, `toolRequestsDropped` is absent and `jq` prints `null`, which reads as *"not dropping"* — a false negative. And `ocp logs` **with no arguments** cannot find the event at all: it defaults to `20 error`, `handleLogs` filters `level` by exact equality, and the event is logged at `warn`. Hence the explicit arguments below.
 
 ```bash
 curl -s localhost:3456/health | jq .stats.toolRequestsDropped   # non-zero ⇒ tools are being dropped
-ocp logs | grep openai_tools_dropped                            # one line per affected request
+ocp logs 200 all | grep openai_tools_dropped   # one line per affected request
 ```
 
 **Then confirm from the client's side**, because the counter above cannot see what the client got:
@@ -89,7 +89,8 @@ node scripts/probes/tools-dropped.mjs      # exit 1 ⇒ prose came back where to
 tool-using turn measured 248 s here:
 
 ```bash
-scripts/probes/wedged-or-working.sh        # STAT=U + flat ~0.2% CPU ⇒ wedged; STAT=S + varying ⇒ working
+scripts/probes/wedged-or-working.sh   # U + flat low CPU ⇒ wedged; varying or busy ⇒ working;
+                                      # flat near-zero without U ⇒ inconclusive (both shapes look like this)
 ```
 
 **Neither instrument is sufficient alone**, and the one that actually separates *"the client's agent

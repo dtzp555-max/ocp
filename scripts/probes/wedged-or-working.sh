@@ -1,11 +1,14 @@
 #!/usr/bin/env bash
 # Is a long-running OCP turn wedged, or is it genuinely working?
 #
-#   ./wedged_or_working.sh [samples] [interval_seconds]
+#   ./wedged-or-working.sh [samples] [interval_seconds]
 #
 # Criterion (macOS/BSD ps; Linux notes below):
 #   WEDGED  = STAT contains U (uninterruptible wait) AND %CPU stays near zero
-#   WORKING = STAT is S/R AND %CPU fluctuates across samples
+#   WORKING      = no uninterruptible wait, AND (%CPU varied across samples OR peak %CPU >= 2)
+#   inconclusive = anything else -- notably a flat near-zero %CPU with no U, which is BOTH what
+#                  a turn waiting on the upstream looks like AND what one blocked forever looks
+#                  like. Saying "I don't know" is the honest answer there, not WORKING.
 #
 # Why a single sample is not enough: a working turn spends most of its wall
 # clock waiting on the upstream API, so ONE sample of a healthy turn looks
@@ -23,7 +26,7 @@
 
 set -uo pipefail
 N=${1:-6}; IV=${2:-4}
-PAT='[c]laude --model'          # bracket avoids matching this script's own argv
+PAT='[c]laude --model'          # the bracket stops the GREP process matching itself in ps output (not this script's argv)
 
 # bash 3.2 (macOS default) has no mapfile — keep this portable.
 PIDS=$(ps -Ao pid,command | grep "$PAT" | awk '{print $1}')
@@ -53,6 +56,30 @@ for pid in $PIDS; do
   else
     lo=$(printf '%s' "$cpus" | grep -v '^$' | sort -n  | head -1)
     hi=$(printf '%s' "$cpus" | grep -v '^$' | sort -rn | head -1)
-    echo "    ⇒ WORKING — no uninterruptible wait; %CPU ranged ${lo}–${hi}"
+    # The %CPU conjunct is TESTED here, not merely printed. An earlier version computed lo/hi and
+    # interpolated them into a WORKING message without ever comparing them, so the only
+    # discriminator was whether the letter U appeared -- while this file's own header, the README
+    # and docs/troubleshooting.md all stated the rule as "STAT S/R AND %CPU fluctuates".
+    #
+    # The gap pointed the WRONG WAY: a process blocked forever on a socket or a pipe sits in an
+    # INTERRUPTIBLE wait at ~0% CPU -- the shape this header itself calls normal ("a working turn
+    # spends most of its wall clock waiting on the upstream API"). So the most common way a
+    # network client wedges was reported WORKING. [measured] a process blocked on a fifo read that
+    # nothing will ever write: STAT=SN, %CPU 0.0-0.2, verdict "WORKING".
+    # WORKING needs EITHER variance OR meaningful CPU, not variance alone. A strict `hi > lo`
+    # alone has a false downgrade in the other direction, and `samples` is this script's first
+    # positional argument so it is one keystroke away: [measured] `./wedged-or-working.sh 1`
+    # against a process pegged at 83.2% reported "inconclusive — %CPU never moved", because with
+    # one sample lo == hi. A process steady at high CPU has the same problem at any N.
+    #
+    # The 2.0 threshold is deliberately the SAME ONE the WEDGED branch uses above, so the two
+    # verdicts are symmetric about one number rather than disagreeing via two unrelated ones.
+    if awk -v l="${lo:-0}" -v h="${hi:-0}" 'BEGIN{exit !(h > l || h >= 2.0)}'; then
+      echo "    ⇒ WORKING — no uninterruptible wait; %CPU ${lo}–${hi}"
+    else
+      echo "    ⇒ inconclusive — no uninterruptible wait, but %CPU never moved (${hi} across ${N} samples)."
+      echo "      A turn waiting on the upstream looks like this. So does one blocked forever."
+      echo "      Sample again over a longer window, or check whether the client ever received bytes."
+    fi
   fi
 done
