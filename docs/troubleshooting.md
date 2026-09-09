@@ -109,9 +109,18 @@ remedies. That value is in the **printed rate**, not in the verdict name, which 
 `WORKING` being removed. `WEDGED` adds a second thing bytes-received cannot: positive evidence of an
 uninterruptible kernel wait, which points at I/O rather than at the upstream.
 
-**There is no rate at which this probe says `working`.** Above a 0.3 % floor — the point at which
-it can see CPU being consumed at all — every verdict is `CONSUMING CPU, WORKING-OR-WEDGED
-UNRESOLVED`, and the thing to decide on is whether the client has actually **received bytes**.
+**There is no rate at which this probe says `working`.** Above the **effective floor** every verdict
+is `CONSUMING CPU, WORKING-OR-WEDGED UNRESOLVED`, and the thing to decide on is whether the client
+has actually **received bytes**.
+
+**The floor is not a constant, and the tool prints the one in force.** `ps -o time=` is quantised —
+0.01 s on macOS, **1 s on Linux** — so the smallest rate the platform can even represent is one
+quantum over the sampling window. The floor is the larger of that and the requested `MIN_RATE_PCT`
+(0.3 %): **0.3 % on macOS at the default 6x4 s window, and 5 % on Linux**, where nothing between 0
+and 5 is representable at all. Read the floor off the verdict line rather than from this page — an
+earlier version of this paragraph stated 0.3 % as *the* floor and *"the point at which it can see CPU
+being consumed at all"*, which was a macOS property written as a property of the instrument, and the
+tool's own output contradicted it on Linux.
 
 Measured, which is why: a wedged client running ordinary timers spans **0.05 – 5.00 %** of wall
 time, genuinely working streams **0.55 – 2.25 %** — they overlap, and the wedged side has no

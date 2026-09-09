@@ -240,14 +240,23 @@ for pid in $PIDS; do
     # at the top, and the confident band was the one place these files stopped applying their own
     # sentence.
     echo "    ⇒ CONSUMING CPU, WORKING-OR-WEDGED UNRESOLVED — ${delta}s over ${window}s = ${rate}%"
-    echo "      of wall time. DECIDE ON WHETHER THE CLIENT HAS RECEIVED BYTES, not on this number."
+    echo "      of wall time (effective floor ${floor}%, = max of MIN_RATE_PCT and one ${TIME_QUANTUM}s"
+    echo "      quantum over the window). DECIDE ON WHETHER THE CLIENT HAS RECEIVED BYTES, not on this."
+    # A rate of exactly one quantum is the COARSEST reading this instrument can produce -- on Linux
+    # at the default window that is 5.00%, and nothing else on the line distinguishes it from a
+    # precise 5%. Said here rather than left for the operator to infer from the quantum.
+    if awk -v d="$delta" -v q="$TIME_QUANTUM" 'BEGIN{exit !(d <= q * 1.0001)}'; then
+      echo "      ⚠ AT THE RESOLUTION LIMIT: ${delta}s is one quantum. The true rate is somewhere in"
+      echo "        (0, ${rate}%] and this instrument cannot narrow it. Lengthen the window to refine."
+    fi
     echo "      Consuming CPU is not progress. Measured: wedged clients running ordinary timers span"
     echo "      0.05-5.00%, genuinely working streams 0.55-2.25% -- overlapping, and the wedged side"
     echo "      is unbounded above. There is no rate at which this instrument can say WORKING."
     echo "      Sampled %CPU ${lo}–${hi} is context and is NOT what any of this rests on."
   elif printf '%s' "$stats" | grep -q "$UNINT"; then
     echo "    ⇒ WEDGED — uninterruptible wait (STAT contains '${UNINT}'), and CPU consumed at only"
-    echo "      ${rate}% of wall time (${delta}s over ${window}s). Blocked in the kernel, not computing."
+    echo "      ${rate}% of wall time (${delta}s over ${window}s, below the ${floor}% effective floor)."
+    echo "      Blocked in the kernel, not computing."
   else
     echo "    ⇒ inconclusive — no uninterruptible wait, and CPU consumed at only ${rate}% of wall"
     echo "      time (${delta}s over ${window}s, below the ${floor}% effective floor; %CPU ${lo}–${hi})."
