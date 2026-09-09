@@ -6541,12 +6541,55 @@ ltTest("integration (#457): the MIXED case — answered, then the last poll fail
     const { child, buf, port } = await ltBootFresh({ CLAUDE_BIN: fake }, dir);
     try {
       assert.ok(await ltWait(() => buf.out.includes("listening on")), `— ${ltDiag(buf)}`);
-      // Start an unsatisfiable wait, let a few polls succeed, then take the server away.
+      // Start an unsatisfiable wait, WAIT UNTIL A POLL HAS ACTUALLY SUCCEEDED, then take the
+      // server away.
+      //
+      // The first version slept 300 ms here and assumed that was long enough for a poll to land.
+      // That is a timing-dependent PREMISE WITH NOTHING ASSERTING IT HELD, and under full-suite
+      // contention it does not: if no poll succeeds before the kill, `_ltEverHealth` is still null,
+      // the diagnostic correctly reports "NEVER returned a body", and this test fails for a reason
+      // that has nothing to do with what it is testing. Measured: green 5/5 in isolation, red
+      // inside the loaded suite — the signature of a premise, not of the behaviour under test.
+      //
+      // `_ltEverHealth` records the last non-null body and `_ltHealthPolls` counts polls, so BOTH
+      // premises this test rests on are OBSERVABLE rather than timed. Waiting on the thing the
+      // assertion depends on is the rule this suite already states; this is that rule applied to its
+      // own new helper.
+      //
+      // THERE ARE TWO PREMISES, and an independent review found the first fix asserted only one:
+      //   (a) a poll SUCCEEDED before the kill -- otherwise this is the unreachable case, and the
+      //       `/NEVER returned a body/` assertion below fails with the BEHAVIOUR message for a fixture
+      //       that never armed. That is what the 300 ms sleep got wrong.
+      //   (b) a poll RAN AFTER the kill -- otherwise ltWaitHealth's own budget expired while the server
+      //       was still alive, the LAST poll succeeded, and `/FINAL poll returned no body/` fails:
+      //       again a behaviour message for a fixture-timing cause. Reachable -- squeezing that budget
+      //       reproduces it.
+      // Both are asserted below, so neither can fail silently wearing the other's diagnosis.
       const waiting = ltWaitHealth(port, () => false, 1500);
-      await new Promise(r => setTimeout(r, 300));
+      assert.ok(await ltWait(() => _ltEverHealth !== null, 5000),
+        `premise: /health must answer at least once before the server is killed, or this test is ` +
+        `measuring the unreachable case instead of the mixed one — ${ltDiag(buf)}`);
+      const pollsAtKill = _ltHealthPolls;
       child.kill("SIGKILL");
       const r = await waiting;
       assert.equal(r, null, "premise: an unsatisfiable predicate must still time out");
+      // Premise (b), asserted rather than assumed. Read AFTER `await waiting`, so the wait has
+      // stopped polling; `pollsAtKill` was sampled synchronously before the signal, so any growth
+      // is a poll that COMPLETED after the server was taken away — not one issued after it.
+      // The distinction is not pedantry: `_ltHealthPolls++` runs AFTER `await ltHealth(port)`
+      // resolves, so a poll already in flight at the sample point increments post-kill. The guard
+      // is therefore very slightly weaker than "issued after" would promise — if the ONLY growth
+      // were an in-flight pre-kill poll that SUCCEEDED, premise (b) passes while the behaviour
+      // assertion below fails. Measured margin: growth is 36-37 polls across 5 runs, so that case
+      // was not reachable here; it is reasoned from the source rather than constructed, and it is
+      // recorded because a later reader deciding whether the residual is closed would trust this
+      // sentence.
+      assert.ok(_ltHealthPolls > pollsAtKill,
+        `premise: ltWaitHealth must still be polling when the server dies (polls ${pollsAtKill} ` +
+        `-> ${_ltHealthPolls}). If its own budget expired first, the LAST poll succeeded and the ` +
+        `"FINAL poll returned no body" assertion below would fail for a fixture-timing reason ` +
+        `while reading as a behaviour defect — the exact confusion this test was rewritten to ` +
+        `remove — ${ltDiag(buf)}`);
 
       const d = ltHealthDiag();
       // The whole point: earlier polls DID answer, so this is not the unreachable case.

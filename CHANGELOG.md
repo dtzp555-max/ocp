@@ -40,6 +40,19 @@
 
   M4 and M5 were written by the **reviewer**, not the author, and both exist because the author's own table could not reach the assertions they cover: under M1 the counter assertion throws before the log assertions run (`AGENTS.md`'s **"Mutual"** case), and the control's second half had no row at all. **M5 is the F1 defect below, as a mutation** — it is the row that would have caught it.
 
+- **A timing-dependent premise in #464's own mixed-case test, replaced with an observed one (#457).** The test starts an unsatisfiable `ltWaitHealth`, waits for `/health` to answer at least once, then kills the child — so the diagnostic sees *"answered, then the last poll failed"*. It used to get that first half by **sleeping 300 ms and assuming a poll had landed**: a premise with nothing asserting it held. Under full-suite contention it does not hold, `_ltEverHealth` stays `null`, and the test fails reporting *"answered-then-died must NOT be reported as unreachable"* — **the behaviour message, for a fixture that never armed.** Measured: green **5/5 in isolation**, red inside the loaded suite, which is the signature of a premise rather than of the behaviour under test.
+
+  The premise is now **observable** — `ltWait(() => _ltEverHealth !== null)` — using the capture #464 already added. Two mutations, and the pair is the point rather than either alone:
+
+  | row | mutation | fails with |
+  |---|---|---|
+  | M1 | premise can never hold | **the premise message** — the reader learns the fixture did not arm |
+  | M2 | back to the timed premise, squeezed to 0 ms | **the behaviour message** — i.e. it reproduces the original flake, and its wrong diagnosis |
+
+  M2 is the row that matters: it shows the old form converts "the fixture never armed" into "the code is wrong", which is the error the failing run actually made. This is `AGENTS.md`'s *"wait for the thing you are about to assert"* applied to a test that #464 added two days earlier — the rule caught its own author.
+
+  **A second premise was still unasserted, and an independent review found it.** The behaviour assertions equally depend on `ltWaitHealth` *still polling* when the kill lands — if its own budget expires first, the last poll SUCCEEDED and `FINAL poll returned no body` fails, again a behaviour message for a fixture-timing cause. Reachable: squeezing that budget to 1 ms reproduces it. It is now asserted from `_ltHealthPolls`, which the comment had been *naming* while nothing read it — the prose was describing a guard that did not exist. Mutation row: with the budget squeezed, the test used to fail on `should disclose that the last poll failed` (behaviour) and now fails on `premise: ltWaitHealth must still be polling when the server dies (polls 1 -> 1)`.
+
 ## v3.33.0 — 2026-09-01
 
 > **Governance audit for this section**, per `CLAUDE.md`'s `release_kit.governance_audits`:
