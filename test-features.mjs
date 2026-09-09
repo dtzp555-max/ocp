@@ -4303,12 +4303,16 @@ ltTest("integration: flag OFF, tools GRANTED -> the -p spawn receives the EXACT 
     // No system messages + no CLAUDE_SYSTEM_PROMPT -> the wrapper is passed verbatim, so this is an
     // exact-equality pin on the text rather than a substring check.
     //
-    // THIS TEST USED TO PIN THE NEGATIVE WRAPPER HERE, and it is the test that caught ADR 0021
-    // item 2 changing behaviour -- which is what it was for. The default path GRANTS nine tools
-    // (see "the non-multi path still passes --allowedTools"), so the denial it used to assert was
-    // measured false: 27 tools in the `system` init event under exactly those flags, including
-    // Bash, Edit, Glob and Grep. What is pinned now is that a tools-granting spawn gets the wrapper
-    // that makes no capability claim.
+    // THIS TEST USED TO PIN THE NEGATIVE WRAPPER HERE, and it is the test that caught ADR 0021 item 2
+    // changing behaviour -- which is what it was for. The default path PRE-APPROVES nine tool NAMES:
+    // the deepEqual in "the non-multi path still passes --allowedTools" pins nine FLAG ARGUMENTS,
+    // which is not the same thing -- --allowedTools "could only ever widen this" per buildCliArgs'
+    // own comment. What it leaves is a NON-EMPTY built-in schema including Bash, Edit, Glob and Grep,
+    // which is what made the old prompt false. The measurement and its expiry live in lib/prompt.mjs
+    // § selectPromptWrapper and are deliberately NOT restated as a number here: the first version of
+    // this comment said 27, and an independent review re-measured 82 on the same host -- exactly what
+    // that expiry predicts. What is pinned now is that a tools-granting spawn gets the wrapper that
+    // makes no capability claim.
     assert.equal(sp, `You are accessed via the OCP HTTP proxy. Use only the tools actually provided to you in this session, and do not infer or invent filesystem, working-directory, shell, git or machine-environment details you have not obtained through them.`);
   } finally { child.kill("SIGKILL"); _ltRmRetry(dir); }
 });
@@ -5112,6 +5116,48 @@ ltTest("integration: AUTH_MODE=multi spawns `--tools \"\"` so the built-in schem
 // The other side of the same fix: the single-user path must be untouched. Its own test rather than
 // a second assertion above, because it needs a different server config -- and because a mutation
 // that wrongly applied `--tools ""` to EVERY mode would leave the test above green.
+// buildCliArgs has THREE arms, and until an independent review of #473 pointed it out only two
+// were booted here — `CLAUDE_SKIP_PERMISSIONS` appeared ZERO times in this file. The comment in
+// lib/prompt.mjs claimed a missing wrapper case "reddens rather than drifting"; the reviewer
+// falsified that with a mutation giving this arm an empty schema and no matching wrapper case,
+// which left the whole co-location set 9 passed / 0 failed. This is the third boot, so the claim
+// is true of every arm rather than of the two that happened to have tests.
+ltTest("integration: the skip-permissions arm passes --dangerously-skip-permissions, and its prompt matches", async () => {
+  if (!LT_POSIX) return;
+  const dir = ltMkdir(); const fake = ltFake(dir);
+  const argvFile = join(dir, "argv-skip.txt");
+  const spFile = join(dir, "sp-skip.txt");
+  try {
+    const { child, buf, port } = await ltBootFresh({ CLAUDE_AUTH_MODE: "none", CLAUDE_SKIP_PERMISSIONS: "true", CLAUDE_BIN: fake, ARGV_CAPTURE: argvFile, SP_CAPTURE: spFile }, dir);
+    try {
+      assert.ok(await ltWait(() => buf.out.includes("listening on")), `server never listened — ${ltDiag(buf)}`);
+      const r = await ltPostStatus(port, { model: "sonnet", messages: [{ role: "user", content: "hi" }] });
+      assert.equal(r.status, 200, `expected the spawn to succeed — ${r.status} ${r.text.slice(0, 200)}`);
+
+      const argv = ltArgvCalls(argvFile);
+      assert.ok(argv.length > 0, `no argv captured: the fake never ran, so nothing below means anything — ${ltDiag(buf)}`);
+      const spIdx = argv.indexOf("--system-prompt-file");
+      assert.ok(spIdx > -1, `argv has no --system-prompt-file: ${JSON.stringify(argv.slice(0, 8))}`);
+      assert.ok(argv.length > spIdx + 2, `argv ends at the system-prompt file path; no tool flags were pushed: ${JSON.stringify(argv)}`);
+      const tail = argv.slice(spIdx + 2);
+      assert.deepEqual(tail, ["--dangerously-skip-permissions"],
+        `the skip-permissions arm's tool flags changed: ${JSON.stringify(tail)}`);
+
+      // The prompt half, from the SAME spawn. This arm grants MORE than the default one — it
+      // pre-approves every tool rather than nine names — so the denying wrapper would be at its
+      // most wrong here, and the inviting one is still gated behind OCP_LOCAL_TOOLS.
+      assert.ok(await ltWait(() => _ltExists(spFile)), `no --system-prompt-file content captured — ${ltDiag(buf)}`);
+      const sp = _ltRead(spFile, "utf8");
+      assert.ok(sp.includes(LT_NEU_MARK), `a skip-permissions spawn must carry the NEUTRAL wrapper. Got: ${sp.slice(0, 120)}`);
+      assert.ok(!sp.includes(LT_NEG_MARK), `the spawn pre-approved every tool and was handed a prompt denying it has any: ${sp.slice(0, 120)}`);
+      assert.ok(!sp.includes(LT_POS_MARK), `the neutral wrapper must not become the INVITING one; that stays behind OCP_LOCAL_TOOLS' boot gate: ${sp.slice(0, 120)}`);
+    } finally {
+      child.kill("SIGKILL");
+      await ltDrain(() => buf.closed, "skip-perms-tools", 5000);
+    }
+  } finally { _ltRmRetry(dir); }
+});
+
 ltTest("integration: the non-multi path still passes --allowedTools and never --tools", async () => {
   if (!LT_POSIX) return;
   const dir = ltMkdir(); const fake = ltFake(dir);
@@ -5137,19 +5183,20 @@ ltTest("integration: the non-multi path still passes --allowedTools and never --
       assert.deepEqual(tail, ["--allowedTools", "Bash", "Read", "Write", "Edit", "Glob", "Grep", "WebSearch", "WebFetch", "Agent"],
         `the non-multi tool flags changed: ${JSON.stringify(tail)}`);
 
-      // The other half of the pin, and the row that CHANGED. This spawn grants nine tools (the
-      // deepEqual immediately above), so the prompt it is handed must not deny them. Before ADR
-      // 0021 item 2 it did: the same spawn passed --allowedTools Bash,Read,Write,... and told the
-      // model it had "no local filesystem, working directory, shell". Measured on claude 2.1.260
-      // via the `system` init event's `tools` array under exactly these flags: 27 tools, including
-      // Bash, Edit, Glob and Grep.
+      // The other half of the pin, and the row that CHANGED. The deepEqual immediately above pins nine
+      // FLAG ARGUMENTS, which is not nine granted tools: --allowedTools is a pre-approval list that
+      // "could only ever widen this" per buildCliArgs' own comment, and the schema it leaves is
+      // NON-EMPTY and includes Bash, Edit, Glob and Grep. That is what made the old prompt false -- it
+      // told the model it had "no local filesystem, working directory, shell". The measurement and its
+      // expiry live in lib/prompt.mjs § selectPromptWrapper, and are not restated as a number here: the
+      // first version said 27 and an independent review re-measured 82 on the same host.
       //
       // The two NEGATIVE assertions need the POSITIVE one first (#405): an unwritten or empty
       // capture file satisfies every `!includes(...)` vacuously.
       assert.ok(await ltWait(() => _ltExists(spFile)), `no --system-prompt-file content captured — ${ltDiag(buf)}`);
       const sp = _ltRead(spFile, "utf8");
       assert.ok(sp.includes(LT_NEU_MARK), `a tools-granting spawn must carry the NEUTRAL wrapper. Got: ${sp.slice(0, 120)}`);
-      assert.ok(!sp.includes(LT_NEG_MARK), `the spawn was handed nine tools and a prompt denying it has any — the drift ADR 0021 item 2 removes: ${sp.slice(0, 120)}`);
+      assert.ok(!sp.includes(LT_NEG_MARK), `the spawn was left a NON-EMPTY tool schema and a prompt denying it has any — the drift ADR 0021 item 2 removes: ${sp.slice(0, 120)}`);
       assert.ok(!sp.includes(LT_POS_MARK), `the neutral wrapper must not become the INVITING one; that stays behind OCP_LOCAL_TOOLS' boot gate: ${sp.slice(0, 120)}`);
     } finally {
       child.kill("SIGKILL");
