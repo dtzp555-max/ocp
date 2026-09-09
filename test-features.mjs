@@ -6419,9 +6419,23 @@ ltTest("integration (#457): the MIXED case — answered, then the last poll fail
     const { child, buf, port } = await ltBootFresh({ CLAUDE_BIN: fake }, dir);
     try {
       assert.ok(await ltWait(() => buf.out.includes("listening on")), `— ${ltDiag(buf)}`);
-      // Start an unsatisfiable wait, let a few polls succeed, then take the server away.
+      // Start an unsatisfiable wait, WAIT UNTIL A POLL HAS ACTUALLY SUCCEEDED, then take the
+      // server away.
+      //
+      // The first version slept 300 ms here and assumed that was long enough for a poll to land.
+      // That is a timing-dependent PREMISE WITH NOTHING ASSERTING IT HELD, and under full-suite
+      // contention it does not: if no poll succeeds before the kill, `_ltEverHealth` is still null,
+      // the diagnostic correctly reports "NEVER returned a body", and this test fails for a reason
+      // that has nothing to do with what it is testing. Measured: green 5/5 in isolation, red
+      // inside the loaded suite — the signature of a premise, not of the behaviour under test.
+      //
+      // `_ltHealthPolls` counts polls and `_ltEverHealth` records the last non-null body, so the
+      // premise is OBSERVABLE rather than timed. Waiting on the thing the assertion depends on is
+      // the rule this suite already states; this is that rule applied to its own new helper.
       const waiting = ltWaitHealth(port, () => false, 1500);
-      await new Promise(r => setTimeout(r, 300));
+      assert.ok(await ltWait(() => _ltEverHealth !== null, 5000),
+        `premise: /health must answer at least once before the server is killed, or this test is ` +
+        `measuring the unreachable case instead of the mixed one — ${ltDiag(buf)}`);
       child.kill("SIGKILL");
       const r = await waiting;
       assert.equal(r, null, "premise: an unsatisfiable predicate must still time out");
