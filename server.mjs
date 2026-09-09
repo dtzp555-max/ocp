@@ -3998,18 +3998,33 @@ async function handleChatCompletions(req, res) {
   // So `toolRequestsDropped <= totalRequests` was never an invariant, and an earlier revision of
   // this comment, the CHANGELOG entry and the control test's assertion message all leaned on it.
   //
-  // REJECTION PATHS THAT REMAIN BELOW -- plural. The previous revision named one of two.
-  // `acquireClaudeSlot` has TWO throwing exits, both inside spawnClaudeProcess, dispatched further
-  // down:
-  //   * RequestDisconnectedError  -- the client aborted while queued for a concurrency slot.
-  //   * ConcurrencyOverflowError  -- the wait queue was full.
-  // [measured] with MAX_CONCURRENT=1 and MAX_QUEUE=8 -- i.e. overflow IMPOSSIBLE -- one occupier
-  // plus one queued request whose client aborts gives toolRequestsDropped 2 against totalRequests 1
-  // with queueRejections 0; the same pair WITHOUT tools leaves the counter at 0, which is what
-  // attributes it. An earlier revision said "the residual needs a queue overflow to appear, and when
-  // it appears it inflates in bursts". That measurement falsifies both halves. It carried a
-  // `[measured]` tag earned from a single burst experiment that only ever exercised overflow -- an
-  // enumeration written in a universal voice, which is the failure this repo keeps re-finding.
+  // BACKPRESSURE BELOW THIS LINE: NOT ENUMERATED, DELIBERATELY. Several paths below can end a
+  // counted request without a spawn, and WHICH ones depends on the lane. The definition above is
+  // independent of that, which is the point -- it is a claim about the decision taken at this line,
+  // not about the outcome.
+  //
+  // This is the FOURTH revision of this paragraph and the first that does not try to list them.
+  // The three before it were each wrong in a new way, all found by review, never by re-reading:
+  //   1. "nothing below it can reject"                          -- false; there is backpressure.
+  //   2. "ONE rejection path remains: ConcurrencyOverflowError" -- one of two on that lane, under a
+  //      `[measured]` tag earned from a burst experiment that only ever exercised overflow.
+  //   3. "TWO throwing exits, both inside spawnClaudeProcess"   -- right count for the -p lane,
+  //      WRONG FUNCTION (acquireClaudeSlot is called from callClaude:2007 and
+  //      callClaudeStreaming:2610; `spawnClaudeProcess` takes `releaseSlot` as a PARAMETER because
+  //      its caller already acquired it -- and the comment at :2253 says so in as many words), and
+  //      not the whole story anyway: under CLAUDE_TUI_MODE the dispatch is callClaudeTui, which
+  //      never calls acquireClaudeSlot at all and has its own gate. [measured] in TUI mode a tools
+  //      request is counted while `concurrency_queue_full` never appears.
+  //
+  // The lesson is not "enumerate more carefully". A list of the ways a thing can go wrong needs
+  // re-deriving on every lane change and silently rots when one is added; the positive definition
+  // does not. Same move as #346, which replaced a CHANGELOG grep with a wire reading rather than
+  // widening the pattern a fourth time.
+  //
+  // The two measurements that motivated all this are kept, because they are what a reader needs:
+  // a disconnect-while-queued gives toolRequestsDropped 2 / totalRequests 1 / queueRejections 0
+  // (same pair without tools: 0), and a cache hit gives 2 / 1. Both are correct under the
+  // definition; what was wrong every time was a sentence about the machinery underneath it.
   //
   // NOT FIXED BY MOVING FURTHER DOWN, and that is a decision rather than an omission: the only
   // position below the slot acquire is inside the spawn, which has two lanes (-p and TUI) and is
