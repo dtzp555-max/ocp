@@ -105,7 +105,9 @@ if [ "$IV" -le 0 ] 2>/dev/null || ! [ "$IV" -ge 1 ] 2>/dev/null; then
   echo "print 0.00% and look like a measurement." >&2
   exit 3
 fi
-MIN_RATE_PCT=${MIN_RATE_PCT:-0.3}   # see header for the measured pair this sits between
+MIN_RATE_PCT=${MIN_RATE_PCT:-0.3}         # floor: below this, not observably computing
+CONFIDENT_RATE_PCT=${CONFIDENT_RATE_PCT:-2}  # above the measured working range's top AND every
+                                          # measured wedged rate -- see header, THE BANDS
 PAT='[c]laude --model'          # the bracket stops the GREP process matching itself in ps output (not this script's argv)
 
 # Uninterruptible-sleep STAT character, chosen rather than assumed. Refuses on an
@@ -155,12 +157,14 @@ for pid in $PIDS; do
   # WORKING branch fired on "%CPU varied", and a decaying average varies while the
   # process does nothing at all.
   #
-  #   rate >= MIN_RATE_PCT -> the process is consuming CPU fast enough to be doing
-#        something. WORKING.
-  #   !grew + uninterruptible seen -> blocked in the kernel and not computing. WEDGED.
-  #   !grew + no uninterruptible   -> INCONCLUSIVE. This is the honest answer, not a
-  #        weaker WORKING: a turn waiting on the upstream API and a turn blocked on a
-  #        socket forever are the SAME observation here, and the header says so.
+  #   rate >= CONFIDENT_RATE_PCT -> above every wedged rate measured. WORKING.
+  #   MIN_RATE_PCT <= rate < CONFIDENT_RATE_PCT -> inside the MEASURED OVERLAP. Working,
+  #        but this instrument cannot say working-or-wedged here, and the verdict says so
+  #        in its headline rather than in a footnote.
+  #   below the floor + uninterruptible seen -> blocked in the kernel, not computing. WEDGED.
+  #   below the floor, no uninterruptible    -> INCONCLUSIVE. The honest answer, not a
+  #        weaker WORKING: a turn waiting on the upstream API and one blocked on a socket
+  #        forever are the SAME observation here.
   if [ "$samples" -eq 0 ]; then
     echo "    ⇒ inconclusive — no sample was taken"
     continue
@@ -175,8 +179,11 @@ for pid in $PIDS; do
   rate=$(awk -v d="$delta" -v w="$window" 'BEGIN{ printf "%.2f", (w > 0) ? (d / w) * 100 : 0 }')
   # THE RATE, not "did it move". See the header for the 7-of-14 measurement that
   # forced this: a wedged Node process accumulates ~0.01 s per ~30 s from timers and
-  # GC alone, which a boolean reads as work.
-  grew=$(awk -v r="$rate" -v m="$MIN_RATE_PCT" 'BEGIN{ print (r >= m) ? 1 : 0 }')
+  # GC alone, which a boolean reads as work. Named for what it holds -- it was called
+  # `grew` through two revisions after it stopped meaning "grew", which is this repo's
+  # own "a name is a claim" rule catching the one identifier whose meaning changed.
+  above_floor=$(awk -v r="$rate" -v m="$MIN_RATE_PCT" 'BEGIN{ print (r >= m) ? 1 : 0 }')
+  confident=$(awk -v r="$rate" -v c="$CONFIDENT_RATE_PCT" 'BEGIN{ print (r >= c) ? 1 : 0 }')
 
   if [ "$samples" -lt 2 ]; then
     # One sample cannot show growth, so it cannot answer this question at all. Said
@@ -185,18 +192,27 @@ for pid in $PIDS; do
     # answered it with a confident verdict derived from lo == hi.
     echo "    ⇒ inconclusive — only 1 sample; CPU-time growth needs at least 2."
     echo "      Re-run with N >= 2 (default 6)."
-  elif [ "$grew" = "1" ]; then
-    echo "    ⇒ WORKING — consumed ${delta}s of CPU over ${window}s = ${rate}% of wall time (>= ${MIN_RATE_PCT}%)."
-    echo "      Sampled %CPU ${lo}–${hi} is printed as context and is NOT what this verdict rests on."
-    # Say when the margin is thin, at the moment the operator is reading the verdict --
-    # not only in a header they may never open. A measured working streaming turn is
-    # 0.5-1.3% and a wedged client's timers are 0.0-0.1%, so a rate just over the floor
-    # is inside the band where this instrument cannot separate them on its own.
-    if awk -v r="$rate" -v m="$MIN_RATE_PCT" 'BEGIN{exit !(r < m * 3)}'; then
-      echo "      ⚠ THIN MARGIN: ${rate}% is within 3x of the ${MIN_RATE_PCT}% floor. A slow but working"
-      echo "        turn and a wedged client running timers both live near here. Corroborate with"
-      echo "        whether the client has actually received bytes before acting on this."
+  elif [ "$above_floor" = "1" ]; then
+    if [ "$confident" = "1" ]; then
+      echo "    ⇒ WORKING — consumed ${delta}s of CPU over ${window}s = ${rate}% of wall time"
+      echo "      (>= ${CONFIDENT_RATE_PCT}%, above every wedged rate measured)."
+    else
+      # THE OVERLAP IS MEASURED, NOT HYPOTHETICAL, so it is the headline and not a footnote.
+      # A wedged client running a 5 ms/s timer measures 0.50% -- HIGHER than a genuinely
+      # working 20 tok/s stream at 0.45%. No threshold orders those correctly, because the
+      # wedged side's rate is set by whatever timers that process happens to run and is
+      # bounded below the working side by nothing. An earlier version of this block warned
+      # only below 3x the floor, i.e. under 0.9% -- which cut THROUGH the overlap: a wedged
+      # process at exactly 0.90% got an unwarned WORKING while working turns at 0.45% and
+      # 0.75% sat below it and were warned. Backwards. The band now ends where the measured
+      # WORKING population ends, not at a multiple of the floor.
+      echo "    ⇒ CONSUMING CPU, WORKING-OR-WEDGED UNRESOLVED — ${delta}s over ${window}s = ${rate}%"
+      echo "      of wall time. Above the ${MIN_RATE_PCT}% floor but below ${CONFIDENT_RATE_PCT}%, which is the"
+      echo "      MEASURED OVERLAP: genuinely working streams ran 0.45-1.60% here, and wedged clients"
+      echo "      running ordinary timers ran 0.30-0.90%. This instrument cannot separate them."
+      echo "      Decide on whether the client has actually RECEIVED BYTES, not on this number."
     fi
+    echo "      Sampled %CPU ${lo}–${hi} is context and is NOT what any of this rests on."
   elif printf '%s' "$stats" | grep -q "$UNINT"; then
     echo "    ⇒ WEDGED — uninterruptible wait (STAT contains '${UNINT}'), and CPU consumed at only"
     echo "      ${rate}% of wall time (${delta}s over ${window}s). Blocked in the kernel, not computing."

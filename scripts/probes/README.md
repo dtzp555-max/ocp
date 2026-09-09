@@ -128,6 +128,41 @@ client with a busier retry loop would sit higher too. **The verdict line says so
 read it** — any rate within 3x of the floor prints a `⚠ THIN MARGIN` line telling you to corroborate
 with whether the client actually received bytes. Override with `MIN_RATE_PCT`.
 
+**The two populations OVERLAP, and no single constant separates them.** Round-4 review measured a
+wedged client — permanently blocked on a never-answering socket — with ordinary timers running:
+
+| wedged fixture | rate |
+|---|---|
+| no heartbeat | 0.10 % |
+| + 3 ms per second | 0.30 % |
+| + 5 ms per second | **0.50 %** |
+| + 10 ms per second | **0.90 %** |
+
+against genuinely working streams at **0.45 %** (20 tok/s), 0.75 % (40 tok/s) and **1.60 %** (100 tok/s).
+A wedged client with a 5 ms/s timer measures **higher** than a working 20 tok/s stream. Nothing bounds
+the wedged side below the working side — its rate is set by whatever timers that process happens to
+run — so **this instrument cannot order them, at any threshold.**
+
+That is not a reason to pick a different number. It is a reason to **say so in the verdict**, which is
+what the middle band does:
+
+| rate | verdict |
+|---|---|
+| below `MIN_RATE_PCT` (0.3 %) | *inconclusive*, or `WEDGED` with an uninterruptible wait |
+| 0.3 % – `CONFIDENT_RATE_PCT` (2 %) | **`CONSUMING CPU, WORKING-OR-WEDGED UNRESOLVED`** — decide on bytes received, not on this number |
+| >= 2 % | `WORKING` — above every wedged rate measured |
+
+The band's top is the **measured** top of the working population, not a multiple of the floor. An
+earlier version warned only below 3x the floor (0.9 %), which cut *through* the overlap: a wedged
+process at exactly 0.90 % got an unwarned `WORKING`, while working turns at 0.45 % and 0.75 % sat
+below it and were warned. Backwards.
+
+**This is the expiry clause firing, on the run after it was written.** It says that if a wedged
+process is ever measured at or above the floor the separation has collapsed — and one was, at 0.30 %,
+0.50 % and 0.90 %. The clause is keyed correctly; the honest consequence is that the constant it
+guards cannot do the job alone, and the probe now admits that rather than picking a number and
+sounding certain.
+
 **Expiry — keyed on the separation, not on a single observation.** An earlier version of this
 paragraph said *"if a genuinely working turn is ever observed below 2 %, this number is wrong"* and
 then, four lines later, called exactly that outcome intended. Both cannot hold, and the review made

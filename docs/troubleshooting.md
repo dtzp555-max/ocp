@@ -112,6 +112,14 @@ detect. A wedged in-flight `fetch` measures 0.00 – 0.10 %. 0.3 sits between th
 prints a `⚠ THIN MARGIN` line** telling you to corroborate with whether the client actually received
 bytes before acting on the verdict.
 
+**There is a middle band where this instrument cannot decide, and it says so.** Measured: a wedged
+client running ordinary timers reaches 0.30 – 0.90 % of wall time, while genuinely working streams
+run 0.45 – 1.60 % — they overlap, and a wedged client with a 5 ms/s timer measures *higher* than a
+working 20 tok/s stream. Between **0.3 %** and **2 %** the verdict is therefore
+`CONSUMING CPU, WORKING-OR-WEDGED UNRESOLVED`, and the thing to decide on is whether the client has
+actually **received bytes** — not this number. At or above 2 % — higher than any wedged rate measured
+— it is `WORKING`.
+
 A turn that is genuinely idle — waiting on the upstream with nothing arriving — consumes essentially
 nothing and is reported *inconclusive*. A wedged process lives in that same band, which is why
 *inconclusive* is a real answer here rather than a failure to reach one.

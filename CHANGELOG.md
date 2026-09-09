@@ -46,6 +46,26 @@
 
 ### Fixed
 
+- **The two populations overlap; the probe now says so instead of picking a number (#467).** Fourth round of independent review, and it answered the question the third round left open — *is 0.3 defensible, or is it the same mistake moved down?*
+
+  Measured: a wedged client permanently blocked on a never-answering socket, with ordinary timers running, reaches **0.30 % / 0.50 % / 0.90 %** of wall time at 3 / 5 / 10 ms of work per second. Genuinely working streams measure **0.45 %** (20 tok/s), 0.75 % (40 tok/s), **1.60 %** (100 tok/s). **A wedged client with a 5 ms/s timer measures higher than a working 20 tok/s stream.** Nothing bounds the wedged side below the working side — its rate is whatever timers that process happens to run — so no threshold orders them, at any value.
+
+  **0.3 was not the same mistake moved down**: it captures working turns 2 % missed, which was a real fix. What it cannot do is exclude a wedged process with a small periodic timer, and a 1 % duty cycle is ordinary for a Node CLI holding an HTTP request.
+
+  So the verdict set gains a middle band, and the ambiguity is the **headline** rather than a footnote:
+
+  | rate | verdict |
+  |---|---|
+  | below 0.3 % | *inconclusive*, or `WEDGED` with an uninterruptible wait |
+  | 0.3 – 2 % | **`CONSUMING CPU, WORKING-OR-WEDGED UNRESOLVED`** — decide on bytes received, not on this number |
+  | ≥ 2 % | `WORKING` — above every wedged rate measured |
+
+  The band's top is the measured top of the working population, **not a multiple of the floor**. The previous revision warned only below 3x the floor (0.9 %), which cut *through* the overlap: a wedged process at exactly 0.90 % got an **unwarned `WORKING`** while working turns at 0.45 % and 0.75 % sat below it and were warned — backwards. All five band boundaries are driven and verified (0.20 → inconclusive; 0.30, 0.90, 1.60 → unresolved; 2.00, 5.00, 90.00 → working).
+
+  **This is the previous round's expiry clause firing on the very next run.** It said that if a wedged process is ever measured at or above the floor, the separation the constant rests on has collapsed — and one was, three times. The clause was keyed correctly; the honest consequence is that the constant cannot do the job alone. That is what a Rule-5 expiry is *for*, and it is worth recording that it earned its keep immediately rather than sitting decorative.
+
+  Also: `grew` was renamed `above_floor`. It stopped meaning "grew" two revisions ago and kept the vocabulary of the defect — this repo's own *a name is a claim*, applied to the one identifier whose meaning had changed.
+
 - **The rate floor was set at 2 %, above the signal it exists to detect (#467).** Third round of independent review on this file, and the third defect it found was in the fix for the second.
 
   `WORKING` requires a minimum **rate**, which was right. **2 % was wrong.** It was chosen to match the `%CPU` threshold the pre-rate versions used — a tidy-looking reason that was never a measurement. The reviewer then measured what a genuinely *working* streaming turn costs and it sits **below** 2 %, i.e. the floor had been placed above the thing it was meant to catch. Re-measured here, one run, one host, a Node SSE client parsing tokens off a real socket over a 20 s window:
