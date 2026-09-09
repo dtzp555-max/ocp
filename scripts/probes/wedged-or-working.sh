@@ -3,18 +3,41 @@
 #
 #   ./wedged-or-working.sh [samples] [interval_seconds]
 #
-# Criterion (macOS/BSD ps; Linux notes below):
-#   WEDGED  = STAT contains U (uninterruptible wait) AND %CPU stays near zero
-#   WORKING      = no uninterruptible wait, AND (%CPU varied across samples OR peak %CPU >= 2)
-#   inconclusive = anything else -- notably a flat near-zero %CPU with no U, which is BOTH what
-#                  a turn waiting on the upstream looks like AND what one blocked forever looks
-#                  like. Saying "I don't know" is the honest answer there, not WORKING.
+# Criterion. The discriminator is the RATE at which the process consumes CPU,
+# measured across this script's own sampling window from the MONOTONIC
+# `ps -o time=` column -- never from the `%CPU` column, which lies differently
+# on each platform (see PLATFORM below).
 #
-# Why a single sample is not enough: a working turn spends most of its wall
-# clock waiting on the upstream API, so ONE sample of a healthy turn looks
-# identical to a wedged one. The signal is in the variance across samples,
-# which is why this takes several and prints them all rather than a verdict
-# from one reading.
+#   WORKING      = CPU consumed at >= MIN_RATE_PCT of wall time across the window.
+#                  Positive evidence that the process is computing.
+#   WEDGED       = below that rate, AND seen in uninterruptible sleep.
+#                  Positive evidence that it is blocked in the kernel.
+#   inconclusive = below that rate, and no uninterruptible sleep. This is BOTH
+#                  what a turn waiting on the upstream looks like AND what one
+#                  blocked forever looks like. "I don't know" is the honest
+#                  answer there, not WORKING.
+#
+# WHY A RATE AND NOT "DID IT GROW AT ALL". A first version of this asked only
+# whether the counter moved, and an independent review measured it reporting
+# WORKING for a permanently wedged process in 7 of 14 default runs. A Node
+# process blocked mid-`fetch` on a server that never answers still runs undici's
+# timers and GC, accumulating ~0.01 s per ~30 s; Darwin's hundredths resolution
+# records that, and a boolean "grew" cannot tell 0.05 % from 90 %. That is the
+# exact target class -- an OCP-spawned `claude` wedged on the Anthropic API -- so
+# it was the expensive error, not an edge case. The refuting evidence was already
+# on the verdict line, which printed `%CPU 0.0-0.0` beside the word WORKING.
+#
+# MIN_RATE_PCT is 2, deliberately the same number the pre-rate versions of this
+# script used as their %CPU threshold, so there is one constant rather than two
+# that can disagree. It separates the measured cases by ~500x: a busy loop ran at
+# 27 % of wall time, the wedged Node fixture at 0.05 %. EXPIRY: if a genuinely
+# working turn is ever observed below 2 %, this number is wrong -- re-measure it,
+# do not nudge it, and note that lowering it walks back toward the boolean.
+#
+# Why a single sample is not enough: a working turn spends most of its wall clock
+# waiting on the upstream API, so ONE sample of a healthy turn looks identical to
+# a wedged one. A rate needs two readings in any case, so N=1 is refused rather
+# than answered.
 #
 # Why not "it has been running a long time": long is not wedged. A legitimate
 # tool-using turn measured here ran 248 s; a wedged one ran 9 min at 0.2% CPU
@@ -51,6 +74,7 @@
 
 set -uo pipefail
 N=${1:-6}; IV=${2:-4}
+MIN_RATE_PCT=${MIN_RATE_PCT:-2}   # see header: one constant, measured separation ~500x
 PAT='[c]laude --model'          # the bracket stops the GREP process matching itself in ps output (not this script's argv)
 
 # Uninterruptible-sleep STAT character, chosen rather than assumed. Refuses on an
@@ -112,7 +136,15 @@ for pid in $PIDS; do
   lo=$(printf '%s' "$cpus" | grep -v '^$' | sort -n  | head -1)
   hi=$(printf '%s' "$cpus" | grep -v '^$' | sort -rn | head -1)
   delta=$(awk -v a="${t_first:-0}" -v b="${t_last:-0}" 'BEGIN{ printf "%.2f", b - a }')
-  grew=$(awk -v d="$delta" 'BEGIN{ print (d > 0) ? 1 : 0 }')
+  # Wall seconds actually spanned: one interval fewer than the sample count, because
+  # the sleep follows each sample. Guard the zero case so the division cannot blow up
+  # on a run that broke out early.
+  window=$(awk -v n="$samples" -v iv="$IV" 'BEGIN{ w=(n-1)*iv; print (w > 0) ? w : 0 }')
+  rate=$(awk -v d="$delta" -v w="$window" 'BEGIN{ printf "%.2f", (w > 0) ? (d / w) * 100 : 0 }')
+  # THE RATE, not "did it move". See the header for the 7-of-14 measurement that
+  # forced this: a wedged Node process accumulates ~0.01 s per ~30 s from timers and
+  # GC alone, which a boolean reads as work.
+  grew=$(awk -v r="$rate" -v m="$MIN_RATE_PCT" 'BEGIN{ print (r >= m) ? 1 : 0 }')
 
   if [ "$samples" -lt 2 ]; then
     # One sample cannot show growth, so it cannot answer this question at all. Said
@@ -122,16 +154,15 @@ for pid in $PIDS; do
     echo "    ⇒ inconclusive — only 1 sample; CPU-time growth needs at least 2."
     echo "      Re-run with N >= 2 (default 6)."
   elif [ "$grew" = "1" ]; then
-    echo "    ⇒ WORKING — consumed ${delta}s of CPU across ${samples} samples (%CPU ${lo}–${hi}, context only)"
+    echo "    ⇒ WORKING — consumed ${delta}s of CPU over ${window}s = ${rate}% of wall time (>= ${MIN_RATE_PCT}%)."
+    echo "      Sampled %CPU ${lo}–${hi} is printed as context and is NOT what this verdict rests on."
   elif printf '%s' "$stats" | grep -q "$UNINT"; then
-    echo "    ⇒ WEDGED — uninterruptible wait (STAT contains '${UNINT}') and 0s of CPU consumed"
-    echo "      across ${samples} samples. Blocked in the kernel, not computing."
+    echo "    ⇒ WEDGED — uninterruptible wait (STAT contains '${UNINT}'), and CPU consumed at only"
+    echo "      ${rate}% of wall time (${delta}s over ${window}s). Blocked in the kernel, not computing."
   else
-    echo "    ⇒ inconclusive — no uninterruptible wait, and no measurable CPU consumed"
-    echo "      (${delta}s across ${samples} samples; %CPU ${lo}–${hi})."
+    echo "    ⇒ inconclusive — no uninterruptible wait, and CPU consumed at only ${rate}% of wall"
+    echo "      time (${delta}s over ${window}s, below the ${MIN_RATE_PCT}% floor; %CPU ${lo}–${hi})."
     echo "      A turn waiting on the upstream looks exactly like this. So does one blocked forever."
     echo "      Sample again over a longer window, or check whether the client ever received bytes."
-    echo "      Note the floor: Linux 'ps -o time=' has 1-second resolution, so a process using less"
-    echo "      than ~1s of CPU over the whole window lands here rather than in WORKING."
   fi
 done

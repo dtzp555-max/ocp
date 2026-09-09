@@ -99,8 +99,30 @@ code on Linux** — the platform OCP is normally deployed on — while `docs/tro
 the command with no platform note at all. The character now comes from `uname`, and an unrecognised
 platform **exits 3** rather than probing with a letter that can never match.
 
-**Floor.** Linux `ps -o time=` has 1-second resolution (macOS reports hundredths), so a process using
-less than roughly a second of CPU across the whole window lands in *inconclusive*, never *WORKING*.
+**The threshold, and why it is a rate.** `WORKING` requires CPU consumed at **>= 2 % of wall time**
+across the sampling window, not merely a counter that moved. A first version of this fix asked only
+whether the counter moved, and an independent review measured it answering `WORKING` for a
+permanently wedged process in **7 of 14** default runs: a Node process blocked mid-`fetch` on a
+server that never replies still runs undici's timers and GC, accumulating ~0.01 s per ~30 s, and
+Darwin's hundredths resolution records it. That is the *target* class — an OCP-spawned `claude`
+wedged on the Anthropic API — so it was the expensive error rather than an edge case. The refuting
+evidence was already on the verdict line, which printed `%CPU 0.0–0.0` next to the word `WORKING`.
+
+2 % is deliberately the same number the pre-rate versions used as their `%CPU` threshold, so there
+is one constant rather than two that can disagree, and it separates the measured cases by roughly
+**500x** (busy loop 27 % of wall time; wedged Node fixture 0.05 %). Override with `MIN_RATE_PCT`.
+**Expiry:** if a genuinely working turn is ever observed below 2 %, this number is wrong — re-measure
+it rather than nudging it, and note that lowering it walks back toward the boolean that failed.
+
+**What this means for a quiet turn.** A turn that is genuinely working but spends its wall clock
+waiting on the upstream API consumes little CPU and is reported *inconclusive*, not `WORKING`. That
+is intended: `WORKING` here means *observably computing*, and the honest answer for a quiet process
+is that this instrument cannot tell it from a wedged one.
+
+**An earlier version of this paragraph promised something false**, and it is recorded rather than
+quietly replaced: it said a process below the `time` column's resolution lands in *inconclusive*,
+"never *`WORKING`*". The conclusion followed only from the Linux half of its own sentence; on macOS,
+0.01 s across the window is exactly what produced the seven false `WORKING`s above.
 
 
 Verified in both directions against constructed processes, not read:

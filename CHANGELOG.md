@@ -4,6 +4,18 @@
 
 ### Fixed
 
+- **The first fix's own instrument reported a wedged process as `WORKING` in 7 of 14 runs (#467).** Found by independent review of that fix, measured, and it landed on exactly the class the probe exists for.
+
+  Replacing `%CPU` with accumulated CPU time was right; asking only **whether the counter moved** was not. A Node process blocked mid-`fetch` on a server that never replies still runs undici's timers and GC, accumulating ~0.01 s per ~30 s — and Darwin's `time` column has hundredths resolution, so a boolean "grew" records that as work. An OCP-spawned `claude` wedged on the Anthropic API *is* that process. The verdict line printed `%CPU 0.0–0.0` immediately beside the word `WORKING`: the refuting evidence was in hand and not consulted.
+
+  Reproduced here before fixing, with a fixture faithful enough to be the thing under test — `process.title` set so the *matched* process is the one holding the in-flight `fetch`, not a shell wrapping it: CPU time `0.12s → 0.14s` across the window, i.e. **0.02 s of growth**, which the boolean answers `WORKING` for (verified by running it). The verdict is now a **rate**: `WORKING` requires CPU consumed at **>= 2 % of wall time** across the window. Same fixture: **0.10 %** → *inconclusive*. Positive control, so this is not just "everything is inconclusive now": a busy loop measures **89.11 %** → `WORKING`. Roughly 900x of separation around the threshold.
+
+  2 % is deliberately the number the pre-rate versions used as their `%CPU` threshold — one constant rather than two that can disagree — and it is overridable with `MIN_RATE_PCT`. **Expiry:** if a genuinely working turn is ever seen below 2 %, the number is wrong; re-measure it rather than nudging it, and note that lowering it walks back toward the boolean that failed.
+
+  **Two prose defects fixed with it, both instances of the same thing.** The script's own header block was byte-unchanged and still stated the `%CPU varied OR peak >= 2` rule this file no longer implements — the previous round's entry had named exactly that failure ("changing the code and leaving the sentences would have moved the same gap from one into the other") and then left the header, which that sentence names first. And the "a process below the `time` column's resolution lands in *inconclusive*, never *`WORKING`*" floor was stated as general while following only from its own Linux half; on macOS, 0.01 s across the window is precisely what produced the seven false `WORKING`s. Both are now rewritten around the rate, and the retracted claim is recorded rather than quietly replaced.
+
+  One consequence a reader should have before trusting a verdict, now stated in all three places: a turn that is genuinely working but spends its wall clock **waiting on the upstream** consumes little CPU and is reported *inconclusive*. `WORKING` means *observably computing*; for a quiet process this instrument honestly cannot separate working from wedged, which is what the third verdict is for.
+
 - **`wedged-or-working.sh` could never report `WEDGED` on Linux, and reported `WORKING` for a process that had just wedged (#467).** Both found by independent review, both measured.
 
   **Linux.** Uninterruptible sleep is `STAT=D` there, not BSD's `U`. The script hardcoded `U` and told the reader in a comment to hand-edit — so on the platform OCP is normally deployed on, the whole `WEDGED` branch was **dead code**, while `docs/troubleshooting.md` printed the command with the criterion restated and no platform note at all. The character now comes from `uname`, and an unrecognised platform **exits 3** rather than probing with a letter that can never match. A constraint made unreachable by construction instead of stated as a prohibition.
