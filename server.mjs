@@ -47,7 +47,7 @@ import { DEFAULT_PORT } from "./lib/constants.mjs";
 import { StructuredOutputError, detectStructuredOutput, validateJsonSchemaSafe, extractJsonPayload, structuredSystemInstruction, resolveMaxAttempts } from "./lib/structured-output.mjs";
 import { isLoopbackBind } from "./lib/net.mjs";
 import { parseAllowedHosts, parseAuthority, matchesDeclared, evaluateOriginGate } from "./lib/host-gate.mjs";
-import { classifyToolRequest } from "./lib/tool-support.mjs";
+import { classifyToolRequest, countDeclaredTools } from "./lib/tool-support.mjs";
 import { runTuiTurn, reapStaleTuiSessions, resolveTuiHome, bootTuiPane, tuiPaneHealthy, poolPaneName, killLiveTurnPanes, POOL_BOOT_MS } from "./lib/tui/session.mjs";
 import { detectTuiUpstreamError } from "./lib/tui/transcript.mjs";
 import { TuiSemaphore, SemaphoreAbortError, recordTuiEntrypoint, buildTuiHealthBlock } from "./lib/tui/semaphore.mjs";
@@ -1086,6 +1086,16 @@ const activeProcesses = new Set();
 // ── Stats & diagnostics ─────────────────────────────────────────────────
 const stats = {
   totalRequests: 0,
+  // #467 / ADR 0021. Requests that DECLARED tools which OCP then dropped -- the silent
+  // degradation, counted. NOT a count of tools, and NOT a count of refusals: the refused shapes
+  // (ADR 0013's four forcing forms) already 400 loudly and are not counted here, because they were
+  // never the invisible case. This is the `tool_choice: "auto"`/absent path, where text is a legal
+  // answer, the request is served exactly as before, and the declared tools quietly never existed.
+  //
+  // Additive read-only field on a grandfathered B.2 endpoint, under ADR 0012. It reaches the wire
+  // through GET /health's bare `stats,` shorthand -- see the ADR 0016 Amendment 1 note below, which
+  // is the same mechanism working in the other direction.
+  toolRequestsDropped: 0,
   activeRequests: 0,
   errors: 0,
   timeouts: 0,
@@ -3982,6 +3992,99 @@ async function handleChatCompletions(req, res) {
         },
       });
     }
+  }
+
+  // #467 / ADR 0021: the request is about to be SERVED, and any tools it declared are being
+  // dropped -- the client will get a text answer it cannot distinguish from a real one. That is the
+  // silent degradation, and until now it left no trace anywhere: HTTP 200, finish_reason "stop",
+  // /health ok, recentErrors empty, clean logs on both sides. It has cost hours twice; ADR 0013's
+  // own Context is the first occurrence, #467 the second.
+  //
+  // PLACED HERE, AFTER EVERY GATE THAT CAN REJECT, and that position is the whole correctness of
+  // the counter rather than a detail. The first version of this sat immediately after
+  // classifyToolRequest -- before model validation, messages validation, image validation and the
+  // quota gate -- so a `tools` request that 400'd for ANY of those reasons still incremented it.
+  // Measured: two malformed-but-tool-carrying requests gave `toolRequestsDropped: 2` with
+  // `totalRequests: 0`, an arithmetic contradiction visible on /health, while the control (same
+  // 400, no tools) stayed at 0. Those 400s are the LOUD case; counting them makes one number mean
+  // two things exactly when someone is trying to read it. Every gate above this line that can
+  // reject now does so BEFORE the count.
+  //
+  // WHAT THIS COUNTS, said positively -- the previous version of this paragraph tried to say it by
+  // enumerating what could still go wrong below, and got the enumeration wrong in two ways at once.
+  //
+  //   `toolRequestsDropped` = requests that DECLARED TOOLS and were therefore going to be answered
+  //   as text, counted at the point the request is accepted for service.
+  //
+  // It is NOT "requests that reached a model", and it is deliberately NOT comparable to
+  // `stats.totalRequests`. An independent review measured two ways that comparison fails, and both
+  // are correct behaviour under the definition above rather than defects to fix:
+  //
+  //   [measured] a plain CACHE HIT (CLAUDE_CACHE_TTL=60, two identical tools requests) gives
+  //     toolRequestsDropped 2 against totalRequests 1 -- both cache lookups are BELOW this line, so
+  //     a served-from-cache request is counted here and never spawns. Its tools really were
+  //     dropped, so the count is right and the comparison is the thing that is meaningless.
+  //   [measured] one `response_format` request took totalRequests 4 -> 7, because the
+  //     structured-output path RETRIES the spawn. totalRequests counts spawns, not requests.
+  //
+  // So `toolRequestsDropped <= totalRequests` was never an invariant, and an earlier revision of
+  // this comment, the CHANGELOG entry and the control test's assertion message all leaned on it.
+  //
+  // BACKPRESSURE BELOW THIS LINE: NOT ENUMERATED, DELIBERATELY. Several paths below can end a
+  // counted request without a spawn, and WHICH ones depends on the lane. The definition above is
+  // independent of that, which is the point -- it is a claim about the decision taken at this line,
+  // not about the outcome.
+  //
+  // This is the FOURTH revision of this paragraph and the first that does not try to list them.
+  // The three before it were each wrong in a new way, all found by review, never by re-reading:
+  //   1. "nothing below it can reject"                          -- false; there is backpressure.
+  //   2. "ONE rejection path remains: ConcurrencyOverflowError" -- one of two on that lane, under a
+  //      `[measured]` tag earned from a burst experiment that only ever exercised overflow.
+  //   3. "TWO throwing exits, both inside spawnClaudeProcess"   -- right count for the -p lane,
+  //      WRONG FUNCTION (acquireClaudeSlot is called from callClaude:2007 and
+  //      callClaudeStreaming:2610; `spawnClaudeProcess` takes `releaseSlot` as a PARAMETER because
+  //      its caller already acquired it -- and the comment at :2253 says so in as many words), and
+  //      not the whole story anyway: under CLAUDE_TUI_MODE the dispatch is callClaudeTui, which
+  //      never calls acquireClaudeSlot at all and has its own gate. [measured] in TUI mode a tools
+  //      request is counted while `concurrency_queue_full` never appears.
+  //
+  // The lesson is not "enumerate more carefully". A list of the ways a thing can go wrong needs
+  // re-deriving on every lane change and silently rots when one is added; the positive definition
+  // does not. Same move as #346, which replaced a CHANGELOG grep with a wire reading rather than
+  // widening the pattern a fourth time.
+  //
+  // The two measurements that motivated all this are kept, because they are what a reader needs:
+  // a disconnect-while-queued gives toolRequestsDropped 2 / totalRequests 1 / queueRejections 0
+  // (same pair without tools: 0), and a cache hit gives 2 / 1. Both are correct under the
+  // definition; what was wrong every time was a sentence about the machinery underneath it.
+  //
+  // NOT FIXED BY MOVING FURTHER DOWN, and that is a decision rather than an omission: the only
+  // position below the slot acquire is inside the spawn, which has two lanes (-p and TUI) and is
+  // retried by the structured-output path. Counting there would silently convert this from
+  // "requests whose tools were dropped" into "spawns" -- a worse defect than the one it fixes, and
+  // the same conflation the paragraph above warns the reader against.
+  //
+  // THE RESPONSE IS DELIBERATELY UNCHANGED. ADR 0013's Alternatives rejected "refuse whenever
+  // `tools` is present" because it would have taken down every OpenClaw agent on the fleet the day
+  // it shipped -- they all send tools and all accept text -- and ADR 0021 keeps that by name. So
+  // this makes the failure OBSERVABLE without making it a failure.
+  //
+  // Logged per request rather than latched: every one of these requests IS degraded, so per-request
+  // is the accurate volume, and it keeps the log and the counter agreeing.
+  const declaredTools = countDeclaredTools(parsed);
+  if (declaredTools > 0) {
+    stats.toolRequestsDropped++;
+    logEvent("warn", "openai_tools_dropped", {
+      model,
+      declaredTools,
+      // Bounded: this is verbatim client input and nothing upstream limits it. classifyToolRequest
+      // lets any non-forcing string, or any unknown object `type`, through -- a 100 000-character
+      // tool_choice was measured producing a 100 200-byte log line. 1:1 with the request body so
+      // there is no amplification, but this repo's log has no rotation of its own. String() first
+      // because an object's `type` need not be a string.
+      toolChoice: String(typeof parsed.tool_choice === "string" ? parsed.tool_choice : (parsed.tool_choice?.type ?? "absent")).slice(0, 64),
+      note: "declared tools are not callable (ADR 0013); answered as text",
+    });
   }
 
   // Structured output (OpenAI response_format / json_mode): its own path — the response must be

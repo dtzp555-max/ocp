@@ -7,7 +7,7 @@
 import { TEST_OCP_DIR } from "./test-env.mjs";
 import { getDb, getDbPath, createKey, listKeys, LIST_KEYS_SQL, validateKey, recordUsage, checkQuota, updateKeyQuota, getKeyQuota, findKey, cacheHash, getCachedResponse, setCachedResponse, clearCache, getCacheStats, closeDb, hasCacheControl, singleflight, getInflightStats } from "./keys.mjs";
 import { isLoopbackBind } from "./lib/net.mjs";
-import { classifyToolRequest } from "./lib/tool-support.mjs";
+import { classifyToolRequest, countDeclaredTools } from "./lib/tool-support.mjs";
 import { randomBytes } from "node:crypto";
 import { createSerialMutex, createTtlCache, isTokenExpiring, orderLabelsLastGoodFirst, scrubInboundAuthEnv, INBOUND_AUTH_ENV_VARS, applyRequestVerdictTtl } from "./lib/spawn-auth.mjs";
 import { makeResolveSpawnToken } from "./lib/spawn-token.mjs";
@@ -5844,6 +5844,128 @@ ltTest("integration (#310): a body over the cap in characters is still rejected,
 // The narrowness is the safety property, not a compromise: refusing on `tools` alone would have
 // broken every OpenClaw agent on this project's own fleet the day it shipped, because every
 // OpenClaw turn carries a tool list and accepts a text answer. That case is pinned below.
+console.log("\ndropped tools are COUNTED and LOGGED, and the response is unchanged (#467, ADR 0021):");
+
+// ── #467: the silent degradation, made observable without being made a failure ────────────────
+//
+// ADR 0013 refuses the four shapes the spec OBLIGES a tool call for. Everything else is served as
+// text, and the declared tools are dropped with no trace: HTTP 200, finish_reason "stop", /health
+// ok, recentErrors empty, clean logs on both sides. That is the case ADR 0013 declined to answer,
+// and it has cost hours twice.
+//
+// The hard constraint, from ADR 0013's own Alternatives and kept by ADR 0021: this must NOT become
+// a refusal. "Refuse whenever `tools` is present" would have taken down every OpenClaw agent on
+// the fleet the day it shipped -- they all send tools and all accept text. So the control below is
+// not ceremony: it is the half of this change that could do real damage if it regressed.
+
+test("#467 countDeclaredTools: counts both the current and the DEPRECATED form", () => {
+  assert.equal(countDeclaredTools({ tools: [1, 2, 3] }), 3);
+  // The deprecated `functions` array. Counted for the same reason classifyToolRequest checks
+  // `function_call`: a client on the old spelling has the identical silent failure, and leaving it
+  // out would read 0 on exactly the setup least likely to have been updated.
+  assert.equal(countDeclaredTools({ functions: [1, 2] }), 2);
+  assert.equal(countDeclaredTools({ tools: [1], functions: [1, 2] }), 3);
+});
+
+test("#467 countDeclaredTools: absent or malformed is 0, never a throw", () => {
+  // A counter that throws on a malformed body would turn a silent degradation into a 500 -- worse
+  // than the bug. Each of these is a shape a real client has sent at some point.
+  for (const [label, r] of [
+    ["absent", {}], ["null", null], ["undefined", undefined],
+    ["empty array", { tools: [] }], ["not an array", { tools: "read_file" }],
+    ["object", { tools: { a: 1 } }], ["functions not an array", { functions: 7 }],
+  ]) {
+    assert.equal(countDeclaredTools(r), 0, `${label} should count 0`);
+  }
+});
+
+ltTest("integration (#467): a dropped-tools request is COUNTED and LOGGED — and still answered", async () => {
+  if (!LT_POSIX) return;
+  const dir = ltMkdir(); const fake = ltFake(dir);
+  try {
+    const { child, buf, port } = await ltBootFresh({ CLAUDE_BIN: fake }, dir);
+    const health = () => fetch(`http://127.0.0.1:${port}/health`).then(x => x.json());
+    try {
+      assert.ok(await ltWait(() => buf.out.includes("listening on")), `— ${ltDiag(buf)}`);
+      const before = await health();
+      assert.equal(before.stats.toolRequestsDropped, 0, "premise: the counter must start at 0");
+
+      const r = await ltPostStatus(port, {
+        model: "sonnet", tool_choice: "auto",
+        tools: [{ type: "function", function: { name: "read_file", parameters: {} } },
+                { type: "function", function: { name: "write_file", parameters: {} } }],
+        messages: [{ role: "user", content: "hi" }],
+      });
+
+      // THE CONSTRAINT, asserted before anything else: ADR 0013's Alternatives rejected refusing
+      // these, and ADR 0021 keeps that. A 400 here is the regression that would break every agent
+      // on the fleet, so it is checked first and by exact status, not by `!== 500`.
+      assert.equal(r.status, 200,
+        `a tools+auto request must still be ANSWERED, not refused — got ${r.status}: ${r.text.slice(0, 200)}`);
+
+      const after = await health();
+      assert.equal(after.stats.toolRequestsDropped, 1,
+        `the dropped tools were not counted: ${JSON.stringify(after.stats)}`);
+      // logEvent routes by level: "warn" -> console.error -> stderr. Wait for the line rather than
+      // assert on an unflushed buffer.
+      assert.ok(await ltWait(() => /"event":"openai_tools_dropped"/.test(buf.err)),
+        `the drop was never logged — ${ltDiag(buf)}`);
+      assert.match(buf.err, /"declaredTools":2/, `the log must carry HOW MANY were dropped — ${ltDiag(buf)}`);
+      assert.match(buf.err, /"toolChoice":"auto"/, `and which tool_choice reached it — ${ltDiag(buf)}`);
+    } finally { child.kill("SIGKILL"); await ltDrain(() => buf.closed, "tools-dropped", 5000); }
+  } finally { _ltRmRetry(dir); }
+});
+
+ltTest("integration (#467 control): a request with NO tools counts nothing, and a REFUSED one is not counted either", async () => {
+  if (!LT_POSIX) return;
+  const dir = ltMkdir(); const fake = ltFake(dir);
+  try {
+    const { child, buf, port } = await ltBootFresh({ CLAUDE_BIN: fake }, dir);
+    const dropped = async () => (await fetch(`http://127.0.0.1:${port}/health`).then(x => x.json())).stats.toolRequestsDropped;
+    try {
+      assert.ok(await ltWait(() => buf.out.includes("listening on")), `— ${ltDiag(buf)}`);
+
+      assert.equal((await ltPostStatus(port, { model: "sonnet", messages: [{ role: "user", content: "hi" }] })).status, 200);
+      assert.equal(await dropped(), 0, "a request declaring NO tools must not move the counter");
+
+      // EVERY rejection path, not just the one I thought of. The first version of this test checked
+      // only the forcing `tool_choice`, and that is exactly why it missed the defect an independent
+      // reviewer found: the counter sat BEFORE model, messages, image and quota validation, so a
+      // `tools` request that 400'd for any of those still incremented it. Measured then:
+      // `toolRequestsDropped: 2` with `totalRequests: 0` — an arithmetic contradiction on /health.
+      //
+      // A refused request is the LOUD case. Counting it makes one number mean two things exactly
+      // when someone is trying to read it.
+      const TOOL = { type: "function", function: { name: "read_file", parameters: {} } };
+      for (const [label, body] of [
+        ["forcing tool_choice (ADR 0013)", { model: "sonnet", tool_choice: "required", tools: [TOOL], messages: [{ role: "user", content: "hi" }] }],
+        ["unknown model", { model: "gpt-9-turbo", tools: [TOOL], messages: [{ role: "user", content: "hi" }] }],
+        ["malformed messages element", { model: "sonnet", tools: [TOOL], messages: ["not-an-object"] }],
+        ["empty messages", { model: "sonnet", tools: [TOOL], messages: [] }],
+      ]) {
+        const r = await ltPostStatus(port, body);
+        assert.equal(r.status, 400, `[${label}] must be refused — got ${r.status}: ${r.text.slice(0, 140)}`);
+        assert.equal(await dropped(), 0,
+          `[${label}] a REFUSED request must not be counted as a silent drop. It is the LOUD case ` +
+          `— the client got a 400 and knows — and the counter exists to measure the quiet one. ` +
+          `(Deliberately NOT justified by "counting it would let toolRequestsDropped exceed ` +
+          `totalRequests": an earlier revision of this message said exactly that, and an ` +
+          `independent review measured it false on the HAPPY path — a plain cache hit is counted ` +
+          `here and never spawns, and totalRequests counts spawns rather than requests. The two ` +
+          `numbers are not comparable at all; see the counting site's comment.)`);
+      }
+
+      // The positive control for the whole loop above: a request that IS served must still count,
+      // or the four assertions are satisfied by a counter that never increments at all.
+      const served = await ltPostStatus(port, {
+        model: "sonnet", tool_choice: "auto", tools: [TOOL], messages: [{ role: "user", content: "hi" }],
+      });
+      assert.equal(served.status, 200, `the served request must succeed — ${served.status}`);
+      assert.equal(await dropped(), 1, "a SERVED tools request must count — otherwise the four checks above prove nothing");
+    } finally { child.kill("SIGKILL"); await ltDrain(() => buf.closed, "tools-control", 5000); }
+  } finally { _ltRmRetry(dir); }
+});
+
 console.log("\nForced tool_choice is refused, permissive tool_choice is untouched (#311, ADR 0013):");
 
 test("#311: tool_choice \"required\" is refused — the spec demands finish_reason tool_calls and OCP cannot produce one", () => {
@@ -6505,12 +6627,55 @@ ltTest("integration (#457): the MIXED case — answered, then the last poll fail
     const { child, buf, port } = await ltBootFresh({ CLAUDE_BIN: fake }, dir);
     try {
       assert.ok(await ltWait(() => buf.out.includes("listening on")), `— ${ltDiag(buf)}`);
-      // Start an unsatisfiable wait, let a few polls succeed, then take the server away.
+      // Start an unsatisfiable wait, WAIT UNTIL A POLL HAS ACTUALLY SUCCEEDED, then take the
+      // server away.
+      //
+      // The first version slept 300 ms here and assumed that was long enough for a poll to land.
+      // That is a timing-dependent PREMISE WITH NOTHING ASSERTING IT HELD, and under full-suite
+      // contention it does not: if no poll succeeds before the kill, `_ltEverHealth` is still null,
+      // the diagnostic correctly reports "NEVER returned a body", and this test fails for a reason
+      // that has nothing to do with what it is testing. Measured: green 5/5 in isolation, red
+      // inside the loaded suite — the signature of a premise, not of the behaviour under test.
+      //
+      // `_ltEverHealth` records the last non-null body and `_ltHealthPolls` counts polls, so BOTH
+      // premises this test rests on are OBSERVABLE rather than timed. Waiting on the thing the
+      // assertion depends on is the rule this suite already states; this is that rule applied to its
+      // own new helper.
+      //
+      // THERE ARE TWO PREMISES, and an independent review found the first fix asserted only one:
+      //   (a) a poll SUCCEEDED before the kill -- otherwise this is the unreachable case, and the
+      //       `/NEVER returned a body/` assertion below fails with the BEHAVIOUR message for a fixture
+      //       that never armed. That is what the 300 ms sleep got wrong.
+      //   (b) a poll RAN AFTER the kill -- otherwise ltWaitHealth's own budget expired while the server
+      //       was still alive, the LAST poll succeeded, and `/FINAL poll returned no body/` fails:
+      //       again a behaviour message for a fixture-timing cause. Reachable -- squeezing that budget
+      //       reproduces it.
+      // Both are asserted below, so neither can fail silently wearing the other's diagnosis.
       const waiting = ltWaitHealth(port, () => false, 1500);
-      await new Promise(r => setTimeout(r, 300));
+      assert.ok(await ltWait(() => _ltEverHealth !== null, 5000),
+        `premise: /health must answer at least once before the server is killed, or this test is ` +
+        `measuring the unreachable case instead of the mixed one — ${ltDiag(buf)}`);
+      const pollsAtKill = _ltHealthPolls;
       child.kill("SIGKILL");
       const r = await waiting;
       assert.equal(r, null, "premise: an unsatisfiable predicate must still time out");
+      // Premise (b), asserted rather than assumed. Read AFTER `await waiting`, so the wait has
+      // stopped polling; `pollsAtKill` was sampled synchronously before the signal, so any growth
+      // is a poll that COMPLETED after the server was taken away — not one issued after it.
+      // The distinction is not pedantry: `_ltHealthPolls++` runs AFTER `await ltHealth(port)`
+      // resolves, so a poll already in flight at the sample point increments post-kill. The guard
+      // is therefore very slightly weaker than "issued after" would promise — if the ONLY growth
+      // were an in-flight pre-kill poll that SUCCEEDED, premise (b) passes while the behaviour
+      // assertion below fails. Measured margin: growth is 36-37 polls across 5 runs, so that case
+      // was not reachable here; it is reasoned from the source rather than constructed, and it is
+      // recorded because a later reader deciding whether the residual is closed would trust this
+      // sentence.
+      assert.ok(_ltHealthPolls > pollsAtKill,
+        `premise: ltWaitHealth must still be polling when the server dies (polls ${pollsAtKill} ` +
+        `-> ${_ltHealthPolls}). If its own budget expired first, the LAST poll succeeded and the ` +
+        `"FINAL poll returned no body" assertion below would fail for a fixture-timing reason ` +
+        `while reading as a behaviour defect — the exact confusion this test was rewritten to ` +
+        `remove — ${ltDiag(buf)}`);
 
       const d = ltHealthDiag();
       // The whole point: earlier polls DID answer, so this is not the unreachable case.
