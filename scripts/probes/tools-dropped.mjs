@@ -4,7 +4,11 @@
 // The wire-level half of the #467 diagnosis: it talks to OCP directly and asserts on the response,
 // so it needs no agent framework.
 //
-//   node scripts/probes/tools-dropped.mjs [--url http://127.0.0.1:3456] [--model claude-opus-5]
+//   node scripts/probes/tools-dropped.mjs [--url <base>] [--model claude-opus-5]
+//
+//   --url defaults to LOCAL_PROXY_URL from lib/constants.mjs. It is imported rather than
+//   spelled here: `.github/workflows/alignment.yml`'s port-literal SPOT check scans every
+//   .mjs outside its exempt list, and scripts/ is not exempt.
 //
 //   exit 0 — tool_calls returned (the fixed state)
 //   exit 1 — prose returned instead (the state #467 reports)
@@ -36,12 +40,14 @@
 // `1`/`2`. Capability tests pass on both sides, which is why the agent was dead for days and every
 // check was green. USE THE THREE TOGETHER; none of them is sufficient alone.
 
+import { LOCAL_PROXY_URL } from "../../lib/constants.mjs";
+
 const args = process.argv.slice(2);
 const opt = (name, dflt) => {
   const i = args.indexOf(`--${name}`);
   return i >= 0 && args[i + 1] !== undefined ? args[i + 1] : dflt;
 };
-const url = opt("url", "http://127.0.0.1:3456");
+const url = opt("url", LOCAL_PROXY_URL);
 const model = opt("model", "claude-opus-5");
 const key = opt("key", "probe");
 const timeoutMs = Number(opt("timeout", "180")) * 1000;

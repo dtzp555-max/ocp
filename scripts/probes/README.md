@@ -44,12 +44,16 @@ both being `1` in #468's cross-check is a coincidence of value, not evidence of 
 Asks OCP for a tool call the model provably cannot answer from knowledge, with `tool_choice: "auto"`.
 
 ```
-node scripts/probes/tools-dropped.mjs [--url http://127.0.0.1:3456] [--model claude-opus-5]
+node scripts/probes/tools-dropped.mjs [--url <base>] [--model claude-opus-5]
 
   exit 0  tool_calls came back        (the fixed state)
   exit 1  prose came back instead     (the state #467 reports)
   exit 2  the request itself failed   (NEITHER state established)
 ```
+
+`--url` defaults to `LOCAL_PROXY_URL` from `lib/constants.mjs`. The port is deliberately not
+spelled here or in the probe: `alignment.yml`'s port-literal SPOT check scans every `.mjs`
+outside its exempt list, and `scripts/` is not exempt.
 
 **Exit 2 is not a detail.** A request that never completed establishes neither state, and reporting
 it as "tools were dropped" would be a negative predicate satisfied by an empty world. All three
