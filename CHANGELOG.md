@@ -46,6 +46,29 @@
 
 ### Fixed
 
+- **There is no upper boundary either, and two versions of this probe found that out one sweep at a time (#467).** Fifth round of independent review.
+
+  The previous round added a confident `WORKING` band at 2 %, calibrated against the **measured top of the working population**. That is the wrong population: the error the boundary must prevent is a **wedged** process exceeding it, and the wedged side has no ceiling — its rate is whatever timers that process happens to run. Measured: a wedged fixture at a 20 ms/s duty cycle reaches exactly **2.00 %** and got a confident `WORKING`, while a genuinely working 200 tok/s stream at **1.85 %** got the caveat. **The wedged side outranked the working side** — the same inversion the 3x `THIN MARGIN` band had at 0.90 %, moved up.
+
+  | wedged fixture | rate | | working fixture | rate |
+  |---|---|---|---|---|
+  | no heartbeat | 0.05 % | | stream 20 tok/s | 0.55 % |
+  | + 10 ms/s | 1.00 % | | stream 100 tok/s | 1.20 % |
+  | **+ 20 ms/s** | **2.00 %** | | **stream 200 tok/s** | **1.85 %** |
+  | + 50 ms/s | 5.00 % | | stream 400 tok/s | 2.25 % |
+
+  **The 0.90 % "highest wedged rate" the 2 % band rested on was an artifact of where the previous sweep stopped**, not a property of the population — the reviewer stopped at 10 ms/s because that was enough to break the 3x band, and one more step broke the 2 % band too. Same error twice: *calibrate against the population you measured, guard against the one you didn't.*
+
+  **So the confident band is gone entirely.** Above the floor every verdict is now `CONSUMING CPU, WORKING-OR-WEDGED UNRESOLVED` — verified at 0.30, 1.85, 2.00, 5.00 and **90.00 %**. A process spinning in a retry loop makes no progress at 99 %, so there is no rate at which CPU alone establishes progress. `WORKING` is reachable only through **bytes received**, which every verdict line now says.
+
+  These files already stated the principle for the *lower* boundary — *"nothing bounds the wedged side below the working side … this instrument cannot order them, at any threshold"* — and the confident band was the one place they stopped applying their own sentence.
+
+  **`MIN_RATE_PCT` (0.3 %) keeps a smaller and defensible job:** separating *consuming CPU* from *not consuming CPU at this instrument's resolution*. Its old justification (*"~3x above the highest observed wedged rate and ~1.7x below the slowest observed working one"*) is **retired in place rather than deleted** — both halves are now falsified, and the sentence is left visible saying so.
+
+  **Two stale operator-facing paragraphs went with it.** `README.md` and `docs/troubleshooting.md` both still described the `⚠ THIN MARGIN` mechanism as current after the script stopped emitting it — falsified in one run, and in both files the stale paragraph sat *immediately above* the one describing its replacement, so each page told the operator both mechanisms were live. Third occurrence of this shape in this PR.
+
+  **And the `interval_seconds` refusal message now describes the rule it enforces.** It refused `0.5` and `2.5` while giving a reason ("no window to measure over") that does not describe a fractional value — which has a perfectly good window. The refusal is right for a different reason, now stated: Linux's `ps` `time` column has whole-second resolution, so a sub-second window quantises the rate to 0 % or 200 %. Verified across `0`, `-1`, `abc`, `0.5`, `2.5` (all exit 3) and `1`, `4`, `60` (accepted). Left unfixed in the previous round on the grounds that shipping an unverified sentence was the greater risk; the reviewer pointed out the sentence **already in the file** was the unverified one, and they were right.
+
 - **The two populations overlap; the probe now says so instead of picking a number (#467).** Fourth round of independent review, and it answered the question the third round left open — *is 0.3 defensible, or is it the same mistake moved down?*
 
   Measured: a wedged client permanently blocked on a never-answering socket, with ordinary timers running, reaches **0.30 % / 0.50 % / 0.90 %** of wall time at 3 / 5 / 10 ms of work per second. Genuinely working streams measure **0.45 %** (20 tok/s), 0.75 % (40 tok/s), **1.60 %** (100 tok/s). **A wedged client with a 5 ms/s timer measures higher than a working 20 tok/s stream.** Nothing bounds the wedged side below the working side — its rate is whatever timers that process happens to run — so no threshold orders them, at any value.

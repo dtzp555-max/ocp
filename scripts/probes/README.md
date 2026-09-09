@@ -121,54 +121,42 @@ it exists to detect. Re-measured, one run, a Node SSE client parsing tokens off 
 | working — streaming at 100 tok/s | 1.30 % |
 | busy loop | 99.80 % |
 
-0.3 sits ~3x above the highest observed wedged rate and ~1.7x below the slowest observed working one.
-**The thinness is stated rather than dressed up:** 1.7x is narrow, the fixture does *less* per-token
-work than a real client (no rendering, no tool deltas) so a real turn sits higher, and a wedged
-client with a busier retry loop would sit higher too. **The verdict line says so at the moment you
-read it** — any rate within 3x of the floor prints a `⚠ THIN MARGIN` line telling you to corroborate
-with whether the client actually received bytes. Override with `MIN_RATE_PCT`.
+0.3 was chosen as ~3x above the highest wedged rate observed **at that time** and ~1.7x below the
+slowest observed working one. **Both halves of that justification have since been falsified** — see
+the section below: further sweeping found wedged fixtures at 0.90 %, 2.00 % and 5.00 %, all above
+0.3, and the working population reaches down to 0.45 %. What 0.3 does today is a smaller and
+defensible job: it separates *consuming CPU* from *not consuming CPU at this instrument's
+resolution*, and makes no claim about which population a consuming process belongs to.
 
-**The two populations OVERLAP, and no single constant separates them.** Round-4 review measured a
-wedged client — permanently blocked on a never-answering socket — with ordinary timers running:
+**There is no rate at which this instrument can say `WORKING`.** Above the floor the verdict is
+always `CONSUMING CPU, WORKING-OR-WEDGED UNRESOLVED`, and the thing to decide on is whether the
+client has actually **received bytes**.
 
-| wedged fixture | rate |
-|---|---|
-| no heartbeat | 0.10 % |
-| + 3 ms per second | 0.30 % |
-| + 5 ms per second | **0.50 %** |
-| + 10 ms per second | **0.90 %** |
+That is not caution, it is the measurement. A wedged client — permanently blocked on a
+never-answering socket — reaches whatever rate its timers happen to cost: **0.05 %** with no
+heartbeat, **1.00 %** at 10 ms/s, **2.00 %** at 20 ms/s, **5.00 %** at 50 ms/s. Genuinely working
+streams measured **0.55 %** (20 and 40 tok/s), 1.20 % (100), **1.85 %** (200), 2.25 % (400). The two
+overlap, and **the wedged side has no ceiling** — a process spinning in a retry loop makes no
+progress at 99 %.
 
-against genuinely working streams at **0.45 %** (20 tok/s), 0.75 % (40 tok/s) and **1.60 %** (100 tok/s).
-A wedged client with a 5 ms/s timer measures **higher** than a working 20 tok/s stream. Nothing bounds
-the wedged side below the working side — its rate is set by whatever timers that process happens to
-run — so **this instrument cannot order them, at any threshold.**
+**Two successive versions of this file put a boundary in the wrong place for the same reason**, and
+the second is worth recording because it looked like the fix for the first. A `⚠ THIN MARGIN`
+warning below 3x the floor cut *through* the overlap: a wedged process at 0.90 % got an unwarned
+`WORKING` while working turns at 0.45 % and 0.75 % were warned. Replacing it with a confident band
+at 2 % — calibrated against the measured *top of the working population* — moved the same inversion
+up: a wedged fixture at 20 ms/s reaches exactly **2.00 %** and got confident `WORKING`, while a
+working 200 tok/s stream at **1.85 %** got the caveat.
 
-That is not a reason to pick a different number. It is a reason to **say so in the verdict**, which is
-what the middle band does:
+**The error both times was calibrating against the population that was measured rather than the one
+the boundary must guard against.** The "highest wedged rate" each band rested on was an artifact of
+where the sweep stopped, not a property of the population — and one more step of the sweep broke
+each band in turn. This file already stated the principle for the *lower* boundary ("nothing bounds
+the wedged side below the working side … this instrument cannot order them, at any threshold"); the
+confident band was the one place it stopped applying its own sentence.
 
-| rate | verdict |
-|---|---|
-| below `MIN_RATE_PCT` (0.3 %) | *inconclusive*, or `WEDGED` with an uninterruptible wait |
-| 0.3 % – `CONFIDENT_RATE_PCT` (2 %) | **`CONSUMING CPU, WORKING-OR-WEDGED UNRESOLVED`** — decide on bytes received, not on this number |
-| >= 2 % | `WORKING` — above every wedged rate measured |
-
-The band's top is the **measured** top of the working population, not a multiple of the floor. An
-earlier version warned only below 3x the floor (0.9 %), which cut *through* the overlap: a wedged
-process at exactly 0.90 % got an unwarned `WORKING`, while working turns at 0.45 % and 0.75 % sat
-below it and were warned. Backwards.
-
-**This is the expiry clause firing, on the run after it was written.** It says that if a wedged
-process is ever measured at or above the floor the separation has collapsed — and one was, at 0.30 %,
-0.50 % and 0.90 %. The clause is keyed correctly; the honest consequence is that the constant it
-guards cannot do the job alone, and the probe now admits that rather than picking a number and
-sounding certain.
-
-**Expiry — keyed on the separation, not on a single observation.** An earlier version of this
-paragraph said *"if a genuinely working turn is ever observed below 2 %, this number is wrong"* and
-then, four lines later, called exactly that outcome intended. Both cannot hold, and the review made
-the observation. So: if a **wedged** process is ever measured at or above this rate, or a **working**
-one below it, the separation this constant rests on has collapsed — re-measure *both* fixtures and
-record the pair, rather than nudging the number toward whichever case you just saw.
+**What `MIN_RATE_PCT` (0.3 %) is now for**, and it is a smaller job than either band tried to do: it
+separates *consuming CPU* from *not consuming CPU at this instrument's resolution*. It makes no claim
+about which population a consuming process belongs to. Override with `MIN_RATE_PCT`.
 
 **A retracted claim, recorded rather than quietly replaced.** An earlier version said a process below
 the `time` column's resolution lands in *inconclusive*, "never `WORKING`". That followed only from the

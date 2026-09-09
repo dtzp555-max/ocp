@@ -100,29 +100,18 @@ reasons that have nothing to do with whether the process is doing anything. The 
 uninterruptible-sleep `STAT` character from `uname` (`U` on macOS/BSD, `D` on Linux) and **refuses on
 a platform it does not know** rather than probing with a letter that can never match.
 
-`working` requires CPU consumed at a minimum **rate** — at least **0.3 % of wall time** across the
-sampling window — not merely a counter that moved. A wedged Node process still runs timers and GC,
-and on macOS that registers; asking only "did it grow" was measured reporting `working` for a
-permanently wedged process in 7 of 14 runs. Override the floor with `MIN_RATE_PCT`.
+**There is no rate at which this probe says `working`.** Above a 0.3 % floor — the point at which
+it can see CPU being consumed at all — every verdict is `CONSUMING CPU, WORKING-OR-WEDGED
+UNRESOLVED`, and the thing to decide on is whether the client has actually **received bytes**.
 
-The floor was **2 %** in a first pass and that was wrong: a genuinely working streaming turn measures
-**0.50 – 1.30 %** (20–100 tok/s), i.e. the floor had been placed *above* the signal it exists to
-detect. A wedged in-flight `fetch` measures 0.00 – 0.10 %. 0.3 sits between them with ~3x below and
-~1.7x above — a narrow margin on the working side, which is why **any rate within 3x of the floor
-prints a `⚠ THIN MARGIN` line** telling you to corroborate with whether the client actually received
-bytes before acting on the verdict.
+Measured, which is why: a wedged client running ordinary timers spans **0.05 – 5.00 %** of wall
+time, genuinely working streams **0.55 – 2.25 %** — they overlap, and the wedged side has no
+ceiling. A process spinning in a retry loop makes no progress at 99 %. Two earlier versions of this
+probe put a confident boundary at 0.9 % and then at 2 %, and a wedged fixture crossed each in turn.
 
-**There is a middle band where this instrument cannot decide, and it says so.** Measured: a wedged
-client running ordinary timers reaches 0.30 – 0.90 % of wall time, while genuinely working streams
-run 0.45 – 1.60 % — they overlap, and a wedged client with a 5 ms/s timer measures *higher* than a
-working 20 tok/s stream. Between **0.3 %** and **2 %** the verdict is therefore
-`CONSUMING CPU, WORKING-OR-WEDGED UNRESOLVED`, and the thing to decide on is whether the client has
-actually **received bytes** — not this number. At or above 2 % — higher than any wedged rate measured
-— it is `WORKING`.
-
-A turn that is genuinely idle — waiting on the upstream with nothing arriving — consumes essentially
-nothing and is reported *inconclusive*. A wedged process lives in that same band, which is why
-*inconclusive* is a real answer here rather than a failure to reach one.
+Below the floor with an **uninterruptible wait** the verdict is `WEDGED` — the one answer here that
+rests on positive evidence of the failure. Below the floor without one it is *inconclusive*: a turn
+waiting on the upstream and a turn blocked forever are the same observation.
 
 **Neither instrument is sufficient alone**, and the one that actually separates *"the client's agent
 loop ran"* from *"OCP's inner CLI did the work and narrated it"* is a third one that is not a

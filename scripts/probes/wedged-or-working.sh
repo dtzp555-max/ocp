@@ -38,12 +38,18 @@
 #     40 tok/s  -> 0.65 %      busy loop                                -> 99.80 %
 #    100 tok/s  -> 1.30 %
 #
-# 0.3 sits ~3x above the highest observed wedged rate and ~1.7x below the slowest
-# observed working one. STATE THE THINNESS RATHER THAN DRESS IT UP: 1.7x is a
-# narrow margin, the fixture does LESS per-token work than a real client (no
-# rendering, no tool deltas) so a real turn sits higher, and a wedged client with a
-# busier retry loop would sit higher too. The verdict line says so whenever the
-# measured rate is within 3x of the floor.
+# 0.3 was chosen as ~3x above the highest wedged rate observed AT THAT TIME and ~1.7x
+# below the slowest observed working one. BOTH HALVES OF THAT HAVE SINCE BEEN
+# FALSIFIED: further sweeping found wedged fixtures at 0.90%, 2.00% and 5.00%, all
+# above 0.3, and the working population reaches down to 0.45%. Two successive bands
+# built on "above every wedged rate measured" -- a 3x THIN MARGIN warning, then a
+# confident band at 2% -- were each broken by one more step of the sweep, because the
+# ceiling they rested on was where someone stopped measuring, not a property of the
+# population.
+#
+# WHAT 0.3 DOES TODAY is a smaller and defensible job: it separates CONSUMING CPU from
+# NOT CONSUMING CPU at this instrument's resolution. It makes no claim about which
+# population a consuming process belongs to, and there is no upper band at all.
 #
 # EXPIRY -- keyed on the SEPARATION, not on any single observation. An earlier
 # revision said "if a genuinely working turn is ever observed below 2 %, this
@@ -100,14 +106,18 @@ N=${1:-6}; IV=${2:-4}
 # print it as though it had been measured, which is the exact shape this script
 # keeps removing. Refuse, the way N=1 is refused, and say why.
 if [ "$IV" -le 0 ] 2>/dev/null || ! [ "$IV" -ge 1 ] 2>/dev/null; then
-  echo "interval_seconds must be >= 1 (got '${IV}'): the rate is CPU seconds per WALL" >&2
-  echo "second, so a zero or non-numeric interval has no window to measure over. It would" >&2
-  echo "print 0.00% and look like a measurement." >&2
+  echo "interval_seconds must be a WHOLE NUMBER >= 1 (got '${IV}')." >&2
+  echo "  0 or non-numeric: there is no window to divide by, and the guard below would" >&2
+  echo "  substitute 0.00% and print it as though it had been measured." >&2
+  echo "  Fractional (0.5, 2.5): sleep accepts these and the window is real, but Linux's" >&2
+  echo "  ps 'time' column has WHOLE-SECOND resolution, so a sub-second window quantises" >&2
+  echo "  the rate to 0% or 200%. Refused for a different reason than 0 is -- an earlier" >&2
+  echo "  version of this message gave only the first reason and refused both." >&2
   exit 3
 fi
-MIN_RATE_PCT=${MIN_RATE_PCT:-0.3}         # floor: below this, not observably computing
-CONFIDENT_RATE_PCT=${CONFIDENT_RATE_PCT:-2}  # above the measured working range's top AND every
-                                          # measured wedged rate -- see header, THE BANDS
+MIN_RATE_PCT=${MIN_RATE_PCT:-0.3}   # the instrument's resolution floor: below this, not
+                                    # observably consuming CPU at all. It is NOT an attempt
+                                    # to order the two populations -- see THE BANDS.
 PAT='[c]laude --model'          # the bracket stops the GREP process matching itself in ps output (not this script's argv)
 
 # Uninterruptible-sleep STAT character, chosen rather than assumed. Refuses on an
@@ -157,14 +167,13 @@ for pid in $PIDS; do
   # WORKING branch fired on "%CPU varied", and a decaying average varies while the
   # process does nothing at all.
   #
-  #   rate >= CONFIDENT_RATE_PCT -> above every wedged rate measured. WORKING.
-  #   MIN_RATE_PCT <= rate < CONFIDENT_RATE_PCT -> inside the MEASURED OVERLAP. Working,
-  #        but this instrument cannot say working-or-wedged here, and the verdict says so
-  #        in its headline rather than in a footnote.
+  #   rate >= MIN_RATE_PCT -> the process is consuming CPU. That is ALL it establishes:
+  #        WORKING-OR-WEDGED UNRESOLVED. There is deliberately NO 'confident WORKING' band --
+  #        see the branch below for the measurement that removed it.
   #   below the floor + uninterruptible seen -> blocked in the kernel, not computing. WEDGED.
-  #   below the floor, no uninterruptible    -> INCONCLUSIVE. The honest answer, not a
-  #        weaker WORKING: a turn waiting on the upstream API and one blocked on a socket
-  #        forever are the SAME observation here.
+  #        The one verdict here that rests on POSITIVE evidence of the failure.
+  #   below the floor, no uninterruptible    -> INCONCLUSIVE. A turn waiting on the upstream
+  #        and one blocked on a socket forever are the SAME observation here.
   if [ "$samples" -eq 0 ]; then
     echo "    ⇒ inconclusive — no sample was taken"
     continue
@@ -183,7 +192,6 @@ for pid in $PIDS; do
   # `grew` through two revisions after it stopped meaning "grew", which is this repo's
   # own "a name is a claim" rule catching the one identifier whose meaning changed.
   above_floor=$(awk -v r="$rate" -v m="$MIN_RATE_PCT" 'BEGIN{ print (r >= m) ? 1 : 0 }')
-  confident=$(awk -v r="$rate" -v c="$CONFIDENT_RATE_PCT" 'BEGIN{ print (r >= c) ? 1 : 0 }')
 
   if [ "$samples" -lt 2 ]; then
     # One sample cannot show growth, so it cannot answer this question at all. Said
@@ -193,25 +201,27 @@ for pid in $PIDS; do
     echo "    ⇒ inconclusive — only 1 sample; CPU-time growth needs at least 2."
     echo "      Re-run with N >= 2 (default 6)."
   elif [ "$above_floor" = "1" ]; then
-    if [ "$confident" = "1" ]; then
-      echo "    ⇒ WORKING — consumed ${delta}s of CPU over ${window}s = ${rate}% of wall time"
-      echo "      (>= ${CONFIDENT_RATE_PCT}%, above every wedged rate measured)."
-    else
-      # THE OVERLAP IS MEASURED, NOT HYPOTHETICAL, so it is the headline and not a footnote.
-      # A wedged client running a 5 ms/s timer measures 0.50% -- HIGHER than a genuinely
-      # working 20 tok/s stream at 0.45%. No threshold orders those correctly, because the
-      # wedged side's rate is set by whatever timers that process happens to run and is
-      # bounded below the working side by nothing. An earlier version of this block warned
-      # only below 3x the floor, i.e. under 0.9% -- which cut THROUGH the overlap: a wedged
-      # process at exactly 0.90% got an unwarned WORKING while working turns at 0.45% and
-      # 0.75% sat below it and were warned. Backwards. The band now ends where the measured
-      # WORKING population ends, not at a multiple of the floor.
-      echo "    ⇒ CONSUMING CPU, WORKING-OR-WEDGED UNRESOLVED — ${delta}s over ${window}s = ${rate}%"
-      echo "      of wall time. Above the ${MIN_RATE_PCT}% floor but below ${CONFIDENT_RATE_PCT}%, which is the"
-      echo "      MEASURED OVERLAP: genuinely working streams ran 0.45-1.60% here, and wedged clients"
-      echo "      running ordinary timers ran 0.30-0.90%. This instrument cannot separate them."
-      echo "      Decide on whether the client has actually RECEIVED BYTES, not on this number."
-    fi
+    # NO CONFIDENT BAND, DELIBERATELY. There is no rate above which this instrument can say
+    # WORKING, because the WEDGED population has no ceiling: its rate is whatever timers that
+    # process happens to run, and a process spinning in a retry loop makes no progress at 99%.
+    #
+    # An earlier revision had a confident band at 2%, calibrated against the measured top of the
+    # WORKING population -- the wrong population, since the error it must prevent is a WEDGED
+    # process EXCEEDING it. [measured] a wedged fixture at a 20 ms/s duty cycle reaches 2.00% and
+    # got a confident WORKING, while a genuinely working 200 tok/s stream at 1.85% got the caveat:
+    # the wedged side outranked the working side. Same inversion the earlier 3x band had at 0.9%,
+    # moved up. And the 0.90% "highest wedged rate" it was justified against was an artifact of
+    # where the sweep STOPPED, not a property of the population.
+    #
+    # The README already said this for the LOWER boundary -- "nothing bounds the wedged side below
+    # the working side ... this instrument cannot order them, at any threshold". It is equally true
+    # at the top, and the confident band was the one place these files stopped applying their own
+    # sentence.
+    echo "    ⇒ CONSUMING CPU, WORKING-OR-WEDGED UNRESOLVED — ${delta}s over ${window}s = ${rate}%"
+    echo "      of wall time. DECIDE ON WHETHER THE CLIENT HAS RECEIVED BYTES, not on this number."
+    echo "      Consuming CPU is not progress. Measured: wedged clients running ordinary timers span"
+    echo "      0.05-5.00%, genuinely working streams 0.55-2.25% -- overlapping, and the wedged side"
+    echo "      is unbounded above. There is no rate at which this instrument can say WORKING."
     echo "      Sampled %CPU ${lo}–${hi} is context and is NOT what any of this rests on."
   elif printf '%s' "$stats" | grep -q "$UNINT"; then
     echo "    ⇒ WEDGED — uninterruptible wait (STAT contains '${UNINT}'), and CPU consumed at only"
