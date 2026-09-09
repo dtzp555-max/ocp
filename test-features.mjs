@@ -2756,7 +2756,8 @@ test("selectPromptWrapper: schema empty (multi) → the negative wrapper, BYTE-I
 
 test("selectPromptWrapper: tools granted, not invited → the NEUTRAL wrapper", () => {
   // The row this change exists for. Before it, this surface got NEG — a denial measured false
-  // against a 27-tool schema (lib/prompt.mjs § selectPromptWrapper).
+  // against a NON-EMPTY schema (lib/prompt.mjs § selectPromptWrapper, which states the two measured
+  // figures and why neither is quotable as a count).
   assert.equal(selectPromptWrapper({ toolsGranted: true, localToolsInvited: false }, W), NEU);
 });
 
