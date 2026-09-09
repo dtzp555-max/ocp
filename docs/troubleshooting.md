@@ -60,6 +60,90 @@ ocp restart
 openclaw gateway restart
 ```
 
+### An agent answers, but never actually uses its tools
+
+The hardest shape in this project's history, because **nothing goes red**. Symptoms:
+
+- simple questions answer in ~4 s; anything needing a tool takes 30 s – 13 min, **non-deterministically for the same class of task**;
+- occasional confidently-wrong answers of the form *"I don't have filesystem access"* for a file that exists;
+- **no error anywhere** — `finish_reason: "stop"`, HTTP 200, `ocp health` ok, `recentErrors` empty, agent-side logs clean.
+
+The agent looks alive and is answering. It just cannot do anything. See
+[#467](https://github.com/dtzp555-max/ocp/issues/467) and
+[ADR 0021](adr/0021-ocp-is-an-agent-backend.md).
+
+**First check — is OCP dropping the declared tools?** Since **#468** it says so, on both surfaces. **Both commands need #468**: before it, `toolRequestsDropped` is absent and `jq` prints `null`, which reads as *"not dropping"* — a false negative. And `ocp logs` **with no arguments** cannot find the event at all: it defaults to `20 error`, `handleLogs` filters `level` by exact equality, and the event is logged at `warn`. Hence the explicit arguments below.
+
+```bash
+curl -s localhost:3456/health | jq .stats.toolRequestsDropped   # non-zero ⇒ tools are being dropped
+ocp logs 200 all | grep openai_tools_dropped   # one line per affected request
+```
+
+**Then confirm from the client's side**, because the counter above cannot see what the client got:
+
+```bash
+node scripts/probes/tools-dropped.mjs      # exit 1 ⇒ prose came back where tool_calls was expected
+```
+
+**If a turn is simply taking a long time**, do not guess from the duration — a legitimate
+tool-using turn measured 248 s here:
+
+```bash
+scripts/probes/wedged-or-working.sh   # consuming CPU  ⇒ WORKING-OR-WEDGED UNRESOLVED
+                                      #                  (read the RATE it prints, see below)
+                                      # not, + uninterruptible sleep ⇒ WEDGED
+                                      # not, ordinary sleep          ⇒ inconclusive
+```
+
+The criterion is **accumulated CPU time**, not `%CPU`. `%CPU` is a decaying average on macOS and an
+average since process start on Linux, so on both platforms it can move — or refuse to move — for
+reasons that have nothing to do with whether the process is doing anything. The script picks the
+uninterruptible-sleep `STAT` character from `uname` (`U` on macOS/BSD, `D` on Linux) and **refuses on
+a platform it does not know** rather than probing with a letter that can never match.
+
+**Why run it at all, when it ends by pointing at bytes received.** Because it answers a question
+bytes-received cannot. A turn blocked on a dead socket and a turn spinning in a retry loop **both
+receive zero bytes** — bytes-received cannot tell them apart. This probe measures **0.05 %** for the
+first and **100.45 %** for the second (both measured), and those are different faults with different
+remedies. That value is in the **printed rate**, not in the verdict name, which is why it survives
+`WORKING` being removed. `WEDGED` adds a second thing bytes-received cannot: positive evidence of an
+uninterruptible kernel wait, which points at I/O rather than at the upstream.
+
+**There is no rate at which this probe says `working`.** Above the **effective floor** every verdict
+is `CONSUMING CPU, WORKING-OR-WEDGED UNRESOLVED`, and the thing to decide on is whether the client
+has actually **received bytes**.
+
+**The floor is not a constant, and the tool prints the one in force.** `ps -o time=` is quantised —
+0.01 s on macOS, **1 s on Linux** — so the smallest rate the platform can even represent is one
+quantum over the sampling window. The floor is the larger of that and the requested `MIN_RATE_PCT`
+(0.3 %): **0.3 % on macOS at the default 6x4 s window, and 5 % on Linux**, where nothing between 0
+and 5 is representable at all. Read the floor off the verdict line rather than from this page — an
+earlier version of this paragraph stated 0.3 % as *the* floor and *"the point at which it can see CPU
+being consumed at all"*, which was a macOS property written as a property of the instrument, and the
+tool's own output contradicted it on Linux.
+
+Measured, which is why: a wedged client running ordinary timers spans **0.05 – 5.00 %** of wall
+time, genuinely working streams **0.55 – 2.25 %** — they overlap, and the wedged side has no
+ceiling. A process spinning in a retry loop makes no progress at 99 %. Two earlier versions of this
+probe put a confident boundary at 0.9 % and then at 2 %, and a wedged fixture crossed each in turn.
+
+Below the floor with an **uninterruptible wait** the verdict is `WEDGED` — the one answer here that
+rests on positive evidence of the failure. Below the floor without one it is *inconclusive*: a turn
+waiting on the upstream and a turn blocked forever are the same observation.
+
+**Neither instrument is sufficient alone**, and the one that actually separates *"the client's agent
+loop ran"* from *"OCP's inner CLI did the work and narrated it"* is a third one that is not a
+script: the client's own per-session **tool-call counter** (OCP: `0`; a native tool-calling API:
+`1`). **Capability tests pass either way** — which is why this went unnoticed for days, twice. Read
+[`scripts/probes/README.md`](../scripts/probes/README.md) before concluding anything.
+
+**Already ruled out — do not re-measure:** context length (none / 20 KB / 100 KB / 300 KB →
+4.1 / 2.8 / 4.9 / 4.5 s) and the network.
+
+**Timeout ordering matters too.** `CLAUDE_TIMEOUT` defaults to 600 s, which is *shorter* than some
+client defaults (1800 s in the reported case), so the client never fails first and never fails
+over — a wedged turn is ten minutes of total silence before anything happens at all.
+
 ### Env var change (e.g. `CLAUDE_BIND`, `CLAUDE_CODE_OAUTH_TOKEN`) doesn't take effect after restart
 
 On **macOS**, `ocp restart` does a full `launchctl bootout` + `bootstrap` of the agent, which **re-reads the plist `EnvironmentVariables`** — so an env change you made (in `~/Library/LaunchAgents/dev.ocp.proxy.plist`) actually takes effect:
