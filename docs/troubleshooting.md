@@ -89,9 +89,10 @@ node scripts/probes/tools-dropped.mjs      # exit 1 ⇒ prose came back where to
 tool-using turn measured 248 s here:
 
 ```bash
-scripts/probes/wedged-or-working.sh   # consumed CPU during the window        ⇒ working
-                                      # consumed none, in uninterruptible sleep ⇒ wedged
-                                      # consumed none, ordinary sleep           ⇒ inconclusive
+scripts/probes/wedged-or-working.sh   # consuming CPU  ⇒ WORKING-OR-WEDGED UNRESOLVED
+                                      #                  (read the RATE it prints, see below)
+                                      # not, + uninterruptible sleep ⇒ WEDGED
+                                      # not, ordinary sleep          ⇒ inconclusive
 ```
 
 The criterion is **accumulated CPU time**, not `%CPU`. `%CPU` is a decaying average on macOS and an
@@ -99,6 +100,14 @@ average since process start on Linux, so on both platforms it can move — or re
 reasons that have nothing to do with whether the process is doing anything. The script picks the
 uninterruptible-sleep `STAT` character from `uname` (`U` on macOS/BSD, `D` on Linux) and **refuses on
 a platform it does not know** rather than probing with a letter that can never match.
+
+**Why run it at all, when it ends by pointing at bytes received.** Because it answers a question
+bytes-received cannot. A turn blocked on a dead socket and a turn spinning in a retry loop **both
+receive zero bytes** — bytes-received cannot tell them apart. This probe measures **0.05 %** for the
+first and **100.45 %** for the second (both measured), and those are different faults with different
+remedies. That value is in the **printed rate**, not in the verdict name, which is why it survives
+`WORKING` being removed. `WEDGED` adds a second thing bytes-received cannot: positive evidence of an
+uninterruptible kernel wait, which points at I/O rather than at the upstream.
 
 **There is no rate at which this probe says `working`.** Above a 0.3 % floor — the point at which
 it can see CPU being consumed at all — every verdict is `CONSUMING CPU, WORKING-OR-WEDGED

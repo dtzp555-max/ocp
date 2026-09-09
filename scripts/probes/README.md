@@ -76,12 +76,25 @@ Three deliberate choices, so a fixture built on it does not drift:
 Classifies a long-running OCP-spawned `claude` child.
 
 ```
-WORKING      = accumulated CPU time GREW across the sampling window
-WEDGED       = it did not grow, AND the process was in uninterruptible sleep
-inconclusive = it did not grow, and there was no uninterruptible sleep
-               (a turn waiting on the upstream and one blocked forever are
-                the same observation here — that is why this is a verdict)
+WORKING-OR-WEDGED UNRESOLVED = consuming CPU at or above the effective floor.
+                               READ THE RATE. It does not establish progress.
+WEDGED                       = below the floor, AND in uninterruptible sleep.
+                               The one verdict resting on positive evidence.
+inconclusive                 = below the floor, no uninterruptible sleep.
+                               A turn waiting on the upstream and one blocked
+                               forever are the same observation here.
 ```
+
+**There is no `WORKING` verdict**, deliberately — see below. The **effective floor** is the larger of
+`MIN_RATE_PCT` (0.3 %) and one `ps -o time=` quantum over the sampling window, which is 0.05 % on
+macOS and **5 %** on Linux at the default 6x4 s; the verdict line prints the one in force, because a
+requested floor the platform's resolution cannot express is not a floor.
+
+**What this gives that a bytes-received check cannot.** A turn blocked on a dead socket and a turn
+spinning in a retry loop both receive zero bytes. This probe measures **0.05 %** and **100.45 %** for
+them (both measured) — different faults, different remedies. That value lives in the printed **rate**,
+not the verdict name, which is why removing `WORKING` did not remove it.
+
 
 **Why not `%CPU`.** It was the criterion until an independent review measured it wrong on both
 platforms. On macOS `%CPU` is a **decaying average** — measured `2.1 → 0.0` with zero CPU consumed

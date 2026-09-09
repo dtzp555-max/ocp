@@ -95,8 +95,9 @@
 # hundredths (measured `0:00.50` -> `0:02.50` across 2 s of busy-work); Linux
 # reports whole seconds. An earlier revision concluded from the Linux half that a
 # process below that resolution "is reported inconclusive, never WORKING" -- FALSE,
-# and falsified in one run: fed 0.40 s of CPU across a 20 s window this script
-# answers WORKING, because 0.40/20 clears the rate floor. What resolution actually
+# and falsified in one run: fed 0.40 s of CPU across a 20 s window THE REVISION BEING
+# DESCRIBED answered WORKING, because 0.40/20 cleared its rate floor. (This script no
+# longer has a WORKING verdict at all -- the same input now answers UNRESOLVED at 2.00%.) What resolution actually
 # costs is precision in the rate near the floor, not a guarantee about the verdict.
 
 set -uo pipefail
@@ -115,17 +116,20 @@ if [ "$IV" -le 0 ] 2>/dev/null || ! [ "$IV" -ge 1 ] 2>/dev/null; then
   echo "  version of this message gave only the first reason and refused both." >&2
   exit 3
 fi
-MIN_RATE_PCT=${MIN_RATE_PCT:-0.3}   # the instrument's resolution floor: below this, not
-                                    # observably consuming CPU at all. It is NOT an attempt
-                                    # to order the two populations -- see THE BANDS.
+MIN_RATE_PCT=${MIN_RATE_PCT:-0.3}   # requested floor. The EFFECTIVE floor is the larger of this
+                                    # and one TIME_QUANTUM over the window -- see below, because on
+                                    # Linux this constant cannot be the thing that decides.
 PAT='[c]laude --model'          # the bracket stops the GREP process matching itself in ps output (not this script's argv)
 
 # Uninterruptible-sleep STAT character, chosen rather than assumed. Refuses on an
 # unknown platform: a wrong letter here does not error, it silently makes the
 # WEDGED verdict unreachable, which is the failure this replaces.
+# TIME_QUANTUM is the smallest non-zero value this platform's `ps -o time=` can report,
+# and it is picked here for the same reason UNINT is: guessing makes a check silently
+# inoperative rather than loudly wrong. Darwin reports hundredths, Linux whole seconds.
 case "$(uname -s)" in
-  Darwin|*BSD*) UNINT='U' ;;
-  Linux)        UNINT='D' ;;
+  Darwin|*BSD*) UNINT='U'; TIME_QUANTUM=0.01 ;;
+  Linux)        UNINT='D'; TIME_QUANTUM=1 ;;
   *) echo "unsupported platform $(uname -s): I do not know which ps STAT character means" >&2
      echo "uninterruptible sleep here, and guessing would make the WEDGED verdict silently" >&2
      echo "unreachable rather than wrong. Add the platform above and re-run." >&2
@@ -191,7 +195,25 @@ for pid in $PIDS; do
   # GC alone, which a boolean reads as work. Named for what it holds -- it was called
   # `grew` through two revisions after it stopped meaning "grew", which is this repo's
   # own "a name is a claim" rule catching the one identifier whose meaning changed.
-  above_floor=$(awk -v r="$rate" -v m="$MIN_RATE_PCT" 'BEGIN{ print (r >= m) ? 1 : 0 }')
+  # THE EFFECTIVE FLOOR, not the requested one. `ps -o time=` is QUANTISED, so the
+  # smallest non-zero rate this platform can even represent over this window is
+  # one quantum / window. On Linux that is 1s/20s = 5% at the default settings --
+  # FIFTEEN TIMES the requested 0.3, so no value between 0 and 5 exists and the
+  # constant can never be what decides. The predicate would silently degenerate to
+  # "did the counter move", which is the boolean an earlier round removed, on the
+  # platform this file itself calls the one OCP is normally deployed on.
+  #
+  # [measured] fed Linux-shaped HH:MM:SS values, delta 0s -> 0.00% -> inconclusive and
+  # delta 1s -> 5.00% -> unresolved, with nothing representable in between. On Darwin
+  # the quantum is 0.05% of the window, so 0.3 sits six quanta above resolution and is
+  # a real floor there: 0.05s -> inconclusive, 0.06s -> unresolved, both measured.
+  #
+  # So the floor is DERIVED and reported, rather than asserted as a constant. An earlier
+  # comment called 0.3 "the instrument's resolution floor" -- a Darwin property written
+  # as an instrument property.
+  quantum_pct=$(awk -v q="$TIME_QUANTUM" -v w="$window" 'BEGIN{ printf "%.2f", (w > 0) ? (q / w) * 100 : 0 }')
+  floor=$(awk -v m="$MIN_RATE_PCT" -v q="$quantum_pct" 'BEGIN{ print (q > m) ? q : m }')
+  above_floor=$(awk -v r="$rate" -v f="$floor" 'BEGIN{ print (r >= f) ? 1 : 0 }')
 
   if [ "$samples" -lt 2 ]; then
     # One sample cannot show growth, so it cannot answer this question at all. Said
@@ -228,7 +250,7 @@ for pid in $PIDS; do
     echo "      ${rate}% of wall time (${delta}s over ${window}s). Blocked in the kernel, not computing."
   else
     echo "    ⇒ inconclusive — no uninterruptible wait, and CPU consumed at only ${rate}% of wall"
-    echo "      time (${delta}s over ${window}s, below the ${MIN_RATE_PCT}% floor; %CPU ${lo}–${hi})."
+    echo "      time (${delta}s over ${window}s, below the ${floor}% effective floor; %CPU ${lo}–${hi})."
     echo "      A turn waiting on the upstream looks exactly like this. So does one blocked forever."
     echo "      Sample again over a longer window, or check whether the client ever received bytes."
   fi
