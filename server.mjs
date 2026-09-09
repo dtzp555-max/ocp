@@ -3978,19 +3978,44 @@ async function handleChatCompletions(req, res) {
   // two things exactly when someone is trying to read it. Every gate above this line that can
   // reject now does so BEFORE the count.
   //
-  // ONE REJECTION PATH REMAINS BELOW, stated rather than left for someone to find in a green run.
-  // Concurrency backpressure -- acquireClaudeSlot throwing ConcurrencyOverflowError when the wait
-  // queue is full -- lives inside spawnClaudeProcess, which is dispatched further down. [measured]
-  // with MAX_CONCURRENT=1, MAX_QUEUE=0 and a slow fake claude, a four-way burst carrying tools
-  // gives `toolRequestsDropped: 4` against `totalRequests: 1`; the same burst WITHOUT tools leaves
-  // the counter untouched, so the over-count is attributable to `tools + 429` and not to 429.
+  // WHAT THIS COUNTS, said positively -- the previous version of this paragraph tried to say it by
+  // enumerating what could still go wrong below, and got the enumeration wrong in two ways at once.
+  //
+  //   `toolRequestsDropped` = requests that DECLARED TOOLS and were therefore going to be answered
+  //   as text, counted at the point the request is accepted for service.
+  //
+  // It is NOT "requests that reached a model", and it is deliberately NOT comparable to
+  // `stats.totalRequests`. An independent review measured two ways that comparison fails, and both
+  // are correct behaviour under the definition above rather than defects to fix:
+  //
+  //   [measured] a plain CACHE HIT (CLAUDE_CACHE_TTL=60, two identical tools requests) gives
+  //     toolRequestsDropped 2 against totalRequests 1 -- both cache lookups are BELOW this line, so
+  //     a served-from-cache request is counted here and never spawns. Its tools really were
+  //     dropped, so the count is right and the comparison is the thing that is meaningless.
+  //   [measured] one `response_format` request took totalRequests 4 -> 7, because the
+  //     structured-output path RETRIES the spawn. totalRequests counts spawns, not requests.
+  //
+  // So `toolRequestsDropped <= totalRequests` was never an invariant, and an earlier revision of
+  // this comment, the CHANGELOG entry and the control test's assertion message all leaned on it.
+  //
+  // REJECTION PATHS THAT REMAIN BELOW -- plural. The previous revision named one of two.
+  // `acquireClaudeSlot` has TWO throwing exits, both inside spawnClaudeProcess, dispatched further
+  // down:
+  //   * RequestDisconnectedError  -- the client aborted while queued for a concurrency slot.
+  //   * ConcurrencyOverflowError  -- the wait queue was full.
+  // [measured] with MAX_CONCURRENT=1 and MAX_QUEUE=8 -- i.e. overflow IMPOSSIBLE -- one occupier
+  // plus one queued request whose client aborts gives toolRequestsDropped 2 against totalRequests 1
+  // with queueRejections 0; the same pair WITHOUT tools leaves the counter at 0, which is what
+  // attributes it. An earlier revision said "the residual needs a queue overflow to appear, and when
+  // it appears it inflates in bursts". That measurement falsifies both halves. It carried a
+  // `[measured]` tag earned from a single burst experiment that only ever exercised overflow -- an
+  // enumeration written in a universal voice, which is the failure this repo keeps re-finding.
   //
   // NOT FIXED BY MOVING FURTHER DOWN, and that is a decision rather than an omission: the only
   // position below the slot acquire is inside the spawn, which has two lanes (-p and TUI) and is
-  // RETRIED by the structured-output path -- one response_format request was measured taking
-  // totalRequests from 4 to 7. Counting there would silently convert this from "requests whose
-  // tools were dropped" into "spawns", which is a worse defect than the one it fixes. The residual
-  // needs a queue overflow to appear, and when it appears it inflates in bursts.
+  // retried by the structured-output path. Counting there would silently convert this from
+  // "requests whose tools were dropped" into "spawns" -- a worse defect than the one it fixes, and
+  // the same conflation the paragraph above warns the reader against.
   //
   // THE RESPONSE IS DELIBERATELY UNCHANGED. ADR 0013's Alternatives rejected "refuse whenever
   // `tools` is present" because it would have taken down every OpenClaw agent on the fleet the day
@@ -4005,7 +4030,12 @@ async function handleChatCompletions(req, res) {
     logEvent("warn", "openai_tools_dropped", {
       model,
       declaredTools,
-      toolChoice: typeof parsed.tool_choice === "string" ? parsed.tool_choice : (parsed.tool_choice?.type ?? "absent"),
+      // Bounded: this is verbatim client input and nothing upstream limits it. classifyToolRequest
+      // lets any non-forcing string, or any unknown object `type`, through -- a 100 000-character
+      // tool_choice was measured producing a 100 200-byte log line. 1:1 with the request body so
+      // there is no amplification, but this repo's log has no rotation of its own. String() first
+      // because an object's `type` need not be a string.
+      toolChoice: String(typeof parsed.tool_choice === "string" ? parsed.tool_choice : (parsed.tool_choice?.type ?? "absent")).slice(0, 64),
       note: "declared tools are not callable (ADR 0013); answered as text",
     });
   }

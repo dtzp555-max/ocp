@@ -5860,13 +5860,13 @@ ltTest("integration (#467 control): a request with NO tools counts nothing, and 
         const r = await ltPostStatus(port, body);
         assert.equal(r.status, 400, `[${label}] must be refused — got ${r.status}: ${r.text.slice(0, 140)}`);
         assert.equal(await dropped(), 0,
-          `[${label}] a REFUSED request must not be counted as a silent drop. It is the loud case, ` +
-          `and the counter exists to measure the quiet one — counting it also lets ` +
-          `toolRequestsDropped exceed totalRequests on THIS path, which is visible nonsense on ` +
-          `/health. (Scoped to "this path" on purpose: concurrency-backpressure 429s are raised ` +
-          `INSIDE spawnClaudeProcess, below the counter, and are a measured and deliberately ` +
-          `accepted residual — see the comment at the counting site. An unscoped claim here would ` +
-          `be one this PR itself violates.)`);
+          `[${label}] a REFUSED request must not be counted as a silent drop. It is the LOUD case ` +
+          `— the client got a 400 and knows — and the counter exists to measure the quiet one. ` +
+          `(Deliberately NOT justified by "counting it would let toolRequestsDropped exceed ` +
+          `totalRequests": an earlier revision of this message said exactly that, and an ` +
+          `independent review measured it false on the HAPPY path — a plain cache hit is counted ` +
+          `here and never spawns, and totalRequests counts spawns rather than requests. The two ` +
+          `numbers are not comparable at all; see the counting site's comment.)`);
       }
 
       // The positive control for the whole loop above: a request that IS served must still count,
