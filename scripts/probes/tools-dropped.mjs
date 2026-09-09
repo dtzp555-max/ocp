@@ -43,14 +43,29 @@
 import { LOCAL_PROXY_URL } from "../../lib/constants.mjs";
 
 const args = process.argv.slice(2);
+// A flag given with NO value used to fall back to the default silently. The default `--url` is a
+// live OCP on this host, so a typo'd or truncated flag probed PRODUCTION and printed a verdict
+// indistinguishable from one about the intended target. Refuse instead.
 const opt = (name, dflt) => {
   const i = args.indexOf(`--${name}`);
-  return i >= 0 && args[i + 1] !== undefined ? args[i + 1] : dflt;
+  if (i < 0) return dflt;
+  const v = args[i + 1];
+  if (v === undefined || v.startsWith("--")) {
+    console.error(`--${name} was given with no value. Refusing rather than silently using the ` +
+      `default (${dflt}) — the default target is a real proxy, and a verdict about the wrong one ` +
+      `looks exactly like a verdict about the right one.`);
+    process.exit(2);
+  }
+  return v;
 };
 const url = opt("url", LOCAL_PROXY_URL);
 const model = opt("model", "claude-opus-5");
 const key = opt("key", "probe");
 const timeoutMs = Number(opt("timeout", "180")) * 1000;
+
+// Echo what was actually resolved. Every verdict below is ABOUT this target, and until an
+// independent review pointed it out the output named neither the URL nor the model.
+console.log(`probing ${url}  model=${model}  timeout=${timeoutMs / 1000}s`);
 
 const TOOL = {
   type: "function",
@@ -104,6 +119,18 @@ if (calls) {
   console.log("\nPASS — client-declared tool was called back.");
   process.exit(0);
 }
+
+// A 200 carrying NEITHER tool_calls NOR prose establishes neither state, so it is exit 2 like any
+// other unusable answer — not exit 1, which asserts "prose came back instead". Measured: a stub
+// returning `{}` with HTTP 200 used to exit 1 while printing `finish_reason : undefined` and an
+// empty content, i.e. it reported the state #467 describes on evidence that showed nothing at all.
+// This is the same rule the README already makes a principle of, applied one case further in.
+if (!fin && !(msg.content || "").length) {
+  console.log(`\nINCONCLUSIVE — HTTP 200 with no tool_calls, no finish_reason and no content. ` +
+    `Neither state is established; this is not evidence that tools were dropped.`);
+  process.exit(2);
+}
+
 console.log(`\nFAIL — tools accepted, no tool_calls emitted, finish_reason ${JSON.stringify(fin)} ` +
   `(reads as "finished normally"). A client has nothing to branch on.`);
 process.exit(1);

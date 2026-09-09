@@ -20,13 +20,59 @@
 # tool-using turn measured here ran 248 s; a wedged one ran 9 min at 0.2% CPU
 # before being killed. Duration alone does not separate them.
 #
-# Linux: STAT 'D' is the equivalent of BSD 'U'. Swap the pattern below.
-# The %CPU column on Linux ps is an average since process start, not an
-# instantaneous sample — use `top -b -n1 -p <pid>` there instead.
+# PLATFORM, and WHY THE DISCRIMINATOR IS NOT %CPU.
+#
+# Uninterruptible sleep is STAT 'U' on Darwin/BSD and 'D' on Linux. An earlier
+# version hardcoded 'U' and told the reader in a comment to "swap the pattern
+# below" for Linux — so on Linux, which is how OCP is normally deployed, the
+# WEDGED branch was DEAD CODE and could never fire, while docs/troubleshooting.md
+# printed the command with no platform note at all. Found by independent review.
+# The character is now selected from `uname`, and an unrecognised platform
+# REFUSES rather than silently probing with the wrong letter.
+#
+# %CPU is no longer the discriminator, in either branch. It is a DECAYING AVERAGE
+# on Darwin — measured: 2.1 -> 0.0 with zero CPU consumed in between — so a
+# process that wedged two seconds ago shows falling %CPU, and "the number moved"
+# read that decay as work. On Linux the same column is an average since process
+# start, so a child that burned CPU at startup and then wedged shows a CONSTANT
+# non-zero value forever. Two platforms, two different ways for the same test to
+# answer WORKING about a wedged process.
+#
+# ACCUMULATED CPU TIME (`ps -o time=`) has neither problem: it is MONOTONIC, so
+# growth across the window is positive evidence that the process ran, and no
+# growth is positive evidence that it did not. That is the discriminator now.
+# %CPU is still printed, as context for a human, and is no longer tested.
+#
+# WHAT THIS STILL CANNOT SEE: a process using less CPU than the `time` column's
+# resolution over the whole window. Darwin reports hundredths (measured:
+# `0:00.50` -> `0:02.50` across 2 s of busy-work); Linux reports whole seconds,
+# so at the default 6x4 s window a process must accumulate >= 1 s of CPU to
+# register. Below that it is reported inconclusive, never WORKING.
 
 set -uo pipefail
 N=${1:-6}; IV=${2:-4}
 PAT='[c]laude --model'          # the bracket stops the GREP process matching itself in ps output (not this script's argv)
+
+# Uninterruptible-sleep STAT character, chosen rather than assumed. Refuses on an
+# unknown platform: a wrong letter here does not error, it silently makes the
+# WEDGED verdict unreachable, which is the failure this replaces.
+case "$(uname -s)" in
+  Darwin|*BSD*) UNINT='U' ;;
+  Linux)        UNINT='D' ;;
+  *) echo "unsupported platform $(uname -s): I do not know which ps STAT character means" >&2
+     echo "uninterruptible sleep here, and guessing would make the WEDGED verdict silently" >&2
+     echo "unreachable rather than wrong. Add the platform above and re-run." >&2
+     exit 3 ;;
+esac
+
+# `ps -o time=` -> seconds. Handles [[DD-]HH:]MM:SS[.CC] so one parser covers
+# Darwin's hundredths and Linux's whole seconds.
+cputime_s() {
+  ps -p "$1" -o time= 2>/dev/null | tr -d ' ' | awk -F: '
+    { d=0; if ($1 ~ /-/) { split($1, a, "-"); d=a[1]; $1=a[2] }
+      n=NF; s=$n; m=(n>=2)?$(n-1):0; h=(n>=3)?$(n-2):0
+      printf "%.2f", d*86400 + h*3600 + m*60 + s }'
+}
 
 # bash 3.2 (macOS default) has no mapfile — keep this portable.
 PIDS=$(ps -Ao pid,command | grep "$PAT" | awk '{print $1}')
@@ -36,50 +82,56 @@ fi
 
 for pid in $PIDS; do
   echo "── pid $pid  ($(ps -p "$pid" -o etime= | tr -d ' ') elapsed)"
-  stats=""; cpus=""
+  stats=""; cpus=""; t_first=""; t_last=""; samples=0
   for _ in $(seq 1 "$N"); do
     read -r st cpu <<<"$(ps -p "$pid" -o stat=,%cpu= 2>/dev/null)"
     [ -z "${st:-}" ] && { echo "    exited mid-sample"; break; }
-    printf '    STAT=%-5s %%CPU=%s\n' "$st" "$cpu"
+    ct=$(cputime_s "$pid")
+    printf '    STAT=%-5s %%CPU=%-6s cpu_time=%ss\n' "$st" "$cpu" "${ct:-?}"
     stats="$stats$st "; cpus="$cpus$cpu
 "
+    [ -z "$t_first" ] && t_first="$ct"
+    t_last="$ct"; samples=$((samples + 1))
     sleep "$IV"
   done
-  # verdict
-  if printf '%s' "$stats" | grep -q 'U'; then
-    hi=$(printf '%s' "$cpus" | grep -v '^$' | sort -rn | head -1)
-    if awk -v h="${hi:-0}" 'BEGIN{exit !(h < 2.0)}'; then
-      echo "    ⇒ WEDGED — uninterruptible wait, peak %CPU ${hi} over ${N} samples"
-    else
-      echo "    ⇒ inconclusive — U seen but CPU peaked at ${hi}; sample again"
-    fi
+  # ── verdict ────────────────────────────────────────────────────────────────────
+  # Ordered so every verdict rests on POSITIVE evidence rather than on the absence
+  # of something. That ordering is the whole correction: the previous version's
+  # WORKING branch fired on "%CPU varied", and a decaying average varies while the
+  # process does nothing at all.
+  #
+  #   grew   -> the process consumed CPU during the window. It ran. WORKING.
+  #   !grew + uninterruptible seen -> blocked in the kernel and not computing. WEDGED.
+  #   !grew + no uninterruptible   -> INCONCLUSIVE. This is the honest answer, not a
+  #        weaker WORKING: a turn waiting on the upstream API and a turn blocked on a
+  #        socket forever are the SAME observation here, and the header says so.
+  if [ "$samples" -eq 0 ]; then
+    echo "    ⇒ inconclusive — no sample was taken"
+    continue
+  fi
+  lo=$(printf '%s' "$cpus" | grep -v '^$' | sort -n  | head -1)
+  hi=$(printf '%s' "$cpus" | grep -v '^$' | sort -rn | head -1)
+  delta=$(awk -v a="${t_first:-0}" -v b="${t_last:-0}" 'BEGIN{ printf "%.2f", b - a }')
+  grew=$(awk -v d="$delta" 'BEGIN{ print (d > 0) ? 1 : 0 }')
+
+  if [ "$samples" -lt 2 ]; then
+    # One sample cannot show growth, so it cannot answer this question at all. Said
+    # rather than defaulted: `samples` is the first positional argument, so
+    # `./wedged-or-working.sh 1` is one keystroke away, and the previous version
+    # answered it with a confident verdict derived from lo == hi.
+    echo "    ⇒ inconclusive — only 1 sample; CPU-time growth needs at least 2."
+    echo "      Re-run with N >= 2 (default 6)."
+  elif [ "$grew" = "1" ]; then
+    echo "    ⇒ WORKING — consumed ${delta}s of CPU across ${samples} samples (%CPU ${lo}–${hi}, context only)"
+  elif printf '%s' "$stats" | grep -q "$UNINT"; then
+    echo "    ⇒ WEDGED — uninterruptible wait (STAT contains '${UNINT}') and 0s of CPU consumed"
+    echo "      across ${samples} samples. Blocked in the kernel, not computing."
   else
-    lo=$(printf '%s' "$cpus" | grep -v '^$' | sort -n  | head -1)
-    hi=$(printf '%s' "$cpus" | grep -v '^$' | sort -rn | head -1)
-    # The %CPU conjunct is TESTED here, not merely printed. An earlier version computed lo/hi and
-    # interpolated them into a WORKING message without ever comparing them, so the only
-    # discriminator was whether the letter U appeared -- while this file's own header, the README
-    # and docs/troubleshooting.md all stated the rule as "STAT S/R AND %CPU fluctuates".
-    #
-    # The gap pointed the WRONG WAY: a process blocked forever on a socket or a pipe sits in an
-    # INTERRUPTIBLE wait at ~0% CPU -- the shape this header itself calls normal ("a working turn
-    # spends most of its wall clock waiting on the upstream API"). So the most common way a
-    # network client wedges was reported WORKING. [measured] a process blocked on a fifo read that
-    # nothing will ever write: STAT=SN, %CPU 0.0-0.2, verdict "WORKING".
-    # WORKING needs EITHER variance OR meaningful CPU, not variance alone. A strict `hi > lo`
-    # alone has a false downgrade in the other direction, and `samples` is this script's first
-    # positional argument so it is one keystroke away: [measured] `./wedged-or-working.sh 1`
-    # against a process pegged at 83.2% reported "inconclusive — %CPU never moved", because with
-    # one sample lo == hi. A process steady at high CPU has the same problem at any N.
-    #
-    # The 2.0 threshold is deliberately the SAME ONE the WEDGED branch uses above, so the two
-    # verdicts are symmetric about one number rather than disagreeing via two unrelated ones.
-    if awk -v l="${lo:-0}" -v h="${hi:-0}" 'BEGIN{exit !(h > l || h >= 2.0)}'; then
-      echo "    ⇒ WORKING — no uninterruptible wait; %CPU ${lo}–${hi}"
-    else
-      echo "    ⇒ inconclusive — no uninterruptible wait, but %CPU never moved (${hi} across ${N} samples)."
-      echo "      A turn waiting on the upstream looks like this. So does one blocked forever."
-      echo "      Sample again over a longer window, or check whether the client ever received bytes."
-    fi
+    echo "    ⇒ inconclusive — no uninterruptible wait, and no measurable CPU consumed"
+    echo "      (${delta}s across ${samples} samples; %CPU ${lo}–${hi})."
+    echo "      A turn waiting on the upstream looks exactly like this. So does one blocked forever."
+    echo "      Sample again over a longer window, or check whether the client ever received bytes."
+    echo "      Note the floor: Linux 'ps -o time=' has 1-second resolution, so a process using less"
+    echo "      than ~1s of CPU over the whole window lands here rather than in WORKING."
   fi
 done

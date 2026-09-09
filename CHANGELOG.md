@@ -2,6 +2,19 @@
 
 ## Unreleased
 
+### Fixed
+
+- **`wedged-or-working.sh` could never report `WEDGED` on Linux, and reported `WORKING` for a process that had just wedged (#467).** Both found by independent review, both measured.
+
+  **Linux.** Uninterruptible sleep is `STAT=D` there, not BSD's `U`. The script hardcoded `U` and told the reader in a comment to hand-edit — so on the platform OCP is normally deployed on, the whole `WEDGED` branch was **dead code**, while `docs/troubleshooting.md` printed the command with the criterion restated and no platform note at all. The character now comes from `uname`, and an unrecognised platform **exits 3** rather than probing with a letter that can never match. A constraint made unreachable by construction instead of stated as a prohibition.
+
+  **The discriminator is no longer `%CPU`.** It is a *decaying average* on macOS and an average *since process start* on Linux — two platforms, two different ways for "the number moved" to answer `WORKING` about a wedged process. Measured against the script: a process that burned CPU and then blocked forever on a fifo gave `%CPU 61.1 → 1.3 → 0.0` while its accumulated CPU time stayed flat at `7.51s`; the old predicate answers **WORKING** on exactly that data (verified by running it), the new one answers **inconclusive**. Accumulated CPU time (`ps -o time=`) is **monotonic**, so growth is positive evidence the process ran and no growth is positive evidence it did not — every verdict now rests on something observed rather than on the absence of something.
+
+  Its floor is stated rather than left to be discovered: Linux `ps -o time=` has 1-second resolution (macOS reports hundredths), so a process using less than about a second of CPU across the window is reported *inconclusive*, never *`WORKING`*. `N=1` is refused outright — growth needs two samples, and `samples` is the first positional argument.
+
+- **`tools-dropped.mjs`: a flag with no value silently probed production, and an empty `200` was reported as evidence (#467).** `--url` with no value fell back to the default, which is a **live OCP on the operator's own host**, and the output named neither the URL nor the model — so a truncated flag produced a verdict indistinguishable from one about the intended target. It now refuses (exit 2) and echoes the resolved target. Separately, an HTTP 200 carrying no `tool_calls`, no `finish_reason` and no content exited **1** ("prose came back instead") while establishing neither state; it is now exit **2**, which is the principle the README already made for every other unusable answer. All four exits re-verified reachable against stubs.
+
+
 ### Added
 
 - **Two probes and a troubleshooting entry for the #467 shape (#467).** The failure that produced [ADR 0021](docs/adr/0021-ocp-is-an-agent-backend.md) is the hardest kind this project has: an agent answers, looks alive, and cannot do anything, while **nothing goes red**. `scripts/probes/` now carries the two instruments that diagnosed it, and `docs/troubleshooting.md` gains *"An agent answers, but never actually uses its tools"* pointing at them.

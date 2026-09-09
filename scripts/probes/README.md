@@ -76,36 +76,63 @@ Three deliberate choices, so a fixture built on it does not drift:
 Classifies a long-running OCP-spawned `claude` child.
 
 ```
-WEDGED       = uninterruptible wait (U), AND peak %CPU < 2
-WORKING      = no uninterruptible wait, AND (%CPU varied OR peak %CPU >= 2)
-inconclusive = anything else — including a FLAT NEAR-ZERO %CPU with no U
+WORKING      = accumulated CPU time GREW across the sampling window
+WEDGED       = it did not grow, AND the process was in uninterruptible sleep
+inconclusive = it did not grow, and there was no uninterruptible sleep
+               (a turn waiting on the upstream and one blocked forever are
+                the same observation here — that is why this is a verdict)
 ```
 
-Verified both ways: **WORKING** against a live 600-word generation (`STAT=S`, %CPU 0.1 → 8.7); the
-**WEDGED** shape came from the incident itself — `STAT=U`, 0.2 % CPU, 9 minutes, killed before
-OCP's 600 s timer would have fired.
+**Why not `%CPU`.** It was the criterion until an independent review measured it wrong on both
+platforms. On macOS `%CPU` is a **decaying average** — measured `2.1 → 0.0` with zero CPU consumed
+in between — so a process that wedged two seconds ago shows a *falling* number, and "it varied" read
+that decay as work. Measured directly against this script: a process that burned CPU and then
+blocked forever on a fifo gave `%CPU 61.1 → 1.3 → 0.0` while its CPU time stayed flat at `7.51s`;
+the old predicate answers **WORKING**, the current one answers **inconclusive**. On Linux the same
+column is an average *since process start*, so a child that burned CPU at startup and then wedged
+shows a **constant non-zero** value indefinitely. Accumulated CPU time is monotonic and has neither
+failure.
 
-Two things it is built to avoid, both of which produce a confident wrong answer:
+**Platform.** Uninterruptible sleep is `STAT=U` on macOS/BSD and `D` on Linux. An earlier version
+hardcoded `U` and told the reader to hand-edit for Linux, which made the `WEDGED` verdict **dead
+code on Linux** — the platform OCP is normally deployed on — while `docs/troubleshooting.md` printed
+the command with no platform note at all. The character now comes from `uname`, and an unrecognised
+platform **exits 3** rather than probing with a letter that can never match.
 
-- **One sample is not enough — for a turn that is WAITING.** A working turn spends most of its wall
-  clock waiting on the upstream, and a single reading of *that* is indistinguishable from a wedged
-  one. Variance across samples is what separates them, which is why the script takes several and
-  prints them all rather than a verdict from one.
+**Floor.** Linux `ps -o time=` has 1-second resolution (macOS reports hundredths), so a process using
+less than roughly a second of CPU across the whole window lands in *inconclusive*, never *WORKING*.
 
-  It is **not** the only signal, and an earlier version of this page said it was: a turn actually
-  *computing* is distinguishable from **one** sample, because its `%CPU` is simply high. The
-  predicate is therefore `varied OR peak >= 2`, not `varied` alone — measured, a strict
-  variance-only rule reported a process pegged at **83.2 %** as `inconclusive — %CPU never moved`,
-  because at `N=1` the low and the high are the same number and `samples` is this script's first
-  positional argument.
+
+Verified in both directions against constructed processes, not read:
+
+| process | observed | verdict |
+|---|---|---|
+| busy loop | `cpu_time 0.73 → 4.73s`, `%CPU 91.9–100.0` | **WORKING** |
+| blocked forever on a fifo, settled | `cpu_time 0.00s` flat, `%CPU 0.0` | inconclusive |
+| burned CPU, then blocked forever, probed inside the decay window | `cpu_time 7.51s` flat, `%CPU 61.1 → 1.3 → 0.0` | inconclusive — the old predicate answered **WORKING** here |
+| `N=1` | one sample | inconclusive, and says why: growth needs two |
+| unrecognised `uname` | — | refuses, exit 3 |
+
+The **WEDGED** shape itself came from the incident rather than from a fixture — `STAT=U`, 0.2 % CPU,
+9 minutes, killed before OCP's 600 s timer would have fired. A real uninterruptible-sleep process
+cannot be constructed on demand, so that branch's *reachability* now rests on the `STAT` character
+being right for the platform, which **is** tested, rather than on the branch having been exercised.
+Said plainly rather than left for a reader to assume the table covers all four.
+
+Three things it is built to avoid, all of which produce a confident wrong answer:
+
+- **One sample cannot show growth at all**, so `N=1` is refused rather than answered. `samples` is
+  this script's first positional argument, so `./wedged-or-working.sh 1` is one keystroke away — and
+  an earlier version answered it with a verdict derived from `lo == hi`, which reported a process
+  pegged at **83.2 %** as `inconclusive — %CPU never moved`.
+- **`%CPU` moving is not evidence of work**, and `%CPU` standing still is not evidence of its
+  absence. See "Why not `%CPU`" above; both directions are measured.
 - **Duration is not the criterion.** A legitimate tool-using turn measured **248 s**; the wedged one
   ran 9 min. Long is not wedged.
 
-It also has a third verdict — `inconclusive`, when `U` is seen but CPU peaked — rather than forcing
-every reading into one of two buckets.
-
-Portability notes are in the script header: Linux `STAT` is `D` not `U`, and Linux `ps %CPU` is an
-average since process start rather than an instantaneous sample — use `top -b -n1 -p <pid>` there.
+The third verdict, `inconclusive`, is a real answer rather than a failure to reach one: a turn
+waiting on the upstream API and a turn blocked forever produce the *same* observation, and forcing
+that into one of two buckets is how the earlier version got it wrong.
 
 ## The third criterion, which is not a script
 

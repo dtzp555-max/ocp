@@ -89,9 +89,20 @@ node scripts/probes/tools-dropped.mjs      # exit 1 ⇒ prose came back where to
 tool-using turn measured 248 s here:
 
 ```bash
-scripts/probes/wedged-or-working.sh   # U + flat low CPU ⇒ wedged; varying or busy ⇒ working;
-                                      # flat near-zero without U ⇒ inconclusive (both shapes look like this)
+scripts/probes/wedged-or-working.sh   # consumed CPU during the window        ⇒ working
+                                      # consumed none, in uninterruptible sleep ⇒ wedged
+                                      # consumed none, ordinary sleep           ⇒ inconclusive
 ```
+
+The criterion is **accumulated CPU time**, not `%CPU`. `%CPU` is a decaying average on macOS and an
+average since process start on Linux, so on both platforms it can move — or refuse to move — for
+reasons that have nothing to do with whether the process is doing anything. The script picks the
+uninterruptible-sleep `STAT` character from `uname` (`U` on macOS/BSD, `D` on Linux) and **refuses on
+a platform it does not know** rather than probing with a letter that can never match.
+
+Its floor, stated so a green answer is not read as more than it is: Linux `ps -o time=` has
+1-second resolution, so a process using less than about a second of CPU across the whole sampling
+window is reported *inconclusive*, never *working*.
 
 **Neither instrument is sufficient alone**, and the one that actually separates *"the client's agent
 loop ran"* from *"OCP's inner CLI did the work and narrated it"* is a third one that is not a
