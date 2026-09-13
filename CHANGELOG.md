@@ -2,6 +2,32 @@
 
 ## Unreleased
 
+## v3.34.0 — 2026-09-14
+
+> **Governance audit for this section**, per `CLAUDE.md`'s `release_kit.governance_audits`.
+> **Two B.2 key paths added this cycle, both on `/health`, both authorized:**
+>
+> | key path (both profiles) | PR | ADR 0012 condition-5 marker |
+> |---|---|---|
+> | `stats.toolRequestsDropped` | #468 | present — "additive under ADR 0012", field named |
+> | `stats.toolCallsEmitted` | #476 | present — "additive under ADR 0012", field named |
+>
+> From the **wire**: `node scripts/b2-key-snapshot.mjs` prints *"B.2 response key sets match the
+> snapshot (2 profiles)"* and exits 0, so the checked-in record equals what a real `server.mjs`
+> returns. From **git**: `git diff v3.33.0..HEAD -- docs/governance/b2-response-keys.json` →
+> **4 added lines, 0 removed** — the two paths above, once per profile block; both additions are
+> INSIDE existing blocks, which is the shape that means new surface (a whole new block would mean
+> new coverage). **Control for the command:** `git diff dd90be3^..HEAD -- <same path>` → 10 lines,
+> 5 of them removals (it spans ADR 0016's deletion) — the same command form with the left endpoint
+> moved gives a different answer, so the command discriminates. (`v3.32.0..HEAD` was tried first
+> and also gave 4, i.e. no discriminating power; recorded rather than replaced, per the v3.33.0
+> audit's own note.)
+> **Cumulative ADR 0012 count: 2 → 4** (`instanceName` and `auth.consecutiveInconclusive` from
+> v3.29.0, plus the two above), derived from the snapshot's git history. The secondary marker grep
+> (`grep -inE 'additive under \[?ADR[^0-9]{0,10}0012' CHANGELOG.md`) hits both new entries and
+> nothing else this cycle once its two meta-text hits from older sections are subtracted by
+> inspection.
+
 ### Added
 
 - **OpenAI tool calling — an agent pointed at OCP now gets `tool_calls` back (#467, ADR 0022).** The implementation ADR 0021 reserved. A request that declares `tools` is served by its own path: the spawn is given the client's tools through an MCP bridge (`lib/mcp-bridge.mjs`, launched by `claude` from an `--mcp-config` OCP writes), holds **exactly** those tools (`--tools ""` empties the built-ins the way `AUTH_MODE=multi` already does; `--strict-mcp-config` keeps account connectors out), and when the model emits a `tool_use` for one of them OCP ends the spawn and answers with `choices[0].message.tool_calls` — `arguments` as a JSON **string**, per spec — and `finish_reason: "tool_calls"`. The client runs the tool and sends the whole history back with its `tool` message; OCP renders that history as text into the next spawn's prompt, and the model answers or calls again.
