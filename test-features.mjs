@@ -29673,6 +29673,13 @@ ltTest("ADR 0020: an unparseable OCP_ALLOWED_HOSTS entry is REPORTED at boot, no
     { CLAUDE_BIN: fake, OCP_ALLOWED_HOSTS: "good.example.com, bad host!, evil.com/path, tls.example.com:443" }, dir);
   try {
     assert.ok(await ltWait(() => buf.out.includes("listening on") || buf.exit != null), `server did not start: ${buf.err.slice(0, 200)}`);
+    // WAIT FOR THE THING BEING ASSERTED, not for a proxy for it. The warning goes to STDERR; the
+    // `listening on` line above goes to STDOUT. They are two pipes, and under load the parent can
+    // see the second before the first even though the child wrote them in the opposite order.
+    // Measured 2026-09-13: red in 2/2 full runs on this branch AND in a full run of origin/main on
+    // the same host (7 loop stalls each), green 1/1 in isolation every time -- the #199 shape.
+    assert.ok(await ltWait(() => /OCP_ALLOWED_HOSTS — ignored/.test(buf.out + buf.err), 5000),
+      `the boot warning never arrived on either pipe — ${ltDiag(buf)}`);
     const all = buf.out + buf.err;
     assert.match(all, /OCP_ALLOWED_HOSTS — ignored 2 unparseable entries/,
       `both bad entries must be counted in the boot warning; got: ${all.slice(-600)}`);
