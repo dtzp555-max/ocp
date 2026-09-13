@@ -45,9 +45,10 @@ before this design was chosen.
 | Does the whole loop work through OCP with a real model? | two-turn round trip, a fresh random nonce as the tool result | Turn 1 `finish_reason: tool_calls`, `arguments` a parseable JSON string; turn 2 `finish_reason: stop`, no re-call, the nonce in the answer. `/health`: `toolCallsEmitted 1`, `errors 0` |
 | Does the #469 probe pass? | `scripts/probes/tools-dropped.mjs` | Exit **0** against this branch; exit 1 against 3.32.0 the same hour |
 
-One cost was measured and is accepted rather than fixed here: MCP tools are *deferred* in the CLI's
-schema, so the first call in a turn is preceded by a `ToolSearch` turn that resolves the name. One
-extra model round-trip per tool turn.
+One cost was observed on 2.1.260 and had already gone by 2.1.270: there, MCP tools were *deferred*
+in the CLI's schema and the first call in a turn was preceded by a `ToolSearch` round-trip. The
+reviewer measured 2.1.270 listing the bridged tool directly and calling it first. A per-version
+observation, recorded as one; nothing in this design depends on it either way.
 
 ---
 
@@ -72,8 +73,14 @@ placeholder was measured to cost an extra narrating turn and to race the kill. N
 exactly one mechanism that concludes a tool turn, with `CLAUDE_TIMEOUT` as the backstop.
 
 **4. The response is what the specification says.** `choices[0].message.tool_calls[]` with
-`function.arguments` as a JSON **string**, `finish_reason: "tool_calls"`, and any text the model
-wrote alongside as `content`. Streaming delivers each call whole in one delta chunk keyed by
+`function.arguments` as a JSON **string**, `finish_reason: "tool_calls"`, and — when it arrives in the
+same `assistant` event as the call — the text the model wrote alongside, as `content`. **Known gap,
+measured by the reviewer on 2.1.270:** the CLI emits one `assistant` event per content block, so a
+text preamble arrives in an earlier event (and is delivered as `content: null` here), and a second
+*parallel* call arrives in a later event that the spawn has already been ended before. The client
+gets one call; the model re-issues the rest next turn, so it converges at one extra round trip per
+dropped call. Closing it needs a message-end signal (`--include-partial-messages` and
+`message_delta.stop_reason`), which is a follow-up. Streaming delivers each call whole in one delta chunk keyed by
 `index`, which is a valid instance of the spec's chunked form. The `tool_call_id` the client echoes
 back is the CLI's own `tool_use.id` where it gave one.
 
@@ -107,14 +114,15 @@ lane, which composes its own prompt and has no bridge.
   exists for the one that is not ready.
 - **ADR 0013's Alternatives section is now fully discharged.** "Refuse whenever `tools` is present"
   was rejected because it would take down the fleet; this ADR neither refuses nor drops.
-- **The `ToolSearch` round-trip is a known cost**, not a defect: one extra model turn per tool turn,
-  paid on the Anthropic side. If the CLI ever stops deferring MCP tools, it disappears with no change
-  here.
+- **The `ToolSearch` round-trip seen on 2.1.260 is gone on 2.1.270** — measured by the reviewer, not
+  assumed. Nothing here depended on it.
 - **#474 applies to a tool turn exactly as to any other.** A spawn that is ended on the event is
   ended by the same SIGTERM/SIGKILL pair the timeout uses; if a descendant holds the stdout pipe,
-  the same hang follows. Measured not to happen with the bridge (its stdio goes to `claude`, not
-  to OCP; the real-model round trip completed in 8 s), but a client tool that made the *model*
-  spawn something would not be reachable here anyway — the model holds no such tool.
+  the same hang follows. Measured not to happen with the bridge, by the discriminating instrument rather than by the
+  round trip's duration (an 8 s completion cannot tell a held pipe from none): `lsof -d 0,1,2` on
+  the bridge during a live turn shows all three of its fds distinct from `claude`'s stdout/stderr,
+  and `close` followed SIGTERM by ~590 ms both directly and through OCP. A client tool that made the
+  *model* spawn something would not be reachable here anyway — the model holds no such tool.
 - **What this does not make true:** that the model will always choose a tool when it should, or
   choose the right one. That is the model's behaviour and OpenAI's own clients face the same. What
   is now true is that when it does, the client is told.

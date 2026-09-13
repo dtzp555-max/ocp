@@ -6120,7 +6120,10 @@ ltTest("integration (ADR 0022): a declared tool the model chooses comes back as 
     const { child, buf, port } = await ltBootFresh({ CLAUDE_BIN: fake, CLAUDE_TIMEOUT: "20000", ARGV_CAPTURE: argvFile, TOOLS_CAPTURE: toolsFile, STDIN_CAPTURE: stdinFile, TOOL_USE_NAME: "lookup_build_id" }, dir);
     try {
       assert.ok(await ltWait(() => buf.out.includes("listening on")), `— ${ltDiag(buf)}`);
-      assert.ok(buf.out.includes("Tool calling: ON"), `banner must say the bridge is on — ${ltDiag(buf)}`);
+      // The banner is printed AFTER `listening on` in the same listen() callback, so the first stdout
+      // chunk can legally end before it: waiting for `listening on` and then asserting this line is
+      // the #199 shape. Measured by the PR's reviewer on the unwaited version: 5 red in 8 runs.
+      assert.ok(await ltWait(() => buf.out.includes("Tool calling: ON")), `banner must say the bridge is on — ${ltDiag(buf)}`);
       const TOOL = { type: "function", function: { name: "lookup_build_id", description: "d", parameters: { type: "object", properties: { project: { type: "string" } } } } };
       const t0 = Date.now();
       const r = await ltPostStatus(port, { model: "sonnet", tools: [TOOL], tool_choice: "auto", messages: [{ role: "user", content: "build id for alpha?" }] });
@@ -6231,6 +6234,52 @@ ltTest("integration (ADR 0022): with stream:true the tool_calls arrive as one in
   } finally { _ltRmRetry(dir); }
 });
 
+ltTest("integration (ADR 0022): image content anywhere routes to the plain path, counted with reason image_content", async () => {
+  if (!LT_POSIX) return;
+  const dir = ltMkdir(); const fake = ltFake(dir);
+  const argvFile = join(dir, "argv.txt");
+  try {
+    const { child, buf, port } = await ltBootFresh({ CLAUDE_BIN: fake, ARGV_CAPTURE: argvFile }, dir);
+    try {
+      assert.ok(await ltWait(() => buf.out.includes("listening on")), `— ${ltDiag(buf)}`);
+      const TOOL = { type: "function", function: { name: "lookup_build_id", parameters: { type: "object" } } };
+      const PNG = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNkYAAAAAYAAjCB0C8AAAAASUVORK5CYII=";
+      const r = await ltPostStatus(port, { model: "sonnet", tools: [TOOL], messages: [
+        { role: "user", content: [{ type: "text", text: "what is this?" }, { type: "image_url", image_url: { url: PNG } }] },
+      ] });
+      assert.equal(r.status, 200, `${r.status} ${r.text.slice(0, 200)}`);
+      const body = JSON.parse(r.text);
+      assert.equal(body.choices[0].message.tool_calls, undefined, "an image request must not be bridged (the multimodal path does not render tool turns)");
+      const argv = ltArgvCalls(argvFile);
+      assert.ok(argv.length > 0, "no argv captured");
+      assert.ok(!argv.includes("--mcp-config"), `no bridge on the image path: ${JSON.stringify(argv.slice(-8))}`);
+      assert.ok(await ltWait(() => /"reason":"image_content"/.test(buf.err)), `the drop must say WHY — ${buf.err.slice(-400)}`);
+    } finally { child.kill("SIGKILL"); await ltDrain(() => buf.closed, "tool-image", 5000); }
+  } finally { _ltRmRetry(dir); }
+});
+
+ltTest("integration (ADR 0022): tool_choice \"none\" is the plain path and is NOT counted as a drop", async () => {
+  if (!LT_POSIX) return;
+  const dir = ltMkdir(); const fake = ltFake(dir);
+  const argvFile = join(dir, "argv.txt");
+  try {
+    const { child, buf, port } = await ltBootFresh({ CLAUDE_BIN: fake, ARGV_CAPTURE: argvFile }, dir);
+    try {
+      assert.ok(await ltWait(() => buf.out.includes("listening on")), `— ${ltDiag(buf)}`);
+      const TOOL = { type: "function", function: { name: "lookup_build_id", parameters: { type: "object" } } };
+      const r = await ltPostStatus(port, { model: "sonnet", tools: [TOOL], tool_choice: "none", messages: [{ role: "user", content: "hi" }] });
+      assert.equal(r.status, 200, `${r.status} ${r.text.slice(0, 200)}`);
+      assert.equal(JSON.parse(r.text).choices[0].message.tool_calls, undefined);
+      const argv = ltArgvCalls(argvFile);
+      assert.ok(argv.length > 0, "no argv captured");
+      assert.ok(!argv.includes("--mcp-config"), `tool_choice none must not bridge: ${JSON.stringify(argv.slice(-8))}`);
+      const h = await fetch(`http://127.0.0.1:${port}/health`).then(x => x.json());
+      assert.equal(h.stats.toolRequestsDropped, 0, "text is the spec-mandated outcome for \"none\"; it is not a drop");
+      assert.equal(h.stats.toolCallsEmitted, 0);
+    } finally { child.kill("SIGKILL"); await ltDrain(() => buf.closed, "tool-none", 5000); }
+  } finally { _ltRmRetry(dir); }
+});
+
 ltTest("integration (ADR 0022): OCP_TOOL_CALLING=0 restores the dropped-and-counted path, with the reason logged", async () => {
   if (!LT_POSIX) return;
   const dir = ltMkdir(); const fake = ltFake(dir);
@@ -6239,7 +6288,7 @@ ltTest("integration (ADR 0022): OCP_TOOL_CALLING=0 restores the dropped-and-coun
     const { child, buf, port } = await ltBootFresh({ CLAUDE_BIN: fake, OCP_TOOL_CALLING: "0", ARGV_CAPTURE: argvFile }, dir);
     try {
       assert.ok(await ltWait(() => buf.out.includes("listening on")), `— ${ltDiag(buf)}`);
-      assert.ok(buf.out.includes("Tool calling: OFF (OCP_TOOL_CALLING=0)"), `banner — ${ltDiag(buf)}`);
+      assert.ok(await ltWait(() => buf.out.includes("Tool calling: OFF (OCP_TOOL_CALLING=0)")), `banner — ${ltDiag(buf)}`);  // same #199 shape as above
       const TOOL = { type: "function", function: { name: "lookup_build_id", parameters: { type: "object" } } };
       const r = await ltPostStatus(port, { model: "sonnet", tools: [TOOL], messages: [{ role: "user", content: "hi" }] });
       assert.equal(r.status, 200, `${r.status} ${r.text.slice(0, 200)}`);

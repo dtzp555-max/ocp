@@ -4253,8 +4253,21 @@ async function handleChatCompletions(req, res) {
   // Everything the old path did before the spawn -- auth, model validation, message validation,
   // image and quota gates, and classifyToolRequest's refusal of forcing tool_choice shapes -- has
   // already run above this line and applies here unchanged.
+  //   * no image content anywhere in the conversation. The multimodal spawn path serialises the
+  //     history through buildStreamJsonInput, which does not render tool turns -- so on turn 2 of a
+  //     vision agent the model would see the bridge but not its own prior call or the client's
+  //     result, and re-call the tool forever. MEASURED by the PR's independent reviewer with a real
+  //     model (haiku, claude 2.1.270): turn 2 given a fresh nonce re-called with identical arguments,
+  //     nonce absent; the text-only control passed. Excluded here rather than left as a loop, and
+  //     counted as dropped with reason `image_content`. Rendering tool turns on the multimodal path
+  //     is the real fix and is a follow-up, not this PR.
+  //   * `tool_choice` is not "none". The spec says "none" means the model will not call any tool
+  //     and generates a message -- OCP satisfies that on the plain path, exactly as before, and does
+  //     not count it as a drop because text IS the mandated outcome.
+  const toolChoiceNone = parsed.tool_choice === "none";
   const useToolCalling = declaredTools > 0 && TOOL_CALLING && !TUI_MODE
-    && Array.isArray(parsed.tools) && parsed.tools.length > 0 && !detectStructuredOutput(parsed);
+    && Array.isArray(parsed.tools) && parsed.tools.length > 0 && !detectStructuredOutput(parsed)
+    && !hasImageContent(messages) && !toolChoiceNone;
   if (useToolCalling) {
     const bad = validateTools(parsed.tools);
     if (bad) {
@@ -4263,7 +4276,7 @@ async function handleChatCompletions(req, res) {
     return handleToolTurn(req, res, model, messages, conversationId, parsed, stream);
   }
 
-  if (declaredTools > 0) {
+  if (declaredTools > 0 && !toolChoiceNone) {
     stats.toolRequestsDropped++;
     logEvent("warn", "openai_tools_dropped", {
       model,
@@ -4277,7 +4290,10 @@ async function handleChatCompletions(req, res) {
       // Which gate kept this request off the tool path. One of: OCP_TOOL_CALLING=0, TUI lane,
       // `functions` shape, or response_format present. Stated so an operator reading a non-zero
       // toolRequestsDropped after ADR 0022 does not have to guess which.
-      reason: !TOOL_CALLING ? "OCP_TOOL_CALLING=0" : TUI_MODE ? "tui_lane" : !(Array.isArray(parsed.tools) && parsed.tools.length) ? "legacy_functions_shape" : "response_format_present",
+      reason: !TOOL_CALLING ? "OCP_TOOL_CALLING=0" : TUI_MODE ? "tui_lane"
+        : !(Array.isArray(parsed.tools) && parsed.tools.length) ? "legacy_functions_shape"
+        : detectStructuredOutput(parsed) ? "response_format_present"
+        : hasImageContent(messages) ? "image_content" : "unknown",
       note: "declared tools were not bridged; answered as text",
     });
   }
