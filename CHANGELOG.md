@@ -2,6 +2,37 @@
 
 ## Unreleased
 
+
+## v3.35.0 — 2026-09-14
+
+> **Governance audit for this section**, per `CLAUDE.md`'s `release_kit.governance_audits`.
+> **One B.2 key path added this cycle, authorized:**
+>
+> | key path (both profiles) | PR | ADR 0012 condition-5 marker |
+> |---|---|---|
+> | `stats.upstreamRateLimits` | #481 | present — "additive under [ADR 0012](…)", field named |
+>
+> **#484 also ships in this release and adds no key path**, which is why it has no row: it changes
+> only the classifier behind an existing field. Recorded rather than left silent, so a reader
+> comparing the entries below against this table does not go looking for a missing row.
+>
+> **Both commands below were run on the tree this section ships — the `v3.35.0` tag — and neither
+> `scripts/b2-key-snapshot.mjs` nor `docs/governance/b2-response-keys.json` appears in this
+> commit's diff** — they landed in #481 and are unchanged here, so a reviewer reading only this
+> diff cannot re-derive the claims and needs the tree named. Check them against that SHA.
+>
+> From the **wire**: `node scripts/b2-key-snapshot.mjs` prints *"B.2 response key sets match the
+> snapshot (2 profiles)"* and exits 0. From **git**:
+> `git diff v3.34.0..HEAD -- docs/governance/b2-response-keys.json` → **2 added lines, 0 removed** —
+> one path, once per profile block, both **INSIDE existing blocks**, which is the shape that means
+> new surface rather than new coverage. **Control for the command:** the same command with the left
+> endpoint moved to `dd90be3^` gives **7 added / 5 removed**, a different answer, so the command
+> discriminates rather than always printing the same thing.
+> **Cumulative ADR 0012 count: 4 → 5** (`instanceName`, `auth.consecutiveInconclusive`,
+> `stats.toolRequestsDropped`, `stats.toolCallsEmitted`, plus this one), derived from the snapshot's
+> git history. The secondary marker grep hits this entry and the older ones, with no unmatched
+> addition this cycle.
+
 ### Fixed
 
 - **A Node stack trace whose line number is `429` no longer classifies as a rate limit.** Found by an independent review of the release, on code that had already been through two rounds on this exact regex — and the third round is what showed that the first two had been fixing the wrong thing. Both earlier fixes adjusted the **delimiters** around `429` while keeping the premise that a delimited `429` means an HTTP status:

@@ -221,6 +221,23 @@ The canonical list lives in [`models.json`](./models.json) — the single source
 | `/cache/stats` | GET | Cache statistics (admin only) |
 | `/cache` | DELETE | Clear response cache (admin only) |
 
+### A `429` from `/v1/chat/completions` has two causes
+
+Since 3.35.0 the proxy returns `429 { "error": { "type": "rate_limit_error" } }` for **two different things**. They are genuinely the same kind of answer — *slow down* — which is why they share a shape, and **an ordinary 429 handler that backs off and honours `Retry-After` is correct for both.** What differs is how long the wait is and whether waiting in this process can ever end it:
+
+| cause | what it means | `/health` counter | `Retry-After` | can backing off clear it? |
+|---|---|---|---|---|
+| OCP is full | more requests are in flight and queued than `CLAUDE_MAX_CONCURRENT` + `CLAUDE_MAX_QUEUE` allow | `stats.queueRejections` | **always** present, and short — seconds | yes |
+| the **upstream** wall | the Anthropic subscription or rate limit the spawned `claude` hit | `stats.upstreamRateLimits` | only when the upstream text said when | **not within this process** — it clears on the upstream's schedule, which can be hours |
+
+So a client that only implements *back off and retry* is safe, not wrong. A client that can do better reads `Retry-After` when it is there and the message when it is not: `usage limit` / `rate limit` text means the second row, and a client with somewhere else to go should go there rather than spend its retry budget on a wall that cannot move.
+
+**Choosing where to go is the client's job, not OCP's.** The proxy reports the condition accurately and stops there; it does not retry against another upstream, switch providers, or hold a queue on your behalf. If you want failover, configure it in the agent framework or SDK that calls OCP.
+
+The two counters are what an **operator** reads to tell "we hit the wall" from "the proxy is saturated" — a distinction `stats.errors` never made. Before 3.35.0 the second row was a `500 proxy_error`, which told every client the proxy had broken.
+
+**Streaming is the exception, and it is structural.** With `stream: true` the SSE headers go out *before* the spawn produces anything (so the heartbeat can cover the silent window), and a status cannot be un-sent. An upstream wall on that path therefore arrives as an SSE error frame with `200`, not a `429` — it is still counted in `stats.upstreamRateLimits` and logged with `"lane":"streaming"`, so the operator view is complete even though the status is not. See [#482](https://github.com/dtzp555-max/ocp/issues/482).
+
 ## Environment Variables
 
 | Variable | Default | Description |
