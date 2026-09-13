@@ -6064,13 +6064,20 @@ test("upstream rate limit: quota/rate NOUNS match, transient advice alone does N
     "quota exceeded for this organization",
     "RESOURCE_EXHAUSTED",
     "insufficient_quota",
-    // A BARE 429 in the shapes it really arrives in. These are here as the positive half of the
-    // number-fragment rows below: a narrowing that killed the false positives by also killing
-    // these would be a silent loss, and only a positive row can tell the two apart.
+    // A 429 IN A STATUS CONTEXT. These are the positive half of the number rows below: a
+    // narrowing that killed the false positives by also killing these would be a silent loss, and
+    // only a positive row can tell the two apart.
     "status: 429",
     "HTTP 429: slow down",
-    "(429)",
-    "upstream returned 429.",           // a trailing period is punctuation, not a decimal
+    "API Error: 429",
+    '{"code":429}',
+    // An incidental filesystem note must not overrule an EXPLICIT status. Its control is the
+    // EDQUOT negative row below: the veto still fires when a QUOTA PHRASE is all there is.
+    "HTTP 429; disk quota exceeded",
+    // Via the PHRASE, not the status regex -- "429 Too Many Requests" has nothing before the
+    // number saying it is a status. Asserted from the outside so the division of labour between
+    // the phrase list and the regex cannot silently invert.
+    "429 Too Many Requests",
   ]) assert.equal(isUpstreamRateLimit(m), true, `should be a rate limit: ${m}`);
 
   // Negative: ordinary failures, INCLUDING ones carrying retry advice. This is the row that keeps
@@ -6091,6 +6098,39 @@ test("upstream rate limit: quota/rate NOUNS match, transient advice alone does N
     "processed 1,429 tokens",               // thousands separator
     "completed in 429.5 seconds",           // 429 on the LEFT of the point
     "node v4.429 crashed",                  // version-shaped
+    // A BARE 429 WITH NOTHING SAYING IT IS A STATUS. The first of these is the one that matters:
+    // a stack trace is what an ORDINARY PROXY CRASH looks like, so a delimiter-based guard reported
+    // "we hit the wall" on exactly the failure the counter exists to tell apart FROM the wall.
+    "Error: socket hang up\n    at handler (/srv/ocp/server.mjs:429:15)",
+    "TypeError: x is not a function\n    at foo (/srv/code/bar.mjs:429:7)",
+    "processed 429 tokens",
+    "pid=429",
+    '{"elapsedMs":429}',
+    // GIVEN UP DELIBERATELY to reach the row above: neither carries anything saying "status", and
+    // admitting them means admitting the stack trace. Both fail CLOSED (500). A real upstream 429
+    // almost always prints a body carrying rate_limit_error or Too Many Requests, which the PHRASE
+    // list matches without this regex being involved.
+    "(429)",
+    "upstream returned 429.",
+    // THE SAME STACK-TRACE CLASS, ONE KEYWORD FURTHER IN. `node:internal/errors` is in essentially
+    // every Node error trace, and `:429:15` is a line and a column -- so `:` had to join the
+    // digit-continuation set alongside `.` and `,`. Found by review AFTER the fix that was supposed
+    // to have killed this class, which is why the row names the module rather than the shape.
+    "Error: boom\n    at new NodeError (node:internal/errors:429:15)",
+    "TypeError: x\n    at handler (/srv/code:429:1)",
+    // A keyword ABUTTING the number is a token, not a status and its value.
+    "code429",
+    "status429",
+    "errors429",
+    // A DOCUMENTED GAP, pinned so it stays visible rather than becoming accidental: the keyword
+    // must be standalone, so camelCase compounds miss. Left open deliberately -- every observed
+    // upstream string carries a phrase the pattern list already matches, so this costs nothing on
+    // known traffic and fails CLOSED, while widening to allow a prefix would admit every word
+    // ENDING in a keyword (`stderr: 429 bytes`). If a vendor is ever OBSERVED emitting one of
+    // these bare, move it to the positive list and say what was observed.
+    "APIError: 429",
+    '{"errorCode":429}',
+    '{"httpStatus":429}',
     "",
     // EACH OF THE FOUR BELOW WAS MEASURED RETURNING 429 FROM A LIVE SERVER before an independent
     // review of this PR, and each is an ordinary failure, not a wall. They are the reason the
@@ -6105,6 +6145,12 @@ test("upstream rate limit: quota/rate NOUNS match, transient advice alone does N
     // few-second blip.
     "overloaded_error",
   ]) assert.equal(isUpstreamRateLimit(m), false, `should NOT be a rate limit: ${m}`);
+
+  // THE FILESYSTEM VETO IS SCOPED, and these two rows are each other's control. Run first and
+  // unconditionally, it suppressed a genuine wall that merely mentioned a disk quota.
+  assert.equal(isUpstreamRateLimit("EDQUOT: disk quota exceeded, write"), false);
+  assert.equal(isUpstreamRateLimit("rate_limit_error: request rejected (EDQUOT on journal)"), true);
+  assert.equal(isUpstreamRateLimit("usage limit reached; disk quota exceeded"), true);
 
   assert.equal(isUpstreamRateLimit(null), false);
   assert.equal(isUpstreamRateLimit(undefined), false);
@@ -6132,6 +6178,9 @@ test("upstream rate limit: Retry-After is read from the message or omitted, neve
   // A reset already in the past, or absurdly far out, is not usable either.
   assert.equal(retryAfterSeconds(`resets_at: ${Math.floor(now / 1000) - 60}`, now), null);
   assert.equal(retryAfterSeconds(`resets_at: ${Math.floor(now / 1000) + 200000}`, now), null);
+  // An UNUSABLE epoch must not veto a usable relative reset in the same message. It used to return
+  // null here, shipping a 429 with no Retry-After while the message said when.
+  assert.equal(retryAfterSeconds(`resets_at: ${Math.floor(now / 1000) - 9999}; try again in 10 minutes`, now), 600);
 });
 
 // The whole point, end to end: a real server.mjs, a spawn that fails with a wall message, and the
