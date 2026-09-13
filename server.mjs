@@ -48,6 +48,7 @@ import { StructuredOutputError, detectStructuredOutput, validateJsonSchemaSafe, 
 import { isLoopbackBind } from "./lib/net.mjs";
 import { parseAllowedHosts, parseAuthority, matchesDeclared, evaluateOriginGate } from "./lib/host-gate.mjs";
 import { classifyToolRequest, countDeclaredTools } from "./lib/tool-support.mjs";
+import { isUpstreamRateLimit, retryAfterSeconds } from "./lib/upstream-errors.mjs";
 import { validateTools, extractBridgeToolUses, extractAssistantText, toolUsesToOpenAI, renderToolTurn,
          endsWithToolResult, TOOL_CONTINUATION_NOTE, TOOL_PREFIX, buildBridgeConfig } from "./lib/tool-calling.mjs";
 import { runTuiTurn, reapStaleTuiSessions, resolveTuiHome, bootTuiPane, tuiPaneHealthy, poolPaneName, killLiveTurnPanes, POOL_BOOT_MS } from "./lib/tui/session.mjs";
@@ -1118,6 +1119,10 @@ const stats = {
   // client's tools -- i.e. answered with `tool_calls`. The companion of toolRequestsDropped: with
   // OCP_TOOL_CALLING on, a request that declares tools lands in exactly one of the two.
   toolCallsEmitted: 0,
+  // ADR 0012 additive: upstream rate limits reported as 429 rather than 500. An operator asking
+  // "did we hit the wall, or is the proxy broken?" reads this instead of grepping the log; it is
+  // the counter that separates the two, which `errors` alone never did.
+  upstreamRateLimits: 0,
   activeRequests: 0,
   errors: 0,
   timeouts: 0,
@@ -2796,6 +2801,12 @@ async function callClaudeStreaming(model, messages, conversationId, res, authInf
   // If errored===true the close handler must not cache the response or record success
   // (mirrors callClaude which rejects and never caches on is_error).
   let errored = false;
+  // ONE request must move the counter by at most one. Both streaming error arms can fire for a
+  // single failure -- the is_error arm sets `errored`, which is exactly what makes the close
+  // handler take its error branch too -- so a wall that appears in the result event AND on stderr
+  // would otherwise be counted twice, and a counter that over-reports is no more usable than one
+  // that reads zero.
+  let rateLimitCounted = false;
 
   function ensureHeaders() {
     if (res.writableEnded || res.destroyed) return false;
@@ -2878,6 +2889,18 @@ async function callClaudeStreaming(model, messages, conversationId, res, authInf
         const errStr = String(parsed.error);
         logEvent("error", "claude_result_error", { model: cliModel, error: errStr.slice(0, 200) });
         countError(errStr.slice(0, 200));
+        // Classified and COUNTED here even though the status is already 200 -- see
+        // noteUpstreamRateLimit for why this lane cannot answer 429 and why counting it anyway is
+        // the point. The frame's `type` is deliberately left as it was; changing it is a separate
+        // question with its own issue, and it was MEASURED to buy the motivating consumer nothing
+        // (an agent framework fails over on this frame today, whatever the type says).
+        if (!rateLimitCounted) rateLimitCounted = noteUpstreamRateLimit(errStr, "streaming").rateLimit;
+        // UNREACHABLE ON THIS PATH, and a review had to ask, so: `ensureHeaders()` ran
+        // unconditionally above and returns false ONLY when the response is already ended or
+        // destroyed -- flags that do not un-set. So `!headersSent` implies ended-or-destroyed,
+        // which makes the rest of this condition false. Kept as the defensive shape the other
+        // handlers use; if it ever does become reachable it should classify like the buffered lane
+        // rather than hard-code 500, or the counter and the wire would disagree.
         if (!headersSent && !res.writableEnded && !res.destroyed) {
           jsonResponse(res, 500, { error: { message: sanitizeError(errStr), type: "provider_error" } });
         } else if (!res.writableEnded && !res.destroyed) {
@@ -2911,6 +2934,7 @@ async function callClaudeStreaming(model, messages, conversationId, res, authInf
       try { recordUsage({ keyId: authInfo.keyId, keyName: authInfo.keyName, model, promptChars: messages.reduce((a, m) => a + contentToText(m.content).length, 0), responseChars: 0, elapsedMs: elapsed, success: false }); } catch (e) { logEvent("error", "usage_record_failed", { error: e.message }); }
       logEvent("error", "claude_exit", { model: cliModel, code, signal: signal || "none", elapsed, errored, stderr: stderr.slice(0, 300) });
       countError(stderr.slice(0, 300) || `claude exit ${code}`);
+      if (!rateLimitCounted) rateLimitCounted = noteUpstreamRateLimit(stderr.slice(0, 300) || `claude exit ${code}`, "streaming").rateLimit;
       handleSessionFailure();
 
       // If the error was already sent inline (parsed.error branch above), the
@@ -3211,11 +3235,53 @@ function jsonResponse(res, status, data, extraHeaders = null) {
 // FIX ⑥: map an upstream error to the right HTTP response. A ConcurrencyOverflowError (the
 // wait-queue was full) becomes HTTP 429 + Retry-After + rate_limit_error; every other error
 // stays a 500 proxy_error (byte-for-byte the pre-fix behaviour for non-overflow errors).
+// Count and log an upstream rate limit, wherever it surfaced. Returns `{ rateLimit, retryAfter }`
+// rather than the seconds alone, because "this was not a rate limit" and "it was, and named no
+// reset time" are different answers that a bare `null` would merge -- and the streaming caller
+// needs the first one to decide whether it has already counted this request.
+//
+// TWO LANES REACH THIS, AND ONLY ONE OF THEM CAN STILL CHOOSE A STATUS CODE. The buffered lane
+// (respondUpstreamError) has sent nothing yet, so it answers 429. The STREAMING lane has already
+// sent `200 text/event-stream` -- deliberately, and before the spawn produces anything: the D4
+// heartbeat spec makes `ensureHeaders()` eager so the heartbeat covers the pre-first-byte silent
+// window (see the call above `startHeartbeat`). A status cannot be un-sent, so a streaming wall is
+// delivered as the SSE error frame #110 introduced and the status stays 200.
+//
+// What the streaming lane CAN do is be counted, and that is why this is a function rather than
+// three lines inside respondUpstreamError: `stats.upstreamRateLimits` answers the operator's
+// question "did we hit the wall, or did the proxy break", and a counter that is blind to the lane
+// most agent traffic uses answers "not the wall" on exactly the deployment that motivated it.
+// MEASURED 2026-09-14: an agent framework (Hermes 0.21.1) pointed at OCP sends `stream: true` for
+// the turn itself, so that lane is the common case, not the corner.
+function noteUpstreamRateLimit(message, lane) {
+  if (!isUpstreamRateLimit(message)) return { rateLimit: false, retryAfter: null };
+  stats.upstreamRateLimits++;
+  const retry = retryAfterSeconds(message);
+  logEvent("warn", "upstream_rate_limit", { lane, retryAfter: retry, message: String(sanitizeError(message)).slice(0, 200) });
+  return { rateLimit: true, retryAfter: retry };
+}
+
 function respondUpstreamError(res, err) {
   if (err instanceof ConcurrencyOverflowError) {
     return jsonResponse(res, 429, { error: { message: sanitizeError(err.message), type: "rate_limit_error" } }, { "Retry-After": String(err.retryAfter) });
   }
-  return jsonResponse(res, 500, { error: { message: sanitizeError(err.message), type: "proxy_error" } });
+  // An UPSTREAM rate limit -- the Anthropic subscription wall, or a 429 the CLI surfaced -- is a
+  // 429 too, not a proxy_error. It used to be a 500, which is non-conformant with the OpenAI
+  // specification this endpoint implements and which no client can act on: a rate limit is the one
+  // upstream failure a caller is supposed to be able to wait out or fail over on. See
+  // lib/upstream-errors.mjs for the patterns and for what fails CLOSED (unmatched -> 500, as before).
+  //
+  // Deliberately reported as the SAME shape as the backpressure 429 above: a client should not have
+  // to tell "OCP is full" from "the account is out of quota" to decide what to do, and the message
+  // still carries which it was. Retry-After is attached only when the upstream text actually said
+  // when it resets.
+  const msg = sanitizeError(err.message);
+  if (isUpstreamRateLimit(err.message)) {
+    const { retryAfter } = noteUpstreamRateLimit(err.message, "buffered");
+    return jsonResponse(res, 429, { error: { message: msg, type: "rate_limit_error" } },
+      retryAfter === null ? {} : { "Retry-After": String(retryAfter) });
+  }
+  return jsonResponse(res, 500, { error: { message: msg, type: "proxy_error" } });
 }
 
 function sendSSE(res, data, hb) {

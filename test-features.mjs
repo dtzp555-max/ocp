@@ -8,6 +8,7 @@ import { TEST_OCP_DIR } from "./test-env.mjs";
 import { getDb, getDbPath, createKey, listKeys, LIST_KEYS_SQL, validateKey, recordUsage, checkQuota, updateKeyQuota, getKeyQuota, findKey, cacheHash, getCachedResponse, setCachedResponse, clearCache, getCacheStats, closeDb, hasCacheControl, singleflight, getInflightStats } from "./keys.mjs";
 import { isLoopbackBind } from "./lib/net.mjs";
 import { classifyToolRequest, countDeclaredTools } from "./lib/tool-support.mjs";
+import { isUpstreamRateLimit, retryAfterSeconds } from "./lib/upstream-errors.mjs";
 import { validateTools, extractBridgeToolUses, toolUsesToOpenAI, renderToolTurn, endsWithToolResult, TOOL_CONTINUATION_NOTE, TOOL_PREFIX as TC_PREFIX, buildBridgeConfig } from "./lib/tool-calling.mjs";
 import { PREFIX as BRIDGE_PREFIX } from "./lib/mcp-bridge.mjs";
 import { randomBytes } from "node:crypto";
@@ -2904,6 +2905,17 @@ if [ -n "$TOOLS_CAPTURE" ]; then
     fi
     prev="$a"
   done
+fi
+if [ -n "$UPSTREAM_ERROR" ]; then
+  # A failing spawn whose message is whatever the test wants, delivered the way a real failure
+  # arrives: a result event with is_error, which server.mjs turns into a rejection.
+  printf '%s\\n' '{"type":"result","is_error":true,"error_message":"'"$UPSTREAM_ERROR"'"}'
+  # Optionally ALSO on stderr. A real wall can arrive both ways at once, and that is precisely the
+  # case where the streaming lane's two error arms both fire for one failure -- the is_error arm
+  # sets the errored flag, which is what makes the close handler take its error branch too. With
+  # this set, the counter is only right because of the at-most-once guard.
+  if [ -n "$UPSTREAM_ERROR_ON_STDERR" ]; then printf '%s\\n' "$UPSTREAM_ERROR" >&2; fi
+  exit 1
 fi
 if [ -n "$TOOL_USE_NAME" ]; then
   printf '%s\\n' '{"type":"assistant","message":{"content":[{"type":"text","text":"Let me look that up."},{"type":"tool_use","id":"toolu_fake01","name":"mcp__ocp__'"$TOOL_USE_NAME"'","input":{"project":"alpha"}}]}}'
@@ -6037,6 +6049,190 @@ ltTest("integration (#467 control, OCP_TOOL_CALLING=0): a request with NO tools 
       assert.equal(served.status, 200, `the served request must succeed — ${served.status}`);
       assert.equal(await dropped(), 1, "a SERVED tools request must count — otherwise the four checks above prove nothing");
     } finally { child.kill("SIGKILL"); await ltDrain(() => buf.closed, "tools-control", 5000); }
+  } finally { _ltRmRetry(dir); }
+});
+
+console.log("\nAn upstream rate limit is 429, not 500 (#475-adjacent, OpenAI spec conformance):");
+
+test("upstream rate limit: quota/rate NOUNS match, transient advice alone does NOT", () => {
+  // Positive: the phrases an Anthropic wall or a surfaced 429 actually carries.
+  for (const m of [
+    "Claude usage limit reached — resets at 7:00",
+    "usage_limit_reached",
+    "API error: rate limit exceeded",
+    "429 Too Many Requests",
+    "quota exceeded for this organization",
+    "RESOURCE_EXHAUSTED",
+    "insufficient_quota",
+    // A BARE 429 in the shapes it really arrives in. These are here as the positive half of the
+    // number-fragment rows below: a narrowing that killed the false positives by also killing
+    // these would be a silent loss, and only a positive row can tell the two apart.
+    "status: 429",
+    "HTTP 429: slow down",
+    "(429)",
+    "upstream returned 429.",           // a trailing period is punctuation, not a decimal
+  ]) assert.equal(isUpstreamRateLimit(m), true, `should be a rate limit: ${m}`);
+
+  // Negative: ordinary failures, INCLUDING ones carrying retry advice. This is the row that keeps
+  // the guard from firing on everything — transient phrases alone must not promote a 500 to a 429,
+  // or every flaky spawn would hand the client a false "you are out of quota" and, downstream, a
+  // needless provider failover.
+  for (const m of [
+    "claude exit 1",
+    "spawn ENOENT",
+    "connection reset by peer, try again in a moment",
+    "the model is temporarily unavailable, please wait and retry",
+    "processed 1429 tokens",           // 429 as a substring is not a status
+    // 429 AS THE LAST GROUP OF A NUMBER. The row above passed under a separator class of
+    // [^0-9a-z] purely because it had no separator, so the guard read as sound while all three of
+    // these returned 429 from a live server. Found by review, not by the row that was supposed to
+    // cover it — which is the reason they are listed one per shape instead of folded into one.
+    "claude exited after 12.429 seconds",   // decimal point
+    "processed 1,429 tokens",               // thousands separator
+    "completed in 429.5 seconds",           // 429 on the LEFT of the point
+    "node v4.429 crashed",                  // version-shaped
+    "",
+    // EACH OF THE FOUR BELOW WAS MEASURED RETURNING 429 FROM A LIVE SERVER before an independent
+    // review of this PR, and each is an ordinary failure, not a wall. They are the reason the
+    // pattern list now requires a qualified noun; a row per cause so a widening reddens here.
+    "request req_011CT429kLmN failed",  // a request id is the commonest decoration on an API error
+    "FATAL ERROR: heap limit exceeded - JavaScript heap out of memory",   // not a QUOTA limit
+    "EDQUOT: disk quota exceeded, write",                                 // not an API quota
+    "x-ratelimit-remaining: 0",         // the HEADER spelling; the wire type is rate_limit_error
+    // Overload is a real upstream condition and still NOT this one: the same OpenAI specification
+    // this endpoint is bounded by gives it 503 `service_unavailable_error`, separately from 429.
+    // Calling it 429 would also tell a fallback-capable client to leave the vendor over a
+    // few-second blip.
+    "overloaded_error",
+  ]) assert.equal(isUpstreamRateLimit(m), false, `should NOT be a rate limit: ${m}`);
+
+  assert.equal(isUpstreamRateLimit(null), false);
+  assert.equal(isUpstreamRateLimit(undefined), false);
+});
+
+test("upstream rate limit: Retry-After is read from the message or omitted, never invented", () => {
+  const now = 1_800_000_000_000;
+  assert.equal(retryAfterSeconds(`resets_at: ${Math.floor(now / 1000) + 600}`, now), 600);
+  assert.equal(retryAfterSeconds(`"resetsAt":${Math.floor(now / 1000) + 120}`, now), 120);
+  // Case-insensitive. isUpstreamRateLimit lowercases its input and this function does not, so the
+  // two used to disagree: these produced a 429 with NO Retry-After, and the client retried straight
+  // into the same wall.
+  assert.equal(retryAfterSeconds(`ResetsAt: ${Math.floor(now / 1000) + 600}`, now), 600);
+  assert.equal(retryAfterSeconds(`RESETS_AT: ${Math.floor(now / 1000) + 600}`, now), 600);
+  // The relative shape is an ACCOMMODATION FOR OTHER UPSTREAMS, not something observed from
+  // `claude`: a review searched the 2.1.270 bundle and every one of its 34 "try again in"
+  // occurrences is non-numeric ("in a moment"), which the row below pins as null. Do not cite
+  // these two as measured behaviour of the upstream this proxy actually spawns.
+  assert.equal(retryAfterSeconds("try again in 5 minutes", now), 300);
+  assert.equal(retryAfterSeconds("try again in 30 seconds", now), 30);
+  assert.equal(retryAfterSeconds("overloaded, try again in a moment", now), null);
+  // No readable reset -> null, so no header. An invented number is worse than none: a client that
+  // trusts it retries into the same wall.
+  assert.equal(retryAfterSeconds("usage limit reached", now), null);
+  // A reset already in the past, or absurdly far out, is not usable either.
+  assert.equal(retryAfterSeconds(`resets_at: ${Math.floor(now / 1000) - 60}`, now), null);
+  assert.equal(retryAfterSeconds(`resets_at: ${Math.floor(now / 1000) + 200000}`, now), null);
+});
+
+// The whole point, end to end: a real server.mjs, a spawn that fails with a wall message, and the
+// STATUS a client would branch on. A source-level check would not catch respondUpstreamError being
+// bypassed on one of the two paths that reach it.
+ltTest("integration: an upstream quota wall reaches the client as 429 rate_limit_error, not 500", async () => {
+  if (!LT_POSIX) return;
+  const dir = ltMkdir(); const fake = ltFake(dir);
+  try {
+    const { child, buf, port } = await ltBootFresh({ CLAUDE_BIN: fake, UPSTREAM_ERROR: "Claude usage limit reached - resets at 7:00am" }, dir);
+    try {
+      assert.ok(await ltWait(() => buf.out.includes("listening on")), `— ${ltDiag(buf)}`);
+      const r = await ltPostStatus(port, { model: "sonnet", messages: [{ role: "user", content: "hi" }] });
+      assert.equal(r.status, 429, `a quota wall must be 429 so a client can wait or fail over — got ${r.status}: ${r.text.slice(0, 200)}`);
+      const body = JSON.parse(r.text);
+      assert.equal(body.error.type, "rate_limit_error", JSON.stringify(body));
+      assert.match(body.error.message, /usage limit/i, "the message must still say what happened");
+      const h = await fetch(`http://127.0.0.1:${port}/health`).then(x => x.json());
+      assert.equal(h.stats.upstreamRateLimits, 1, "the wall must be counted separately from errors");
+      assert.ok(await ltWait(() => /"event":"upstream_rate_limit"/.test(buf.err)), `and logged — ${buf.err.slice(-300)}`);
+    } finally { child.kill("SIGKILL"); await ltDrain(() => buf.closed, "upstream-429", 5000); }
+  } finally { _ltRmRetry(dir); }
+});
+
+// The control. Without it the test above passes on a build that returns 429 for EVERY failure,
+// which would fail a client over to its backup provider on an ordinary crash.
+ltTest("integration (control): an ordinary spawn failure is still 500 proxy_error, and not counted", async () => {
+  if (!LT_POSIX) return;
+  const dir = ltMkdir(); const fake = ltFake(dir);
+  try {
+    const { child, buf, port } = await ltBootFresh({ CLAUDE_BIN: fake, UPSTREAM_ERROR: "claude exited unexpectedly" }, dir);
+    try {
+      assert.ok(await ltWait(() => buf.out.includes("listening on")), `— ${ltDiag(buf)}`);
+      const r = await ltPostStatus(port, { model: "sonnet", messages: [{ role: "user", content: "hi" }] });
+      assert.equal(r.status, 500, `an ordinary failure must stay 500 — got ${r.status}: ${r.text.slice(0, 200)}`);
+      assert.equal(JSON.parse(r.text).error.type, "proxy_error");
+      const h = await fetch(`http://127.0.0.1:${port}/health`).then(x => x.json());
+      assert.equal(h.stats.upstreamRateLimits, 0, "an ordinary failure must NOT be counted as a rate limit");
+    } finally { child.kill("SIGKILL"); await ltDrain(() => buf.closed, "upstream-500", 5000); }
+  } finally { _ltRmRetry(dir); }
+});
+
+// THE STREAMING LANE CANNOT ANSWER 429, AND THAT IS NOT A BUG TO BE HIDDEN -- it is a consequence
+// of the D4 heartbeat spec making `ensureHeaders()` eager, so `200 text/event-stream` is on the
+// wire before the spawn has produced anything. These three tests pin what the lane DOES do, so the
+// claim in the PR body and the CHANGELOG is checkable rather than prose: status stays 200, the
+// failure still surfaces, and the COUNTER is truthful. It matters which lane this is: an agent
+// framework pointed at OCP sends `stream: true` for the turn itself (measured, Hermes 0.21.1), so
+// a counter blind here would read 0 on the traffic that motivated the field.
+ltTest("integration: a streaming wall keeps 200 (headers are already sent) but IS counted", async () => {
+  if (!LT_POSIX) return;
+  const dir = ltMkdir(); const fake = ltFake(dir);
+  try {
+    const { child, buf, port } = await ltBootFresh({ CLAUDE_BIN: fake, UPSTREAM_ERROR: "Claude usage limit reached - resets at 7:00am" }, dir);
+    try {
+      assert.ok(await ltWait(() => buf.out.includes("listening on")), `— ${ltDiag(buf)}`);
+      const r = await ltPostStatus(port, { model: "sonnet", stream: true, messages: [{ role: "user", content: "hi" }] });
+      // Positive anchors first: this really was the streaming lane, and it really did carry the
+      // failure. Asserting the status alone would pass on a response that never streamed at all.
+      assert.match(r.text, /data: /, `must be an SSE body — got ${r.text.slice(0, 200)}`);
+      assert.match(r.text, /usage limit/i, `the failure must still surface — got ${r.text.slice(0, 300)}`);
+      assert.equal(r.status, 200, "a status cannot be un-sent once the eager SSE headers went out");
+      const h = await fetch(`http://127.0.0.1:${port}/health`).then(x => x.json());
+      assert.equal(h.stats.upstreamRateLimits, 1, "the wall must be counted on the streaming lane too");
+      assert.ok(await ltWait(() => /"event":"upstream_rate_limit"/.test(buf.err)), `and logged — ${buf.err.slice(-300)}`);
+      assert.match(buf.err, /"lane":"streaming"/, "the log must say which lane, so an operator can tell why there was no 429");
+    } finally { child.kill("SIGKILL"); await ltDrain(() => buf.closed, "stream-429-count", 5000); }
+  } finally { _ltRmRetry(dir); }
+});
+
+ltTest("integration (control): an ordinary STREAMING failure is not counted as a rate limit", async () => {
+  if (!LT_POSIX) return;
+  const dir = ltMkdir(); const fake = ltFake(dir);
+  try {
+    const { child, buf, port } = await ltBootFresh({ CLAUDE_BIN: fake, UPSTREAM_ERROR: "claude exited unexpectedly" }, dir);
+    try {
+      assert.ok(await ltWait(() => buf.out.includes("listening on")), `— ${ltDiag(buf)}`);
+      const r = await ltPostStatus(port, { model: "sonnet", stream: true, messages: [{ role: "user", content: "hi" }] });
+      assert.match(r.text, /data: /, `must be an SSE body — got ${r.text.slice(0, 200)}`);
+      const h = await fetch(`http://127.0.0.1:${port}/health`).then(x => x.json());
+      assert.equal(h.stats.upstreamRateLimits, 0, "an ordinary streaming failure must NOT be counted");
+    } finally { child.kill("SIGKILL"); await ltDrain(() => buf.closed, "stream-500-count", 5000); }
+  } finally { _ltRmRetry(dir); }
+});
+
+ltTest("integration: one streaming failure seen by BOTH error arms still counts once", async () => {
+  if (!LT_POSIX) return;
+  const dir = ltMkdir(); const fake = ltFake(dir);
+  try {
+    const { child, buf, port } = await ltBootFresh({ CLAUDE_BIN: fake, UPSTREAM_ERROR: "Claude usage limit reached - resets at 7:00am", UPSTREAM_ERROR_ON_STDERR: "1" }, dir);
+    try {
+      assert.ok(await ltWait(() => buf.out.includes("listening on")), `— ${ltDiag(buf)}`);
+      const r = await ltPostStatus(port, { model: "sonnet", stream: true, messages: [{ role: "user", content: "hi" }] });
+      assert.match(r.text, /data: /, `must be an SSE body — got ${r.text.slice(0, 200)}`);
+      // The premise: BOTH arms really did see this failure. Without it the test would still pass on
+      // a build where only one arm ever fires, and would prove nothing about the guard.
+      assert.ok(await ltWait(() => /"event":"claude_result_error"/.test(buf.err) && /"event":"claude_exit"/.test(buf.err)),
+        `both arms must have fired, or this proves nothing — ${buf.err.slice(-400)}`);
+      const h = await fetch(`http://127.0.0.1:${port}/health`).then(x => x.json());
+      assert.equal(h.stats.upstreamRateLimits, 1, "one request must move the counter by exactly one");
+    } finally { child.kill("SIGKILL"); await ltDrain(() => buf.closed, "stream-429-once", 5000); }
   } finally { _ltRmRetry(dir); }
 });
 
