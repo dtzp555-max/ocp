@@ -13,3 +13,7 @@ node_modules/
 .DS_Store
 *.swp
 *~
+
+# test-features.mjs takes its suite lock at ./scratchpad/.suite.lock (#416). It exists only while a
+# suite is running -- which is exactly when a `git add -A` from an agent will sweep it up.
+scratchpad/

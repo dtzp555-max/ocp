@@ -1,7 +1,7 @@
 # ADR 0013 — OCP Does Not Implement OpenAI Tool Calling
 
 **Date:** 2026-08-03
-**Status:** Accepted (maintainer sign-off 2026-08-03) — **Decision superseded in part by [ADR 0021](0021-ocp-is-an-agent-backend.md)** (2026-09-09). The analysis below stands and is still the reference for *why* tool calling is hard here; what changed is the answer to *whether OCP should support agents*, which is now a requirement. In particular § "Alternatives considered" remains binding: refusing whenever `tools` is present is still rejected, for the reason given there.
+**Status:** Accepted (maintainer sign-off 2026-08-03) — **Decision superseded in part by [ADR 0021](0021-ocp-is-an-agent-backend.md)** (2026-09-09) **and in full by [ADR 0022](0022-openai-tool-calling-over-a-stateless-mcp-bridge.md)** (2026-09-13), which implements the tool calling this ADR declined — over a stateless bridge rather than the stateful design sketched below, because the stateful part was measured to be unnecessary. The analysis below stands and is still the reference for *why* tool calling is hard here; what changed is the answer to *whether OCP should support agents*, which is now a requirement. In particular § "Alternatives considered" remains binding: refusing whenever `tools` is present is still rejected, for the reason given there.
 **Scope:** Class B.1 — `POST /v1/chat/completions`. Authority: OpenAI's published
 `/v1/chat/completions` specification + [ADR 0006](0006-openai-shim-scope.md).
 

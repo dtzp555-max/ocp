@@ -8,6 +8,8 @@ import { TEST_OCP_DIR } from "./test-env.mjs";
 import { getDb, getDbPath, createKey, listKeys, LIST_KEYS_SQL, validateKey, recordUsage, checkQuota, updateKeyQuota, getKeyQuota, findKey, cacheHash, getCachedResponse, setCachedResponse, clearCache, getCacheStats, closeDb, hasCacheControl, singleflight, getInflightStats } from "./keys.mjs";
 import { isLoopbackBind } from "./lib/net.mjs";
 import { classifyToolRequest, countDeclaredTools } from "./lib/tool-support.mjs";
+import { validateTools, extractBridgeToolUses, toolUsesToOpenAI, renderToolTurn, endsWithToolResult, TOOL_CONTINUATION_NOTE, TOOL_PREFIX as TC_PREFIX, buildBridgeConfig } from "./lib/tool-calling.mjs";
+import { PREFIX as BRIDGE_PREFIX } from "./lib/mcp-bridge.mjs";
 import { randomBytes } from "node:crypto";
 import { createSerialMutex, createTtlCache, isTokenExpiring, orderLabelsLastGoodFirst, scrubInboundAuthEnv, INBOUND_AUTH_ENV_VARS, applyRequestVerdictTtl } from "./lib/spawn-auth.mjs";
 import { makeResolveSpawnToken } from "./lib/spawn-token.mjs";
@@ -2886,6 +2888,30 @@ for a in "$@"; do
   prev="$a"
 done
 if [ -n "$SP_COUNTER" ]; then c=$(cat "$SP_COUNTER" 2>/dev/null || echo 0); echo $((c+1)) > "$SP_COUNTER"; fi
+# ADR 0022 captures. STDIN_CAPTURE records the prompt the server piped in (write-then-rename, same
+# reason as ENV_CAPTURE). TOOLS_CAPTURE copies the tools file the --mcp-config points at, BEFORE the
+# server's cleanup removes it -- a test cannot read that file itself. TOOL_USE_NAME makes this fake
+# behave like a claude that chose a bridged tool: it emits the tool_use and then BLOCKS, exactly as
+# the real CLI blocks on lib/mcp-bridge.mjs, so the test proves the server ends the spawn rather
+# than waiting for a result that will never come.
+if [ -n "$STDIN_CAPTURE" ]; then cat > "$STDIN_CAPTURE.tmp" && mv "$STDIN_CAPTURE.tmp" "$STDIN_CAPTURE"; fi
+if [ -n "$TOOLS_CAPTURE" ]; then
+  prev=""
+  for a in "$@"; do
+    if [ "$prev" = "--mcp-config" ]; then
+      tf=$(node -e 'const c=JSON.parse(require("fs").readFileSync(process.argv[1],"utf8"));const s=c.mcpServers&&c.mcpServers.ocp;process.stdout.write((s&&s.env&&s.env.OCP_TOOLS_FILE)||"")' "$a")
+      [ -n "$tf" ] && cp "$tf" "$TOOLS_CAPTURE"
+    fi
+    prev="$a"
+  done
+fi
+if [ -n "$TOOL_USE_NAME" ]; then
+  printf '%s\\n' '{"type":"assistant","message":{"content":[{"type":"text","text":"Let me look that up."},{"type":"tool_use","id":"toolu_fake01","name":"mcp__ocp__'"$TOOL_USE_NAME"'","input":{"project":"alpha"}}]}}'
+  # exec, not a child: a sleep GRANDCHILD would keep the stdout pipe open after the server kills
+  # this shell, and the request would hang until it exited -- the #474 shape. With exec the server's
+  # signal lands on the process that holds the pipe.
+  exec sleep 120
+fi
 printf '%s\\n' '{"type":"assistant","message":{"content":[{"type":"text","text":"OK"}]}}'
 printf '%s\\n' '{"type":"result"}'
 exit 0
@@ -5927,11 +5953,11 @@ test("#467 countDeclaredTools: absent or malformed is 0, never a throw", () => {
   }
 });
 
-ltTest("integration (#467): a dropped-tools request is COUNTED and LOGGED — and still answered", async () => {
+ltTest("integration (#467, OCP_TOOL_CALLING=0): a dropped-tools request is COUNTED and LOGGED — and still answered", async () => {
   if (!LT_POSIX) return;
   const dir = ltMkdir(); const fake = ltFake(dir);
   try {
-    const { child, buf, port } = await ltBootFresh({ CLAUDE_BIN: fake }, dir);
+    const { child, buf, port } = await ltBootFresh({ CLAUDE_BIN: fake, OCP_TOOL_CALLING: "0" }, dir); // ADR 0022: the DROPPED path is now the kill-switch path
     const health = () => fetch(`http://127.0.0.1:${port}/health`).then(x => x.json());
     try {
       assert.ok(await ltWait(() => buf.out.includes("listening on")), `— ${ltDiag(buf)}`);
@@ -5964,11 +5990,11 @@ ltTest("integration (#467): a dropped-tools request is COUNTED and LOGGED — an
   } finally { _ltRmRetry(dir); }
 });
 
-ltTest("integration (#467 control): a request with NO tools counts nothing, and a REFUSED one is not counted either", async () => {
+ltTest("integration (#467 control, OCP_TOOL_CALLING=0): a request with NO tools counts nothing, and a REFUSED one is not counted either", async () => {
   if (!LT_POSIX) return;
   const dir = ltMkdir(); const fake = ltFake(dir);
   try {
-    const { child, buf, port } = await ltBootFresh({ CLAUDE_BIN: fake }, dir);
+    const { child, buf, port } = await ltBootFresh({ CLAUDE_BIN: fake, OCP_TOOL_CALLING: "0" }, dir); // ADR 0022: the DROPPED path is now the kill-switch path
     const dropped = async () => (await fetch(`http://127.0.0.1:${port}/health`).then(x => x.json())).stats.toolRequestsDropped;
     try {
       assert.ok(await ltWait(() => buf.out.includes("listening on")), `— ${ltDiag(buf)}`);
@@ -6011,6 +6037,223 @@ ltTest("integration (#467 control): a request with NO tools counts nothing, and 
       assert.equal(served.status, 200, `the served request must succeed — ${served.status}`);
       assert.equal(await dropped(), 1, "a SERVED tools request must count — otherwise the four checks above prove nothing");
     } finally { child.kill("SIGKILL"); await ltDrain(() => buf.closed, "tools-control", 5000); }
+  } finally { _ltRmRetry(dir); }
+});
+
+console.log("\nOpenAI tool calling over the MCP bridge (ADR 0022):");
+
+// ── unit: the pure helpers ──────────────────────────────────────────────────────────────────────
+test("ADR 0022: the bridge's prefix literal agrees with lib/tool-calling.mjs (two files, one truth)", () => {
+  // lib/mcp-bridge.mjs repeats the literal so it can stay import-free (it runs as a child of a
+  // child). This is the pin that turns "they agree" from a comment into a red.
+  assert.equal(BRIDGE_PREFIX, TC_PREFIX);
+  assert.equal(TC_PREFIX, "mcp__ocp__");
+});
+
+test("ADR 0022: validateTools accepts the spec shape and refuses what the bridge could not round-trip", () => {
+  const ok = [{ type: "function", function: { name: "lookup_build_id", parameters: { type: "object" } } }];
+  assert.equal(validateTools(ok), null);
+  assert.match(validateTools([]), /non-empty/);
+  assert.match(validateTools([{ type: "function", function: { name: "has space" } }]), /must match/);
+  assert.match(validateTools([{ type: "function", function: { name: "a".repeat(65) } }]), /must match/);
+  assert.match(validateTools([{ type: "code_interpreter" }]), /type must be "function"/);
+  assert.match(validateTools([ok[0], ok[0]]), /declared twice/);
+  assert.match(validateTools([{ type: "function", function: { name: "x", parameters: [] } }]), /JSON Schema object/);
+});
+
+test("ADR 0022: extractBridgeToolUses takes ONLY mcp__ocp__ calls and ignores the CLI's own tools", () => {
+  const ev = { type: "assistant", message: { content: [
+    { type: "text", text: "Let me look." },
+    { type: "tool_use", id: "t1", name: "ToolSearch", input: { query: "select:mcp__ocp__x" } },   // the deferred-tool lookup
+    { type: "tool_use", id: "t2", name: "mcp__ocp__lookup", input: { project: "alpha" } },
+    { type: "tool_use", id: "t3", name: "mcp__other__thing", input: {} },                       // not ours
+    { type: "tool_use", id: "t4", name: "mcp__ocp__second", input: { n: 2 } },
+  ] } };
+  assert.deepEqual(extractBridgeToolUses(ev), [
+    { id: "t2", name: "lookup", input: { project: "alpha" } },
+    { id: "t4", name: "second", input: { n: 2 } },
+  ]);
+  assert.equal(extractBridgeToolUses({ type: "assistant", message: { content: [{ type: "text", text: "hi" }] } }), null);
+  assert.equal(extractBridgeToolUses({ type: "user", message: { content: [{ type: "tool_use", name: "mcp__ocp__x" }] } }), null);
+});
+
+test("ADR 0022: toolUsesToOpenAI emits `arguments` as a JSON STRING and mints an id only when the CLI gave none", () => {
+  const out = toolUsesToOpenAI([{ id: "toolu_1", name: "a", input: { k: 1 } }, { id: null, name: "b", input: {} }], () => "call_minted");
+  assert.deepEqual(out, [
+    { id: "toolu_1", type: "function", function: { name: "a", arguments: "{\"k\":1}" } },
+    { id: "call_minted", type: "function", function: { name: "b", arguments: "{}" } },
+  ]);
+  assert.equal(typeof out[0].function.arguments, "string", "a client does JSON.parse(arguments); an object here breaks every client");
+});
+
+test("ADR 0022: renderToolTurn pairs a result with its call by id, and the continuation note follows the last result", () => {
+  const names = new Map();
+  const a = renderToolTurn({ role: "assistant", content: "On it.", tool_calls: [{ id: "c1", type: "function", function: { name: "lookup", arguments: "{\"p\":1}" } }] }, names);
+  assert.equal(a.text, "[Assistant] On it.\n[Assistant called tool lookup with arguments {\"p\":1}]");
+  const t = renderToolTurn({ role: "tool", tool_call_id: "c1", content: "build-9" }, names);
+  assert.equal(t.text, "[Tool lookup returned]\nbuild-9");
+  assert.equal(renderToolTurn({ role: "user", content: "hi" }, names), null, "ordinary messages are left to messagesToPrompt");
+  assert.equal(endsWithToolResult([{ role: "user", content: "q" }, { role: "assistant", tool_calls: [] }, { role: "tool", content: "r" }]), true);
+  assert.equal(endsWithToolResult([{ role: "tool", content: "r" }, { role: "user", content: "q" }]), false);
+  assert.equal(endsWithToolResult([{ role: "tool", content: "r" }, { role: "system", content: "s" }]), true, "a trailing system message does not change whose turn it is");
+  assert.ok(TOOL_CONTINUATION_NOTE.includes("results are final"));
+});
+
+test("ADR 0022: buildBridgeConfig names the server `ocp`, which is what puts mcp__ocp__ on every tool", () => {
+  const c = buildBridgeConfig({ nodeBin: "/n", bridgeScript: "/b.mjs", toolsFile: "/t.json" });
+  assert.deepEqual(c, { mcpServers: { ocp: { command: "/n", args: ["/b.mjs"], env: { OCP_TOOLS_FILE: "/t.json" } } } });
+});
+
+// ── integration: a tool turn end to end, against a fake claude that BLOCKS after its tool_use ────
+// The fake does what the real CLI was measured to do (lib/tool-calling.mjs header): emit the
+// assistant event carrying tool_use, then block waiting on the bridge. So this test proves three
+// things from one spawn: the response is tool_calls in OpenAI shape; the server ENDED the spawn
+// rather than waiting (the fake sleeps 120 s; the request completes in seconds); and the argv is the
+// bridge shape -- schema emptied, our config, strict, our prefix pre-approved, NO Bash.
+ltTest("integration (ADR 0022): a declared tool the model chooses comes back as tool_calls, and the spawn is ended, not awaited", async () => {
+  if (!LT_POSIX) return;
+  const dir = ltMkdir(); const fake = ltFake(dir);
+  const argvFile = join(dir, "argv.txt"); const toolsFile = join(dir, "tools.json"); const stdinFile = join(dir, "stdin.txt");
+  try {
+    // CLAUDE_TIMEOUT short so that a server which FAILS to end the spawn reddens in 20 s (as a 500)
+    // rather than sitting on the fake's 120 s sleep. The 30 s assertion below is what reads it.
+    const { child, buf, port } = await ltBootFresh({ CLAUDE_BIN: fake, CLAUDE_TIMEOUT: "20000", ARGV_CAPTURE: argvFile, TOOLS_CAPTURE: toolsFile, STDIN_CAPTURE: stdinFile, TOOL_USE_NAME: "lookup_build_id" }, dir);
+    try {
+      assert.ok(await ltWait(() => buf.out.includes("listening on")), `— ${ltDiag(buf)}`);
+      assert.ok(buf.out.includes("Tool calling: ON"), `banner must say the bridge is on — ${ltDiag(buf)}`);
+      const TOOL = { type: "function", function: { name: "lookup_build_id", description: "d", parameters: { type: "object", properties: { project: { type: "string" } } } } };
+      const t0 = Date.now();
+      const r = await ltPostStatus(port, { model: "sonnet", tools: [TOOL], tool_choice: "auto", messages: [{ role: "user", content: "build id for alpha?" }] });
+      const elapsed = Date.now() - t0;
+      assert.equal(r.status, 200, `${r.status} ${r.text.slice(0, 200)}`);
+      // The fake blocks after its tool_use, and CLAUDE_TIMEOUT above is 20 s. A server that ends the
+      // spawn ON THE EVENT completes in well under a second; one that merely waits for the timeout to
+      // do it completes at ~20 s with the same 200 and the same tool_calls -- which is why this bound
+      // sits at half the timeout and not above it. An earlier version said 30 s, and the mutation
+      // that removed the kill stayed green behind the timeout.
+      assert.ok(elapsed < 10000, `the request took ${elapsed} ms — the server waited for CLAUDE_TIMEOUT to end the blocked spawn instead of ending it on the tool_use event`);
+
+      const body = JSON.parse(r.text);
+      const ch = body.choices[0];
+      assert.equal(ch.finish_reason, "tool_calls", `finish_reason is the value a client branches on: ${JSON.stringify(ch)}`);
+      assert.equal(ch.message.role, "assistant");
+      assert.equal(ch.message.content, "Let me look that up.", "text the model wrote alongside its call is delivered, not dropped");
+      assert.deepEqual(ch.message.tool_calls, [{ id: "toolu_fake01", type: "function", function: { name: "lookup_build_id", arguments: "{\"project\":\"alpha\"}" } }]);
+
+      // argv: the bridge shape, and NOT the default nine
+      const argv = ltArgvCalls(argvFile);
+      assert.ok(argv.length > 0, `no argv captured — ${ltDiag(buf)}`);
+      const spIdx = argv.indexOf("--system-prompt-file");
+      assert.ok(spIdx > -1, JSON.stringify(argv.slice(0, 8)));
+      const tail = argv.slice(spIdx + 2);
+      assert.equal(tail[0], "--tools"); assert.equal(tail[1], "", "the built-in schema is EMPTIED: the model holds exactly the client's tools");
+      assert.equal(tail[2], "--mcp-config"); assert.ok(tail[3].endsWith(".json"), tail[3]);
+      assert.equal(tail[4], "--strict-mcp-config", "only the bridge is loaded; no account connectors");
+      assert.deepEqual(tail.slice(5), ["--allowedTools", "mcp__ocp__*"]);
+      assert.ok(!argv.includes("Bash"), `a tool turn must not also grant Bash: ${JSON.stringify(tail)}`);
+
+      // the tools file the bridge would serve: the client's array, verbatim
+      assert.ok(await ltWait(() => _ltExists(toolsFile)), "the fake did not capture the tools file");
+      assert.deepEqual(JSON.parse(_ltRead(toolsFile, "utf8")), [TOOL]);
+
+      // counters: emitted, not dropped
+      const h = await fetch(`http://127.0.0.1:${port}/health`).then(x => x.json());
+      assert.equal(h.stats.toolCallsEmitted, 1, "the turn must be counted as emitted");
+      assert.equal(h.stats.toolRequestsDropped, 0, "…and NOT as dropped");
+      assert.equal(h.stats.errors, 0, "ending the spawn on purpose is not an error");
+    } finally { child.kill("SIGKILL"); await ltDrain(() => buf.closed, "tool-turn", 5000); }
+  } finally { _ltRmRetry(dir); }
+});
+
+// The other half of the loop: the client sends the result back. This spawn's PROMPT must carry the
+// rendered call and result, and the continuation note, because that text is the only way a fresh
+// spawn learns what happened (stream-json injection was measured not to work).
+ltTest("integration (ADR 0022): a tool result sent back is rendered into the next spawn's prompt with the continuation note", async () => {
+  if (!LT_POSIX) return;
+  const dir = ltMkdir(); const fake = ltFake(dir);
+  const stdinFile = join(dir, "stdin.txt");
+  try {
+    const { child, buf, port } = await ltBootFresh({ CLAUDE_BIN: fake, STDIN_CAPTURE: stdinFile }, dir);
+    try {
+      assert.ok(await ltWait(() => buf.out.includes("listening on")), `— ${ltDiag(buf)}`);
+      const TOOL = { type: "function", function: { name: "lookup_build_id", parameters: { type: "object" } } };
+      const r = await ltPostStatus(port, { model: "sonnet", tools: [TOOL], messages: [
+        { role: "user", content: "build id for alpha?" },
+        { role: "assistant", content: null, tool_calls: [{ id: "call_abc", type: "function", function: { name: "lookup_build_id", arguments: "{\"project\":\"alpha\"}" } }] },
+        { role: "tool", tool_call_id: "call_abc", content: "build-7f3a9c" },
+      ] });
+      assert.equal(r.status, 200, `${r.status} ${r.text.slice(0, 200)}`);
+      assert.equal(JSON.parse(r.text).choices[0].finish_reason, "stop", "the fake answers with text, so this turn ends normally");
+      assert.ok(await ltWait(() => _ltExists(stdinFile)), "the fake did not capture stdin");
+      const prompt = _ltRead(stdinFile, "utf8");
+      // Positive anchors first (#405), then order.
+      const iCall = prompt.indexOf("[Assistant called tool lookup_build_id with arguments {\"project\":\"alpha\"}]");
+      const iRes = prompt.indexOf("[Tool lookup_build_id returned]\nbuild-7f3a9c");
+      const iNote = prompt.indexOf(TOOL_CONTINUATION_NOTE);
+      assert.ok(iCall > -1, `the call was not rendered: ${prompt.slice(0, 300)}`);
+      assert.ok(iRes > iCall, `the result was not rendered after the call (call@${iCall}, result@${iRes})`);
+      assert.ok(iNote > iRes, `the continuation note must follow the last result (result@${iRes}, note@${iNote})`);
+    } finally { child.kill("SIGKILL"); await ltDrain(() => buf.closed, "tool-result", 5000); }
+  } finally { _ltRmRetry(dir); }
+});
+
+ltTest("integration (ADR 0022): with stream:true the tool_calls arrive as one indexed delta, then finish_reason, then [DONE]", async () => {
+  if (!LT_POSIX) return;
+  const dir = ltMkdir(); const fake = ltFake(dir);
+  try {
+    const { child, buf, port } = await ltBootFresh({ CLAUDE_BIN: fake, CLAUDE_TIMEOUT: "20000", TOOL_USE_NAME: "lookup_build_id" }, dir);
+    try {
+      assert.ok(await ltWait(() => buf.out.includes("listening on")), `— ${ltDiag(buf)}`);
+      const TOOL = { type: "function", function: { name: "lookup_build_id", parameters: { type: "object" } } };
+      const res = await fetch(`http://127.0.0.1:${port}/v1/chat/completions`, { method: "POST", headers: { "content-type": "application/json" },
+        body: JSON.stringify({ model: "sonnet", stream: true, tools: [TOOL], messages: [{ role: "user", content: "build id for alpha?" }] }) });
+      assert.equal(res.status, 200);
+      assert.match(res.headers.get("content-type") || "", /text\/event-stream/);
+      const raw = await res.text();
+      // Positive count first (#405): an empty stream satisfies every "no bad chunk" claim.
+      const frames = raw.split("\n\n").filter(Boolean);
+      assert.ok(frames.length >= 4, `expected role, tool_calls, finish, [DONE]; got ${frames.length}: ${raw.slice(0, 300)}`);
+      assert.equal(frames[frames.length - 1], "data: [DONE]");
+      const chunks = frames.slice(0, -1).map(f => { assert.ok(f.startsWith("data: "), f); return JSON.parse(f.slice(6)); });
+      const deltas = chunks.map(c => c.choices[0]);
+      // 1: role (+ the text the model wrote alongside its call)
+      assert.equal(deltas[0].delta.role, "assistant");
+      assert.equal(deltas[0].delta.content, "Let me look that up.");
+      // 2: the call, whole, with its index -- a client accumulating by index sees one piece
+      const tc = deltas[1].delta.tool_calls;
+      assert.ok(Array.isArray(tc) && tc.length === 1, JSON.stringify(deltas[1]));
+      assert.deepEqual(tc[0], { index: 0, id: "toolu_fake01", type: "function", function: { name: "lookup_build_id", arguments: "{\"project\":\"alpha\"}" } });
+      assert.equal(typeof tc[0].function.arguments, "string");
+      // 3: the finish reason a client branches on
+      assert.equal(deltas[2].finish_reason, "tool_calls");
+      assert.ok(deltas.slice(0, 2).every(d => d.finish_reason === null), "finish_reason must be null until the closing chunk");
+    } finally { child.kill("SIGKILL"); await ltDrain(() => buf.closed, "tool-stream", 5000); }
+  } finally { _ltRmRetry(dir); }
+});
+
+ltTest("integration (ADR 0022): OCP_TOOL_CALLING=0 restores the dropped-and-counted path, with the reason logged", async () => {
+  if (!LT_POSIX) return;
+  const dir = ltMkdir(); const fake = ltFake(dir);
+  const argvFile = join(dir, "argv.txt");
+  try {
+    const { child, buf, port } = await ltBootFresh({ CLAUDE_BIN: fake, OCP_TOOL_CALLING: "0", ARGV_CAPTURE: argvFile }, dir);
+    try {
+      assert.ok(await ltWait(() => buf.out.includes("listening on")), `— ${ltDiag(buf)}`);
+      assert.ok(buf.out.includes("Tool calling: OFF (OCP_TOOL_CALLING=0)"), `banner — ${ltDiag(buf)}`);
+      const TOOL = { type: "function", function: { name: "lookup_build_id", parameters: { type: "object" } } };
+      const r = await ltPostStatus(port, { model: "sonnet", tools: [TOOL], messages: [{ role: "user", content: "hi" }] });
+      assert.equal(r.status, 200, `${r.status} ${r.text.slice(0, 200)}`);
+      const body = JSON.parse(r.text);
+      assert.equal(body.choices[0].finish_reason, "stop");
+      assert.equal(body.choices[0].message.tool_calls, undefined, `switch is off, yet tool_calls came back: ${r.text.slice(0, 200)}`);
+      const argv = ltArgvCalls(argvFile);
+      assert.ok(argv.length > 0, "no argv captured");
+      assert.ok(!argv.includes("--mcp-config"), `no bridge must be configured with the switch off: ${JSON.stringify(argv.slice(-8))}`);
+      assert.ok(argv.includes("Bash"), "the default nine are back");
+      // logEvent writes to stderr, and the event lands after the response is sent -- wait for it.
+      assert.ok(await ltWait(() => /"event":"openai_tools_dropped"/.test(buf.err)), `no drop event — ${ltDiag(buf)}`);
+      assert.ok(/"reason":"OCP_TOOL_CALLING=0"/.test(buf.err), `the drop must say WHY — ${buf.err.slice(-400)}`);
+    } finally { child.kill("SIGKILL"); await ltDrain(() => buf.closed, "tool-off", 5000); }
   } finally { _ltRmRetry(dir); }
 });
 

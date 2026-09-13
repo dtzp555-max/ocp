@@ -48,6 +48,8 @@ import { StructuredOutputError, detectStructuredOutput, validateJsonSchemaSafe, 
 import { isLoopbackBind } from "./lib/net.mjs";
 import { parseAllowedHosts, parseAuthority, matchesDeclared, evaluateOriginGate } from "./lib/host-gate.mjs";
 import { classifyToolRequest, countDeclaredTools } from "./lib/tool-support.mjs";
+import { validateTools, extractBridgeToolUses, extractAssistantText, toolUsesToOpenAI, renderToolTurn,
+         endsWithToolResult, TOOL_CONTINUATION_NOTE, TOOL_PREFIX, buildBridgeConfig } from "./lib/tool-calling.mjs";
 import { runTuiTurn, reapStaleTuiSessions, resolveTuiHome, bootTuiPane, tuiPaneHealthy, poolPaneName, killLiveTurnPanes, POOL_BOOT_MS } from "./lib/tui/session.mjs";
 import { detectTuiUpstreamError } from "./lib/tui/transcript.mjs";
 import { TuiSemaphore, SemaphoreAbortError, recordTuiEntrypoint, buildTuiHealthBlock } from "./lib/tui/semaphore.mjs";
@@ -61,6 +63,9 @@ import { parsePositiveInt } from "./lib/env.mjs";
 import { appendOperatorPrompt, promptCharBudgetFor, fallbackPromptCharBudget, resolveGlobalPromptCharOverride, selectPromptWrapper, localToolsSafetyError } from "./lib/prompt.mjs";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
+// lib/mcp-bridge.mjs, resolved from this file's own location so a relocated install (#348) still
+// finds it. Launched by `claude` via --mcp-config, never by this process directly.
+const MCP_BRIDGE_SCRIPT = join(__dirname, "lib", "mcp-bridge.mjs");
 const _pkg = JSON.parse(readFileSync(join(__dirname, "package.json"), "utf8"));
 const modelsConfig = JSON.parse(readFileSync(join(__dirname, "models.json"), "utf8"));
 
@@ -331,6 +336,11 @@ function parseStreamJsonEvent(event, sawTextDelta) {
   // seen (sawTextDelta), the aggregate duplicates them — ignore it.
   // Reference: OLP commit 65f945c (assistant-aggregate fallback, fold-in).
   if (t === "assistant") {
+    // ADR 0022: a `tool_use` for one of the client's bridged tools ends the turn here. Checked
+    // BEFORE the text branch and regardless of sawTextDelta, because in streaming mode the text
+    // has already gone out as deltas and this event is the only place the tool call appears.
+    const toolUses = extractBridgeToolUses(event);
+    if (toolUses) return { toolUses, text: extractAssistantText(event) };
     if (!sawTextDelta) {
       const blocks = event.message?.content;
       if (Array.isArray(blocks)) {
@@ -381,6 +391,14 @@ const CLAUDE = resolveClaude();
 let TIMEOUT = parseInt(process.env.CLAUDE_TIMEOUT || "600000", 10);
 const PROXY_API_KEY = process.env.PROXY_API_KEY || "";
 const SKIP_PERMISSIONS = process.env.CLAUDE_SKIP_PERMISSIONS === "true";
+// OpenAI tool calling over the MCP bridge (ADR 0022). ON by default because ADR 0021 makes "OCP
+// is an agent backend" a requirement, not a feature. `OCP_TOOL_CALLING=0` restores the pre-0022
+// behaviour -- declared tools are dropped and counted -- and exists because this is a behaviour
+// change on the default path: a client that sent `tools` and was content with prose now gets
+// `tool_calls` and must run them. EXPIRY: when no deployment has needed the switch for two
+// releases, remove it and this comment; a kill-switch nobody has pulled is a second code path
+// nobody tests.
+const TOOL_CALLING = process.env.OCP_TOOL_CALLING !== "0";
 const ALLOWED_TOOLS = (process.env.CLAUDE_ALLOWED_TOOLS ||
   "Bash,Read,Write,Edit,Glob,Grep,WebSearch,WebFetch,Agent"
 ).split(",").map(s => s.trim()).filter(Boolean);
@@ -1096,6 +1114,10 @@ const stats = {
   // through GET /health's bare `stats,` shorthand -- see the ADR 0016 Amendment 1 note below, which
   // is the same mechanism working in the other direction.
   toolRequestsDropped: 0,
+  // ADR 0022 / additive under ADR 0012: requests that ended with the model calling one of the
+  // client's tools -- i.e. answered with `tool_calls`. The companion of toolRequestsDropped: with
+  // OCP_TOOL_CALLING on, a request that declares tools lands in exactly one of the two.
+  toolCallsEmitted: 0,
   activeRequests: 0,
   errors: 0,
   timeouts: 0,
@@ -1426,6 +1448,21 @@ function buildCliArgs(cliModel, systemPromptFile, opts = {}) {
     args.push("--input-format", "stream-json");
   }
 
+  // ADR 0022: the client declared `tools`, so the model holds EXACTLY those and nothing else --
+  // that is what the OpenAI contract says it holds, and it is what makes the answer to "which tool
+  // did the model choose" unambiguous. Built-in schema emptied the way multi mode empties it;
+  // `--strict-mcp-config` so only the bridge is loaded (no account-level connectors); the bridge's
+  // tools pre-approved so no permission prompt can stall a headless spawn. This branch comes
+  // FIRST and returns, in every auth mode, because the tools it grants run on the CLIENT: a guest
+  // in multi mode calling its own tool touches nothing of the operator's. Any operator MCP_CONFIG
+  // is deliberately not merged in -- a client's tool surface and an operator's are different
+  // things, and a request that declares tools has asked for the former.
+  if (opts.toolBridge) {
+    args.push("--tools", "", "--mcp-config", opts.toolBridge.configFile, "--strict-mcp-config",
+      "--allowedTools", `${TOOL_PREFIX}*`);
+    return args;
+  }
+
   // Permissions
   // ADR 0007 B-path: in multi-tenant mode, suppress operator-FS tools so a guest
   // prompt cannot drive Bash/Read/Write/Edit/etc. on the operator's filesystem.
@@ -1605,15 +1642,25 @@ function contentToText(content) {
 // in hand still gets the conservative fallback rather than an undefined (NaN) ceiling, which
 // would disable the guard entirely.
 function messagesToPrompt(messages, maxChars = FALLBACK_PROMPT_CHARS) {
+  // ADR 0022: an assistant message carrying `tool_calls` and a `tool` message carrying a result are
+  // rendered as text describing what happened, because a fresh spawn has no other way to learn
+  // it (injecting real tool_use/tool_result blocks over stream-json input was measured NOT to work;
+  // see lib/tool-calling.mjs). `callNames` pairs each result with the call that produced it.
+  const callNames = new Map();
   const full = messages.map((m) => {
+    const toolTurn = renderToolTurn(m, callNames);
+    if (toolTurn) return toolTurn.text;
     const text = contentToText(m.content);
     if (m.role === "system") return `[System] ${text}`;
     if (m.role === "assistant") return `[Assistant] ${text}`;
     return text;
   });
+  // Appended to the RESULT rather than pushed into `full`: the truncation path below partitions
+  // `full` by indexing `messages[i].role`, so the two must stay the same length.
+  const tail = endsWithToolResult(messages) ? `\n\n${TOOL_CONTINUATION_NOTE}` : "";
 
   const joined = full.join("\n\n");
-  if (joined.length <= maxChars) return joined;
+  if (joined.length + tail.length <= maxChars) return joined + tail;
 
   // Truncation: keep system messages, first user msg, and trim from the tail
   logEvent("warn", "prompt_truncated", {
@@ -1641,7 +1688,7 @@ function messagesToPrompt(messages, maxChars = FALLBACK_PROMPT_CHARS) {
   }
 
   const truncNote = `[System] Note: ${rest.length - kept.length} older messages were truncated to fit context limit.`;
-  const result = [systemText, truncNote, ...kept].filter(Boolean).join("\n\n");
+  const result = [systemText, truncNote, ...kept].filter(Boolean).join("\n\n") + tail;
 
   logEvent("info", "prompt_after_truncation", {
     chars: result.length,
@@ -1678,7 +1725,7 @@ function getModelTier(cliModel) {
 // budget. releaseSlot is wired into the idempotent cleanup() so the slot is freed on EVERY exit
 // path (close/error/timeout/abort). Back-compat: releaseSlot defaults to a no-op so any future
 // internal caller that does its own gating still works.
-function spawnClaudeProcess(model, messages, conversationId, keyName, releaseSlot = () => {}, spawnDecision = null) {
+function spawnClaudeProcess(model, messages, conversationId, keyName, releaseSlot = () => {}, spawnDecision = null, opts = {}) {
   const cliModel = MODEL_MAP[model] || model;
 
   // Circuit breaker: disabled (see comment at top of breaker section)
@@ -1691,6 +1738,13 @@ function spawnClaudeProcess(model, messages, conversationId, keyName, releaseSlo
   // The path is computed here (a pure string) but the file is NOT written until immediately
   // before spawn(), so the window in which an orphan can exist is one function call wide.
   const systemPromptFile = join(tmpdir(), `ocp-sysprompt-${randomUUID()}.txt`);
+  // ADR 0022: two more 0600 files for a tool-bridge spawn, same lifecycle as the prompt file --
+  // written one call before spawn(), removed in cleanup(). The tools file is what the bridge
+  // serves; the config file is what `--mcp-config` reads. Paths computed here, written below.
+  const toolBridge = Array.isArray(opts.tools) && opts.tools.length ? {
+    toolsFile: join(tmpdir(), `ocp-tools-${randomUUID()}.json`),
+    configFile: join(tmpdir(), `ocp-mcp-${randomUUID()}.json`),
+  } : null;
 
   // messagesToPrompt / buildStreamJsonInput skip system messages (they go via
   // --system-prompt-file). Filter them out first to avoid double-injection.
@@ -1732,7 +1786,7 @@ function spawnClaudeProcess(model, messages, conversationId, keyName, releaseSlo
     console.log(`[session] stateless conv=${conversationId.slice(0, 12)}... key=${keyName || "anon"} msgs=${messages.length} prompt_chars=${promptChars}`);
   }
 
-  const cliArgs = buildCliArgs(cliModel, systemPromptFile, { streamJsonInput: useStreamJson });
+  const cliArgs = buildCliArgs(cliModel, systemPromptFile, { streamJsonInput: useStreamJson, toolBridge });
 
   const env = { ...process.env };
   delete env.CLAUDECODE;
@@ -1841,6 +1895,12 @@ function spawnClaudeProcess(model, messages, conversationId, keyName, releaseSlo
   let proc;
   try {
     writeFileSync(systemPromptFile, systemPrompt, { encoding: "utf8", mode: 0o600, flag: "wx" });
+    if (toolBridge) {
+      writeFileSync(toolBridge.toolsFile, JSON.stringify(opts.tools), { encoding: "utf8", mode: 0o600, flag: "wx" });
+      writeFileSync(toolBridge.configFile, JSON.stringify(buildBridgeConfig({
+        nodeBin: process.execPath, bridgeScript: MCP_BRIDGE_SCRIPT, toolsFile: toolBridge.toolsFile,
+      })), { encoding: "utf8", mode: 0o600, flag: "wx" });
+    }
     proc = spawn(CLAUDE, cliArgs, spawnOpts);
   } catch (e) {
     // Covers BOTH the write failing and spawn() throwing synchronously (the #193 shape). Every
@@ -1860,6 +1920,10 @@ function spawnClaudeProcess(model, messages, conversationId, keyName, releaseSlo
     // established: two levers checked and closed, NOT a proof that no lever exists. Recorded so
     // the next reader does not re-derive the two, and knows what is still open.
     try { rmSync(systemPromptFile, { force: true }); } catch { /* never mask the real error */ }
+    if (toolBridge) {
+      try { rmSync(toolBridge.toolsFile, { force: true }); } catch { /* same */ }
+      try { rmSync(toolBridge.configFile, { force: true }); } catch { /* same */ }
+    }
     throw e;
   }
   // #365 (the other half of #359): decode the child's stdout/stderr as UTF-8 ONCE, here, at the
@@ -1937,6 +2001,10 @@ function spawnClaudeProcess(model, messages, conversationId, keyName, releaseSlo
     // every path past a successful spawn, and it is reached on 'exit' (wired below) as well as on
     // the 'close'/'error' the CALLERS wire -- which is why a failed spawn also removes it.
     try { rmSync(systemPromptFile, { force: true }); } catch { /* a missing file is the success case */ }
+    if (toolBridge) {
+      try { rmSync(toolBridge.toolsFile, { force: true }); } catch { /* same */ }
+      try { rmSync(toolBridge.configFile, { force: true }); } catch { /* same */ }
+    }
   }
 
   // Guarantee slot release on ANY exit path (normal close, error, timeout kill,
@@ -2010,7 +2078,10 @@ function spawnClaudeProcess(model, messages, conversationId, keyName, releaseSlo
 // `res` (optional, F2) is the client's http.ServerResponse — passed through so a queued wait
 // can be cancelled the moment the client disconnects, instead of spawning claude for a dead
 // socket once a slot finally frees up.
-async function callClaude(model, messages, conversationId, keyName, res) {
+// `opts.tools` (ADR 0022) turns this into a tool turn: the spawn gets the MCP bridge, and the
+// promise resolves with `{ toolCalls, text }` instead of a string when the model calls one of
+// the client's tools. Every other caller passes no opts and sees a string, as before.
+async function callClaude(model, messages, conversationId, keyName, res, opts = {}) {
   // #460: stats.errors must move by exactly ONE per failed request, and before this it moved by
   // 0, 1 or 2 depending on HOW the request failed. trackError() is global and every arm of this
   // lane calls it independently, so a failure that trips two arms counted twice -- MEASURED: a
@@ -2069,7 +2140,7 @@ async function callClaude(model, messages, conversationId, keyName, res) {
   return new Promise((resolve, reject) => {
     let ctx;
     try {
-      ctx = spawnClaudeProcess(model, messages, conversationId, keyName, releaseSlot, spawnDecision);
+      ctx = spawnClaudeProcess(model, messages, conversationId, keyName, releaseSlot, spawnDecision, opts);
     } catch (err) {
       releaseSlot();
       // Spawn threw before cleanup() was wired → release the fallback mutex here so it never leaks.
@@ -2107,6 +2178,10 @@ async function callClaude(model, messages, conversationId, keyName, res) {
     let sawTextDelta = false;
     let resultEventSeen = false;
     let stderr = "";
+    // ADR 0022: set when the model called a bridged tool. The spawn is ended on purpose at that
+    // point, so `close` must read this BEFORE treating a non-zero exit as a failure.
+    let toolCalls = null;
+    let toolText = "";
 
     proc.stdout.on("data", (d) => {
       markFirstByte();
@@ -2122,6 +2197,30 @@ async function callClaude(model, messages, conversationId, keyName, res) {
       for (const event of events) {
         const parsed = parseStreamJsonEvent(event, sawTextDelta);
         if (!parsed) continue;
+        if (parsed.toolUses) {
+          // Only a tool-bridge spawn acts on these. A spawn with no bridge cannot legitimately emit
+          // an mcp__ocp__ call, but the parser is shared and a fake can, so the guard is here where
+          // the decision is: on a non-bridge spawn the text half is kept and the calls are dropped.
+          if (!opts.tools) {
+            if (parsed.text && !sawTextDelta) {
+              if (assembledText && !assembledText.endsWith("\n")) assembledText += "\n\n";
+              assembledText += parsed.text;
+            }
+            continue;
+          }
+          // The turn is over: the model chose a tool the CLIENT owns. End the spawn now rather than
+          // let it block on the bridge (which never answers tools/call -- see lib/mcp-bridge.mjs),
+          // and hand the calls up. SIGTERM first, SIGKILL after the same 5 s the timeout path uses.
+          if (!toolCalls) {
+            toolCalls = parsed.toolUses;
+            toolText = parsed.text || "";
+            stats.toolCallsEmitted++;
+            logEvent("info", "openai_tool_calls", { model: cliModel, count: toolCalls.length, names: toolCalls.map((u) => u.name).slice(0, 8) });
+            try { proc.kill("SIGTERM"); } catch {}
+            setTimeout(() => { try { proc.kill("SIGKILL"); } catch {} }, 5000);
+          }
+          continue;
+        }
         if (parsed.text !== undefined) {
           if (parsed.fromDelta) {
             assembledText += parsed.text;
@@ -2181,6 +2280,18 @@ async function callClaude(model, messages, conversationId, keyName, res) {
       cleanup();
       // Tolerate null exit code when result event was seen (sandbox-wrap noise, same
       // as OLP commit 2864275 — bwrap shell exits null after model completes).
+      if (toolCalls && !errored) {
+        // A deliberate end, not a failure: no error is recorded, no session failure is signalled,
+        // and the request completes normally with tool_calls. resultEventSeen is false here by
+        // construction (the spawn was killed before it could finish), which is why this check
+        // precedes the exit-code one.
+        recordModelSuccess(cliModel, elapsed);
+        breakerRecordSuccess(cliModel);
+        noteAuthVerifiedByRequest();
+        logEvent("info", "claude_ok", { model: cliModel, chars: toolText.length, elapsed, toolCalls: toolCalls.length, session: convId ? convId.slice(0, 12) + "..." : "none" });
+        resolve({ toolCalls, text: toolText });
+        return;
+      }
       if ((code !== 0 && !resultEventSeen) || errored) {
         recordModelError(cliModel, false);
         logEvent("error", "claude_exit", { model: cliModel, code, signal: signal || "none", elapsed, errored, stderr: stderr.slice(0, 300) });
@@ -3126,6 +3237,34 @@ function completionResponse(res, id, model, content) {
 // assistant `refusal` field (content:null, refusal:<text>, finish_reason:"stop") — NOT an invented
 // error type. Structured-output exhaustion emits this so SDK clients take their written `refusal`
 // branch instead of throwing an opaque UnprocessableEntityError. (PR #153 review, finding 3.)
+// ADR 0022: the request ends with the model asking the CLIENT to run a tool. `content` is the
+// text the model wrote in the same message (or null), `toolCalls` is already in OpenAI shape
+// (arguments as a JSON string). finish_reason "tool_calls" is the whole point: it is the value a
+// client branches on, and the one that "stop" was silently standing in for before this ADR.
+function toolCallsResponse(res, id, model, content, toolCalls) {
+  jsonResponse(res, 200, {
+    id, object: "chat.completion",
+    created: Math.floor(Date.now() / 1000),
+    model,
+    choices: [{ index: 0, message: { role: "assistant", content: content || null, tool_calls: toolCalls }, finish_reason: "tool_calls" }],
+    usage: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 },
+  });
+}
+
+// Streaming form. OpenAI streams tool calls as deltas keyed by `index`, with `function.arguments`
+// permitted to arrive in pieces; one chunk carrying each call whole, with its index, is a valid
+// instance of that -- a client accumulates by index and sees exactly one piece. Text first, then
+// the calls, then the finish_reason, then [DONE]: the same order streamStringAsSSE uses.
+function streamToolCallsAsSSE(res, id, model, content, toolCalls) {
+  const created = Math.floor(Date.now() / 1000);
+  res.writeHead(200, { "Content-Type": "text/event-stream", "Cache-Control": "no-cache", "Connection": "keep-alive", "X-Accel-Buffering": "no" });
+  sendSSE(res, { id, object: "chat.completion.chunk", created, model, choices: [{ index: 0, delta: { role: "assistant", content: content || null }, finish_reason: null }] });
+  sendSSE(res, { id, object: "chat.completion.chunk", created, model, choices: [{ index: 0, delta: { tool_calls: toolCalls.map((c, i) => ({ index: i, ...c })) }, finish_reason: null }] });
+  sendSSE(res, { id, object: "chat.completion.chunk", created, model, choices: [{ index: 0, delta: {}, finish_reason: "tool_calls" }] });
+  res.write("data: [DONE]\n\n");
+  res.end();
+}
+
 function refusalResponse(res, id, model, refusal) {
   jsonResponse(res, 200, {
     id, object: "chat.completion",
@@ -3762,6 +3901,37 @@ async function runStructuredCompletion(upstreamCall, model, messages, conversati
   throw new StructuredOutputError(lastErr, lastRaw);
 }
 
+// ADR 0022: one tool turn. Spawns claude with the client's tools bridged in, and answers with
+// either `tool_calls` (the model chose a tool; the client runs it and calls back) or plain text
+// (the model answered). Deliberately outside the response cache -- a tool turn's answer depends on
+// tool results the cache key cannot see -- and outside the structured-output and TUI paths, which
+// the dispatch gate already excluded. Error handling mirrors the structured path's.
+async function handleToolTurn(req, res, model, messages, conversationId, parsed, stream) {
+  const t0 = Date.now();
+  const promptChars = messages.reduce((a, m) => a + contentToText(m.content).length, 0);
+  const mintId = () => `call_${randomUUID().replace(/-/g, "").slice(0, 24)}`;
+  try {
+    const r = await callClaude(model, messages, conversationId, req._authKeyName, res, { tools: parsed.tools });
+    const id = `chatcmpl-${randomUUID()}`;
+    if (r && typeof r === "object" && Array.isArray(r.toolCalls)) {
+      const calls = toolUsesToOpenAI(r.toolCalls, mintId);
+      if (stream) streamToolCallsAsSSE(res, id, model, r.text, calls);
+      else toolCallsResponse(res, id, model, r.text, calls);
+      try { recordUsage({ keyId: req._authKeyId, keyName: req._authKeyName, model, promptChars, responseChars: JSON.stringify(calls).length, elapsedMs: Date.now() - t0, success: true }); } catch (e) { logEvent("error", "usage_record_failed", { error: e.message }); }
+      return;
+    }
+    const content = typeof r === "string" ? r : "";
+    if (stream) streamStringAsSSE(res, id, model, content);
+    else completionResponse(res, id, model, content);
+    try { recordUsage({ keyId: req._authKeyId, keyName: req._authKeyName, model, promptChars, responseChars: content.length, elapsedMs: Date.now() - t0, success: true }); } catch (e) { logEvent("error", "usage_record_failed", { error: e.message }); }
+  } catch (err) {
+    if (err instanceof RequestDisconnectedError) { try { res.end(); } catch {} return; }
+    try { recordUsage({ keyId: req._authKeyId, keyName: req._authKeyName, model, promptChars, responseChars: 0, elapsedMs: Date.now() - t0, success: false }); } catch (e) { logEvent("error", "usage_record_failed", { error: e.message }); }
+    if (res.headersSent || res.writableEnded || res.destroyed) { try { res.end(); } catch {} return; }
+    return respondUpstreamError(res, err);
+  }
+}
+
 async function handleChatCompletions(req, res) {
   // #359: see handleSettings. Chunk boundaries are chosen by the kernel and the network, so a
   // multi-byte character in a prompt is split unpredictably rather than rarely; setEncoding makes
@@ -4072,6 +4242,27 @@ async function handleChatCompletions(req, res) {
   // Logged per request rather than latched: every one of these requests IS degraded, so per-request
   // is the accurate volume, and it keeps the log and the counter agreeing.
   const declaredTools = countDeclaredTools(parsed);
+
+  // ADR 0022: a request that declares `tools` is a TOOL TURN, served by its own path, when
+  //   * OCP_TOOL_CALLING is on (the default),
+  //   * the spawn lane is -p (the TUI lane composes its own prompt and has no MCP bridge),
+  //   * the tools are in the modern `tools` shape (the deprecated `functions` shape stays on the
+  //     counted-and-dropped path below; its response format differs and nobody has asked), and
+  //   * no response_format is set (structured output and tool calls are different contracts and
+  //     combining them was never measured).
+  // Everything the old path did before the spawn -- auth, model validation, message validation,
+  // image and quota gates, and classifyToolRequest's refusal of forcing tool_choice shapes -- has
+  // already run above this line and applies here unchanged.
+  const useToolCalling = declaredTools > 0 && TOOL_CALLING && !TUI_MODE
+    && Array.isArray(parsed.tools) && parsed.tools.length > 0 && !detectStructuredOutput(parsed);
+  if (useToolCalling) {
+    const bad = validateTools(parsed.tools);
+    if (bad) {
+      return jsonResponse(res, 400, { error: { message: bad, type: "invalid_request_error", param: "tools", code: "invalid_tools" } });
+    }
+    return handleToolTurn(req, res, model, messages, conversationId, parsed, stream);
+  }
+
   if (declaredTools > 0) {
     stats.toolRequestsDropped++;
     logEvent("warn", "openai_tools_dropped", {
@@ -4083,7 +4274,11 @@ async function handleChatCompletions(req, res) {
       // there is no amplification, but this repo's log has no rotation of its own. String() first
       // because an object's `type` need not be a string.
       toolChoice: String(typeof parsed.tool_choice === "string" ? parsed.tool_choice : (parsed.tool_choice?.type ?? "absent")).slice(0, 64),
-      note: "declared tools are not callable (ADR 0013); answered as text",
+      // Which gate kept this request off the tool path. One of: OCP_TOOL_CALLING=0, TUI lane,
+      // `functions` shape, or response_format present. Stated so an operator reading a non-zero
+      // toolRequestsDropped after ADR 0022 does not have to guess which.
+      reason: !TOOL_CALLING ? "OCP_TOOL_CALLING=0" : TUI_MODE ? "tui_lane" : !(Array.isArray(parsed.tools) && parsed.tools.length) ? "legacy_functions_shape" : "response_format_present",
+      note: "declared tools were not bridged; answered as text",
     });
   }
 
@@ -5152,6 +5347,11 @@ server.listen(PORT, BIND_ADDRESS, () => {
   console.log(`Prompt wrapper: ${SYSTEM_PROMPT_WRAPPER === OCP_SYSTEM_PROMPT_WRAPPER ? "denies local tools (schema is empty)"
                               : SYSTEM_PROMPT_WRAPPER === OCP_NEUTRAL_TOOLS_WRAPPER ? "neutral (tools granted, use not invited)"
                               : "invites local tools (OCP_LOCAL_TOOLS=1)"}`);
+  // ADR 0022. Reads the constant the dispatch gate reads, and says which lane, because the TUI lane
+  // never bridges regardless of the switch.
+  console.log(`Tool calling: ${!TOOL_CALLING ? "OFF (OCP_TOOL_CALLING=0) — declared tools are dropped and counted"
+    : TUI_MODE ? "OFF on the TUI lane — declared tools are dropped and counted"
+    : "ON — client tools are bridged into the -p spawn (ADR 0022)"}`);
   if (LOCAL_TOOLS_ACTIVE) console.log(`Local tools: ON (OCP_LOCAL_TOOLS=1) — model told it may use local tools; single-user/loopback only`);
   else if (LOCAL_TOOLS) console.warn(`⚠ OCP_LOCAL_TOOLS=1 is ignored in TUI mode (the -p system-prompt wrapper is not used). The TUI tool surface is governed by OCP_TUI_FULL_TOOLS.`);
   if (NO_CONTEXT) console.log(`Context: suppressed (CLAUDE_NO_CONTEXT=true — no CLAUDE.md, no auto-memory)`);

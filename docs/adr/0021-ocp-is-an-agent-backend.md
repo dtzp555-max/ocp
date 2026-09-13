@@ -71,7 +71,7 @@ sketched becomes the **target**, with its own stated risk unchanged:
 > questions that implies, on a proxy whose current design deliberately spawns one short-lived child
 > per request.
 
-**3. That implementation is NOT authorized by this ADR.** It needs its own ADR, its own risk surface
+**3. That implementation is NOT authorized by this ADR** — it is authorized by [ADR 0022](0022-openai-tool-calling-over-a-stateless-mcp-bridge.md) (2026-09-13), which built it stateless after measuring that the stateful design was not needed. It needs its own ADR, its own risk surface
 and its own review — exactly as 0013 said. This ADR authorizes the *direction* and the *staging*.
 
 **4. Three changes ship first, and none of them requires that implementation:**

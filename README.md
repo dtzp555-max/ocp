@@ -233,6 +233,7 @@ The canonical list lives in [`models.json`](./models.json) — the single source
 | `OCP_ADMIN_KEY` | *(unset)* | Admin key for key management (multi mode) |
 | `CLAUDE_BIN` | *(auto-detect)* | Path to claude binary |
 | `CLAUDE_TIMEOUT` | `600000` | Request timeout (ms, default: 10 min) |
+| `OCP_TOOL_CALLING` | `1` | OpenAI tool calling over the MCP bridge (ADR 0022). `0` restores the pre-0022 behaviour: declared `tools` are dropped, answered as text, and counted in `/health`'s `stats.toolRequestsDropped` with the reason logged. |
 | `CLAUDE_HEARTBEAT_INTERVAL` | `0` | Streaming SSE keepalive interval (ms). `0` = disabled. See ["Streaming heartbeat"](#streaming-heartbeat) below. |
 | `CLAUDE_MAX_CONCURRENT` | `8` | Max concurrent claude processes (`-p`/stream-json path) |
 | `CLAUDE_MAX_QUEUE` | `16` | Max requests **waiting** for a `-p` concurrency slot. Beyond `CLAUDE_MAX_CONCURRENT`, requests queue (up to this cap) instead of being rejected; when the queue is **also** full, the request gets `HTTP 429` + `Retry-After` (not an opaque 500). Surfaced on `/health.concurrency` + `/health.stats.queueRejections`. |
