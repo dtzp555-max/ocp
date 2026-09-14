@@ -4,6 +4,14 @@
 
 ### Fixed
 
+- **In `AUTH_MODE=multi`, a spawn carrying the client's tools is no longer told it has none (#479).** The system-prompt wrapper was chosen **once at boot** from `AUTH_MODE`, and in `multi` that is the *negative* one — *"You do NOT have access to any local filesystem … Respond only based on the conversation provided."* Correct for a multi-mode spawn whose schema is emptied; **false** for a multi-mode spawn that carries the client's tools through the bridge, which is exactly what `buildCliArgs` builds. Measured by #476's reviewer: argv `--tools "" --mcp-config … --allowedTools mcp__ocp__*` arriving with that denial in the prompt. It is the same contradiction [#473](https://github.com/dtzp555-max/ocp/issues/473) closed for the non-bridge case, reopened on one path.
+
+  The wrapper is now chosen **per spawn** when that spawn has a bridge: **neutral**, not positive — the bridged tools are the client's and run on the client, so OCP grants them without inviting their use, which is the client's instruction to give. `OCP_LOCAL_TOOLS=1` still takes precedence where it is active at all — which is **never in `multi`**: `localToolsSafetyError` refuses the boot outright for that combination (*"incompatible with CLAUDE_AUTH_MODE=multi"*), and it is also inert in TUI mode, which composes its own prompt and never reaches this function. So on the path this change touches, the precedence is unreachable rather than merely unlikely.
+
+  **The response cache is unaffected, and that is a fact about the call graph rather than a hope.** `CONFIG_EPOCH` hashes the boot-time wrapper into every cache key, so a per-spawn wrapper could in principle let two spawns with different prompts share an entry — they cannot, because `handleToolTurn` returns before the cache lookup, so a request that declares `tools` never reads or writes the cache at all.
+
+  Pinned by one live boot whose two requests are **each other's control** — the claim is that one instance sends *different* wrappers depending on the spawn, so a test checking either alone would pass on a build that sends one wrapper to everything. Each request also asserts its own premise (`--mcp-config` present / absent) before the wrapper assertion, or a build that dropped the bridge entirely would look like a pass. Mutation rows, all three red: back to the boot-time wrapper; neutral for *every* spawn (the over-correction); and dropping `toolBridge` at the call site while leaving the helper correct — the #339 shape.
+
 - **A vision agent can use tools (#477).** A request that declared `tools` and carried image content *anywhere* in the conversation was refused the bridge outright — dropped, counted, reason `image_content`, and the agent got prose. The reason it was refused is what the fix had to make false: the multimodal spawn path serialises history through `buildStreamJsonInput`, which knew nothing of `assistant.tool_calls` or `tool` messages, so on turn 2 a vision agent saw the bridge but not its own prior call or the client's result — **measured by #476's reviewer with a real model: it re-called the tool with identical arguments and never saw the result**, while the text-only control passed.
 
   `buildImageBlocks` now calls the **same** `renderToolTurn` / `endsWithToolResult` / `TOOL_CONTINUATION_NOTE` the text path uses — imported, not re-implemented, because a second copy of `[Assistant called tool X with arguments …]` would drift silently and the wording is the thing that was measured to turn a re-call into an answer. The rendered turns become text blocks in the same order, with the continuation note as a trailing block, and a rendered turn is **not** given `rolePrefix` on top (it carries its own marker).
@@ -23,7 +31,6 @@
   The `image_content` drop reason is removed rather than left unreachable, and the test that asserted the old refusal is **inverted** rather than deleted: it now asserts the bridge is wired on the image path *and* that the rendered call, result, value and note reach the spawn's stdin **in that order** — anchored by index before any ordering claim, since `-1` is "absent", not "early". Mutation rows: stop rendering tool turns → red; drop the continuation note → red; restore the image exclusion → red; drop a rendered turn's own image → red; apply `rolePrefix` on top of a rendered turn → **green until an assertion was added for it**, which is why the doubled-`[Assistant]` case is now pinned explicitly.
 
   One review finding has **no row and is recorded that way**: the test waited on the stdin capture file *existing*, which turn 1 had already created — so the wait was vacuous and the read raced turn 2's overwrite. It now waits for the turn-2-only nonce. A vacuous wait cannot be made to redden on demand; it makes a test flaky rather than false, so there is no mutation to claim.
-
 
 - **A parallel tool call is no longer truncated to one, and the text preamble no longer vanishes (#478).** The CLI emits **one `assistant` event per content block**, so a message carrying two parallel calls arrives as two events ~100 ms apart. OCP ended the spawn on the **first** `tool_use`, so the client got 1 of N; the model re-issued the rest on the next turn, converging at one wasted round trip each and a history that diverged from what the model actually emitted. A preamble written in its own block arrived in an event with no `tool_use`, and the tool event's own text was empty, so the response carried `content: null` while the model had written something.
 
@@ -52,7 +59,6 @@
 
   Pinned by mutation rows on the behaviour, not on the flag list: reverting to first-call-only reddens both new tests, removing the end-signal recognition reddens the parallel one, dropping the preamble fallback reddens the `content` assertion, and removing the flag reddens the argv `deepEqual` that ADR 0022 already kept.
 
-
 - **Corrected a v3.35.0 claim about which lane real agent traffic takes.** The v3.35.0 section below says *"an agent framework pointed at OCP sends `stream: true` for the turn itself, so a counter blind to that lane would read `0` on exactly the deployment that motivated the field."* **The observation is right and the conclusion drawn from it is wrong**, and the released section is left as it stands rather than quietly edited — a changelog that rewrites what it said is worth less than one that says it was wrong.
 
   What was never checked is **which handler** such a request reaches. The same framework's turn also declares `tools` — 20 of them, measured — and with tool calling on (the default since 3.34.0) a request that declares tools is served by the tool path, which **awaits** the spawn and only writes SSE afterwards. No headers have been sent when the failure arrives, so it still gets a real `429`. Measured against a live 3.35.0 instance whose upstream fails with a wall:
@@ -67,9 +73,6 @@
   **The lane split is now pinned by a test**, because it had drifted into four artifacts unchecked: one live boot sends both shapes and asserts the statuses *and* the two log lanes, the two requests being each other's control — a test asserting either alone would pass on a build where both behave the same. Mutation rows: forcing the tool request down the streaming lane reddens it, and so does dropping the lane label from the log. **Pinned on POSIX only**: the fixture's fake `claude` is a `/bin/sh` script, so the test early-returns on `win32`. CI is `ubuntu-latest` today, so that costs nothing now — stated because a Windows runner added later would make this sentence quietly false rather than red.
 
   Same correction applied to `README.md` and to the comment in `server.mjs`; [#482](https://github.com/dtzp555-max/ocp/issues/482) updated, since it had inherited the same framing.
-
-
-
 ## v3.35.0 — 2026-09-14
 
 > **Governance audit for this section**, per `CLAUDE.md`'s `release_kit.governance_audits`.

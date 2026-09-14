@@ -6353,6 +6353,64 @@ ltTest("integration: stream+tools keeps a real 429 — only a TOOL-LESS stream l
   } finally { _ltRmRetry(dir); }
 });
 
+// #479 / ADR 0021 item 2. In AUTH_MODE=multi the boot-time wrapper is the NEGATIVE one -- correct
+// for a spawn whose schema is emptied, and false for a spawn that carries the client's tools
+// through the bridge. The two assertions are each other's control and must stay in one test: the
+// claim is that the SAME instance sends different wrappers depending on the spawn, so a test that
+// checked either alone would pass on a build that sends one wrapper to everything.
+ltTest("integration (#479): in multi mode a BRIDGE spawn gets the neutral wrapper, a plain one still gets the denial", async () => {
+  if (!LT_POSIX) return;
+  const dir = ltMkdir(); const fake = ltFake(dir);
+  const cap = join(dir, "sp.txt");
+  const argvFile = join(dir, "argv.txt");
+  try {
+    const { child, buf, port } = await ltBootFresh({
+      CLAUDE_BIN: fake, SP_CAPTURE: cap, ARGV_CAPTURE: argvFile,
+      CLAUDE_AUTH_MODE: "multi", PROXY_API_KEY: "test-multi-key",
+    }, dir);
+    try {
+      assert.ok(await ltWait(() => buf.out.includes("listening on")), `— ${ltDiag(buf)}`);
+      const auth = { Authorization: "Bearer test-multi-key" };
+      const TOOL = { type: "function", function: { name: "lookup_build_id", parameters: { type: "object" } } };
+
+      // A) a spawn WITH tools: the bridge is wired, so the prompt must not deny tools.
+      const r1 = await ltPostStatus(port, { model: "sonnet", tools: [TOOL], messages: [{ role: "user", content: "hi" }] }, auth);
+      assert.equal(r1.status, 200, `${r1.status} ${r1.text.slice(0, 200)}`);
+      assert.ok(await ltWait(() => _ltExists(cap) && _ltRead(cap, "utf8").includes("OCP HTTP proxy")), "no system prompt captured for the bridge spawn");
+      const argv1 = ltArgvCalls(argvFile);
+      // Premise: this really was a bridge spawn. Without it the wrapper assertion below proves
+      // nothing -- a build that dropped the bridge entirely would also stop denying tools.
+      assert.ok(argv1.includes("--mcp-config"), `premise: the bridge must be wired — ${JSON.stringify(argv1.slice(-8))}`);
+      const spBridge = _ltRead(cap, "utf8");
+      assert.match(spBridge, /Use only the tools actually provided to you in this session/,
+        `a bridge spawn must get the NEUTRAL wrapper — ${spBridge.slice(0, 300)}`);
+      assert.ok(!spBridge.includes("You do NOT have access to any local filesystem"),
+        `…and must not also carry the denial — ${spBridge.slice(0, 300)}`);
+
+      // B) a spawn WITHOUT tools, same instance, same auth mode: the denial is still correct there,
+      // because that spawn's schema really is empty.
+      const r2 = await ltPostStatus(port, { model: "sonnet", messages: [{ role: "user", content: "hi" }] }, auth);
+      assert.equal(r2.status, 200, `${r2.status} ${r2.text.slice(0, 200)}`);
+      // The wait is on a B-ONLY marker: only the plain spawn writes the denial, so this cannot
+      // unblock on A's capture. And reading argv after it is safe by the fake's own write ORDER --
+      // ARGV_CAPTURE is written (truncate + rename, per call, NOT cumulative) BEFORE the
+      // --system-prompt-file loop that writes SP_CAPTURE, so by the time the denial is visible the
+      // same invocation's argv already is. Checked in the fixture rather than assumed, because a
+      // reviewer read it the other way round.
+      assert.ok(await ltWait(() => _ltRead(cap, "utf8").includes("You do NOT have access")),
+        `a plain multi-mode spawn must STILL get the denial — ${_ltRead(cap, "utf8").slice(0, 300)}`);
+      const plainPrompt = _ltRead(cap, "utf8");
+      // ...and NOT the neutral one. Without this, a build that sent the neutral wrapper to every
+      // spawn AND the denial to plain ones would pass both halves, which is the "each other's
+      // control" property only half-enforced.
+      assert.ok(!plainPrompt.includes("Use only the tools actually provided to you in this session"),
+        `a plain multi-mode spawn must not ALSO carry the neutral wrapper — ${plainPrompt.slice(0, 300)}`);
+      const argv2 = ltArgvCalls(argvFile);
+      assert.ok(!argv2.includes("--mcp-config"), `premise: no bridge on the plain spawn — ${JSON.stringify(argv2.slice(-8))}`);
+    } finally { child.kill("SIGKILL"); await ltDrain(() => buf.closed, "multi-wrapper", 5000); }
+  } finally { _ltRmRetry(dir); }
+});
+
 console.log("\nOpenAI tool calling over the MCP bridge (ADR 0022):");
 
 // ── unit: the pure helpers ──────────────────────────────────────────────────────────────────────

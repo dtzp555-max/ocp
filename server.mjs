@@ -260,15 +260,37 @@ const LOCAL_TOOLS_ACTIVE = LOCAL_TOOLS && process.env.CLAUDE_TUI_MODE !== "true"
 // then the operator-wide CLAUDE_SYSTEM_PROMPT appended LAST (lib/prompt.mjs — a
 // no-op returning the same string when the var is unset, so the default path is
 // byte-for-byte unchanged). ADR 0009 Amendment 1 analogue § "OLP system prompt wrapper".
-function extractSystemPrompt(messages) {
+// #479 / ADR 0021 item 2: the wrapper is chosen PER SPAWN when that spawn carries a tool bridge,
+// not once at boot. The boot-time constant reads AUTH_MODE, and in `multi` it is the NEGATIVE
+// wrapper -- "You do NOT have access to any local filesystem ... Respond only based on the
+// conversation provided." That is correct for a multi-mode spawn with an emptied schema, and FALSE
+// for a multi-mode spawn that carries the client's tools through the bridge: MEASURED by #476's
+// reviewer, argv `--tools "" --mcp-config … --allowedTools mcp__ocp__*` arriving with that denial
+// in the system prompt. It is the same contradiction #473 closed for the non-bridge case, reopened
+// on one path -- and #473's own lesson is that the model is told it has nothing while the init
+// event shows it a schema.
+//
+// NEUTRAL, not positive: the bridged tools are the CLIENT's and run on the client, so OCP grants
+// them but does not invite their use -- how a granted tool gets used is the client's instruction to
+// give, not the proxy's. `OCP_LOCAL_TOOLS=1` still wins, because that is an explicit operator
+// invitation and is boot-gated to loopback/single-user.
+//
+// THE RESPONSE CACHE IS NOT AFFECTED, and that is a fact about the call graph rather than a hope:
+// CONFIG_EPOCH hashes the boot-time wrapper into every cache key, so a per-spawn wrapper could in
+// principle let two spawns with different prompts share an entry. They cannot -- `handleToolTurn`
+// returns from handleChatCompletions BEFORE the cache lookup, so a request that declares tools
+// never reads or writes the cache at all. Only non-bridge spawns are cached, and those still use
+// the boot-time wrapper this epoch was computed from.
+function extractSystemPrompt(messages, opts = {}) {
+  const wrapper = opts.toolBridge && !LOCAL_TOOLS_ACTIVE ? OCP_NEUTRAL_TOOLS_WRAPPER : SYSTEM_PROMPT_WRAPPER;
   const systemMessages = (messages ?? []).filter(m => m.role === "system");
   if (systemMessages.length === 0) {
-    return appendOperatorPrompt(SYSTEM_PROMPT_WRAPPER, SYSTEM_PROMPT);
+    return appendOperatorPrompt(wrapper, SYSTEM_PROMPT);
   }
   const clientContent = systemMessages.map(m =>
     contentToText(m.content)
   ).join("\n\n");
-  return appendOperatorPrompt(`${SYSTEM_PROMPT_WRAPPER}\n\n${clientContent}`, SYSTEM_PROMPT);
+  return appendOperatorPrompt(`${wrapper}\n\n${clientContent}`, SYSTEM_PROMPT);
 }
 
 // ── NDJSON line buffer parser (Phase 6c port) ─────────────────────────────
@@ -1783,18 +1805,23 @@ function spawnClaudeProcess(model, messages, conversationId, keyName, releaseSlo
   // Phase 6c: always serialize full conversation via stdin (no session resume).
   // System messages are extracted and passed via --system-prompt-file; the remaining
   // messages (user/assistant/tool) are serialized for stdin.
-  const systemPrompt = extractSystemPrompt(messages);
-
-  // The path is computed here (a pure string) but the file is NOT written until immediately
-  // before spawn(), so the window in which an orphan can exist is one function call wide.
-  const systemPromptFile = join(tmpdir(), `ocp-sysprompt-${randomUUID()}.txt`);
   // ADR 0022: two more 0600 files for a tool-bridge spawn, same lifecycle as the prompt file --
   // written one call before spawn(), removed in cleanup(). The tools file is what the bridge
   // serves; the config file is what `--mcp-config` reads. Paths computed here, written below.
+  //
+  // Computed BEFORE the system prompt (#479), because the prompt's wrapper now depends on it: a
+  // spawn that carries the bridge must not be told it has no tools. The two were the other way
+  // round until the wrapper became per-spawn.
   const toolBridge = Array.isArray(opts.tools) && opts.tools.length ? {
     toolsFile: join(tmpdir(), `ocp-tools-${randomUUID()}.json`),
     configFile: join(tmpdir(), `ocp-mcp-${randomUUID()}.json`),
   } : null;
+
+  const systemPrompt = extractSystemPrompt(messages, { toolBridge });
+
+  // The path is computed here (a pure string) but the file is NOT written until immediately
+  // before spawn(), so the window in which an orphan can exist is one function call wide.
+  const systemPromptFile = join(tmpdir(), `ocp-sysprompt-${randomUUID()}.txt`);
 
   // messagesToPrompt / buildStreamJsonInput skip system messages (they go via
   // --system-prompt-file). Filter them out first to avoid double-injection.
