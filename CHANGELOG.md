@@ -2,6 +2,40 @@
 
 ## Unreleased
 
+
+## v3.36.0 — 2026-09-14
+
+> **Governance audit for this section**, per `CLAUDE.md`'s `release_kit.governance_audits`.
+>
+> **No B.2 key-set change this cycle.** Written rather than omitted, per the `report:` clause — a
+> releaser reading only the count cannot otherwise tell a cycle that was audited and added nothing
+> from a cycle nobody audited.
+>
+> From the **wire**: `node scripts/b2-key-snapshot.mjs` prints *"B.2 response key sets match the
+> snapshot (2 profiles)"* and exits 0. From **git**:
+> `git diff v3.35.0..HEAD -- docs/governance/b2-response-keys.json` → **empty**. **Control for the
+> command:** the same command with the left endpoint moved to `dd90be3^` gives **7 added / 5
+> removed**, so an empty result is a measurement and not a command that always prints nothing.
+> **Cumulative ADR 0012 count: 5, unchanged.**
+>
+> **FOUR PRs, FIVE ENTRIES**, and the claim below covers all five. The two counts differ because
+> PR #487 contributed two entries — the parallel-call fix and the boot capability gate — and because
+> the entries cite ISSUE numbers while this audit cites PR numbers, so `#479` in an entry and `#489`
+> in this list are the same change. Spelled out because an earlier draft of this block said "four
+> changes", which read as an exhaustive enumeration over a population of five: a reader reconciling
+> the two could reasonably conclude one shipped change had not been audited.
+>
+> | entry | PR | touches a B.2 response shape? |
+> |---|---|---|
+> | which lane agent traffic takes (correction) | #486 | no — documentation and one test |
+> | parallel tool calls + preamble (#478) | #487 | no — the `-p` spawn's argv and stream parsing |
+> | the boot capability gate covers the tool path | #487 | no — a boot-time probe |
+> | a vision agent can use tools (#477) | #488 | no — prompt construction for the spawn |
+> | the multi-mode wrapper (#479) | #489 | no — the spawn's system prompt |
+>
+> The one new **environment variable**, `OCP_TOOL_TURN_QUIESCE_MS`, is documented in the README's
+> table per `new_feature_doc_expectations`.
+
 ### Fixed
 
 - **In `AUTH_MODE=multi`, a spawn carrying the client's tools is no longer told it has none (#479).** The system-prompt wrapper was chosen **once at boot** from `AUTH_MODE`, and in `multi` that is the *negative* one — *"You do NOT have access to any local filesystem … Respond only based on the conversation provided."* Correct for a multi-mode spawn whose schema is emptied; **false** for a multi-mode spawn that carries the client's tools through the bridge, which is exactly what `buildCliArgs` builds. Measured by #476's reviewer: argv `--tools "" --mcp-config … --allowedTools mcp__ocp__*` arriving with that denial in the prompt. It is the same contradiction [#473](https://github.com/dtzp555-max/ocp/issues/473) closed for the non-bridge case, reopened on one path.
