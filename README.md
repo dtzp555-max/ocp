@@ -165,11 +165,13 @@ OCP translates OpenAI-compatible `/v1/chat/completions` requests into `claude --
 | `tool_choice` `"none"` | **served on the plain path** — the spec says the model will not call a tool, and text is the mandated outcome; not counted as dropped |
 | `tool_choice` `"required"`, `{"type":"function"}`, `{"type":"custom"}`, or `allowed_tools` `mode: "required"` | **`400`** — the CLI cannot be forced, and a forced call the model does not make would be a silently wrong answer (ADR 0013's analysis, still in force) |
 | legacy `functions` / `function_call` | `functions` is **dropped and counted** (reason `legacy_functions_shape`); `function_call: {"name": …}` is **`400`** |
-| `tools` together with `response_format`, or with **image content** anywhere in the conversation, or on the **TUI lane** | **dropped and counted**, reason logged — see the boundary below |
+| `tools` together with `response_format`, or on the **TUI lane** | **dropped and counted**, reason logged — see the boundary below |
 
 Every drop increments `/health`'s `stats.toolRequestsDropped` and logs `openai_tools_dropped` with a `reason`; every bridged call increments `stats.toolCallsEmitted`. With `OCP_TOOL_CALLING=0` (see § Environment Variables) every declared tool is dropped and counted, which is the pre-3.34.0 behaviour.
 
-**Two limits worth knowing before pointing an agent at OCP.** A request that declares `tools` and asks for `stream: true` receives its response as SSE **once the turn completes**, not token by token. And the image exclusion above is a **scope boundary, not a design position**: the multimodal spawn path does not yet render tool turns, and a vision agent with tools was measured (by this change's reviewer, with a real model) to re-call its tool indefinitely if allowed through — so it is refused onto the plain path until that path is done.
+**One limit worth knowing before pointing an agent at OCP.** A request that declares `tools` and asks for `stream: true` receives its response as SSE **once the turn completes**, not token by token.
+
+**Images and tools work together** as of #477. They did not before: the multimodal spawn path did not render tool turns, so a vision agent was measured — with a real model — to re-call its tool indefinitely, and such requests were refused onto the plain path. That path now renders the same call/result/continuation text the text path does. Verified with a real model: fed its own tool result back with the image still in the history, the model answers from the result (no re-call) **and** describes the image.
 
 The tools the bridge grants run on the **client**, so this works in every auth mode, including `AUTH_MODE=multi`: a guest calling its own tool touches nothing on the OCP host. What the model can do on the host itself is a separate question, governed by `--allowedTools` and `OCP_LOCAL_TOOLS` below — and when a request declares client tools, the host-side built-ins are emptied for that spawn so there is exactly one way to do each thing.
 
@@ -245,7 +247,7 @@ A **streaming request that declares `tools`** is not affected, and that is the s
 | `stream: true` **with** `tools` | **429** | `buffered` |
 | `stream: true` without `tools` | 200 + SSE error frame | `streaming` |
 
-So the blind spot is real but narrow: it needs `stream: true`, no tools — or `OCP_TOOL_CALLING=0`, or a request the tool path excludes (image content, `response_format`, the legacy `functions` shape, `tool_choice: "none"`).
+So the blind spot is real but narrow: it needs `stream: true`, no tools — or `OCP_TOOL_CALLING=0`, or a request the tool path excludes (`response_format`, the legacy `functions` shape, `tool_choice: "none"`).
 
 ## Environment Variables
 

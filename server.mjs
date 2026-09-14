@@ -4450,21 +4450,22 @@ async function handleChatCompletions(req, res) {
   // Everything the old path did before the spawn -- auth, model validation, message validation,
   // image and quota gates, and classifyToolRequest's refusal of forcing tool_choice shapes -- has
   // already run above this line and applies here unchanged.
-  //   * no image content anywhere in the conversation. The multimodal spawn path serialises the
-  //     history through buildStreamJsonInput, which does not render tool turns -- so on turn 2 of a
-  //     vision agent the model would see the bridge but not its own prior call or the client's
-  //     result, and re-call the tool forever. MEASURED by the PR's independent reviewer with a real
-  //     model (haiku, claude 2.1.270): turn 2 given a fresh nonce re-called with identical arguments,
-  //     nonce absent; the text-only control passed. Excluded here rather than left as a loop, and
-  //     counted as dropped with reason `image_content`. Rendering tool turns on the multimodal path
-  //     is the real fix and is a follow-up, not this PR.
+  //   * IMAGE CONTENT IS NO LONGER EXCLUDED (#477). It was, and the reason is worth keeping because
+  //     it is what the fix had to make false: the multimodal spawn path serialises history through
+  //     buildStreamJsonInput, which did not render tool turns -- so on turn 2 a vision agent saw the
+  //     bridge but not its own prior call or the client's result, and re-called the tool forever.
+  //     MEASURED by #476's independent reviewer with a real model (haiku, claude 2.1.270): turn 2
+  //     given a fresh nonce re-called with identical arguments, nonce absent; the text-only control
+  //     passed. buildImageBlocks now calls the SAME renderToolTurn / endsWithToolResult /
+  //     TOOL_CONTINUATION_NOTE the text path uses, emitting them as text blocks in the same order,
+  //     so the history a vision agent sees on turn 2 is the history a text agent sees.
   //   * `tool_choice` is not "none". The spec says "none" means the model will not call any tool
   //     and generates a message -- OCP satisfies that on the plain path, exactly as before, and does
   //     not count it as a drop because text IS the mandated outcome.
   const toolChoiceNone = parsed.tool_choice === "none";
   const useToolCalling = declaredTools > 0 && TOOL_CALLING && !TUI_MODE
     && Array.isArray(parsed.tools) && parsed.tools.length > 0 && !detectStructuredOutput(parsed)
-    && !hasImageContent(messages) && !toolChoiceNone;
+    && !toolChoiceNone;
   if (useToolCalling) {
     const bad = validateTools(parsed.tools);
     if (bad) {
@@ -4490,7 +4491,7 @@ async function handleChatCompletions(req, res) {
       reason: !TOOL_CALLING ? "OCP_TOOL_CALLING=0" : TUI_MODE ? "tui_lane"
         : !(Array.isArray(parsed.tools) && parsed.tools.length) ? "legacy_functions_shape"
         : detectStructuredOutput(parsed) ? "response_format_present"
-        : hasImageContent(messages) ? "image_content" : "unknown",
+        : "unknown",
       note: "declared tools were not bridged; answered as text",
     });
   }

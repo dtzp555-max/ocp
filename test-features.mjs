@@ -6633,26 +6633,87 @@ ltTest("integration (ADR 0022): with stream:true the tool_calls arrive as one in
   } finally { _ltRmRetry(dir); }
 });
 
-ltTest("integration (ADR 0022): image content anywhere routes to the plain path, counted with reason image_content", async () => {
+// #477 INVERTS the test that used to live here. Until now an image ANYWHERE in the conversation
+// refused tool calling outright, because the multimodal spawn path did not render tool turns and a
+// vision agent's turn 2 would re-call forever. Both halves are asserted, because the claim is that
+// the image path now behaves like the text path and one assertion cannot say that:
+//   turn 1 -- the bridge is wired even though an image is present (it used to be refused), and
+//   turn 2 -- the rendered call, result and continuation note reach the spawn's stdin IN ORDER,
+//             which is the thing whose absence caused the re-call loop.
+ltTest("integration (#477): an image request IS bridged, and its tool history reaches the next spawn", async () => {
   if (!LT_POSIX) return;
   const dir = ltMkdir(); const fake = ltFake(dir);
   const argvFile = join(dir, "argv.txt");
+  const stdinFile = join(dir, "stdin.txt");
   try {
-    const { child, buf, port } = await ltBootFresh({ CLAUDE_BIN: fake, ARGV_CAPTURE: argvFile }, dir);
+    const { child, buf, port } = await ltBootFresh({ CLAUDE_BIN: fake, ARGV_CAPTURE: argvFile, STDIN_CAPTURE: stdinFile, TOOL_USE_NAME: "lookup_build_id" }, dir);
     try {
       assert.ok(await ltWait(() => buf.out.includes("listening on")), `— ${ltDiag(buf)}`);
       const TOOL = { type: "function", function: { name: "lookup_build_id", parameters: { type: "object" } } };
       const PNG = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNkYAAAAAYAAjCB0C8AAAAASUVORK5CYII=";
-      const r = await ltPostStatus(port, { model: "sonnet", tools: [TOOL], messages: [
-        { role: "user", content: [{ type: "text", text: "what is this?" }, { type: "image_url", image_url: { url: PNG } }] },
-      ] });
-      assert.equal(r.status, 200, `${r.status} ${r.text.slice(0, 200)}`);
-      const body = JSON.parse(r.text);
-      assert.equal(body.choices[0].message.tool_calls, undefined, "an image request must not be bridged (the multimodal path does not render tool turns)");
+      const imageTurn = { role: "user", content: [{ type: "text", text: "what is this?" }, { type: "image_url", image_url: { url: PNG } }] };
+
+      // TURN 1: the bridge must be wired. This is the assertion the old test made backwards.
+      const r1 = await ltPostStatus(port, { model: "sonnet", tools: [TOOL], messages: [imageTurn] });
+      assert.equal(r1.status, 200, `${r1.status} ${r1.text.slice(0, 200)}`);
+      const calls = JSON.parse(r1.text).choices[0].message.tool_calls;
+      assert.ok(Array.isArray(calls) && calls.length === 1, `an image request must now be bridged — got ${r1.text.slice(0, 250)}`);
       const argv = ltArgvCalls(argvFile);
       assert.ok(argv.length > 0, "no argv captured");
-      assert.ok(!argv.includes("--mcp-config"), `no bridge on the image path: ${JSON.stringify(argv.slice(-8))}`);
-      assert.ok(await ltWait(() => /"reason":"image_content"/.test(buf.err)), `the drop must say WHY — ${buf.err.slice(-400)}`);
+      assert.ok(argv.includes("--mcp-config"), `the bridge must be wired on the image path: ${JSON.stringify(argv.slice(-8))}`);
+      // ...and it is still the MULTIMODAL lane, or this proves nothing about that lane.
+      assert.ok(argv.includes("--input-format"), `still the stream-json input path: ${JSON.stringify(argv.slice(-10))}`);
+
+      // TURN 2: the history the model actually receives. Anchor on the ORDER, because the failure
+      // this replaces was not "the text is missing" but "the model never learned the result".
+      const NONCE = "NONCE-" + Math.random().toString(36).slice(2, 10);
+      const r2 = await ltPostStatus(port, { model: "sonnet", tools: [TOOL], messages: [
+        imageTurn,
+        { role: "assistant", content: "Let me look that up.", tool_calls: [{ id: "call_x1", type: "function", function: { name: "lookup_build_id", arguments: '{"project":"alpha"}' } }] },
+        { role: "tool", tool_call_id: "call_x1", content: NONCE },
+      ] });
+      assert.equal(r2.status, 200, `${r2.status} ${r2.text.slice(0, 200)}`);
+      // WAIT FOR TURN 2'S CAPTURE, not for the file. Turn 1 is bridged now, so it captured stdin
+      // too and the file already exists — `_ltExists` returns true immediately and says nothing
+      // about whose capture is in it. STDIN_CAPTURE is write-then-rename (overwrite), so reading on
+      // mere existence races turn 2's write and can read TURN 1. The nonce appears only in turn 2,
+      // which makes it the thing to wait for. (#405: wait for what you are about to assert.)
+      assert.ok(await ltWait(() => _ltExists(stdinFile) && _ltRead(stdinFile, "utf8").includes(NONCE)),
+        `turn 2's stdin capture never appeared — ${_ltExists(stdinFile) ? _ltRead(stdinFile, "utf8").slice(0, 300) : "(no file)"}`);
+      const stdin = _ltRead(stdinFile, "utf8");
+      const iCall = stdin.indexOf("[Assistant called tool lookup_build_id");
+      const iResult = stdin.indexOf("[Tool lookup_build_id returned]");
+      const iNonce = stdin.indexOf(NONCE);
+      const iNote = stdin.indexOf("results are final");
+      // Anchors by INDEX before any ordering claim (#347): -1 is not "early", it is "absent".
+      assert.ok(iCall > -1, `the rendered CALL must reach the spawn — ${stdin.slice(0, 400)}`);
+      assert.ok(iResult > -1, `the rendered RESULT must reach the spawn — ${stdin.slice(0, 400)}`);
+      assert.ok(iNonce > -1, `the client's own result value must reach the spawn — ${stdin.slice(0, 400)}`);
+      assert.ok(iNote > -1, `the continuation note must reach the spawn — ${stdin.slice(0, 400)}`);
+      assert.ok(iCall < iResult && iResult < iNonce && iNonce < iNote,
+        `order must be call → result → value → note, got ${iCall}/${iResult}/${iNonce}/${iNote}`);
+      // The image is still there: rendering the history must not have displaced it.
+      assert.match(stdin, /"type":"image"/, `the image block must survive alongside the rendered turns — ${stdin.slice(0, 300)}`);
+      // A rendered turn already carries its own role marker, so rolePrefix must NOT be applied on
+      // top. Without this the two paths drift by a doubled `[Assistant] [Assistant]` and every other
+      // assertion here still passes — found because the mutation that adds the prefix came back
+      // GREEN. The positive anchors above are what make this negative safe to trust.
+      assert.ok(!stdin.includes("[Assistant] [Assistant]"),
+        `the rendered turn must not be given a SECOND role prefix — ${stdin.slice(0, 400)}`);
+      // A rendered turn's OWN image must survive too. Rendering flattens content to text, so a bare
+      // `continue` dropped an image carried BY a tool result -- silently, and without counting it.
+      // Two images in, two images out; measured against origin/main, which emits two.
+      const r3 = await ltPostStatus(port, { model: "sonnet", tools: [TOOL], messages: [
+        imageTurn,
+        { role: "assistant", content: "Let me look.", tool_calls: [{ id: "call_x2", type: "function", function: { name: "lookup_build_id", arguments: "{}" } }] },
+        { role: "tool", tool_call_id: "call_x2", content: [{ type: "text", text: "chart:" }, { type: "image_url", image_url: { url: PNG } }] },
+      ] });
+      assert.equal(r3.status, 200, `${r3.status} ${r3.text.slice(0, 200)}`);
+      assert.ok(await ltWait(() => _ltExists(stdinFile) && _ltRead(stdinFile, "utf8").includes("chart:")),
+        "turn 3's stdin capture never appeared");
+      const stdin3 = _ltRead(stdinFile, "utf8");
+      const imgs = (stdin3.match(/"type":"image"/g) || []).length;
+      assert.equal(imgs, 2, `an image carried BY a tool result must survive the rendering — got ${imgs} image blocks`);
     } finally { child.kill("SIGKILL"); await ltDrain(() => buf.closed, "tool-image", 5000); }
   } finally { _ltRmRetry(dir); }
 });

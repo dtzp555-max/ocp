@@ -4,6 +4,27 @@
 
 ### Fixed
 
+- **A vision agent can use tools (#477).** A request that declared `tools` and carried image content *anywhere* in the conversation was refused the bridge outright — dropped, counted, reason `image_content`, and the agent got prose. The reason it was refused is what the fix had to make false: the multimodal spawn path serialises history through `buildStreamJsonInput`, which knew nothing of `assistant.tool_calls` or `tool` messages, so on turn 2 a vision agent saw the bridge but not its own prior call or the client's result — **measured by #476's reviewer with a real model: it re-called the tool with identical arguments and never saw the result**, while the text-only control passed.
+
+  `buildImageBlocks` now calls the **same** `renderToolTurn` / `endsWithToolResult` / `TOOL_CONTINUATION_NOTE` the text path uses — imported, not re-implemented, because a second copy of `[Assistant called tool X with arguments …]` would drift silently and the wording is the thing that was measured to turn a re-call into an answer. The rendered turns become text blocks in the same order, with the continuation note as a trailing block, and a rendered turn is **not** given `rolePrefix` on top (it carries its own marker).
+
+  **Verified with a real model against this branch**, which is the measurement that cannot be faked — turn 1: an image request now comes back `finish_reason: tool_calls`; turn 2, fed the result back with the image still in the history:
+
+  | check | result |
+  |---|---|
+  | re-called the tool? | **no** — `finish_reason: stop` |
+  | saw the client's result? | yes — the value appears in the answer |
+  | saw the image? | yes — *"The image is **red** — a solid bright red square"* |
+
+  The first run of that check used a 1×1 **transparent** PNG and the model said it could not see an image. That was the picture being blank, not the block being dropped — established by re-running with an 8×8 solid red PNG rather than by assuming, because "the model didn't mention it" and "the model never got it" are the same sentence from the outside.
+
+  **The first version of this change dropped an image and the review caught it.** `renderToolTurn` flattens a message's content to text, so a bare `continue` past the generic path meant an image carried **by** a tool result — a returned chart — never reached the CLI, and did not even increment the image counters. Measured against `origin/main`, which emits **two** image blocks for that history: the first version of this branch emitted **one**. A rendered turn's own non-text parts now still go through, pinned by a row that reddens when they don't.
+
+  The `image_content` drop reason is removed rather than left unreachable, and the test that asserted the old refusal is **inverted** rather than deleted: it now asserts the bridge is wired on the image path *and* that the rendered call, result, value and note reach the spawn's stdin **in that order** — anchored by index before any ordering claim, since `-1` is "absent", not "early". Mutation rows: stop rendering tool turns → red; drop the continuation note → red; restore the image exclusion → red; drop a rendered turn's own image → red; apply `rolePrefix` on top of a rendered turn → **green until an assertion was added for it**, which is why the doubled-`[Assistant]` case is now pinned explicitly.
+
+  One review finding has **no row and is recorded that way**: the test waited on the stdin capture file *existing*, which turn 1 had already created — so the wait was vacuous and the read raced turn 2's overwrite. It now waits for the turn-2-only nonce. A vacuous wait cannot be made to redden on demand; it makes a test flaky rather than false, so there is no mutation to claim.
+
+
 - **A parallel tool call is no longer truncated to one, and the text preamble no longer vanishes (#478).** The CLI emits **one `assistant` event per content block**, so a message carrying two parallel calls arrives as two events ~100 ms apart. OCP ended the spawn on the **first** `tool_use`, so the client got 1 of N; the model re-issued the rest on the next turn, converging at one wasted round trip each and a history that diverged from what the model actually emitted. A preamble written in its own block arrived in an event with no `tool_use`, and the tool event's own text was empty, so the response carried `content: null` while the model had written something.
 
   **Measured on `claude` 2.1.270** before the design was chosen, by reproducing `buildCliArgs`' exact bridge argv and asking for both calls at once:
