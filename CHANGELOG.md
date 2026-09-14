@@ -4,6 +4,34 @@
 
 ### Fixed
 
+- **A parallel tool call is no longer truncated to one, and the text preamble no longer vanishes (#478).** The CLI emits **one `assistant` event per content block**, so a message carrying two parallel calls arrives as two events ~100 ms apart. OCP ended the spawn on the **first** `tool_use`, so the client got 1 of N; the model re-issued the rest on the next turn, converging at one wasted round trip each and a history that diverged from what the model actually emitted. A preamble written in its own block arrived in an event with no `tool_use`, and the tool event's own text was empty, so the response carried `content: null` while the model had written something.
+
+  **Measured on `claude` 2.1.270** before the design was chosen, by reproducing `buildCliArgs`' exact bridge argv and asking for both calls at once:
+
+  ```
+  init tools: ["mcp__ocp__lookup_build_id","mcp__ocp__lookup_deploy_id"]
+  content_block_start:tool_use → input_json_delta ×3 → assistant[tool_use] → block_stop
+  content_block_start:tool_use → input_json_delta ×3 → assistant[tool_use] → block_stop
+  message_delta {"stop_reason":"tool_use"}
+  ```
+
+  Every `assistant` event carries `stop_reason: null` and all three share one `message.id`, so without a message-end signal there was nothing to end the turn on except the first call. `--include-partial-messages` supplies one: `message_delta` with `stop_reason: "tool_use"` means the model finished **because** it wants tools run, so every block it intended is already out. OCP now adds that flag **on the tool-bridge branch only** — the plain and image paths are untouched, so the extra delta traffic is paid for only by requests that declared tools — accumulates every `tool_use`, and ends the spawn on the signal.
+
+  Keyed on `message_delta` rather than `message_stop` deliberately: the latter arrives one event later and says only that the message ended, not why. This predicate fires on **positive evidence**.
+
+  **The wait is BOUNDED, and that bound is the point.** Gating the flag's *name* at boot proves the CLI accepts it; it proves nothing about the CLI still *emitting* `stop_reason: "tool_use"`. A build that accepted the flag and renamed the stop reason would send every tool request down the fallback — so if the fallback waited for `CLAUDE_TIMEOUT`, this change would be **worse** than the truncation it replaces, and it would not fail at boot. Found by review. So once a call is in hand the turn ends on the signal **or** on quiescence (`OCP_TOOL_TURN_QUIESCE_MS`, default 2 s — ~20× the measured ~100 ms gap between blocks), whichever comes first, and every `openai_tool_calls` line records `endedOn`, so a run of `quiescence` where `signal` used to be is visible rather than merely slow.
+
+  A last-ditch arm at process close still delivers whatever was collected if neither trigger fired, logged `signalMissing: true`. **What it does not cover**, stated because an earlier draft claimed it did: a spawn that dies with a non-zero exit sets `errored`, and delivery is gated on `!errored`, so those calls are dropped — the same outcome as before this change.
+
+- **The boot capability gate was blind to the entire tool path, and now is not.** `buildCliArgs`' tool-bridge branch **returns early**, so `--tools ""`, `--mcp-config`, `--strict-mcp-config`, `--allowedTools` — and the new `--include-partial-messages` — were never probed. Five flags on the path a request takes the moment it declares `tools`, on a gate whose own comment says it covers *"exactly what THIS instance will spawn"*. It did not; the other four have been ungated since #476. The probe now runs **both argv shapes** and names which one failed.
+
+  The two shapes fail **differently** — collapsing them was itself a review finding. The plain argv is what every request spawns, so a missing flag there stays **fatal**. The bridge argv is reached only by a request that declared `tools`, so refusing the whole instance over it would take down the plain and image paths that never use the flag; it now **degrades** instead — tool calling turns off loudly and a tools request is answered as text and counted in `stats.toolRequestsDropped`, the path `OCP_TOOL_CALLING=0` already takes.
+
+  Proven against the failing side rather than asserted, **both ways**: with a bogus flag on the **bridge** branch the instance **boots**, warns, disables tool calling, and a tools request comes back `200` with `toolRequestsDropped=1`; with a bogus flag on the **plain** branch the boot is **refused**, naming the flag and the shape. Both shapes pass against `claude` 2.1.270, adding ~230 ms to boot — and `claude_capability_probe_ok` is still emitted **once** per boot, with the shapes as a field, so anything keyed on that event counts what it used to.
+
+  Pinned by mutation rows on the behaviour, not on the flag list: reverting to first-call-only reddens both new tests, removing the end-signal recognition reddens the parallel one, dropping the preamble fallback reddens the `content` assertion, and removing the flag reddens the argv `deepEqual` that ADR 0022 already kept.
+
+
 - **Corrected a v3.35.0 claim about which lane real agent traffic takes.** The v3.35.0 section below says *"an agent framework pointed at OCP sends `stream: true` for the turn itself, so a counter blind to that lane would read `0` on exactly the deployment that motivated the field."* **The observation is right and the conclusion drawn from it is wrong**, and the released section is left as it stands rather than quietly edited — a changelog that rewrites what it said is worth less than one that says it was wrong.
 
   What was never checked is **which handler** such a request reaches. The same framework's turn also declares `tools` — 20 of them, measured — and with tool calling on (the default since 3.34.0) a request that declares tools is served by the tool path, which **awaits** the spawn and only writes SSE afterwards. No headers have been sent when the failure arrives, so it still gets a real `429`. Measured against a live 3.35.0 instance whose upstream fails with a wall:

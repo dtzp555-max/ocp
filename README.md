@@ -260,6 +260,7 @@ So the blind spot is real but narrow: it needs `stream: true`, no tools — or `
 | `CLAUDE_BIN` | *(auto-detect)* | Path to claude binary |
 | `CLAUDE_TIMEOUT` | `600000` | Request timeout (ms, default: 10 min) |
 | `OCP_TOOL_CALLING` | `1` | OpenAI tool calling over the MCP bridge (ADR 0022). `0` restores the pre-0022 behaviour: declared `tools` are dropped, answered as text, and counted in `/health`'s `stats.toolRequestsDropped` with the reason logged. |
+| `OCP_TOOL_TURN_QUIESCE_MS` | `2000` | Milliseconds to wait for the model's message-end signal after a tool call before ending the turn anyway. The healthy path never reaches it — the signal arrives first — so this is a **ceiling on the degraded path**, not a target: it bounds what happens if a `claude` build accepts `--include-partial-messages` but stops emitting `stop_reason: "tool_use"`. Every `openai_tool_calls` log line records `endedOn` (`signal` / `quiescence` / `close`); a run of `quiescence` means re-measure. |
 | `CLAUDE_HEARTBEAT_INTERVAL` | `0` | Streaming SSE keepalive interval (ms). `0` = disabled. See ["Streaming heartbeat"](#streaming-heartbeat) below. |
 | `CLAUDE_MAX_CONCURRENT` | `8` | Max concurrent claude processes (`-p`/stream-json path) |
 | `CLAUDE_MAX_QUEUE` | `16` | Max requests **waiting** for a `-p` concurrency slot. Beyond `CLAUDE_MAX_CONCURRENT`, requests queue (up to this cap) instead of being rejected; when the queue is **also** full, the request gets `HTTP 429` + `Retry-After` (not an opaque 500). Surfaced on `/health.concurrency` + `/health.stats.queueRejections`. |

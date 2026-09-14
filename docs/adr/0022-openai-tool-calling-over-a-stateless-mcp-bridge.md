@@ -74,13 +74,21 @@ exactly one mechanism that concludes a tool turn, with `CLAUDE_TIMEOUT` as the b
 
 **4. The response is what the specification says.** `choices[0].message.tool_calls[]` with
 `function.arguments` as a JSON **string**, `finish_reason: "tool_calls"`, and — when it arrives in the
-same `assistant` event as the call — the text the model wrote alongside, as `content`. **Known gap,
-measured by the reviewer on 2.1.270:** the CLI emits one `assistant` event per content block, so a
-text preamble arrives in an earlier event (and is delivered as `content: null` here), and a second
-*parallel* call arrives in a later event that the spawn has already been ended before. The client
-gets one call; the model re-issues the rest next turn, so it converges at one extra round trip per
-dropped call. Closing it needs a message-end signal (`--include-partial-messages` and
-`message_delta.stop_reason`), which is a follow-up. Streaming delivers each call whole in one delta chunk keyed by
+same `assistant` event as the call — the text the model wrote alongside, as `content`. **This gap is CLOSED as of #478**, and the
+record of it is kept because it is what the design was measured against. As originally shipped, the
+CLI emitting one `assistant` event per content block meant a text preamble arrived in an earlier
+event (delivered as `content: null`) and a second *parallel* call arrived in a later event the spawn
+had already been ended before — the client got one call and the model re-issued the rest next turn,
+converging at one extra round trip per dropped call.
+
+The message-end signal this section anticipated turned out to exist exactly as sketched:
+`--include-partial-messages`, added on the tool-bridge branch only, makes the stream carry
+`message_delta` with `stop_reason: "tool_use"` after the last content block. Re-measured on 2.1.270
+with `buildCliArgs`' own bridge argv and a prompt asking for two calls at once: both `tool_use`
+blocks arrive as separate `assistant` events, **each with `stop_reason: null`**, all sharing one
+`message.id`, followed by the `message_delta`. So every call is now accumulated and the spawn ends
+on the signal rather than on the first call; a fail-safe delivers whatever was collected if the
+signal never arrives, logged as `signalMissing`. Streaming delivers each call whole in one delta chunk keyed by
 `index`, which is a valid instance of the spec's chunked form. The `tool_call_id` the client echoes
 back is the CLI's own `tool_use.id` where it gave one.
 

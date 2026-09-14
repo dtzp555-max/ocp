@@ -2918,10 +2918,32 @@ if [ -n "$UPSTREAM_ERROR" ]; then
   exit 1
 fi
 if [ -n "$TOOL_USE_NAME" ]; then
+  # ONE event carrying text + one tool_use: the shape this fixture always emitted, kept because two
+  # shipped tests describe it. The real CLI emits one event PER CONTENT BLOCK -- see
+  # TOOL_USE_PARALLEL below, which is the measured shape.
   printf '%s\\n' '{"type":"assistant","message":{"content":[{"type":"text","text":"Let me look that up."},{"type":"tool_use","id":"toolu_fake01","name":"mcp__ocp__'"$TOOL_USE_NAME"'","input":{"project":"alpha"}}]}}'
+  # #478: the message-end signal, emitted exactly as claude --include-partial-messages emits it
+  # on 2.1.270. Without it the server no longer ends the turn (it stopped ending on the FIRST
+  # tool_use), so this line is what keeps the two pre-#478 tests measuring what they say.
+  if [ -z "$TOOL_USE_NO_END_SIGNAL" ]; then
+    printf '%s\\n' '{"type":"stream_event","event":{"type":"message_delta","delta":{"stop_reason":"tool_use","stop_sequence":null}}}'
+  fi
   # exec, not a child: a sleep GRANDCHILD would keep the stdout pipe open after the server kills
   # this shell, and the request would hang until it exited -- the #474 shape. With exec the server's
   # signal lands on the process that holds the pipe.
+  exec sleep 120
+fi
+if [ -n "$TOOL_USE_PARALLEL" ]; then
+  # THE MEASURED SHAPE, claude 2.1.270 with --include-partial-messages: one assistant event per
+  # content block, stop_reason: null on every one of them, all three sharing one message.id, and
+  # the stop reason arriving only in a trailing message_delta. Text preamble as DELTAS, because
+  # that is what the flag makes the CLI do -- which is also why the tool events' own text is empty.
+  printf '%s\\n' '{"type":"stream_event","event":{"type":"content_block_delta","delta":{"type":"text_delta","text":"Looking both up."}}}'
+  printf '%s\\n' '{"type":"assistant","message":{"id":"msg_fake01","stop_reason":null,"content":[{"type":"tool_use","id":"toolu_fakeA","name":"mcp__ocp__lookup_build_id","input":{"project":"alpha"}}]}}'
+  printf '%s\\n' '{"type":"assistant","message":{"id":"msg_fake01","stop_reason":null,"content":[{"type":"tool_use","id":"toolu_fakeB","name":"mcp__ocp__lookup_deploy_id","input":{"project":"alpha"}}]}}'
+  if [ -z "$TOOL_USE_NO_END_SIGNAL" ]; then
+    printf '%s\\n' '{"type":"stream_event","event":{"type":"message_delta","delta":{"stop_reason":"tool_use","stop_sequence":null}}}'
+  fi
   exec sleep 120
 fi
 printf '%s\\n' '{"type":"assistant","message":{"content":[{"type":"text","text":"OK"}]}}'
@@ -6443,7 +6465,10 @@ ltTest("integration (ADR 0022): a declared tool the model chooses comes back as 
       assert.equal(tail[0], "--tools"); assert.equal(tail[1], "", "the built-in schema is EMPTIED: the model holds exactly the client's tools");
       assert.equal(tail[2], "--mcp-config"); assert.ok(tail[3].endsWith(".json"), tail[3]);
       assert.equal(tail[4], "--strict-mcp-config", "only the bridge is loaded; no account connectors");
-      assert.deepEqual(tail.slice(5), ["--allowedTools", "mcp__ocp__*"]);
+      // #478 added --include-partial-messages HERE, and the deepEqual is why that is checkable:
+      // the flag is what gives the turn a message-end signal, so a build that stops sending it goes
+      // back to ending on the first tool_use and truncating a parallel call to one -- silently.
+      assert.deepEqual(tail.slice(5), ["--allowedTools", "mcp__ocp__*", "--include-partial-messages"]);
       assert.ok(!argv.includes("Bash"), `a tool turn must not also grant Bash: ${JSON.stringify(tail)}`);
 
       // the tools file the bridge would serve: the client's array, verbatim
@@ -6462,6 +6487,89 @@ ltTest("integration (ADR 0022): a declared tool the model chooses comes back as 
 // The other half of the loop: the client sends the result back. This spawn's PROMPT must carry the
 // rendered call and result, and the continuation note, because that text is the only way a fresh
 // spawn learns what happened (stream-json injection was measured not to work).
+const PAR_TOOLS = [
+  { type: "function", function: { name: "lookup_build_id", description: "d", parameters: { type: "object", properties: { project: { type: "string" } } } } },
+  { type: "function", function: { name: "lookup_deploy_id", description: "d", parameters: { type: "object", properties: { project: { type: "string" } } } } },
+];
+
+// #478. The CLI emits ONE assistant event PER CONTENT BLOCK, so a message carrying two parallel
+// calls arrives as two events and the turn has no stop_reason on either -- measured on 2.1.270,
+// where all three events of such a message share one message.id and the stop reason arrives only in
+// a trailing `message_delta`. Ending on the FIRST tool_use therefore handed the client 1 of N and
+// dropped any preamble.
+ltTest("integration (#478): BOTH parallel calls come back, and the preamble survives as content", async () => {
+  if (!LT_POSIX) return;
+  const dir = ltMkdir(); const fake = ltFake(dir);
+  try {
+    const { child, buf, port } = await ltBootFresh({ CLAUDE_BIN: fake, TOOL_USE_PARALLEL: "1", CLAUDE_TIMEOUT: "20000" }, dir);
+    try {
+      assert.ok(await ltWait(() => buf.out.includes("listening on")), `— ${ltDiag(buf)}`);
+      const t0 = Date.now();
+      const r = await ltPostStatus(port, { model: "sonnet", tools: PAR_TOOLS, messages: [{ role: "user", content: "both please" }] });
+      const took = Date.now() - t0;
+      assert.equal(r.status, 200, r.text.slice(0, 200));
+      const body = JSON.parse(r.text);
+      const msg = body.choices[0].message;
+
+      // BOTH, in order. `.length` first: a bare deepEqual on names would report "1 !== 2" just as
+      // well, but the count is the claim and reading it first makes the failure say so.
+      assert.equal(msg.tool_calls.length, 2, `a parallel call must not be truncated — got ${JSON.stringify(msg.tool_calls)}`);
+      assert.deepEqual(msg.tool_calls.map((c) => c.function.name), ["lookup_build_id", "lookup_deploy_id"]);
+      assert.deepEqual(msg.tool_calls.map((c) => c.id), ["toolu_fakeA", "toolu_fakeB"], "each call keeps ITS OWN id, or the client cannot pair results");
+      assert.equal(body.choices[0].finish_reason, "tool_calls");
+
+      // The preamble arrived as a text DELTA, in its own block, before either call -- which is what
+      // made `content` null before: the tool events' own text is empty.
+      assert.equal(msg.content, "Looking both up.", `the preamble must survive — got ${JSON.stringify(msg.content)}`);
+
+      // Still ended, not awaited. Half the timeout, for the reason the sibling test records.
+      assert.ok(took < 10000, `the spawn must be ended on the end signal — took ${took} ms`);
+
+      // buf.OUT, not buf.err: the healthy ending logs at `info` and the degraded one at `warn`, and
+      // logEvent splits those across the two pipes. Asserting the wrong pipe is a test that fails
+      // for the right reason at the wrong place -- which is how this line was first written.
+      assert.match(buf.out, /"endedOn":"signal"/, `the healthy path must record WHICH trigger ended it, or it cannot be told from the degraded one — ${buf.out.slice(-400)}`);
+      const h = await fetch(`http://127.0.0.1:${port}/health`).then(x => x.json());
+      assert.equal(h.stats.toolCallsEmitted, 1, "one TURN, whatever the call count");
+    } finally { child.kill("SIGKILL"); await ltDrain(() => buf.closed, "parallel-tools", 5000); }
+  } finally { _ltRmRetry(dir); }
+});
+
+// The fail-safe, and its control is the test above: same fixture, end signal withheld. The calls
+// must still reach the client rather than be dropped -- but this arm CANNOT end the spawn early,
+// so it is slow by construction and says so in the log. Without this test the fallback would be
+// unreachable code that reads like a safety net.
+// THE FALLBACK IS BOUNDED, and the bound is the claim. Name-gating --include-partial-messages at
+// boot proves the CLI ACCEPTS it, never that the CLI still EMITS `stop_reason: "tool_use"`. A build
+// that accepted the flag and renamed the stop reason would send EVERY tool request down this arm --
+// so if the arm waits for CLAUDE_TIMEOUT, the fix is worse than the truncation it replaced. The
+// duration assertion is therefore not decoration: it is the only thing separating "degrades by a
+// bounded delay" from "hangs on every tool request", and it was missing until review asked.
+ltTest("integration (#478): with NO end signal the calls arrive on a BOUNDED wait, not at CLAUDE_TIMEOUT", async () => {
+  if (!LT_POSIX) return;
+  const dir = ltMkdir(); const fake = ltFake(dir);
+  try {
+    // The two budgets are deliberately far apart so the assertion can tell them apart: quiesce at
+    // 1 s, CLAUDE_TIMEOUT at 30 s. A bound of "under 10 s" therefore fails loudly on a build that
+    // fell through to the timeout, and cannot pass by accident on a slow host.
+    const { child, buf, port } = await ltBootFresh({ CLAUDE_BIN: fake, TOOL_USE_PARALLEL: "1", TOOL_USE_NO_END_SIGNAL: "1", OCP_TOOL_TURN_QUIESCE_MS: "1000", CLAUDE_TIMEOUT: "30000" }, dir);
+    try {
+      assert.ok(await ltWait(() => buf.out.includes("listening on")), `— ${ltDiag(buf)}`);
+      const t0 = Date.now();
+      const r = await ltPostStatus(port, { model: "sonnet", tools: PAR_TOOLS, messages: [{ role: "user", content: "both please" }] });
+      const took = Date.now() - t0;
+      assert.equal(r.status, 200, r.text.slice(0, 200));
+      const msg = JSON.parse(r.text).choices[0].message;
+      assert.equal(msg.tool_calls.length, 2, `both calls must survive the fallback — got ${JSON.stringify(msg.tool_calls)}`);
+      assert.ok(took < 10000, `the fallback must be BOUNDED, not wait for CLAUDE_TIMEOUT — took ${took} ms against a 30000 ms timeout`);
+      // ...and it must not be so eager that it beats a signal that was merely a little late.
+      assert.ok(took >= 1000, `the quiescence budget must actually be spent — took ${took} ms`);
+      assert.match(buf.err, /"endedOn":"quiescence"/, `the log must say WHICH trigger ended it — ${buf.err.slice(-400)}`);
+      assert.match(buf.err, /"signalMissing":true/, `and name itself as the degraded path — ${buf.err.slice(-400)}`);
+    } finally { child.kill("SIGKILL"); await ltDrain(() => buf.closed, "parallel-nosignal", 8000); }
+  } finally { _ltRmRetry(dir); }
+});
+
 ltTest("integration (ADR 0022): a tool result sent back is rendered into the next spawn's prompt with the continuation note", async () => {
   if (!LT_POSIX) return;
   const dir = ltMkdir(); const fake = ltFake(dir);

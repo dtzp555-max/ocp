@@ -323,7 +323,23 @@ function parseStreamJsonEvent(event, sawTextDelta) {
     if (inner?.type === "content_block_delta" && inner.delta?.type === "text_delta") {
       return { text: inner.delta.text ?? "", fromDelta: true };
     }
-    // Other stream_event sub-types (content_block_start, message_delta, etc.) — consumed
+    // #478: THE MESSAGE-END SIGNAL, and the only one there is. Reached only when
+    // --include-partial-messages is on, which buildCliArgs adds on the tool-bridge branch alone.
+    // `stop_reason: "tool_use"` means the model finished this message BECAUSE it wants tools run --
+    // every tool_use block it intends is already emitted. Measured on 2.1.270, a two-call message:
+    //
+    //   content_block_start:tool_use -> input_json_delta x3 -> assistant[tool_use] -> block_stop
+    //   content_block_start:tool_use -> input_json_delta x3 -> assistant[tool_use] -> block_stop
+    //   message_delta {"stop_reason":"tool_use"}          <- here
+    //
+    // Deliberately NOT keyed on `message_stop`, which arrives one event later and says only that
+    // the message ended, not why. A message that ends for any other reason must not end a tool
+    // turn early, and this predicate fires on POSITIVE evidence rather than on the absence of more
+    // blocks.
+    if (inner?.type === "message_delta" && inner.delta?.stop_reason === "tool_use") {
+      return { toolTurnEnd: true };
+    }
+    // Other stream_event sub-types (content_block_start, message_stop, etc.) — consumed
     return null;
   }
 
@@ -399,7 +415,20 @@ const SKIP_PERMISSIONS = process.env.CLAUDE_SKIP_PERMISSIONS === "true";
 // `tool_calls` and must run them. EXPIRY: when no deployment has needed the switch for two
 // releases, remove it and this comment; a kill-switch nobody has pulled is a second code path
 // nobody tests.
-const TOOL_CALLING = process.env.OCP_TOOL_CALLING !== "0";
+let TOOL_CALLING = process.env.OCP_TOOL_CALLING !== "0";
+
+// How long after a tool_use block to wait for the message-end signal before ending the turn anyway.
+// MEASURED on claude 2.1.270: the two tool_use events of a parallel message arrive ~100 ms apart and
+// the `message_delta` immediately after the second, so 2 s is ~20x the observed gap. It is a CEILING
+// on the fallback, not a target -- the healthy path never reaches it, because the signal arrives
+// first and clears the timer.
+//
+// EXPIRY: this number is only meaningful while the CLI emits per-content-block events at roughly
+// that cadence. If a future build batches or streams them much slower, a parallel call could be
+// truncated again -- SILENTLY, because the fallback answers rather than fails. The guard against
+// that is the `endedOn` field on every openai_tool_calls log line: a run of "quiescence" where
+// "signal" used to be is the signal to re-measure, and it is why that field is logged at `warn`.
+const TOOL_TURN_QUIESCE_MS = parseIntEnv("OCP_TOOL_TURN_QUIESCE_MS", 2000);
 const ALLOWED_TOOLS = (process.env.CLAUDE_ALLOWED_TOOLS ||
   "Bash,Read,Write,Edit,Glob,Grep,WebSearch,WebFetch,Agent"
 ).split(",").map(s => s.trim()).filter(Boolean);
@@ -1465,6 +1494,22 @@ function buildCliArgs(cliModel, systemPromptFile, opts = {}) {
   if (opts.toolBridge) {
     args.push("--tools", "", "--mcp-config", opts.toolBridge.configFile, "--strict-mcp-config",
       "--allowedTools", `${TOOL_PREFIX}*`);
+    // #478: --include-partial-messages, so the turn has a MESSAGE-END SIGNAL. Without it the CLI
+    // emits one `assistant` event per content block with `stop_reason: null` on every one of them
+    // (measured on 2.1.270 -- all three events of a two-call message share one `message.id` and
+    // none carries a stop reason), so the only way to end the turn was on the FIRST tool_use --
+    // which truncated a parallel call to one and dropped any text preamble. With the flag the
+    // stream carries `message_delta` with `stop_reason: "tool_use"` after the last content block,
+    // which is what callClaude now ends on.
+    //
+    // Added HERE and nowhere else: the plain and image paths are untouched, so the extra
+    // content_block_delta traffic is paid for only by requests that declared tools.
+    //
+    // EXPIRY: `claude --help` lists this flag on 2.1.270 ("Include partial message chunks as they
+    // ... --output-format=stream-json"). If a future CLI drops it, the boot capability probe below
+    // refuses the boot and names the flag, rather than every tool request failing at runtime --
+    // that gate covers this branch as of #478 and did not before.
+    args.push("--include-partial-messages");
     return args;
   }
 
@@ -2187,6 +2232,39 @@ async function callClaude(model, messages, conversationId, keyName, res, opts = 
     // point, so `close` must read this BEFORE treating a non-zero exit as a failure.
     let toolCalls = null;
     let toolText = "";
+    // #478: tool_use blocks ACCUMULATE and the turn ends on the message-end signal, not on the
+    // first call. The CLI emits one `assistant` event per content block, so a message carrying two
+    // parallel calls arrives as two events ~100 ms apart; ending on the first handed the client
+    // 1 of N and the model re-issued the rest next turn -- converging, at one wasted round trip
+    // each, with a history that diverged from what the model actually emitted.
+    const pendingToolUses = [];
+    let pendingToolText = "";
+    let toolQuiesceTimer = null;
+    // ONE ending, two triggers, so the two cannot drift apart. `reason` is logged because the
+    // difference is operationally load-bearing: "signal" is the healthy path, and a run of
+    // "quiescence" means the CLI stopped emitting the stop reason and this build is one release
+    // away from having no end signal at all.
+    //
+    // THE `toolCalls` CHECK BELOW IS NOT INDEPENDENTLY PINNED, and that is recorded rather than
+    // dressed up. Three things stop the timer double-counting a turn the signal already ended: this
+    // check, the clearTimeout on the next line, and a third clearTimeout in the close handler.
+    // Removing any ONE leaves the other two, so no single mutation reddens -- measured twice, and
+    // the second attempt instrumented the timer to find out why: with BOTH clears removed the timer
+    // still never fired, because ending the turn kills the spawn and the close handler clears it
+    // before the budget elapses. Keep it as the cheap third line; do not claim a row for it.
+    const endToolTurn = (reason) => {
+      if (toolCalls || !opts.tools || !pendingToolUses.length) return;
+      if (toolQuiesceTimer) { clearTimeout(toolQuiesceTimer); toolQuiesceTimer = null; }
+      toolCalls = pendingToolUses.slice();
+      toolText = pendingToolText || assembledText;
+      stats.toolCallsEmitted++;
+      logEvent(reason === "signal" ? "info" : "warn", "openai_tool_calls",
+        { model: cliModel, count: toolCalls.length, names: toolCalls.map((u) => u.name).slice(0, 8), endedOn: reason, signalMissing: reason !== "signal" });
+      // End the spawn rather than let it block on the bridge (which never answers tools/call --
+      // see lib/mcp-bridge.mjs). SIGTERM first, SIGKILL after the same 5 s the timeout path uses.
+      try { proc.kill("SIGTERM"); } catch {}
+      setTimeout(() => { try { proc.kill("SIGKILL"); } catch {} }, 5000);
+    };
 
     proc.stdout.on("data", (d) => {
       markFirstByte();
@@ -2217,15 +2295,33 @@ async function callClaude(model, messages, conversationId, keyName, res, opts = 
           // let it block on the bridge (which never answers tools/call -- see lib/mcp-bridge.mjs),
           // and hand the calls up. SIGTERM first, SIGKILL after the same 5 s the timeout path uses.
           if (!toolCalls) {
-            toolCalls = parsed.toolUses;
-            toolText = parsed.text || "";
-            stats.toolCallsEmitted++;
-            logEvent("info", "openai_tool_calls", { model: cliModel, count: toolCalls.length, names: toolCalls.map((u) => u.name).slice(0, 8) });
-            try { proc.kill("SIGTERM"); } catch {}
-            setTimeout(() => { try { proc.kill("SIGKILL"); } catch {} }, 5000);
+            pendingToolUses.push(...parsed.toolUses);
+            // BOUND THE WAIT. Name-gating the flag at boot proves the CLI ACCEPTS
+            // --include-partial-messages; it proves nothing about the CLI still EMITTING
+            // `message_delta.stop_reason: "tool_use"`. A build that accepts the flag and renamed
+            // the stop reason would send every tool request into the close-time fail-safe, which
+            // cannot end the spawn -- so each one would block on the silent bridge until
+            // CLAUDE_TIMEOUT. That is WORSE than the fast-but-truncated behaviour this change
+            // replaced, and it would not fail at boot. Found by review; the gate validated the
+            // flag's name and not the contract the flag exists for.
+            //
+            // So: once a call is in hand, the turn ends either on the signal or on quiescence,
+            // whichever comes first. The fallback then costs a bounded delay instead of a timeout,
+            // and delivers at least what 3.34.0 delivered.
+            if (!toolQuiesceTimer) {
+              toolQuiesceTimer = setTimeout(() => {
+                endToolTurn("quiescence");
+              }, TOOL_TURN_QUIESCE_MS);
+              if (typeof toolQuiesceTimer.unref === "function") toolQuiesceTimer.unref();
+            }
+            // The tool event's own text is empty whenever the preamble arrived as its own block
+            // (measured), so this is additive rather than an assignment, and `assembledText` is the
+            // fallback below -- between them the preamble survives either shape.
+            if (parsed.text) pendingToolText += parsed.text;
           }
           continue;
         }
+        if (parsed.toolTurnEnd) { endToolTurn("signal"); continue; }
         if (parsed.text !== undefined) {
           if (parsed.fromDelta) {
             assembledText += parsed.text;
@@ -2283,6 +2379,21 @@ async function callClaude(model, messages, conversationId, keyName, res, opts = 
       activeProcesses.delete(proc);
       const elapsed = Date.now() - t0;
       cleanup();
+      // #478 LAST-DITCH ARM: the process ended before EITHER trigger fired -- before the signal
+      // and before the quiescence timer. Deliver what the model did emit rather than drop it.
+      //
+      // WHAT IT DOES NOT COVER, stated because an earlier version of this comment claimed it did:
+      // a spawn that dies with a non-zero exit sets `errored`, and the send gate below is
+      // `toolCalls && !errored`, so those calls are dropped -- the same outcome as before #478.
+      // Extending delivery to an errored turn is a different decision (a partial or invalid call
+      // from a transport failure is not the same thing as a finished one) and is not made here.
+      if (toolQuiesceTimer) { clearTimeout(toolQuiesceTimer); toolQuiesceTimer = null; }
+      if (!toolCalls && !errored && opts.tools && pendingToolUses.length) {
+        toolCalls = pendingToolUses.slice();
+        toolText = pendingToolText || assembledText;
+        stats.toolCallsEmitted++;
+        logEvent("warn", "openai_tool_calls", { model: cliModel, count: toolCalls.length, names: toolCalls.map((u) => u.name).slice(0, 8), endedOn: "close", signalMissing: true });
+      }
       // Tolerate null exit code when result event was seen (sandbox-wrap noise, same
       // as OLP commit 2864275 — bwrap shell exits null after model completes).
       if (toolCalls && !errored) {
@@ -5354,7 +5465,26 @@ if (process.env.OCP_SKIP_CAPABILITY_PROBE !== "1") {
   // refused a boot over it -- the fail-closed direction this gate exists to avoid. [measured]
   // without it the probe is unchanged: 174ms, same `System prompt file not found`, status 1, and
   // an unknown flag still answers `unknown option` in 95ms.
-  const probeArgs = buildCliArgs(probeModel, probePath, { streamJsonInput: true });
+  // TWO ARGVS, because buildCliArgs has TWO SHAPES and this gate only ever saw one. The tool-bridge
+  // branch RETURNS EARLY, so `--tools ""`, `--mcp-config`, `--strict-mcp-config`, `--allowedTools`
+  // and (as of #478) `--include-partial-messages` were never probed -- five flags on the path a
+  // request takes the moment it declares `tools`, gated by nothing, on a gate whose own comment
+  // says it covers "exactly what THIS instance will spawn". It did not. Found while adding the
+  // fifth; the other four have been ungated since #476.
+  //
+  // The bridge shape's file paths point inside the same non-existent directory as the plain one:
+  // the CLI parses options before validating their values, which is the ordering this whole probe
+  // rests on, so an unknown flag still answers `unknown option` and a known one still reaches the
+  // missing-file complaint.
+  const probeShapes = [
+    { label: "plain", args: buildCliArgs(probeModel, probePath, { streamJsonInput: true }) },
+    { label: "tool-bridge", args: buildCliArgs(probeModel, probePath, {
+      toolBridge: { configFile: join(dirname(probePath), "absent-mcp.json"), toolsFile: join(dirname(probePath), "absent-tools.json") },
+    }) },
+  ];
+  const probedOk = [];
+  for (const shape of probeShapes) {
+  const probeArgs = shape.args;
   let probe;
   try {
     probe = spawnSync(CLAUDE, probeArgs, {
@@ -5384,16 +5514,44 @@ if (process.env.OCP_SKIP_CAPABILITY_PROBE !== "1") {
     timedOut,
   });
   if (verdict.verdict === "absent") {
-    console.error(`FATAL: ${capabilityBootError({ flag: verdict.flag, bin: CLAUDE })}\n  Refusing to start.`);
+    // THE TWO SHAPES FAIL DIFFERENTLY, and collapsing them was a review finding. The plain argv is
+    // what EVERY request spawns, so a missing flag there is fatal -- there is no reduced service to
+    // offer. The tool-bridge argv is reached only by a request that declared `tools`, so refusing
+    // the whole instance over it takes down the plain and image paths that never use the flag: a
+    // blast radius out of proportion to the loss, and out of line with this gate's own asymmetry
+    // (only observed absence refuses, and nothing that affects one lane takes down a fleet).
+    //
+    // So the bridge shape DEGRADES: tool calling turns off, loudly, and a request that declares
+    // tools is dropped-and-counted with a reason exactly as OCP_TOOL_CALLING=0 already does --
+    // a path that already exists, is already tested, and is already visible on /health as
+    // stats.toolRequestsDropped. That is a worse service than tool calling, and a far better one
+    // than no service.
+    if (shape.label === "tool-bridge") {
+      TOOL_CALLING = false;
+      // The message is written here rather than reusing capabilityBootError, whose first sentence
+      // says the flag is passed "on every request" -- true for the plain shape and FALSE for this
+      // one, where it is passed only by a request that declared tools. A warning that misstates
+      // the scope of what it is warning about is the shape this repo keeps correcting.
+      console.error(`WARNING: this build of \`claude\` does not support ${verdict.flag}, which OCP passes only on requests that declare \`tools\`.\n  Probed: ${CLAUDE}\n  Tool calling is DISABLED for this instance; every other path is unaffected.\n  A request that declares \`tools\` will be answered as text and counted in /health stats.toolRequestsDropped.`);
+      logEvent("warn", "claude_capability_probe_tool_calling_disabled", { flag: verdict.flag, bin: CLAUDE });
+      continue;
+    }
+    console.error(`FATAL: ${capabilityBootError({ flag: verdict.flag, bin: CLAUDE })}\n  (probe shape: ${shape.label})\n  Refusing to start.`);
     process.exit(1);
   }
   if (verdict.verdict === "inconclusive") {
     // NOT fatal, and the asymmetry is the design: only OBSERVED absence refuses a boot. A missing
     // binary, a slow host, or an upstream rewording of the message must not take a fleet down.
-    logEvent("warn", "claude_capability_probe_inconclusive", { reason: verdict.reason, detail: verdict.detail });
+    logEvent("warn", "claude_capability_probe_inconclusive", { shape: shape.label, reason: verdict.reason, detail: verdict.detail });
   } else {
-    logEvent("info", "claude_capability_probe_ok", { bin: CLAUDE });
+    probedOk.push(shape.label);
   }
+  }
+  // ONE event per boot, not one per shape. An alert or dashboard keyed on
+  // `claude_capability_probe_ok` counted one per successful boot before this change and must keep
+  // counting one; the shapes are a field, not a multiplier. (Review finding: log cardinality is a
+  // contract too.)
+  if (probedOk.length) logEvent("info", "claude_capability_probe_ok", { bin: CLAUDE, shapes: probedOk });
 }
 
 // ── Start ───────────────────────────────────────────────────────────────
