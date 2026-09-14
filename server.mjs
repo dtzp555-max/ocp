@@ -49,6 +49,7 @@ import { isLoopbackBind } from "./lib/net.mjs";
 import { parseAllowedHosts, parseAuthority, matchesDeclared, evaluateOriginGate } from "./lib/host-gate.mjs";
 import { classifyToolRequest, countDeclaredTools } from "./lib/tool-support.mjs";
 import { isUpstreamRateLimit, retryAfterSeconds } from "./lib/upstream-errors.mjs";
+import { listUnhonouredFields, CACHE_KEY_ONLY } from "./lib/unhonoured-fields.mjs";
 import { validateTools, extractBridgeToolUses, extractAssistantText, toolUsesToOpenAI, renderToolTurn,
          endsWithToolResult, TOOL_CONTINUATION_NOTE, TOOL_PREFIX, buildBridgeConfig } from "./lib/tool-calling.mjs";
 import { runTuiTurn, reapStaleTuiSessions, resolveTuiHome, bootTuiPane, tuiPaneHealthy, poolPaneName, killLiveTurnPanes, POOL_BOOT_MS } from "./lib/tui/session.mjs";
@@ -1166,6 +1167,11 @@ const stats = {
   // through GET /health's bare `stats,` shorthand -- see the ADR 0016 Amendment 1 note below, which
   // is the same mechanism working in the other direction.
   toolRequestsDropped: 0,
+  // #470 / additive under ADR 0012: requests that were SERVED while carrying at least one OpenAI
+  // field OCP does not act on. Counts REQUESTS, not fields -- a request sending three inert fields
+  // moves it by one, the same discipline toolRequestsDropped uses, so the number stays readable as
+  // "how much traffic is asking for something it is not getting".
+  unhonouredFieldRequests: 0,
   // ADR 0022 / additive under ADR 0012: requests that ended with the model calling one of the
   // client's tools -- i.e. answered with `tool_calls`. The companion of toolRequestsDropped: with
   // OCP_TOOL_CALLING on, a request that declares tools lands in exactly one of the two.
@@ -4493,11 +4499,60 @@ async function handleChatCompletions(req, res) {
   const useToolCalling = declaredTools > 0 && TOOL_CALLING && !TUI_MODE
     && Array.isArray(parsed.tools) && parsed.tools.length > 0 && !detectStructuredOutput(parsed)
     && !toolChoiceNone;
+  // #470: `tools` was never the only field OCP accepts and does not act on. Same answer as #468
+  // gave for tools -- a counter and a log rather than a refusal -- for the same reason: a client
+  // that sends `temperature: 0` out of habit must still get an answer, and 400-ing it would break
+  // working integrations to make a point. What changes is that the silence is countable.
+  //
+  // PLACED HERE for the same reason the tools drop below is: after every gate that can reject, so a
+  // request that 400s is not counted as "served with fields ignored". And ABOVE the useToolCalling
+  // branch, which RETURNS -- a bridged tool request ignores `temperature` exactly as a plain one
+  // does, so counting only the non-tool lane would have made this number mean "requests without
+  // tools that sent an inert field", which is not what its name says.
+  //
+  // "AFTER EVERY GATE THAT CAN REJECT" WAS FALSE THE FIRST TIME, and review measured it: validateTools
+  // lived INSIDE the useToolCalling branch, one line below this count, so a tools request with an
+  // unnamed function and a `temperature` was counted as served and then 400'd --
+  // unhonouredFieldRequests 1 against totalRequests 0, the same arithmetic contradiction the
+  // toolRequestsDropped comment below records catching in its own first version. The validation is
+  // hoisted above the count now; the branch below only dispatches.
+  //
+  // What this deliberately still counts: a request that is ACCEPTED for service and then fails
+  // upstream. That is the sibling counter's definition too ("counted at the point the request is
+  // accepted for service", explicitly NOT "requests that reached a model"), and it is the right
+  // one -- the fields were ignored whether or not the spawn later succeeded.
+  //
+  // LOGGED AT `info`, NOT `warn`, and the difference is not timidity. A dropped `tools` kills an
+  // agent's loop; an ignored `temperature` degrades one answer. More concretely: many clients send
+  // `temperature` on every call, so `warn` here would fire on most traffic and drown the signal
+  // #304 made load-bearing (`warn_count` in the doctor shape). A guard that fires on everything is
+  // worth nothing, and this one is meant to be read as a rate, not an alarm.
+  // The last rejecting gate, hoisted from inside the useToolCalling branch (see the paragraph above).
   if (useToolCalling) {
     const bad = validateTools(parsed.tools);
     if (bad) {
       return jsonResponse(res, 400, { error: { message: bad, type: "invalid_request_error", param: "tools", code: "invalid_tools" } });
     }
+  }
+
+  const unhonoured = listUnhonouredFields(parsed);
+  if (unhonoured.length) {
+    stats.unhonouredFieldRequests++;
+    logEvent("info", "openai_fields_not_honoured", {
+      model,
+      // Field NAMES only -- never their values. `logit_bias` and `stop` carry client content, and
+      // this log has no rotation of its own (same reasoning as the tool_choice truncation below).
+      // The names are a closed set from lib/unhonoured-fields.mjs, so this line is bounded by that
+      // list rather than by anything the client sends.
+      fields: unhonoured,
+      // Of those, the ones that are not wholly inert: they feed cacheHash, so they partition the
+      // cache without steering the sampler. Named separately because "ignored" is too strong for
+      // them and a reader who greps the code will find the cacheHash use and distrust the rest.
+      cacheKeyOnly: unhonoured.filter((f) => CACHE_KEY_ONLY.has(f)),
+    });
+  }
+
+  if (useToolCalling) {
     return handleToolTurn(req, res, model, messages, conversationId, parsed, stream);
   }
 

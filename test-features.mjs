@@ -9,6 +9,7 @@ import { getDb, getDbPath, createKey, listKeys, LIST_KEYS_SQL, validateKey, reco
 import { isLoopbackBind } from "./lib/net.mjs";
 import { classifyToolRequest, countDeclaredTools } from "./lib/tool-support.mjs";
 import { isUpstreamRateLimit, retryAfterSeconds } from "./lib/upstream-errors.mjs";
+import { listUnhonouredFields, CACHE_KEY_ONLY, ALWAYS_UNHONOURED } from "./lib/unhonoured-fields.mjs";
 import { validateTools, extractBridgeToolUses, toolUsesToOpenAI, renderToolTurn, endsWithToolResult, TOOL_CONTINUATION_NOTE, TOOL_PREFIX as TC_PREFIX, buildBridgeConfig } from "./lib/tool-calling.mjs";
 import { PREFIX as BRIDGE_PREFIX } from "./lib/mcp-bridge.mjs";
 import { randomBytes } from "node:crypto";
@@ -6445,6 +6446,170 @@ ltTest("integration (#479): in multi mode a BRIDGE spawn gets the neutral wrappe
       const argv2 = ltArgvCalls(argvFile);
       assert.ok(!argv2.includes("--mcp-config"), `premise: no bridge on the plain spawn — ${JSON.stringify(argv2.slice(-8))}`);
     } finally { child.kill("SIGKILL"); await ltDrain(() => buf.closed, "multi-wrapper", 5000); }
+  } finally { _ltRmRetry(dir); }
+});
+
+console.log("\nFields OCP accepts and does not act on (#470):");
+
+test("#470: a field is listed only when the client asked for something it is not getting", () => {
+  // Nothing sent, nothing to report.
+  assert.deepEqual(listUnhonouredFields({}), []);
+  assert.deepEqual(listUnhonouredFields(null), []);
+  assert.deepEqual(listUnhonouredFields("not an object"), []);
+
+  // THE DEFAULTS ARE HONOURED, and reporting them would make this fire on clients that are getting
+  // exactly what they asked for -- which is how a signal becomes noise and then gets ignored.
+  assert.deepEqual(listUnhonouredFields({ n: 1 }), [], "n:1 IS what OCP returns");
+  assert.deepEqual(listUnhonouredFields({ stop: [] }), [], "an empty stop list asks for nothing");
+  assert.deepEqual(listUnhonouredFields({ logprobs: false }), [], "logprobs:false is the default");
+  assert.deepEqual(listUnhonouredFields({ parallel_tool_calls: true }), [],
+    "parallel calls ARE delivered as of #478 — this one became honoured, and the list must follow");
+
+  // ...and the same fields at a non-default value are not.
+  assert.deepEqual(listUnhonouredFields({ n: 3 }), ["n"]);
+  assert.deepEqual(listUnhonouredFields({ stop: ["END"] }), ["stop"]);
+  assert.deepEqual(listUnhonouredFields({ logprobs: true, top_logprobs: 5 }), ["logprobs", "top_logprobs"]);
+  assert.deepEqual(listUnhonouredFields({ parallel_tool_calls: false }), ["parallel_tool_calls"],
+    "asking OCP to SERIALISE calls is the half that still goes unmet");
+
+  // THE OPENAI DEFAULTS are not reported either. Weaker footing than n:1 (OCP has no sampler control
+  // at all) and stated so in the module: a client sending the default gets default behaviour it
+  // cannot distinguish from what it asked for, and an SDK that fills defaults in would otherwise
+  // light this up on every call -- review measured a body of five such fields reporting all five.
+  assert.deepEqual(listUnhonouredFields({ temperature: 1, top_p: 1, presence_penalty: 0, frequency_penalty: 0, logit_bias: {} }), [],
+    "the OpenAI defaults ask for nothing the client could see OCP fail to deliver");
+  // ...and one notch off any of them IS a request.
+  assert.deepEqual(listUnhonouredFields({ temperature: 0 }), ["temperature"]);
+  assert.deepEqual(listUnhonouredFields({ presence_penalty: 0.5 }), ["presence_penalty"]);
+  assert.deepEqual(listUnhonouredFields({ logit_bias: { "50256": -100 } }), ["logit_bias"]);
+
+  // Several at once, sorted, so a log line is stable to read and to assert on.
+  assert.deepEqual(listUnhonouredFields({ max_tokens: 50, seed: 7, temperature: 0.2 }),
+    ["max_tokens", "seed", "temperature"]);
+
+  // The three that are not wholly inert: they reach cacheHash and nothing else.
+  assert.deepEqual([...CACHE_KEY_ONLY].sort(), ["max_tokens", "temperature", "top_p"]);
+});
+
+// The WIRING PIN, and the reason this list can be trusted a year from now. The claim is not "these
+// fields are ignored" -- that is prose. It is "no value of these fields reaches the spawn", which a
+// live boot can read off the argv the server really passed. Implement one of them without removing
+// it from the list and this reddens.
+ltTest("integration (#470): the listed fields reach NEITHER the argv NOR the prompt, and the request is counted", async () => {
+  if (!LT_POSIX) return;
+  const dir = ltMkdir(); const fake = ltFake(dir);
+  const argvFile = join(dir, "argv.txt");
+  const stdinFile = join(dir, "stdin.txt");
+  try {
+    const { child, buf, port } = await ltBootFresh({ CLAUDE_BIN: fake, ARGV_CAPTURE: argvFile, STDIN_CAPTURE: stdinFile }, dir);
+    try {
+      assert.ok(await ltWait(() => buf.out.includes("listening on")), `— ${ltDiag(buf)}`);
+      // ONE SENTINEL VALUE PER LISTED FIELD, built from the module's OWN list -- review found the first
+      // version of this test checking six of the eleven by hand, which is a pin that silently stops
+      // pinning the moment a field is added to the list and not to the test. Each value is a number
+      // or string that cannot occur by accident, so its absence from the prompt is meaningful.
+      const SENTINELS = {
+        temperature: 0.7319, top_p: 0.6173, max_tokens: 4177, max_completion_tokens: 4179,
+        seed: 918273, stop: ["ZZSTOPZZ"], logprobs: true, top_logprobs: 7,
+        presence_penalty: 0.5511, frequency_penalty: 0.5513, logit_bias: { "50256": -73 },
+      };
+      // The test's sentinel table and the module's list must agree, or a field could be listed and
+      // never exercised here. This is the assertion that keeps the two from drifting apart.
+      assert.deepEqual(Object.keys(SENTINELS).sort(), [...ALWAYS_UNHONOURED].sort(),
+        "every field in ALWAYS_UNHONOURED needs a sentinel here, and nothing else");
+      const r = await ltPostStatus(port, { model: "sonnet", messages: [{ role: "user", content: "hi" }], n: 3, ...SENTINELS });
+      assert.equal(r.status, 200, `an inert field must not turn into a refusal — ${r.text.slice(0, 200)}`);
+      // The spec's own answer for n>1 is n choices; OCP returns one. Asserting it pins WHY the
+      // field is on the list rather than taking the list's word for it.
+      assert.equal(JSON.parse(r.text).choices.length, 1, "n:3 is reported, not honoured");
+
+      const argv = ltArgvCalls(argvFile);
+      assert.ok(argv.length > 0, `no argv captured — ${ltDiag(buf)}`);
+      // POSITIVE anchor before any absence claim (#405): a known-present element proves the capture
+      // is this request's and not an empty world satisfying every negative.
+      assert.ok(argv.includes("--output-format"), `premise: a real argv — ${JSON.stringify(argv.slice(0, 6))}`);
+      // No flag for ANY listed field, in either spelling the CLI could plausibly use.
+      for (const f of ALWAYS_UNHONOURED) {
+        for (const flag of [`--${f}`, `--${f.replace(/_/g, "-")}`]) {
+          assert.ok(!argv.includes(flag), `${flag} must not appear — the CLI has no such flag: ${JSON.stringify(argv)}`);
+        }
+      }
+      // And no sentinel VALUE smuggled into the prompt either, which is the other way a value could
+      // reach the model. Every listed field's sentinel is searched for, not just stop's.
+      assert.ok(await ltWait(() => _ltExists(stdinFile)), "no stdin captured");
+      const stdin = _ltRead(stdinFile, "utf8");
+      // TWO FIELDS CANNOT CARRY A DISTINCT SENTINEL and are covered by the argv check ONLY, stated
+      // here rather than papered over: `logprobs` is a boolean, and `top_logprobs` is a 0-20
+      // integer per the spec, so any value it can take is one or two characters -- and review
+      // found the first version asserting `!stdin.includes("7")` over the whole prompt, which
+      // reddens on any unrelated 7. The set is asserted exactly, so it cannot grow quietly.
+      const ARGV_ONLY = new Set(["logprobs", "top_logprobs"]);
+      assert.deepEqual([...ARGV_ONLY].sort(), ["logprobs", "top_logprobs"], "the argv-only exemption is exactly these two");
+      for (const [f, v] of Object.entries(SENTINELS)) {
+        if (ARGV_ONLY.has(f)) continue;
+        const needle = Array.isArray(v) ? v[0] : typeof v === "object" ? Object.keys(v)[0] : String(v);
+        assert.ok(needle.length >= 4, `premise: ${f}'s sentinel "${needle}" is too short to be distinct`);
+        assert.ok(!stdin.includes(needle), `${f}'s value must not be smuggled into the prompt — ${stdin.slice(0, 300)}`);
+      }
+
+      const h = await fetch(`http://127.0.0.1:${port}/health`).then(x => x.json());
+      assert.equal(h.stats.unhonouredFieldRequests, 1, "one REQUEST, whatever the field count");
+      // Wait on EITHER stream, then assert the level on the line found. logEvent routes info to
+      // stdout and warn to stderr, so a wait on buf.out alone already implied "info" and the level
+      // assertion below could never be the one that fired (#405, the asymmetric shape: an earlier
+      // assertion catches the mutation, the later one never runs). Searching both makes the level
+      // assertion the ONLY thing that separates info from warn, so its mutation row is its own.
+      assert.ok(await ltWait(() => /"event":"openai_fields_not_honoured"/.test(buf.out + buf.err)),
+        `the request must be named in the log — ${(buf.out + buf.err).slice(-400)}`);
+      const line = (buf.out + buf.err).split("\n").filter((l) => l.includes("openai_fields_not_honoured")).pop();
+      assert.match(line, /"cacheKeyOnly":\["max_tokens","temperature","top_p"\]/,
+        `the three cache-key-only fields must be called out separately — ${line}`);
+      // info, not warn: a dropped tool kills an agent loop, an ignored temperature degrades one
+      // answer, and warning on most traffic would drown warn_count (#304). Asserted POSITIVELY on
+      // the captured line -- the first version tested a negative against buf.err, which logEvent
+      // never writes info to, so it could not have fired. The `log at warn` mutation reddened only
+      // because the buf.out lookup above found nothing; this is the assertion that says why.
+      assert.match(line, /"level":"info"/, `must be logged at info, not warn — ${line}`);
+    } finally { child.kill("SIGKILL"); await ltDrain(() => buf.closed, "unhonoured", 5000); }
+  } finally { _ltRmRetry(dir); }
+});
+
+// THE P1 FROM REVIEW, as its own test. The count sat one line above validateTools, which 400s, so a
+// tools request with an unnamed function and a `temperature` was counted as served and then
+// refused: unhonouredFieldRequests 1 against totalRequests 0. Same arithmetic contradiction the
+// toolRequestsDropped counter records catching in ITS first version -- the placement rule was
+// copied and its precondition was not.
+ltTest("integration (#470): a request REJECTED by validateTools is not counted as served-with-fields-ignored", async () => {
+  if (!LT_POSIX) return;
+  const dir = ltMkdir(); const fake = ltFake(dir);
+  try {
+    const { child, buf, port } = await ltBootFresh({ CLAUDE_BIN: fake }, dir);
+    try {
+      assert.ok(await ltWait(() => buf.out.includes("listening on")), `— ${ltDiag(buf)}`);
+      const r = await ltPostStatus(port, { model: "sonnet", messages: [{ role: "user", content: "hi" }],
+        tools: [{ type: "function", function: { description: "no name" } }], temperature: 0.5 });
+      assert.equal(r.status, 400, `premise: the malformed tool must be refused — got ${r.status}: ${r.text.slice(0, 200)}`);
+      const h = await fetch(`http://127.0.0.1:${port}/health`).then(x => x.json());
+      assert.equal(h.stats.unhonouredFieldRequests, 0,
+        `a request that was REFUSED cannot have been served with fields ignored — got ${h.stats.unhonouredFieldRequests}`);
+    } finally { child.kill("SIGKILL"); await ltDrain(() => buf.closed, "unhonoured-400", 5000); }
+  } finally { _ltRmRetry(dir); }
+});
+
+ltTest("integration (#470 control): a request sending only honoured fields is NOT counted", async () => {
+  if (!LT_POSIX) return;
+  const dir = ltMkdir(); const fake = ltFake(dir);
+  try {
+    const { child, buf, port } = await ltBootFresh({ CLAUDE_BIN: fake }, dir);
+    try {
+      assert.ok(await ltWait(() => buf.out.includes("listening on")), `— ${ltDiag(buf)}`);
+      // n:1 and an empty stop are the interesting half: present in the body, asking for nothing.
+      const r = await ltPostStatus(port, { model: "sonnet", messages: [{ role: "user", content: "hi" }], n: 1, stop: [] });
+      assert.equal(r.status, 200, r.text.slice(0, 200));
+      const h = await fetch(`http://127.0.0.1:${port}/health`).then(x => x.json());
+      assert.equal(h.stats.unhonouredFieldRequests, 0,
+        "a request getting what it asked for must not be counted, or the number stops meaning anything");
+    } finally { child.kill("SIGKILL"); await ltDrain(() => buf.closed, "unhonoured-control", 5000); }
   } finally { _ltRmRetry(dir); }
 });
 

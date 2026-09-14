@@ -223,6 +223,22 @@ The canonical list lives in [`models.json`](./models.json) — the single source
 | `/cache/stats` | GET | Cache statistics (admin only) |
 | `/cache` | DELETE | Clear response cache (admin only) |
 
+### Fields OCP accepts and does not act on
+
+Sending one of these is **not an error** and never will be — a client that sets `temperature: 0` out of habit still gets an answer. But OCP does not honour them, and since 3.37.0 it says so: each such request increments `/health`'s **`stats.unhonouredFieldRequests`** and logs `openai_fields_not_honoured` at `info` with the field names.
+
+| field | what happens |
+|---|---|
+| `n` (≠ 1) | one choice is returned |
+| `logprobs`, `top_logprobs` | no `logprobs` in the response |
+| `seed`, `stop`, `presence_penalty`, `frequency_penalty`, `logit_bias`, `max_completion_tokens` | no effect |
+| `temperature`, `top_p`, `max_tokens` | **no effect on generation** — they are read only as cache-key material, so they partition the response cache. Reported separately as `cacheKeyOnly`. The OpenAI defaults (`temperature: 1`, `top_p: 1`, penalties `0`, `logit_bias: {}`) are **not** reported: a client sending them gets default behaviour it cannot tell apart from what it asked for |
+| `parallel_tool_calls: false` | calls are not serialised (`true` **is** honoured — see § tool calling) |
+
+**These are not unwired fields, they are absent knobs.** `claude` exposes no `--max-tokens`, `--stop`, `--seed`, `--temperature` or `--top-p`; its only budget flags are `--max-budget-usd` (a dollar cap) and `--autocompact` (the context window, not the output). Honouring them would mean OCP post-processing the model's output.
+
+**`max_tokens` deserves a second look if you are using it for cost control** — it does not cap anything here. Use `--max-budget-usd` on the CLI side, or a per-key quota (§ API Keys), instead.
+
 ### A `429` from `/v1/chat/completions` has two causes
 
 Since 3.35.0 the proxy returns `429 { "error": { "type": "rate_limit_error" } }` for **two different things**. They are genuinely the same kind of answer — *slow down* — which is why they share a shape, and **an ordinary 429 handler that backs off and honours `Retry-After` is correct for both.** What differs is how long the wait is and whether waiting in this process can ever end it:
