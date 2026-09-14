@@ -3251,8 +3251,28 @@ function jsonResponse(res, status, data, extraHeaders = null) {
 // three lines inside respondUpstreamError: `stats.upstreamRateLimits` answers the operator's
 // question "did we hit the wall, or did the proxy break", and a counter that is blind to the lane
 // most agent traffic uses answers "not the wall" on exactly the deployment that motivated it.
-// MEASURED 2026-09-14: an agent framework (Hermes 0.21.1) pointed at OCP sends `stream: true` for
-// the turn itself, so that lane is the common case, not the corner.
+// WHICH LANE REAL AGENT TRAFFIC TAKES -- CORRECTED, because the first version of this comment drew
+// the wrong conclusion from a correct measurement. Both halves are worth keeping:
+//
+//   OBSERVED, and still true: an agent framework (Hermes 0.21.1) pointed at OCP sends the turn as
+//   `stream: true`.
+//   INFERRED, and false: "so the streaming lane is the common case for agent traffic." That never
+//   checked WHICH HANDLER such a request reaches.
+//
+// The same framework's turn also declares `tools` (20 of them, measured). With tool calling on --
+// the default since 3.34.0 -- a request that declares tools is served by handleToolTurn, which
+// AWAITS callClaude and only renders SSE afterwards. So no headers have been sent when the failure
+// arrives, and it goes through respondUpstreamError with a real 429. Measured against a live
+// 3.35.0 instance whose spawn fails with a wall:
+//
+//   stream:true WITH tools  (the real agent shape) -> HTTP 429,     lane "buffered"
+//   stream:true WITHOUT tools                      -> HTTP 200 SSE, lane "streaming"
+//
+// Counting on the streaming lane is still right, and its justification is now the plain one: a
+// counter that is blind to a reachable lane cannot answer the question it exists for. What it is
+// NOT is the lane an agent lands on. The streaming lane is reached when the request declares no
+// tools, when OCP_TOOL_CALLING=0, or when the request is excluded from the tool path (image
+// content, response_format, legacy `functions`, `tool_choice: "none"`).
 function noteUpstreamRateLimit(message, lane) {
   if (!isUpstreamRateLimit(message)) return { rateLimit: false, retryAfter: null };
   stats.upstreamRateLimits++;

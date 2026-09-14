@@ -236,7 +236,16 @@ So a client that only implements *back off and retry* is safe, not wrong. A clie
 
 The two counters are what an **operator** reads to tell "we hit the wall" from "the proxy is saturated" — a distinction `stats.errors` never made. Before 3.35.0 the second row was a `500 proxy_error`, which told every client the proxy had broken.
 
-**Streaming is the exception, and it is structural.** With `stream: true` the SSE headers go out *before* the spawn produces anything (so the heartbeat can cover the silent window), and a status cannot be un-sent. An upstream wall on that path therefore arrives as an SSE error frame with `200`, not a `429` — it is still counted in `stats.upstreamRateLimits` and logged with `"lane":"streaming"`, so the operator view is complete even though the status is not. See [#482](https://github.com/dtzp555-max/ocp/issues/482).
+**One shape cannot carry the status, and which one is not what you would guess.** With `stream: true` **and no `tools`**, the SSE headers go out *before* the spawn produces anything (so the heartbeat can cover the silent window), and a status cannot be un-sent — so an upstream wall arrives as an SSE error frame with `200`. It is still counted in `stats.upstreamRateLimits` and logged with `"lane":"streaming"`, so the operator view stays complete even though the status is not. See [#482](https://github.com/dtzp555-max/ocp/issues/482).
+
+A **streaming request that declares `tools`** is not affected, and that is the shape agents actually send: with tool calling on (the default since 3.34.0) OCP completes the turn before it writes any SSE, so a wall still comes back as a real `429`. Measured against a live 3.35.0 instance whose upstream fails with a wall:
+
+| request | status | lane, in the proxy's own log (`/logs`) |
+|---|---|---|
+| `stream: true` **with** `tools` | **429** | `buffered` |
+| `stream: true` without `tools` | 200 + SSE error frame | `streaming` |
+
+So the blind spot is real but narrow: it needs `stream: true`, no tools — or `OCP_TOOL_CALLING=0`, or a request the tool path excludes (image content, `response_format`, the legacy `functions` shape, `tool_choice: "none"`).
 
 ## Environment Variables
 

@@ -2,6 +2,24 @@
 
 ## Unreleased
 
+### Fixed
+
+- **Corrected a v3.35.0 claim about which lane real agent traffic takes.** The v3.35.0 section below says *"an agent framework pointed at OCP sends `stream: true` for the turn itself, so a counter blind to that lane would read `0` on exactly the deployment that motivated the field."* **The observation is right and the conclusion drawn from it is wrong**, and the released section is left as it stands rather than quietly edited — a changelog that rewrites what it said is worth less than one that says it was wrong.
+
+  What was never checked is **which handler** such a request reaches. The same framework's turn also declares `tools` — 20 of them, measured — and with tool calling on (the default since 3.34.0) a request that declares tools is served by the tool path, which **awaits** the spawn and only writes SSE afterwards. No headers have been sent when the failure arrives, so it still gets a real `429`. Measured against a live 3.35.0 instance whose upstream fails with a wall:
+
+  | request | status | log lane |
+  |---|---|---|
+  | `stream: true` **with** `tools` — the shape agents send | **429** `rate_limit_error` | `buffered` |
+  | `stream: true` without `tools` | `200` + SSE error frame | `streaming` |
+
+  So the blind spot is real but **narrow**: it needs `stream: true` and no tools — or `OCP_TOOL_CALLING=0`, or a request the tool path excludes (image content, `response_format`, the legacy `functions` shape, `tool_choice: "none"`). Counting on the streaming lane remains right; its justification is now the plain one, that a counter blind to a reachable lane cannot answer the question it exists for.
+
+  **The lane split is now pinned by a test**, because it had drifted into four artifacts unchecked: one live boot sends both shapes and asserts the statuses *and* the two log lanes, the two requests being each other's control — a test asserting either alone would pass on a build where both behave the same. Mutation rows: forcing the tool request down the streaming lane reddens it, and so does dropping the lane label from the log. **Pinned on POSIX only**: the fixture's fake `claude` is a `/bin/sh` script, so the test early-returns on `win32`. CI is `ubuntu-latest` today, so that costs nothing now — stated because a Windows runner added later would make this sentence quietly false rather than red.
+
+  Same correction applied to `README.md` and to the comment in `server.mjs`; [#482](https://github.com/dtzp555-max/ocp/issues/482) updated, since it had inherited the same framing.
+
+
 
 ## v3.35.0 — 2026-09-14
 

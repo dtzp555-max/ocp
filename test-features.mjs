@@ -6285,6 +6285,52 @@ ltTest("integration: one streaming failure seen by BOTH error arms still counts 
   } finally { _ltRmRetry(dir); }
 });
 
+// THE LANE SPLIT IS NOT STREAM-VS-NON-STREAM, and a shipped comment, a shipped README section and
+// a shipped CHANGELOG entry all said it was. `stream: true` WITH `tools` -- which is the shape an
+// agent actually sends (Hermes 0.21.1 was measured sending exactly that, 20 tools) -- is served by
+// the tool path, which AWAITS the spawn and only writes SSE afterwards, so a wall still gets a real
+// 429. Only `stream: true` WITHOUT tools has already sent its headers.
+//
+// These two are each other's control and must stay in ONE pair: the claim is a DIFFERENCE between
+// them, so a test that asserted either alone would pass on a build where both behave the same.
+ltTest("integration: stream+tools keeps a real 429 — only a TOOL-LESS stream loses the status", async () => {
+  if (!LT_POSIX) return;
+  const dir = ltMkdir(); const fake = ltFake(dir);
+  const tools = [{ type: "function", function: { name: "lookup", description: "d", parameters: { type: "object", properties: { q: { type: "string" } } } } }];
+  try {
+    const { child, buf, port } = await ltBootFresh({ CLAUDE_BIN: fake, UPSTREAM_ERROR: "Claude usage limit reached - resets at 7:00am" }, dir);
+    try {
+      assert.ok(await ltWait(() => buf.out.includes("listening on")), `— ${ltDiag(buf)}`);
+
+      const withTools = await ltPostStatus(port, { model: "sonnet", stream: true, tools, messages: [{ role: "user", content: "hi" }] });
+      assert.equal(withTools.status, 429, `the shape agents send must still carry a status — got ${withTools.status}: ${withTools.text.slice(0, 200)}`);
+      // Assert the raw text BEFORE parsing it. A regression that answered 429 with an SSE body would
+      // otherwise throw a bare SyntaxError out of JSON.parse and take the diagnostic with it.
+      assert.match(withTools.text, /^\s*\{/, `a buffered 429 must be a JSON body, not SSE — got ${withTools.text.slice(0, 200)}`);
+      assert.equal(JSON.parse(withTools.text).error.type, "rate_limit_error", withTools.text.slice(0, 200));
+
+      const noTools = await ltPostStatus(port, { model: "sonnet", stream: true, messages: [{ role: "user", content: "hi" }] });
+      assert.equal(noTools.status, 200, "a tool-less stream has already sent its headers, so it cannot");
+      assert.match(noTools.text, /data: /, `and answers as SSE — got ${noTools.text.slice(0, 200)}`);
+      // ...carrying the WALL, not merely some SSE. Without this a regression that replaced the error
+      // frame with any other `data:`-bearing payload would keep this test green while the documented
+      // behaviour was gone.
+      assert.match(noTools.text, /usage limit/i, `the SSE frame must carry the failure — got ${noTools.text.slice(0, 300)}`);
+
+      // Both were walls, so both are counted; the lanes are what differ. Asserting the lanes is what
+      // stops this from passing on a build where the split moved but the statuses happened to match.
+      const h = await fetch(`http://127.0.0.1:${port}/health`).then(x => x.json());
+      // EXACTLY two, not "at least". A weaker bound here would stop this from noticing a request
+      // counted twice, which is a separate live claim (#481's at-most-once guard) and the one thing
+      // that makes this counter usable. The two claims are independently reachable -- no single
+      // mutation breaks both -- so co-locating them costs no mutation row.
+      assert.equal(h.stats.upstreamRateLimits, 2, `both walls counted, exactly once each — got ${h.stats.upstreamRateLimits}`);
+      assert.match(buf.err, /"lane":"buffered"/, `the tools request must log the buffered lane — ${buf.err.slice(-400)}`);
+      assert.match(buf.err, /"lane":"streaming"/, `the tool-less one must log the streaming lane — ${buf.err.slice(-400)}`);
+    } finally { child.kill("SIGKILL"); await ltDrain(() => buf.closed, "lane-split", 5000); }
+  } finally { _ltRmRetry(dir); }
+});
+
 console.log("\nOpenAI tool calling over the MCP bridge (ADR 0022):");
 
 // ── unit: the pure helpers ──────────────────────────────────────────────────────────────────────
