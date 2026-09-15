@@ -232,7 +232,7 @@ Since 3.35.0 the proxy returns `429 { "error": { "type": "rate_limit_error" } }`
 | OCP is full | more requests are in flight and queued than `CLAUDE_MAX_CONCURRENT` + `CLAUDE_MAX_QUEUE` allow | `stats.queueRejections` | **always** present, and short — seconds | yes |
 | the **upstream** wall | the Anthropic subscription or rate limit the spawned `claude` hit | `stats.upstreamRateLimits` | only when the upstream text said when | **not within this process** — it clears on the upstream's schedule, which can be hours |
 
-So a client that only implements *back off and retry* is safe, not wrong. A client that can do better reads `Retry-After` when it is there and the message when it is not: `usage limit` / `rate limit` text means the second row, and a client with somewhere else to go should go there rather than spend its retry budget on a wall that cannot move.
+So a client that only implements *back off and retry* is safe, not wrong. A client that can do better reads `Retry-After` when it is there and the message when it is not: `usage limit` / `rate limit` / `session limit` text means the second row, and a client with somewhere else to go should go there rather than spend its retry budget on a wall that cannot move.
 
 **Choosing where to go is the client's job, not OCP's.** The proxy reports the condition accurately and stops there; it does not retry against another upstream, switch providers, or hold a queue on your behalf. If you want failover, configure it in the agent framework or SDK that calls OCP.
 

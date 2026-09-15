@@ -6081,6 +6081,12 @@ test("upstream rate limit: quota/rate NOUNS match, transient advice alone does N
   for (const m of [
     "Claude usage limit reached — resets at 7:00",
     "usage_limit_reached",
+    // OBSERVED FROM A LIVE 500, not invented: on 2026-09-15 a v3.36.0 instance hit the 5-hour
+    // subscription wall and returned exactly this string in a `500 proxy_error` body, while OCP's
+    // own log carried the originating `rate_limit_event` frame (`rateLimitType: "five_hour"`, with
+    // a `resetsAt` epoch). The frame is not what this classifier receives -- the caller-visible
+    // message is -- which is why the phrase has to match on its own.
+    "You've hit your session limit · resets 5am (UTC)",
     "API error: rate limit exceeded",
     "429 Too Many Requests",
     "quota exceeded for this organization",
@@ -6102,6 +6108,14 @@ test("upstream rate limit: quota/rate NOUNS match, transient advice alone does N
     "429 Too Many Requests",
   ]) assert.equal(isUpstreamRateLimit(m), true, `should be a rate limit: ${m}`);
 
+  // NO NEGATIVE ROW WAS ADDED FOR "session limit", and that is a finding rather than an omission.
+  // No unrelated OCP failure was found that carries the phrase, and the module's own input-channel
+  // note already records the one real risk: when a spawn dies with empty stderr the classifier's
+  // input is the model's answer, so a client could put a quota noun in its own prompt. That channel
+  // is documented and bounded (a false positive costs one needless failover, never a wrong answer),
+  // not a discrete near-miss string -- inventing one would be theatre. The qualification is already
+  // controlled by the existing "heap limit exceeded" row below: `limit exceeded` is not a pattern,
+  // so a phrase matching a bare `limit` reddens there.
   // Negative: ordinary failures, INCLUDING ones carrying retry advice. This is the row that keeps
   // the guard from firing on everything — transient phrases alone must not promote a 500 to a 429,
   // or every flaky spawn would hand the client a false "you are out of quota" and, downstream, a

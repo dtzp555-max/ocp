@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+### Fixed
+
+- **The 5-hour subscription wall's `session limit` phrasing reaches the client as `429 rate_limit_error`, not `500 proxy_error`.** Observed on a live OCP v3.36.0 instance on 2026-09-15: the caller-visible response was `500 {"error":{"message":"You've hit your session limit · resets 5am (UTC)","type":"proxy_error"}}`, while OCP's own log carried the originating `rate_limit_event` frame with `rateLimitType: "five_hour"` and a `resetsAt` epoch. The classifier in `lib/upstream-errors.mjs` matched the phrasing the `claude` CLI was known to print — `usage limit`, `rate limit`, and the quota nouns — and not this one, so the wall missed and failed **closed**, exactly as the module's `EXPIRY` note predicts. It arrived as 26 `rate_limit_event` frames over ~40 minutes, in bursts of three retries every five minutes, every one answered 500.
+
+  **`"session limit"` is added to `RATE_LIMIT_PATTERNS`** — the smallest phrase covering the observed string, and the phrase that string actually contains. It follows the list's house rule that **every pattern names a quota or rate noun**: "session" qualifies the limit the way "usage" does in the existing `usage limit`, and it is deliberately not a widening toward a bare limit — `limit exceeded` was removed for matching the `claude` bundle's `heap limit exceeded`, so a phrase matching on `limit` alone would walk that removal back. It is not a transient signal, so it does not widen the guard toward `"try again"` / `"wait"` / `"resets at"`. Like `usage limit` and unlike the quota entries it is not `quota`-qualified, so the filesystem veto cannot suppress it.
+
+  **Why the status code is the whole signal, unchanged from [#481](https://github.com/dtzp555-max/ocp/issues/481):** the consuming framework classifies a 429 as rate-limit-or-billing and sets `should_fallback`, while a 500 classifies as `server_error` — `retryable`, and **not** `should_fallback` — so a 500 makes a fallback-capable client retry **into** a wall that cannot clear for hours instead of leaving for another provider. This is the same defect [#481](https://github.com/dtzp555-max/ocp/issues/481) fixed for `usage limit`; the wall simply used a phrase the pattern list did not carry. Pinned by a positive row for the observed message in `test-features.mjs` (recorded there as observed, not invented) alongside the existing negative rows; the classifier's prior hardening is [#484](https://github.com/dtzp555-max/ocp/issues/484).
+
+  **`retryAfterSeconds` is deliberately not extended here** to parse the `"resets 5am (UTC)"` wall-clock shape. The originating frame already carries a parseable `resetsAt` epoch, and the function's standing rule is to return `null` rather than invent a number; reading a wall-clock reset is a separate and more debatable change. No B.2 response key set changes: an HTTP status is not a key path.
+
 
 ## v3.36.0 — 2026-09-14
 
