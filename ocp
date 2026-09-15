@@ -144,6 +144,23 @@ _curl_or_die() {
   if [[ $status -ne 0 ]]; then
     if _curl_is_local_fault "$status" "$err"; then
       echo "Error: could not run curl (${err:-exit status $status}) — this is a local shell/environment fault, not a proxy problem" >&2
+    elif [[ $status -eq 22 ]]; then
+      # Issue #475. Exit 22 is curl's OWN code for "the server answered with an HTTP error and -f
+      # made me fail on it" -- it is produced by nothing else, and it is the opposite of unreachable:
+      # a TCP connection was made and an HTTP response came back. Reporting it under the network
+      # label told an operator "proxy unreachable" about a proxy that had just answered /health,
+      # and hid a 502 whose body named the real fault ("Usage API returned 401 ..."). The body is
+      # gone by this point (-f discards it), so this branch can only say what KIND of failure it
+      # was; a call site that wants the body must fetch without -f (see cmd_usage).
+      #
+      # TWO LABELS FOR TWO FAILURES. The positional label is the NETWORK-failure text and must not
+      # be printed here -- "proxy unreachable" is false for an answered request. A call site whose
+      # HTTP-error case has a more specific meaning (cmd_connect: a refusal on /v1/models means the
+      # key may be bad) sets _CURL_HTTP_ERROR_LABEL for the duration of its call. The first version
+      # of this branch printed one generic line for everyone and OVERRODE cmd_connect's diagnosis
+      # -- its #300 control reddened, which is the control doing its job.
+      echo "Error: ${_CURL_HTTP_ERROR_LABEL:-the proxy answered, but with an HTTP error status — not a connection failure: a connection was made and a response came back; curl -f discarded the body}" >&2
+      [[ -n "$err" ]] && echo "$err" >&2
     else
       echo "Error: $network_label" >&2
       [[ -n "$err" ]] && echo "$err" >&2
@@ -255,7 +272,7 @@ EOF
 cmd_usage() {
   if [[ "${1:-}" == "--by-key" ]]; then
     local data
-    data=$(_curl_or_die "proxy unreachable or usage API not available" _curl -sf --max-time 15 "$PROXY/api/usage") || exit 1
+    data=$(_CURL_HTTP_ERROR_LABEL="the proxy refused /api/usage — unauthorized, or the usage API is not available (is OCP_ADMIN_KEY set and correct?)" _curl_or_die "proxy unreachable" _curl -sf --max-time 15 "$PROXY/api/usage") || exit 1
     echo "$data" | python3 -c "
 import sys, json
 d = json.loads(sys.stdin.read())
@@ -275,8 +292,39 @@ else:
     return
   fi
 
-  local data
-  data=$(_curl_or_die "proxy unreachable" curl -sf --max-time 15 "$PROXY/usage") || exit 1
+  # Issue #475. Fetched WITHOUT -f and with the status code appended, so a non-2xx keeps its body:
+  # for /usage that body carries the one sentence that names the real fault ("Usage API returned
+  # 401 with no rate-limit headers"), and with -f it was thrown away and replaced by "proxy
+  # unreachable" -- the headline this script's own _curl_or_die comment exists to kill, reported
+  # about a proxy that had just answered. Transport failures still go through _curl_or_die's
+  # network branch (curl exits non-zero on those with or without -f); only the "answered, badly"
+  # case changes, and it now says so and shows what the proxy said.
+  local data raw code
+  raw=$(_curl_or_die "proxy unreachable" curl -s --max-time 15 -w '\n%{http_code}' "$PROXY/usage") || exit 1
+  code="${raw##*$'\n'}"
+  data="${raw%$'\n'*}"
+  if [[ ! "$code" =~ ^2[0-9][0-9]$ ]]; then
+    echo "Error: the proxy answered HTTP $code for /usage (it is reachable — this is what it said):" >&2
+    # Read stdin ONCE. The first version read it again inside `except`, by which point the `try`
+    # had drained it -- so a non-JSON body (nginx's "Bad Gateway", or a JSON array) printed two
+    # spaces and nothing else, and the `|| echo` fallback never fired because the pipeline had
+    # succeeded. Found by review; the test now feeds a non-JSON body as well as a JSON one.
+    # The body is echoed to a TERMINAL and comes from the network, so control characters are
+    # stripped and both paths are capped -- a reverse proxy in front of OCP could otherwise put
+    # escape sequences on the operator's screen. (Review: -f used to discard this body entirely.)
+    echo "$data" | python3 -c "
+import sys, json, re
+raw = sys.stdin.read()
+clean = lambda t: re.sub(r'[\x00-\x08\x0b-\x1f\x7f]', '', str(t))[:300]
+try:
+    d = json.loads(raw)
+    msg = d.get('error') if isinstance(d, dict) else None
+    print('  ' + clean(msg if msg else d))
+except Exception:
+    print('  ' + clean(raw))
+" >&2 2>/dev/null || echo "  $(printf '%s' "${data:0:300}" | tr -d '\000-\010\013-\037\177')" >&2
+    exit 1
+  fi
 
   echo "$data" | python3 -c "
 import sys, json
@@ -474,7 +522,8 @@ cmd_keys() {
     add)
       if [[ -z "${2:-}" ]]; then echo "Usage: ocp keys add <name>"; return 1; fi
       local result
-      result=$(_curl_or_die "proxy unreachable or unauthorized" _curl -sf --max-time 5 -X POST "$PROXY/api/keys" \
+      result=$(_CURL_HTTP_ERROR_LABEL="the proxy refused the key request — unauthorized, or key management not available (is OCP_ADMIN_KEY set and correct?)" \
+        _curl_or_die "proxy unreachable" _curl -sf --max-time 5 -X POST "$PROXY/api/keys" \
         -H "Content-Type: application/json" \
         -d "{\"name\": \"$2\"}") || exit 1
       # Issue #242: this is the highest-stakes of the nine `_pyfail` sites — the formatted view
@@ -503,7 +552,8 @@ else:
       # Issue #278 (same shape as cmd_logs above, see its comment) — kept on `_curl` (not bare
       # curl): `_curl` adds the admin-key auth header via `_AUTH_ARGS`, dropping it here would
       # silently break authenticated revoke requests.
-      result=$(_curl_or_die "proxy unreachable or unauthorized" _curl -sf --max-time 5 -X DELETE "$PROXY/api/keys/$2") || return 1
+      result=$(_CURL_HTTP_ERROR_LABEL="the proxy refused the revoke — unauthorized, or no such key (is OCP_ADMIN_KEY set and correct?)" \
+        _curl_or_die "proxy unreachable" _curl -sf --max-time 5 -X DELETE "$PROXY/api/keys/$2") || return 1
       echo "$result" | python3 -c "
 import sys, json
 d = json.loads(sys.stdin.read())
@@ -529,7 +579,7 @@ else:
       local data
       # Issue #278 (same shape as cmd_logs above, see its comment) — kept on `_curl` (not bare
       # curl): dropping it here would silently break authenticated list requests.
-      data=$(_curl_or_die "proxy unreachable or key management not available" _curl -sf --max-time 5 "$PROXY/api/keys") || return 1
+      data=$(_CURL_HTTP_ERROR_LABEL="the proxy refused the key listing — unauthorized, or key management not available (is OCP_ADMIN_KEY set and correct?)" _curl_or_die "proxy unreachable" _curl -sf --max-time 5 "$PROXY/api/keys") || return 1
       echo "$data" | python3 -c "
 import sys, json
 d = json.loads(sys.stdin.read())
@@ -661,11 +711,16 @@ cmd_connect() {
   # twice. Routed through `_curl_or_die`, which separates "curl could not be run here" from "the
   # remote refused" and prints whichever actually happened.
   local models_out models_ok=0
+  # #475: the refusal text is the HTTP-error label (a 401/403 is exit 22 under -f), and the network
+  # label says what a connection failure means here. Before #475 one label served both, which was
+  # right for this site by accident and wrong for the /usage sites.
   if [[ -n "$key" ]]; then
-    models_out=$(_curl_or_die "API access failed — the remote refused or did not serve /v1/models (the key may be invalid or revoked)" \
+    models_out=$(_CURL_HTTP_ERROR_LABEL="API access failed — the remote refused or did not serve /v1/models (the key may be invalid or revoked)" \
+      _curl_or_die "API access failed — could not reach $base_url" \
       curl -sf --max-time 10 -H "Authorization: Bearer $key" "$base_url/v1/models") && models_ok=1
   else
-    models_out=$(_curl_or_die "API access failed — the remote refused or did not serve /v1/models" \
+    models_out=$(_CURL_HTTP_ERROR_LABEL="API access failed — the remote refused or did not serve /v1/models" \
+      _curl_or_die "API access failed — could not reach $base_url" \
       curl -sf --max-time 10 "$base_url/v1/models") && models_ok=1
   fi
 
@@ -742,14 +797,16 @@ PYEOF
   # the complete list, and each was assembled by eye.
   local chat_out chat_ok=0
   if [[ -n "$key" ]]; then
-    chat_out=$(_curl_or_die "smoke test failed — the remote is reachable but did not complete a chat request" \
+    chat_out=$(_CURL_HTTP_ERROR_LABEL="smoke test failed — the remote is reachable but did not complete a chat request" \
+      _curl_or_die "smoke test failed — could not reach $base_url" \
       curl -sf --max-time 30 \
       -H "Authorization: Bearer $key" \
       -H "Content-Type: application/json" \
       -d "$chat_payload" \
       "$base_url/v1/chat/completions") && chat_ok=1
   else
-    chat_out=$(_curl_or_die "smoke test failed — the remote is reachable but did not complete a chat request" \
+    chat_out=$(_CURL_HTTP_ERROR_LABEL="smoke test failed — the remote is reachable but did not complete a chat request" \
+      _curl_or_die "smoke test failed — could not reach $base_url" \
       curl -sf --max-time 30 \
       -H "Content-Type: application/json" \
       -d "$chat_payload" \

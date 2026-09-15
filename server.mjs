@@ -50,6 +50,7 @@ import { parseAllowedHosts, parseAuthority, matchesDeclared, evaluateOriginGate 
 import { classifyToolRequest, countDeclaredTools } from "./lib/tool-support.mjs";
 import { isUpstreamRateLimit, retryAfterSeconds } from "./lib/upstream-errors.mjs";
 import { listUnhonouredFields, CACHE_KEY_ONLY } from "./lib/unhonoured-fields.mjs";
+import { selectCredential } from "./lib/credential-source.mjs";
 import { validateTools, extractBridgeToolUses, extractAssistantText, toolUsesToOpenAI, renderToolTurn,
          endsWithToolResult, TOOL_CONTINUATION_NOTE, TOOL_PREFIX, buildBridgeConfig } from "./lib/tool-calling.mjs";
 import { runTuiTurn, reapStaleTuiSessions, resolveTuiHome, bootTuiPane, tuiPaneHealthy, poolPaneName, killLiveTurnPanes, POOL_BOOT_MS } from "./lib/tui/session.mjs";
@@ -3620,21 +3621,55 @@ function invalidateKeychainReadCache() {
   _keychainCache.clear();
 }
 
+// #475: the three sources are READ, then the winner is CHOSEN -- previously the first source with
+// a token won outright, and the file step below (commented as Linux-only) is not platform-gated, so
+// on a Mac a stale ~/.claude/.credentials.json shadowed the live keychain. Measured: the file's
+// expiresAt six days past, the keychain's four hours ahead, and OCP signing /usage with the dead
+// one while the spawned `claude` used the live one. lib/credential-source.mjs holds the rule (an
+// expired source must not shadow a valid one) and its rows; this function only gathers.
+//
+// The env var keeps its precedence untouched: it carries no expiresAt, so it is never "known
+// expired", and an explicit operator override stays an override.
+//
+// Cost: the keychain is read only when the env var is unset AND the file is absent or expired --
+// the same short-circuit as before #475, plus the expiry check. When it is read it is TTL-cached
+// (30 s), so at most one `security` exec per 30 s. Review caught the first version reading every
+// source eagerly, which would have let a locked keychain block a spawn path that never used it.
+let _credentialSourceLastLogged = null;
 function getOAuthCredentials() {
-  // 1. Env var fallback — highest precedence for explicit overrides.
-  if (process.env.CLAUDE_CODE_OAUTH_TOKEN) {
-    return { accessToken: process.env.CLAUDE_CODE_OAUTH_TOKEN };
+  // Thunks, read LAZILY in precedence order by selectCredential -- a lower source is touched only
+  // if every higher one was absent or expired. So with the env var set, neither the file nor the
+  // keychain is read, exactly as before #475; the keychain exec happens only when it can matter.
+  const candidates = [
+    { source: "env", read: () => (process.env.CLAUDE_CODE_OAUTH_TOKEN ? { accessToken: process.env.CLAUDE_CODE_OAUTH_TOKEN } : null) },
+    { source: "file", read: () => {
+      const credPath = join(homedir(), ".claude", ".credentials.json");
+      const creds = JSON.parse(readFileSync(credPath, "utf8")); // a missing/unreadable file throws; the selector treats that as "absent"
+      return creds?.claudeAiOauth?.accessToken ? creds.claudeAiOauth : null;
+    } },
+    { source: "keychain", read: () => readKeychainCreds() },
+  ];
+
+  const pick = selectCredential(candidates);
+  // Log ONCE per change of outcome, not per call -- this runs on every spawn. What is logged is
+  // the shape of the decision (which source won, which were passed over as expired), never a
+  // token. An operator reading `spawn.reason` stuck on "self-heals on next refresh" needs exactly
+  // this line to learn that the healing source was never the one being read.
+  const key = `${pick.source}|${pick.skipped.join(",")}|${pick.allExpired}`;
+  if (pick.source && key !== _credentialSourceLastLogged) {
+    _credentialSourceLastLogged = key;
+    if (pick.skipped.length || pick.allExpired) {
+      logEvent("warn", "credential_source_selected", { source: pick.source, skippedExpired: pick.skipped, allExpired: pick.allExpired });
+    } else if (pick.source === "env") {
+      // The env var is structurally unshadowable -- it carries no expiresAt, so it always wins --
+      // and review pointed out that makes an env-shadowed host exactly as silent as the file-
+      // shadowed one this change fixes: a stale CLAUDE_CODE_OAUTH_TOKEN in a shell profile next to
+      // a fresh keychain would 401 forever with no line saying why. So the env outcome is logged
+      // once too, at info: it is not a problem, it is the fact an operator needs to have seen.
+      logEvent("info", "credential_source_selected", { source: "env", note: "CLAUDE_CODE_OAUTH_TOKEN is set and takes precedence over the credentials file and the keychain; it is never expiry-checked" });
+    }
   }
-
-  // 2. Linux file-based credentials
-  try {
-    const credPath = join(homedir(), ".claude", ".credentials.json");
-    const creds = JSON.parse(readFileSync(credPath, "utf8"));
-    if (creds?.claudeAiOauth?.accessToken) return creds.claudeAiOauth;
-  } catch { /* fall through to macOS keychain */ }
-
-  // 3. macOS keychain (both label formats) — F5: label-memoized + 30s TTL cached (see above).
-  return readKeychainCreds();
+  return pick.creds;
 }
 
 async function refreshOAuthToken(refreshToken) {

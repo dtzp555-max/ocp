@@ -10,6 +10,7 @@ import { isLoopbackBind } from "./lib/net.mjs";
 import { classifyToolRequest, countDeclaredTools } from "./lib/tool-support.mjs";
 import { isUpstreamRateLimit, retryAfterSeconds } from "./lib/upstream-errors.mjs";
 import { listUnhonouredFields, CACHE_KEY_ONLY, ALWAYS_UNHONOURED } from "./lib/unhonoured-fields.mjs";
+import { selectCredential, isExpired } from "./lib/credential-source.mjs";
 import { validateTools, extractBridgeToolUses, toolUsesToOpenAI, renderToolTurn, endsWithToolResult, TOOL_CONTINUATION_NOTE, TOOL_PREFIX as TC_PREFIX, buildBridgeConfig } from "./lib/tool-calling.mjs";
 import { PREFIX as BRIDGE_PREFIX } from "./lib/mcp-bridge.mjs";
 import { randomBytes } from "node:crypto";
@@ -6447,6 +6448,118 @@ ltTest("integration (#479): in multi mode a BRIDGE spawn gets the neutral wrappe
       assert.ok(!argv2.includes("--mcp-config"), `premise: no bridge on the plain spawn — ${JSON.stringify(argv2.slice(-8))}`);
     } finally { child.kill("SIGKILL"); await ltDrain(() => buf.closed, "multi-wrapper", 5000); }
   } finally { _ltRmRetry(dir); }
+});
+
+console.log("\nCredential source selection: an expired source must not shadow a valid one (#475):");
+
+test("#475: selectCredential passes over an expired source in favour of a valid lower-precedence one", () => {
+  const now = 1_800_000_000_000, past = now - 1, future = now + 3_600_000;
+  const T = "test-placeholder-not-a-token";
+  const v = (creds) => ({ read: () => creds });
+  // THE MEASURED CASE: the file six days dead, the keychain four hours ahead. File is higher
+  // precedence and must lose.
+  const r = selectCredential([
+    { source: "file", ...v({ accessToken: T, expiresAt: past }) },
+    { source: "keychain", ...v({ accessToken: T, expiresAt: future }) },
+  ], now);
+  assert.equal(r.source, "keychain");
+  assert.deepEqual(r.skipped, ["file"], "the source passed over must be NAMED, so the operator can see why the usual winner lost");
+  assert.equal(r.allExpired, false);
+
+  // CONTROL: both valid -> precedence is untouched. Without this row, "always pick the keychain"
+  // would pass the row above.
+  // LAZINESS, as a claim the suite checks: the keychain thunk RECORDS whether it was called. A
+  // valid file must win without the keychain ever being read -- review found the first version
+  // reading every source eagerly, which let a locked keychain block a spawn path that never used
+  // to touch it. A thunk that THROWS does not pin this: an eager implementation that catches (as
+  // any sane one does) swallows the throw as "absent" and the file still wins -- measured, the
+  // eager mutation stayed green against a throwing thunk. A flag cannot be swallowed.
+  let keychainRead = false;
+  const c = selectCredential([
+    { source: "file", ...v({ accessToken: T, expiresAt: future }) },
+    { source: "keychain", read: () => { keychainRead = true; return { accessToken: T, expiresAt: future }; } },
+  ], now);
+  assert.equal(keychainRead, false, "the keychain must not be read when a higher-precedence source is valid");
+  assert.equal(c.source, "file", "a valid higher-precedence source must still win");
+  assert.deepEqual(c.skipped, []);
+
+  // The env var carries no expiresAt: never "known expired", keeps its override precedence.
+  let fileRead = false;
+  const e = selectCredential([
+    { source: "env", ...v({ accessToken: T }) },
+    { source: "file", read: () => { fileRead = true; return { accessToken: T, expiresAt: future }; } },
+  ], now);
+  assert.equal(e.source, "env");
+  assert.equal(fileRead, false, "the file must not be read when the env var is set");
+
+  // ALL expired: the first is returned anyway (its refresh token gets the attempt), nobody was
+  // passed over in favour of anybody, and the caller is told.
+  const x = selectCredential([
+    { source: "file", ...v({ accessToken: T, expiresAt: past }) },
+    { source: "keychain", ...v({ accessToken: T, expiresAt: past }) },
+  ], now);
+  assert.equal(x.source, "file");
+  assert.deepEqual(x.skipped, [], "an all-expired pick passed over nothing IN FAVOUR OF the winner");
+  assert.equal(x.allExpired, true);
+  // ...and among all-expired sources, one that CAN refresh beats one that cannot, whatever the
+  // precedence. Review caught "the first, so its refresh token is tried" promising more than it
+  // delivered when the first had no refresh token.
+  const y = selectCredential([
+    { source: "file", ...v({ accessToken: T, expiresAt: past }) },
+    { source: "keychain", ...v({ accessToken: T, refreshToken: T, expiresAt: past }) },
+  ], now);
+  assert.equal(y.source, "keychain", "an expired source WITH a refresh token beats an expired one without");
+  assert.equal(y.allExpired, true);
+
+  // Nothing present, and sources with no token, are not candidates.
+  assert.equal(selectCredential([{ source: "file", ...v(null) }, { source: "keychain", ...v({}) }], now).source, null);
+  // A thunk that throws (a missing file) is "absent", not an error.
+  assert.equal(selectCredential([{ source: "file", read: () => { throw new Error("ENOENT"); } }, { source: "keychain", ...v({ accessToken: T, expiresAt: future }) }], now).source, "keychain");
+  assert.equal(selectCredential([], now).source, null);
+  assert.equal(selectCredential(null, now).source, null);
+
+  // isExpired on its own: boundary and non-number.
+  assert.equal(isExpired({ expiresAt: now }, now), true, "expiring exactly now is expired");
+  assert.equal(isExpired({ expiresAt: now + 1 }, now), false);
+  assert.equal(isExpired({ expiresAt: "soon" }, now), false, "a non-numeric expiresAt is not KNOWN expired");
+  assert.equal(isExpired({}, now), false);
+});
+
+// THE WIRING, on a real server.mjs: a scratch HOME carrying an EXPIRED credentials file, a
+// `security` stub on PATH answering with a VALID keychain-shaped credential, and no env token. The
+// old behaviour read the file, saw it expiring on every spawn, and fell back to real-HOME forever
+// -- which is the `spawn.reason` string this asserts is ABSENT. Placeholder tokens throughout.
+ltTest("integration (#475): an expired credentials file no longer shadows a valid keychain entry", async () => {
+  if (!LT_POSIX) return;
+  const dir = ltMkdir(); const home = ltMkdir(); const fake = ltFake(dir);
+  const shimDir = join(dir, "kc"); _ltMkdirSync(shimDir, { recursive: true });
+  const T = "test-placeholder-not-a-token";
+  const past = Date.now() - 6 * 24 * 3600 * 1000, future = Date.now() + 4 * 3600 * 1000;
+  _ltMkdirSync(join(home, ".claude"), { recursive: true });
+  _ltWrite(join(home, ".claude", ".credentials.json"), JSON.stringify({ claudeAiOauth: { accessToken: T, refreshToken: T, expiresAt: past } }));
+  _ltWrite(join(shimDir, "security"), `#!/bin/sh\nprintf '%s\\n' '${JSON.stringify({ claudeAiOauth: { accessToken: T, refreshToken: T, expiresAt: future } })}'\n`);
+  _ltChmod(join(shimDir, "security"), 0o755);
+  try {
+    const { child, buf, port } = await ltBootFresh({ CLAUDE_BIN: fake, HOME: home, PATH: `${shimDir}:${process.env.PATH}`, CLAUDE_CODE_OAUTH_TOKEN: "" }, dir);
+    try {
+      assert.ok(await ltWait(() => buf.out.includes("listening on")), `— ${ltDiag(buf)}`);
+      // Force a spawn so resolveSpawnToken runs and /health's spawn.reason is populated.
+      const r = await ltPostStatus(port, { model: "sonnet", messages: [{ role: "user", content: "hi" }] });
+      assert.equal(r.status, 200, r.text.slice(0, 200));
+      const h = await fetch(`http://127.0.0.1:${port}/health`).then(x => x.json());
+      const reason = String(h.spawn?.reason ?? "");
+      // POSITIVE anchor first: the spawn block exists and says something.
+      assert.ok(reason.length > 0, `premise: /health must report a spawn.reason — ${JSON.stringify(h.spawn)}`);
+      assert.ok(!/within 5-min expiry window/.test(reason),
+        `the expired FILE must not be the token the spawn is judged on — got spawn.reason=${JSON.stringify(reason)}`);
+      // And the decision was logged, naming the source that lost.
+      assert.ok(await ltWait(() => /"event":"credential_source_selected"/.test(buf.err)), `decision not logged — ${buf.err.slice(-400)}`);
+      assert.match(buf.err, /"source":"keychain"/, buf.err.slice(-400));
+      assert.match(buf.err, /"skippedExpired":\["file"\]/, buf.err.slice(-400));
+      // Never a token in the log, on either stream.
+      assert.ok(!(buf.out + buf.err).includes(T), "a credential value must never reach the log");
+    } finally { child.kill("SIGKILL"); await ltDrain(() => buf.closed, "cred-source", 5000); }
+  } finally { _ltRmRetry(dir); _ltRmRetry(home); }
 });
 
 console.log("\nFields OCP accepts and does not act on (#470):");
@@ -26515,7 +26628,7 @@ test("#242 cmd_usage (main): absent python3 shows the raw plan JSON instead of d
     proxy: { uptime: "5h", totalRequests: 42, activeRequests: 0, errors: 0, timeouts: 0 },
     models: {},
   });
-  const r = _bwHarnessRun({ args: ["usage"], pythonAbsent: true, curlResponses: [{ match: "/usage", body }] });
+  const r = _bwHarnessRun({ args: ["usage"], pythonAbsent: true, curlResponses: [{ match: "/usage", body: `${body}\n200` }] });  // #475: cmd_usage now reads the status curl appends
   assert.ok(!(r.status === 127 && r.stdout === ""), `must not reproduce #236's silent-127 signature; status=${r.status} stdout=${JSON.stringify(r.stdout)}`);
   assert.ok(r.stderr.includes("python3 is unavailable or failed to format the response"), `expected the _pyfail warning, got: ${JSON.stringify(r.stderr)}`);
   assert.ok(r.stdout.includes("allowed"), `expected the raw plan JSON on stdout, got: ${JSON.stringify(r.stdout)}`);
@@ -26531,7 +26644,7 @@ test("#242 control: cmd_usage (main) with python3 PRESENT still prints the forma
     proxy: { uptime: "5h", totalRequests: 42, activeRequests: 0, errors: 0, timeouts: 0 },
     models: {},
   });
-  const r = _bwHarnessRun({ args: ["usage"], curlResponses: [{ match: "/usage", body }] });
+  const r = _bwHarnessRun({ args: ["usage"], curlResponses: [{ match: "/usage", body: `${body}\n200` }] });  // #475: cmd_usage now reads the status curl appends
   assert.equal(r.status, 0, `expected a clean exit, got status=${r.status} stderr=${r.stderr}`);
   assert.ok(r.stdout.includes("Plan Usage Limits"), `expected the formatted header, got: ${JSON.stringify(r.stdout)}`);
   assert.ok(r.stdout.includes("Proxy: up 5h"), `expected the formatted proxy line, got: ${JSON.stringify(r.stdout)}`);
@@ -26661,7 +26774,7 @@ test("#242 (10th site) control: cmd_keys list with a genuinely unreachable proxy
   // (proving the curl-failure branch's own message is unaffected by this site's restructuring).
   const r = _bwHarnessRun({ args: ["keys"], adminKey: "test-admin-key-marker" });
   assert.notEqual(r.status, 0, `expected a non-zero exit; status=${r.status}`);
-  assert.ok(r.stderr.includes("proxy unreachable or key management not available"), `expected the curl-failure message preserved, got stderr=${JSON.stringify(r.stderr)}`);
+  assert.ok(r.stderr.includes("Error: proxy unreachable"), `expected the curl-failure message preserved (#475: the network label is now exactly that), got stderr=${JSON.stringify(r.stderr)}`);
 });
 
 test("#242 cmd_settings (GET): absent python3 shows the raw settings JSON instead of dying silently", () => {
@@ -26720,10 +26833,10 @@ test("#242 fix-3 cmd_settings (GET): 'Error: proxy unreachable' goes to stderr, 
   assert.equal(r.stdout, "", `stdout must stay clean; got: ${JSON.stringify(r.stdout)}`);
 });
 
-test("#242 fix-3 cmd_keys revoke: 'Error: proxy unreachable or unauthorized' goes to stderr, stdout stays empty", () => {
+test("#242 fix-3 cmd_keys revoke: 'Error: proxy unreachable' goes to stderr, stdout stays empty", () => {
   const r = _bwHarnessRun({ args: ["keys", "revoke", "laptop-marker"], adminKey: "test-admin-key-marker" });
   assert.notEqual(r.status, 0);
-  assert.ok(r.stderr.includes("Error: proxy unreachable or unauthorized"), `expected the message on stderr, got: ${JSON.stringify(r.stderr)}`);
+  assert.ok(r.stderr.includes("Error: proxy unreachable"), `expected the message on stderr (#475: the network label is now exactly that), got: ${JSON.stringify(r.stderr)}`);
   assert.equal(r.stdout, "", `stdout must stay clean; got: ${JSON.stringify(r.stdout)}`);
 });
 
@@ -26756,7 +26869,7 @@ test("#261 cmd_usage --by-key: curl missing from $PATH must be reported as a loc
 test("#261 control: cmd_usage --by-key with curl present but the proxy genuinely unreachable still says so", () => {
   const r = _bwHarnessRun({ args: ["usage", "--by-key"], adminKey: "test-admin-key-marker" });
   assert.notEqual(r.status, 0, `expected a nonzero exit; status=${r.status}`);
-  assert.ok(r.stderr.includes("proxy unreachable or usage API not available"),
+  assert.ok(r.stderr.includes("Error: proxy unreachable"),  // #475: network label is now exactly this,
     `a GENUINE network failure must still be reported as such (proves the fix does not just delete the diagnosis), got stderr=${JSON.stringify(r.stderr)}`);
 });
 
@@ -26786,7 +26899,7 @@ test("#261 cmd_keys add: curl missing from $PATH must be reported as a local fau
 test("#261 control: cmd_keys add with curl present but the proxy genuinely unreachable still says so", () => {
   const r = _bwHarnessRun({ args: ["keys", "add", "laptop-marker"], adminKey: "test-admin-key-marker" });
   assert.notEqual(r.status, 0, `expected a nonzero exit; status=${r.status}`);
-  assert.ok(r.stderr.includes("proxy unreachable or unauthorized"),
+  assert.ok(r.stderr.includes("Error: proxy unreachable"),  // #475: the network label is now exactly this; the HTTP-error half has its own label
     `a GENUINE network failure must still be reported as such, got stderr=${JSON.stringify(r.stderr)}`);
 });
 
@@ -26800,6 +26913,75 @@ test("#261 stream parity: cmd_usage/cmd_keys-add 'proxy unreachable' guards now 
 });
 
 // ── Independent review round 1: two fold-ins ──────────────────────────────────────────────────
+console.log("\nocp: a proxy that ANSWERED with an HTTP error is not \"unreachable\" (#475):");
+
+// The defect: `curl -sf` turns a 502-with-a-body into exit 22 and an EMPTY stderr (-s silences
+// curl's own message), so _curl_or_die's network branch printed "proxy unreachable" about a proxy
+// that had just answered /health -- and the body naming the real fault was discarded.
+test("#475: `ocp usage` on a 502 names the status and shows the proxy's own error, never 'unreachable'", () => {
+  const body = JSON.stringify({ error: "Usage API returned 401 with no rate-limit headers", proxy: {} });
+  // cmd_usage now fetches without -f and with the status appended, so the stub returns body + code.
+  const r = _bwHarnessRun({ args: ["usage"], curlResponses: [{ match: "/usage", body: `${body}\n502`, exit: 0 }] });
+  assert.notEqual(r.status, 0, `expected a nonzero exit; status=${r.status}`);
+  assert.ok(_bwCalled(r.log, "FAKE-CURL-CALL"), `premise: curl was invoked; log=${JSON.stringify(r.log)}`);
+  assert.ok(!r.stderr.includes("proxy unreachable") && !r.stdout.includes("proxy unreachable"),
+    `a proxy that answered must not be called unreachable; stderr=${JSON.stringify(r.stderr)}`);
+  assert.ok(r.stderr.includes("answered HTTP 502"), `the status must be named; stderr=${JSON.stringify(r.stderr)}`);
+  assert.ok(r.stderr.includes("Usage API returned 401"),
+    `the proxy's own error text is the whole point and must be shown; stderr=${JSON.stringify(r.stderr)}`);
+});
+
+// The body is not always JSON: a reverse proxy in front of OCP answers 502 with "Bad Gateway". The
+// first version of the printer read stdin twice and showed NOTHING for that -- the shape this row
+// exists to keep visible.
+test("#475: `ocp usage` on a NON-JSON error body still shows the body", () => {
+  const r = _bwHarnessRun({ args: ["usage"], curlResponses: [{ match: "/usage", body: "Bad Gateway\n502", exit: 0 }] });
+  assert.notEqual(r.status, 0);
+  assert.ok(r.stderr.includes("answered HTTP 502"), `status named; stderr=${JSON.stringify(r.stderr)}`);
+  assert.ok(r.stderr.includes("Bad Gateway"), `a non-JSON body must still be shown; stderr=${JSON.stringify(r.stderr)}`);
+});
+
+test("#475 control: `ocp usage` on a 200 still formats the plan as before", () => {
+  // Shape copied from the formatter's own reads (plan.currentSession / plan.weeklyLimits.allModels
+  // / plan.extraUsage.status / proxy / models), not guessed -- the first version of this fixture
+  // spelled `weekly` and the control reddened on a KeyError, which is the fixture lying rather
+  // than the code failing.
+  const body = JSON.stringify({
+    plan: {
+      currentSession: { percent: "34%", resetsIn: "22m", resetsAtHuman: "soon", utilization: 0.34 },
+      weeklyLimits: { allModels: { percent: "10%", resetsIn: "3d", resetsAtHuman: "later", utilization: 0.1 } },
+      extraUsage: { status: "allowed" },
+    },
+    proxy: { totalRequests: 1, activeRequests: 0, errors: 0, timeouts: 0, uptime: "1m" },
+    models: {},
+  });
+  const r = _bwHarnessRun({ args: ["usage"], curlResponses: [{ match: "/usage", body: `${body}\n200`, exit: 0 }] });
+  assert.equal(r.status, 0, `a 200 must still succeed; stderr=${JSON.stringify(r.stderr)} stdout=${JSON.stringify(r.stdout)}`);
+  assert.ok(!r.stderr.includes("answered HTTP"), `no error headline on success; stderr=${JSON.stringify(r.stderr)}`);
+  assert.ok(r.stdout.includes("34%"), `the plan must be rendered; stdout=${JSON.stringify(r.stdout)}`);
+});
+
+// The general layer: every OTHER call site still uses -sf, so exit 22 must at least stop being
+// reported as unreachable there, even though the body is gone. `usage --by-key` hits /api/usage
+// through _curl_or_die with -sf.
+test("#475: _curl_or_die on curl exit 22 (HTTP error under -f) says 'answered', not 'unreachable'", () => {
+  const r = _bwHarnessRun({ args: ["usage", "--by-key"], adminKey: "test-admin-key-marker", curlResponses: [{ match: "/api/usage", body: "", exit: 22 }] });
+  assert.notEqual(r.status, 0, `expected a nonzero exit; status=${r.status}`);
+  assert.ok(_bwCalled(r.log, "FAKE-CURL-CALL"), `premise: curl was invoked; log=${JSON.stringify(r.log)}`);
+  assert.ok(!r.stderr.includes("proxy unreachable"), `exit 22 is an ANSWER, not a connection failure; stderr=${JSON.stringify(r.stderr)}`);
+  // This site carries its own HTTP-error label (a refusal on /api/usage means the admin key), so
+  // the generic "answered, but with an HTTP error" text is NOT what appears here -- the specific
+  // one is, and that is the better outcome. What must hold is: not "unreachable", and it names a
+  // refusal rather than a connection.
+  assert.ok(/refused \/api\/usage/.test(r.stderr), `must say the proxy REFUSED, i.e. answered; stderr=${JSON.stringify(r.stderr)}`);
+});
+
+test("#475 control: a genuine connection failure (curl exit 7) is STILL 'proxy unreachable'", () => {
+  const r = _bwHarnessRun({ args: ["usage", "--by-key"], adminKey: "test-admin-key-marker", curlResponses: [{ match: "/api/usage", body: "", exit: 7 }] });
+  assert.notEqual(r.status, 0);
+  assert.ok(r.stderr.includes("proxy unreachable"), `exit 7 IS unreachable and must keep saying so; stderr=${JSON.stringify(r.stderr)}`);
+});
+
 console.log("\nocp _curl_or_die: independent review round 1 fold-ins (exit 126, mktemp security):");
 
 test("#261 fold-in B (independent review round 1): curl present but NOT EXECUTABLE (exit 126) is reported as a local fault, not 'proxy unreachable'", () => {
@@ -27061,10 +27243,10 @@ test("#278 cmd_keys revoke: curl missing from $PATH must be reported as a local 
   assert.ok(/curl/i.test(r.stderr), `expected the message to name curl/the local command failure, got stderr=${JSON.stringify(r.stderr)}`);
 });
 
-test("#278 control: cmd_keys revoke with curl present but the proxy genuinely unreachable still says 'proxy unreachable or unauthorized'", () => {
+test("#278 control: cmd_keys revoke with curl present but the proxy genuinely unreachable still says 'proxy unreachable'", () => {
   const r = _bwHarnessRun({ args: ["keys", "revoke", "laptop-marker"], adminKey: "test-admin-key-marker" });
   assert.notEqual(r.status, 0, `expected a nonzero exit; status=${r.status}`);
-  assert.ok(r.stderr.includes("proxy unreachable or unauthorized"),
+  assert.ok(r.stderr.includes("Error: proxy unreachable"),  // #475: the network label is now exactly this; the HTTP-error half has its own label
     `a GENUINE network failure must still be reported as such, got stderr=${JSON.stringify(r.stderr)}`);
 });
 
@@ -27076,10 +27258,10 @@ test("#278 cmd_keys list: curl missing from $PATH must be reported as a local fa
   assert.ok(/curl/i.test(r.stderr), `expected the message to name curl/the local command failure, got stderr=${JSON.stringify(r.stderr)}`);
 });
 
-test("#278 control: cmd_keys list with curl present but the proxy genuinely unreachable still says 'proxy unreachable or key management not available'", () => {
+test("#278 control: cmd_keys list with curl present but the proxy genuinely unreachable still says 'proxy unreachable'", () => {
   const r = _bwHarnessRun({ args: ["keys"], adminKey: "test-admin-key-marker" });
   assert.notEqual(r.status, 0, `expected a nonzero exit; status=${r.status}`);
-  assert.ok(r.stderr.includes("proxy unreachable or key management not available"),
+  assert.ok(r.stderr.includes("Error: proxy unreachable"),  // #475: the network label is now exactly this; the HTTP-error half has its own label
     `a GENUINE network failure must still be reported as such, got stderr=${JSON.stringify(r.stderr)}`);
 });
 

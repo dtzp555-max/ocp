@@ -659,6 +659,8 @@ After installing, use `/ocp` slash commands in your chat: `/ocp status`, `/ocp u
 
 ## Troubleshooting
 
+**`/usage` answers `502` (or `ocp usage` reports an HTTP error) while chat works.** Since 3.37.0 the proxy logs `credential_source_selected` when it passes over an expired credential source in favour of a valid one — look for `"skippedExpired":["file"]`. That means a stale `~/.claude/.credentials.json` (the Linux-style file) is sitting next to a live macOS keychain entry; on macOS nothing rewrites that file, so it never self-heals. The proxy now picks the valid source anyway; removing the stale file is optional and is your call. If instead the log shows `"source":"env"`, `CLAUDE_CODE_OAUTH_TOKEN` is set for the service and wins outright — it is never expiry-checked, so a stale value there produces the same symptom and only unsetting it fixes it.
+
 The simplest path: ask your AI — paste `Run `ocp doctor` and follow its `next_action`. Tell me if you hit anything that needs human input.` The doctor emits a JSON `next_action` with `ai_executable[]` (commands to run verbatim) and `human_required[]` (usually just OAuth).
 
 **Most common issues:**
