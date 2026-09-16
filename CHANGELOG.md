@@ -2,6 +2,39 @@
 
 ## Unreleased
 
+
+## v3.37.0 — 2026-09-16
+
+> **Governance audit for this section**, per `CLAUDE.md`'s `release_kit.governance_audits`.
+> **One B.2 key path added this cycle, authorized:**
+>
+> | key path (both profiles) | PR | ADR 0012 condition-5 marker |
+> |---|---|---|
+> | `stats.unhonouredFieldRequests` | #491 | present — "additive under [ADR 0012](docs/adr/0012-additive-fields-on-grandfathered-b2.md)", field named |
+>
+> **THREE PRs, FOUR ENTRIES** — counted with `grep -c '^- \*\*'` over the section, not estimated,
+> because the v3.35.0 audit got this number wrong by guessing. PR #495 contributes two entries, and
+> entries cite issue numbers where this table cites PRs (`#470` ↔ `#491`, `#475` ↔ `#495`).
+>
+> | entry | PR | touches a B.2 response shape? |
+> |---|---|---|
+> | OCP says which OpenAI fields it did not act on (#470) | #491 | **yes** — the one row above |
+> | the 5-hour wall's `session limit` phrasing is a 429 | #494 | no — a classifier pattern |
+> | an expired credential source no longer shadows a valid one (#475) | #495 | no — token selection |
+> | `ocp usage` stops calling an answering proxy "unreachable" (#475) | #495 | no — the CLI |
+>
+> Both commands below were run on the tree this section ships — the `v3.37.0` tag. From the
+> **wire**: `node scripts/b2-key-snapshot.mjs` prints *"B.2 response key sets match the snapshot
+> (2 profiles)"* and exits 0. From **git**:
+> `git diff v3.36.0..HEAD -- docs/governance/b2-response-keys.json` → **2 added lines, 0 removed** —
+> one path, once per profile block, both **inside existing blocks**, the shape that means new surface.
+> **Control for the command:** the same command from `dd90be3^` gives **9 added / 5 removed**, a
+> different answer, so it discriminates. **Cumulative ADR 0012 count: 5 → 6.**
+>
+> `new_feature_doc_expectations`: no new CLI subcommand, env var, hook or endpoint this cycle. A
+> README section for the unhonoured fields and a Troubleshooting entry for the credential-source
+> log line were added by their PRs.
+
 ### Added
 
 - **OCP now says which OpenAI fields it did not act on (#470).** `tools` was never the only one. Measured: `n: 3` returns one choice, `logprobs` produces no `logprobs`, and `seed` / `stop` / `max_completion_tokens` have no effect — all `HTTP 200`, all silent. `temperature`, `top_p` and `max_tokens` are read too, but **only by `cacheHash`**: they partition the cache without steering the sampler, which is a different thing from "ignored" and is reported separately as `cacheKeyOnly` rather than folded in.
