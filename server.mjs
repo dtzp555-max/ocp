@@ -1804,6 +1804,38 @@ function getModelTier(cliModel) {
 // budget. releaseSlot is wired into the idempotent cleanup() so the slot is freed on EVERY exit
 // path (close/error/timeout/abort). Back-compat: releaseSlot defaults to a no-op so any future
 // internal caller that does its own gating still works.
+// #474: kill the child's ENTIRE process group, not just the direct child.
+//
+// Why a group: with spawnOpts.detached (set in spawnClaudeProcess below, POSIX only) the child
+// is a session leader, so proc.pid doubles as its pgid and process.kill(-pid) reaches every
+// process in that group — including a grandchild that inherited the stdout pipe. That grandchild
+// is the exact shape that kept 'close' (and with it the client request) open forever: the
+// timer's SIGTERM/SIGKILL landed on the parent, the parent died, the pipe stayed open, and the
+// request hung until the client gave up (issue #474, measured on v3.37.0: client silent past
+// 240 s while the log already showed request_timeout + claude_exit).
+//
+// A throw here means either the group was already fully reaped (the kill landed — nothing more
+// to do) or the group was never created (detached failed to apply). In BOTH cases we fall
+// through to the per-process kill below: in the first it is a harmless no-op, in the second it
+// still reaches the direct child instead of leaking it. win32: `detached` means something
+// different there and a negative pid is not killable, so the group path is POSIX-only and
+// win32 keeps the pre-#474 per-process behaviour.
+function killChildTree(proc, sig) {
+  if (proc.pid != null && process.platform !== "win32") {
+    try {
+      process.kill(-proc.pid, sig);
+      proc.killed = true; // honor the flag's contract: a signal WAS sent (see the #111 guard)
+      return;
+    } catch {
+      // ESRCH means EITHER the whole group was already reaped (the kill landed — nothing more to
+      // do) OR the group was never created (detached failed to take effect and the child is
+      // alive in its INHERITED group). In the second case giving up would be a silent leak, so
+      // fall through to the per-process kill below: at least it reaches the direct child.
+    }
+  }
+  try { proc.kill(sig); } catch { /* already gone */ }
+}
+
 function spawnClaudeProcess(model, messages, conversationId, keyName, releaseSlot = () => {}, spawnDecision = null, opts = {}) {
   const cliModel = MODEL_MAP[model] || model;
 
@@ -1902,6 +1934,12 @@ function spawnClaudeProcess(model, messages, conversationId, keyName, releaseSlo
   // (belt-and-braces; mirrors the TUI path).
   const decision = spawnDecision || { isolated: false, releaseFallback: null };
   const spawnOpts = { env, stdio: ["pipe", "pipe", "pipe"] };
+  // #474: POSIX setsid — the child becomes a session leader, so its pid doubles as the pgid
+  // that killChildTree() addresses (process.kill(-pid)). Without this, a grandchild that
+  // inherited the stdout pipe (a real `claude` tool subprocess) survives the per-process kill
+  // and the client hangs. win32: `detached` means something different there; the group kill is
+  // POSIX-only (see killChildTree), so win32 keeps the pre-#474 per-process behaviour.
+  if (process.platform !== "win32") spawnOpts.detached = true;
   if (decision.isolated && decision.token) {
     env.HOME = decision.home;
     env.CLAUDE_CODE_OAUTH_TOKEN = decision.token; // env token is authoritative for -p
@@ -2070,7 +2108,11 @@ function spawnClaudeProcess(model, messages, conversationId, keyName, releaseSlo
   function cleanup() {
     if (cleaned) return;
     cleaned = true;
-    clearTimeout(overallTimer);
+    // #474 + review P2: this deliberately does NOT clear overallTimer. 'exit' (this listener)
+    // means the PARENT died — not that the request settled. An abandoned grandchild can still be
+    // holding the stdout pipe, keeping 'close' — and the client — pending past the deadline. The
+    // watchdog must outlive 'exit'; the 'close' listener below clears it instead. A timer that
+    // survives 'exit' is harmless in every settled case: fireTimeout() bails on childClosed.
     stats.activeRequests--;
     // FIX ⑥: free the concurrency slot for a queued waiter. releaseSlot is itself idempotent,
     // and cleanup() is guarded by `cleaned`, so the slot is released exactly once on the first
@@ -2099,6 +2141,16 @@ function spawnClaudeProcess(model, messages, conversationId, keyName, releaseSlo
   // beyond) the SIGKILL escalation actually reaped it. cleanup() is idempotent
   // so this listener is safe alongside the existing 'close'/'error' paths.
   proc.once("exit", cleanup);
+
+  // #474 + review P2: 'close' (child reaped AND every stdio pipe released) is the moment a
+  // request settles — 'exit' alone is not. Both lanes settle only on 'close', so a parent that
+  // exits while an abandoned grandchild still holds the stdout pipe leaves the request pending
+  // with no watchdog if the timer died with 'exit'. childClosed is therefore the one signal
+  // fireTimeout() bails on: by the deadline, "close delivered" means settled (success, a
+  // caller-handled failure, or a kill site's own close path), and "close NOT delivered" means
+  // the client is still hanging — act, regardless of whether the parent already exited.
+  let childClosed = false;
+  proc.on("close", () => { childClosed = true; clearTimeout(overallTimer); });
 
   function handleSessionFailure() {
     // Phase 6c: session resume (--resume/--session-id) is no longer used;
@@ -2131,21 +2183,68 @@ function spawnClaudeProcess(model, messages, conversationId, keyName, releaseSlo
   // Single request timeout — no separate first-byte timer.
   // Claude tool-use causes long pauses in the token stream (30s-5min),
   // making first-byte/idle timeouts unreliable. One generous timeout is simpler and correct.
-  const overallTimer = setTimeout(() => {
-    if (!cleaned) {
-      stats.timeouts++;
-      recordModelError(cliModel, true);
-      breakerRecordTimeout(cliModel);
-      logEvent("error", "request_timeout", { model: cliModel, timeoutMs: TIMEOUT, elapsed: Date.now() - t0 });
-      try { proc.kill("SIGTERM"); } catch {}
-      setTimeout(() => { try { proc.kill("SIGKILL"); } catch {} }, 5000);
+  // #474 + review P1: the decision is re-checked ONE TICK after the deadline, because libuv runs
+  // the timers phase BEFORE the poll phase that delivers a child's 'exit' (and its 'close'). A
+  // child that finishes in the same iteration as the deadline is still un-settled when this
+  // timer fires — acting immediately would convert a success into a 500 (and append a
+  // proxy_error frame to a finished stream) and pollute the one-failure-one-count accounting the
+  // timeout exists to protect. By the next tick the queued 'exit'+'close' have been delivered,
+  // childClosed is true, and fireTimeout() below bails. A genuine timeout costs exactly this one
+  // tick (~1 ms).
+  function fireTimeout() {
+    // Settled (or settling) ⇒ the deadline watchdog has nothing left to do. Note the deliberate
+    // asymmetry with `cleaned`: a parent that exited EARLIER while an abandoned grandchild still
+    // holds the stdout pipe is NOT finished — 'close' is still pending and the client is still
+    // hanging (the stuck-pipe shape of the #474 hang). Bailing on exitCode/cleaned there would
+    // re-create the exact defect this fix eliminates, so the guard is childClosed alone: by the
+    // deadline, a pending close means hang, and the group kill below is its answer (a no-op for
+    // the already-reaped parent, the fix for the orphan).
+    if (childClosed) return;
+    // A kill site (client disconnect / tool-quiesce / shutdown sweep) already owns this child.
+    // Its own close path keeps the accounting; settling here too would double-count a failure.
+    // (It also fixes the disconnect-just-before-deadline echo: without this skip the timer would
+    // set timedOut and suppress the close path's only usage record for a full-length failure.)
+    if (proc.killed) return;
+    stats.timeouts++;
+    recordModelError(cliModel, true);
+    breakerRecordTimeout(cliModel);
+    logEvent("error", "request_timeout", { model: cliModel, timeoutMs: TIMEOUT, elapsed: Date.now() - t0 });
+    // #474: kill the whole group, not just the direct child — see killChildTree. The pre-#474
+    // per-process kill left a pipe-holding grandchild alive, which is what kept the request open.
+    killChildTree(proc, "SIGTERM");
+    setTimeout(() => killChildTree(proc, "SIGKILL"), 5000);
+    // #474: the TIMER must answer the client, not just the stream. The stream may never close
+    // (a grandchild holding the stdout pipe keeps 'close' pending even after the parent dies),
+    // and both callers settle ONLY on 'close' — so without this the request hangs past the
+    // timeout indefinitely, which is the defect, not the timeout. onTimeout settles the request
+    // at the deadline: the buffered lane rejects (→ the caller's catch records usage and
+    // respondUpstreamError answers 500 proxy_error) and the streaming lane ends its SSE stream
+    // with an error frame + [DONE]. Kill first, then notify: if onTimeout throws, the process
+    // is already dying, and that is the resource that has to be reaped.
+    if (opts.onTimeout) {
+      try { opts.onTimeout(); } catch (e) { logEvent("error", "timeout_notify_failed", { model: cliModel, error: e.message }); }
     }
+  }
+  let deferredFire = null;
+  const overallTimer = setTimeout(() => {
+    // Same oracle as fireTimeout: skip the deferral only when settlement (close) or another
+    // kill site already owns the child. `cleaned` must NOT gate this — in the stuck-pipe shape
+    // the parent has already exited (cleaned=true) and the watchdog is precisely what is needed.
+    if (!childClosed && !proc.killed) deferredFire = setTimeout(fireTimeout, 0);
   }, TIMEOUT);
 
   // Clear ONLY the request timer (not the slot accounting) when the response has
   // semantically completed (result/[DONE]) but the child hasn't exited yet — prevents
-  // a spurious post-success timeout. cleanup() (on exit) still clears it idempotently. (issue #111)
-  function clearOverallTimer() { clearTimeout(overallTimer); }
+  // a spurious post-success timeout. The 'close' listener clears it idempotently too. (issue #111)
+  // It must ALSO cancel the deferred fireTimeout: the outer timer can fire in the same
+  // iteration as the completion (timers phase before poll phase) and schedule the deferral,
+  // and a deferral that survives the completion would SIGTERM a child that just delivered a
+  // success and record a timeout for it — the mislabel the deferral exists to prevent, in a
+  // ~1 ms window. Once the response is done, no watchdog may remain at all.
+  function clearOverallTimer() {
+    clearTimeout(overallTimer);
+    if (deferredFire) { clearTimeout(deferredFire); deferredFire = null; }
+  }
 
   return { proc, cliModel, conversationId, t0, cleanup, clearOverallTimer, handleSessionFailure, markFirstByte };
 }
@@ -2223,8 +2322,18 @@ async function callClaude(model, messages, conversationId, keyName, res, opts = 
   }
   return new Promise((resolve, reject) => {
     let ctx;
+    // #474: set by the overallTimer's onTimeout (below). When it is, the timer has ALREADY
+    // answered the client (this reject) and already counted the request as a TIMEOUT — the
+    // 'close' that eventually fires is a reap, not a second failure (see the close handler).
+    let timedOut = false;
     try {
-      ctx = spawnClaudeProcess(model, messages, conversationId, keyName, releaseSlot, spawnDecision, opts);
+      ctx = spawnClaudeProcess(model, messages, conversationId, keyName, releaseSlot, spawnDecision, {
+        ...opts,
+        onTimeout: () => {
+          timedOut = true;
+          reject(new Error(`claude request timed out after ${TIMEOUT}ms`));
+        },
+      });
     } catch (err) {
       releaseSlot();
       // Spawn threw before cleanup() was wired → release the fallback mutex here so it never leaks.
@@ -2296,8 +2405,9 @@ async function callClaude(model, messages, conversationId, keyName, res, opts = 
         { model: cliModel, count: toolCalls.length, names: toolCalls.map((u) => u.name).slice(0, 8), endedOn: reason, signalMissing: reason !== "signal" });
       // End the spawn rather than let it block on the bridge (which never answers tools/call --
       // see lib/mcp-bridge.mjs). SIGTERM first, SIGKILL after the same 5 s the timeout path uses.
-      try { proc.kill("SIGTERM"); } catch {}
-      setTimeout(() => { try { proc.kill("SIGKILL"); } catch {} }, 5000);
+      // #474: the whole group — a grandchild holding the pipe would otherwise keep 'close' pending.
+      killChildTree(proc, "SIGTERM");
+      setTimeout(() => killChildTree(proc, "SIGKILL"), 5000);
     };
 
     proc.stdout.on("data", (d) => {
@@ -2422,6 +2532,17 @@ async function callClaude(model, messages, conversationId, keyName, res, opts = 
       // Extending delivery to an errored turn is a different decision (a partial or invalid call
       // from a transport failure is not the same thing as a finished one) and is not made here.
       if (toolQuiesceTimer) { clearTimeout(toolQuiesceTimer); toolQuiesceTimer = null; }
+      // #474: the overall timer fired first. It already answered the client (the reject in
+      // onTimeout above → 500 via the caller's catch + respondUpstreamError) and already counted
+      // this request as a TIMEOUT (stats.timeouts, recordModelError(true), breakerRecordTimeout
+      // in the timer). This close is that kill landing — a REAP, not a second failure. Falling
+      // through would double-record: recordModelError(false) + countError would move stats.errors
+      // for an event ADR 0018 classifies as a timeout (one failure, one count), and the
+      // last-ditch arm below would emit tool_calls for a request whose response is already gone.
+      if (timedOut) {
+        logEvent("info", "claude_reaped_after_timeout", { model: cliModel, code, signal: signal || "none", elapsed });
+        return;
+      }
       if (!toolCalls && !errored && opts.tools && pendingToolUses.length) {
         toolCalls = pendingToolUses.slice();
         toolText = pendingToolText || assembledText;
@@ -2922,8 +3043,27 @@ async function callClaudeStreaming(model, messages, conversationId, res, authInf
     return jsonResponse(res, 500, { error: { message: sanitizeError(err.message), type: "proxy_error" } });
   }
   let ctx;
+  // #474: set by the overallTimer's onTimeout (below). When it is, the timer has ALREADY ended
+  // the client's SSE stream and already recorded this request — the 'close' that eventually
+  // fires is a reap, not a second failure (see the close handler).
+  let timedOut = false;
   try {
-    ctx = spawnClaudeProcess(model, messages, conversationId, authInfo.keyName, releaseSlot, spawnDecision);
+    ctx = spawnClaudeProcess(model, messages, conversationId, authInfo.keyName, releaseSlot, spawnDecision, {
+      onTimeout: () => {
+        timedOut = true;
+        if (res.writableEnded || res.destroyed) return;
+        const elapsed = Date.now() - t0;
+        // Usage continuity: the close branch records success:false for a failed request, and a
+        // timed-out request consumed its prompt — so the timer records it HERE, and the close
+        // handler (which sees timedOut) must not record it a second time.
+        try { recordUsage({ keyId: authInfo.keyId, keyName: authInfo.keyName, model, promptChars: messages.reduce((a, m) => a + contentToText(m.content).length, 0), responseChars: 0, elapsedMs: elapsed, success: false }); } catch (e) { logEvent("error", "usage_record_failed", { error: e.message }); }
+        // The eager headers (D4) make the status unchangeable — the failure rides in the frame,
+        // terminated by [DONE], exactly like the parsed.error arm.
+        sendSSE(res, { error: { message: `request timed out after ${Math.round(TIMEOUT / 1000)}s`, type: "proxy_error" } }, hb);
+        res.write("data: [DONE]\n\n");
+        res.end();
+      },
+    });
   } catch (err) {
     releaseSlot();
     // Spawn threw before cleanup() was wired → release the fallback mutex here so it never leaks.
@@ -3070,6 +3210,17 @@ async function callClaudeStreaming(model, messages, conversationId, res, authInf
     cleanup();
     const elapsed = Date.now() - t0;
 
+    // #474: the overall timer fired first. It already ended the client's stream (error frame +
+    // [DONE]), recorded usage (success:false) and counted the request as a TIMEOUT (stats.timeouts,
+    // recordModelError(true), breakerRecordTimeout in the timer). This close is that kill
+    // landing — a REAP, not a second failure. Falling through would double-record (recordUsage
+    // again, countError moving stats.errors for a timeout) and — worst — write a second error
+    // frame onto a stream the timer already ended.
+    if (timedOut) {
+      logEvent("info", "claude_reaped_after_timeout", { model: cliModel, code, signal: signal || "none", elapsed });
+      return;
+    }
+
     // Tolerate null exit code when result event was seen (sandbox-wrap noise, same
     // as OLP commit 2864275 — bwrap shell exits null after model completes).
     // Also route to the error path when errored===true (is_error result received):
@@ -3142,10 +3293,12 @@ async function callClaudeStreaming(model, messages, conversationId, res, authInf
     // SIGTERM and the 5s kill-timer entirely (a post-exit proc.once("exit") never fires,
     // so the timer would otherwise leak a closure over proc for 5s per request). (issue #111)
     if (!proc.killed && proc.exitCode === null && proc.signalCode === null) {
-      try { proc.kill("SIGTERM"); } catch {}
+      // #474: the whole group — the client is gone, so nothing waits for 'close' on this lane,
+      // and a pipe-holding grandchild must not outlive the request either.
+      killChildTree(proc, "SIGTERM");
       // Mirror the overallTimer escalation (server.mjs ~818): a SIGTERM-resistant child would
       // otherwise hold its concurrency slot until the request timeout — #37 on the disconnect path. (issue #111)
-      const killTimer = setTimeout(() => { try { proc.kill("SIGKILL"); } catch {} }, 5000);
+      const killTimer = setTimeout(() => killChildTree(proc, "SIGKILL"), 5000);
       killTimer.unref();
       proc.once("exit", () => clearTimeout(killTimer));
     }
@@ -5515,14 +5668,16 @@ function gracefulShutdown(signal) {
   } catch (e) { logEvent("error", "tui_turn_pane_kill_failed", { error: e.message }); }
 
   // 3. Kill all active child processes
+  // #474: whole process groups, not just the direct children — a pipe-holding grandchild would
+  // otherwise survive the server exit and hold its pipe (and the slot's bookkeeping) forever.
   for (const proc of activeProcesses) {
-    try { proc.kill("SIGTERM"); } catch {}
+    killChildTree(proc, "SIGTERM");
   }
 
   // Force-kill any remaining processes after 5s, then exit
   const forceExitTimer = setTimeout(() => {
     for (const proc of activeProcesses) {
-      try { proc.kill("SIGKILL"); } catch {}
+      killChildTree(proc, "SIGKILL");
     }
     logEvent("warn", "shutdown_forced", { remainingProcesses: activeProcesses.size });
     process.exit(1);

@@ -6943,6 +6943,390 @@ ltTest("integration (#478): with NO end signal the calls arrive on a BOUNDED wai
   } finally { _ltRmRetry(dir); }
 });
 
+// ── #474: a timeout that never answers the client is a hang, not a timeout ────────────────────
+//
+// The overall timer kills only the DIRECT child. A grandchild that inherited the stdout pipe —
+// the `sleep 300 & wait` shape, which a real `claude` tool subprocess can produce — survives the
+// SIGTERM/SIGKILL aimed at the parent and keeps the pipe open. 'close' therefore never fires, and
+// the promise in callClaude (the SSE stream in callClaudeStreaming) settles only on 'close', so
+// the client waits forever. MEASURED 2026-09-17 on v3.37.0 (issue #474, CLAUDE_TIMEOUT=30000):
+// the client request hung past 240 s while the server log already showed request_timeout and a
+// claude_exit — the parent was reaped, the response was never sent.
+//
+// Fixture B below reproduces the shape with a fake whose ONLY job is to hold the pipe; fixture A
+// is LT_FAKE (emits a result, exits 0) as the control. The fix has two parts, and each gets its
+// own assertion: (1) the TIMER answers the client (500 on the buffered lane, error frame + [DONE]
+// on the streaming lane) — proven by the response ARRIVING with a bounded elapsed; (2) the KILL
+// reaches the whole process group (detached: true + kill(-pid)) — proven by the grandchild being
+// DEAD after the response, not merely the parent. Pre-fix, both fixture-B tests fail at the
+// 12 s abort: the response never arrives and the grandchild is still alive.
+const LT474_FAKE_HOLD = `#!/bin/sh
+# #474 fixture B: a claude fake with TWO call shapes, because the server issues BOTH within one
+# request cycle and the fixture must emulate the real claude for each:
+#   \`claude auth status\` — the periodic auth probe (server.mjs execFile, per-process kill).
+#     Real claude exits promptly and forks no long-lived children, so this path must too —
+#     otherwise its orphan grandchild clobbers the pid file below and the test polls a process
+#     the request's group kill can never touch (measured: the flake's true source).
+#   \`claude --model ... -p ...\` — the request. THIS is the #474 scenario: a grandchild (a real
+#     claude tool subprocess) holds the stdout pipe. A SIGTERM aimed at the shell only (pre-fix)
+#     leaves sleep alive and the pipe open.
+if [ "$1" = "auth" ] && [ "$2" = "status" ]; then
+  echo '{"loggedIn":true}'
+  exit 0
+fi
+sleep 300 &
+echo $! > "$GRANDCHILD_PID_FILE"
+wait
+`;
+
+// #474 fixture C: the STUCK-PIPE shape (zai review P2). Fixture B's parent is alive when the
+// timer fires; here the parent exits on its OWN within milliseconds (like a claude that
+// finishes its turn while a tool-spawned descendant it abandoned keeps the inherited stdout fd
+// open). Pre-fix, 'exit' runs cleanup() which CLEARS the request timer, so with the parent gone
+// no watchdog remains and the client hangs with zero response — the same failure class #474
+// eliminates, just with an earlier parent death. The fix must keep a live watchdog until
+// 'close' (the pipe) settles, not until 'exit'.
+const LT474_FAKE_ORPHAN = `#!/bin/sh
+# auth probe: same discipline as fixture B (real claude forks no long-lived children here).
+if [ "$1" = "auth" ] && [ "$2" = "status" ]; then
+  echo '{"loggedIn":true}'
+  exit 0
+fi
+sleep 300 &
+echo $! > "$GRANDCHILD_PID_FILE"
+# NO wait: the shell exits immediately, orphaning the pipe-holding grandchild.
+`;
+
+// #474 fixture D: the WITH-RESULT stuck-pipe shape (zai review P1 counter-reproduction). The
+// parent emits a FULL result — LT_FAKE's exact success shape, assistant + result events — and
+// then exits WITHOUT waiting while a tool-spawned descendant keeps the inherited stdout fd open.
+// The buffered lane settles only on 'close', so this request must still be answered at the
+// deadline: a 500 timeout with a request_timeout log, never silence. If the watchdog were
+// disarmed at result parse (the P1's claimed failure), this request would hang with no response
+// and no log line — the test would fail at the 12 s abort with the diagnostic.
+const LT474_FAKE_RESULT_ORPHAN = `#!/bin/sh
+# auth probe: same discipline as fixtures B/C (real claude forks no long-lived children here).
+if [ "$1" = "auth" ] && [ "$2" = "status" ]; then
+  echo '{"loggedIn":true}'
+  exit 0
+fi
+printf '%s\\n' '{"type":"assistant","message":{"content":[{"type":"text","text":"OK"}]}}'
+printf '%s\\n' '{"type":"result"}'
+sleep 300 &
+echo $! > "$GRANDCHILD_PID_FILE"
+# NO wait: the shell exits with the result already written, orphaning the pipe-holder.
+`;
+
+function lt474FakeHold(dir) {
+  const p = join(dir, "claude-hold");
+  _ltWrite(p, LT474_FAKE_HOLD);
+  _ltChmod(p, 0o755);
+  return p;
+}
+
+function lt474FakeOrphan(dir) {
+  const p = join(dir, "claude-orphan");
+  _ltWrite(p, LT474_FAKE_ORPHAN);
+  _ltChmod(p, 0o755);
+  return p;
+}
+
+function lt474FakeResultOrphan(dir) {
+  const p = join(dir, "claude-result-orphan");
+  _ltWrite(p, LT474_FAKE_RESULT_ORPHAN);
+  _ltChmod(p, 0o755);
+  return p;
+}
+
+// `process.kill(pid, 0)` cannot tell a zombie from a live process, and a reparented grandchild
+// IS a zombie between death and reaping — so asking it would report "alive" for a dead process.
+// And on a loaded machine a DEAD grandchild's pid can be reused by an unrelated process inside
+// the polling window, which would also read "alive". Ask ps for both the state AND the start
+// time: empty = gone, Z = zombie (dead, unreaped), and a live process whose start time differs
+// from the fingerprint is a REUSE — our grandchild is dead either way.
+function lt474Start(pid) {
+  const r = spawnSync("ps", ["-p", String(pid), "-o", "lstart="]);
+  // Normalize EXACTLY like lt474Alive's probe: ps space-pads single-digit days
+  // ("Wed Dec  3 10:00:00"), and lt474Alive rejoins its split with single spaces — if this
+  // fingerprint kept the raw double space, every day 1-9 of a month a LIVE grandchild would
+  // mismatch and read "dead", passing the kill assertions vacuously.
+  return (r.stdout || "").toString().trim().split(/\s+/).join(" ");
+}
+function lt474Alive(pid, startFp) {
+  const r = spawnSync("ps", ["-p", String(pid), "-o", "stat=,lstart="]);
+  if (r.error) return false;
+  const out = (r.stdout || "").toString().trim();
+  if (out === "") return false;
+  const [stat, ...rest] = out.split(/\s+/);
+  if (/^Z/.test(stat)) return false; // zombie = dead, unreaped
+  // A live process at our pid with a DIFFERENT start time is a reuse, not the grandchild.
+  // An empty fingerprint means the grandchild was ALREADY DEAD when we fingerprinted, so a live
+  // process at that pid can only be a reuse — it must read "dead". (An `||` here would be a
+  // flake: on a loaded machine the dead pid gets reused inside the polling window and the
+  // reused process reads "alive", failing a correct fix.)
+  return startFp !== "" && rest.join(" ") === startFp;
+}
+async function lt474WaitDead(pid, startFp, ms = 8000) {
+  const t0 = Date.now();
+  while (Date.now() - t0 < ms) {
+    if (!lt474Alive(pid, startFp)) return true;
+    await new Promise((r) => setTimeout(r, 250));
+  }
+  return !lt474Alive(pid, startFp);
+}
+
+// The grandchild outlives every server in this block — pre-fix by up to 300 s, and on any
+// failure path of a post-fix run it must not be left holding a pipe to a dead server either.
+function lt474ReapGrandchild(pidFile) {
+  if (!_ltExists(pidFile)) return;
+  const gp = parseInt(_ltRead(pidFile, "utf8").trim(), 10);
+  if (!Number.isInteger(gp) || gp <= 0) return;
+  // Fingerprint before kill (zai review P2): a bare kill of a pid read from a file can strike an
+  // UNRELATED process — on a loaded machine the dead grandchild's pid can be reused inside the
+  // window, and this cleanup runs unconditionally in every fixture test's finally. Only reap a pid
+  // the oracle still reads as OUR grandchild (live AND start-time-matching). A microsecond TOCTOU
+  // between the probe and the kill remains — it shrinks the hazard from "entirely plausible" to
+  // "requires a reuse in the same poll", which is acceptable for test cleanup, not for production.
+  const fp = lt474Start(gp);
+  if (fp && lt474Alive(gp, fp)) { try { process.kill(gp, "SIGKILL"); } catch { /* already gone */ } }
+}
+
+// On a kill miss: show the grandchild's actual group so a reviewer can see whether it was even
+// in the signaled group (a pid whose group id is NOT the fake shell's pid means the detached
+// spawn did not take effect — a different defect than a missed signal). The keyword list is the
+// intersection of GNU and BSD ps — `sid` is rejected by macOS ps ("keyword not found") and would
+// have made the whole line vanish exactly when it is needed.
+function lt474KillDiag(pidFile, buf) {
+  const gp = parseInt(_ltRead(pidFile, "utf8").trim(), 10);
+  const r = spawnSync("ps", ["-o", "pid,ppid,pgid,stat,comm", "-p", String(gp)]);
+  const psLine = ((r.stdout || "") + (r.stderr || "")).toString().trim().replace(/\n/g, " | ") || "ps: gone";
+  return `grandchild ps: ${psLine}`;
+}
+
+// #474 oracle self-check (zai review P2): the group-kill assertion only means something if the
+// liveness oracle actually works — not just that ps prints a line, but that the fingerprint
+// COMPARISON discriminates. It is verified against a KNOWN-LIVE pid (the server just booted):
+// the oracle must read that live server as ALIVE. If `ps` is missing (slim CI containers), the
+// stat/lstart keywords are unsupported, or the fingerprint normalization is asymmetric (ps
+// space-pads single-digit days — "Dec  3" — and the two sides must normalize identically), the
+// live server reads "dead" and the test fails loudly instead of letting the kill assertions
+// pass vacuously on a real regression.
+function lt474PsSanity(serverPid) {
+  const fp = lt474Start(serverPid);
+  if (!fp) return "the ps lstart probe returned nothing for a live pid — ps or the keyword is unavailable here";
+  if (!lt474Alive(serverPid, fp)) return "the oracle read a KNOWN-LIVE process as dead — the lstart fingerprint comparison is broken on this platform";
+  return "";
+}
+
+ltTest("integration (#474): a grandchild holding stdout gets a 500 at the timeout, not silence", async () => {
+  if (!LT_POSIX) return;
+  const dir = ltMkdir(); const fake = lt474FakeHold(dir); const pidFile = join(dir, "grandchild.pid");
+  try {
+    const { child, buf, port } = await ltBootFresh({ CLAUDE_BIN: fake, CLAUDE_TIMEOUT: "2000", GRANDCHILD_PID_FILE: pidFile }, dir);
+    try {
+      assert.ok(await ltWait(() => buf.out.includes("listening on")), `— ${ltDiag(buf)}`);
+      const psBlind = lt474PsSanity(child.pid);
+      assert.ok(!psBlind, `the liveness oracle is blind on this platform — the group-kill assertion would be vacuous: ${psBlind}`);
+      const before = await ltHealth(port);
+      assert.ok(before && before.stats, `precondition: /health serves a stats block — ${ltDiag(buf)}`);
+      const t0 = Date.now();
+      let r;
+      try {
+        const resp = await fetch(`http://127.0.0.1:${port}/v1/chat/completions`, {
+          method: "POST", headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ model: "sonnet", messages: [{ role: "user", content: "hi" }] }),
+          signal: AbortSignal.timeout(12000),
+        });
+        r = { status: resp.status, text: await resp.text() };
+      } catch (e) {
+        throw new Error(`the client got NO response in 12 s — the #474 hang (${e.name || e.message}) ${ltDiag(buf)}`);
+      }
+      const elapsed = Date.now() - t0;
+      // Premise: the timer really fired. A fast failure that merely LOOKS like a timeout would
+      // pass every other assertion here and prove nothing.
+      assert.ok(elapsed >= 1500, `the response at ${elapsed} ms predates the 2000 ms timeout — this is not the timeout path ${ltDiag(buf)}`);
+      assert.ok(elapsed < 10000, `the response took ${elapsed} ms — it must be bounded by the timer, not by the 12 s abort`);
+      assert.equal(r.status, 500, `a timeout is a REFUSED request, not a success — got ${r.status}: ${r.text.slice(0, 200)}`);
+      assert.match(r.text, /timed out/i, `the body must say it timed out — got ${r.text.slice(0, 200)}`);
+      assert.match(buf.err, /"event":"request_timeout"/, `the timer must have logged — ${buf.err.slice(-300)}`);
+      const after = await ltHealth(port);
+      assert.ok(after && after.stats, `/health must still serve after the timeout — ${ltDiag(buf)}`);
+      assert.equal(after.stats.timeouts, before.stats.timeouts + 1, "the timeout moves the aggregate counter exactly once");
+      // Part 2: the KILL must have reached the grandchild — the holder, not just the parent.
+      assert.ok(await ltWait(() => _ltExists(pidFile), 5000), "the fake never recorded the grandchild's pid");
+      const gp = parseInt(_ltRead(pidFile, "utf8").trim(), 10);
+      assert.ok(Number.isInteger(gp) && gp > 0, `no usable grandchild pid — ${_ltRead(pidFile, "utf8")}`);
+      // Fingerprint the grandchild NOW: if the kill missed, it is still alive here (the kill can
+      // land only at the 2 s timer), so its start time is capturable and the check below will
+      // keep reading "alive" for it — a real failure stays a real failure. If the kill worked,
+      // the process is already gone and the fingerprint is empty, which reads "dead".
+      const gpStart = lt474Start(gp);
+      assert.ok(await lt474WaitDead(gp, gpStart), `the grandchild (pid ${gp}) that holds the stdout pipe is still ALIVE after the timeout — the process group was not killed — ${lt474KillDiag(pidFile, buf)}`);
+    } finally { child.kill("SIGKILL"); await ltDrain(() => buf.closed, "474-buffered", 8000); }
+  } finally { lt474ReapGrandchild(pidFile); _ltRmRetry(dir); }
+});
+
+ltTest("integration (#474): a grandchild holding stdout ends the SSE stream at the timeout, not silence", async () => {
+  if (!LT_POSIX) return;
+  const dir = ltMkdir(); const fake = lt474FakeHold(dir); const pidFile = join(dir, "grandchild.pid");
+  try {
+    const { child, buf, port } = await ltBootFresh({ CLAUDE_BIN: fake, CLAUDE_TIMEOUT: "2000", GRANDCHILD_PID_FILE: pidFile }, dir);
+    try {
+      assert.ok(await ltWait(() => buf.out.includes("listening on")), `— ${ltDiag(buf)}`);
+      const psBlind = lt474PsSanity(child.pid);
+      assert.ok(!psBlind, `the liveness oracle is blind on this platform — the group-kill assertion would be vacuous: ${psBlind}`);
+      const t0 = Date.now();
+      let r;
+      try {
+        const resp = await fetch(`http://127.0.0.1:${port}/v1/chat/completions`, {
+          method: "POST", headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ model: "sonnet", stream: true, messages: [{ role: "user", content: "hi" }] }),
+          signal: AbortSignal.timeout(12000),
+        });
+        r = { status: resp.status, text: await resp.text() };
+      } catch (e) {
+        throw new Error(`the SSE stream never ended in 12 s — the #474 hang on the streaming lane (${e.name || e.message}) ${ltDiag(buf)}`);
+      }
+      const elapsed = Date.now() - t0;
+      assert.ok(elapsed >= 1500, `the stream ended at ${elapsed} ms — before the 2000 ms timeout, so this is not the timeout path ${ltDiag(buf)}`);
+      assert.ok(elapsed < 10000, `the stream took ${elapsed} ms to end — it must end at the timeout, not at the 12 s abort`);
+      assert.equal(r.status, 200, "the eager SSE headers make the status unchangeable; the FAILURE must ride in the frame");
+      assert.match(r.text, /data: /, `must be an SSE body — got ${r.text.slice(0, 200)}`);
+      assert.match(r.text, /"type":"proxy_error"/, `the timeout must surface as an error frame — got ${r.text.slice(0, 300)}`);
+      assert.match(r.text, /timed out/i, `the frame must say it timed out — got ${r.text.slice(0, 300)}`);
+      assert.match(r.text, /data: \[DONE\]/, "the stream must be TERMINATED, not merely errored");
+      assert.ok(await ltWait(() => _ltExists(pidFile), 5000), "the fake never recorded the grandchild's pid");
+      const gp = parseInt(_ltRead(pidFile, "utf8").trim(), 10);
+      assert.ok(Number.isInteger(gp) && gp > 0, `no usable grandchild pid — ${_ltRead(pidFile, "utf8")}`);
+      // Fingerprint as in the buffered twin — see there for why the empty-fingerprint case is safe.
+      const gpStart = lt474Start(gp);
+      assert.ok(await lt474WaitDead(gp, gpStart), `the grandchild (pid ${gp}) holding the pipe is still ALIVE after the timeout — the process group was not killed — ${lt474KillDiag(pidFile, buf)}`);
+    } finally { child.kill("SIGKILL"); await ltDrain(() => buf.closed, "474-streaming", 8000); }
+  } finally { lt474ReapGrandchild(pidFile); _ltRmRetry(dir); }
+});
+
+ltTest("integration (#474): a parent that exits early with an orphan holding stdout still gets a 500 at the timeout", async () => {
+  if (!LT_POSIX) return;
+  const dir = ltMkdir(); const fake = lt474FakeOrphan(dir); const pidFile = join(dir, "grandchild.pid");
+  try {
+    const { child, buf, port } = await ltBootFresh({ CLAUDE_BIN: fake, CLAUDE_TIMEOUT: "2000", GRANDCHILD_PID_FILE: pidFile }, dir);
+    try {
+      assert.ok(await ltWait(() => buf.out.includes("listening on")), `— ${ltDiag(buf)}`);
+      const psBlind = lt474PsSanity(child.pid);
+      assert.ok(!psBlind, `the liveness oracle is blind on this platform — the group-kill assertion would be vacuous: ${psBlind}`);
+      const before = await ltHealth(port);
+      assert.ok(before && before.stats, `precondition: /health serves a stats block — ${ltDiag(buf)}`);
+      const t0 = Date.now();
+      let r;
+      try {
+        const resp = await fetch(`http://127.0.0.1:${port}/v1/chat/completions`, {
+          method: "POST", headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ model: "sonnet", messages: [{ role: "user", content: "hi" }] }),
+          signal: AbortSignal.timeout(12000),
+        });
+        r = { status: resp.status, text: await resp.text() };
+      } catch (e) {
+        throw new Error(`the client got NO response in 12 s — the stuck-pipe #474 hang: the parent exited, the orphan held the pipe, and no watchdog answered (${e.name || e.message}) ${ltDiag(buf)}`);
+      }
+      const elapsed = Date.now() - t0;
+      // The parent dies in ~0 ms here, so any fast failure would NOT be the timeout path.
+      // The response must arrive AT the deadline: the watchdog that survived the parent's exit.
+      assert.ok(elapsed >= 1500, `the response at ${elapsed} ms predates the 2000 ms timeout — this is not the stuck-pipe timeout path ${ltDiag(buf)}`);
+      assert.ok(elapsed < 10000, `the response took ${elapsed} ms — it must be bounded by the timer, not by the 12 s abort`);
+      assert.equal(r.status, 500, `a timeout is a REFUSED request, not a success — got ${r.status}: ${r.text.slice(0, 200)}`);
+      assert.match(r.text, /timed out/i, `the body must say it timed out — got ${r.text.slice(0, 200)}`);
+      assert.match(buf.err, /"event":"request_timeout"/, `the timer must have logged — ${buf.err.slice(-300)}`);
+      const after = await ltHealth(port);
+      assert.ok(after && after.stats, `/health must still serve after the timeout — ${ltDiag(buf)}`);
+      assert.equal(after.stats.timeouts, before.stats.timeouts + 1, "the timeout moves the aggregate counter exactly once");
+      // Part 2: the group kill must have reached the orphan — the pipe holder, not the (already dead) parent.
+      assert.ok(await ltWait(() => _ltExists(pidFile), 5000), "the fake never recorded the grandchild's pid");
+      const gp = parseInt(_ltRead(pidFile, "utf8").trim(), 10);
+      assert.ok(Number.isInteger(gp) && gp > 0, `no usable grandchild pid — ${_ltRead(pidFile, "utf8")}`);
+      // Same fingerprint discipline as the buffered twin: an alive orphan is a real failure.
+      const gpStart = lt474Start(gp);
+      assert.ok(await lt474WaitDead(gp, gpStart), `the orphaned grandchild (pid ${gp}) holding the pipe is still ALIVE after the timeout — the process group was not killed — ${lt474KillDiag(pidFile, buf)}`);
+    } finally { child.kill("SIGKILL"); await ltDrain(() => buf.closed, "474-stuckpipe", 8000); }
+  } finally { lt474ReapGrandchild(pidFile); _ltRmRetry(dir); }
+});
+
+ltTest("integration (#474): a parent that emits the full result and exits with an orphan holding stdout still gets a 500 at the timeout", async () => {
+  if (!LT_POSIX) return;
+  const dir = ltMkdir(); const fake = lt474FakeResultOrphan(dir); const pidFile = join(dir, "grandchild.pid");
+  try {
+    const { child, buf, port } = await ltBootFresh({ CLAUDE_BIN: fake, CLAUDE_TIMEOUT: "2000", GRANDCHILD_PID_FILE: pidFile }, dir);
+    try {
+      assert.ok(await ltWait(() => buf.out.includes("listening on")), `— ${ltDiag(buf)}`);
+      const psBlind = lt474PsSanity(child.pid);
+      assert.ok(!psBlind, `the liveness oracle is blind on this platform — the group-kill assertion would be vacuous: ${psBlind}`);
+      const before = await ltHealth(port);
+      assert.ok(before && before.stats, `precondition: /health serves a stats block — ${ltDiag(buf)}`);
+      const t0 = Date.now();
+      let r;
+      try {
+        const resp = await fetch(`http://127.0.0.1:${port}/v1/chat/completions`, {
+          method: "POST", headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ model: "sonnet", messages: [{ role: "user", content: "hi" }] }),
+          signal: AbortSignal.timeout(12000),
+        });
+        r = { status: resp.status, text: await resp.text() };
+      } catch (e) {
+        throw new Error(`the client got NO response in 12 s — the with-result stuck-pipe hang: the result was emitted, the parent exited, the orphan held the pipe, and no watchdog answered (${e.name || e.message}) ${ltDiag(buf)}`);
+      }
+      const elapsed = Date.now() - t0;
+      // The parent exits ~0 ms after emitting the result, so a fast response would NOT be the
+      // timeout path — and the buffered lane settles only on 'close', which the orphan prevents.
+      // The ONLY correct answer is the timeout at the deadline: a 500, never a 200 (the client
+      // was never served) and never silence.
+      assert.ok(elapsed >= 1500, `the response at ${elapsed} ms predates the 2000 ms timeout — this is not the stuck-pipe timeout path ${ltDiag(buf)}`);
+      assert.ok(elapsed < 10000, `the response took ${elapsed} ms — it must be bounded by the timer, not by the 12 s abort`);
+      assert.equal(r.status, 500, `a timeout is a REFUSED request, not a success — the emitted result was never delivered to the client, so a 200 would be a lie: got ${r.status}: ${r.text.slice(0, 200)}`);
+      assert.match(r.text, /timed out/i, `the body must say it timed out — got ${r.text.slice(0, 200)}`);
+      assert.match(buf.err, /"event":"request_timeout"/, `the timer must have logged — ${buf.err.slice(-300)}`);
+      const after = await ltHealth(port);
+      assert.ok(after && after.stats, `/health must still serve after the timeout — ${ltDiag(buf)}`);
+      // Exactly ONE accounting. Global, from /health: the timeout moves timeouts+1 and NOT
+      // errors (a timeout is a separate class, ADR 0018).
+      assert.equal(after.stats.timeouts, before.stats.timeouts + 1, "the timeout moves the aggregate counter exactly once");
+      assert.equal(after.stats.errors, before.stats.errors, "the global error counter must not move — a timeout is not an error (ADR 0018)");
+      // Per-model, from the wire — /usage is the only endpoint that serves the model snapshot.
+      // Same no-token 502 branch as the ADR 0018 test: the `models` block is attached either
+      // way, so the per-model counters are readable with every credential source closed.
+      const ur = await fetch(`http://127.0.0.1:${port}/usage`);
+      assert.equal(ur.status, 502, `/usage must take the no-token branch here — got ${ur.status} ${ltDiag(buf)}`);
+      const ub = await ur.json();
+      const m = ub.models || {};
+      const keys = Object.keys(m);
+      assert.equal(keys.length, 1, `premise: exactly one model row on a fresh boot — or the per-model assertions are vacuous; got ${JSON.stringify(m)}`);
+      const row = m[keys[0]];
+      assert.equal(row.timeouts, 1, `the per-model timeout counter must agree with the aggregate one (ADR 0018) — got ${JSON.stringify(row)}`);
+      assert.equal(row.errors, 1, "the timeout counts as the single per-model failure — not two bookings");
+      assert.equal(row.successes, 0, `the emitted-but-undelivered result must NOT be recorded as a success: the close that lands after the group kill is a REAP, not a second settlement — without the timedOut guard the buffered fall-through (code=0, resultEventSeen=true) takes the success arm for a request whose client received a 500 (measured red: successes=1 alongside errors=1, timeouts=1); got ${JSON.stringify(row)}`);
+      // Part 2: the group kill must have reached the orphan — the pipe holder.
+      assert.ok(await ltWait(() => _ltExists(pidFile), 5000), "the fake never recorded the grandchild's pid");
+      const gp = parseInt(_ltRead(pidFile, "utf8").trim(), 10);
+      assert.ok(Number.isInteger(gp) && gp > 0, `no usable grandchild pid — ${_ltRead(pidFile, "utf8")}`);
+      const gpStart = lt474Start(gp);
+      assert.ok(await lt474WaitDead(gp, gpStart), `the orphaned grandchild (pid ${gp}) holding the pipe is still ALIVE after the timeout — the process group was not killed — ${lt474KillDiag(pidFile, buf)}`);
+    } finally { child.kill("SIGKILL"); await ltDrain(() => buf.closed, "474-result-stuckpipe", 8000); }
+  } finally { lt474ReapGrandchild(pidFile); _ltRmRetry(dir); }
+});
+
+ltTest("integration (#474 control): a normal spawn still completes with the detached process group", async () => {
+  if (!LT_POSIX) return;
+  const dir = ltMkdir(); const fake = ltFake(dir);
+  try {
+    const { child, buf, port } = await ltBootFresh({ CLAUDE_BIN: fake }, dir);
+    try {
+      assert.ok(await ltWait(() => buf.out.includes("listening on")), `— ${ltDiag(buf)}`);
+      const r = await ltPostStatus(port, { model: "sonnet", messages: [{ role: "user", content: "hi" }] });
+      assert.equal(r.status, 200, `${r.status} ${r.text.slice(0, 200)}`);
+      assert.equal(JSON.parse(r.text).choices[0].message.content, "OK",
+        "fixture A must answer normally — the control that the detached/group-kill change did not break the happy path");
+    } finally { child.kill("SIGKILL"); await ltDrain(() => buf.closed, "474-control", 5000); }
+  } finally { _ltRmRetry(dir); }
+});
+
 ltTest("integration (ADR 0022): a tool result sent back is rendered into the next spawn's prompt with the continuation note", async () => {
   if (!LT_POSIX) return;
   const dir = ltMkdir(); const fake = ltFake(dir);
