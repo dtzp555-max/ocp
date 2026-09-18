@@ -2919,6 +2919,13 @@ if [ -n "$UPSTREAM_ERROR" ]; then
   if [ -n "$UPSTREAM_ERROR_ON_STDERR" ]; then printf '%s\\n' "$UPSTREAM_ERROR" >&2; fi
   exit 1
 fi
+if [ -n "$UPSTREAM_ERROR_STDERR_ONLY" ]; then
+  # #482: a wall that arrives ONLY on stderr, with NO result event on stdout — the close
+  # handler's stderr arm is the only arm that sees it. Exits non-zero, like a CLI that
+  # prints the wall and bails without a result event.
+  printf '%s\\n' "$UPSTREAM_ERROR_STDERR_ONLY" >&2
+  exit 1
+fi
 if [ -n "$TOOL_USE_NAME" ]; then
   # ONE event carrying text + one tool_use: the shape this fixture always emitted, kept because two
   # shipped tests describe it. The real CLI emits one event PER CONTENT BLOCK -- see
@@ -6343,6 +6350,68 @@ ltTest("integration: one streaming failure seen by BOTH error arms still counts 
       const h = await fetch(`http://127.0.0.1:${port}/health`).then(x => x.json());
       assert.equal(h.stats.upstreamRateLimits, 1, "one request must move the counter by exactly one");
     } finally { child.kill("SIGKILL"); await ltDrain(() => buf.closed, "stream-429-once", 5000); }
+  } finally { _ltRmRetry(dir); }
+});
+
+// #482: #481 classified, counted and logged the streaming wall — but the SSE frame itself still
+// said provider_error. A mid-stream failure typed provider_error when it is a rate limit is
+// mislabelled: an operator reading the frame cannot tell the wall from a crash without
+// correlating /health. These tests pin the TYPE on the wire. Deliberately they assert nothing
+// about client behaviour: the issue MEASURED (Hermes 0.21.1, 2026-09-14, via a stub) that the
+// type makes no difference to that consumer's failover, so any test implying a capability
+// change would be false.
+ltTest("integration: a streaming wall frame is typed rate_limit_error (#482)", async () => {
+  if (!LT_POSIX) return;
+  const dir = ltMkdir(); const fake = ltFake(dir);
+  try {
+    const { child, buf, port } = await ltBootFresh({ CLAUDE_BIN: fake, UPSTREAM_ERROR: "Claude usage limit reached - resets at 7:00am" }, dir);
+    try {
+      assert.ok(await ltWait(() => buf.out.includes("listening on")), `— ${ltDiag(buf)}`);
+      const r = await ltPostStatus(port, { model: "sonnet", stream: true, messages: [{ role: "user", content: "hi" }] });
+      // Positive anchors first: really the streaming lane, really carrying the failure.
+      assert.match(r.text, /data: /, `must be an SSE body — got ${r.text.slice(0, 200)}`);
+      assert.match(r.text, /usage limit/i, `the failure must still surface — got ${r.text.slice(0, 300)}`);
+      assert.equal(r.status, 200, "the status stays 200 — it cannot be un-sent once the eager headers went out");
+      assert.match(r.text, /"type":"rate_limit_error"/, `the wall frame must be typed rate_limit_error — got ${r.text.slice(0, 400)}`);
+    } finally { child.kill("SIGKILL"); await ltDrain(() => buf.closed, "stream-482-wall", 5000); }
+  } finally { _ltRmRetry(dir); }
+});
+
+ltTest("integration (control): an ordinary streaming failure frame stays provider_error (#482)", async () => {
+  if (!LT_POSIX) return;
+  const dir = ltMkdir(); const fake = ltFake(dir);
+  try {
+    const { child, buf, port } = await ltBootFresh({ CLAUDE_BIN: fake, UPSTREAM_ERROR: "claude exited unexpectedly" }, dir);
+    try {
+      assert.ok(await ltWait(() => buf.out.includes("listening on")), `— ${ltDiag(buf)}`);
+      const r = await ltPostStatus(port, { model: "sonnet", stream: true, messages: [{ role: "user", content: "hi" }] });
+      assert.match(r.text, /data: /, `must be an SSE body — got ${r.text.slice(0, 200)}`);
+      // The negative side of the same claim: only a WALL moves the type. A test asserting the
+      // positive side alone would pass on a build that types EVERYTHING rate_limit_error.
+      assert.match(r.text, /"type":"provider_error"/, `an ordinary failure must stay provider_error — got ${r.text.slice(0, 400)}`);
+      assert.ok(!/"type":"rate_limit_error"/.test(r.text), "an ordinary failure must NOT be typed rate_limit_error");
+    } finally { child.kill("SIGKILL"); await ltDrain(() => buf.closed, "stream-482-control", 5000); }
+  } finally { _ltRmRetry(dir); }
+});
+
+ltTest("integration: a wall arriving only on stderr is typed rate_limit_error on the close arm (#482)", async () => {
+  if (!LT_POSIX) return;
+  const dir = ltMkdir(); const fake = ltFake(dir);
+  try {
+    // The verbatim observed wall (2026-09-15, live v3.36.0) — matches the wire-added pattern.
+    const { child, buf, port } = await ltBootFresh({ CLAUDE_BIN: fake, UPSTREAM_ERROR_STDERR_ONLY: "You've hit your session limit · resets 5am (UTC)" }, dir);
+    try {
+      assert.ok(await ltWait(() => buf.out.includes("listening on")), `— ${ltDiag(buf)}`);
+      const r = await ltPostStatus(port, { model: "sonnet", stream: true, messages: [{ role: "user", content: "hi" }] });
+      assert.match(r.text, /data: /, `must be an SSE body — got ${r.text.slice(0, 200)}`);
+      assert.equal(r.status, 200, "the status stays 200");
+      assert.match(r.text, /session limit/i, `the wall text must still surface — got ${r.text.slice(0, 300)}`);
+      assert.match(r.text, /"type":"rate_limit_error"/, `the close arm must type the wall rate_limit_error — got ${r.text.slice(0, 400)}`);
+      // The counter already moved on this arm since #481 — the type must now AGREE with it,
+      // not the reverse.
+      const h = await fetch(`http://127.0.0.1:${port}/health`).then(x => x.json());
+      assert.equal(h.stats.upstreamRateLimits, 1, "the close arm counts the wall; the frame type must match the counter");
+    } finally { child.kill("SIGKILL"); await ltDrain(() => buf.closed, "stream-482-stderr", 5000); }
   } finally { _ltRmRetry(dir); }
 });
 

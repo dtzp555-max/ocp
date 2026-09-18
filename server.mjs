@@ -3192,7 +3192,10 @@ async function callClaudeStreaming(model, messages, conversationId, res, authInf
           // Headers already sent (eager ensureHeaders) — can't send a JSON 500. Surface the
           // failure as an SSE error frame so the client can distinguish an upstream error
           // from a legitimately empty completion, instead of a success-looking finish_reason:"stop". (issue #110)
-          sendSSE(res, { error: { message: sanitizeError(errStr), type: "provider_error" } }, hb);
+          // #482: type the frame what the counter already says it is — rateLimitCounted was set
+          // from THIS message (errStr) above, so wire and /health agree by construction. The
+          // status stays 200 (it cannot be un-sent); only the type moves.
+          sendSSE(res, { error: { message: sanitizeError(errStr), type: rateLimitCounted ? "rate_limit_error" : "provider_error" } }, hb);
           res.write("data: [DONE]\n\n");
           res.end();
         }
@@ -3241,7 +3244,9 @@ async function callClaudeStreaming(model, messages, conversationId, res, authInf
         // Headers already sent — surface the failure as an SSE error frame instead of a
         // success-looking finish_reason:"stop", so the client can tell the upstream crashed
         // rather than returned empty. (issue #110 — sibling of the parsed.error branch above.)
-        sendSSE(res, { error: { message: sanitizeError(stderr.slice(0, 300) || `claude exit ${code}`), type: "proxy_error" } }, hb);
+        // #482: a wall that reached us via stderr is rate_limit_error, not proxy_error —
+        // rateLimitCounted was set from THIS string above, so the type matches the counter.
+        sendSSE(res, { error: { message: sanitizeError(stderr.slice(0, 300) || `claude exit ${code}`), type: rateLimitCounted ? "rate_limit_error" : "proxy_error" } }, hb);
         res.write("data: [DONE]\n\n");
         res.end();
       }
