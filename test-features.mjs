@@ -6223,12 +6223,21 @@ test("upstream rate limit: quota/rate NOUNS match, transient advice alone does N
   // fallback-capable client to leave the vendor over a menu item. `monthly spend limit` alone
   // occurs 23 times in that binary and most of the occurrences are these.
   //
-  // THESE ROWS PROVE THE ANCHOR FOR TWO PATTERNS, NOT FIVE. `fast limit` and `team's shared
-  // budget` occur ONLY inside walls in this binary, so widening either to its bare noun produces
-  // no red here; they carry the verb because the wall BUILDER is
-  // `return \`You've hit your ${e}${n}${g}\`` -- the verb is structural, present in every wall by
-  // construction -- not because a near-miss was measured for them. Stated so nobody reads five
-  // rows as five measurements.
+  // WHICH ANCHORS THESE ROWS PROVE, precisely, because five rows are not five measurements:
+  // the FOUND rows above prove `monthly spend limit` and `monthly limit` -- those two have real
+  // settings labels in the binary, and widening either pattern to its bare noun reddens by name.
+  // The other two, `fast limit` and `team's shared budget`, occur ONLY inside walls in this
+  // binary, so no found string can catch their widening. They carry the verb because the wall
+  // BUILDER is `return \`You've hit your ${e}${n}${g}\`` -- the verb is structural, present in
+  // every wall by construction -- rather than because a near-miss was measured.
+  //
+  // The two CONSTRUCTED rows below close that gap as a regression guard. They are labelled
+  // constructed and are deliberately NOT presented as upstream output: this file's rule that a
+  // corpus must be FOUND rather than invented is about POSITIVE rows, where a paraphrase
+  // validates a pattern against text the upstream never emits. A negative row makes the strictly
+  // safer claim -- that the pattern does not match -- and its job here is to redden when someone
+  // later "simplifies" the anchor away. They follow the UI grammar the binary does use
+  // (`Adjust monthly limit`, `Set monthly spend limit`).
   //
   // The last row is the one that also kills the TEMPLATE option #493 proposed (matching `hit your `
   // plus a limit noun): it is prose ABOUT the behaviour, and a bare `hit your ` or `hit your limit`
@@ -6243,6 +6252,10 @@ test("upstream rate limit: quota/rate NOUNS match, transient advice alone does N
     "org's monthly spend limit",
     "Adjust monthly limit",
     "client composes its own \"You've hit your limit\" line and drops your message;",
+    // CONSTRUCTED (not from the binary) -- see the note above. Without these, widening
+    // `hit your fast limit` or `hit your team's shared budget` to its bare noun reddens nothing.
+    "Adjust fast limit",
+    "Set team's shared budget",
   ]) assert.equal(isUpstreamRateLimit(m), false, `a settings label must NOT be a rate limit (#493): ${m}`);
 
   // Negative: ordinary failures, INCLUDING ones carrying retry advice. This is the row that keeps
