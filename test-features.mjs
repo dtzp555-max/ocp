@@ -537,6 +537,58 @@ test("updateKeyQuota partial update preserves existing values", () => {
   assert.equal(quota.weekly.limit, 20);
 });
 
+// Regression tests for the PR #498 discussion: the flagged template literal only ever
+// interpolates a fixed set of hard-coded column fragments (never attacker-reachable data),
+// and the SELECT-then-UPDATE rewrite proposed there loses a non-targeted row's untouched
+// columns on a multi-match idOrName. These pin the data-flow claim and the multi-match
+// behavior directly, rather than trusting either description.
+
+test("updateKeyQuota treats a SQL-metacharacter idOrName as literal data, not SQL", () => {
+  const before = listKeys().length;
+  const ok = updateKeyQuota("x' OR '1'='1", { daily: 5 });
+  assert.equal(ok, false, "a payload matching no real key must not match every row");
+  assert.equal(listKeys().length, before, "no keys created or removed");
+  // key1's quota set by the previous two tests must be unaffected.
+  const quota = getKeyQuota(key1.id);
+  assert.equal(quota.daily.limit, 5);
+  assert.equal(quota.weekly.limit, 20);
+});
+
+test("updateKeyQuota stores a malicious quota value as bound data, not executable SQL", () => {
+  const key = createKey("sql-value-test");
+  const injected = "5; DROP TABLE api_keys; --";
+  const ok = updateKeyQuota(key.id, { daily: injected });
+  assert.ok(ok);
+  // The table must still exist and be fully queryable — a real injection would have dropped it.
+  const keys = listKeys();
+  assert.ok(keys.some(k => k.name === "sql-value-test"));
+  assert.ok(keys.some(k => k.name === "test-user-1"));
+  // SQLite's dynamic typing stores the string verbatim; it was bound, never concatenated.
+  assert.equal(getKeyQuota(key.id).daily.limit, injected);
+});
+
+test("updateKeyQuota with a multi-match idOrName does not clobber the non-targeted row's untouched columns", () => {
+  const keyB = createKey("clobber-b");
+  updateKeyQuota(keyB.id, { weekly: 5 });
+  // keyC's name collides with keyB's numeric id: `id = ? OR name = ?` matches both rows.
+  const keyC = createKey(String(keyB.id));
+  updateKeyQuota(keyC.id, { monthly: 7 });
+
+  const idOrName = String(keyB.id);
+  const preMatches = db.prepare("SELECT id FROM api_keys WHERE id = ? OR name = ?").all(idOrName, idOrName);
+  assert.equal(preMatches.length, 2, "fixture must produce a genuine multi-match");
+
+  const ok = updateKeyQuota(idOrName, { daily: 99 });
+  assert.ok(ok);
+
+  const quotaB = getKeyQuota(keyB.id);
+  const quotaC = getKeyQuota(keyC.id);
+  assert.equal(quotaB.daily.limit, 99);
+  assert.equal(quotaB.weekly.limit, 5, "keyB's own weekly quota must be untouched");
+  assert.equal(quotaC.daily.limit, 99);
+  assert.equal(quotaC.monthly.limit, 7, "keyC's monthly quota must survive an update aimed at a field it never set");
+});
+
 test("checkQuota passes when under limit", () => {
   // Record 3 usages (limit is 5 daily)
   for (let i = 0; i < 3; i++) {
