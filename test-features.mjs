@@ -16,7 +16,7 @@ import { PREFIX as BRIDGE_PREFIX } from "./lib/mcp-bridge.mjs";
 import { randomBytes } from "node:crypto";
 import { createSerialMutex, createTtlCache, isTokenExpiring, orderLabelsLastGoodFirst, scrubInboundAuthEnv, INBOUND_AUTH_ENV_VARS, applyRequestVerdictTtl } from "./lib/spawn-auth.mjs";
 import { makeResolveSpawnToken } from "./lib/spawn-token.mjs";
-import { scheduleKillEscalation } from "./lib/child-tree.mjs";
+import { scheduleKillEscalation, makeKillEscalation } from "./lib/child-tree.mjs";
 import { EventEmitter } from "node:events";
 import { parseAuthority, isRebindSafe, matchesDeclared, parseAllowedHosts, evaluateOriginGate } from "./lib/host-gate.mjs";
 import { createHash } from "node:crypto";
@@ -21377,22 +21377,46 @@ async function runAsyncTests() {
   // #474 arms a SIGKILL 5 s after each SIGTERM. Two of the four sites never cleared it, so on the
   // normal path (measured: 'close' at ~1 ms, group already ESRCH) the timer sat ~4999 ms per
   // request aimed at a released pgid — and killChildTree's group kill is a raw syscall with no
-  // liveness check. Each claim gets its OWN body: the close-vs-exit mutation breaks two of them
-  // at once, and co-located they could only ever produce one red (#405, "Mutual").
+  // liveness check. The cancel condition is an EMPTY GROUP; 'close' is only the prompt to
+  // re-check it. Each claim gets its OWN body: the close/group mutations break several at once,
+  // and co-located they could only ever produce one red (#405, "Mutual").
   const _esc = () => { const p = new EventEmitter(); p.pid = 424242; return p; };
   const _settle = () => new Promise((r) => setTimeout(r, 150));
+  const _occupied = makeKillEscalation({ groupEmpty: () => false });
 
-  await testAsync("#500 escalation is cancelled once the child tree closes", async () => {
-    const proc = _esc(); const sigs = [];
-    scheduleKillEscalation(proc, (_p, sig) => sigs.push(sig), 30);
+  await testAsync("#500 escalation is cancelled once the GROUP is empty", async () => {
+    const proc = _esc(); const sigs = []; let drained = false;
+    const sched = makeKillEscalation({ groupEmpty: () => drained });
+    sched(proc, (_p, sig) => sigs.push(sig), 30);
+    drained = true;                      // the group emptied, then 'close' woke the re-check
     proc.emit("close");
     await _settle();
-    assert.deepEqual(sigs, [], "a drained tree must not be signalled — its pgid may be reused by then");
+    assert.deepEqual(sigs, [], "a drained group must not be signalled — its pgid may be reused by then");
+  });
+
+  await testAsync("#500 'close' with a SURVIVING group member does NOT cancel the escalation", async () => {
+    // A backgrounded tool subprocess that redirected its fds away from the inherited pipes lets
+    // 'close' fire while it is still in the group. Cancelling here would trade the stale-pgid
+    // kill for a silent process leak — the pre-#500 code did kill this member at 5 s.
+    const proc = _esc(); const sigs = [];
+    _occupied(proc, (_p, sig) => sigs.push(sig), 30);
+    proc.emit("close");
+    await _settle();
+    assert.deepEqual(sigs, ["SIGKILL"], "a surviving group member must still be escalated");
+  });
+
+  await testAsync("#500 an already-released pgid is never armed at all", async () => {
+    const proc = _esc(); const sigs = [];
+    const sched = makeKillEscalation({ groupEmpty: () => true });
+    const timer = sched(proc, (_p, sig) => sigs.push(sig), 30);
+    assert.equal(timer, null, "nothing to escalate against — arming would BE the defect");
+    await _settle();
+    assert.deepEqual(sigs, [], "a released pgid must never be signalled");
   });
 
   await testAsync("#500 escalation still fires when the tree never closes", async () => {
     const proc = _esc(); const sigs = [];
-    scheduleKillEscalation(proc, (_p, sig) => sigs.push(sig), 30);
+    _occupied(proc, (_p, sig) => sigs.push(sig), 30);
     await _settle();
     assert.deepEqual(sigs, ["SIGKILL"], "a SIGTERM-resistant tree must still be escalated");
   });
@@ -21401,9 +21425,9 @@ async function runAsyncTests() {
     // The parent has been reaped while a grandchild still holds the stdout pipe: 'exit' has
     // fired, 'close' has not. This is precisely the case #474 exists for, so clearing on 'exit'
     // — what the disconnect site (#111) does, and the obvious thing to copy — would cancel the
-    // one kill that matters. This test is what makes 'close' the oracle rather than a preference.
+    // one kill that matters.
     const proc = _esc(); const sigs = [];
-    scheduleKillEscalation(proc, (_p, sig) => sigs.push(sig), 30);
+    _occupied(proc, (_p, sig) => sigs.push(sig), 30);
     proc.emit("exit", null, "SIGTERM");
     await _settle();
     assert.deepEqual(sigs, ["SIGKILL"], "clearing on 'exit' would cancel the escalation #474 needs");
@@ -21411,10 +21435,22 @@ async function runAsyncTests() {
 
   await testAsync("#500 a pending escalation does not hold the event loop open", async () => {
     const proc = _esc();
-    const timer = scheduleKillEscalation(proc, () => {}, 30);
+    const timer = _occupied(proc, () => {}, 30);
     assert.equal(timer.hasRef(), false, "an unref'd timer must never be why the process stays alive");
     clearTimeout(timer);
   });
+
+  await testAsync("#500 the production binding uses the real group check, not an injected one", async () => {
+    // Pins the DEFAULT wiring: scheduleKillEscalation must be makeKillEscalation()'s product with
+    // defaultGroupEmpty bound. pid 424242 is not a live pgid here, so the real check reports empty
+    // and the helper declines to arm — which an injected always-occupied stub would not do.
+    const proc = _esc(); const sigs = [];
+    const timer = scheduleKillEscalation(proc, (_p, sig) => sigs.push(sig), 30);
+    assert.equal(timer, null, "the exported binding must consult the real group, not a stub");
+    await _settle();
+    assert.deepEqual(sigs, []);
+  });
+
   await testAsync("createSerialMutex: second waiter blocks until first holder releases", async () => {
     const mutex = createSerialMutex();
     const order = [];
