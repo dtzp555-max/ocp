@@ -16,6 +16,8 @@ import { PREFIX as BRIDGE_PREFIX } from "./lib/mcp-bridge.mjs";
 import { randomBytes } from "node:crypto";
 import { createSerialMutex, createTtlCache, isTokenExpiring, orderLabelsLastGoodFirst, scrubInboundAuthEnv, INBOUND_AUTH_ENV_VARS, applyRequestVerdictTtl } from "./lib/spawn-auth.mjs";
 import { makeResolveSpawnToken } from "./lib/spawn-token.mjs";
+import { scheduleKillEscalation } from "./lib/child-tree.mjs";
+import { EventEmitter } from "node:events";
 import { parseAuthority, isRebindSafe, matchesDeclared, parseAllowedHosts, evaluateOriginGate } from "./lib/host-gate.mjs";
 import { createHash } from "node:crypto";
 import { strict as assert } from "node:assert";
@@ -21370,6 +21372,49 @@ test("makeResolveSpawnToken: no override → REAL isTokenExpiring (default) path
 
 // ── Async: F3 real-HOME fallback serialization mutex ──
 async function runAsyncTests() {
+
+  // ── #500: the SIGKILL escalation timer's lifecycle (lib/child-tree.mjs) ──
+  // #474 arms a SIGKILL 5 s after each SIGTERM. Two of the four sites never cleared it, so on the
+  // normal path (measured: 'close' at ~1 ms, group already ESRCH) the timer sat ~4999 ms per
+  // request aimed at a released pgid — and killChildTree's group kill is a raw syscall with no
+  // liveness check. Each claim gets its OWN body: the close-vs-exit mutation breaks two of them
+  // at once, and co-located they could only ever produce one red (#405, "Mutual").
+  const _esc = () => { const p = new EventEmitter(); p.pid = 424242; return p; };
+  const _settle = () => new Promise((r) => setTimeout(r, 150));
+
+  await testAsync("#500 escalation is cancelled once the child tree closes", async () => {
+    const proc = _esc(); const sigs = [];
+    scheduleKillEscalation(proc, (_p, sig) => sigs.push(sig), 30);
+    proc.emit("close");
+    await _settle();
+    assert.deepEqual(sigs, [], "a drained tree must not be signalled — its pgid may be reused by then");
+  });
+
+  await testAsync("#500 escalation still fires when the tree never closes", async () => {
+    const proc = _esc(); const sigs = [];
+    scheduleKillEscalation(proc, (_p, sig) => sigs.push(sig), 30);
+    await _settle();
+    assert.deepEqual(sigs, ["SIGKILL"], "a SIGTERM-resistant tree must still be escalated");
+  });
+
+  await testAsync("#500 'exit' without 'close' does NOT cancel the escalation (the #474 stuck-pipe shape)", async () => {
+    // The parent has been reaped while a grandchild still holds the stdout pipe: 'exit' has
+    // fired, 'close' has not. This is precisely the case #474 exists for, so clearing on 'exit'
+    // — what the disconnect site (#111) does, and the obvious thing to copy — would cancel the
+    // one kill that matters. This test is what makes 'close' the oracle rather than a preference.
+    const proc = _esc(); const sigs = [];
+    scheduleKillEscalation(proc, (_p, sig) => sigs.push(sig), 30);
+    proc.emit("exit", null, "SIGTERM");
+    await _settle();
+    assert.deepEqual(sigs, ["SIGKILL"], "clearing on 'exit' would cancel the escalation #474 needs");
+  });
+
+  await testAsync("#500 a pending escalation does not hold the event loop open", async () => {
+    const proc = _esc();
+    const timer = scheduleKillEscalation(proc, () => {}, 30);
+    assert.equal(timer.hasRef(), false, "an unref'd timer must never be why the process stays alive");
+    clearTimeout(timer);
+  });
   await testAsync("createSerialMutex: second waiter blocks until first holder releases", async () => {
     const mutex = createSerialMutex();
     const order = [];

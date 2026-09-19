@@ -45,6 +45,7 @@ import { homedir, tmpdir } from "node:os";
 import { validateKey, recordUsage, getUsageByKey, getUsageTimeline, getRecentUsage, createKey, listKeys, revokeKey, closeDb, checkQuota, updateKeyQuota, getKeyQuota, findKey, cacheHash, getCachedResponse, setCachedResponse, clearCache, getCacheStats, hasCacheControl, singleflight, getInflightStats } from "./keys.mjs";
 import { DEFAULT_PORT } from "./lib/constants.mjs";
 import { StructuredOutputError, detectStructuredOutput, validateJsonSchemaSafe, extractJsonPayload, structuredSystemInstruction, resolveMaxAttempts } from "./lib/structured-output.mjs";
+import { scheduleKillEscalation } from "./lib/child-tree.mjs";
 import { isLoopbackBind } from "./lib/net.mjs";
 import { parseAllowedHosts, parseAuthority, matchesDeclared, evaluateOriginGate } from "./lib/host-gate.mjs";
 import { classifyToolRequest, countDeclaredTools } from "./lib/tool-support.mjs";
@@ -2212,7 +2213,7 @@ function spawnClaudeProcess(model, messages, conversationId, keyName, releaseSlo
     // #474: kill the whole group, not just the direct child — see killChildTree. The pre-#474
     // per-process kill left a pipe-holding grandchild alive, which is what kept the request open.
     killChildTree(proc, "SIGTERM");
-    setTimeout(() => killChildTree(proc, "SIGKILL"), 5000);
+    scheduleKillEscalation(proc, killChildTree); // #500
     // #474: the TIMER must answer the client, not just the stream. The stream may never close
     // (a grandchild holding the stdout pipe keeps 'close' pending even after the parent dies),
     // and both callers settle ONLY on 'close' — so without this the request hangs past the
@@ -2407,7 +2408,7 @@ async function callClaude(model, messages, conversationId, keyName, res, opts = 
       // see lib/mcp-bridge.mjs). SIGTERM first, SIGKILL after the same 5 s the timeout path uses.
       // #474: the whole group — a grandchild holding the pipe would otherwise keep 'close' pending.
       killChildTree(proc, "SIGTERM");
-      setTimeout(() => killChildTree(proc, "SIGKILL"), 5000);
+      scheduleKillEscalation(proc, killChildTree); // #500
     };
 
     proc.stdout.on("data", (d) => {
