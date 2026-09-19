@@ -6202,6 +6202,49 @@ test("upstream rate limit: quota/rate NOUNS match, transient advice alone does N
     "you have hit your session limit",
   ]) assert.equal(isUpstreamRateLimit(m), true, `the wall must still classify: ${m}`);
 
+  // #493: the FIVE sibling wall phrasings, added on the owner's decision of 2026-09-19 after the
+  // negative sweep. All five are VERBATIM out of the `claude` 2.1.277 binary this proxy spawns --
+  // transcribed, not paraphrased, which is the correction this file's session-limit rows above
+  // record the hard way. The em dash is U+2014 and the middle dot U+00B7, as the CLI emits them.
+  for (const m of [
+    "You've hit your fast limit",
+    "You've hit your monthly spend limit.",
+    "You've hit your channel's monthly spend limit.",
+    "You've hit your team's shared budget. /model to switch models.",
+    "You've hit your team's shared budget. Switch to another model",
+    "You've hit your monthly limit \u2014 raise it below, or it resets next month.",
+    // The runtime-template form, where the limit's name and reset time are substituted in.
+    "You've hit your monthly spend limit \u00b7 your Max 20x limit resets 5am (UTC)",
+  ]) assert.equal(isUpstreamRateLimit(m), true, `a sibling wall must classify (#493): ${m}`);
+
+  // #493 THE NEGATIVE CORPUS. Every string here is verbatim out of the same 2.1.277 binary. The
+  // first eight are SETTINGS-UI labels, and under the bare nouns (`monthly spend limit`,
+  // `monthly limit`) each classifies as a rate limit -- the fail-OPEN direction, which tells a
+  // fallback-capable client to leave the vendor over a menu item. `monthly spend limit` alone
+  // occurs 23 times in that binary and most of the occurrences are these.
+  //
+  // THESE ROWS PROVE THE ANCHOR FOR TWO PATTERNS, NOT FIVE. `fast limit` and `team's shared
+  // budget` occur ONLY inside walls in this binary, so widening either to its bare noun produces
+  // no red here; they carry the verb because the wall BUILDER is
+  // `return \`You've hit your ${e}${n}${g}\`` -- the verb is structural, present in every wall by
+  // construction -- not because a near-miss was measured for them. Stated so nobody reads five
+  // rows as five measurements.
+  //
+  // The last row is the one that also kills the TEMPLATE option #493 proposed (matching `hit your `
+  // plus a limit noun): it is prose ABOUT the behaviour, and a bare `hit your ` or `hit your limit`
+  // matches it.
+  for (const m of [
+    "Adjust monthly spend limit: ",
+    "Set your monthly spend limit to",
+    "Increased monthly spend limit to ",
+    "Removed monthly spend limit",
+    "Set monthly spend limit",
+    "/usage-credits to adjust your monthly spend limit.",
+    "org's monthly spend limit",
+    "Adjust monthly limit",
+    "client composes its own \"You've hit your limit\" line and drops your message;",
+  ]) assert.equal(isUpstreamRateLimit(m), false, `a settings label must NOT be a rate limit (#493): ${m}`);
+
   // Negative: ordinary failures, INCLUDING ones carrying retry advice. This is the row that keeps
   // the guard from firing on everything — transient phrases alone must not promote a 500 to a 429,
   // or every flaky spawn would hand the client a false "you are out of quota" and, downstream, a
