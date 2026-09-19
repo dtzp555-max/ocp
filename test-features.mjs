@@ -6217,6 +6217,26 @@ test("upstream rate limit: quota/rate NOUNS match, transient advice alone does N
     "You've hit your monthly spend limit \u00b7 your Max 20x limit resets 5am (UTC)",
   ]) assert.equal(isUpstreamRateLimit(m), true, `a sibling wall must classify (#493): ${m}`);
 
+  // #505: the rest of the limit-name set, taken from the WALL BUILDER's own constants rather than
+  // from a string sweep -- `Ry(name, suffix)` returns `You've hit your ${name}${suffix}`, so its
+  // argument table is the authoritative source a grep can only approximate:
+  //     oPr = "individual usage limit"        iPr = "channel's monthly usage limit"
+  //     QFt = "individual spend limit"        sPr = "channel's monthly spend limit"
+  //
+  // THE FIRST THREE ARE THE POINT OF THIS BLOCK. They classify only because of the BARE
+  // `usage limit` pattern, which #493's comment called a "pre-existing false positive" and
+  // proposed narrowing. It is not a false positive -- these are real walls -- and narrowing that
+  // pattern would silently return all three to 500. Nothing pinned them until now, so the
+  // narrowing would have passed quietly. These rows are what makes it redden.
+  for (const m of [
+    "You've hit your individual usage limit",
+    "You've hit your org's monthly usage limit",
+    "You've hit your channel's monthly usage limit",
+    // The two that were still 500 on v3.37.2, now covered by their own verb-anchored entries.
+    "You've hit your individual spend limit",
+    "You've hit your org's monthly spend limit",
+  ]) assert.equal(isUpstreamRateLimit(m), true, `a builder-rendered wall must classify (#505): ${m}`);
+
   // #493 THE NEGATIVE CORPUS. Every string here is verbatim out of the same 2.1.277 binary. The
   // first eight are SETTINGS-UI labels, and under the bare nouns (`monthly spend limit`,
   // `monthly limit`) each classifies as a rate limit -- the fail-OPEN direction, which tells a
@@ -6249,7 +6269,6 @@ test("upstream rate limit: quota/rate NOUNS match, transient advice alone does N
     "Removed monthly spend limit",
     "Set monthly spend limit",
     "/usage-credits to adjust your monthly spend limit.",
-    "org's monthly spend limit",
     "Adjust monthly limit",
     "client composes its own \"You've hit your limit\" line and drops your message;",
     // CONSTRUCTED (not from the binary) -- see the note above. Without these, widening
@@ -6257,6 +6276,23 @@ test("upstream rate limit: quota/rate NOUNS match, transient advice alone does N
     "Adjust fast limit",
     "Set team's shared budget",
   ]) assert.equal(isUpstreamRateLimit(m), false, `a settings label must NOT be a rate limit (#493): ${m}`);
+
+  // #505 CORRECTION. `org's monthly spend limit` used to sit in the list above, called a settings
+  // label. It is not one -- it is a limit NAME passed to the wall builder, so the rendered wall
+  // `You've hit your org's monthly spend limit` is pinned as a POSITIVE row above. What stays true
+  // is narrower: for the SPEND family, the bare name on its own does not classify, because those
+  // patterns carry the verb. We match what the builder RENDERS, not the fragment it interpolates.
+  //
+  // THE USAGE FAMILY IS DELIBERATELY ABSENT FROM THIS LOOP, and the asymmetry is the honest part.
+  // `channel's monthly usage limit` as a bare fragment DOES classify, because `usage limit` is a
+  // bare pattern and the fragment contains it. A first draft of this row asserted otherwise and
+  // reddened -- correctly. That is the standing cost of the bare `usage limit` entry, accepted
+  // rather than hidden: it is the only thing classifying three real walls (pinned above), and a
+  // bare limit-name fragment arriving as an upstream error body is not a shape anyone has seen.
+  for (const m of [
+    "org's monthly spend limit",
+    "individual spend limit",
+  ]) assert.equal(isUpstreamRateLimit(m), false, `a bare spend-limit NAME is not a wall (#505): ${m}`);
 
   // Negative: ordinary failures, INCLUDING ones carrying retry advice. This is the row that keeps
   // the guard from firing on everything — transient phrases alone must not promote a 500 to a 429,
