@@ -9,7 +9,7 @@ import { getDb, getDbPath, createKey, listKeys, LIST_KEYS_SQL, validateKey, reco
 import { isLoopbackBind } from "./lib/net.mjs";
 import { classifyToolRequest, countDeclaredTools } from "./lib/tool-support.mjs";
 import { isUpstreamRateLimit, retryAfterSeconds } from "./lib/upstream-errors.mjs";
-import { listUnhonouredFields, CACHE_KEY_ONLY, ALWAYS_UNHONOURED } from "./lib/unhonoured-fields.mjs";
+import { listUnhonouredFields, CACHE_KEY_ONLY, ALWAYS_UNHONOURED, cliEffort, CLI_EFFORT_LEVELS } from "./lib/unhonoured-fields.mjs";
 import { selectCredential, isExpired } from "./lib/credential-source.mjs";
 import { validateTools, extractBridgeToolUses, toolUsesToOpenAI, renderToolTurn, endsWithToolResult, TOOL_CONTINUATION_NOTE, TOOL_PREFIX as TC_PREFIX, buildBridgeConfig } from "./lib/tool-calling.mjs";
 import { PREFIX as BRIDGE_PREFIX } from "./lib/mcp-bridge.mjs";
@@ -689,6 +689,14 @@ test("cacheHash: same configEpoch is stable; absent epoch hashes byte-identicall
   // absent-epoch calls (older callers, all pre-existing tests) must not change behavior
   assert.equal(cacheHash("sonnet", msgs1, {}), cacheHash("sonnet", msgs1));
   assert.notEqual(e1, cacheHash("sonnet", msgs1), "epoch-carrying key differs from legacy key");
+});
+
+test("cacheHash: each reasoning_effort level gets its own slot; absent effort hashes as before", () => {
+  const low = cacheHash("sonnet", msgs1, { effort: "low" });
+  const max = cacheHash("sonnet", msgs1, { effort: "max" });
+  assert.notEqual(low, max, "an answer at low effort must not be served to a max-effort request");
+  assert.notEqual(low, cacheHash("sonnet", msgs1));
+  assert.equal(cacheHash("sonnet", msgs1, { effort: null }), cacheHash("sonnet", msgs1));
 });
 
 test("cacheHash includes max_tokens in hash", () => {
@@ -6938,6 +6946,89 @@ ltTest("integration (#470 control): a request sending only honoured fields is NO
       assert.equal(h.stats.unhonouredFieldRequests, 0,
         "a request getting what it asked for must not be counted, or the number stops meaning anything");
     } finally { child.kill("SIGKILL"); await ltDrain(() => buf.closed, "unhonoured-control", 5000); }
+  } finally { _ltRmRetry(dir); }
+});
+
+console.log("\nreasoning_effort -> claude --effort:");
+
+test("reasoning_effort: the five OpenAI values the CLI has map one-to-one; the rest are reported, never passed", () => {
+  assert.deepEqual(CLI_EFFORT_LEVELS, ["low", "medium", "high", "xhigh", "max"]);
+  for (const l of CLI_EFFORT_LEVELS) {
+    assert.equal(cliEffort(l), l);
+    assert.deepEqual(listUnhonouredFields({ reasoning_effort: l }), [], `${l} is honoured`);
+  }
+  // OpenAI values with no CLI level, a non-value, and a wrong type: no flag, and the request is told.
+  for (const v of ["none", "minimal", "turbo", "LOW", 3]) {
+    assert.equal(cliEffort(v), null, JSON.stringify(v));
+    assert.deepEqual(listUnhonouredFields({ reasoning_effort: v }), ["reasoning_effort"], JSON.stringify(v));
+  }
+  assert.deepEqual(listUnhonouredFields({ reasoning_effort: null }), [], "null asks for nothing");
+});
+
+test("reasoning_effort: on the TUI lane a valid level is still reported, because the pane cannot take it", () => {
+  assert.deepEqual(listUnhonouredFields({ reasoning_effort: "high" }, { effortHonoured: false }), ["reasoning_effort"]);
+  assert.deepEqual(listUnhonouredFields({}, { effortHonoured: false }), [], "absent is absent on either lane");
+});
+
+// Two requests in one boot are each other's control: the flag must appear with the level after
+// the first and be gone after the second, so neither assertion can pass on a stale capture.
+ltTest("integration: reasoning_effort reaches argv as `--effort <level>`, and its absence leaves argv without it", async () => {
+  if (!LT_POSIX) return;
+  const dir = ltMkdir(); const fake = ltFake(dir);
+  const argvFile = join(dir, "argv.txt");
+  try {
+    const { child, buf, port } = await ltBootFresh({ CLAUDE_BIN: fake, ARGV_CAPTURE: argvFile }, dir);
+    try {
+      assert.ok(await ltWait(() => buf.out.includes("listening on")), `— ${ltDiag(buf)}`);
+      const r1 = await ltPostStatus(port, { model: "sonnet", messages: [{ role: "user", content: "hi" }], reasoning_effort: "max" });
+      assert.equal(r1.status, 200, r1.text.slice(0, 200));
+      const a1 = ltArgvCalls(argvFile);
+      assert.ok(a1.includes("--output-format"), `premise: a real argv — ${JSON.stringify(a1.slice(0, 6))}`);
+      const i = a1.indexOf("--effort");
+      assert.ok(i > -1 && a1[i + 1] === "max", `--effort max must be in argv — ${JSON.stringify(a1)}`);
+
+      const r2 = await ltPostStatus(port, { model: "sonnet", messages: [{ role: "user", content: "hi again" }] });
+      assert.equal(r2.status, 200, r2.text.slice(0, 200));
+      const a2 = ltArgvCalls(argvFile);
+      assert.ok(a2.includes("--output-format"), "premise: second argv captured");
+      assert.ok(!a2.includes("--effort"), `no reasoning_effort, no flag — ${JSON.stringify(a2)}`);
+    } finally { child.kill("SIGKILL"); await ltDrain(() => buf.closed, "effort", 5000); }
+  } finally { _ltRmRetry(dir); }
+});
+
+ltTest("integration: the streaming lane passes reasoning_effort too", async () => {
+  if (!LT_POSIX) return;
+  const dir = ltMkdir(); const fake = ltFake(dir);
+  const argvFile = join(dir, "argv.txt");
+  try {
+    const { child, buf, port } = await ltBootFresh({ CLAUDE_BIN: fake, ARGV_CAPTURE: argvFile }, dir);
+    try {
+      assert.ok(await ltWait(() => buf.out.includes("listening on")), `— ${ltDiag(buf)}`);
+      const r = await ltPostStatus(port, { model: "sonnet", stream: true, messages: [{ role: "user", content: "hi" }], reasoning_effort: "low" });
+      assert.equal(r.status, 200, r.text.slice(0, 200));
+      const a = ltArgvCalls(argvFile);
+      const i = a.indexOf("--effort");
+      assert.ok(i > -1 && a[i + 1] === "low", `--effort low must be in the streaming argv — ${JSON.stringify(a)}`);
+    } finally { child.kill("SIGKILL"); await ltDrain(() => buf.closed, "effort-stream", 5000); }
+  } finally { _ltRmRetry(dir); }
+});
+
+ltTest("integration: a reasoning_effort the CLI has no level for is answered, reported, and kept out of argv", async () => {
+  if (!LT_POSIX) return;
+  const dir = ltMkdir(); const fake = ltFake(dir);
+  const argvFile = join(dir, "argv.txt");
+  try {
+    const { child, buf, port } = await ltBootFresh({ CLAUDE_BIN: fake, ARGV_CAPTURE: argvFile }, dir);
+    try {
+      assert.ok(await ltWait(() => buf.out.includes("listening on")), `— ${ltDiag(buf)}`);
+      const r = await ltPostStatus(port, { model: "sonnet", messages: [{ role: "user", content: "hi" }], reasoning_effort: "minimal" });
+      assert.equal(r.status, 200, `an unmappable level must not become a refusal — ${r.text.slice(0, 200)}`);
+      const a = ltArgvCalls(argvFile);
+      assert.ok(a.includes("--output-format"), "premise: a real argv");
+      assert.ok(!a.includes("--effort"), `no CLI level, no flag — ${JSON.stringify(a)}`);
+      const h = await fetch(`http://127.0.0.1:${port}/health`).then(x => x.json());
+      assert.equal(h.stats.unhonouredFieldRequests, 1, "the request is counted as served with a field unmet");
+    } finally { child.kill("SIGKILL"); await ltDrain(() => buf.closed, "effort-unmapped", 5000); }
   } finally { _ltRmRetry(dir); }
 });
 
