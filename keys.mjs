@@ -535,6 +535,8 @@ export function cacheHash(model, messages, opts = {}) {
   if (opts.temperature != null) h.update(`t:${opts.temperature}`);
   if (opts.max_tokens != null) h.update(`mt:${opts.max_tokens}`);
   if (opts.top_p != null) h.update(`tp:${opts.top_p}`);
+  // `reasoning_effort` changes the answer, so each level gets its own slot. Absent => unchanged hash.
+  if (opts.effort != null) h.update(`e:${opts.effort}|`);
   // #176: fold the server's boot-config epoch into the key, so a config change that shapes
   // answers (operator system prompt, wrapper text, allowed tools, NO_CONTEXT) invalidates
   // the persistent cache instead of serving answers composed under the old config. Callers

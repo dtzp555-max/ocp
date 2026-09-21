@@ -234,6 +234,11 @@ Sending one of these is **not an error** and never will be — a client that set
 | `seed`, `stop`, `presence_penalty`, `frequency_penalty`, `logit_bias`, `max_completion_tokens` | no effect |
 | `temperature`, `top_p`, `max_tokens` | **no effect on generation** — they are read only as cache-key material, so they partition the response cache. Reported separately as `cacheKeyOnly`. The OpenAI defaults (`temperature: 1`, `top_p: 1`, penalties `0`, `logit_bias: {}`) are **not** reported: a client sending them gets default behaviour it cannot tell apart from what it asked for |
 | `parallel_tool_calls: false` | calls are not serialised (`true` **is** honoured — see § tool calling) |
+| `reasoning_effort` `none` / `minimal` / a non-OpenAI value, or **any** value on the TUI lane | no `--effort` flag; the CLI uses its default (see below) |
+
+### `reasoning_effort`
+
+OpenAI's [`reasoning_effort`](https://platform.openai.com/docs/api-reference/chat/create#chat-create-reasoning_effort) is passed to the spawned CLI as `claude --effort <level>` for `low`, `medium`, `high`, `xhigh` and `max` — the five OpenAI values `claude` has a level for. `none` and `minimal` have no CLI level and are reported in the table above rather than rounded; so is any other value, which never reaches argv, so a typo cannot fail the spawn. Without the field the argv is unchanged. The level is part of the cache key, so answers at different efforts never share a slot. On the TUI lane the pane is booted before the request with `OCP_TUI_EFFORT`, so a per-request level cannot reach it and is reported instead.
 
 **These are not unwired fields, they are absent knobs.** `claude` exposes no `--max-tokens`, `--stop`, `--seed`, `--temperature` or `--top-p`; its only budget flags are `--max-budget-usd` (a dollar cap) and `--autocompact` (the context window, not the output). Honouring them would mean OCP post-processing the model's output.
 
@@ -505,7 +510,7 @@ export CLAUDE_CACHE_TTL=300000   # cache responses for 5 minutes
 ```
 
 **How it works:**
-- Cache key = SHA-256 of `v2|<keyId or "anon">|model + messages + temperature + max_tokens + top_p`
+- Cache key = SHA-256 of `v2|<keyId or "anon">|model + messages + temperature + max_tokens + top_p + reasoning_effort`
 - **Per-key isolation** — different API keys never share cache entries; anonymous callers share one `anon` pool
 - Cache hits return instantly — no Claude CLI process spawned. **Streaming hits** are replayed as multiple SSE chunks (80 codepoints each), not one large delta, so incremental render is preserved
 - **`cache_control` bypass** — a request carrying an Anthropic `cache_control` annotation (top-level or nested in `content[]`) skips OCP's cache entirely, so it doesn't interfere with Anthropic-side prompt caching

@@ -50,7 +50,7 @@ import { isLoopbackBind } from "./lib/net.mjs";
 import { parseAllowedHosts, parseAuthority, matchesDeclared, evaluateOriginGate } from "./lib/host-gate.mjs";
 import { classifyToolRequest, countDeclaredTools } from "./lib/tool-support.mjs";
 import { isUpstreamRateLimit, retryAfterSeconds } from "./lib/upstream-errors.mjs";
-import { listUnhonouredFields, CACHE_KEY_ONLY } from "./lib/unhonoured-fields.mjs";
+import { listUnhonouredFields, CACHE_KEY_ONLY, cliEffort } from "./lib/unhonoured-fields.mjs";
 import { selectCredential } from "./lib/credential-source.mjs";
 import { validateTools, extractBridgeToolUses, extractAssistantText, toolUsesToOpenAI, renderToolTurn,
          endsWithToolResult, TOOL_CONTINUATION_NOTE, TOOL_PREFIX, buildBridgeConfig } from "./lib/tool-calling.mjs";
@@ -1504,6 +1504,11 @@ function buildCliArgs(cliModel, systemPromptFile, opts = {}) {
     "--system-prompt-file", systemPromptFile,
   ];
 
+  // OpenAI `reasoning_effort` (Class B.1, ADR 0006), already mapped to a `claude --effort` level
+  // by cliEffort() in lib/unhonoured-fields.mjs. Absent => argv unchanged, and the CLI keeps
+  // whatever effort it would have used before. Before the toolBridge branch, which returns.
+  if (opts.effort) args.push("--effort", opts.effort);
+
   // Multimodal path (issue #110): images are fed as Anthropic content blocks over
   // a stream-json stdin stream. `--input-format stream-json` (§ --input-format,
   // choices text|stream-json; realtime streaming input) is added ONLY when the
@@ -1903,7 +1908,7 @@ function spawnClaudeProcess(model, messages, conversationId, keyName, releaseSlo
     console.log(`[session] stateless conv=${conversationId.slice(0, 12)}... key=${keyName || "anon"} msgs=${messages.length} prompt_chars=${promptChars}`);
   }
 
-  const cliArgs = buildCliArgs(cliModel, systemPromptFile, { streamJsonInput: useStreamJson, toolBridge });
+  const cliArgs = buildCliArgs(cliModel, systemPromptFile, { streamJsonInput: useStreamJson, toolBridge, effort: opts.effort });
 
   const env = { ...process.env };
   delete env.CLAUDECODE;
@@ -3050,6 +3055,7 @@ async function callClaudeStreaming(model, messages, conversationId, res, authInf
   let timedOut = false;
   try {
     ctx = spawnClaudeProcess(model, messages, conversationId, authInfo.keyName, releaseSlot, spawnDecision, {
+      effort: authInfo.effort,
       onTimeout: () => {
         timedOut = true;
         if (res.writableEnded || res.destroyed) return;
@@ -4335,7 +4341,7 @@ async function handleToolTurn(req, res, model, messages, conversationId, parsed,
   const promptChars = messages.reduce((a, m) => a + contentToText(m.content).length, 0);
   const mintId = () => `call_${randomUUID().replace(/-/g, "").slice(0, 24)}`;
   try {
-    const r = await callClaude(model, messages, conversationId, req._authKeyName, res, { tools: parsed.tools });
+    const r = await callClaude(model, messages, conversationId, req._authKeyName, res, { tools: parsed.tools, effort: cliEffort(parsed.reasoning_effort) });
     const id = `chatcmpl-${randomUUID()}`;
     if (r && typeof r === "object" && Array.isArray(r.toolCalls)) {
       const calls = toolUsesToOpenAI(r.toolCalls, mintId);
@@ -4729,7 +4735,9 @@ async function handleChatCompletions(req, res) {
     }
   }
 
-  const unhonoured = listUnhonouredFields(parsed);
+  const unhonoured = listUnhonouredFields(parsed, { effortHonoured: !TUI_MODE });
+  // `reasoning_effort` -> `claude --effort`, on the -p lane only (see lib/unhonoured-fields.mjs).
+  const effort = TUI_MODE ? null : cliEffort(parsed.reasoning_effort);
   if (unhonoured.length) {
     stats.unhonouredFieldRequests++;
     logEvent("info", "openai_fields_not_honoured", {
@@ -4792,7 +4800,7 @@ async function handleChatCompletions(req, res) {
     // asymmetry. If you do deduplicate it, compute once under the WEAKER guard and derive the
     // cache lookup under the stronger one — and add a stampede test before you do.
     if (CACHE_TTL > 0 && !conversationId && !hasCacheControl(messages)) {
-      structuredHash = cacheHash(cacheModel, messages, { keyId: req._authKeyId, temperature: parsed.temperature, max_tokens: parsed.max_tokens, top_p: parsed.top_p, structured, configEpoch: CONFIG_EPOCH });
+      structuredHash = cacheHash(cacheModel, messages, { keyId: req._authKeyId, temperature: parsed.temperature, max_tokens: parsed.max_tokens, top_p: parsed.top_p, effort, structured, configEpoch: CONFIG_EPOCH });
       try {
         const cached = getCachedResponse(structuredHash, CACHE_TTL);
         if (cached) {
@@ -4804,7 +4812,7 @@ async function handleChatCompletions(req, res) {
         }
       } catch (e) { logEvent("error", "cache_check_failed", { error: e.message }); }
     }
-    const upstreamCall = TUI_MODE ? callClaudeTui : callClaude;
+    const upstreamCall = TUI_MODE ? callClaudeTui : (m, msgs, c, k, r) => callClaude(m, msgs, c, k, r, { effort });
     // Stampede protection (PR #153 review, finding 5): a structured request can cost up to
     // STRUCTURED_MAX_ATTEMPTS metered spawns, so N identical concurrent requests (Home Assistant
     // firing several AI Tasks at once) must NOT each pay N× — they share one flight. We dedup every
@@ -4813,7 +4821,7 @@ async function handleChatCompletions(req, res) {
     // Note the guard here is deliberately WEAKER than structuredHash's — no CACHE_TTL check. See the
     // do-not-collapse comment above (#200).
     const dedupKey = (!conversationId && !hasCacheControl(messages))
-      ? cacheHash(cacheModel, messages, { keyId: req._authKeyId, temperature: parsed.temperature, max_tokens: parsed.max_tokens, top_p: parsed.top_p, structured, configEpoch: CONFIG_EPOCH })
+      ? cacheHash(cacheModel, messages, { keyId: req._authKeyId, temperature: parsed.temperature, max_tokens: parsed.max_tokens, top_p: parsed.top_p, effort, structured, configEpoch: CONFIG_EPOCH })
       : null;
     const runStructured = async () => {
       const c = await runStructuredCompletion(upstreamCall, model, messages, conversationId, req._authKeyName, res, structured);
@@ -4862,7 +4870,7 @@ async function handleChatCompletions(req, res) {
     } else {
       // D1: include keyId in hash to isolate per-key cache pools (v2 format).
       // configEpoch (#176): any boot-config change that shapes answers invalidates the cache.
-      const hash = cacheHash(cacheModel, messages, { keyId: req._authKeyId, temperature: parsed.temperature, max_tokens: parsed.max_tokens, top_p: parsed.top_p, configEpoch: CONFIG_EPOCH });
+      const hash = cacheHash(cacheModel, messages, { keyId: req._authKeyId, temperature: parsed.temperature, max_tokens: parsed.max_tokens, top_p: parsed.top_p, effort, configEpoch: CONFIG_EPOCH });
       req._cacheHash = hash; // store for later write-back
       try {
         const cached = getCachedResponse(hash, CACHE_TTL);
@@ -4912,7 +4920,7 @@ async function handleChatCompletions(req, res) {
       }
     }
     // Default: real stream-json streaming, unchanged.
-    return callClaudeStreaming(model, messages, conversationId, res, { keyId: req._authKeyId, keyName: req._authKeyName, cacheHash: req._cacheHash });
+    return callClaudeStreaming(model, messages, conversationId, res, { keyId: req._authKeyId, keyName: req._authKeyName, cacheHash: req._cacheHash, effort });
   }
 
   const t0Usage = Date.now();
@@ -4920,7 +4928,7 @@ async function handleChatCompletions(req, res) {
 
   // Select upstream based on TUI_MODE flag. With TUI_MODE===false (default),
   // upstreamCall===callClaude — identical to the pre-TUI code path.
-  const upstreamCall = TUI_MODE ? callClaudeTui : callClaude;
+  const upstreamCall = TUI_MODE ? callClaudeTui : (m, msgs, c, k, r) => callClaude(m, msgs, c, k, r, { effort });
 
   // Non-streaming path with stampede protection: wrap the upstream call in singleflight
   // when cache is enabled and a hash is present. Concurrent identical requests share

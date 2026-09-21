@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+### Added
+
+- **`reasoning_effort` on `/v1/chat/completions` becomes `claude --effort <level>`.** Class B.1: OpenAI `chat/completions`, [`reasoning_effort`](https://platform.openai.com/docs/api-reference/chat/create#chat-create-reasoning_effort), authorized by ADR 0006. The OpenAI values are `none`, `minimal`, `low`, `medium`, `high`, `xhigh` and `max`; `claude --help` (2.1.278) accepts `low|medium|high|xhigh|max`, so those five pass through one-to-one on every `-p` path (buffered, streaming, structured, tool bridge). `none`, `minimal` and any non-OpenAI value add no flag and are reported through the existing `stats.unhonouredFieldRequests` / `openai_fields_not_honoured` signal rather than refused or rounded. The level is folded into `cacheHash`, so answers at different efforts never share a slot; a request without the field hashes and spawns byte-identically to before. **Out of scope: the TUI lane**, whose pane is booted (or pre-warmed) with `OCP_TUI_EFFORT` before the request exists; there the field is reported as unhonoured. README § "`reasoning_effort`".
+
 ## v3.37.3 — 2026-09-20
 
 ### Fixed
