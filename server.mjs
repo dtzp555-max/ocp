@@ -2367,6 +2367,26 @@ async function callClaude(model, messages, conversationId, keyName, res, opts = 
     }
 
     const { proc, cliModel, conversationId: convId, t0, cleanup, handleSessionFailure, markFirstByte } = ctx;
+    // The client went away mid-spawn: end the child, as callClaudeStreaming's res 'close' handler
+    // does. Before this the buffered lane (non-stream, structured output, every tool turn) only
+    // cancelled a QUEUED wait (F2); a child that was already running kept its slot and kept
+    // spending until it finished or hit CLAUDE_TIMEOUT. closeSignalFor also covers a client that
+    // left between the slot grant and here. Every settle path detaches it first, so the
+    // normal-success close of `res` never signals a reaped (possibly reused) pgid; a parent that
+    // exited while a grandchild still holds the pipe (#474) has not settled, and IS killed.
+    let clientGone = false;
+    const disconnect = closeSignalFor(res);
+    const onClientGone = () => {
+      // A timeout or tool-turn kill already owns this child; an is_error result already answered
+      // (and counted) the request, and its close must keep its own accounting.
+      if (proc.killed || errored) return;
+      clientGone = true;
+      logEvent("info", "claude_killed_client_disconnected", { model: cliModel, elapsed: Date.now() - t0 });
+      killChildTree(proc, "SIGTERM");
+      scheduleKillEscalation(proc, killChildTree); // #500
+    };
+    if (disconnect.signal.aborted) onClientGone();
+    else disconnect.signal.addEventListener("abort", onClientGone, { once: true });
     let lineBuffer = "";
     let assembledText = "";
     let sawTextDelta = false;
@@ -2524,6 +2544,7 @@ async function callClaude(model, messages, conversationId, keyName, res, opts = 
       activeProcesses.delete(proc);
       const elapsed = Date.now() - t0;
       cleanup();
+      disconnect.detach();
       // #478 LAST-DITCH ARM: the process ended before EITHER trigger fired -- before the signal
       // and before the quiescence timer. Deliver what the model did emit rather than drop it.
       //
@@ -2542,6 +2563,13 @@ async function callClaude(model, messages, conversationId, keyName, res, opts = 
       // last-ditch arm below would emit tool_calls for a request whose response is already gone.
       if (timedOut) {
         logEvent("info", "claude_reaped_after_timeout", { model: cliModel, code, signal: signal || "none", elapsed });
+        return;
+      }
+      // Killed because the client left: not an upstream failure (same rule as the queued-wait and
+      // TUI disconnect paths), so no error count, no model error, no session failure. The caller
+      // ends quietly on RequestDisconnectedError; a live singleflight follower retries with its own.
+      if (clientGone) {
+        reject(new RequestDisconnectedError("client disconnected mid-spawn; claude killed"));
         return;
       }
       if (!toolCalls && !errored && opts.tools && pendingToolUses.length) {
@@ -2582,6 +2610,7 @@ async function callClaude(model, messages, conversationId, keyName, res, opts = 
     proc.on("error", (err) => {
       console.error(`[claude] spawn error: ${err.message}`);
       cleanup();
+      disconnect.detach();
       countError(err.message);
       handleSessionFailure();
       reject(err);

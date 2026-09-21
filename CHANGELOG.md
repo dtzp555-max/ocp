@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+### Fixed
+
+- **A client that disconnects mid-request now ends the `claude` spawn on the buffered lane too.** Only the streaming lane killed its child when the client went away. The buffered lane (`callClaude`) serves every non-stream request, every structured-output request and every tool turn, and there a disconnect only cancelled a *queued* wait. A spawn that was already running kept its concurrency slot and kept spending until it finished or hit `CLAUDE_TIMEOUT`. A client that stops an agent's tool turn by closing the connection hits exactly this. Now the process group gets `SIGTERM` on the response's `close`, with the same #500 `SIGKILL` escalation, and the request ends quietly as a disconnect: logged as `claude_killed_client_disconnected` at info level, not counted in `stats.errors` or `stats.timeouts`, no usage-failure row. A request that finishes normally signals nothing. The listener is detached on every settle path before the response closes.
+
 ## v3.37.3 — 2026-09-20
 
 ### Fixed

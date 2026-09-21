@@ -2962,6 +2962,13 @@ if [ -n "$TOOLS_CAPTURE" ]; then
     prev="$a"
   done
 fi
+# A claude still thinking: record this spawn's pid and block with no output, ONCE -- the next spawn
+# answers normally, which is how a test shows the concurrency slot came back. exec, so the recorded
+# pid is the process that holds the pipe (see TOOL_USE_NAME below).
+if [ -n "$HANG_ONCE_PID_FILE" ] && [ ! -e "$HANG_ONCE_PID_FILE" ]; then
+  echo $$ > "$HANG_ONCE_PID_FILE.tmp" && mv "$HANG_ONCE_PID_FILE.tmp" "$HANG_ONCE_PID_FILE"
+  exec sleep 120
+fi
 if [ -n "$UPSTREAM_ERROR" ]; then
   # A failing spawn whose message is whatever the test wants, delivered the way a real failure
   # arrives: a result event with is_error, which server.mjs turns into a rejection.
@@ -7539,6 +7546,78 @@ ltTest("integration (#474 control): a normal spawn still completes with the deta
       assert.equal(JSON.parse(r.text).choices[0].message.content, "OK",
         "fixture A must answer normally — the control that the detached/group-kill change did not break the happy path");
     } finally { child.kill("SIGKILL"); await ltDrain(() => buf.closed, "474-control", 5000); }
+  } finally { _ltRmRetry(dir); }
+});
+
+// ── buffered lane: a client that disconnects mid-spawn ends the child ────────────────────────────
+// callClaudeStreaming kills its child on res 'close'; callClaude (non-stream, structured output,
+// every tool turn) only cancelled a QUEUED wait, so a client that stopped a tool turn left claude
+// running -- holding a slot and spending -- until it finished or hit CLAUDE_TIMEOUT. The fake here
+// blocks forever with no output (HANG_ONCE_PID_FILE), CLAUDE_TIMEOUT is 60 s and the slot count is
+// 1, so both "the child died within 5 s" and "the next request got a slot" can only come from the
+// disconnect, never from the timeout.
+function ltPidAlive(pid) { try { process.kill(pid, 0); return true; } catch (e) { return e.code === "EPERM"; } }
+async function ltDisconnectMidSpawn(port, body, pidFile) {
+  const ac = new AbortController();
+  const req = fetch(`http://127.0.0.1:${port}/v1/chat/completions`, {
+    method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body), signal: ac.signal,
+  }).catch(() => {});
+  const spawned = await ltWait(() => _ltExists(pidFile), 9000);
+  ac.abort();
+  await req;
+  return spawned ? parseInt(_ltRead(pidFile, "utf8").trim(), 10) : null;
+}
+const LT_DISCONNECT_TOOL = { type: "function", function: { name: "lookup_build_id", description: "d", parameters: { type: "object", properties: { project: { type: "string" } } } } };
+for (const [lane, body] of [
+  ["a tool turn", { model: "sonnet", tools: [LT_DISCONNECT_TOOL], tool_choice: "auto", messages: [{ role: "user", content: "think hard" }] }],
+  ["a structured-output request", { model: "sonnet", response_format: { type: "json_object" }, messages: [{ role: "user", content: "think hard" }] }],
+]) {
+  ltTest(`integration (buffered disconnect): ${lane} whose client disconnects mid-spawn kills claude, frees the slot, and counts no error`, async () => {
+    if (!LT_POSIX) return;
+    const dir = ltMkdir(); const fake = ltFake(dir); const pidFile = join(dir, "hang.pid");
+    let pid = null;
+    try {
+      const { child, buf, port } = await ltBootFresh({ CLAUDE_BIN: fake, CLAUDE_TIMEOUT: "60000", CLAUDE_MAX_CONCURRENT: "1", HANG_ONCE_PID_FILE: pidFile }, dir);
+      try {
+        assert.ok(await ltWait(() => buf.out.includes("listening on")), `— ${ltDiag(buf)}`);
+        const before = await ltHealth(port);
+        assert.ok(before && before.stats, `precondition: /health serves a stats block — ${ltDiag(buf)}`);
+        pid = await ltDisconnectMidSpawn(port, body, pidFile);
+        assert.ok(Number.isInteger(pid) && pid > 0, `the fake never recorded its pid — ${ltDiag(buf)}`);
+        assert.ok(await ltWait(() => !ltPidAlive(pid), 5000), `claude (pid ${pid}) is still running 5 s after its client disconnected — ${ltDiag(buf)}`);
+        assert.match(buf.out, /"event":"claude_killed_client_disconnected"/, `the kill must be logged — ${buf.out.slice(-300)}`);
+        // The one slot came back: the next request is answered by the (now normal) fake well inside
+        // CLAUDE_TIMEOUT. Without the kill it would queue behind the 120 s sleep.
+        const t0 = Date.now();
+        const next = await fetch(`http://127.0.0.1:${port}/v1/chat/completions`, {
+          method: "POST", headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ model: "sonnet", messages: [{ role: "user", content: "hi" }] }), signal: AbortSignal.timeout(15000),
+        }).then(async (r) => ({ status: r.status, text: await r.text() }), (e) => ({ status: 0, text: String(e) }));
+        assert.equal(next.status, 200, `the next request did not get the slot in ${Date.now() - t0} ms: ${next.text.slice(0, 200)}`);
+        const after = await ltHealth(port);
+        assert.equal(after.stats.errors, before.stats.errors, "a client walking away is not an upstream error");
+        assert.equal(after.stats.timeouts, before.stats.timeouts, "nor a timeout");
+      } finally { child.kill("SIGKILL"); await ltDrain(() => buf.closed, "buffered-disconnect", 8000); }
+    } finally { if (pid && ltPidAlive(pid)) { try { process.kill(pid, "SIGKILL"); } catch { /* gone */ } } _ltRmRetry(dir); }
+  });
+}
+
+ltTest("integration (buffered disconnect control): a request that finishes normally signals nothing when its response closes", async () => {
+  if (!LT_POSIX) return;
+  const dir = ltMkdir(); const fake = ltFake(dir);
+  try {
+    const { child, buf, port } = await ltBootFresh({ CLAUDE_BIN: fake }, dir);
+    try {
+      assert.ok(await ltWait(() => buf.out.includes("listening on")), `— ${ltDiag(buf)}`);
+      const r = await ltPostStatus(port, { model: "sonnet", messages: [{ role: "user", content: "hi" }] });
+      assert.equal(r.status, 200, `${r.status} ${r.text.slice(0, 200)}`);
+      assert.equal(JSON.parse(r.text).choices[0].message.content, "OK");
+      // The response's own close comes after the child is reaped; a kill there would aim at a
+      // released pgid. Give the close a moment to be delivered, then require silence.
+      await new Promise((r) => setTimeout(r, 300));
+      assert.ok(/"event":"claude_ok"/.test(buf.out), `premise: the log is being read — ${buf.out.slice(-300)}`);
+      assert.doesNotMatch(buf.out, /claude_killed_client_disconnected/, `a finished request was treated as a disconnect — ${buf.out.slice(-300)}`);
+    } finally { child.kill("SIGKILL"); await ltDrain(() => buf.closed, "buffered-disconnect-control", 5000); }
   } finally { _ltRmRetry(dir); }
 });
 
