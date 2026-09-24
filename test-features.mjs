@@ -20884,8 +20884,8 @@ test("models.json aliases.sonnet === 'claude-sonnet-5' (default-request-model SP
   assert.equal(_spotModels.aliases.sonnet, "claude-sonnet-5");
 });
 
-test("models.json aliases.opus === 'claude-opus-5' (opus-alias SPOT)", () => {
-  assert.equal(_spotModels.aliases.opus, "claude-opus-5");
+test("models.json aliases.opus === 'claude-opus-5-5' (opus-alias SPOT)", () => {
+  assert.equal(_spotModels.aliases.opus, "claude-opus-5-5");
 });
 
 // ── Referential integrity (PR #152 review) ──────────────────────────────────
@@ -20931,7 +20931,7 @@ test("models.json: every contextWindow is a positive integer (shape guard; the c
 // re-scaled the ceiling for every model. ADR 0011 made the budget per-model, so the cap is gone and
 // there is now exactly ONE legal value per row: the registry's. That makes the table discriminating
 // for the first time — before, all seven rows resolved to 200000 and it was equivalent to
-// `assert.equal(m.contextWindow, 200000)`; now four rows require 1000000 and three require 200000,
+// `assert.equal(m.contextWindow, 200000)`; now five rows require 1000000 (four until claude-opus-5-5 was added) and three require 200000,
 // so a copy-paste that flattens them fails.
 //
 // It remains a FROZEN SNAPSHOT, not a live check. If Anthropic promotes claude-opus-4-6 from 200k to
@@ -20953,7 +20953,12 @@ test("models.json: every contextWindow is a positive integer (shape guard; the c
 //      binary-wide and independently of the per-id slices: `native_1m:!0` occurs 6x and
 //      `context:{window:1e6` occurs 6x, over the same six records — the four below plus
 //      claude-fable-5 and claude-mythos-5, which OCP does not expose.
+//      THAT COUNT IS A 2.1.220 READING AND IS LEFT AS ONE (it is pinned to the sha above). Re-measured
+//      on CLI 2.1.280 when claude-opus-5-5 was added: `context:{window:1e6` occurs 9x — the five 1M rows
+//      below plus claude-fable-5, claude-fable-5-1, claude-mythos-5 and claude-mythos-5-1, none of which
+//      OCP exposes. (Review of that change proposed "7" by inference; the binary says 9.)
 const _spotRegistryContextWindow = {
+  "claude-opus-5-5": 1000000,   // CLI 2.1.280 registry: context:{window:1e6}
   "claude-opus-5": 1000000, "claude-opus-4-8": 1000000, "claude-opus-4-7": 1000000,
   "claude-opus-4-6": 200000, "claude-sonnet-5": 1000000, "claude-sonnet-4-6": 200000,
   "claude-haiku-4-5-20251001": 200000,      // registry id: claude-haiku-4-5
@@ -21029,6 +21034,11 @@ test("models.json: every aliases value resolves to a real models[].id (referenti
 // -> 633 passed, 0 failed (the wrong-repro trap — renaming without adding the new id anywhere
 // fails the FORWARD check instead and masks this gap entirely; see #222 for both repros).
 const _spotRegistryMaxTokens = {
+  // claude-opus-5-5 is read from the CLI 2.1.280 registry, NOT 2.1.220 like the rows below -- the model
+  // did not exist then. Record: max_output_tokens:{default:128000,upper:128000}. Note it is NOT the
+  // sibling claude-opus-5 value (default:64000,upper:128000): copying the neighbour row, which is what
+  // the first draft of this change did, would have under-advertised it by half and this test caught it.
+  "claude-opus-5-5": 128000,
   "claude-opus-5": 64000, "claude-opus-4-8": 64000, "claude-opus-4-7": 64000, "claude-opus-4-6": 64000,
   "claude-sonnet-5": 64000, "claude-sonnet-4-6": 32000,
   "claude-haiku-4-5-20251001": 32000,       // registry id: claude-haiku-4-5
@@ -22819,6 +22829,7 @@ const _OC_EXPECTED_MODEL_META_TABLE = {
   "claude-opus": { name: "Claude Opus (OCP)", reasoning: true, maxTokens: 64000, contextWindow: 200000 },
   "claude-sonnet": { name: "Claude Sonnet (OCP)", reasoning: true, maxTokens: 32000, contextWindow: 200000 },
   "claude-haiku": { name: "Claude Haiku (OCP)", reasoning: false, maxTokens: 32000, contextWindow: 200000 },
+  "claude-opus-5-5": { name: "Claude Opus (OCP)", reasoning: true, maxTokens: 128000, contextWindow: 1000000 },
   "claude-opus-5": { name: "Claude Opus (OCP)", reasoning: true, maxTokens: 64000, contextWindow: 1000000 },
   "claude-opus-4-8": { name: "Claude Opus (OCP)", reasoning: true, maxTokens: 64000, contextWindow: 1000000 },
   "claude-opus-4-7": { name: "Claude Opus (OCP)", reasoning: true, maxTokens: 64000, contextWindow: 1000000 },

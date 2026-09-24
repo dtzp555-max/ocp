@@ -177,6 +177,10 @@ model_meta = {
     "claude-haiku": {"name": "Claude Haiku (OCP)", "reasoning": False, "maxTokens": 32000, "contextWindow": 200000},
     # Specific ids whose window and/or output exceed their family default. Values are those in
     # models.json, which is the SPOT (ADR 0003) and is asserted against on every test run.
+    # claude-opus-5-5 MUST be its own row: longest-prefix-wins would otherwise hand it the
+    # "claude-opus-5" row below and under-advertise 64000 against the SPOT's 128000 (CLI 2.1.280
+    # registry: max_output_tokens.default 128000). #309's equality test is what catches that.
+    "claude-opus-5-5": {"name": "Claude Opus (OCP)", "reasoning": True, "maxTokens": 128000, "contextWindow": 1000000},
     "claude-opus-5": {"name": "Claude Opus (OCP)", "reasoning": True, "maxTokens": 64000, "contextWindow": 1000000},
     "claude-opus-4-8": {"name": "Claude Opus (OCP)", "reasoning": True, "maxTokens": 64000, "contextWindow": 1000000},
     "claude-opus-4-7": {"name": "Claude Opus (OCP)", "reasoning": True, "maxTokens": 64000, "contextWindow": 1000000},

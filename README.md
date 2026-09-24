@@ -113,11 +113,11 @@ node setup.mjs
 
 `setup.mjs` verifies the Claude CLI, starts the proxy on port 3456, and installs auto-start (launchd on macOS, systemd on Linux). The `ocp` CLI lands at `~/ocp/ocp` — symlink it onto your PATH (`sudo ln -sf ~/ocp/ocp /usr/local/bin/ocp`, or `ln -sf ~/ocp/ocp ~/.local/bin/ocp`) or alias it (`alias ocp=~/ocp/ocp`); the rest of the docs assume `ocp` is on your PATH.
 
-**Verify** — should list 7 models:
+**Verify** — should list exactly the ids in [`models.json`](./models.json) (a count written here would go stale with every model added):
 
 ```bash
 curl http://127.0.0.1:3456/v1/models
-# claude-opus-5, claude-opus-4-8, claude-opus-4-7, claude-opus-4-6, claude-sonnet-5, claude-sonnet-4-6, claude-haiku-4-5-20251001
+# claude-opus-5-5, claude-opus-5, claude-opus-4-8, claude-opus-4-7, claude-opus-4-6, claude-sonnet-5, claude-sonnet-4-6, claude-haiku-4-5-20251001
 ```
 
 **Connect one IDE** — point any OpenAI-compatible tool at the proxy, then reload your shell and start a tool (Cline / Continue / Cursor / OpenCode):
@@ -181,8 +181,9 @@ The tools the bridge grants run on the **client**, so this works in every auth m
 
 | Model ID | Context window | Notes |
 |----------|---------------:|-------|
-| `claude-opus-5` | 1M | Most capable (default for `opus` alias) |
-| `claude-opus-4-8` | 1M | Previous Opus, retained for pinning |
+| `claude-opus-5-5` | 1M | Most capable (default for `opus` alias) |
+| `claude-opus-5` | 1M | Previous Opus, retained for pinning |
+| `claude-opus-4-8` | 1M | Older Opus, retained for pinning |
 | `claude-opus-4-7` | 1M | Older Opus, retained for pinning |
 | `claude-opus-4-6` | 200k | Older Opus, retained for pinning |
 | `claude-sonnet-5` | 1M | Latest Sonnet (default for `sonnet` alias) |
