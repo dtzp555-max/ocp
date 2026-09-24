@@ -3,6 +3,14 @@
   "version": 1,
   "models": [
     {
+      "id": "claude-opus-5-5",
+      "displayName": "Claude Opus 5.5",
+      "openclawName": "Claude Opus 5.5 (via CLI)",
+      "reasoning": true,
+      "contextWindow": 1000000,
+      "maxTokens": 128000
+    },
+    {
       "id": "claude-opus-5",
       "displayName": "Claude Opus 5",
       "openclawName": "Claude Opus 5 (via CLI)",
@@ -60,7 +68,7 @@
     }
   ],
   "aliases": {
-    "opus": "claude-opus-5",
+    "opus": "claude-opus-5-5",
     "sonnet": "claude-sonnet-5",
     "haiku": "claude-haiku-4-5-20251001"
   },
