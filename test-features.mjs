@@ -12117,8 +12117,9 @@ function _ltStageChild(argv, label) {
 // So the grandchild now lives until RELEASED, not until a timer fires. It polls for a file this
 // function owns and exits when the file appears -- still no kill the control cannot attribute,
 // which was the reason for the timer in the first place. The 60 s cap is a leak bound, not a
-// schedule: it only matters if the suite dies before releasing, and then the grandchild still goes
-// away on its own. RULE 5: 60 000 ms stops being the right bound if a control ever needs to hold
+// schedule: it is what guarantees the grandchild goes away if the suite dies before releasing. It is
+// not inert otherwise -- in control C it also bounds the window the assertions run inside, which is
+// why it is measured on a monotonic clock (see the script below). RULE 5: 60 000 ms stops being the right bound if a control ever needs to hold
 // the pipe for longer than a minute; the caller would then pass its own, not move this one.
 //
 // Marker placement is still load-bearing: `where` is the grandchild's LAST argv element and appears
@@ -12137,8 +12138,12 @@ function _ltStageHolder(where) {
   const dir = _ltMkdtemp(join(_ltTmp(), "oc374hold-"));
   const releaseFile = join(dir, "release");
   const script = join(dir, "hold.js");
-  _ltWrite(script, `const f=require("path").join(__dirname,"release"),t=Date.now();(function p(){` +
-                   `if(require("fs").existsSync(f)||Date.now()-t>${LT_HOLDER_LEAK_BOUND_MS})process.exit(0);` +
+  // process.uptime(), not Date.now(): the bound must not move when the WALL clock does. An NTP
+  // step or a VM resume that jumps Date.now() forward would otherwise fire it early -- and in
+  // control C that ends the grandchild inside the window the assertions depend on, resurrecting
+  // exactly the failure signature this helper exists to retire. (Review finding on #510.)
+  _ltWrite(script, `const f=require("path").join(__dirname,"release");(function p(){` +
+                   `if(require("fs").existsSync(f)||process.uptime()*1000>${LT_HOLDER_LEAK_BOUND_MS})process.exit(0);` +
                    `setTimeout(p,50)})()\n`);
   const holder = `require("child_process").spawn(process.execPath,` +
                  `[${JSON.stringify(script)},${JSON.stringify(where)}],` +
