@@ -12106,6 +12106,56 @@ function _ltStageChild(argv, label) {
   _ltRegisterOpenChild(child, buf, label);
   return { child, buf };
 }
+// #485: control C's grandchild used to live a FIXED 2500 ms (`setTimeout(()=>{},2500)`), so that
+// the control would never need a kill it could not attribute. That lifetime raced the host: the
+// control must see the grandchild running before it kills the parent, and on this host a stall of
+// the TEST process during staging is routine -- the grandchild's own clock keeps running while the
+// observer is not scheduled, so a stall longer than the remaining lifetime made the premise
+// permanently unreachable. Captured twice (2026-09-14, 2026-09-19) as `✗ #374 control C: … the
+// grandchild must be running before the parent is killed`.
+//
+// So the grandchild now lives until RELEASED, not until a timer fires. It polls for a file this
+// function owns and exits when the file appears -- still no kill the control cannot attribute,
+// which was the reason for the timer in the first place. The 60 s cap is a leak bound, not a
+// schedule: it only matters if the suite dies before releasing, and then the grandchild still goes
+// away on its own. RULE 5: 60 000 ms stops being the right bound if a control ever needs to hold
+// the pipe for longer than a minute; the caller would then pass its own, not move this one.
+//
+// Marker placement is still load-bearing: `where` is the grandchild's LAST argv element and appears
+// in the parent's -e source, so the scan counts both. The poll lives in a FILE rather than in `-e`,
+// and that is not style: _ltGrandchildScan returns each matching line cut to 200 chars. An inline
+// poll put the grandchild's command line past 200, the marker fell off the returned line, and
+// control C failed on "the REAPED-GONE branch must scan for who is still holding the pipe" --
+// caught by the control itself on this change's first run. (`ps` was measured NOT to truncate a
+// 440-char argv when piped; true, and irrelevant, because the harness truncates on its own.)
+// With the file, the line is `<execPath> <dir>/hold.js <where>`: measured at 143 chars on the
+// maintainer's workstation (execPath 36, tmpdir() 48). RULE 5: that margin is spent by a longer
+// execPath or TMPDIR, not by anything in this file -- if either grows past ~55 more chars, the
+// marker falls off again and control C says so, loudly, with the line it got.
+const LT_HOLDER_LEAK_BOUND_MS = 60000;
+function _ltStageHolder(where) {
+  const dir = _ltMkdtemp(join(_ltTmp(), "oc374hold-"));
+  const releaseFile = join(dir, "release");
+  const script = join(dir, "hold.js");
+  _ltWrite(script, `const f=require("path").join(__dirname,"release"),t=Date.now();(function p(){` +
+                   `if(require("fs").existsSync(f)||Date.now()-t>${LT_HOLDER_LEAK_BOUND_MS})process.exit(0);` +
+                   `setTimeout(p,50)})()\n`);
+  const holder = `require("child_process").spawn(process.execPath,` +
+                 `[${JSON.stringify(script)},${JSON.stringify(where)}],` +
+                 `{stdio:"inherit"});setTimeout(()=>{},30000)`;
+  const { child, buf } = _ltStageChild([process.execPath, "-e", holder], where);
+  let released = false;
+  const release = () => { if (!released) { released = true; _ltWrite(releaseFile, ""); } };
+  // Everything a control needs to leave nothing behind on ANY exit path, including a failed
+  // assertion before its own kill -- which is exactly the path that leaked before (see control C).
+  const cleanup = async () => {
+    release();
+    child.kill("SIGKILL");   // per-process kill: a no-op once Node has reaped it
+    await ltWait(() => buf.closed, 10000);
+    _ltRm(dir, { recursive: true, force: true });
+  };
+  return { child, buf, release, cleanup };
+}
 // The controls stage exactly one child each, but the registry is global and a run that is ALREADY
 // in #374's state can have a straggler in it. Reporting that rather than asserting on the total
 // keeps the control's own claim ("the child I staged reads X") provable without making it fail on
@@ -12464,42 +12514,75 @@ test("#374: the host snapshot carries the level gauges and a suite-start delta, 
 });
 
 ltTest("#374 control C: a grandchild holding stdout reads REAPED-GONE on a LIVE loop, and the scan names the holder", async () => {
-  // Marker rather than a directory: the ps filter is on the label, and this control has no fixture
-  // dir. It goes in the grandchild's argv so `ps -eo command=` carries it — measured unnecessary
-  // to pass -ww on this host, but the marker is placed last precisely because that is the end that
-  // truncates. Includes this pid so two concurrent suites cannot match each other's holder.
+  // Marker rather than a directory: the ps filter is on the label. Includes this pid so two
+  // concurrent suites cannot match each other's holder. The grandchild lives until RELEASED, not on
+  // a fixed timer -- see _ltStageHolder for why the timer lost to the host (#485).
   const where = `oc374holdC${process.pid}`;
-  const holder = `require("child_process").spawn(process.execPath,["-e","setTimeout(()=>{},2500)","${where}"],{stdio:"inherit"});setTimeout(()=>{},30000)`;
-  const { child, buf } = _ltStageChild([process.execPath, "-e", holder], where);
-  // Wait for the grandchild to EXIST before killing the parent — waiting on the thing about to be
-  // asserted, not a proxy for it. Two hits: the parent (the marker is in its -e source) and the
-  // grandchild (the marker is its argv).
-  assert.ok(await ltWait(() => (_ltGrandchildScan(where) || []).length >= 2, 10000),
-    "the grandchild must be running before the parent is killed");
+  const { child, buf, release, cleanup } = _ltStageHolder(where);
+  try {
+    // Wait for the grandchild to EXIST before killing the parent — waiting on the thing about to be
+    // asserted, not a proxy for it. Two hits: the parent (the marker is in its -e source) and the
+    // grandchild (the marker is its argv).
+    assert.ok(await ltWait(() => (_ltGrandchildScan(where) || []).length >= 2, 10000),
+      "the grandchild must be running before the parent is killed");
 
-  const t0 = Date.now();
-  child.kill("SIGKILL");
-  // Here the loop IS live, deliberately: this is the world in which 'exit' lands and 'close' does
-  // not. Waiting for exit is what makes the REAPED-GONE reading deterministic rather than a race.
-  assert.ok(await ltWait(() => buf.signal !== undefined, 10000), "the parent's exit must be observed");
-  assert.equal(buf.closed, false, "'close' must NOT have fired — the grandchild still holds the pipe");
-  const rec = _ltObserveDrainTimeout(where, Date.now() - t0, t0);
+    const t0 = Date.now();
+    child.kill("SIGKILL");
+    // Here the loop IS live, deliberately: this is the world in which 'exit' lands and 'close' does
+    // not. Waiting for exit is what makes the REAPED-GONE reading deterministic rather than a race.
+    assert.ok(await ltWait(() => buf.signal !== undefined, 10000), "the parent's exit must be observed");
+    assert.equal(buf.closed, false, "'close' must NOT have fired — the grandchild still holds the pipe");
+    const rec = _ltObserveDrainTimeout(where, Date.now() - t0, t0);
 
-  const mine = _ltControlChild(rec, child, where);
-  assert.equal(mine.verdict, LT_PS_VERDICT.GONE,
-    `a reaped child must read REAPED-GONE; ps said ${JSON.stringify(mine.raw)}`);
-  assert.equal(rec.loop.verdict, LT_LOOP_VERDICT.LIVE,
-    `the loop was never blocked here, so it must read LOOP-LIVE, got ${rec.loop.verdict} (${JSON.stringify(rec.loop)})`);
-  // The contrast with control A is the reading itself: `undefined` there means UNOBSERVED, `null`
-  // here means observed-and-killed. Same field, and only the ps verdict tells them apart.
-  assert.equal(mine.loopRead.exit, null, "a SIGKILLed child reports exit=null with signal set");
-  assert.equal(mine.loopRead.signal, "SIGKILL", "the signal is the observed part of that reading");
-  assert.ok(Array.isArray(mine.grandchildren) && mine.grandchildren.some(l => l.includes(where)),
-    `the REAPED-GONE branch must scan for who is still holding the pipe, got ${JSON.stringify(mine.grandchildren)}`);
+    const mine = _ltControlChild(rec, child, where);
+    assert.equal(mine.verdict, LT_PS_VERDICT.GONE,
+      `a reaped child must read REAPED-GONE; ps said ${JSON.stringify(mine.raw)}`);
+    assert.equal(rec.loop.verdict, LT_LOOP_VERDICT.LIVE,
+      `the loop was never blocked here, so it must read LOOP-LIVE, got ${rec.loop.verdict} (${JSON.stringify(rec.loop)})`);
+    // The contrast with control A is the reading itself: `undefined` there means UNOBSERVED, `null`
+    // here means observed-and-killed. Same field, and only the ps verdict tells them apart.
+    assert.equal(mine.loopRead.exit, null, "a SIGKILLed child reports exit=null with signal set");
+    assert.equal(mine.loopRead.signal, "SIGKILL", "the signal is the observed part of that reading");
+    assert.ok(Array.isArray(mine.grandchildren) && mine.grandchildren.some(l => l.includes(where)),
+      `the REAPED-GONE branch must scan for who is still holding the pipe, got ${JSON.stringify(mine.grandchildren)}`);
 
-  assert.ok(await ltWait(() => buf.closed, 15000),
-    "the grandchild exits on its own, so this control needs no kill it cannot attribute");
+    release();
+    assert.ok(await ltWait(() => buf.closed, 15000),
+      "the grandchild exits once RELEASED, so this control still needs no kill it cannot attribute");
+  } finally {
+    // #485: this control had no finally, unlike A and B. A failed premise returned before
+    // `child.kill` ran, so the 30 s parent LEAKED into the controls after it -- captured on
+    // 2026-09-19 as control E's record reading `pid … ALIVE … HYPOTHESIS FLIPPED` with
+    // `label=oc374holdC<pid>`: control C's own marker, in control E's drain. The "SIGKILL did not
+    // take" reading was an artifact; that process had never been sent one. It is also what failed
+    // control F's "no earlier boot is still registered" premise on 2026-09-14, in the same run as C.
+    await cleanup();
+  }
   assert.equal(_ltOpenChildren.has(child.pid), false, "'close' must deregister it");
+});
+
+// #485: pins the fix to control C's staging race. The field failure was the TEST process not being
+// scheduled while the grandchild's own clock ran out. A real `await` reproduces "real time passes
+// between staging and the premise check" exactly, WITHOUT staging the stall itself -- so this adds
+// nothing to the #374 stall ledger, and it is deterministic where the field failure was not.
+// 3000 ms is chosen against the OLD lifetime (2500 ms), not tuned: it has to exceed it, nothing more.
+ltTest("#485: control C's holder outlives a delay longer than its old fixed lifetime, and exits when released", async () => {
+  const where = `oc485hold${process.pid}`;   // distinct from control C's marker, so the scans cannot collide
+  const { child, buf, release, cleanup } = _ltStageHolder(where);
+  try {
+    assert.ok(await ltWait(() => (_ltGrandchildScan(where) || []).length >= 2, 10000),
+      "premise: the parent and the grandchild must both be running");
+    await new Promise(r => setTimeout(r, 3000));
+    assert.ok((_ltGrandchildScan(where) || []).length >= 2,
+      "the grandchild must still be running 3000 ms after staging — the old fixed 2500 ms lifetime had already exited");
+    release();
+    assert.ok(await ltWait(() => (_ltGrandchildScan(where) || []).length === 1, 10000),
+      "once released the grandchild must exit on its own, leaving only the parent — the cap is a leak bound, not the schedule");
+  } finally {
+    await cleanup();
+  }
+  assert.equal(buf.closed, true, "cleanup must leave the parent closed");
+  assert.equal(_ltOpenChildren.has(child.pid), false, "and deregistered");
 });
 
 ltTest("#374 control E: a drain that overruns its budget and SUCCEEDS is recorded too — the face the reproduction actually produced", async () => {
@@ -12541,25 +12624,32 @@ ltTest("#374 control F: a child that closes WHILE the drain waits reads CLOSED-B
     "premise: no earlier boot is still registered, or openAtStart is not this control's");
   const beforeTimeouts = _ltDrainTimeouts.length;
   const { child, buf } = _ltStageChild(["/bin/sleep", "30"], where);
-  assert.equal(_ltOpenChildren.size, 1, "premise: exactly the staged child is registered");
-  // Killed BEFORE the drain and never awaited, so it closes while the drain is waiting and the
-  // loop is live throughout — the reschedule world, staged.
-  child.kill("SIGKILL");
-  const ok = await ltDrain(() => false, where, 500);
-  assert.equal(ok, false, "a constant-false condition must still time out");
-  assert.equal(_ltDrainTimeouts.length, beforeTimeouts + 1, "exactly one record");
-  const rec = _ltDrainTimeouts.pop();
-  assert.equal(_ltDrainTimeouts.length, beforeTimeouts, "the control record must not survive in the offender ledger");
+  try {
+    assert.equal(_ltOpenChildren.size, 1, "premise: exactly the staged child is registered");
+    // Killed BEFORE the drain and never awaited, so it closes while the drain is waiting and the
+    // loop is live throughout — the reschedule world, staged.
+    child.kill("SIGKILL");
+    const ok = await ltDrain(() => false, where, 500);
+    assert.equal(ok, false, "a constant-false condition must still time out");
+    assert.equal(_ltDrainTimeouts.length, beforeTimeouts + 1, "exactly one record");
+    const rec = _ltDrainTimeouts.pop();
+    assert.equal(_ltDrainTimeouts.length, beforeTimeouts, "the control record must not survive in the offender ledger");
 
-  assert.equal(buf.closed, true, "premise: the child closed while the drain waited");
-  assert.equal(rec.children.length, 0, "so there is nothing left to probe");
-  assert.equal(rec.openAtStart, 1, "but one child WAS open when the drain started — that is the whole signal");
-  assert.equal(rec.registry, LT_PS_VERDICT.CLOSED_FIRST,
-    `an emptied registry must be NAMED, got ${rec.registry}`);
-  assert.ok(_ltExplainDrainTimeout(rec).includes("positively excludes"),
-    "the printed diagnosis must say this is information rather than the absence of it");
-  assert.ok(_ltRenderDrainTimeout(rec).includes(LT_PS_VERDICT.CLOSED_FIRST),
-    "the compact offender line must carry it too — that line is what the #358 summary prints");
+    assert.equal(buf.closed, true, "premise: the child closed while the drain waited");
+    assert.equal(rec.children.length, 0, "so there is nothing left to probe");
+    assert.equal(rec.openAtStart, 1, "but one child WAS open when the drain started — that is the whole signal");
+    assert.equal(rec.registry, LT_PS_VERDICT.CLOSED_FIRST,
+      `an emptied registry must be NAMED, got ${rec.registry}`);
+    assert.ok(_ltExplainDrainTimeout(rec).includes("positively excludes"),
+      "the printed diagnosis must say this is information rather than the absence of it");
+    assert.ok(_ltRenderDrainTimeout(rec).includes(LT_PS_VERDICT.CLOSED_FIRST),
+      "the compact offender line must carry it too — that line is what the #358 summary prints");
+  } finally {
+    // #485: A and B clean up in a finally and F did not, so a failed assertion here left a 30 s
+    // sleeper registered for the controls after it -- the leak shape control C caused for F.
+    child.kill("SIGKILL");
+    await ltWait(() => buf.closed, 5000);
+  }
 });
 
 ltTest("#374 control G: a drain that was never waiting on a child says NO-CHILD-WAS-OPEN, and the two must not collapse", async () => {
@@ -12581,35 +12671,41 @@ ltTest("#374 control G: a drain that was never waiting on a child says NO-CHILD-
 ltTest("#374 control D: a real ltDrain timeout carries the probe and the tracer, and a still-running child reads ALIVE", async () => {
   const where = "#374-control-D-EXPECTED-CONTROL";
   const { child, buf } = _ltStageChild(["/bin/sleep", "30"], where);
-  const before = _ltDrainTimeouts.length;
-  // The real thing, timing out for real — the other three controls stage the observation, this one
-  // proves ltDrain reaches it. cond is constant-false, so the give-up is not a race either.
-  const ok = await ltDrain(() => false, where, 60);
-  assert.equal(ok, false, "a constant-false condition must time out");
-  assert.equal(_ltDrainTimeouts.length, before + 1, "ltDrain must push exactly one record per timeout");
-  // Popped, not left behind: this is a DELIBERATE timeout, and the #358 summary reads that ledger
-  // to name real offenders. A control that seeded it would make a green run print a #374 lead that
-  // did not happen — which is the failure mode this whole PR exists to remove, not to add.
-  const rec = _ltDrainTimeouts.pop();
-  assert.equal(_ltDrainTimeouts.length, before, "the control record must not survive in the offender ledger");
-  assert.equal(rec.where, where, "the record must carry the site that timed out");
-  assert.ok(rec.ms >= 60, `the record must carry the elapsed wait, got ${rec.ms}ms`);
+  try {
+    const before = _ltDrainTimeouts.length;
+    // The real thing, timing out for real — the other three controls stage the observation, this one
+    // proves ltDrain reaches it. cond is constant-false, so the give-up is not a race either.
+    const ok = await ltDrain(() => false, where, 60);
+    assert.equal(ok, false, "a constant-false condition must time out");
+    assert.equal(_ltDrainTimeouts.length, before + 1, "ltDrain must push exactly one record per timeout");
+    // Popped, not left behind: this is a DELIBERATE timeout, and the #358 summary reads that ledger
+    // to name real offenders. A control that seeded it would make a green run print a #374 lead that
+    // did not happen — which is the failure mode this whole PR exists to remove, not to add.
+    const rec = _ltDrainTimeouts.pop();
+    assert.equal(_ltDrainTimeouts.length, before, "the control record must not survive in the offender ledger");
+    assert.equal(rec.where, where, "the record must carry the site that timed out");
+    assert.ok(rec.ms >= 60, `the record must carry the elapsed wait, got ${rec.ms}ms`);
 
-  const mine = _ltControlChild(rec, child, where);
-  assert.equal(mine.verdict, LT_PS_VERDICT.ALIVE,
-    `a child that was never killed must read ALIVE; ps said ${JSON.stringify(mine.raw)}`);
-  assert.ok(!mine.state.startsWith("Z"), `ALIVE must not be a zombie state, got ${JSON.stringify(mine.state)}`);
-  assert.equal(mine.grandchildren, null, "the grandchild scan is REAPED-GONE-only — it must not run here");
-  assert.equal(rec.loop.verdict, LT_LOOP_VERDICT.LIVE, `the loop was live, got ${JSON.stringify(rec.loop)}`);
+    const mine = _ltControlChild(rec, child, where);
+    assert.equal(mine.verdict, LT_PS_VERDICT.ALIVE,
+      `a child that was never killed must read ALIVE; ps said ${JSON.stringify(mine.raw)}`);
+    assert.ok(!mine.state.startsWith("Z"), `ALIVE must not be a zombie state, got ${JSON.stringify(mine.state)}`);
+    assert.equal(mine.grandchildren, null, "the grandchild scan is REAPED-GONE-only — it must not run here");
+    assert.equal(rec.loop.verdict, LT_LOOP_VERDICT.LIVE, `the loop was live, got ${JSON.stringify(rec.loop)}`);
 
-  const line = _ltRenderDrainTimeout(rec);
-  assert.ok(line.includes(LT_PS_VERDICT.ALIVE) && line.includes(LT_LOOP_VERDICT.LIVE),
-    `the offender line must name BOTH verdicts so a reader need not infer the world: ${line}`);
-  assert.ok(_ltExplainDrainTimeout(rec).includes(LT_PS_DIAGNOSIS[LT_PS_VERDICT.ALIVE]),
-    "the full explanation must carry the ALIVE diagnosis sentence — the one that says the hypothesis flipped");
-
-  child.kill("SIGKILL");
-  assert.ok(await ltWait(() => buf.closed, 5000), "control D must clean up its own child");
+    const line = _ltRenderDrainTimeout(rec);
+    assert.ok(line.includes(LT_PS_VERDICT.ALIVE) && line.includes(LT_LOOP_VERDICT.LIVE),
+      `the offender line must name BOTH verdicts so a reader need not infer the world: ${line}`);
+    assert.ok(_ltExplainDrainTimeout(rec).includes(LT_PS_DIAGNOSIS[LT_PS_VERDICT.ALIVE]),
+      "the full explanation must carry the ALIVE diagnosis sentence — the one that says the hypothesis flipped");
+  } finally {
+    // #485: the kill used to be the LAST statement, after a dozen assertions -- one of them
+    // `rec.loop.verdict === LOOP-LIVE`, which is exactly what a host stall breaks. Any of them
+    // failing leaked a 30 s sleeper into the next test. Same discipline as A and B.
+    child.kill("SIGKILL");
+    await ltWait(() => buf.closed, 5000);
+  }
+  assert.equal(buf.closed, true, "control D must clean up its own child");
 });
 // ── #374 mem snapshot: STRUCTURE, never values ───────────────────────────────────────────────
 // The #427 audit of 6978505 measured this feature at ZERO test coverage — three mutations, three
