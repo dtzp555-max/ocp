@@ -20931,7 +20931,7 @@ test("models.json: every contextWindow is a positive integer (shape guard; the c
 // re-scaled the ceiling for every model. ADR 0011 made the budget per-model, so the cap is gone and
 // there is now exactly ONE legal value per row: the registry's. That makes the table discriminating
 // for the first time — before, all seven rows resolved to 200000 and it was equivalent to
-// `assert.equal(m.contextWindow, 200000)`; now four rows require 1000000 and three require 200000,
+// `assert.equal(m.contextWindow, 200000)`; now five rows require 1000000 (four until claude-opus-5-5 was added) and three require 200000,
 // so a copy-paste that flattens them fails.
 //
 // It remains a FROZEN SNAPSHOT, not a live check. If Anthropic promotes claude-opus-4-6 from 200k to
@@ -20953,6 +20953,10 @@ test("models.json: every contextWindow is a positive integer (shape guard; the c
 //      binary-wide and independently of the per-id slices: `native_1m:!0` occurs 6x and
 //      `context:{window:1e6` occurs 6x, over the same six records — the four below plus
 //      claude-fable-5 and claude-mythos-5, which OCP does not expose.
+//      THAT COUNT IS A 2.1.220 READING AND IS LEFT AS ONE (it is pinned to the sha above). Re-measured
+//      on CLI 2.1.280 when claude-opus-5-5 was added: `context:{window:1e6` occurs 9x — the five 1M rows
+//      below plus claude-fable-5, claude-fable-5-1, claude-mythos-5 and claude-mythos-5-1, none of which
+//      OCP exposes. (Review of that change proposed "7" by inference; the binary says 9.)
 const _spotRegistryContextWindow = {
   "claude-opus-5-5": 1000000,   // CLI 2.1.280 registry: context:{window:1e6}
   "claude-opus-5": 1000000, "claude-opus-4-8": 1000000, "claude-opus-4-7": 1000000,
