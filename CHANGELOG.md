@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## v3.41.0 — 2026-09-25
+
 ### Added
 
 - **An agent's growing conversation can now hit Anthropic's prompt cache (#512, PR 2 of 2).** Class B.1, ADR 0006. No request or response shape changes: this changes how an accepted `/v1/chat/completions` request is handed to `claude -p`.
