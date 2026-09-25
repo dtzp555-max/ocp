@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## v3.40.0 — 2026-09-25
+
 ### Added
 
 - **The proxy log records what each spawn cost: tokens, prompt-cache hits, and the subscription windows (#512, PR 1 of 2).** Observability only. No request, response or B.2 shape changes. `claude_ok` gains `inputTokens`, `outputTokens`, `cacheWriteTokens` and `cacheReadTokens`, read from the CLI's `result.usage` on the buffered and streaming lanes. `claude_spawned` gains `systemPromptSha`, `toolsSha` (tool requests only) and `blockCount`, so prefix stability can be read per request without logging content. A `rate_limit_event` is now logged as parsed fields, including each window's `utilization`. Before, it was a 200-character JSON prefix, which cut `unifiedWindows` off every record. Why: #512 found an agent client exhausting a 5-hour window in about 38 minutes, and OCP recorded no token counts at all, so whether a request hit the prompt cache could not be read anywhere. PR 2 changes how the conversation is handed to the CLI, and these fields are how its effect gets measured. README § "Per-request tokens and prompt-cache hits".
