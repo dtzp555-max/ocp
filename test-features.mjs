@@ -7153,7 +7153,7 @@ test("#512 summarizeResultUsage: the four cache-relevant counts from the measure
 
 test("#512 summarizeRateLimitEvent: status, limit, reset and per-window utilization from the measured shape; bounded", () => {
   assert.deepEqual(summarizeRateLimitEvent(U512_RATE_EVENT), {
-    status: "allowed", rateLimitType: "five_hour", resetsAt: 1790323200, overageStatus: "rejected", isUsingOverage: false,
+    status: "allowed", rateLimitType: "five_hour", resetsAt: 1790323200, overageStatus: "rejected", overageDisabledReason: "org_level_disabled", isUsingOverage: false,
     windows: { five_hour: { utilization: 0.05, resetsAt: 1790323200 }, seven_day: { utilization: 0.47, resetsAt: 1790506800 } },
   });
   for (const v of [undefined, null, {}, { rate_limit_info: [] }, { rate_limit_info: "x" }]) assert.equal(summarizeRateLimitEvent(v), null, JSON.stringify(v));

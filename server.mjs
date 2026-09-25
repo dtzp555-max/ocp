@@ -408,8 +408,9 @@ function parseStreamJsonEvent(event, sawTextDelta) {
 
   // rate_limit_event / usage — log for observability, don't forward.
   // #512: a rate_limit_event is logged as parsed fields. The 200-char JSON prefix it replaces cut
-  // `unifiedWindows` -- where the utilization lives -- off every record. A shape the parser does not
-  // recognise still gets the prefix, so an unknown CLI change loses nothing it had before.
+  // `unifiedWindows` -- where the utilization lives -- off every record. The parser keeps a closed
+  // set of fields (lib/cli-usage.mjs), so a field the CLI ADDS later is dropped rather than shown;
+  // an event it cannot parse at all still gets the old prefix.
   if (t === "rate_limit_event" || t === "usage") {
     const info = t === "rate_limit_event" ? summarizeRateLimitEvent(event) : null;
     logEvent("info", "claude_stream_event", info ? { type: t, info } : { type: t, data: JSON.stringify(event).slice(0, 200) });
