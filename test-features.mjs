@@ -9,7 +9,7 @@ import { getDb, getDbPath, createKey, listKeys, LIST_KEYS_SQL, validateKey, reco
 import { isLoopbackBind } from "./lib/net.mjs";
 import { classifyToolRequest, countDeclaredTools } from "./lib/tool-support.mjs";
 import { isUpstreamRateLimit, retryAfterSeconds } from "./lib/upstream-errors.mjs";
-import { listUnhonouredFields, CACHE_KEY_ONLY, ALWAYS_UNHONOURED } from "./lib/unhonoured-fields.mjs";
+import { listUnhonouredFields, CACHE_KEY_ONLY, ALWAYS_UNHONOURED, cliEffort, CLI_EFFORT_LEVELS } from "./lib/unhonoured-fields.mjs";
 import { selectCredential, isExpired } from "./lib/credential-source.mjs";
 import { validateTools, extractBridgeToolUses, toolUsesToOpenAI, renderToolTurn, endsWithToolResult, TOOL_CONTINUATION_NOTE, TOOL_PREFIX as TC_PREFIX, buildBridgeConfig } from "./lib/tool-calling.mjs";
 import { PREFIX as BRIDGE_PREFIX } from "./lib/mcp-bridge.mjs";
@@ -689,6 +689,14 @@ test("cacheHash: same configEpoch is stable; absent epoch hashes byte-identicall
   // absent-epoch calls (older callers, all pre-existing tests) must not change behavior
   assert.equal(cacheHash("sonnet", msgs1, {}), cacheHash("sonnet", msgs1));
   assert.notEqual(e1, cacheHash("sonnet", msgs1), "epoch-carrying key differs from legacy key");
+});
+
+test("cacheHash: each reasoning_effort level gets its own slot; absent effort hashes as before", () => {
+  const low = cacheHash("sonnet", msgs1, { effort: "low" });
+  const max = cacheHash("sonnet", msgs1, { effort: "max" });
+  assert.notEqual(low, max, "an answer at low effort must not be served to a max-effort request");
+  assert.notEqual(low, cacheHash("sonnet", msgs1));
+  assert.equal(cacheHash("sonnet", msgs1, { effort: null }), cacheHash("sonnet", msgs1));
 });
 
 test("cacheHash includes max_tokens in hash", () => {
@@ -6938,6 +6946,186 @@ ltTest("integration (#470 control): a request sending only honoured fields is NO
       assert.equal(h.stats.unhonouredFieldRequests, 0,
         "a request getting what it asked for must not be counted, or the number stops meaning anything");
     } finally { child.kill("SIGKILL"); await ltDrain(() => buf.closed, "unhonoured-control", 5000); }
+  } finally { _ltRmRetry(dir); }
+});
+
+console.log("\nreasoning_effort -> claude --effort:");
+
+test("reasoning_effort: the five OpenAI values the CLI has map one-to-one; the rest are reported, never passed", () => {
+  assert.deepEqual(CLI_EFFORT_LEVELS, ["low", "medium", "high", "xhigh", "max"]);
+  for (const l of CLI_EFFORT_LEVELS) {
+    assert.equal(cliEffort(l), l);
+    assert.deepEqual(listUnhonouredFields({ reasoning_effort: l }), [], `${l} is honoured`);
+  }
+  // OpenAI values with no CLI level, a non-value, and a wrong type: no flag, and the request is told.
+  for (const v of ["none", "minimal", "turbo", "LOW", 3]) {
+    assert.equal(cliEffort(v), null, JSON.stringify(v));
+    assert.deepEqual(listUnhonouredFields({ reasoning_effort: v }), ["reasoning_effort"], JSON.stringify(v));
+  }
+  assert.deepEqual(listUnhonouredFields({ reasoning_effort: null }), [], "null asks for nothing");
+});
+
+test("reasoning_effort: on the TUI lane a valid level is still reported, because the pane cannot take it", () => {
+  assert.deepEqual(listUnhonouredFields({ reasoning_effort: "high" }, { effortHonoured: false }), ["reasoning_effort"]);
+  assert.deepEqual(listUnhonouredFields({}, { effortHonoured: false }), [], "absent is absent on either lane");
+});
+
+// Two requests in one boot are each other's control: the flag must appear with the level after
+// the first and be gone after the second, so neither assertion can pass on a stale capture.
+ltTest("integration: reasoning_effort reaches argv as `--effort <level>`, and its absence leaves argv without it", async () => {
+  if (!LT_POSIX) return;
+  const dir = ltMkdir(); const fake = ltFake(dir);
+  const argvFile = join(dir, "argv.txt");
+  try {
+    const { child, buf, port } = await ltBootFresh({ CLAUDE_BIN: fake, ARGV_CAPTURE: argvFile }, dir);
+    try {
+      assert.ok(await ltWait(() => buf.out.includes("listening on")), `— ${ltDiag(buf)}`);
+      const r1 = await ltPostStatus(port, { model: "sonnet", messages: [{ role: "user", content: "hi" }], reasoning_effort: "max" });
+      assert.equal(r1.status, 200, r1.text.slice(0, 200));
+      const a1 = ltArgvCalls(argvFile);
+      assert.ok(a1.includes("--output-format"), `premise: a real argv — ${JSON.stringify(a1.slice(0, 6))}`);
+      const i = a1.indexOf("--effort");
+      assert.ok(i > -1 && a1[i + 1] === "max", `--effort max must be in argv — ${JSON.stringify(a1)}`);
+
+      const r2 = await ltPostStatus(port, { model: "sonnet", messages: [{ role: "user", content: "hi again" }] });
+      assert.equal(r2.status, 200, r2.text.slice(0, 200));
+      const a2 = ltArgvCalls(argvFile);
+      assert.ok(a2.includes("--output-format"), "premise: second argv captured");
+      assert.ok(!a2.includes("--effort"), `no reasoning_effort, no flag — ${JSON.stringify(a2)}`);
+    } finally { child.kill("SIGKILL"); await ltDrain(() => buf.closed, "effort", 5000); }
+  } finally { _ltRmRetry(dir); }
+});
+
+ltTest("integration: the streaming lane passes reasoning_effort too", async () => {
+  if (!LT_POSIX) return;
+  const dir = ltMkdir(); const fake = ltFake(dir);
+  const argvFile = join(dir, "argv.txt");
+  try {
+    const { child, buf, port } = await ltBootFresh({ CLAUDE_BIN: fake, ARGV_CAPTURE: argvFile }, dir);
+    try {
+      assert.ok(await ltWait(() => buf.out.includes("listening on")), `— ${ltDiag(buf)}`);
+      const r = await ltPostStatus(port, { model: "sonnet", stream: true, messages: [{ role: "user", content: "hi" }], reasoning_effort: "low" });
+      assert.equal(r.status, 200, r.text.slice(0, 200));
+      const a = ltArgvCalls(argvFile);
+      const i = a.indexOf("--effort");
+      assert.ok(i > -1 && a[i + 1] === "low", `--effort low must be in the streaming argv — ${JSON.stringify(a)}`);
+    } finally { child.kill("SIGKILL"); await ltDrain(() => buf.closed, "effort-stream", 5000); }
+  } finally { _ltRmRetry(dir); }
+});
+
+ltTest("integration: a reasoning_effort the CLI has no level for is answered, reported, and kept out of argv", async () => {
+  if (!LT_POSIX) return;
+  const dir = ltMkdir(); const fake = ltFake(dir);
+  const argvFile = join(dir, "argv.txt");
+  try {
+    const { child, buf, port } = await ltBootFresh({ CLAUDE_BIN: fake, ARGV_CAPTURE: argvFile }, dir);
+    try {
+      assert.ok(await ltWait(() => buf.out.includes("listening on")), `— ${ltDiag(buf)}`);
+      const r = await ltPostStatus(port, { model: "sonnet", messages: [{ role: "user", content: "hi" }], reasoning_effort: "minimal" });
+      assert.equal(r.status, 200, `an unmappable level must not become a refusal — ${r.text.slice(0, 200)}`);
+      const a = ltArgvCalls(argvFile);
+      assert.ok(a.includes("--output-format"), "premise: a real argv");
+      assert.ok(!a.includes("--effort"), `no CLI level, no flag — ${JSON.stringify(a)}`);
+      const h = await fetch(`http://127.0.0.1:${port}/health`).then(x => x.json());
+      assert.equal(h.stats.unhonouredFieldRequests, 1, "the request is counted as served with a field unmet");
+    } finally { child.kill("SIGKILL"); await ltDrain(() => buf.closed, "effort-unmapped", 5000); }
+  } finally { _ltRmRetry(dir); }
+});
+
+// The structured and tool-call lanes reach callClaude through call sites of their own (the
+// structured branch's upstreamCall wrapper, and handleToolTurn), so the buffered test above
+// cannot see either one dropping the level. Each gets its own boot and its own premise: a line or
+// an argv element only that lane produces, so an argv from some other lane cannot satisfy it.
+ltTest("integration: the structured-output lane passes reasoning_effort too", async () => {
+  if (!LT_POSIX) return;
+  const dir = ltMkdir(); const fake = ltFake(dir);
+  const argvFile = join(dir, "argv.txt");
+  try {
+    const { child, buf, port } = await ltBootFresh({ CLAUDE_BIN: fake, ARGV_CAPTURE: argvFile }, dir);
+    try {
+      assert.ok(await ltWait(() => buf.out.includes("listening on")), `— ${ltDiag(buf)}`);
+      const rf = { type: "json_schema", json_schema: { name: "probe", schema: { type: "object", properties: { ok: { type: "boolean" } }, required: ["ok"] } } };
+      await ltPostStatus(port, { model: "sonnet", messages: [{ role: "user", content: "hi" }], response_format: rf, reasoning_effort: "high" });
+      // The stock fake answers "OK", which is not JSON, so the structured lane logs a retry. No other
+      // lane writes that line.
+      assert.ok(await ltWait(() => buf.err.includes('"event":"structured_retry"')), `premise: the structured lane ran — ${ltDiag(buf)}`);
+      const a = ltArgvCalls(argvFile);
+      assert.ok(a.includes("--output-format"), `premise: a real argv — ${JSON.stringify(a.slice(0, 6))}`);
+      const i = a.indexOf("--effort");
+      assert.ok(i > -1 && a[i + 1] === "high", `--effort high must be in the structured argv — ${JSON.stringify(a)}`);
+    } finally { child.kill("SIGKILL"); await ltDrain(() => buf.closed, "effort-structured", 5000); }
+  } finally { _ltRmRetry(dir); }
+});
+
+ltTest("integration: the tool-call lane passes reasoning_effort too", async () => {
+  if (!LT_POSIX) return;
+  const dir = ltMkdir(); const fake = ltFake(dir);
+  const argvFile = join(dir, "argv.txt");
+  try {
+    const { child, buf, port } = await ltBootFresh({ CLAUDE_BIN: fake, ARGV_CAPTURE: argvFile }, dir);
+    try {
+      assert.ok(await ltWait(() => buf.out.includes("listening on")), `— ${ltDiag(buf)}`);
+      const TOOL = { type: "function", function: { name: "lookup_build_id", parameters: { type: "object" } } };
+      const r = await ltPostStatus(port, { model: "sonnet", tools: [TOOL], messages: [{ role: "user", content: "hi" }], reasoning_effort: "xhigh" });
+      assert.equal(r.status, 200, r.text.slice(0, 200));
+      const a = ltArgvCalls(argvFile);
+      // --strict-mcp-config is in the tool bridge's argv and in no other.
+      assert.ok(a.includes("--strict-mcp-config"), `premise: the tool bridge's argv — ${JSON.stringify(a)}`);
+      const i = a.indexOf("--effort");
+      assert.ok(i > -1 && a[i + 1] === "xhigh", `--effort xhigh must be in the tool-turn argv — ${JSON.stringify(a)}`);
+    } finally { child.kill("SIGKILL"); await ltDrain(() => buf.closed, "effort-tool", 5000); }
+  } finally { _ltRmRetry(dir); }
+});
+
+// The unit test above proves cacheHash CAN fold the level; this proves the call site passes it.
+// The third request is the control: same body as the second, so it must be a cache hit. Without
+// it, a cache that never stored anything would pass the second assertion for the wrong reason.
+ltTest("integration: requests that differ only in reasoning_effort do not share a cache slot", async () => {
+  if (!LT_POSIX) return;
+  const dir = ltMkdir(); const fake = ltFake(dir);
+  const argvFile = join(dir, "argv.txt");
+  try {
+    const { child, buf, port } = await ltBootFresh({ CLAUDE_BIN: fake, ARGV_CAPTURE: argvFile, CLAUDE_CACHE_TTL: "60000" }, dir);
+    try {
+      assert.ok(await ltWait(() => buf.out.includes("listening on")), `— ${ltDiag(buf)}`);
+      const spawned = () => buf.out.split("\n").filter((l) => l.includes('"event":"claude_spawned"')).length;
+      const msgs = [{ role: "user", content: "effort-cache-probe" }];
+      const r1 = await ltPostStatus(port, { model: "sonnet", messages: msgs, reasoning_effort: "low" });
+      assert.equal(r1.status, 200, r1.text.slice(0, 200));
+      assert.ok(await ltWait(() => spawned() === 1), `premise: the first request spawned — ${ltDiag(buf)}`);
+      const r2 = await ltPostStatus(port, { model: "sonnet", messages: msgs, reasoning_effort: "max" });
+      assert.equal(r2.status, 200, r2.text.slice(0, 200));
+      assert.ok(await ltWait(() => spawned() === 2), `a max-effort request was answered from the low-effort slot — spawns=${spawned()}`);
+      const a = ltArgvCalls(argvFile);
+      const i = a.indexOf("--effort");
+      assert.ok(i > -1 && a[i + 1] === "max", `the second spawn must carry --effort max — ${JSON.stringify(a)}`);
+      const r3 = await ltPostStatus(port, { model: "sonnet", messages: msgs, reasoning_effort: "max" });
+      assert.equal(r3.status, 200, r3.text.slice(0, 200));
+      await new Promise((res) => setTimeout(res, 400));
+      assert.equal(spawned(), 2, "control: the same body at the same level must be a cache hit");
+    } finally { child.kill("SIGKILL"); await ltDrain(() => buf.closed, "effort-cache", 5000); }
+  } finally { _ltRmRetry(dir); }
+});
+
+// The operator-side view: with the flag, claude_spawned names the level; without it, the line has
+// no effort key. The two requests are each other's control.
+ltTest("integration: claude_spawned names the effort when --effort is in argv, and has no effort key without it", async () => {
+  if (!LT_POSIX) return;
+  const dir = ltMkdir(); const fake = ltFake(dir);
+  try {
+    const { child, buf, port } = await ltBootFresh({ CLAUDE_BIN: fake }, dir);
+    try {
+      assert.ok(await ltWait(() => buf.out.includes("listening on")), `— ${ltDiag(buf)}`);
+      const spawned = () => buf.out.split("\n").filter((l) => l.includes('"event":"claude_spawned"'));
+      const r1 = await ltPostStatus(port, { model: "sonnet", messages: [{ role: "user", content: "one" }], reasoning_effort: "medium" });
+      assert.equal(r1.status, 200, r1.text.slice(0, 200));
+      assert.ok(await ltWait(() => spawned().length === 1), `premise: one spawn logged — ${ltDiag(buf)}`);
+      assert.match(spawned()[0], /"effort":"medium"/, `the level must be logged — ${spawned()[0]}`);
+      const r2 = await ltPostStatus(port, { model: "sonnet", messages: [{ role: "user", content: "two" }] });
+      assert.equal(r2.status, 200, r2.text.slice(0, 200));
+      assert.ok(await ltWait(() => spawned().length === 2), `premise: second spawn logged — ${ltDiag(buf)}`);
+      assert.doesNotMatch(spawned()[1], /"effort"/, `no reasoning_effort, no effort key — ${spawned()[1]}`);
+    } finally { child.kill("SIGKILL"); await ltDrain(() => buf.closed, "effort-log", 5000); }
   } finally { _ltRmRetry(dir); }
 });
 
