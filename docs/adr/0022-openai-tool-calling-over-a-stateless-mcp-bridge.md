@@ -1,7 +1,7 @@
 # ADR 0022 — OpenAI tool calling over a stateless MCP bridge
 
 **Date:** 2026-09-13
-**Status:** Accepted (maintainer instruction 2026-09-13: *"继续把工具调用做完 … 做完直接合"*)
+**Status:** Accepted (maintainer instruction 2026-09-13: *"继续把工具调用做完 … 做完直接合"*); §5 amended 2026-09-25 by #520 (maintainer approval 2026-09-26: *"ADR 补注存吧，提交"*)
 **Scope:** Class B.1 — `POST /v1/chat/completions`. Authority: OpenAI's published
 `/v1/chat/completions` specification (`tools`, `tool_choice`, `tool_calls`, `finish_reason:
 "tool_calls"`, the `tool` message role) + [ADR 0006](0006-openai-shim-scope.md).
@@ -97,6 +97,14 @@ with `tool_calls` becomes `[Assistant called tool X with arguments …]`; a `too
 `[Tool X returned] …`, paired by id; and when the conversation ends on a result, a continuation note
 tells the model the results are final and to answer unless it needs something not yet returned. The
 wording is the thing measured to turn a re-call into an answer.
+
+> **Amendment (2026-09-25, #512 / PR #520; approved by the maintainer 2026-09-26).** Under
+> `OCP_MULTIBLOCK_INPUT` (the default), the continuation note lives in the system prompt of every `-p`
+> spawn, byte-constant and worded as a condition (`TOOL_CONTINUATION_SYSTEM_NOTE`), instead of trailing
+> the last result. As a trailing block it moved to the new end of the prompt on every step, which
+> defeated prompt caching. Re-measured with the new placement on 2026-09-25 through OCP: haiku 4.5,
+> sonnet 5 and opus 5.5 each answered from a returned result without re-calling, over two tool steps
+> each. `OCP_MULTIBLOCK_INPUT=0` restores the trailing note, and the TUI lane keeps it.
 
 **6. `OCP_TOOL_CALLING=0` restores the pre-0022 path** — declared tools dropped and counted — and
 the drop event now says *which* gate kept the request off the bridge. Default is on, because 0021
