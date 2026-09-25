@@ -30185,6 +30185,20 @@ test("replay → dashboard.html Status card DECIDES tag-ok (the green card) on t
     "control: a real degraded verdict must still render the error tag");
 });
 
+// #518, measured on CI (Linux, Node 24 and 26): process.exit() does not wait for stdout writes that
+// libuv had to QUEUE because a piped stdout was not writable at that instant, so the last lines a
+// run prints -- its results line -- can be dropped. The lock tests' contender child recorded
+// "results printed 1/0" and "exit code=0" in a side file within the same millisecond, and its
+// parent, reading until 'close', never received that line. It did not reproduce on macOS. Exit
+// only after an empty write on each stream has completed: writes complete in order, so its
+// callback fires after everything queued before it.
+function _exitAfterFlush(code) {
+  let pending = 2;
+  const done = () => { if (--pending === 0) process.exit(code); };
+  process.stdout.write("", done);
+  process.stderr.write("", done);
+}
+
 runAsyncTests().then(() => Promise.all(pendingAsync)).then(() => {
   closeDb();
   // THE RESULTS LINE IS A CONSUMED INTERFACE — keep it byte-identical (#366 review, finding A).
@@ -30231,7 +30245,8 @@ runAsyncTests().then(() => Promise.all(pendingAsync)).then(() => {
     console.error(`=== VOID: nothing ran, so no Results line was printed — a filter that matches ` +
                   `nothing is not a green run. ===`);
     _ltReportStallLedger();
-    process.exit(1);
+    _exitAfterFlush(1);
+    return;
   }
 
   console.log(`\n=== Results: ${passed} passed, ${failed} failed ===\n`);
@@ -30241,11 +30256,11 @@ runAsyncTests().then(() => Promise.all(pendingAsync)).then(() => {
                 `to see which coverage this run did NOT provide.\n`);
   }
   _ltReportStallLedger();
-  process.exit(failed > 0 ? 1 : 0);
+  _exitAfterFlush(failed > 0 ? 1 : 0);
 }).catch((e) => {
   console.error("async test runner crashed:", e);
   closeDb();
-  process.exit(1);
+  _exitAfterFlush(1);
 });
 
 // ── #411: an unhandledRejection must carry the request's method + path ──────────────────────
