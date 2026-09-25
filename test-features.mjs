@@ -31744,8 +31744,13 @@ ltTest("ADR 0020: an unparseable OCP_ALLOWED_HOSTS entry is REPORTED at boot, no
     // see the second before the first even though the child wrote them in the opposite order.
     // Measured 2026-09-13: red in 2/2 full runs on this branch AND in a full run of origin/main on
     // the same host (7 loop stalls each), green 1/1 in isolation every time -- the #199 shape.
-    assert.ok(await ltWait(() => /OCP_ALLOWED_HOSTS — ignored/.test(buf.out + buf.err), 5000),
-      `the boot warning never arrived on either pipe — ${ltDiag(buf)}`);
+    // Wait for the LAST of the warning's lines, not the first (#518's CI run, 2026-09-25): they are
+    // separate console.warn writes (server.mjs, the OCP_ALLOWED_HOSTS boot block), and under load
+    // the parent received the first two while "declare the bare host" had not arrived yet. Waiting
+    // on the first line and then asserting on the fourth is the #199 shape one line further down.
+    assert.ok(await ltWait(() => /OCP_ALLOWED_HOSTS — ignored/.test(buf.out + buf.err)
+                              && /the entry is correct as written/.test(buf.out + buf.err), 5000),
+      `the boot warning never fully arrived on either pipe — ${ltDiag(buf)}`);
     const all = buf.out + buf.err;
     assert.match(all, /OCP_ALLOWED_HOSTS — ignored 2 unparseable entries/,
       `both bad entries must be counted in the boot warning; got: ${all.slice(-600)}`);
