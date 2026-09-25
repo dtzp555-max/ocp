@@ -9,7 +9,7 @@
   - Consecutive `tool` results share one block. The tool-continuation note moves from a trailing user block into the system prompt, byte-constant.
   - OCP puts ONE prompt-cache breakpoint on the last block it sends. The CLI's own final breakpoint lands on a block the CLI appends after OCP's content, so without this, opus 5.5 and sonnet 5 re-wrote the whole conversation on every step. haiku 4.5 did not, which is how the first design was fooled.
   - Measured on opus 5.5 through OCP with the tool bridge: each step went from ~13.5k tokens written and ~0.6k read to ~240 written, with the whole previous prompt read.
-  - The CLI already uses 3 of the API's 4 breakpoints, and the TTL must fit the CLI's: `OCP_CACHE_BREAKPOINT=1h|5m|off`, and the first 400 that names `cache_control` switches it off for the rest of the boot (`cache_breakpoint_disabled`).
+  - The CLI already uses 3 of the API's 4 breakpoints, and the TTL must fit the CLI's: `OCP_CACHE_BREAKPOINT=1h|5m|off`, and the first 400 that names `cache_control` switches it off for the rest of the boot (`cache_breakpoint_disabled`). Requests already in flight with a breakpoint fail with that one.
   - `OCP_MULTIBLOCK_INPUT=0` restores the previous input byte for byte. Over-budget text-only conversations keep the text path's truncation. The TUI lane is untouched.
   - README: env var rows, and § "Per-request tokens and prompt-cache hits".
 

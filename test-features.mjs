@@ -7430,6 +7430,57 @@ for (const stream of [false, true]) ltTest(`integration (#512, ${stream ? "strea
   } finally { _ltRmRetry(dir); }
 });
 
+// The two modes hand the model different input, so a cached answer from one must not be served in
+// the other: MULTIBLOCK_INPUT is folded into CONFIG_EPOCH. Two boots sharing one store (#176 shape).
+ltTest("integration (#512): toggling OCP_MULTIBLOCK_INPUT invalidates the standard response cache (epoch fold)", async () => {
+  if (!LT_POSIX) return;
+  const dir = ltMkdir(); const fake = ltFake(dir); const counter = join(dir, "spawns.txt");
+  const req = { model: "sonnet", messages: [{ role: "user", content: "multiblock-epoch-probe" }] };
+  const bootOnce = async (env) => {
+    const { child, buf, port } = await ltBootFresh({ CLAUDE_BIN: fake, CLAUDE_CACHE_TTL: "60000", SP_COUNTER: counter, ...env }, dir);
+    try {
+      assert.ok(await ltWait(() => buf.out.includes("listening on")), `did not start: ${buf.err.slice(0, 160)}`);
+      _ltWrite(counter, "0");
+      await ltPost(port, req);
+      await ltWait(() => (Number(_ltRead(counter, "utf8")) || 0) >= 1, 3000);
+      return Number(_ltRead(counter, "utf8")) || 0;
+    } finally { child.kill("SIGKILL"); await ltDrain(() => buf.closed, "multiblock-epoch", 5000); }
+  };
+  try {
+    const on = await bootOnce({});
+    const off = await bootOnce({ OCP_MULTIBLOCK_INPUT: "0" });
+    assert.equal(on, 1, "premise: the first request (cache empty) must spawn claude");
+    assert.equal(off, 1, "after toggling the flag the identical request must NOT be served from the other mode's cache");
+  } finally { _ltRmRetry(dir); }
+});
+
+// "Byte for byte" under the kill switch includes the IMAGE path, which takes stream-json in both modes:
+// no breakpoint, the trailing note back as the last block, and no note in the system prompt.
+ltTest("integration (#512 kill switch): an image request under OCP_MULTIBLOCK_INPUT=0 carries no breakpoint and keeps the trailing note", async () => {
+  if (!LT_POSIX) return;
+  const dir = ltMkdir(); const fake = ltFake(dir);
+  const stdinFile = join(dir, "stdin.txt"); const spFile = join(dir, "sp.txt");
+  try {
+    const { child, buf, port } = await ltBootFresh({ CLAUDE_BIN: fake, STDIN_CAPTURE: stdinFile, SP_CAPTURE: spFile, OCP_MULTIBLOCK_INPUT: "0" }, dir);
+    try {
+      assert.ok(await ltWait(() => buf.out.includes("listening on")), `— ${ltDiag(buf)}`);
+      const PNG = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNkYAAAAAYAAjCB0C8AAAAASUVORK5CYII=";
+      const r = await ltPostStatus(port, { model: "sonnet", messages: [
+        { role: "user", content: [{ type: "text", text: "what is this?" }, { type: "image_url", image_url: { url: PNG } }] },
+        { role: "assistant", content: null, tool_calls: [{ id: "c1", type: "function", function: { name: "lookup_a", arguments: "{}" } }] },
+        { role: "tool", tool_call_id: "c1", content: "kill-switch-image-probe" },
+      ] });
+      assert.equal(r.status, 200, `${r.status} ${r.text.slice(0, 200)}`);
+      assert.ok(await ltWait(() => _ltExists(stdinFile) && _ltExists(spFile)), "premise: captures");
+      const blocks = ltStdinBlocks(_ltRead(stdinFile, "utf8"));
+      assert.ok(Array.isArray(blocks) && blocks.some((b) => b.type === "image"), "premise: the image path, as stream-json");
+      assert.equal(blocks.some((b) => b.cache_control), false, "the kill switch must not send a breakpoint on the image path either");
+      assert.ok(blocks[blocks.length - 1].text?.includes(TOOL_CONTINUATION_NOTE), `the trailing note is the last block again — ${JSON.stringify(blocks[blocks.length - 1])}`);
+      assert.ok(!_ltRead(spFile, "utf8").includes(TOOL_CONTINUATION_SYSTEM_NOTE), "and it is not in the system prompt");
+    } finally { child.kill("SIGKILL"); await ltDrain(() => buf.closed, "ks-image", 5000); }
+  } finally { _ltRmRetry(dir); }
+});
+
 console.log("\nOpenAI tool calling over the MCP bridge (ADR 0022):");
 
 // ── unit: the pure helpers ──────────────────────────────────────────────────────────────────────
@@ -21151,6 +21202,21 @@ test("buildStreamJsonInput: stats.blockCount is the number of content blocks in 
   const n = JSON.parse(payload.trim()).message.content.length;
   assert.ok(n >= 3, `premise: a multi-block envelope — ${n}`);
   assert.equal(stats.blockCount, n);
+});
+
+// #512: coalescing appends a tool result to the PREVIOUS TEXT block only. A tool result that carried
+// an image leaves that image as the last block, and the next result must open a new text block.
+test("buildImageBlocks: coalesceToolResults never appends text onto an image block", () => {
+  const { blocks } = mmBuildImageBlocks([
+    { role: "user", content: "look" },
+    { role: "assistant", content: null, tool_calls: [{ id: "c1", type: "function", function: { name: "shot", arguments: "{}" } }, { id: "c2", type: "function", function: { name: "note", arguments: "{}" } }] },
+    { role: "tool", tool_call_id: "c1", content: [txtPart("a chart"), imgPart()] },
+    { role: "tool", tool_call_id: "c2", content: "second result" },
+  ], { coalesceToolResults: true, continuationNote: false }); // the multi-block path's options
+  const types = blocks.map((b) => b.type);
+  assert.deepEqual(types.slice(-3), ["text", "image", "text"], `the image stays between the two results — ${JSON.stringify(types)}`);
+  assert.equal("text" in blocks[blocks.length - 2], false, "no text was appended onto the image block");
+  assert.ok(blocks[blocks.length - 1].text.includes("[Tool note returned]\nsecond result"), JSON.stringify(blocks[blocks.length - 1]));
 });
 
 // ── malformed / policy / oversized handling (clean 4xx, never a silent drop) ──

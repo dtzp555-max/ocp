@@ -517,7 +517,8 @@ const MULTIBLOCK_INPUT = process.env.OCP_MULTIBLOCK_INPUT !== "0";
 // and the TTL must not be shorter than a breakpoint the CLI places AFTER ours (a 5m one before the
 // CLI's 1h one was refused). Both are the CLI's to change, so: OCP_CACHE_BREAKPOINT=1h (default) |
 // 5m | off, and the first 400 that names cache_control switches it off for the rest of this boot.
-// That request fails; the ones after it run without the breakpoint instead of failing too.
+// That request fails, as does any spawn already in flight with a breakpoint (each reads the value
+// once, at spawn); spawns after the switch run without it instead of failing too.
 let cacheBreakpointTtl = ({ "": "1h", "1h": "1h", "5m": "5m" })[(process.env.OCP_CACHE_BREAKPOINT || "").trim().toLowerCase()] ?? null;
 if (process.env.OCP_CACHE_BREAKPOINT && cacheBreakpointTtl === null && !/^(off|0|false|no)$/i.test(process.env.OCP_CACHE_BREAKPOINT.trim())) {
   console.error(`WARNING: OCP_CACHE_BREAKPOINT=${JSON.stringify(process.env.OCP_CACHE_BREAKPOINT)} is not 1h, 5m or off — treating it as off.`);
