@@ -30920,10 +30920,15 @@ function lt416Contender(cwd) {
     cwd, stdio: ["ignore", "pipe", "pipe"],
     env: { ...process.env, OCP_SUITE_LOCK_CHILD: "1" },
   });
-  const state = { out: "", exited: null, child };
+  const state = { out: "", err: "", exited: null, closed: false, child };
   child.stdout.on("data", (d) => { state.out += d; });
-  child.stderr.on("data", () => {});
+  // A bounded tail of stderr, for the failure messages only: with it discarded, a child that crashed
+  // and a child whose last stdout had not been read yet looked identical (#518).
+  child.stderr.on("data", (d) => { state.err = (state.err + d).slice(-2000); });
   child.on("exit", (code, signal) => { state.exited = { code, signal }; });
+  // #518: 'exit' can fire while the stdout pipe still holds the child's last lines -- the #203 race
+  // AGENTS.md records. Anything that READS state.out after the child ends waits for 'close'.
+  child.on("close", () => { state.closed = true; });
   return state;
 }
 const lt416Sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -31006,10 +31011,11 @@ lockTest("#416 F2: only the OLDEST ticket acts — a real contender holds off a 
     // repo's rule that a claim of guaranteed behaviour must cite the mutation that proves it, and
     // it has to be earned by more than one attempt.
     _lockRmSync(olderTicket, { force: true });
-    await lt416Until(() => c.exited !== null, "the contender to acquire and finish once its ticket is the oldest");
+    await lt416Until(() => c.closed, "the contender to acquire, finish and close its stdio once its ticket is the oldest");
     assert.ok(c.out.includes(LT_LOCK_CHILD_DONE),
       `once oldest, the contender must get through acquire and RUN TO COMPLETION — expected ${JSON.stringify(LT_LOCK_CHILD_DONE)} ` +
-      `from --only ${JSON.stringify(LT_LOCK_CHILD_FILTER)}; its stdout ended: ${JSON.stringify(c.out.slice(-400))}`);
+      `from --only ${JSON.stringify(LT_LOCK_CHILD_FILTER)}; exit ${JSON.stringify(c.exited)}; its stdout ended: ${JSON.stringify(c.out.slice(-400))}; ` +
+      `stderr ended: ${JSON.stringify(c.err.slice(-400))}`);
   } finally {
     try { c.child.kill("SIGKILL"); } catch {}
     try { _lockRmSync(base, { recursive: true, force: true }); } catch {}
@@ -31106,14 +31112,14 @@ lockTest("#423 F3: the exit handler releases the lock — a finished run leaves 
   const lockDir = join(base, "scratchpad", ".suite.lock");
   const c = lt416Contender(base); // uncontended: nothing else holds this path
   try {
-    await lt416Until(() => c.exited !== null, "the uncontended run to finish");
+    await lt416Until(() => c.closed, "the uncontended run to finish and close its stdio");
     // Two premises, because "no lock dir" is exactly what a child that never took one leaves.
     // The results line is only reachable PAST the module-level acquire, and `scratchpad/` exists
     // only because the acquire's populate-then-publish mkdir -p'd its temp dir into it.
     assert.ok(c.out.includes(LT_LOCK_CHILD_DONE),
       `premise: the child must have run past the module-level acquire and completed its one test — ` +
       `expected ${JSON.stringify(LT_LOCK_CHILD_DONE)} from --only ${JSON.stringify(LT_LOCK_CHILD_FILTER)}; ` +
-      `stdout ended: ${JSON.stringify(c.out.slice(-400))}`);
+      `exit ${JSON.stringify(c.exited)}; stdout ended: ${JSON.stringify(c.out.slice(-400))}; stderr ended: ${JSON.stringify(c.err.slice(-400))}`);
     assert.ok(_lockExistsSync(join(base, "scratchpad")),
       "premise: the child's acquire must have created the scratchpad dir its lock lives in");
     assert.ok(!_lockExistsSync(lockDir),
