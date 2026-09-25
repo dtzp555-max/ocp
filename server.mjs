@@ -523,8 +523,10 @@ let cacheBreakpointTtl = ({ "": "1h", "1h": "1h", "5m": "5m" })[(process.env.OCP
 if (process.env.OCP_CACHE_BREAKPOINT && cacheBreakpointTtl === null && !/^(off|0|false|no)$/i.test(process.env.OCP_CACHE_BREAKPOINT.trim())) {
   console.error(`WARNING: OCP_CACHE_BREAKPOINT=${JSON.stringify(process.env.OCP_CACHE_BREAKPOINT)} is not 1h, 5m or off — treating it as off.`);
 }
-function noteCacheBreakpointRejection(errText) {
-  if (cacheBreakpointTtl === null) return;
+// `spawnCarried` is the breakpoint the failing spawn actually sent (review P2 on #520): a 400 from a
+// spawn that sent none -- the kill switch, or the over-budget text path -- says nothing about ours.
+function noteCacheBreakpointRejection(errText, spawnCarried) {
+  if (cacheBreakpointTtl === null || !spawnCarried) return;
   if (!/cache_control/.test(errText) || !/\b400\b/.test(errText)) return;
   logEvent("warn", "cache_breakpoint_disabled", { ttl: cacheBreakpointTtl, reason: String(errText).slice(0, 200) });
   cacheBreakpointTtl = null;
@@ -2322,7 +2324,8 @@ function spawnClaudeProcess(model, messages, conversationId, keyName, releaseSlo
     if (deferredFire) { clearTimeout(deferredFire); deferredFire = null; }
   }
 
-  return { proc, cliModel, conversationId, t0, cleanup, clearOverallTimer, handleSessionFailure, markFirstByte };
+  return { proc, cliModel, conversationId, t0, cleanup, clearOverallTimer, handleSessionFailure, markFirstByte,
+           cacheBreakpoint: useStreamJson ? bpTtl : null };
 }
 
 // ── Call claude CLI (non-streaming) ─────────────────────────────────────
@@ -2441,7 +2444,7 @@ async function callClaude(model, messages, conversationId, keyName, res, opts = 
       return reject(err);
     }
 
-    const { proc, cliModel, conversationId: convId, t0, cleanup, handleSessionFailure, markFirstByte } = ctx;
+    const { proc, cliModel, conversationId: convId, t0, cleanup, handleSessionFailure, markFirstByte, cacheBreakpoint } = ctx;
     let lineBuffer = "";
     let assembledText = "";
     let sawTextDelta = false;
@@ -2586,7 +2589,7 @@ async function callClaude(model, messages, conversationId, keyName, res, opts = 
           // double-counting precisely because of the per-request guard above: the close handler's
           // countError becomes a no-op. That is the guard paying for itself rather than merely
           // preventing a regression.
-          noteCacheBreakpointRejection(parsed.error);
+          noteCacheBreakpointRejection(parsed.error, cacheBreakpoint);
           countError(String(parsed.error).slice(0, 200));
           reject(new Error(String(parsed.error)));
         }
@@ -3153,7 +3156,7 @@ async function callClaudeStreaming(model, messages, conversationId, res, authInf
     return jsonResponse(res, 500, { error: { message: sanitizeError(err.message), type: "proxy_error" } });
   }
 
-  const { proc, cliModel, conversationId: convId, t0, cleanup, clearOverallTimer, handleSessionFailure, markFirstByte } = ctx;
+  const { proc, cliModel, conversationId: convId, t0, cleanup, clearOverallTimer, handleSessionFailure, markFirstByte, cacheBreakpoint } = ctx;
   let stderr = "";
   let headersSent = false;
   let totalChars = 0;
@@ -3254,7 +3257,7 @@ async function callClaudeStreaming(model, messages, conversationId, res, authInf
         // cause the close handler to record success + write cache). Set errored instead.
         errored = true;
         const errStr = String(parsed.error);
-        noteCacheBreakpointRejection(errStr);
+        noteCacheBreakpointRejection(errStr, cacheBreakpoint);
         logEvent("error", "claude_result_error", { model: cliModel, error: errStr.slice(0, 200) });
         countError(errStr.slice(0, 200));
         // Classified and COUNTED here even though the status is already 200 -- see

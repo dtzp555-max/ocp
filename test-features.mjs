@@ -7430,6 +7430,24 @@ for (const stream of [false, true]) ltTest(`integration (#512, ${stream ? "strea
   } finally { _ltRmRetry(dir); }
 });
 
+// Review P2 on #520: a 400 naming cache_control from a spawn that sent NO breakpoint (here the kill
+// switch) says nothing about ours and must not switch it off. The failing request is the premise.
+ltTest("integration (#512): a cache_control 400 from a spawn that carried no breakpoint does not switch it off", async () => {
+  if (!LT_POSIX) return;
+  const dir = ltMkdir(); const fake = ltFake(dir);
+  try {
+    const { child, buf, port } = await ltBootFresh({ CLAUDE_BIN: fake, OCP_MULTIBLOCK_INPUT: "0",
+      UPSTREAM_ERROR: "API Error: 400 A maximum of 4 blocks with cache_control may be provided. Found 5." }, dir);
+    try {
+      assert.ok(await ltWait(() => buf.out.includes("listening on")), `— ${ltDiag(buf)}`);
+      const r = await ltPostStatus(port, { model: "sonnet", messages: [{ role: "user", content: "no breakpoint here" }] });
+      assert.ok(r.status !== 200 && /cache_control/.test(r.text), `premise: the request failed with the cache_control 400 — ${r.status} ${r.text.slice(0, 200)}`);
+      await new Promise((res) => setTimeout(res, 300));
+      assert.ok(!/"event":"cache_breakpoint_disabled"/.test(buf.out + buf.err), "a spawn that sent no breakpoint switched ours off");
+    } finally { child.kill("SIGKILL"); await ltDrain(() => buf.closed, "bp-not-ours", 5000); }
+  } finally { _ltRmRetry(dir); }
+});
+
 // The two modes hand the model different input, so a cached answer from one must not be served in
 // the other: MULTIBLOCK_INPUT is folded into CONFIG_EPOCH. Two boots sharing one store (#176 shape).
 ltTest("integration (#512): toggling OCP_MULTIBLOCK_INPUT invalidates the standard response cache (epoch fold)", async () => {
