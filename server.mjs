@@ -2184,7 +2184,9 @@ function spawnClaudeProcess(model, messages, conversationId, keyName, releaseSlo
   proc.stdin.end();
 
   recordModelRequest(cliModel, promptChars);
-  logEvent("info", "claude_spawned", { model: cliModel, promptChars, systemPromptChars: systemPrompt.length, inputFormat: useStreamJson ? "stream-json" : "text", timeout: TIMEOUT, tier: getModelTier(cliModel), session: conversationId ? conversationId.slice(0, 12) + "..." : "none" });
+  // `effort` only when `--effort` is in argv: the one place an operator can confirm what level a
+  // client's `reasoning_effort` actually ran at. Absent => this line is unchanged.
+  logEvent("info", "claude_spawned", { model: cliModel, promptChars, systemPromptChars: systemPrompt.length, inputFormat: useStreamJson ? "stream-json" : "text", timeout: TIMEOUT, tier: getModelTier(cliModel), session: conversationId ? conversationId.slice(0, 12) + "..." : "none", ...(opts.effort ? { effort: opts.effort } : {}) });
 
   // Single request timeout — no separate first-byte timer.
   // Claude tool-use causes long pauses in the token stream (30s-5min),
