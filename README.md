@@ -474,6 +474,18 @@ Proxy: up 6h 32m | 23 reqs | 0 err | 0 timeout
 
 **Web Dashboard:** open `http://<host>:3456/dashboard` in any browser for real-time per-key usage, request history, plan utilization, and system health (screenshot + details in [docs/lan-mode.md § Monitoring](docs/lan-mode.md#monitoring-server-side)).
 
+### Per-request tokens and prompt-cache hits (proxy log)
+
+Each spawn's cost is on its log lines in the proxy log (`~/.ocp/logs/proxy.log` for the service `setup.mjs` installs). The values are read from the `claude` CLI's own stream-json events, and OCP computes nothing itself:
+
+| event | fields | what they tell you |
+|---|---|---|
+| `claude_ok` | `inputTokens`, `outputTokens`, `cacheWriteTokens`, `cacheReadTokens` | The four counts from the CLI's `result.usage`. `inputTokens` is only the uncached remainder. The whole prompt is the sum of the three input fields. A conversation that re-writes itself into the cache on every call shows a large `cacheWriteTokens` and a `cacheReadTokens` that never grows (#512). Absent when the CLI reported no usage, for example on a tool turn, whose spawn is ended before its result event. |
+| `claude_spawned` | `systemPromptSha`, `toolsSha` (tool requests only), `blockCount` | The first 12 hex characters of sha256 of the system prompt and of the declared tools, plus the number of content blocks sent. The prompt cache matches tools, then system, then messages, in that order. So if a sha changes between two requests of one conversation, that layer invalidated everything after it. Content is never logged. |
+| `claude_stream_event` (`type: "rate_limit_event"`) | `info.status`, `info.rateLimitType`, `info.resetsAt`, `info.windows.<name>.utilization` | The CLI's own view of the subscription windows (`five_hour`, `seven_day`), per spawn. A shape OCP does not recognise is logged as the old 200-character `data` prefix instead. |
+
+The fields are read from `claude` 2.1.280's event shapes. They are not a documented contract, so if a CLI upgrade removes them, the keys disappear from these lines rather than holding wrong values.
+
 ### All Commands
 
 ```
