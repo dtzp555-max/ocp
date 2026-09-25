@@ -284,6 +284,8 @@ So the blind spot is real but narrow: it needs `stream: true`, no tools — or `
 | `CLAUDE_BIN` | *(auto-detect)* | Path to claude binary |
 | `CLAUDE_TIMEOUT` | `600000` | Request timeout (ms, default: 10 min) |
 | `OCP_TOOL_CALLING` | `1` | OpenAI tool calling over the MCP bridge (ADR 0022). `0` restores the pre-0022 behaviour: declared `tools` are dropped, answered as text, and counted in `/health`'s `stats.toolRequestsDropped` with the reason logged. |
+| `OCP_MULTIBLOCK_INPUT` | `1` | How the conversation is handed to `claude -p` (#512). By default each message is its own content block, sent over `--input-format stream-json`, and the tool-continuation note is part of the system prompt. A growing agent conversation then only ever appends blocks, so the prompt cache can match everything it has seen before and does not re-write it on every step. `0` restores the pre-#512 input byte for byte: one text block, with the note after the last tool result. Boot-time only. See § "Per-request tokens and prompt-cache hits" for how to see the effect. |
+| `OCP_CACHE_BREAKPOINT` | `1h` | The one prompt-cache breakpoint OCP adds, on the last block it sends, under `OCP_MULTIBLOCK_INPUT` (#512). `1h`, `5m` or `off`. The CLI already uses 3 of the API's 4 breakpoints and places one after ours, and a shorter TTL may not precede a longer one. So if the API refuses the breakpoint (a 400 naming `cache_control`), OCP logs `cache_breakpoint_disabled` and switches it off for the rest of the boot. The request that hit the 400 fails; the ones after it run without the breakpoint. Boot-time only. |
 | `OCP_TOOL_TURN_QUIESCE_MS` | `2000` | Milliseconds to wait for the model's message-end signal after a tool call before ending the turn anyway. The healthy path never reaches it — the signal arrives first — so this is a **ceiling on the degraded path**, not a target: it bounds what happens if a `claude` build accepts `--include-partial-messages` but stops emitting `stop_reason: "tool_use"`. Every `openai_tool_calls` log line records `endedOn` (`signal` / `quiescence` / `close`); a run of `quiescence` means re-measure. |
 | `CLAUDE_HEARTBEAT_INTERVAL` | `0` | Streaming SSE keepalive interval (ms). `0` = disabled. See ["Streaming heartbeat"](#streaming-heartbeat) below. |
 | `CLAUDE_MAX_CONCURRENT` | `8` | Max concurrent claude processes (`-p`/stream-json path) |
@@ -483,6 +485,22 @@ Each spawn's cost is on its log lines in the proxy log (`~/.ocp/logs/proxy.log` 
 | `claude_ok` | `inputTokens`, `outputTokens`, `cacheWriteTokens`, `cacheReadTokens` | The four counts from the CLI's `result.usage`. `inputTokens` is only the uncached remainder. The whole prompt is the sum of the three input fields. A conversation that re-writes itself into the cache on every call shows a large `cacheWriteTokens` and a `cacheReadTokens` that never grows (#512). Absent when the CLI reported no usage, for example on a tool turn, whose spawn is ended before its result event. |
 | `claude_spawned` | `systemPromptSha`, `toolsSha` (tool requests only), `blockCount` | The first 12 hex characters of sha256 of the system prompt and of the declared tools, plus the number of content blocks sent. The prompt cache matches tools, then system, then messages, in that order. So if a sha changes between two requests of one conversation, that layer invalidated everything after it. Content is never logged. |
 | `claude_stream_event` (`type: "rate_limit_event"`) | `info.status`, `info.rateLimitType`, `info.resetsAt`, `info.windows.<name>.utilization` | The CLI's own view of the subscription windows (`five_hour`, `seven_day`), per spawn. A shape OCP does not recognise is logged as the old 200-character `data` prefix instead. |
+
+**Why an agent's prompt can be cached at all (#512, `OCP_MULTIBLOCK_INPUT`, `OCP_CACHE_BREAKPOINT`).** Anthropic's prompt cache matches a request's prefix at content blocks. OCP used to flatten the whole conversation into one block, and a block that grows at its end never matches the previous request's block, so every step of an agent loop re-wrote the entire conversation into the cache. Two changes, both needed:
+
+- **One block per message.** Consecutive tool results share one block, and the "results are final" note moves into the system prompt, where it is byte-constant. As a trailing block, it moved to the new end on every step.
+- **One cache breakpoint on the last block OCP sends.** The CLI's own final breakpoint lands on a block it appends after OCP's content. The entry it writes is therefore never a prefix of the next request, and on opus 5.5 and sonnet 5 nothing else finds it. (haiku 4.5 happened to recover through the API's short lookback. The Claude 5 models did not.) An entry that ends on OCP's last block is a prefix of the next request, and the lookback finds it.
+
+Measured on opus 5.5 through OCP, with `reasoning_effort: low` and the tool bridge (#512):
+
+| per step | written to cache | read from cache |
+|---|---|---|
+| before | ~13.5k (the whole conversation) | ~0.6k |
+| now | ~240 | the whole previous prompt |
+
+What this does not cover:
+- A conversation over the model's prompt budget keeps the text path's whole-message truncation. Once old messages are dropped, the start of the prompt shifts on every turn and nothing can cache.
+- A client that sends one tool result at a time within a single step extends the last block instead of appending one, so that one step misses.
 
 The fields are read from `claude` 2.1.280's event shapes. They are not a documented contract, so if a CLI upgrade removes them, the keys disappear from these lines rather than holding wrong values.
 
