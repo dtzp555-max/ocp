@@ -51,6 +51,7 @@ import { parseAllowedHosts, parseAuthority, matchesDeclared, evaluateOriginGate 
 import { classifyToolRequest, countDeclaredTools } from "./lib/tool-support.mjs";
 import { isUpstreamRateLimit, retryAfterSeconds } from "./lib/upstream-errors.mjs";
 import { listUnhonouredFields, CACHE_KEY_ONLY, cliEffort } from "./lib/unhonoured-fields.mjs";
+import { summarizeResultUsage, summarizeRateLimitEvent } from "./lib/cli-usage.mjs";
 import { selectCredential } from "./lib/credential-source.mjs";
 import { validateTools, extractBridgeToolUses, extractAssistantText, toolUsesToOpenAI, renderToolTurn,
          endsWithToolResult, TOOL_CONTINUATION_NOTE, TOOL_PREFIX, buildBridgeConfig } from "./lib/tool-calling.mjs";
@@ -401,12 +402,17 @@ function parseStreamJsonEvent(event, sawTextDelta) {
     if (event.is_error === true) {
       return { error: event.error_message ?? event.result ?? "claude returned is_error" };
     }
-    return { stop: true };
+    // #512: the token counts ride along to the lane, which logs them on `claude_ok`.
+    return { stop: true, usage: summarizeResultUsage(event.usage) };
   }
 
-  // rate_limit_event / usage — log for observability, don't forward
+  // rate_limit_event / usage — log for observability, don't forward.
+  // #512: a rate_limit_event is logged as parsed fields. The 200-char JSON prefix it replaces cut
+  // `unifiedWindows` -- where the utilization lives -- off every record. A shape the parser does not
+  // recognise still gets the prefix, so an unknown CLI change loses nothing it had before.
   if (t === "rate_limit_event" || t === "usage") {
-    logEvent("info", "claude_stream_event", { type: t, data: JSON.stringify(event).slice(0, 200) });
+    const info = t === "rate_limit_event" ? summarizeRateLimitEvent(event) : null;
+    logEvent("info", "claude_stream_event", info ? { type: t, info } : { type: t, data: JSON.stringify(event).slice(0, 200) });
     return null;
   }
 
@@ -996,6 +1002,9 @@ const VERSION = _pkg.version;
 const START_TIME = Date.now();
 
 // ── Structured logging helper ───────────────────────────────────────────
+// #512: first 12 hex of sha256 -- enough to tell two prefixes apart in a log, not enough to log content.
+const shortSha = (text) => cryptoCreateHash("sha256").update(String(text)).digest("hex").slice(0, 12);
+
 function logEvent(level, event, data = {}) {
   const entry = { ts: new Date().toISOString(), level, event, ...data };
   if (level === "error" || level === "warn") {
@@ -1883,12 +1892,15 @@ function spawnClaudeProcess(model, messages, conversationId, keyName, releaseSlo
   // Per-model ceiling (ADR 0011): resolved from cliModel, not a global max across the registry.
   const maxPromptChars = promptCharBudget(cliModel);
   let stdinPayload, promptChars;
+  // #512: how many content blocks this request hands the prompt cache. The text path is one block.
+  let blockCount = 1;
   if (useStreamJson) {
     // Pass the budget so the multimodal text is bounded by the same
     // runaway-context guard as the text path (PR #154 review F2). Images bypass it.
     const built = buildStreamJsonInput(nonSystemMessages, { ...MULTIMODAL_OPTS, maxTextChars: maxPromptChars });
     stdinPayload = built.payload;
     promptChars = built.stats.textChars;
+    blockCount = built.stats.blockCount;
     if (built.stats.truncated) {
       logEvent("warn", "prompt_truncated", {
         originalChars: built.stats.originalTextChars,
@@ -2186,7 +2198,11 @@ function spawnClaudeProcess(model, messages, conversationId, keyName, releaseSlo
   recordModelRequest(cliModel, promptChars);
   // `effort` only when `--effort` is in argv: the one place an operator can confirm what level a
   // client's `reasoning_effort` actually ran at. Absent => this line is unchanged.
-  logEvent("info", "claude_spawned", { model: cliModel, promptChars, systemPromptChars: systemPrompt.length, inputFormat: useStreamJson ? "stream-json" : "text", timeout: TIMEOUT, tier: getModelTier(cliModel), session: conversationId ? conversationId.slice(0, 12) + "..." : "none", ...(opts.effort ? { effort: opts.effort } : {}) });
+  logEvent("info", "claude_spawned", { model: cliModel, promptChars, systemPromptChars: systemPrompt.length, inputFormat: useStreamJson ? "stream-json" : "text", timeout: TIMEOUT, tier: getModelTier(cliModel), session: conversationId ? conversationId.slice(0, 12) + "..." : "none", ...(opts.effort ? { effort: opts.effort } : {}),
+    // #512: prefix stability, observable without logging content. The prompt cache matches
+    // tools -> system -> messages in that order, so a sha that changes between two requests of one
+    // conversation names the layer that invalidated everything after it.
+    systemPromptSha: shortSha(systemPrompt), ...(toolBridge ? { toolsSha: shortSha(JSON.stringify(opts.tools)) } : {}), blockCount });
 
   // Single request timeout — no separate first-byte timer.
   // Claude tool-use causes long pauses in the token stream (30s-5min),
@@ -2378,6 +2394,7 @@ async function callClaude(model, messages, conversationId, keyName, res, opts = 
     let assembledText = "";
     let sawTextDelta = false;
     let resultEventSeen = false;
+    let resultUsage = null; // #512
     let stderr = "";
     // ADR 0022: set when the model called a bridged tool. The spawn is ended on purpose at that
     // point, so `close` must read this BEFORE treating a non-zero exit as a failure.
@@ -2486,6 +2503,7 @@ async function callClaude(model, messages, conversationId, keyName, res, opts = 
           }
         } else if (parsed.stop) {
           resultEventSeen = true;
+          resultUsage = parsed.usage;
         } else if (parsed.error) {
           // is_error result — treat as process error.
           //
@@ -2581,7 +2599,7 @@ async function callClaude(model, messages, conversationId, keyName, res, opts = 
         recordModelSuccess(cliModel, elapsed);
         breakerRecordSuccess(cliModel);
         noteAuthVerifiedByRequest(); // #308: a completed request is conclusive evidence the credential works
-        logEvent("info", "claude_ok", { model: cliModel, chars: assembledText.length, elapsed, session: convId ? convId.slice(0, 12) + "..." : "none" });
+        logEvent("info", "claude_ok", { model: cliModel, chars: assembledText.length, elapsed, session: convId ? convId.slice(0, 12) + "..." : "none", ...(resultUsage || {}) });
         resolve(assembledText);
       }
     });
@@ -3091,6 +3109,7 @@ async function callClaudeStreaming(model, messages, conversationId, res, authInf
   let lineBuffer = "";
   let sawTextDelta = false;
   let resultEventSeen = false;
+  let resultUsage = null; // #512
   // Separate flag for is_error result — must NOT be conflated with resultEventSeen.
   // If errored===true the close handler must not cache the response or record success
   // (mirrors callClaude which rejects and never caches on is_error).
@@ -3165,6 +3184,7 @@ async function callClaudeStreaming(model, messages, conversationId, res, authInf
       } else if (parsed.stop) {
         // result event — emit stop and [DONE] immediately
         resultEventSeen = true;
+        resultUsage = parsed.usage;
         if (!ensureHeaders()) continue;
         sendSSE(res, {
           id, object: "chat.completion.chunk", created, model,
@@ -3264,7 +3284,7 @@ async function callClaudeStreaming(model, messages, conversationId, res, authInf
       breakerRecordSuccess(cliModel);
       try { recordUsage({ keyId: authInfo.keyId, keyName: authInfo.keyName, model, promptChars: messages.reduce((a, m) => a + contentToText(m.content).length, 0), responseChars: totalChars, elapsedMs: elapsed, success: true }); } catch (e) { logEvent("error", "usage_record_failed", { error: e.message }); }
       noteAuthVerifiedByRequest(); // #308: a completed request is conclusive evidence the credential works
-      logEvent("info", "claude_ok", { model: cliModel, chars: totalChars, elapsed, session: convId ? convId.slice(0, 12) + "..." : "none" });
+      logEvent("info", "claude_ok", { model: cliModel, chars: totalChars, elapsed, session: convId ? convId.slice(0, 12) + "..." : "none", ...(resultUsage || {}) });
       // Cache write-back for streaming — only on true success (not errored)
       if (CACHE_TTL > 0 && authInfo.cacheHash) {
         try { setCachedResponse(authInfo.cacheHash, model, cachedContent); } catch (e) { logEvent("error", "cache_write_failed", { error: e.message }); }

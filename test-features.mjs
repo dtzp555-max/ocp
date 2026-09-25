@@ -10,6 +10,7 @@ import { isLoopbackBind } from "./lib/net.mjs";
 import { classifyToolRequest, countDeclaredTools } from "./lib/tool-support.mjs";
 import { isUpstreamRateLimit, retryAfterSeconds } from "./lib/upstream-errors.mjs";
 import { listUnhonouredFields, CACHE_KEY_ONLY, ALWAYS_UNHONOURED, cliEffort, CLI_EFFORT_LEVELS } from "./lib/unhonoured-fields.mjs";
+import { summarizeResultUsage, summarizeRateLimitEvent } from "./lib/cli-usage.mjs";
 import { selectCredential, isExpired } from "./lib/credential-source.mjs";
 import { validateTools, extractBridgeToolUses, toolUsesToOpenAI, renderToolTurn, endsWithToolResult, TOOL_CONTINUATION_NOTE, TOOL_PREFIX as TC_PREFIX, buildBridgeConfig } from "./lib/tool-calling.mjs";
 import { PREFIX as BRIDGE_PREFIX } from "./lib/mcp-bridge.mjs";
@@ -3016,6 +3017,14 @@ if [ -n "$TOOL_USE_PARALLEL" ]; then
     printf '%s\\n' '{"type":"stream_event","event":{"type":"message_delta","delta":{"stop_reason":"tool_use","stop_sequence":null}}}'
   fi
   exec sleep 120
+fi
+if [ -n "$FAKE_USAGE_EVENTS" ]; then
+  # #512: the two events that carry what a spawn cost, in the shape claude 2.1.280 emits them
+  # (captured 2026-09-25 from a real -p call; numbers kept, uuids and session ids dropped).
+  printf '%s\\n' '{"type":"rate_limit_event","rate_limit_info":{"status":"allowed","resetsAt":1790323200,"rateLimitType":"five_hour","overageStatus":"rejected","overageDisabledReason":"org_level_disabled","isUsingOverage":false,"unifiedWindows":{"five_hour":{"utilization":0.05,"resetsAt":1790323200},"seven_day":{"utilization":0.47,"resetsAt":1790506800}}}}'
+  printf '%s\\n' '{"type":"assistant","message":{"content":[{"type":"text","text":"OK"}]}}'
+  printf '%s\\n' '{"type":"result","usage":{"input_tokens":10,"cache_creation_input_tokens":20294,"cache_read_input_tokens":13673,"output_tokens":39,"output_tokens_details":{"thinking_tokens":33},"service_tier":"standard"}}'
+  exit 0
 fi
 printf '%s\\n' '{"type":"assistant","message":{"content":[{"type":"text","text":"OK"}]}}'
 printf '%s\\n' '{"type":"result"}'
@@ -7126,6 +7135,105 @@ ltTest("integration: claude_spawned names the effort when --effort is in argv, a
       assert.ok(await ltWait(() => spawned().length === 2), `premise: second spawn logged — ${ltDiag(buf)}`);
       assert.doesNotMatch(spawned()[1], /"effort"/, `no reasoning_effort, no effort key — ${spawned()[1]}`);
     } finally { child.kill("SIGKILL"); await ltDrain(() => buf.closed, "effort-log", 5000); }
+  } finally { _ltRmRetry(dir); }
+});
+
+console.log("\n#512: what a spawn cost, logged:");
+
+// The measured shapes (claude 2.1.280, 2026-09-25). Identical to what FAKE_USAGE_EVENTS emits.
+const U512_RESULT_USAGE = { input_tokens: 10, cache_creation_input_tokens: 20294, cache_read_input_tokens: 13673, output_tokens: 39, output_tokens_details: { thinking_tokens: 33 }, service_tier: "standard" };
+const U512_RATE_EVENT = { type: "rate_limit_event", rate_limit_info: { status: "allowed", resetsAt: 1790323200, rateLimitType: "five_hour", overageStatus: "rejected", overageDisabledReason: "org_level_disabled", isUsingOverage: false, unifiedWindows: { five_hour: { utilization: 0.05, resetsAt: 1790323200 }, seven_day: { utilization: 0.47, resetsAt: 1790506800 } } } };
+
+test("#512 summarizeResultUsage: the four cache-relevant counts from the measured shape, and null for anything else", () => {
+  assert.deepEqual(summarizeResultUsage(U512_RESULT_USAGE), { inputTokens: 10, outputTokens: 39, cacheWriteTokens: 20294, cacheReadTokens: 13673 });
+  for (const v of [undefined, null, 3, "x", [], {}]) assert.equal(summarizeResultUsage(v), null, JSON.stringify(v));
+  // A non-count value is dropped, not passed through: this goes into a log line verbatim.
+  assert.deepEqual(summarizeResultUsage({ input_tokens: -1, output_tokens: "39", cache_read_input_tokens: NaN, cache_creation_input_tokens: 5 }), { cacheWriteTokens: 5 });
+});
+
+test("#512 summarizeRateLimitEvent: status, limit, reset and per-window utilization from the measured shape; bounded", () => {
+  assert.deepEqual(summarizeRateLimitEvent(U512_RATE_EVENT), {
+    status: "allowed", rateLimitType: "five_hour", resetsAt: 1790323200, overageStatus: "rejected", isUsingOverage: false,
+    windows: { five_hour: { utilization: 0.05, resetsAt: 1790323200 }, seven_day: { utilization: 0.47, resetsAt: 1790506800 } },
+  });
+  for (const v of [undefined, null, {}, { rate_limit_info: [] }, { rate_limit_info: "x" }]) assert.equal(summarizeRateLimitEvent(v), null, JSON.stringify(v));
+  // Bounded no matter what the CLI sends: at most 4 windows, no long strings, numbers only inside a window.
+  const many = {}; for (let i = 0; i < 10; i++) many[`w${i}`] = { utilization: i / 10, resetsAt: 1, note: "x" };
+  const s = summarizeRateLimitEvent({ rate_limit_info: { status: "y".repeat(65), unifiedWindows: many } });
+  assert.equal(Object.keys(s.windows).length, 4);
+  assert.equal(s.status, undefined, "a 65-char status is dropped");
+  assert.deepEqual(s.windows.w1, { utilization: 0.1, resetsAt: 1 }, "only the numeric fields survive");
+});
+
+// The live path: both events reach the log through parseStreamJsonEvent and the lane that owns the
+// spawn. FAKE_USAGE_EVENTS emits both; the second boot, with the stock fake, is the control -- a
+// result with no usage adds no token keys, and nothing was assumed about which lane logged what.
+async function u512Run(stream, env) {
+  const dir = ltMkdir(); const fake = ltFake(dir);
+  try {
+    const { child, buf, port } = await ltBootFresh({ CLAUDE_BIN: fake, ...env }, dir);
+    try {
+      assert.ok(await ltWait(() => buf.out.includes("listening on")), `— ${ltDiag(buf)}`);
+      const r = await ltPostStatus(port, { model: "sonnet", stream, messages: [{ role: "user", content: "hi" }] });
+      assert.equal(r.status, 200, r.text.slice(0, 200));
+      const lines = (ev) => buf.out.split("\n").filter((l) => l.includes(`"event":"${ev}"`)).map((l) => JSON.parse(l));
+      assert.ok(await ltWait(() => lines("claude_ok").length === 1), `premise: one claude_ok — ${ltDiag(buf)}`);
+      return { ok: lines("claude_ok")[0], rate: lines("claude_stream_event").filter((e) => e.type === "rate_limit_event") };
+    } finally { child.kill("SIGKILL"); await ltDrain(() => buf.closed, "u512", 5000); }
+  } finally { _ltRmRetry(dir); }
+}
+
+for (const stream of [false, true]) {
+  const lane = stream ? "streaming" : "buffered";
+  ltTest(`integration (#512, ${lane}): claude_ok carries the result's token counts, and the rate_limit_event is logged parsed`, async () => {
+    if (!LT_POSIX) return;
+    const { ok, rate } = await u512Run(stream, { FAKE_USAGE_EVENTS: "1" });
+    assert.equal(ok.inputTokens, 10, JSON.stringify(ok));
+    assert.equal(ok.outputTokens, 39, JSON.stringify(ok));
+    assert.equal(ok.cacheWriteTokens, 20294, JSON.stringify(ok));
+    assert.equal(ok.cacheReadTokens, 13673, JSON.stringify(ok));
+    assert.equal(rate.length, 1, `one rate_limit_event line — ${JSON.stringify(rate)}`);
+    assert.equal(rate[0].info?.windows?.five_hour?.utilization, 0.05, `utilization must be in the log line — ${JSON.stringify(rate[0])}`);
+    assert.equal(rate[0].data, undefined, "the parsed form replaces the 200-char prefix");
+  });
+  ltTest(`integration (#512 control, ${lane}): a result with no usage adds no token keys`, async () => {
+    if (!LT_POSIX) return;
+    const { ok } = await u512Run(stream, {});
+    assert.equal(typeof ok.elapsed, "number", `premise: a real claude_ok — ${JSON.stringify(ok)}`);
+    for (const k of ["inputTokens", "outputTokens", "cacheWriteTokens", "cacheReadTokens"]) assert.equal(k in ok, false, `${k} — ${JSON.stringify(ok)}`);
+  });
+}
+
+// Prefix stability, per layer. Three requests in one boot, each the others' control: 1 and 2 share
+// a system prompt and differ only in the user turn, so their systemPromptSha must match; 3 changes
+// the system message, so its sha must differ. toolsSha appears only on the request that declares tools.
+ltTest("integration (#512): claude_spawned carries systemPromptSha, toolsSha only with tools, and blockCount", async () => {
+  if (!LT_POSIX) return;
+  const dir = ltMkdir(); const fake = ltFake(dir);
+  try {
+    const { child, buf, port } = await ltBootFresh({ CLAUDE_BIN: fake }, dir);
+    try {
+      assert.ok(await ltWait(() => buf.out.includes("listening on")), `— ${ltDiag(buf)}`);
+      const spawned = () => buf.out.split("\n").filter((l) => l.includes('"event":"claude_spawned"')).map((l) => JSON.parse(l));
+      const sys = { role: "system", content: "You are a probe." };
+      const TOOL = { type: "function", function: { name: "lookup_build_id", parameters: { type: "object" } } };
+      await ltPostStatus(port, { model: "sonnet", messages: [sys, { role: "user", content: "one" }] });
+      await ltPostStatus(port, { model: "sonnet", messages: [sys, { role: "user", content: "two" }] });
+      await ltPostStatus(port, { model: "sonnet", messages: [{ role: "system", content: "You are another probe." }, { role: "user", content: "three" }] });
+      await ltPostStatus(port, { model: "sonnet", tools: [TOOL], messages: [sys, { role: "user", content: "four" }] });
+      const PNG = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNkYAAAAAYAAjCB0C8AAAAASUVORK5CYII=";
+      await ltPostStatus(port, { model: "sonnet", messages: [sys, { role: "user", content: [{ type: "text", text: "five" }, { type: "image_url", image_url: { url: PNG } }] }] });
+      assert.ok(await ltWait(() => spawned().length === 5), `premise: five spawns — ${ltDiag(buf)}`);
+      const [a, b, c, d, e5] = spawned();
+      assert.match(a.systemPromptSha, /^[0-9a-f]{12}$/, JSON.stringify(a));
+      assert.equal(a.systemPromptSha, b.systemPromptSha, "same system prompt, same sha");
+      assert.notEqual(a.systemPromptSha, c.systemPromptSha, "a different system message must change the sha");
+      assert.equal("toolsSha" in a, false, `no tools, no toolsSha — ${JSON.stringify(a)}`);
+      assert.match(d.toolsSha || "", /^[0-9a-f]{12}$/, `tools declared, toolsSha present — ${JSON.stringify(d)}`);
+      for (const e of [a, b, c, d]) assert.equal(e.blockCount, 1, `the text path is one block — ${JSON.stringify(e)}`);
+      assert.equal(e5.inputFormat, "stream-json", `premise: the image request took the stream-json path — ${JSON.stringify(e5)}`);
+      assert.ok(e5.blockCount >= 2, `a text part and an image are at least two blocks — ${JSON.stringify(e5)}`);
+    } finally { child.kill("SIGKILL"); await ltDrain(() => buf.closed, "u512-spawn", 5000); }
   } finally { _ltRmRetry(dir); }
 });
 
@@ -20806,6 +20914,14 @@ test("buildStreamJsonInput: emits one newline-terminated user envelope", () => {
   assert.equal(env.type, "user");
   assert.equal(env.message.role, "user");
   assert.equal(env.message.content[1].type, "image");
+});
+
+// #512: blockCount is what claude_spawned reports for this path, so it must be the envelope's own count.
+test("buildStreamJsonInput: stats.blockCount is the number of content blocks in the envelope", () => {
+  const { payload, stats } = mmBuildStreamJsonInput([{ role: "user", content: [txtPart("hi"), imgPart()] }, { role: "assistant", content: "ok" }, { role: "user", content: "more" }]);
+  const n = JSON.parse(payload.trim()).message.content.length;
+  assert.ok(n >= 3, `premise: a multi-block envelope — ${n}`);
+  assert.equal(stats.blockCount, n);
 });
 
 // ── malformed / policy / oversized handling (clean 4xx, never a silent drop) ──
