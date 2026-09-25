@@ -12,7 +12,7 @@ import { isUpstreamRateLimit, retryAfterSeconds } from "./lib/upstream-errors.mj
 import { listUnhonouredFields, CACHE_KEY_ONLY, ALWAYS_UNHONOURED, cliEffort, CLI_EFFORT_LEVELS } from "./lib/unhonoured-fields.mjs";
 import { summarizeResultUsage, summarizeRateLimitEvent } from "./lib/cli-usage.mjs";
 import { selectCredential, isExpired } from "./lib/credential-source.mjs";
-import { validateTools, extractBridgeToolUses, toolUsesToOpenAI, renderToolTurn, endsWithToolResult, TOOL_CONTINUATION_NOTE, TOOL_PREFIX as TC_PREFIX, buildBridgeConfig } from "./lib/tool-calling.mjs";
+import { validateTools, extractBridgeToolUses, toolUsesToOpenAI, renderToolTurn, endsWithToolResult, TOOL_CONTINUATION_NOTE, TOOL_CONTINUATION_SYSTEM_NOTE, TOOL_PREFIX as TC_PREFIX, buildBridgeConfig } from "./lib/tool-calling.mjs";
 import { PREFIX as BRIDGE_PREFIX } from "./lib/mcp-bridge.mjs";
 import { randomBytes } from "node:crypto";
 import { createSerialMutex, createTtlCache, isTokenExpiring, orderLabelsLastGoodFirst, scrubInboundAuthEnv, INBOUND_AUTH_ENV_VARS, applyRequestVerdictTtl } from "./lib/spawn-auth.mjs";
@@ -2971,6 +2971,16 @@ if [ -n "$TOOLS_CAPTURE" ]; then
     prev="$a"
   done
 fi
+if [ -n "$FAKE_REJECT_CACHE_CONTROL" ]; then
+  # #512: a claude/API that refuses a client prompt-cache breakpoint, with the real error text the
+  # CLI reported on 2026-09-25. Only when stdin carries one, so a run without it answers normally.
+  if [ -n "$STDIN_CAPTURE" ]; then fin=$(cat "$STDIN_CAPTURE"); else fin=$(cat); fi
+  case "$fin" in
+    *cache_control*)
+      printf '%s\\n' '{"type":"result","is_error":true,"result":"API Error: 400 A maximum of 4 blocks with cache_control may be provided. Found 5."}'
+      exit 1;;
+  esac
+fi
 if [ -n "$UPSTREAM_ERROR" ]; then
   # A failing spawn whose message is whatever the test wants, delivered the way a real failure
   # arrives: a result event with is_error, which server.mjs turns into a rejection.
@@ -3040,6 +3050,16 @@ function ltFake(dir) { const p = join(dir, "claude"); _ltWrite(p, LT_FAKE); _ltC
 // Caveat, stated rather than guarded: an argv element containing the literal `<<ARG>>` would
 // split wrong. Every caller here spawns a prompt it wrote itself, so that is reachable only by a
 // test author who put the marker in on purpose.
+// #512: the spawn's stdin as blocks. Under OCP_MULTIBLOCK_INPUT (the default) stdin is ONE stream-json
+// user envelope, and this returns its content blocks; plain-text stdin (the kill switch, or an
+// over-budget conversation) returns null. Callers assert which one they expected before using it.
+function ltStdinBlocks(raw) {
+  const t = String(raw).trim();
+  if (!t.startsWith("{")) return null;
+  const env = JSON.parse(t);
+  return Array.isArray(env?.message?.content) ? env.message.content : null;
+}
+
 function ltArgvCalls(file) {
   if (!_ltExists(file)) return [];
   const raw = _ltRead(file, "utf8");
@@ -4454,7 +4474,9 @@ ltTest("integration: flag OFF, tools GRANTED -> the -p spawn receives the EXACT 
     // this comment said 27, and an independent review re-measured 82 on the same host -- exactly what
     // that expiry predicts. What is pinned now is that a tools-granting spawn gets the wrapper that
     // makes no capability claim.
-    assert.equal(sp, `You are accessed via the OCP HTTP proxy. Use only the tools actually provided to you in this session, and do not infer or invent filesystem, working-directory, shell, git or machine-environment details you have not obtained through them.`);
+    // #512: under OCP_MULTIBLOCK_INPUT (the default) the tool-continuation note follows the wrapper,
+    // byte-constant, on every -p spawn. Pinned here in full so neither half can drift unseen.
+    assert.equal(sp, `You are accessed via the OCP HTTP proxy. Use only the tools actually provided to you in this session, and do not infer or invent filesystem, working-directory, shell, git or machine-environment details you have not obtained through them.\n\n${TOOL_CONTINUATION_SYSTEM_NOTE}`);
   } finally { child.kill("SIGKILL"); _ltRmRetry(dir); }
 });
 
@@ -4474,7 +4496,8 @@ ltTest("integration: AUTH_MODE=multi -> the EXACT negative wrapper, unchanged by
     // Byte-identical to what shipped before ADR 0021 item 2. multi mode passes `--tools ""`, which
     // was measured to leave 0 tools in the schema, so here the denial is accurate -- and this is the
     // untrusted-caller path, which that change deliberately did not touch.
-    assert.equal(sp, `You are accessed via the OCP HTTP proxy. You do NOT have access to any local filesystem, working directory, shell, git status, or machine environment. Do not infer or invent such information from any context you observe. Respond only based on the conversation provided.`);
+    // #512: the tool-continuation note follows the wrapper on every -p spawn (OCP_MULTIBLOCK_INPUT).
+    assert.equal(sp, `You are accessed via the OCP HTTP proxy. You do NOT have access to any local filesystem, working directory, shell, git status, or machine environment. Do not infer or invent such information from any context you observe. Respond only based on the conversation provided.\n\n${TOOL_CONTINUATION_SYSTEM_NOTE}`);
   } finally { child.kill("SIGKILL"); _ltRmRetry(dir); }
 });
 
@@ -5220,7 +5243,8 @@ ltTest("integration: AUTH_MODE=multi spawns `--tools \"\"` so the built-in schem
       // in one body that a SINGLE mutation breaks can only ever produce one mutation row, leaving
       // the second claim shipped-but-unproven.
       const tail = argv.slice(spIdx + 2);
-      assert.deepEqual(tail, ["--tools", "", "--strict-mcp-config", "--disallowedTools", "mcp__*"],
+      // #512: the default input path is stream-json for every request, so its flag leads the tail.
+      assert.deepEqual(tail, ["--input-format", "stream-json", "--tools", "", "--strict-mcp-config", "--disallowedTools", "mcp__*"],
         `multi-mode tool flags are not the empty-schema form: ${JSON.stringify(tail)}`);
 
       // The operator-facing half of the same defect: the boot banner printed the ALLOWED_TOOLS
@@ -5281,7 +5305,8 @@ ltTest("integration: the skip-permissions arm passes --dangerously-skip-permissi
       assert.ok(spIdx > -1, `argv has no --system-prompt-file: ${JSON.stringify(argv.slice(0, 8))}`);
       assert.ok(argv.length > spIdx + 2, `argv ends at the system-prompt file path; no tool flags were pushed: ${JSON.stringify(argv)}`);
       const tail = argv.slice(spIdx + 2);
-      assert.deepEqual(tail, ["--dangerously-skip-permissions"],
+      // #512: the default input path is stream-json for every request, so its flag leads the tail.
+      assert.deepEqual(tail, ["--input-format", "stream-json", "--dangerously-skip-permissions"],
         `the skip-permissions arm's tool flags changed: ${JSON.stringify(tail)}`);
 
       // The prompt half, from the SAME spawn. This arm grants MORE than the default one — it
@@ -5321,7 +5346,8 @@ ltTest("integration: the non-multi path still passes --allowedTools and never --
       // this is the surface a single-user instance actually grants, and a silent change to it
       // should redden something.
       const tail = argv.slice(spIdx + 2);
-      assert.deepEqual(tail, ["--allowedTools", "Bash", "Read", "Write", "Edit", "Glob", "Grep", "WebSearch", "WebFetch", "Agent"],
+      // #512: the default input path is stream-json for every request, so its flag leads the tail.
+      assert.deepEqual(tail, ["--input-format", "stream-json", "--allowedTools", "Bash", "Read", "Write", "Edit", "Glob", "Grep", "WebSearch", "WebFetch", "Agent"],
         `the non-multi tool flags changed: ${JSON.stringify(tail)}`);
 
       // The other half of the pin, and the row that CHANGED. The deepEqual immediately above pins nine
@@ -7237,6 +7263,242 @@ ltTest("integration (#512): claude_spawned carries systemPromptSha, toolsSha onl
   } finally { _ltRmRetry(dir); }
 });
 
+console.log("\n#512 PR 2: one content block per message, append-only:");
+
+// An agent conversation as two consecutive requests: step N ends on two parallel tool results; step
+// N+1 is N plus the model's answer, the user's next turn, a third call and its result. Nonces make
+// each request's stdin capture identifiable (the capture file is overwritten per spawn, #405).
+function lt512Steps(nonce) {
+  const T = (id, n) => ({ id, type: "function", function: { name: n, arguments: "{}" } });
+  const stepN = [
+    { role: "system", content: "You are a probe." },
+    { role: "user", content: `first question ${nonce}` },
+    { role: "assistant", content: null, tool_calls: [T("c1", "lookup_a"), T("c2", "lookup_b")] },
+    { role: "tool", tool_call_id: "c1", content: "result A" },
+    { role: "tool", tool_call_id: "c2", content: `result B ${nonce}-N` },
+  ];
+  const stepN1 = [...stepN,
+    { role: "assistant", content: "A and B are known." },
+    { role: "user", content: "and now C?" },
+    { role: "assistant", content: null, tool_calls: [T("c3", "lookup_c")] },
+    { role: "tool", tool_call_id: "c3", content: `result C ${nonce}-N1` },
+  ];
+  return { stepN, stepN1 };
+}
+const LT512_TOOLS = ["lookup_a", "lookup_b", "lookup_c"].map((n) => ({ type: "function", function: { name: n, parameters: { type: "object" } } }));
+
+async function lt512Capture(env, bodies) {
+  const dir = ltMkdir(); const fake = ltFake(dir);
+  const stdinFile = join(dir, "stdin.txt"); const spFile = join(dir, "sp.txt");
+  try {
+    const { child, buf, port } = await ltBootFresh({ CLAUDE_BIN: fake, STDIN_CAPTURE: stdinFile, SP_CAPTURE: spFile, ...env }, dir);
+    try {
+      assert.ok(await ltWait(() => buf.out.includes("listening on")), `— ${ltDiag(buf)}`);
+      const out = [];
+      for (const { body, marker } of bodies) {
+        const r = await ltPostStatus(port, body);
+        assert.equal(r.status, 200, `${r.status} ${r.text.slice(0, 200)}`);
+        assert.ok(await ltWait(() => _ltExists(stdinFile) && _ltRead(stdinFile, "utf8").includes(marker)), `the capture for ${marker} never appeared`);
+        out.push({ raw: _ltRead(stdinFile, "utf8"), sp: _ltRead(spFile, "utf8") });
+      }
+      const spawned = buf.out.split("\n").filter((l) => l.includes('"event":"claude_spawned"')).map((l) => JSON.parse(l));
+      return { out, spawned };
+    } finally { child.kill("SIGKILL"); await ltDrain(() => buf.closed, "lt512", 5000); }
+  } finally { _ltRmRetry(dir); }
+}
+
+// THE property the prompt cache depends on, tested directly: request N's blocks are an element-wise
+// prefix of request N+1's. Consecutive tool results share one block (the ~20-block lookback, #512).
+ltTest("integration (#512): step N's content blocks are an exact prefix of step N+1's, with parallel tool results in one block", async () => {
+  if (!LT_POSIX) return;
+  const nonce = "P" + Math.random().toString(36).slice(2, 8);
+  const { stepN, stepN1 } = lt512Steps(nonce);
+  const { out } = await lt512Capture({}, [
+    { body: { model: "sonnet", tools: LT512_TOOLS, messages: stepN }, marker: `${nonce}-N"` },
+    { body: { model: "sonnet", tools: LT512_TOOLS, messages: stepN1 }, marker: `${nonce}-N1` },
+  ]);
+  const a = ltStdinBlocks(out[0].raw); const b = ltStdinBlocks(out[1].raw);
+  assert.ok(Array.isArray(a) && Array.isArray(b), `premise: both are stream-json envelopes — ${out[0].raw.slice(0, 120)}`);
+  assert.ok(b.length > a.length, `premise: N+1 has more blocks (${a.length} -> ${b.length})`);
+  // The cache breakpoint is a marker, not content: the prompt cache matches the blocks WITHOUT it,
+  // and it has to move to the new last block on every request. Compare content, then pin the marker.
+  const content = ({ cache_control, ...rest }) => rest;
+  for (let i = 0; i < a.length; i++) assert.deepEqual(content(b[i]), content(a[i]), `block ${i} of step N changed in step N+1 — the cache cannot match past it`);
+  for (const [name, blocks] of [["N", a], ["N+1", b]]) {
+    const marked = blocks.map((x, i) => (x.cache_control ? i : -1)).filter((i) => i > -1);
+    assert.deepEqual(marked, [blocks.length - 1], `${name}: exactly one breakpoint, on the last block — ${JSON.stringify(marked)}`);
+    assert.deepEqual(blocks[blocks.length - 1].cache_control, { type: "ephemeral", ttl: "1h" }, `${name}: the default breakpoint is 1h`);
+  }
+  // user, the two calls, the two results as ONE block.
+  assert.equal(a.length, 3, `step N is 3 blocks: ${JSON.stringify(a.map((x) => x.text.slice(0, 40)))}`);
+  const last = a[2].text;
+  const iA = last.indexOf("[Tool lookup_a returned]\nresult A"); const iB = last.indexOf("[Tool lookup_b returned]\nresult B");
+  assert.ok(iA > -1 && iB > iA, `both results, in order, in one block — ${JSON.stringify(last)}`);
+});
+
+// The model reads the same characters as before: the blocks, concatenated, are byte-identical to the
+// kill switch's plain text minus its trailing note. Two boots, same body.
+ltTest("integration (#512): the blocks concatenate to exactly the pre-#512 text, minus the trailing note", async () => {
+  if (!LT_POSIX) return;
+  const nonce = "E" + Math.random().toString(36).slice(2, 8);
+  const { stepN1 } = lt512Steps(nonce);
+  const body = { model: "sonnet", tools: LT512_TOOLS, messages: stepN1 };
+  const multi = await lt512Capture({}, [{ body, marker: `${nonce}-N1` }]);
+  const legacy = await lt512Capture({ OCP_MULTIBLOCK_INPUT: "0" }, [{ body, marker: `${nonce}-N1` }]);
+  const blocks = ltStdinBlocks(multi.out[0].raw);
+  const plain = legacy.out[0].raw;
+  assert.ok(Array.isArray(blocks), "premise: default mode sends blocks");
+  assert.equal(ltStdinBlocks(plain), null, "premise: the kill switch sends plain text");
+  const tail = `\n\n${TOOL_CONTINUATION_NOTE}`;
+  assert.ok(plain.endsWith(tail), `premise: the legacy text ends with the note — ${JSON.stringify(plain.slice(-80))}`);
+  assert.equal(blocks.map((x) => x.text).join(""), plain.slice(0, -tail.length));
+});
+
+// A system prompt that changed with "does the history end in a tool result" would invalidate the cache
+// at the layer BEFORE the conversation. Same tools, one request ending in a result, one not.
+ltTest("integration (#512): the system prompt is byte-identical whether or not the conversation ends in a tool result", async () => {
+  if (!LT_POSIX) return;
+  const nonce = "S" + Math.random().toString(36).slice(2, 8);
+  const { stepN } = lt512Steps(nonce);
+  const { out, spawned } = await lt512Capture({}, [
+    { body: { model: "sonnet", tools: LT512_TOOLS, messages: stepN }, marker: `${nonce}-N"` },
+    { body: { model: "sonnet", tools: LT512_TOOLS, messages: [...stepN, { role: "assistant", content: "done" }, { role: "user", content: `thanks ${nonce}-U` }] }, marker: `${nonce}-U` },
+  ]);
+  assert.ok(out[0].sp.includes(TOOL_CONTINUATION_SYSTEM_NOTE), "premise: the note is in the system prompt");
+  assert.equal(out[1].sp, out[0].sp, "the system prompt moved with the shape of the conversation");
+  assert.equal(spawned.length, 2, "premise: two spawns");
+  assert.equal(spawned[1].systemPromptSha, spawned[0].systemPromptSha, "claude_spawned must say the same");
+});
+
+// Over budget, a text-only conversation keeps the text path: its whole-message truncation, not the
+// block path's mid-block cut. That the prefix cannot be stable here is the stated limit (#512 plan §3.4).
+ltTest("integration (#512): an over-budget text-only conversation takes the text path, without the trailing note", async () => {
+  if (!LT_POSIX) return;
+  const nonce = "B" + Math.random().toString(36).slice(2, 8);
+  const { stepN } = lt512Steps(nonce);
+  const big = [{ role: "user", content: "x".repeat(3000) }, ...stepN.slice(1)];
+  const { out, spawned } = await lt512Capture({ CLAUDE_MAX_PROMPT_CHARS: "2000" }, [
+    // No closing quote in this marker: this capture is plain text, not JSON.
+    { body: { model: "sonnet", tools: LT512_TOOLS, messages: big }, marker: `${nonce}-N` },
+  ]);
+  assert.equal(ltStdinBlocks(out[0].raw), null, `over budget must be plain text — ${out[0].raw.slice(0, 120)}`);
+  assert.equal(spawned[0]?.inputFormat, "text", JSON.stringify(spawned[0]));
+  assert.ok(out[0].raw.includes("older messages were truncated"), `premise: the text path's truncation ran — ${out[0].raw.slice(0, 200)}`);
+  assert.ok(!out[0].raw.includes(TOOL_CONTINUATION_NOTE), "the system prompt carries the note; the text path must not add it again");
+  assert.ok(out[0].sp.includes(TOOL_CONTINUATION_SYSTEM_NOTE), "premise: the note is in the system prompt");
+});
+
+// #512: OCP_CACHE_BREAKPOINT. Three boots, each the others' control: the default puts a 1h breakpoint
+// on the last block, 5m changes only the TTL, off removes it -- and claude_spawned says which.
+ltTest("integration (#512): OCP_CACHE_BREAKPOINT sets the last block's breakpoint — 1h by default, 5m, or none", async () => {
+  if (!LT_POSIX) return;
+  const nonce = "C" + Math.random().toString(36).slice(2, 8);
+  const { stepN } = lt512Steps(nonce);
+  const body = { body: { model: "sonnet", tools: LT512_TOOLS, messages: stepN }, marker: `${nonce}-N"` };
+  for (const [env, want] of [[{}, { type: "ephemeral", ttl: "1h" }], [{ OCP_CACHE_BREAKPOINT: "5m" }, { type: "ephemeral", ttl: "5m" }], [{ OCP_CACHE_BREAKPOINT: "off" }, undefined]]) {
+    const { out, spawned } = await lt512Capture(env, [body]);
+    const blocks = ltStdinBlocks(out[0].raw);
+    assert.ok(Array.isArray(blocks) && blocks.length > 1, `premise: a multi-block envelope — ${out[0].raw.slice(0, 120)}`);
+    assert.deepEqual(blocks[blocks.length - 1].cache_control, want, `${JSON.stringify(env)}: last block's breakpoint`);
+    assert.equal(blocks.slice(0, -1).some((x) => x.cache_control), false, `${JSON.stringify(env)}: no other block may carry one`);
+    assert.equal(spawned[0].cacheBreakpoint, want?.ttl, `${JSON.stringify(env)}: claude_spawned must name the breakpoint in use`);
+  }
+});
+
+// The CLI spends 3 of the API's 4 breakpoints and decides the TTL of the one after ours, so the API
+// can refuse ours. The first refusal switches the breakpoint off for the rest of the boot: that request
+// fails, the next one runs without it instead of failing too.
+// Both lanes, because each has its own is_error arm and each must switch it off.
+for (const stream of [false, true]) ltTest(`integration (#512, ${stream ? "streaming" : "buffered"}): a 400 naming cache_control switches the breakpoint off for the rest of the boot`, async () => {
+  if (!LT_POSIX) return;
+  const dir = ltMkdir(); const fake = ltFake(dir);
+  const stdinFile = join(dir, "stdin.txt");
+  try {
+    const { child, buf, port } = await ltBootFresh({ CLAUDE_BIN: fake, STDIN_CAPTURE: stdinFile, FAKE_REJECT_CACHE_CONTROL: "1" }, dir);
+    try {
+      assert.ok(await ltWait(() => buf.out.includes("listening on")), `— ${ltDiag(buf)}`);
+      const r1 = await ltPostStatus(port, { model: "sonnet", stream, messages: [{ role: "user", content: "one" }] });
+      // The streaming lane answers an upstream error as an SSE error event on a 200.
+      assert.ok(r1.status !== 200 || /"error"/.test(r1.text), `premise: the fake refused the breakpoint — ${r1.status} ${r1.text.slice(0, 200)}`);
+      assert.ok(await ltWait(() => /"event":"cache_breakpoint_disabled"/.test(buf.out + buf.err)), `the switch-off must be logged — ${ltDiag(buf)}`);
+      const r2 = await ltPostStatus(port, { model: "sonnet", stream, messages: [{ role: "user", content: "two" }] });
+      assert.ok(r2.status === 200 && !/"error"/.test(r2.text), `the next request must run without the breakpoint, not fail too — ${r2.status} ${r2.text.slice(0, 200)}`);
+      const raw = _ltRead(stdinFile, "utf8");
+      assert.ok(raw.includes("two"), `premise: the capture is the second request's — ${raw.slice(0, 120)}`);
+      assert.ok(!raw.includes("cache_control"), `the second request still carried a breakpoint — ${raw.slice(0, 200)}`);
+    } finally { child.kill("SIGKILL"); await ltDrain(() => buf.closed, "bp-off", 5000); }
+  } finally { _ltRmRetry(dir); }
+});
+
+// Review P2 on #520: a 400 naming cache_control from a spawn that sent NO breakpoint (here the kill
+// switch) says nothing about ours and must not switch it off. The failing request is the premise.
+ltTest("integration (#512): a cache_control 400 from a spawn that carried no breakpoint does not switch it off", async () => {
+  if (!LT_POSIX) return;
+  const dir = ltMkdir(); const fake = ltFake(dir);
+  try {
+    const { child, buf, port } = await ltBootFresh({ CLAUDE_BIN: fake, OCP_MULTIBLOCK_INPUT: "0",
+      UPSTREAM_ERROR: "API Error: 400 A maximum of 4 blocks with cache_control may be provided. Found 5." }, dir);
+    try {
+      assert.ok(await ltWait(() => buf.out.includes("listening on")), `— ${ltDiag(buf)}`);
+      const r = await ltPostStatus(port, { model: "sonnet", messages: [{ role: "user", content: "no breakpoint here" }] });
+      assert.ok(r.status !== 200 && /cache_control/.test(r.text), `premise: the request failed with the cache_control 400 — ${r.status} ${r.text.slice(0, 200)}`);
+      await new Promise((res) => setTimeout(res, 300));
+      assert.ok(!/"event":"cache_breakpoint_disabled"/.test(buf.out + buf.err), "a spawn that sent no breakpoint switched ours off");
+    } finally { child.kill("SIGKILL"); await ltDrain(() => buf.closed, "bp-not-ours", 5000); }
+  } finally { _ltRmRetry(dir); }
+});
+
+// The two modes hand the model different input, so a cached answer from one must not be served in
+// the other: MULTIBLOCK_INPUT is folded into CONFIG_EPOCH. Two boots sharing one store (#176 shape).
+ltTest("integration (#512): toggling OCP_MULTIBLOCK_INPUT invalidates the standard response cache (epoch fold)", async () => {
+  if (!LT_POSIX) return;
+  const dir = ltMkdir(); const fake = ltFake(dir); const counter = join(dir, "spawns.txt");
+  const req = { model: "sonnet", messages: [{ role: "user", content: "multiblock-epoch-probe" }] };
+  const bootOnce = async (env) => {
+    const { child, buf, port } = await ltBootFresh({ CLAUDE_BIN: fake, CLAUDE_CACHE_TTL: "60000", SP_COUNTER: counter, ...env }, dir);
+    try {
+      assert.ok(await ltWait(() => buf.out.includes("listening on")), `did not start: ${buf.err.slice(0, 160)}`);
+      _ltWrite(counter, "0");
+      await ltPost(port, req);
+      await ltWait(() => (Number(_ltRead(counter, "utf8")) || 0) >= 1, 3000);
+      return Number(_ltRead(counter, "utf8")) || 0;
+    } finally { child.kill("SIGKILL"); await ltDrain(() => buf.closed, "multiblock-epoch", 5000); }
+  };
+  try {
+    const on = await bootOnce({});
+    const off = await bootOnce({ OCP_MULTIBLOCK_INPUT: "0" });
+    assert.equal(on, 1, "premise: the first request (cache empty) must spawn claude");
+    assert.equal(off, 1, "after toggling the flag the identical request must NOT be served from the other mode's cache");
+  } finally { _ltRmRetry(dir); }
+});
+
+// "Byte for byte" under the kill switch includes the IMAGE path, which takes stream-json in both modes:
+// no breakpoint, the trailing note back as the last block, and no note in the system prompt.
+ltTest("integration (#512 kill switch): an image request under OCP_MULTIBLOCK_INPUT=0 carries no breakpoint and keeps the trailing note", async () => {
+  if (!LT_POSIX) return;
+  const dir = ltMkdir(); const fake = ltFake(dir);
+  const stdinFile = join(dir, "stdin.txt"); const spFile = join(dir, "sp.txt");
+  try {
+    const { child, buf, port } = await ltBootFresh({ CLAUDE_BIN: fake, STDIN_CAPTURE: stdinFile, SP_CAPTURE: spFile, OCP_MULTIBLOCK_INPUT: "0" }, dir);
+    try {
+      assert.ok(await ltWait(() => buf.out.includes("listening on")), `— ${ltDiag(buf)}`);
+      const PNG = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNkYAAAAAYAAjCB0C8AAAAASUVORK5CYII=";
+      const r = await ltPostStatus(port, { model: "sonnet", messages: [
+        { role: "user", content: [{ type: "text", text: "what is this?" }, { type: "image_url", image_url: { url: PNG } }] },
+        { role: "assistant", content: null, tool_calls: [{ id: "c1", type: "function", function: { name: "lookup_a", arguments: "{}" } }] },
+        { role: "tool", tool_call_id: "c1", content: "kill-switch-image-probe" },
+      ] });
+      assert.equal(r.status, 200, `${r.status} ${r.text.slice(0, 200)}`);
+      assert.ok(await ltWait(() => _ltExists(stdinFile) && _ltExists(spFile)), "premise: captures");
+      const blocks = ltStdinBlocks(_ltRead(stdinFile, "utf8"));
+      assert.ok(Array.isArray(blocks) && blocks.some((b) => b.type === "image"), "premise: the image path, as stream-json");
+      assert.equal(blocks.some((b) => b.cache_control), false, "the kill switch must not send a breakpoint on the image path either");
+      assert.ok(blocks[blocks.length - 1].text?.includes(TOOL_CONTINUATION_NOTE), `the trailing note is the last block again — ${JSON.stringify(blocks[blocks.length - 1])}`);
+      assert.ok(!_ltRead(spFile, "utf8").includes(TOOL_CONTINUATION_SYSTEM_NOTE), "and it is not in the system prompt");
+    } finally { child.kill("SIGKILL"); await ltDrain(() => buf.closed, "ks-image", 5000); }
+  } finally { _ltRmRetry(dir); }
+});
+
 console.log("\nOpenAI tool calling over the MCP bridge (ADR 0022):");
 
 // ── unit: the pure helpers ──────────────────────────────────────────────────────────────────────
@@ -7345,7 +7607,9 @@ ltTest("integration (ADR 0022): a declared tool the model chooses comes back as 
       assert.ok(argv.length > 0, `no argv captured — ${ltDiag(buf)}`);
       const spIdx = argv.indexOf("--system-prompt-file");
       assert.ok(spIdx > -1, JSON.stringify(argv.slice(0, 8)));
-      const tail = argv.slice(spIdx + 2);
+      // #512: `--input-format stream-json` now leads every -p tail; the bridge's flags follow it.
+      assert.deepEqual(argv.slice(spIdx + 2, spIdx + 4), ["--input-format", "stream-json"], JSON.stringify(argv.slice(spIdx)));
+      const tail = argv.slice(spIdx + 4);
       assert.equal(tail[0], "--tools"); assert.equal(tail[1], "", "the built-in schema is EMPTIED: the model holds exactly the client's tools");
       assert.equal(tail[2], "--mcp-config"); assert.ok(tail[3].endsWith(".json"), tail[3]);
       assert.equal(tail[4], "--strict-mcp-config", "only the bridge is loaded; no account connectors");
@@ -7838,12 +8102,16 @@ ltTest("integration (#474 control): a normal spawn still completes with the deta
   } finally { _ltRmRetry(dir); }
 });
 
-ltTest("integration (ADR 0022): a tool result sent back is rendered into the next spawn's prompt with the continuation note", async () => {
-  if (!LT_POSIX) return;
+// #512 split this test in two: the rendering is the same on both input paths, but WHERE the
+// continuation note lives is not. Default (OCP_MULTIBLOCK_INPUT on): stdin is one stream-json
+// envelope whose LAST block is the tool result itself, and the note is in the system prompt. Kill
+// switch: the pre-#512 shape, plain-text stdin with the note after the last result. The two tests
+// are each other's control -- a mutation that puts the note in both places, or in neither, reddens one.
+async function ltToolResultTurn(env) {
   const dir = ltMkdir(); const fake = ltFake(dir);
-  const stdinFile = join(dir, "stdin.txt");
+  const stdinFile = join(dir, "stdin.txt"); const spFile = join(dir, "sp.txt"); const argvFile = join(dir, "argv.txt");
   try {
-    const { child, buf, port } = await ltBootFresh({ CLAUDE_BIN: fake, STDIN_CAPTURE: stdinFile }, dir);
+    const { child, buf, port } = await ltBootFresh({ CLAUDE_BIN: fake, STDIN_CAPTURE: stdinFile, SP_CAPTURE: spFile, ARGV_CAPTURE: argvFile, ...env }, dir);
     try {
       assert.ok(await ltWait(() => buf.out.includes("listening on")), `— ${ltDiag(buf)}`);
       const TOOL = { type: "function", function: { name: "lookup_build_id", parameters: { type: "object" } } };
@@ -7854,19 +8122,45 @@ ltTest("integration (ADR 0022): a tool result sent back is rendered into the nex
       ] });
       assert.equal(r.status, 200, `${r.status} ${r.text.slice(0, 200)}`);
       assert.equal(JSON.parse(r.text).choices[0].finish_reason, "stop", "the fake answers with text, so this turn ends normally");
-      assert.ok(await ltWait(() => _ltExists(stdinFile)), "the fake did not capture stdin");
-      const prompt = _ltRead(stdinFile, "utf8");
-      // Positive anchors first (#405), then order.
-      const iCall = prompt.indexOf("[Assistant called tool lookup_build_id with arguments {\"project\":\"alpha\"}]");
-      const iRes = prompt.indexOf("[Tool lookup_build_id returned]\nbuild-7f3a9c");
-      const iNote = prompt.indexOf(TOOL_CONTINUATION_NOTE);
-      assert.ok(iCall > -1, `the call was not rendered: ${prompt.slice(0, 300)}`);
-      assert.ok(iRes > iCall, `the result was not rendered after the call (call@${iCall}, result@${iRes})`);
-      assert.ok(iNote > iRes, `the continuation note must follow the last result (result@${iRes}, note@${iNote})`);
+      assert.ok(await ltWait(() => _ltExists(stdinFile) && _ltExists(spFile)), "the fake did not capture stdin and the system prompt");
+      return { raw: _ltRead(stdinFile, "utf8"), sp: _ltRead(spFile, "utf8"), argv: ltArgvCalls(argvFile) };
     } finally { child.kill("SIGKILL"); await ltDrain(() => buf.closed, "tool-result", 5000); }
   } finally { _ltRmRetry(dir); }
+}
+
+ltTest("integration (ADR 0022, #512): a tool result sent back is rendered into the next spawn's prompt, ends it, and the continuation note rides in the system prompt", async () => {
+  if (!LT_POSIX) return;
+  const { raw, sp, argv } = await ltToolResultTurn({});
+  const blocks = ltStdinBlocks(raw);
+  assert.ok(Array.isArray(blocks) && blocks.length >= 2, `premise: a stream-json envelope with one block per message — ${raw.slice(0, 300)}`);
+  assert.ok(argv.includes("--input-format"), `premise: the stream-json input path — ${JSON.stringify(argv.slice(-10))}`);
+  const text = blocks.map((b) => b.text).join("");
+  // Positive anchors first (#405), then order.
+  const iCall = text.indexOf("[Assistant called tool lookup_build_id with arguments {\"project\":\"alpha\"}]");
+  const iRes = text.indexOf("[Tool lookup_build_id returned]\nbuild-7f3a9c");
+  assert.ok(iCall > -1, `the call was not rendered: ${text.slice(0, 300)}`);
+  assert.ok(iRes > iCall, `the result was not rendered after the call (call@${iCall}, result@${iRes})`);
+  // The cache property: the prompt ENDS on the result itself, so the next request's blocks extend
+  // this one's instead of replacing its last block.
+  assert.ok(blocks[blocks.length - 1].text.endsWith("[Tool lookup_build_id returned]\nbuild-7f3a9c"),
+    `the last block must be the tool result — ${JSON.stringify(blocks[blocks.length - 1])}`);
+  assert.ok(!text.includes(TOOL_CONTINUATION_NOTE), "the trailing note must not be in the user turn");
+  assert.ok(sp.includes(TOOL_CONTINUATION_SYSTEM_NOTE), `the note must reach the spawn through the system prompt — ${sp.slice(-300)}`);
 });
 
+ltTest("integration (ADR 0022, #512 kill switch): OCP_MULTIBLOCK_INPUT=0 restores plain-text stdin with the continuation note after the last result", async () => {
+  if (!LT_POSIX) return;
+  const { raw, sp, argv } = await ltToolResultTurn({ OCP_MULTIBLOCK_INPUT: "0" });
+  assert.equal(ltStdinBlocks(raw), null, `premise: plain-text stdin — ${raw.slice(0, 120)}`);
+  assert.ok(!argv.includes("--input-format"), `no stream-json input on the text path — ${JSON.stringify(argv.slice(-10))}`);
+  const iCall = raw.indexOf("[Assistant called tool lookup_build_id with arguments {\"project\":\"alpha\"}]");
+  const iRes = raw.indexOf("[Tool lookup_build_id returned]\nbuild-7f3a9c");
+  const iNote = raw.indexOf(TOOL_CONTINUATION_NOTE);
+  assert.ok(iCall > -1, `the call was not rendered: ${raw.slice(0, 300)}`);
+  assert.ok(iRes > iCall, `the result was not rendered after the call (call@${iCall}, result@${iRes})`);
+  assert.ok(iNote > iRes, `the continuation note must follow the last result (result@${iRes}, note@${iNote})`);
+  assert.ok(!sp.includes(TOOL_CONTINUATION_SYSTEM_NOTE), "the kill switch must also take the note back out of the system prompt");
+});
 ltTest("integration (ADR 0022): with stream:true the tool_calls arrive as one indexed delta, then finish_reason, then [DONE]", async () => {
   if (!LT_POSIX) return;
   const dir = ltMkdir(); const fake = ltFake(dir);
@@ -7913,8 +8207,9 @@ ltTest("integration (#477): an image request IS bridged, and its tool history re
   const dir = ltMkdir(); const fake = ltFake(dir);
   const argvFile = join(dir, "argv.txt");
   const stdinFile = join(dir, "stdin.txt");
+  const spFile = join(dir, "sp.txt");
   try {
-    const { child, buf, port } = await ltBootFresh({ CLAUDE_BIN: fake, ARGV_CAPTURE: argvFile, STDIN_CAPTURE: stdinFile, TOOL_USE_NAME: "lookup_build_id" }, dir);
+    const { child, buf, port } = await ltBootFresh({ CLAUDE_BIN: fake, ARGV_CAPTURE: argvFile, STDIN_CAPTURE: stdinFile, SP_CAPTURE: spFile, TOOL_USE_NAME: "lookup_build_id" }, dir);
     try {
       assert.ok(await ltWait(() => buf.out.includes("listening on")), `— ${ltDiag(buf)}`);
       const TOOL = { type: "function", function: { name: "lookup_build_id", parameters: { type: "object" } } };
@@ -7952,14 +8247,17 @@ ltTest("integration (#477): an image request IS bridged, and its tool history re
       const iCall = stdin.indexOf("[Assistant called tool lookup_build_id");
       const iResult = stdin.indexOf("[Tool lookup_build_id returned]");
       const iNonce = stdin.indexOf(NONCE);
-      const iNote = stdin.indexOf("results are final");
       // Anchors by INDEX before any ordering claim (#347): -1 is not "early", it is "absent".
       assert.ok(iCall > -1, `the rendered CALL must reach the spawn — ${stdin.slice(0, 400)}`);
       assert.ok(iResult > -1, `the rendered RESULT must reach the spawn — ${stdin.slice(0, 400)}`);
       assert.ok(iNonce > -1, `the client's own result value must reach the spawn — ${stdin.slice(0, 400)}`);
-      assert.ok(iNote > -1, `the continuation note must reach the spawn — ${stdin.slice(0, 400)}`);
-      assert.ok(iCall < iResult && iResult < iNonce && iNonce < iNote,
-        `order must be call → result → value → note, got ${iCall}/${iResult}/${iNonce}/${iNote}`);
+      assert.ok(iCall < iResult && iResult < iNonce,
+        `order must be call → result → value, got ${iCall}/${iResult}/${iNonce}`);
+      // #512: the continuation note reaches the spawn through the system prompt now, not as a
+      // trailing user block (which moved every step and broke the prompt cache).
+      assert.ok(!stdin.includes(TOOL_CONTINUATION_NOTE), `the trailing note must not be in the user turn — ${stdin.slice(-300)}`);
+      assert.ok(_ltExists(spFile) && _ltRead(spFile, "utf8").includes(TOOL_CONTINUATION_SYSTEM_NOTE),
+        "the continuation note must reach the spawn through the system prompt");
       // The image is still there: rendering the history must not have displaced it.
       assert.match(stdin, /"type":"image"/, `the image block must survive alongside the rendered turns — ${stdin.slice(0, 300)}`);
       // A rendered turn already carries its own role marker, so rolePrefix must NOT be applied on
@@ -20922,6 +21220,21 @@ test("buildStreamJsonInput: stats.blockCount is the number of content blocks in 
   const n = JSON.parse(payload.trim()).message.content.length;
   assert.ok(n >= 3, `premise: a multi-block envelope — ${n}`);
   assert.equal(stats.blockCount, n);
+});
+
+// #512: coalescing appends a tool result to the PREVIOUS TEXT block only. A tool result that carried
+// an image leaves that image as the last block, and the next result must open a new text block.
+test("buildImageBlocks: coalesceToolResults never appends text onto an image block", () => {
+  const { blocks } = mmBuildImageBlocks([
+    { role: "user", content: "look" },
+    { role: "assistant", content: null, tool_calls: [{ id: "c1", type: "function", function: { name: "shot", arguments: "{}" } }, { id: "c2", type: "function", function: { name: "note", arguments: "{}" } }] },
+    { role: "tool", tool_call_id: "c1", content: [txtPart("a chart"), imgPart()] },
+    { role: "tool", tool_call_id: "c2", content: "second result" },
+  ], { coalesceToolResults: true, continuationNote: false }); // the multi-block path's options
+  const types = blocks.map((b) => b.type);
+  assert.deepEqual(types.slice(-3), ["text", "image", "text"], `the image stays between the two results — ${JSON.stringify(types)}`);
+  assert.equal("text" in blocks[blocks.length - 2], false, "no text was appended onto the image block");
+  assert.ok(blocks[blocks.length - 1].text.includes("[Tool note returned]\nsecond result"), JSON.stringify(blocks[blocks.length - 1]));
 });
 
 // ── malformed / policy / oversized handling (clean 4xx, never a silent drop) ──

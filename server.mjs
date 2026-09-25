@@ -54,7 +54,7 @@ import { listUnhonouredFields, CACHE_KEY_ONLY, cliEffort } from "./lib/unhonoure
 import { summarizeResultUsage, summarizeRateLimitEvent } from "./lib/cli-usage.mjs";
 import { selectCredential } from "./lib/credential-source.mjs";
 import { validateTools, extractBridgeToolUses, extractAssistantText, toolUsesToOpenAI, renderToolTurn,
-         endsWithToolResult, TOOL_CONTINUATION_NOTE, TOOL_PREFIX, buildBridgeConfig } from "./lib/tool-calling.mjs";
+         endsWithToolResult, TOOL_CONTINUATION_NOTE, TOOL_CONTINUATION_SYSTEM_NOTE, TOOL_PREFIX, buildBridgeConfig } from "./lib/tool-calling.mjs";
 import { runTuiTurn, reapStaleTuiSessions, resolveTuiHome, bootTuiPane, tuiPaneHealthy, poolPaneName, killLiveTurnPanes, POOL_BOOT_MS } from "./lib/tui/session.mjs";
 import { detectTuiUpstreamError } from "./lib/tui/transcript.mjs";
 import { TuiSemaphore, SemaphoreAbortError, recordTuiEntrypoint, buildTuiHealthBlock } from "./lib/tui/semaphore.mjs";
@@ -286,7 +286,11 @@ const LOCAL_TOOLS_ACTIVE = LOCAL_TOOLS && process.env.CLAUDE_TUI_MODE !== "true"
 // never reads or writes the cache at all. Only non-bridge spawns are cached, and those still use
 // the boot-time wrapper this epoch was computed from.
 function extractSystemPrompt(messages, opts = {}) {
-  const wrapper = opts.toolBridge && !LOCAL_TOOLS_ACTIVE ? OCP_NEUTRAL_TOOLS_WRAPPER : SYSTEM_PROMPT_WRAPPER;
+  const chosen = opts.toolBridge && !LOCAL_TOOLS_ACTIVE ? OCP_NEUTRAL_TOOLS_WRAPPER : SYSTEM_PROMPT_WRAPPER;
+  // #512: the continuation note, unconditionally and byte-constant, on every -p spawn. Conditional
+  // placement (only when the history ends in a tool result) would change the SYSTEM prompt between
+  // steps and invalidate the cache at a layer before the conversation, which is worse than before.
+  const wrapper = MULTIBLOCK_INPUT ? `${chosen}\n\n${TOOL_CONTINUATION_SYSTEM_NOTE}` : chosen;
   const systemMessages = (messages ?? []).filter(m => m.role === "system");
   if (systemMessages.length === 0) {
     return appendOperatorPrompt(wrapper, SYSTEM_PROMPT);
@@ -498,6 +502,35 @@ const BIND_ADDRESS = process.env.CLAUDE_BIND || "127.0.0.1";
 // DNS name — which is also the only deployment DNS rebinding can imitate. See lib/host-gate.mjs.
 const ALLOWED_HOSTS = parseAllowedHosts(process.env.OCP_ALLOWED_HOSTS);
 const NO_CONTEXT = process.env.CLAUDE_NO_CONTEXT === "true";
+// #512: hand the conversation to `claude -p` as one content block per message (stream-json), with
+// the tool-continuation note moved into the system prompt, so a growing agent conversation is an
+// append-only block list the prompt cache can match. `OCP_MULTIBLOCK_INPUT=0` restores the
+// single-text-block input and the trailing note, byte for byte. Boot-time only.
+const MULTIBLOCK_INPUT = process.env.OCP_MULTIBLOCK_INPUT !== "0";
+// #512: under MULTIBLOCK_INPUT, OCP puts ONE prompt-cache breakpoint on the last block it sends. The
+// CLI's own final breakpoint lands on a block it appends after the client's content, so the entry it
+// writes is never a prefix of the next request; an entry ending on our last block is, and the API's
+// short lookback finds it. Measured on opus 5.5 through OCP (#512, 2026-09-25): each agent step read
+// the whole previous prompt and wrote ~240 tokens, against ~13.5k re-written per step without it.
+//
+// The CLI already spends 3 of the API's 4 breakpoints (a 2nd client breakpoint was refused "Found 5"),
+// and the TTL must not be shorter than a breakpoint the CLI places AFTER ours (a 5m one before the
+// CLI's 1h one was refused). Both are the CLI's to change, so: OCP_CACHE_BREAKPOINT=1h (default) |
+// 5m | off, and the first 400 that names cache_control switches it off for the rest of this boot.
+// That request fails, as does any spawn already in flight with a breakpoint (each reads the value
+// once, at spawn); spawns after the switch run without it instead of failing too.
+let cacheBreakpointTtl = ({ "": "1h", "1h": "1h", "5m": "5m" })[(process.env.OCP_CACHE_BREAKPOINT || "").trim().toLowerCase()] ?? null;
+if (process.env.OCP_CACHE_BREAKPOINT && cacheBreakpointTtl === null && !/^(off|0|false|no)$/i.test(process.env.OCP_CACHE_BREAKPOINT.trim())) {
+  console.error(`WARNING: OCP_CACHE_BREAKPOINT=${JSON.stringify(process.env.OCP_CACHE_BREAKPOINT)} is not 1h, 5m or off — treating it as off.`);
+}
+// `spawnCarried` is the breakpoint the failing spawn actually sent (review P2 on #520): a 400 from a
+// spawn that sent none -- the kill switch, or the over-budget text path -- says nothing about ours.
+function noteCacheBreakpointRejection(errText, spawnCarried) {
+  if (cacheBreakpointTtl === null || !spawnCarried) return;
+  if (!/cache_control/.test(errText) || !/\b400\b/.test(errText)) return;
+  logEvent("warn", "cache_breakpoint_disabled", { ttl: cacheBreakpointTtl, reason: String(errText).slice(0, 200) });
+  cacheBreakpointTtl = null;
+}
 // Config epoch for the response cache (issue #176). The cache key hashes model + messages +
 // sampling params, but the ANSWER also depends on boot-time server config that shapes the
 // composed prompt / tool surface: the operator system prompt (#175), the OCP wrapper text,
@@ -531,7 +564,7 @@ const SYSTEM_PROMPT_WRAPPER = selectPromptWrapper(
 );
 
 const CONFIG_EPOCH = cryptoCreateHash("sha256")
-  .update(JSON.stringify([SYSTEM_PROMPT, SYSTEM_PROMPT_WRAPPER, ALLOWED_TOOLS, NO_CONTEXT]))
+  .update(JSON.stringify([SYSTEM_PROMPT, SYSTEM_PROMPT_WRAPPER, ALLOWED_TOOLS, NO_CONTEXT, MULTIBLOCK_INPUT]))
   .digest("hex").slice(0, 16);
 const ADMIN_KEY = process.env.OCP_ADMIN_KEY || "";
 const PROXY_ANONYMOUS_KEY = process.env.PROXY_ANONYMOUS_KEY || "";
@@ -1736,7 +1769,7 @@ function contentToText(content) {
 // argument in practice — the default only exists so a future internal caller that has no model
 // in hand still gets the conservative fallback rather than an undefined (NaN) ceiling, which
 // would disable the guard entirely.
-function messagesToPrompt(messages, maxChars = FALLBACK_PROMPT_CHARS) {
+function messagesToPrompt(messages, maxChars = FALLBACK_PROMPT_CHARS, opts = {}) {
   // ADR 0022: an assistant message carrying `tool_calls` and a `tool` message carrying a result are
   // rendered as text describing what happened, because a fresh spawn has no other way to learn
   // it (injecting real tool_use/tool_result blocks over stream-json input was measured NOT to work;
@@ -1752,7 +1785,9 @@ function messagesToPrompt(messages, maxChars = FALLBACK_PROMPT_CHARS) {
   });
   // Appended to the RESULT rather than pushed into `full`: the truncation path below partitions
   // `full` by indexing `messages[i].role`, so the two must stay the same length.
-  const tail = endsWithToolResult(messages) ? `\n\n${TOOL_CONTINUATION_NOTE}` : "";
+  // opts.continuationNote === false (#512): the -p path under MULTIBLOCK_INPUT, whose system prompt
+  // already carries the note. The TUI lane has no such system prompt and keeps the default.
+  const tail = opts.continuationNote !== false && endsWithToolResult(messages) ? `\n\n${TOOL_CONTINUATION_NOTE}` : "";
 
   const joined = full.join("\n\n");
   if (joined.length + tail.length <= maxChars) return joined + tail;
@@ -1885,20 +1920,37 @@ function spawnClaudeProcess(model, messages, conversationId, keyName, releaseSlo
   // Multimodal (issue #110): when any message carries an OpenAI image_url part,
   // feed the conversation as Anthropic content blocks over --input-format
   // stream-json (images preserved and kept OUT of the text char budget).
-  // Otherwise the text path is byte-for-byte unchanged. buildStreamJsonInput may
+  // #512 extends the same path to text-only conversations (see below); with
+  // OCP_MULTIBLOCK_INPUT=0 the text path is as it was. buildStreamJsonInput may
   // throw MultimodalError on an invalid/oversized image; it runs BEFORE any stats
   // mutation so a validation failure never leaks counters or the concurrency slot
   // (handleChatCompletions validates first, so in practice it will not throw here).
-  const useStreamJson = hasImageContent(nonSystemMessages);
+  const hasImages = hasImageContent(nonSystemMessages);
   // Per-model ceiling (ADR 0011): resolved from cliModel, not a global max across the registry.
   const maxPromptChars = promptCharBudget(cliModel);
+  // #512: under MULTIBLOCK_INPUT a text-only conversation also goes over stream-json, one block per
+  // message, append-only. It does so only while it FITS the budget: once text has to be dropped the
+  // start of the prompt shifts every turn and nothing can cache anyway, so an over-budget text-only
+  // conversation keeps the text path's whole-message truncation instead of the block path's
+  // mid-block cut. Images always take this path, exactly as before.
+  let built = null;
+  // Read once per spawn: noteCacheBreakpointRejection() may switch it off mid-flight for later spawns.
+  const bpTtl = MULTIBLOCK_INPUT ? cacheBreakpointTtl : null;
+  if (hasImages || MULTIBLOCK_INPUT) {
+    // Pass the budget so the multimodal text is bounded by the same
+    // runaway-context guard as the text path (PR #154 review F2). Images bypass it.
+    built = buildStreamJsonInput(nonSystemMessages, {
+      ...MULTIMODAL_OPTS, maxTextChars: maxPromptChars,
+      continuationNote: !MULTIBLOCK_INPUT, coalesceToolResults: MULTIBLOCK_INPUT,
+      cacheBreakpointTtl: bpTtl,
+    });
+    if (!hasImages && built.stats.truncated) built = null;
+  }
+  const useStreamJson = built !== null;
   let stdinPayload, promptChars;
   // #512: how many content blocks this request hands the prompt cache. The text path is one block.
   let blockCount = 1;
   if (useStreamJson) {
-    // Pass the budget so the multimodal text is bounded by the same
-    // runaway-context guard as the text path (PR #154 review F2). Images bypass it.
-    const built = buildStreamJsonInput(nonSystemMessages, { ...MULTIMODAL_OPTS, maxTextChars: maxPromptChars });
     stdinPayload = built.payload;
     promptChars = built.stats.textChars;
     blockCount = built.stats.blockCount;
@@ -1911,7 +1963,7 @@ function spawnClaudeProcess(model, messages, conversationId, keyName, releaseSlo
       });
     }
   } else {
-    stdinPayload = messagesToPrompt(nonSystemMessages, maxPromptChars);
+    stdinPayload = messagesToPrompt(nonSystemMessages, maxPromptChars, { continuationNote: !MULTIBLOCK_INPUT });
     promptChars = stdinPayload.length;
   }
 
@@ -2203,7 +2255,8 @@ function spawnClaudeProcess(model, messages, conversationId, keyName, releaseSlo
     // #512: prefix stability, observable without logging content. The prompt cache matches
     // tools -> system -> messages in that order, so a sha that changes between two requests of one
     // conversation names the layer that invalidated everything after it.
-    systemPromptSha: shortSha(systemPrompt), ...(toolBridge ? { toolsSha: shortSha(JSON.stringify(opts.tools)) } : {}), blockCount });
+    systemPromptSha: shortSha(systemPrompt), ...(toolBridge ? { toolsSha: shortSha(JSON.stringify(opts.tools)) } : {}), blockCount,
+    ...(useStreamJson && bpTtl ? { cacheBreakpoint: bpTtl } : {}) });
 
   // Single request timeout — no separate first-byte timer.
   // Claude tool-use causes long pauses in the token stream (30s-5min),
@@ -2271,7 +2324,8 @@ function spawnClaudeProcess(model, messages, conversationId, keyName, releaseSlo
     if (deferredFire) { clearTimeout(deferredFire); deferredFire = null; }
   }
 
-  return { proc, cliModel, conversationId, t0, cleanup, clearOverallTimer, handleSessionFailure, markFirstByte };
+  return { proc, cliModel, conversationId, t0, cleanup, clearOverallTimer, handleSessionFailure, markFirstByte,
+           cacheBreakpoint: useStreamJson ? bpTtl : null };
 }
 
 // ── Call claude CLI (non-streaming) ─────────────────────────────────────
@@ -2390,7 +2444,7 @@ async function callClaude(model, messages, conversationId, keyName, res, opts = 
       return reject(err);
     }
 
-    const { proc, cliModel, conversationId: convId, t0, cleanup, handleSessionFailure, markFirstByte } = ctx;
+    const { proc, cliModel, conversationId: convId, t0, cleanup, handleSessionFailure, markFirstByte, cacheBreakpoint } = ctx;
     let lineBuffer = "";
     let assembledText = "";
     let sawTextDelta = false;
@@ -2535,6 +2589,7 @@ async function callClaude(model, messages, conversationId, keyName, res, opts = 
           // double-counting precisely because of the per-request guard above: the close handler's
           // countError becomes a no-op. That is the guard paying for itself rather than merely
           // preventing a regression.
+          noteCacheBreakpointRejection(parsed.error, cacheBreakpoint);
           countError(String(parsed.error).slice(0, 200));
           reject(new Error(String(parsed.error)));
         }
@@ -3101,7 +3156,7 @@ async function callClaudeStreaming(model, messages, conversationId, res, authInf
     return jsonResponse(res, 500, { error: { message: sanitizeError(err.message), type: "proxy_error" } });
   }
 
-  const { proc, cliModel, conversationId: convId, t0, cleanup, clearOverallTimer, handleSessionFailure, markFirstByte } = ctx;
+  const { proc, cliModel, conversationId: convId, t0, cleanup, clearOverallTimer, handleSessionFailure, markFirstByte, cacheBreakpoint } = ctx;
   let stderr = "";
   let headersSent = false;
   let totalChars = 0;
@@ -3202,6 +3257,7 @@ async function callClaudeStreaming(model, messages, conversationId, res, authInf
         // cause the close handler to record success + write cache). Set errored instead.
         errored = true;
         const errStr = String(parsed.error);
+        noteCacheBreakpointRejection(errStr, cacheBreakpoint);
         logEvent("error", "claude_result_error", { model: cliModel, error: errStr.slice(0, 200) });
         countError(errStr.slice(0, 200));
         // Classified and COUNTED here even though the status is already 200 -- see
