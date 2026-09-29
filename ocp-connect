@@ -184,6 +184,10 @@ model_meta = {
     "claude-opus-5": {"name": "Claude Opus (OCP)", "reasoning": True, "maxTokens": 64000, "contextWindow": 1000000},
     "claude-opus-4-8": {"name": "Claude Opus (OCP)", "reasoning": True, "maxTokens": 64000, "contextWindow": 1000000},
     "claude-opus-4-7": {"name": "Claude Opus (OCP)", "reasoning": True, "maxTokens": 64000, "contextWindow": 1000000},
+    # claude-sonnet-5-5 MUST be its own row, same reason as claude-opus-5-5: longest-prefix-wins would
+    # hand it the "claude-sonnet-5" row and under-advertise 64000 against the SPOT's 128000 (CLI 2.1.284
+    # registry: max_output_tokens.default 128000).
+    "claude-sonnet-5-5": {"name": "Claude Sonnet (OCP)", "reasoning": True, "maxTokens": 128000, "contextWindow": 1000000},
     "claude-sonnet-5": {"name": "Claude Sonnet (OCP)", "reasoning": True, "maxTokens": 64000, "contextWindow": 1000000},
 }
 
@@ -267,7 +271,7 @@ for mid in model_ids:
 if priority == "1":
     # OCP as primary — pick the best model (prefer the latest Sonnet for daily use,
     # tracking the `sonnet` alias default in models.json; fall back across versions).
-    _sonnet_pref = ["claude-sonnet-5", "claude-sonnet-4-6"]
+    _sonnet_pref = ["claude-sonnet-5-5", "claude-sonnet-5", "claude-sonnet-4-6"]
     primary_model = next(
         (provider_name + "/" + m for m in _sonnet_pref if m in model_ids),
         provider_name + "/" + model_ids[0],

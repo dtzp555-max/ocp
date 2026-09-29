@@ -8464,7 +8464,7 @@ ltTest("integration: an alias and its canonical target share ONE cache slot (nor
     const msgs = [{ role: "user", content: "alias-resolution-probe" }];
     await ltPost(port, { model: "sonnet", messages: msgs });                 // miss → spawn
     await ltWait(() => (Number(_ltRead(counter, "utf8")) || 0) >= 1, 3000);
-    await ltPost(port, { model: "claude-sonnet-5", messages: msgs });        // same resolved model → HIT
+    await ltPost(port, { model: "claude-sonnet-5-5", messages: msgs });        // same resolved model → HIT
     await new Promise(r => setTimeout(r, 600));
     assert.equal(Number(_ltRead(counter, "utf8")) || 0, 1,
       "the canonical id must hit the slot the alias populated — a 2nd spawn means the key still hashes the raw alias");
@@ -8622,7 +8622,7 @@ ltTest("integration: an alias and its canonical target share ONE cache slot (STR
     const msgs = [{ role: "user", content: "structured-alias-probe" }];
     await ltPost(port, { model: "sonnet", messages: msgs, response_format: rf });
     await ltWait(() => (Number(_ltRead(counter, "utf8")) || 0) >= 1, 4000);
-    await ltPost(port, { model: "claude-sonnet-5", messages: msgs, response_format: rf });
+    await ltPost(port, { model: "claude-sonnet-5-5", messages: msgs, response_format: rf });
     await new Promise(r => setTimeout(r, 600));
     assert.equal(Number(_ltRead(counter, "utf8")) || 0, 1,
       "structured cache key must resolve the alias too — this is the path the epoch-only fix missed");
@@ -21497,8 +21497,8 @@ test("models.json aliases.haiku === 'claude-haiku-4-5-20251001' (usage-probe SPO
   assert.equal(_spotModels.aliases.haiku, "claude-haiku-4-5-20251001");
 });
 
-test("models.json aliases.sonnet === 'claude-sonnet-5' (default-request-model SPOT)", () => {
-  assert.equal(_spotModels.aliases.sonnet, "claude-sonnet-5");
+test("models.json aliases.sonnet === 'claude-sonnet-5-5' (default-request-model SPOT)", () => {
+  assert.equal(_spotModels.aliases.sonnet, "claude-sonnet-5-5");
 });
 
 test("models.json aliases.opus === 'claude-opus-5-5' (opus-alias SPOT)", () => {
@@ -21575,6 +21575,7 @@ test("models.json: every contextWindow is a positive integer (shape guard; the c
 //      below plus claude-fable-5, claude-fable-5-1, claude-mythos-5 and claude-mythos-5-1, none of which
 //      OCP exposes. (Review of that change proposed "7" by inference; the binary says 9.)
 const _spotRegistryContextWindow = {
+  "claude-sonnet-5-5": 1000000, // CLI 2.1.284 registry: context:{window:1e6}
   "claude-opus-5-5": 1000000,   // CLI 2.1.280 registry: context:{window:1e6}
   "claude-opus-5": 1000000, "claude-opus-4-8": 1000000, "claude-opus-4-7": 1000000,
   "claude-opus-4-6": 200000, "claude-sonnet-5": 1000000, "claude-sonnet-4-6": 200000,
@@ -21651,6 +21652,9 @@ test("models.json: every aliases value resolves to a real models[].id (referenti
 // -> 633 passed, 0 failed (the wrong-repro trap — renaming without adding the new id anywhere
 // fails the FORWARD check instead and masks this gap entirely; see #222 for both repros).
 const _spotRegistryMaxTokens = {
+  // claude-sonnet-5-5: CLI 2.1.284 registry, max_output_tokens:{default:128000,upper:128000} -- NOT the
+  // sibling claude-sonnet-5's 64000 (same trap as claude-opus-5-5 below).
+  "claude-sonnet-5-5": 128000,
   // claude-opus-5-5 is read from the CLI 2.1.280 registry, NOT 2.1.220 like the rows below -- the model
   // did not exist then. Record: max_output_tokens:{default:128000,upper:128000}. Note it is NOT the
   // sibling claude-opus-5 value (default:64000,upper:128000): copying the neighbour row, which is what
@@ -23450,6 +23454,7 @@ const _OC_EXPECTED_MODEL_META_TABLE = {
   "claude-opus-5": { name: "Claude Opus (OCP)", reasoning: true, maxTokens: 64000, contextWindow: 1000000 },
   "claude-opus-4-8": { name: "Claude Opus (OCP)", reasoning: true, maxTokens: 64000, contextWindow: 1000000 },
   "claude-opus-4-7": { name: "Claude Opus (OCP)", reasoning: true, maxTokens: 64000, contextWindow: 1000000 },
+  "claude-sonnet-5-5": { name: "Claude Sonnet (OCP)", reasoning: true, maxTokens: 128000, contextWindow: 1000000 },
   "claude-sonnet-5": { name: "Claude Sonnet (OCP)", reasoning: true, maxTokens: 64000, contextWindow: 1000000 },
 };
 

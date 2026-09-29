@@ -117,7 +117,7 @@ node setup.mjs
 
 ```bash
 curl http://127.0.0.1:3456/v1/models
-# claude-opus-5-5, claude-opus-5, claude-opus-4-8, claude-opus-4-7, claude-opus-4-6, claude-sonnet-5, claude-sonnet-4-6, claude-haiku-4-5-20251001
+# claude-opus-5-5, claude-opus-5, claude-opus-4-8, claude-opus-4-7, claude-opus-4-6, claude-sonnet-5-5, claude-sonnet-5, claude-sonnet-4-6, claude-haiku-4-5-20251001
 ```
 
 **Connect one IDE** — point any OpenAI-compatible tool at the proxy, then reload your shell and start a tool (Cline / Continue / Cursor / OpenCode):
@@ -186,7 +186,8 @@ The tools the bridge grants run on the **client**, so this works in every auth m
 | `claude-opus-4-8` | 1M | Older Opus, retained for pinning |
 | `claude-opus-4-7` | 1M | Older Opus, retained for pinning |
 | `claude-opus-4-6` | 200k | Older Opus, retained for pinning |
-| `claude-sonnet-5` | 1M | Latest Sonnet (default for `sonnet` alias) |
+| `claude-sonnet-5-5` | 1M | Latest Sonnet (default for `sonnet` alias) |
+| `claude-sonnet-5` | 1M | Previous Sonnet, retained for pinning |
 | `claude-sonnet-4-6` | 200k | Previous Sonnet, retained for pinning |
 | `claude-haiku-4-5-20251001` | 200k | Fastest, lightweight (default for `haiku` alias) |
 
