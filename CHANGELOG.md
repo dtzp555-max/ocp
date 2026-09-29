@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## v3.42.0 — 2026-09-29
+
 ### Added
 
 - **Claude Sonnet 5.5 (`claude-sonnet-5-5`), and the `sonnet` alias now points to it.** Class B.1 — `GET /v1/models` lists one more id, shape unchanged (OpenAI "List models"; ADR 0006). Added to `models.json` (the SPOT, ADR 0003) with the values read id-anchored from the Claude Code CLI **2.1.284** registry: `context.window` 1e6 and `max_output_tokens.default` **128000** — not the neighbouring `claude-sonnet-5`'s 64000, so `ocp-connect` gets its own `claude-sonnet-5-5` row (longest-prefix lookup would otherwise under-advertise 64000, #309) and its OCP-as-primary preference list tries 5.5 first. Every request naming `sonnet`, or omitting `model`, moves to Sonnet 5.5 on upgrade; `claude-sonnet-5` stays as an explicit id for pinning. The registry records `default_effort:"medium"` for 5.5 against `"high"` for Sonnet 5, at the same `tier_2_10` pricing; OCP's `-p` lane passes no `--effort`, and which effort a spawn actually runs at was not observed. Expiry: the registry figures are CLI 2.1.284's; re-read them id-anchored when the CLI moves.
