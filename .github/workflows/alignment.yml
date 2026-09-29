@@ -1,15 +1,14 @@
 name: Alignment Guardrail
 
+# Runs on EVERY pull request, deliberately (2026-09-27). It used to be path-filtered, which left two
+# choices and both were bad. Had these jobs been REQUIRED, a PR touching none of the paths would wait
+# forever for a check that never reports: blocked, not failed. So the branch ruleset did NOT require
+# them, and a check that is not required does not block a merge even when it fails -- so the "hard
+# fail" jobs below did not actually stop anything. Every job here is a grep over the tree or the
+# PR's commits (seconds), so running it on a docs-only PR costs nothing and lets them be required.
+# Do not re-add `paths:` without also removing these jobs from the required checks.
 on:
   pull_request:
-    paths:
-      - 'server.mjs'
-      - 'setup.mjs'
-      - 'scripts/**'
-      - 'lib/**'
-      - 'ocp'
-      - 'ocp-connect'
-      - '.github/workflows/alignment.yml'
 
 jobs:
   blacklist:
