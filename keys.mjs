@@ -152,11 +152,24 @@ export function revokeKey(idOrName) {
   return stmt.run(idOrName, idOrName).changes > 0;
 }
 
+const _failedKeyAttempts = { count: 0, windowStart: 0 };
+const MAX_FAILED_KEY_ATTEMPTS = 10;
+const FAILED_KEY_WINDOW_MS = 1000;
+
 export function validateKey(key) {
+  const now = Date.now();
+  if (now - _failedKeyAttempts.windowStart > FAILED_KEY_WINDOW_MS) {
+    _failedKeyAttempts.windowStart = now;
+    _failedKeyAttempts.count = 0;
+  }
+  if (_failedKeyAttempts.count >= MAX_FAILED_KEY_ATTEMPTS) {
+    return null;
+  }
   const d = getDb();
   const row = d.prepare(
     "SELECT id, name FROM api_keys WHERE key = ? AND revoked = 0"
   ).get(key);
+  if (!row) _failedKeyAttempts.count++;
   return row || null;
 }
 
