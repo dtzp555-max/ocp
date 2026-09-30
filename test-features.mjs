@@ -122,7 +122,11 @@ function suiteLockAcquire(dir) {
       return myTicket;
     } catch (e) {
       try { _lockRmSync(tmpDir, { recursive: true, force: true }); } catch {}
-      if (e.code !== "EEXIST" && e.code !== "ENOTEMPTY") throw e; // rename onto a held lock
+      // rename onto a held lock. win32 reports that as EPERM (MoveFileEx refuses to replace an
+      // existing directory), which is also its code for a real permission failure, so it counts
+      // as "held" only while the lock dir actually exists.
+      const heldOnWin32 = process.platform === "win32" && e.code === "EPERM" && _lockExistsSync(dir);
+      if (e.code !== "EEXIST" && e.code !== "ENOTEMPTY" && !heldOnWin32) throw e;
     }
     // Fairness (issue #416 "Fairness"): the plain retry loop is a lottery — one contender waited
     // ~40 min. Register a ticket once, then only the OLDEST ticket acts each cycle; everyone else
@@ -18098,6 +18102,47 @@ test("resolveBinaryPath: existsSyncFn is called with the absolute path being che
   assert.equal(seen, "/usr/sbin/lsof");
 });
 
+// win32 launcher (buildStartCmd): run the generated cmd file for real, once with the port held by
+// a listener (must refuse to start a second server) and once with it free (must start it). The
+// "server" is a stub script that prints a marker, so starting it is observable and instant.
+{
+  const { buildStartCmd } = await import("./scripts/lib/start-sh.mjs");
+  const runLauncher = (port) => {
+    const dir = mkdtempSync(join(tmpdir(), "ocp-startcmd-"));
+    const stub = join(dir, "stub_server.mjs");
+    testWriteFile(stub, 'console.log("STUB-SERVER-STARTED");\n');
+    const launcher = join(dir, "start_ocp.cmd");
+    testWriteFile(launcher, buildStartCmd({ port, serverPath: stub }));
+    const env = { ...process.env };
+    delete env.CLAUDE_PROXY_PORT;
+    const r = spawnSync("cmd.exe", ["/d", "/c", launcher], { encoding: "utf8", env, timeout: 30000, windowsHide: true });
+    rmSync(dir, { recursive: true, force: true });
+    return r;
+  };
+  if (process.platform !== "win32") {
+    testSkipped("buildStartCmd win32: port already listening -- does not start a duplicate", "cmd.exe launcher, win32 only");
+    testSkipped("buildStartCmd win32: port free -- starts the server", "cmd.exe launcher, win32 only");
+  } else {
+    const net = await import("node:net");
+    const holder = net.createServer();
+    await new Promise((res) => holder.listen(0, "127.0.0.1", res));
+    const heldPort = holder.address().port;
+    await testAsync("buildStartCmd win32: port already listening -- does not start a duplicate", async () => {
+      const r = runLauncher(heldPort);
+      assert.equal(r.status, 0, `stderr=${r.stderr}`);
+      assert.match(r.stdout, /already running/);
+      assert.doesNotMatch(r.stdout, /STUB-SERVER-STARTED/);
+    });
+    await new Promise((res) => holder.close(res));
+    await testAsync("buildStartCmd win32: port free -- starts the server", async () => {
+      const r = runLauncher(heldPort); // just released, so nothing listens on it now
+      assert.equal(r.status, 0, `stderr=${r.stderr}`);
+      assert.match(r.stdout, /STUB-SERVER-STARTED/);
+      assert.doesNotMatch(r.stdout, /already running/);
+    });
+  }
+}
+
 test("buildStartSh darwin: lsof cleanly matches -- already running, does not start a duplicate", () => {
   const r = _runStartShScenario({
     port: _startShTestPort,
@@ -21907,8 +21952,8 @@ function _s328Env(slice) {
   return seen;
 }
 
-for (const [label, marker] of [["which claude", "which claude 2>/dev/null"],
-                               ["claude --version", "claude --version 2>/dev/null"],
+for (const [label, marker] of [["which claude", "\"which claude\""],
+                               ["claude --version", "\"claude --version\""],
                                ["claude -p auth probe", "--no-session-persistence"]]) {
   test(`#328: setup.mjs's \`${label}\` spawn does not hand the child OCP's inbound credentials`, () => {
     const opts = _s328Env(_s328Slice(marker));

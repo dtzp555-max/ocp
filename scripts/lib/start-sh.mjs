@@ -211,6 +211,29 @@ fi
 `;
 }
 
+// win32 counterpart of buildStartSh(): a cmd launcher that starts server.mjs in the foreground
+// of its own window unless something already listens on the port. The check is `netstat -ano`
+// filtered by findstr (both in System32), matching the local-address column ":<port> " followed
+// by LISTENING. LF line endings: cmd runs LF-only batch files fine as long as they use no
+// labels/goto, and this one uses none.
+export function buildStartCmd({ port, serverPath }) {
+  return [
+    "@echo off",
+    "rem Start OCP (Open Claude Proxy) if not already running",
+    "setlocal",
+    `if not defined CLAUDE_PROXY_PORT set "CLAUDE_PROXY_PORT=${port}"`,
+    `netstat -ano -p tcp | findstr /r /c:":%CLAUDE_PROXY_PORT% .*LISTENING" >nul`,
+    `if not errorlevel 1 (`,
+    `  echo claude-proxy already running on port %CLAUDE_PROXY_PORT%`,
+    `  exit /b 0`,
+    `)`,
+    `set "CLAUDECODE="`,
+    `title OCP proxy :%CLAUDE_PROXY_PORT%`,
+    `node "${serverPath}"`,
+    "",
+  ].join("\n");
+}
+
 // Pure command-string builder for setup.mjs's Step 8 post-install bind-check (issue #246,
 // second half). No execution happens here -- classifyBindCheck() below is the only caller
 // that actually runs the returned string -- so this is testable with a plain return-value

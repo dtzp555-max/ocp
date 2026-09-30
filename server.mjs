@@ -598,7 +598,7 @@ let CACHE_TTL = parseInt(process.env.CLAUDE_CACHE_TTL || "0", 10); // 0 = disabl
 // (guest prompts would run claude with operator filesystem access).
 const TUI_MODE = process.env.CLAUDE_TUI_MODE === "true";
 const TUI_WALLCLOCK_MS = parseInt(process.env.CLAUDE_TUI_WALLCLOCK_MS || "120000", 10);
-const TUI_CWD  = process.env.OCP_TUI_CWD  || `${process.env.HOME}/.ocp-tui/work`;
+const TUI_CWD  = process.env.OCP_TUI_CWD  || `${homedir()}/.ocp-tui/work`;
 // HOME the interactive claude runs under. resolveTuiHome() decides:
 //   - OCP_TUI_HOME set            → that path (explicit override, back-compat).
 //   - else CLAUDE_CODE_OAUTH_TOKEN set → a CREDENTIAL-FREE scratch home
@@ -609,7 +609,7 @@ const TUI_CWD  = process.env.OCP_TUI_CWD  || `${process.env.HOME}/.ocp-tui/work`
 //   - else (no env token)         → the operator's real home (legacy credentials.json path,
 //     byte-for-byte unchanged for hosts that intentionally rely on credentials.json).
 const TUI_HOME = resolveTuiHome({
-  realHome:       process.env.HOME,
+  realHome:       homedir(),
   configuredHome: process.env.OCP_TUI_HOME,
   envTokenSet:    !!process.env.CLAUDE_CODE_OAUTH_TOKEN,
 });
@@ -649,7 +649,7 @@ const tuiStats = {
 // progressively-rendering chat UI gains the ~4s between first delta and last. It does not
 // move the ~6s TTFT floor of TUI mode.
 const TUI_STREAM = process.env.OCP_TUI_STREAM === "1";
-const TUI_STREAM_DIR = process.env.OCP_TUI_STREAM_DIR || `${process.env.HOME}/.ocp-tui/stream`;
+const TUI_STREAM_DIR = process.env.OCP_TUI_STREAM_DIR || `${homedir()}/.ocp-tui/stream`;
 // First-bytes holdback — the auth-banner gate's (C-1) survival mechanism under streaming.
 // See TuiDeltaAssembler: nothing is emitted for a message until its TRIMMED accumulation
 // exceeds this, which puts it out of the default banner detector's <=100-char reach — the
@@ -711,7 +711,7 @@ const tuiPool = TUI_POOL_SIZE > 0
         model,
         claudeBin: CLAUDE,
         home: TUI_HOME,
-        realHome: process.env.HOME,
+        realHome: homedir(),
         cwd: TUI_CWD,
         port: PORT,
         entrypointMode: TUI_ENTRYPOINT,
@@ -755,7 +755,7 @@ const tuiPool = TUI_POOL_SIZE > 0
 // regression). OCP_SPAWN_REAL_HOME=1 forces that legacy behaviour even when a token exists.
 // The scratch home holds NO .credentials.json / NO settings.json / NO plugins — it is created
 // minimal and (re)cleaned of any settings.json on prepare.
-const SPAWN_HOME_DIR = `${process.env.HOME}/.ocp/spawn-home`;
+const SPAWN_HOME_DIR = `${homedir()}/.ocp/spawn-home`;
 
 // Idempotently prepare the minimal scratch HOME. Creates the dir if missing and removes any
 // settings.json that might have crept in, so the spawned claude loads no host settings/plugins.
@@ -980,6 +980,14 @@ async function acquireClaudeSlot(res) {
 //   3. PROXY_ANONYMOUS_KEY set — anonymous callers can submit prompts without a key.
 // In all three cases TUI runs interactive claude with the OPERATOR's full filesystem
 // access — home is NOT isolation. Refuse to boot. See ADR 0007.
+if (TUI_MODE && process.platform === "win32") {
+  console.error(
+    "FATAL: CLAUDE_TUI_MODE=true is not supported on Windows.\n" +
+    "  TUI-mode drives claude inside tmux and hooks it with a /bin/sh script. Unset CLAUDE_TUI_MODE\n" +
+    "  to use the default -p path. Refusing to start."
+  );
+  process.exit(1);
+}
 if (TUI_MODE && AUTH_MODE === "multi") {
   console.error(
     "FATAL: CLAUDE_TUI_MODE=true is incompatible with CLAUDE_AUTH_MODE=multi.\n" +
@@ -1054,6 +1062,9 @@ function logEvent(level, event, data = {}) {
 // Wrapped in try/catch — chmod failure must never crash startup.
 // Does NOT touch systemd units or launchd plists; those are managed by setup.mjs.
 function _tightenFileModesIfPossible() {
+  // win32: POSIX modes are emulated (only the read-only bit is real), so the comparison below
+  // never matches and chmod protects nothing; the files inherit the per-user profile ACLs.
+  if (process.platform === "win32") return;
   const ocpDir = join(homedir(), ".ocp");
   const targets = [
     { path: ocpDir,                      mode: 0o700, label: "~/.ocp (dir)" },
@@ -1454,7 +1465,7 @@ async function checkAuth() {
     // process.exit()s. So: no unref, no trap for whoever moves this code next.
     await new Promise((resolve, reject) => {
       execFile(CLAUDE, ["auth", "status"],
-        { encoding: "utf8", timeout: AUTH_CHECK_TIMEOUT_MS, env },
+        { encoding: "utf8", timeout: AUTH_CHECK_TIMEOUT_MS, env, windowsHide: true },
         // execFile does NOT attach stdout/stderr to the error object the way execFileSync does
         // (verified: err.stderr is undefined in the callback), so carry stderr across
         // explicitly — the message below depends on it.
@@ -1872,6 +1883,16 @@ function getModelTier(cliModel) {
 // different there and a negative pid is not killable, so the group path is POSIX-only and
 // win32 keeps the pre-#474 per-process behaviour.
 function killChildTree(proc, sig) {
+  // win32 has no process groups: `taskkill /T` walks the tree by parent pid instead, so it must
+  // run while claude.exe is still alive (its children are only found through it). Forced (/F)
+  // whatever `sig` asked for, since Windows has no graceful-signal equivalent for a console-less
+  // child. The per-process kill runs after it, as the fallback when taskkill itself fails.
+  if (proc.pid != null && process.platform === "win32") {
+    proc.killed = true;
+    execFile("taskkill", ["/PID", String(proc.pid), "/T", "/F"], { windowsHide: true, timeout: 10000 },
+      () => { try { proc.kill(sig); } catch { /* already gone */ } });
+    return;
+  }
   if (proc.pid != null && process.platform !== "win32") {
     try {
       process.kill(-proc.pid, sig);
@@ -2011,8 +2032,13 @@ function spawnClaudeProcess(model, messages, conversationId, keyName, releaseSlo
   // and the client hangs. win32: `detached` means something different there; the group kill is
   // POSIX-only (see killChildTree), so win32 keeps the pre-#474 per-process behaviour.
   if (process.platform !== "win32") spawnOpts.detached = true;
+  // win32: no console window per spawn when the server runs without one (Task Scheduler).
+  else spawnOpts.windowsHide = true;
   if (decision.isolated && decision.token) {
     env.HOME = decision.home;
+    // win32: claude.exe resolves its home (and so ~/.claude) from USERPROFILE and ignores HOME
+    // (verified: `claude auth status` reports configDirectory under USERPROFILE, not HOME).
+    if (process.platform === "win32") env.USERPROFILE = decision.home;
     env.CLAUDE_CODE_OAUTH_TOKEN = decision.token; // env token is authoritative for -p
     env.CLAUDE_CODE_DISABLE_CLAUDE_MDS = "1";
     env.CLAUDE_CODE_DISABLE_AUTO_MEMORY = "1";
@@ -2761,7 +2787,7 @@ async function callClaudeTui(model, messages, _conversationId, _keyName, res, st
       model: cliModel,
       claudeBin: CLAUDE,
       home: TUI_HOME,
-      realHome: process.env.HOME,
+      realHome: homedir(),
       cwd: TUI_CWD,
       port: PORT, // F7 fix: port-scopes the tmux session name so a sibling OCP instance on a
                   // different port never collides with this instance's reap/kill-server logic.
@@ -3399,7 +3425,10 @@ async function callClaudeStreaming(model, messages, conversationId, res, authInf
 // Strip absolute filesystem paths from an error message before sending it to a client.
 // claude error_message / stderr routinely embed home-dir / credential-file paths. (issue #111)
 function sanitizeError(msg) {
-  return String(msg || "Internal error").replace(/\/[\w/.\-]+/g, "[path]");
+  return String(msg || "Internal error")
+    .replace(/(?<![A-Za-z])[A-Za-z]:[\\/][^\s"'<>|]*/g, "[path]") // win32 drive paths
+    .replace(/\\\\[^\s"'<>|]+/g, "[path]")                         // win32 UNC paths
+    .replace(/\/[\w/.\-]+/g, "[path]");
 }
 
 // ── Parsed-body shape predicates (#360) ─────────────────────────────────
@@ -3840,6 +3869,8 @@ let _lastGoodKeychainLabel = null;
 // Read the macOS keychain credentials, label-memoized + short-TTL cached (F5). Sync (execFileSync);
 // returns the `claudeAiOauth` creds object or null.
 function readKeychainCreds() {
+  // `security` is macOS-only; elsewhere claude keeps its credentials in ~/.claude/.credentials.json.
+  if (process.platform !== "darwin") return null;
   return _keychainCache.get(() => {
     for (const label of orderLabelsLastGoodFirst(KEYCHAIN_LABELS, _lastGoodKeychainLabel)) {
       try {
@@ -4145,7 +4176,7 @@ function handleLogs(req, res) {
   const n = Math.min(parseInt(url.searchParams.get("n") || "30", 10), 200);
   const level = url.searchParams.get("level") || "all"; // all | error | warn | info
 
-  const LOG_PATH = join(process.env.HOME || "/tmp", ".openclaw/logs/proxy.log");
+  const LOG_PATH = join(homedir(), ".openclaw/logs/proxy.log");
   let lines;
   try {
     const raw = readFileSync(LOG_PATH, "utf8");
@@ -5796,6 +5827,8 @@ function gracefulShutdown(signal) {
 
 process.on("SIGTERM", () => gracefulShutdown("SIGTERM"));
 process.on("SIGINT", () => gracefulShutdown("SIGINT"));
+// win32: Ctrl+Break, and closing the console window, arrive as SIGBREAK (SIGTERM never fires).
+if (process.platform === "win32") process.on("SIGBREAK", () => gracefulShutdown("SIGBREAK"));
 
 // ── Boot-time `claude` capability gate (#455) ────────────────────────────
 //
@@ -5855,6 +5888,7 @@ if (process.env.OCP_SKIP_CAPABILITY_PROBE !== "1") {
   try {
     probe = spawnSync(CLAUDE, probeArgs, {
       encoding: "utf8",
+      windowsHide: true,
       timeout: CAPABILITY_PROBE_TIMEOUT_MS,
       // The budget is ~50x the observed cost (see CAPABILITY_PROBE_TIMEOUT_MS), so a loaded host
       // warns rather than refusing. An earlier revision said "two orders of magnitude" here while
@@ -5995,7 +6029,7 @@ server.listen(PORT, BIND_ADDRESS, () => {
   if (TUI_MODE) {
     console.warn(`⚠️  TUI-mode ON — single-user only; do NOT enable on a multi-user OCP (guest prompts would run claude with operator filesystem access). See ADR 0007.`);
     const tuiAuth = process.env.CLAUDE_CODE_OAUTH_TOKEN
-      ? (TUI_HOME === process.env.HOME ? "env-token (real home — unset OCP_TUI_HOME for credential isolation)" : "env-token (credential-isolated home — no credentials.json)")
+      ? (TUI_HOME === homedir() ? "env-token (real home — unset OCP_TUI_HOME for credential isolation)" : "env-token (credential-isolated home — no credentials.json)")
       : "credentials.json (no CLAUDE_CODE_OAUTH_TOKEN — see Troubleshooting #401)";
     console.log(`  TUI-mode: ON home=${TUI_HOME} cwd=${TUI_CWD} auth=${tuiAuth} wallclock=${TUI_WALLCLOCK_MS}ms maxConcurrent=${TUI_MAX_CONCURRENT}`);
     console.log(TUI_POOL_SIZE > 0
