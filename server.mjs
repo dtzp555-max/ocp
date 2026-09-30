@@ -47,7 +47,7 @@ import { DEFAULT_PORT } from "./lib/constants.mjs";
 import { StructuredOutputError, detectStructuredOutput, validateJsonSchemaSafe, extractJsonPayload, structuredSystemInstruction, resolveMaxAttempts } from "./lib/structured-output.mjs";
 import { scheduleKillEscalation } from "./lib/child-tree.mjs";
 import { isLoopbackBind } from "./lib/net.mjs";
-import { parseAllowedHosts, parseAuthority, matchesDeclared, evaluateOriginGate } from "./lib/host-gate.mjs";
+import { parseAllowedHosts, parseAuthority, matchesDeclared, evaluateOriginGate, parseAllowedOriginSchemes, matchesDeclaredScheme } from "./lib/host-gate.mjs";
 import { classifyToolRequest, countDeclaredTools } from "./lib/tool-support.mjs";
 import { isUpstreamRateLimit, retryAfterSeconds } from "./lib/upstream-errors.mjs";
 import { listUnhonouredFields, CACHE_KEY_ONLY, cliEffort } from "./lib/unhonoured-fields.mjs";
@@ -501,6 +501,8 @@ const BIND_ADDRESS = process.env.CLAUDE_BIND || "127.0.0.1";
 // need no declaration, so the ONLY deployment that has to set this is one reached by a real public
 // DNS name — which is also the only deployment DNS rebinding can imitate. See lib/host-gate.mjs.
 const ALLOWED_HOSTS = parseAllowedHosts(process.env.OCP_ALLOWED_HOSTS);
+// Whole origin schemes admitted by the ADR 0019 gate, e.g. `moz-extension` (see host-gate.mjs).
+const ALLOWED_ORIGIN_SCHEMES = parseAllowedOriginSchemes(process.env.OCP_ALLOWED_ORIGIN_SCHEMES);
 const NO_CONTEXT = process.env.CLAUDE_NO_CONTEXT === "true";
 // #512: hand the conversation to `claude -p` as one content block per message (stream-json), with
 // the tool-continuation note moved into the system prompt, so a growing agent conversation is an
@@ -5091,7 +5093,8 @@ async function handleRequest(req, res) {
   // same invisible failure, moved one layer out.
   let originAuthority = null;
   if (origin) { try { originAuthority = parseAuthority(new URL(origin).host); } catch { /* opaque */ } }
-  const isAllowedOrigin = isPrivateOrigin || matchesDeclared(originAuthority, ALLOWED_HOSTS.hosts);
+  const isAllowedOrigin = isPrivateOrigin || matchesDeclared(originAuthority, ALLOWED_HOSTS.hosts)
+    || matchesDeclaredScheme(origin, ALLOWED_ORIGIN_SCHEMES.schemes);
   res.setHeader("Access-Control-Allow-Origin", isAllowedOrigin ? origin : `http://127.0.0.1:${PORT}`);
   res.setHeader("Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS, PATCH");
   res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization, X-Session-Id, X-Conversation-Id");
@@ -5176,6 +5179,7 @@ async function handleRequest(req, res) {
     method: req.method,
     declaredHosts: ALLOWED_HOSTS.hosts,
     isPrivateOrigin,
+    declaredSchemes: ALLOWED_ORIGIN_SCHEMES.schemes,
   });
   if (!gate.allow) {
     logEvent("warn", "origin_rejected", { origin, host: String(req.headers.host || ""), reason: gate.reason, method: req.method, path: req.url.split("?")[0] });
@@ -5928,6 +5932,12 @@ server.listen(PORT, BIND_ADDRESS, () => {
   // ADR 0020: a token that did not parse is a name the operator BELIEVES they declared. Say so at
   // boot rather than at the 403, because the 403 arrives on someone else's screen. Not fatal — a
   // refusing boot would take the proxy down to fix a misspelling.
+  if (ALLOWED_ORIGIN_SCHEMES.invalid.length) {
+    console.warn(`WARNING: OCP_ALLOWED_ORIGIN_SCHEMES — ignored ${ALLOWED_ORIGIN_SCHEMES.invalid.join(", ")} (not a scheme, or http/https, which would admit every web page)`);
+  }
+  if (ALLOWED_ORIGIN_SCHEMES.schemes.length) {
+    console.log(`Origin schemes admitted outright: ${ALLOWED_ORIGIN_SCHEMES.schemes.join(", ")} (OCP_ALLOWED_ORIGIN_SCHEMES)`);
+  }
   if (ALLOWED_HOSTS.invalid.length) {
     console.warn(`WARNING: OCP_ALLOWED_HOSTS — ignored ${ALLOWED_HOSTS.invalid.length} unparseable entr${ALLOWED_HOSTS.invalid.length === 1 ? "y" : "ies"}: ${ALLOWED_HOSTS.invalid.join(", ")}`);
     console.warn(`         Expected a comma-separated list of host[:port], e.g. "ocp.example.com,dash.example.com:8443".`);

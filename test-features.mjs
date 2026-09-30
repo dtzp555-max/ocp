@@ -19,7 +19,7 @@ import { createSerialMutex, createTtlCache, isTokenExpiring, orderLabelsLastGood
 import { makeResolveSpawnToken } from "./lib/spawn-token.mjs";
 import { scheduleKillEscalation, makeKillEscalation } from "./lib/child-tree.mjs";
 import { EventEmitter } from "node:events";
-import { parseAuthority, isRebindSafe, matchesDeclared, parseAllowedHosts, evaluateOriginGate } from "./lib/host-gate.mjs";
+import { parseAuthority, isRebindSafe, matchesDeclared, parseAllowedHosts, evaluateOriginGate, parseAllowedOriginSchemes, matchesDeclaredScheme } from "./lib/host-gate.mjs";
 import { createHash } from "node:crypto";
 import { strict as assert } from "node:assert";
 import { join } from "node:path";
@@ -32201,6 +32201,32 @@ test("ADR 0020: a declared entry naming a default port is flagged, and the flag 
     ["a.example.com:443", "b.example.com:80", "c.example.com:8443", "d.example.com:"],
     "and the entry is kept EXACTLY as written — dropping the port would widen it to any port, " +
     "which the operator did not ask for");
+});
+
+test("OCP_ALLOWED_ORIGIN_SCHEMES: parsing keeps extension schemes and refuses http/https", () => {
+  const r = parseAllowedOriginSchemes("moz-extension, chrome-extension://, MOZ-EXTENSION:, http, https://, not a scheme");
+  assert.deepEqual(r.schemes, ["moz-extension", "chrome-extension"],
+    "trailing :// and : are tolerated, case folds, duplicates collapse");
+  assert.deepEqual(r.invalid, ["http", "https://", "not a scheme"],
+    "http/https would admit every web page, so they are refused and reported, never silently kept");
+  assert.deepEqual(parseAllowedOriginSchemes(undefined), { schemes: [], invalid: [] });
+});
+
+test("OCP_ALLOWED_ORIGIN_SCHEMES: a declared scheme admits every origin of that scheme, and nothing else", () => {
+  const g = (origin, declaredSchemes) =>
+    evaluateOriginGate({ origin, hostHeader: "127.0.0.1:3456", method: "POST", declaredHosts: [], isPrivateOrigin: false, declaredSchemes });
+  const ext = ["moz-extension"];
+  assert.deepEqual(g("moz-extension://aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee", ext), { allow: true, reason: "declared-scheme" });
+  assert.deepEqual(g("moz-extension://00000000-0000-0000-0000-000000000000", ext), { allow: true, reason: "declared-scheme" });
+  // Control: without the declaration the same origin is the foreign-origin refusal it was.
+  assert.deepEqual(g("moz-extension://aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee", []), { allow: false, reason: "foreign-origin" });
+  // A different scheme, a web page, and an opaque origin stay refused.
+  assert.equal(g("chrome-extension://abcdefghijklmnopabcdefghijklmnop", ext).allow, false);
+  assert.equal(g("https://evil.example", ext).allow, false);
+  assert.equal(g("null", ext).allow, false);
+  assert.equal(matchesDeclaredScheme("moz-extension://x", ext), true);
+  assert.equal(matchesDeclaredScheme("https://moz-extension.example", ext), false,
+    "the scheme is compared, not a substring of the origin");
 });
 
 test("ADR 0020: the gate's verdict and its REASON across the whole matrix", () => {

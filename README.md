@@ -280,6 +280,7 @@ So the blind spot is real but narrow: it needs `stream: true`, no tools — or `
 | `OCP_PROXY_URL` | *(unset)* | Plugin-side full URL override (e.g. `http://10.0.0.5:3456`). Wins over `CLAUDE_PROXY_PORT` when both are set. Read by `ocp-plugin/index.js` only — server ignores it. |
 | `CLAUDE_BIND` | `127.0.0.1` | Bind address (`0.0.0.0` for LAN access) |
 | `OCP_ALLOWED_HOSTS` | *(empty)* | Comma-separated `host[:port]` this proxy is served on. Only needed when a browser reaches it at a **public DNS name** — IP literals, `localhost` and `*.local` need no declaration because neither can be pointed at loopback by public DNS. Also required behind a reverse proxy that rewrites `Host` (nginx's default `proxy_pass`; Caddy preserves it). See [ADR 0020](docs/adr/0020-declared-hosts.md). |
+| `OCP_ALLOWED_ORIGIN_SCHEMES` | *(empty)* | Comma-separated origin schemes admitted outright, for **browser extensions**: `moz-extension` admits every Firefox extension, `chrome-extension` every Chromium one (Chrome, Edge, Brave). **Every extension of that scheme can then use the proxy — and, with the default `CLAUDE_ALLOWED_TOOLS`, run tools on this machine** — so to admit just one extension, put its id (the part after `://` in its `Origin`) in `OCP_ALLOWED_HOSTS` instead; Firefox changes that id when the extension is reinstalled. `http`/`https` are refused. See [ADR 0023](docs/adr/0023-declared-origin-schemes.md). |
 | `CLAUDE_AUTH_MODE` | `none` | Auth mode: `none`, `shared`, or `multi` |
 | `OCP_ADMIN_KEY` | *(unset)* | Admin key for key management (multi mode) |
 | `CLAUDE_BIN` | *(auto-detect)* | Path to claude binary |
@@ -720,6 +721,8 @@ The simplest path: ask your AI — paste `Run `ocp doctor` and follow its `next_
   Write the **bare host** when the scheme's own default port is in use — `Origin` omits it, so `ocp.example.com:443` will not match an `https://ocp.example.com` dashboard (OCP flags this at boot). It *is* correct if you serve **plain HTTP on 443**, which is why OCP warns rather than rejects: a declaration carries no scheme, so OCP cannot tell the two apart. Use `host:port` for any non-default port.
 
   Loopback, LAN addresses, `[::1]`, Tailscale addresses, `localhost` and `*.local` names need **no** declaration — none of them can be pointed at your loopback by public DNS, which is the thing this setting exists to stop ([ADR 0020](docs/adr/0020-declared-hosts.md)). Behind nginx you likely also want `proxy_set_header Host $host;`; Caddy preserves `Host` already.
+
+- **A browser extension gets 403 `forbidden_origin` ("cross-origin request rejected")** — its `Origin` is `moz-extension://<id>` (Firefox) or `chrome-extension://<id>` (Chromium), which the gate refuses by default. The rejected origin is in the proxy log as `origin_rejected`. Admit that one extension with `OCP_ALLOWED_HOSTS=<id>`, or every extension of the browser with `OCP_ALLOWED_ORIGIN_SCHEMES=moz-extension` (or `chrome-extension`) — the second also lets every other installed extension drive the proxy ([ADR 0023](docs/adr/0023-declared-origin-schemes.md)).
 
 **Bootstrap quirks (one-time migrations):**
 
