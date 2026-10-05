@@ -4,6 +4,7 @@
 
 ### Added
 
+- **Claude Fable 5 (`claude-fable-5`), Claude Opus 4.5 (`claude-opus-4-5`) and Claude Sonnet 4.5 (`claude-sonnet-4-5`).** Class B.1 — `GET /v1/models` lists three more ids, shape unchanged. Every Claude model in the CLI 2.1.289 registry that answers a live `claude -p --model <id>` on the subscription pool is now exposed; values read id-anchored from that registry (Fable 5: 1e6 / 64000; Opus 4.5 and Sonnet 4.5: 200000 / 32000). Left out on purpose: `claude-opus-4-1` and `claude-opus-4-0` (the CLI silently remaps them to Opus 5.5), `claude-mythos-5` and `claude-mythos-5-1` (access-restricted), and the retired `claude-sonnet-4-0`, `claude-3-7-sonnet`, `claude-3-5-sonnet` and `claude-3-5-haiku`. `ocp-connect` gets rows for Fable 5 and Opus 4.5, whose values differ from what prefix matching would give them.
 - **Claude Fable 5.1 (`claude-fable-5-1`).** Class B.1 — `GET /v1/models` lists one more id, shape unchanged (OpenAI "List models"; ADR 0006). Added to `models.json` (the SPOT, ADR 0003) with the values read id-anchored from the Claude Code CLI **2.1.289** registry: `context.window` 1e6, `max_output_tokens.default` 64000 (upper 128000). No alias: `opus` stays on `claude-opus-5-5`. `ocp-connect` gets its own row, since no `claude-fable` family row exists and the unknown-id floor would under-advertise it.
 
 ### Changed

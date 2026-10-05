@@ -117,7 +117,7 @@ node setup.mjs
 
 ```bash
 curl http://127.0.0.1:3456/v1/models
-# claude-fable-5-1, claude-opus-5-5, claude-opus-5, claude-opus-4-8, claude-opus-4-7, claude-opus-4-6, claude-sonnet-5-5, claude-sonnet-5, claude-sonnet-4-6, claude-haiku-4-5-20251001
+# claude-fable-5-1, claude-fable-5, claude-opus-5-5, claude-opus-5, claude-opus-4-8, claude-opus-4-7, claude-opus-4-6, claude-opus-4-5, claude-sonnet-5-5, claude-sonnet-5, claude-sonnet-4-6, claude-sonnet-4-5, claude-haiku-4-5-20251001
 ```
 
 **Connect one IDE** — point any OpenAI-compatible tool at the proxy, then reload your shell and start a tool (Cline / Continue / Cursor / OpenCode):
@@ -207,14 +207,17 @@ Two things still describe the **host**, not the client:
 | Model ID | Context window | Notes |
 |----------|---------------:|-------|
 | `claude-fable-5-1` | 1M | Most capable; no alias, request it by id |
+| `claude-fable-5` | 1M | Previous Fable, retained for pinning |
 | `claude-opus-5-5` | 1M | Latest Opus (default for `opus` alias) |
 | `claude-opus-5` | 1M | Previous Opus, retained for pinning |
 | `claude-opus-4-8` | 1M | Older Opus, retained for pinning |
 | `claude-opus-4-7` | 1M | Older Opus, retained for pinning |
 | `claude-opus-4-6` | 200k | Older Opus, retained for pinning |
+| `claude-opus-4-5` | 200k | Older Opus, retained for pinning |
 | `claude-sonnet-5-5` | 1M | Latest Sonnet (default for `sonnet` alias) |
 | `claude-sonnet-5` | 1M | Previous Sonnet, retained for pinning |
 | `claude-sonnet-4-6` | 200k | Previous Sonnet, retained for pinning |
+| `claude-sonnet-4-5` | 200k | Older Sonnet, retained for pinning |
 | `claude-haiku-4-5-20251001` | 200k | Fastest, lightweight (default for `haiku` alias) |
 
 Context windows match the Claude Code CLI registry. Each model's prompt truncation ceiling is

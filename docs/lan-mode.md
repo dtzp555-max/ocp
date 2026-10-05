@@ -78,7 +78,7 @@ Run `ocp lan` to see your IP and ready-to-share instructions.
 **Verify:**
 ```bash
 curl http://127.0.0.1:3456/v1/models
-# Returns: claude-fable-5-1, claude-opus-5, claude-opus-4-8, claude-opus-4-7, claude-opus-4-6, claude-sonnet-5-5, claude-sonnet-5, claude-sonnet-4-6, claude-haiku-4-5-20251001
+# Returns: claude-fable-5-1, claude-fable-5, claude-opus-5, claude-opus-4-8, claude-opus-4-7, claude-opus-4-6, claude-opus-4-5, claude-sonnet-5-5, claude-sonnet-5, claude-sonnet-4-6, claude-sonnet-4-5, claude-haiku-4-5-20251001
 ```
 
 ### Headless install notes
@@ -247,13 +247,16 @@ OCP Connect v1.3.0
     Provider: ocp
     Models:
       • ocp/claude-fable-5-1
+      • ocp/claude-fable-5
       • ocp/claude-opus-5
       • ocp/claude-opus-4-8
       • ocp/claude-opus-4-7
       • ocp/claude-opus-4-6
+      • ocp/claude-opus-4-5
       • ocp/claude-sonnet-5-5
       • ocp/claude-sonnet-5
       • ocp/claude-sonnet-4-6
+      • ocp/claude-sonnet-4-5
       • ocp/claude-haiku-4-5-20251001
     Priority: PRIMARY (default model)
 
