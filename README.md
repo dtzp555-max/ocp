@@ -117,7 +117,7 @@ node setup.mjs
 
 ```bash
 curl http://127.0.0.1:3456/v1/models
-# claude-opus-5-5, claude-opus-5, claude-opus-4-8, claude-opus-4-7, claude-opus-4-6, claude-sonnet-5-5, claude-sonnet-5, claude-sonnet-4-6, claude-haiku-4-5-20251001
+# claude-fable-5-1, claude-opus-5-5, claude-opus-5, claude-opus-4-8, claude-opus-4-7, claude-opus-4-6, claude-sonnet-5-5, claude-sonnet-5, claude-sonnet-4-6, claude-haiku-4-5-20251001
 ```
 
 **Connect one IDE** — point any OpenAI-compatible tool at the proxy, then reload your shell and start a tool (Cline / Continue / Cursor / OpenCode):
@@ -206,7 +206,8 @@ Two things still describe the **host**, not the client:
 
 | Model ID | Context window | Notes |
 |----------|---------------:|-------|
-| `claude-opus-5-5` | 1M | Most capable (default for `opus` alias) |
+| `claude-fable-5-1` | 1M | Most capable; no alias, request it by id |
+| `claude-opus-5-5` | 1M | Latest Opus (default for `opus` alias) |
 | `claude-opus-5` | 1M | Previous Opus, retained for pinning |
 | `claude-opus-4-8` | 1M | Older Opus, retained for pinning |
 | `claude-opus-4-7` | 1M | Older Opus, retained for pinning |

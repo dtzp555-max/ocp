@@ -22313,6 +22313,7 @@ test("models.json: every contextWindow is a positive integer (shape guard; the c
 //      below plus claude-fable-5, claude-fable-5-1, claude-mythos-5 and claude-mythos-5-1, none of which
 //      OCP exposes. (Review of that change proposed "7" by inference; the binary says 9.)
 const _spotRegistryContextWindow = {
+  "claude-fable-5-1": 1000000,  // CLI 2.1.289 registry: context:{window:1e6}
   "claude-sonnet-5-5": 1000000, // CLI 2.1.284 registry: context:{window:1e6}
   "claude-opus-5-5": 1000000,   // CLI 2.1.280 registry: context:{window:1e6}
   "claude-opus-5": 1000000, "claude-opus-4-8": 1000000, "claude-opus-4-7": 1000000,
@@ -22390,6 +22391,9 @@ test("models.json: every aliases value resolves to a real models[].id (referenti
 // -> 633 passed, 0 failed (the wrong-repro trap — renaming without adding the new id anywhere
 // fails the FORWARD check instead and masks this gap entirely; see #222 for both repros).
 const _spotRegistryMaxTokens = {
+  // claude-fable-5-1: CLI 2.1.289 registry, max_output_tokens:{default:64000,upper:128000}. The API
+  // accepts up to 128000, but this table records the registry DEFAULT, as for claude-opus-5 (same pair).
+  "claude-fable-5-1": 64000,
   // claude-sonnet-5-5: CLI 2.1.284 registry, max_output_tokens:{default:128000,upper:128000} -- NOT the
   // sibling claude-sonnet-5's 64000 (same trap as claude-opus-5-5 below).
   "claude-sonnet-5-5": 128000,
@@ -24267,6 +24271,7 @@ const _OC_EXPECTED_MODEL_META_TABLE = {
   "claude-opus": { name: "Claude Opus (OCP)", reasoning: true, maxTokens: 64000, contextWindow: 200000 },
   "claude-sonnet": { name: "Claude Sonnet (OCP)", reasoning: true, maxTokens: 32000, contextWindow: 200000 },
   "claude-haiku": { name: "Claude Haiku (OCP)", reasoning: false, maxTokens: 32000, contextWindow: 200000 },
+  "claude-fable-5-1": { name: "Claude Fable (OCP)", reasoning: true, maxTokens: 64000, contextWindow: 1000000 },
   "claude-opus-5-5": { name: "Claude Opus (OCP)", reasoning: true, maxTokens: 128000, contextWindow: 1000000 },
   "claude-opus-5": { name: "Claude Opus (OCP)", reasoning: true, maxTokens: 64000, contextWindow: 1000000 },
   "claude-opus-4-8": { name: "Claude Opus (OCP)", reasoning: true, maxTokens: 64000, contextWindow: 1000000 },

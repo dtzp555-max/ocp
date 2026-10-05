@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+### Added
+
+- **Claude Fable 5.1 (`claude-fable-5-1`).** Class B.1 — `GET /v1/models` lists one more id, shape unchanged (OpenAI "List models"; ADR 0006). Added to `models.json` (the SPOT, ADR 0003) with the values read id-anchored from the Claude Code CLI **2.1.289** registry: `context.window` 1e6, `max_output_tokens.default` 64000 (upper 128000). No alias: `opus` stays on `claude-opus-5-5`. `ocp-connect` gets its own row, since no `claude-fable` family row exists and the unknown-id floor would under-advertise it.
+
 ### Changed
 
 - `.gitignore` now ignores the root `start.sh` launcher that `setup.mjs` writes and the root `package-lock.json` that `npm install` writes, so an install directory's `git status` stays clean after `ocp update`. `package.json` declares no dependencies, so that lock file records only the package itself; if a dependency is ever added, the lock should be committed and the ignore line removed.

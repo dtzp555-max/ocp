@@ -3,6 +3,14 @@
   "version": 1,
   "models": [
     {
+      "id": "claude-fable-5-1",
+      "displayName": "Claude Fable 5.1",
+      "openclawName": "Claude Fable 5.1 (via CLI)",
+      "reasoning": true,
+      "contextWindow": 1000000,
+      "maxTokens": 64000
+    },
+    {
       "id": "claude-opus-5-5",
       "displayName": "Claude Opus 5.5",
       "openclawName": "Claude Opus 5.5 (via CLI)",
