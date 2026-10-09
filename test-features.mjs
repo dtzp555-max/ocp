@@ -4377,11 +4377,12 @@ ltTest("integration: OCP_LOCAL_TOOLS=1 → the -p spawn receives the POSITIVE wr
 // `ocp logs` answered 500 on a service the current setup.mjs installed. And the suite stayed green
 // because scripts/b2-key-snapshot.mjs seeded the OLD path in its fixture.
 //
-// Five tests, each other's control, because one mutation of the handler breaks more than one claim
+// Six tests, each other's control, because one mutation of the handler breaks more than one claim
 // and a shared body would report only the first: new-only reddens a handler still on the old path,
-// legacy-only reddens dropping the fallback, both-present reddens swapping the order, unreadable-
-// primary reddens falling through on any error instead of only on ENOENT, and neither-present pins
-// that the 500 keeps its shape and now names the file the service writes.
+// legacy-only reddens dropping the fallback, both-present reddens swapping the order, empty-primary
+// reddens treating an empty file as an error or as a reason to fall through, unreadable-primary
+// reddens falling through on any error instead of only on ENOENT, and neither-present pins that the
+// 500 keeps its shape and now names the file the service writes.
 // Each one asserts a POSITIVE hit (its own marker is in entries) before any absence claim.
 function ltLogsSeed(dir, sub, text) {
   _ltMkdirSync(join(dir, "home", sub, "logs"), { recursive: true });
@@ -4434,6 +4435,23 @@ ltTest("integration (#514): when BOTH files exist, the service's file wins and a
     const events = ltLogsEvents(body);
     assert.ok(events.includes("lt514_live_service_file"), `the live file's entry must be returned, got ${JSON.stringify(events)}`);
     assert.ok(!events.includes("lt514_stale_legacy_file"), "the stale legacy file must not be read when the service's file exists");
+  } finally { child.kill("SIGKILL"); _ltRmRetry(dir); }
+});
+
+ltTest("integration (#514): an EMPTY service file is an empty answer, not an error and not a reason to read the legacy file", async () => {
+  if (!LT_POSIX) return;
+  const dir = ltMkdir(); const fake = ltFake(dir);
+  // A truncated log (logrotate copytruncate, `> proxy.log`) is the realistic way to get here. Empty is a
+  // file that was found and read, so it must not fall through the way a missing one does.
+  ltLogsSeed(dir, ".ocp", "");
+  ltLogsSeed(dir, ".openclaw", '{"level":"info","event":"lt514_legacy_behind_an_empty_file"}\n');
+  const { child, buf, port } = await ltBootFresh({ CLAUDE_BIN: fake }, dir);
+  try {
+    assert.ok(await ltWait(() => buf.out.includes("listening on") || buf.exit != null), `server did not start: ${buf.err.slice(0, 200)}`);
+    const { status, body } = await ltLogsGet(port);
+    assert.equal(status, 200, `an empty log is a valid log, got ${status}: ${JSON.stringify(body)}`);
+    assert.equal(body.count, 0, `an empty service file means no entries, got ${JSON.stringify(ltLogsEvents(body))}`);
+    assert.deepEqual(body.entries, []);
   } finally { child.kill("SIGKILL"); _ltRmRetry(dir); }
 });
 
