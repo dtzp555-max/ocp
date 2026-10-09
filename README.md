@@ -216,7 +216,7 @@ The canonical list lives in [`models.json`](./models.json) — the single source
 | `/usage` | GET | Plan usage limits + per-model stats |
 | `/status` | GET | Combined overview (usage + health) |
 | `/settings` | GET/PATCH | View or update settings at runtime |
-| `/logs` | GET | Recent log entries (`?n=20&level=error`) |
+| `/logs` | GET | Recent log entries (`?n=20&level=error`) from the service log, `~/.ocp/logs/proxy.log` (the old `~/.openclaw/logs/proxy.log` is read only if that one does not exist) |
 | `/dashboard` | GET | Web dashboard (always public) |
 | `/api/keys` | GET/POST | List or create API keys (admin only). `POST` body must be a JSON object — `{}` auto-names, `{"name":"…"}` names; anything else is `400` ([ADR 0017](./docs/adr/0017-api-keys-request-shape.md)) |
 | `/api/keys/:id` | DELETE | Revoke an API key (admin only) |
