@@ -96,7 +96,7 @@ The simplest path: ask your AI.
 
 The AI will run `git clone`, `npm install`, `node setup.mjs`, and tell you when to OAuth.
 
-**Prerequisites:** macOS or Linux (Windows is not supported), Node.js 22.13+ or 23.4+ (Node 24+ is what CI and the reference fleet run), `git`, and the [Claude CLI](https://docs.anthropic.com/en/docs/claude-cli) — new enough to have `--system-prompt-file`, which OCP passes on every spawn since v3.32.0. There is still no *version* floor — no minimum has been established, so this statement is deliberately version-free — but since [#455](https://github.com/dtzp555-max/ocp/issues/455) OCP **checks the capability at boot** and refuses to start if your CLI rejects a flag it passes, so you will find out at startup rather than on your first request — authenticated:
+**Prerequisites:** macOS, Linux or Windows (Windows runs the default `-p` path without auto-start — see [Windows](#windows)), Node.js 22.13+ or 23.4+ (Node 24+ is what CI and the reference fleet run), `git`, and the [Claude CLI](https://docs.anthropic.com/en/docs/claude-cli) — new enough to have `--system-prompt-file`, which OCP passes on every spawn since v3.32.0. There is still no *version* floor — no minimum has been established, so this statement is deliberately version-free — but since [#455](https://github.com/dtzp555-max/ocp/issues/455) OCP **checks the capability at boot** and refuses to start if your CLI rejects a flag it passes, so you will find out at startup rather than on your first request — authenticated:
 
 ```bash
 npm install -g @anthropic-ai/claude-code
@@ -135,6 +135,26 @@ node setup.mjs --bind 0.0.0.0 --auth-mode multi
 ```
 
 The full LAN server + client handbook, headless (Pi / NAS / VPS) OAuth, key/quota/anonymous-access management, AI-assisted install prompts, and the deployment/security model live in **[docs/lan-mode.md](docs/lan-mode.md)**. Claude Pro/Max are per-user accounts — read the [honest limits of sharing](docs/lan-mode.md#deployment-model--security-read-this) before extending access to other people.
+
+### Windows
+
+OCP runs natively on Windows 10/11 for the default `-p` path. Run the same install from PowerShell:
+
+```powershell
+git clone https://github.com/dtzp555-max/ocp.git
+cd ocp
+node setup.mjs
+.\start_ocp.cmd
+```
+
+What differs from macOS/Linux:
+
+- **`claude.exe` only.** OCP spawns the native executable, not a shell shim: it looks in `%USERPROFILE%\.local\bin` (where the native installer puts it), the WinGet and WindowsApps links, then `where claude`, and skips any `claude.cmd`/extensionless match. If yours lives elsewhere, set `CLAUDE_BIN` to the full path of `claude.exe`.
+- **No auto-start, and setup does not start the proxy.** `setup.mjs` writes `start_ocp.cmd` next to `server.mjs` instead of `start.sh`. It runs the proxy in the foreground of its window and does nothing if the port is already listening; stop it with Ctrl+C or by closing the window. To start it at logon, create a Task Scheduler task for it yourself.
+- **Environment variables** are read from the environment the launcher inherits. Set them once with `setx NAME value` (user scope) and open a new terminal before running `start_ocp.cmd`.
+- **Not available on Windows:** TUI mode (`CLAUDE_TUI_MODE=true` refuses to boot: it needs tmux and a `/bin/sh` hook), and the `ocp` / `ocp-connect` CLIs, which are bash scripts that call `python3`. Use `/health`, `/usage` and the dashboard at `http://127.0.0.1:3456/dashboard` instead, and point clients at the proxy with `setx OPENAI_BASE_URL http://127.0.0.1:3456/v1`.
+- **Port already in use:** `Get-NetTCPConnection -LocalPort 3456 -State Listen | Select-Object OwningProcess`, then `Stop-Process -Id <pid>`.
+- **Isolation** works as on the other platforms: spawns run under `~\.ocp\spawn-home` (OCP sets `USERPROFILE` as well as `HOME`, because `claude.exe` reads its config directory from `USERPROFILE`), and an aborted request ends the whole `claude.exe` process tree via `taskkill /T`.
 
 ### Uninstall
 
@@ -311,7 +331,7 @@ So the blind spot is real but narrow: it needs `stream: true`, no tools — or `
 | `PROXY_API_KEY` | *(unset)* | Bearer token for shared-mode authentication |
 | `PROXY_ANONYMOUS_KEY` | *(unset)* | Well-known anonymous key (multi mode) — this exact string bypasses `validateKey()` and grants public access. Exposed via `/health.anonymousKey` only to localhost, or to all callers when `PROXY_ADVERTISE_ANON_KEY=1`. Full setup + security notes: [docs/lan-mode.md § Anonymous Access](docs/lan-mode.md#anonymous-access-optional). |
 | `PROXY_ADVERTISE_ANON_KEY` | *(unset)* | When `=1`, advertise `PROXY_ANONYMOUS_KEY` in the public `/health` body for remote zero-config discovery. Default off — `/health` is unauthenticated, so this exposes the shared key to any LAN-reachable device (issue #109). Localhost always sees it regardless. |
-| `CLAUDE_TUI_MODE` | `false` | **Opt-in, single-user only.** Set to `"true"` to serve requests via interactive `claude` (`cc_entrypoint=cli`, subscription pool). Refuses to boot under `AUTH_MODE=multi`. See [Subscription-pool (TUI) mode](docs/tui-mode.md#subscription-pool-tui-mode). |
+| `CLAUDE_TUI_MODE` | `false` | **Opt-in, single-user only.** Set to `"true"` to serve requests via interactive `claude` (`cc_entrypoint=cli`, subscription pool). Refuses to boot under `AUTH_MODE=multi`, and on Windows. See [Subscription-pool (TUI) mode](docs/tui-mode.md#subscription-pool-tui-mode). |
 | `CLAUDE_CODE_OAUTH_TOKEN` | *(unset)* | OAuth bearer token — highest-precedence credential for the `-p` path, and the **recommended** credential for TUI-mode hosts (when set with `OCP_TUI_HOME` unset, OCP runs the TUI `claude` in a credential-isolated home). See [docs/tui-mode.md](docs/tui-mode.md#tui-other-vars) and the [permanent-401 fix](docs/troubleshooting.md#tui-401). |
 | `OCP_SPAWN_REAL_HOME` | *(unset)* | Kill-switch for the default `-p`/stream-json **spawn-home isolation** (latency fix). When unset and an OAuth token is resolvable, OCP runs the per-request `claude` spawn in a **credential-free minimal scratch home** (`$HOME/.ocp/spawn-home`, no `.credentials.json`/`settings.json`/plugins) with a neutral cwd and the env token — so it loads none of the operator's heavy global `~/.claude` (plugins/skills/hooks) or the project `CLAUDE.md`, cutting per-request latency (measured ~10–28s → ~3–7s). Set to `"1"` to force the legacy real-`HOME` spawn (no cwd override) even when a token exists. With **no** resolvable token, OCP falls back to the real `HOME` automatically (zero regression). Active mode is shown at startup and on `/health.spawn`. |
 | `CLAUDE_TUI_WALLCLOCK_MS` | `120000` | (TUI-mode) Maximum time in ms to wait for the native transcript to signal turn completion. Increase for long Opus thinking turns. |

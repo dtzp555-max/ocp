@@ -271,6 +271,8 @@ WantedBy=default.target
       log(`Service file written + daemon-reload'd (reconfigure-only: enable left as-is; start left to the upgrade flow's restart phase)`);
     }
 
+  } else if (platform === "win32") {
+    warn(`Auto-start is not installed on Windows — start manually with: ${startPath}`);
   } else {
     warn(`Auto-start not supported on ${platform} — start manually with: bash ${startPath}`);
   }
