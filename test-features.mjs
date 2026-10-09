@@ -3210,7 +3210,7 @@ function ltResolveTmuxBin(env, dir) {
 //   both token states.
 //   scripts/b2-key-snapshot.mjs also pins HOME, but for a NEIGHBOURING reason rather than this
 //   one, and the distinction is worth keeping: its stated purpose is snapshot DETERMINISM —
-//   handleLogs reads $HOME/.openclaw/logs/proxy.log, so an ambient HOME makes /logs record a
+//   handleLogs reads $HOME/.ocp/logs/proxy.log, so an ambient HOME makes /logs record a
 //   different key set on a developer machine than on CI. That is about READING the operator's
 //   files; this is about WRITING to their home. Precedent for the mechanism, not the argument.
 //
@@ -4367,6 +4367,104 @@ ltTest("integration: OCP_LOCAL_TOOLS=1 → the -p spawn receives the POSITIVE wr
     const sp = _ltRead(cap, "utf8");
     assert.ok(sp.includes(LT_POS_MARK), `expected POSITIVE wrapper in --system-prompt, got: ${sp.slice(0,90)}`);
     assert.ok(!sp.includes(LT_NEG_MARK), "positive wrapper must REPLACE the negative one, not append");
+  } finally { child.kill("SIGKILL"); _ltRmRetry(dir); }
+});
+
+// ── /logs reads the file the installed service writes (#514) ─────────────────────────────────────
+// setup.mjs points launchd's StandardOutPath and systemd's StandardOutput=append: at
+// ~/.ocp/logs/proxy.log (scripts/lib/install-autostart.mjs), so that is where the events are.
+// handleLogs read ~/.openclaw/logs/proxy.log, which no current install writes, so /logs and
+// `ocp logs` answered 500 on a service the current setup.mjs installed. And the suite stayed green
+// because scripts/b2-key-snapshot.mjs seeded the OLD path in its fixture.
+//
+// Five tests, each other's control, because one mutation of the handler breaks more than one claim
+// and a shared body would report only the first: new-only reddens a handler still on the old path,
+// legacy-only reddens dropping the fallback, both-present reddens swapping the order, unreadable-
+// primary reddens falling through on any error instead of only on ENOENT, and neither-present pins
+// that the 500 keeps its shape and now names the file the service writes.
+// Each one asserts a POSITIVE hit (its own marker is in entries) before any absence claim.
+function ltLogsSeed(dir, sub, text) {
+  _ltMkdirSync(join(dir, "home", sub, "logs"), { recursive: true });
+  _ltWrite(join(dir, "home", sub, "logs", "proxy.log"), text);
+}
+async function ltLogsGet(port) {
+  const r = await fetch(`http://127.0.0.1:${port}/logs?n=50&level=all`);
+  return { status: r.status, body: await r.json() };
+}
+const ltLogsEvents = (body) => (body.entries || []).map((e) => e.event ?? e.raw);
+
+ltTest("integration (#514): /logs reads ~/.ocp/logs/proxy.log, the file the installed service writes", async () => {
+  if (!LT_POSIX) return; // sh fake — skip on Windows CI
+  const dir = ltMkdir(); const fake = ltFake(dir);
+  ltLogsSeed(dir, ".ocp", '{"level":"info","event":"lt514_service_file"}\nnot json, kept as raw\n');
+  const { child, buf, port } = await ltBootFresh({ CLAUDE_BIN: fake }, dir);
+  try {
+    assert.ok(await ltWait(() => buf.out.includes("listening on") || buf.exit != null), `server did not start: ${buf.err.slice(0, 200)}`);
+    const { status, body } = await ltLogsGet(port);
+    assert.equal(status, 200, `/logs must answer 200 when ~/.ocp/logs/proxy.log exists, got ${status}: ${JSON.stringify(body)}`);
+    const events = ltLogsEvents(body);
+    assert.ok(events.includes("lt514_service_file"), `the service file's entry must be returned, got ${JSON.stringify(events)}`);
+    assert.ok(events.includes("not json, kept as raw"), "a non-JSON line keeps its { raw } shape");
+  } finally { child.kill("SIGKILL"); _ltRmRetry(dir); }
+});
+
+ltTest("integration (#514): with only the legacy ~/.openclaw/logs/proxy.log present, /logs still reads it", async () => {
+  if (!LT_POSIX) return;
+  const dir = ltMkdir(); const fake = ltFake(dir);
+  ltLogsSeed(dir, ".openclaw", '{"level":"info","event":"lt514_legacy_file"}\n');
+  const { child, buf, port } = await ltBootFresh({ CLAUDE_BIN: fake }, dir);
+  try {
+    assert.ok(await ltWait(() => buf.out.includes("listening on") || buf.exit != null), `server did not start: ${buf.err.slice(0, 200)}`);
+    const { status, body } = await ltLogsGet(port);
+    assert.equal(status, 200, `a host whose only log is the legacy path must keep working, got ${status}: ${JSON.stringify(body)}`);
+    assert.ok(ltLogsEvents(body).includes("lt514_legacy_file"), `the legacy file's entry must be returned, got ${JSON.stringify(ltLogsEvents(body))}`);
+  } finally { child.kill("SIGKILL"); _ltRmRetry(dir); }
+});
+
+ltTest("integration (#514): when BOTH files exist, the service's file wins and a stale legacy file does not shadow it", async () => {
+  if (!LT_POSIX) return;
+  const dir = ltMkdir(); const fake = ltFake(dir);
+  ltLogsSeed(dir, ".ocp", '{"level":"info","event":"lt514_live_service_file"}\n');
+  ltLogsSeed(dir, ".openclaw", '{"level":"info","event":"lt514_stale_legacy_file"}\n');
+  const { child, buf, port } = await ltBootFresh({ CLAUDE_BIN: fake }, dir);
+  try {
+    assert.ok(await ltWait(() => buf.out.includes("listening on") || buf.exit != null), `server did not start: ${buf.err.slice(0, 200)}`);
+    const { status, body } = await ltLogsGet(port);
+    assert.equal(status, 200);
+    const events = ltLogsEvents(body);
+    assert.ok(events.includes("lt514_live_service_file"), `the live file's entry must be returned, got ${JSON.stringify(events)}`);
+    assert.ok(!events.includes("lt514_stale_legacy_file"), "the stale legacy file must not be read when the service's file exists");
+  } finally { child.kill("SIGKILL"); _ltRmRetry(dir); }
+});
+
+ltTest("integration (#514): a service file that EXISTS but cannot be read is reported, not read past to the legacy file", async () => {
+  if (!LT_POSIX) return;
+  const dir = ltMkdir(); const fake = ltFake(dir);
+  // A directory at the service path: readFileSync fails with EISDIR, a non-ENOENT error that does not
+  // depend on the uid the suite runs as (chmod 000 would be ignored under root).
+  _ltMkdirSync(join(dir, "home", ".ocp", "logs", "proxy.log"), { recursive: true });
+  ltLogsSeed(dir, ".openclaw", '{"level":"info","event":"lt514_must_not_be_read_past_an_error"}\n');
+  const { child, buf, port } = await ltBootFresh({ CLAUDE_BIN: fake }, dir);
+  try {
+    assert.ok(await ltWait(() => buf.out.includes("listening on") || buf.exit != null), `server did not start: ${buf.err.slice(0, 200)}`);
+    const { status, body } = await ltLogsGet(port);
+    assert.equal(status, 500, `an unreadable service file must be an error, got ${status}: ${JSON.stringify(body)}`);
+    assert.match(body.error, /^Cannot read log: EISDIR/, `the service file's own error must be reported, got: ${body.error}`);
+    assert.ok(!JSON.stringify(body).includes("lt514_must_not_be_read_past_an_error"), "the legacy file must not have been read");
+  } finally { child.kill("SIGKILL"); _ltRmRetry(dir); }
+});
+
+ltTest("integration (#514): with neither file, /logs answers the same 500 shape and names the file the service writes", async () => {
+  if (!LT_POSIX) return;
+  const dir = ltMkdir(); const fake = ltFake(dir);
+  const { child, buf, port } = await ltBootFresh({ CLAUDE_BIN: fake }, dir);
+  try {
+    assert.ok(await ltWait(() => buf.out.includes("listening on") || buf.exit != null), `server did not start: ${buf.err.slice(0, 200)}`);
+    const { status, body } = await ltLogsGet(port);
+    assert.equal(status, 500);
+    assert.deepEqual(Object.keys(body), ["error"], "the error body keeps its one-key shape");
+    assert.match(body.error, /^Cannot read log: ENOENT/, `unexpected error text: ${body.error}`);
+    assert.ok(body.error.includes(".ocp/logs/proxy.log"), `the message must name the file the service writes, got: ${body.error}`);
   } finally { child.kill("SIGKILL"); _ltRmRetry(dir); }
 });
 

@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+### Fixed
+
+- **`/logs`, and so `ocp logs`, read a file the installed service never writes, and answered `500` (#514).** `setup.mjs` points launchd's `StandardOutPath` and systemd's `StandardOutput=append:` at `~/.ocp/logs/proxy.log`; `handleLogs` read `~/.openclaw/logs/proxy.log`. It now reads the service's file first and falls back to the old path **only when the first does not exist**, so a host whose log is still there keeps working and a stale legacy file cannot shadow the live one. Any other failure on the service's file (say a permissions error) is reported as it is rather than read past, and when neither file exists the `500` has the same `{ "error": "Cannot read log: ..." }` body, now naming `~/.ocp/logs/proxy.log`.
+  **Class B.2, [ADR 0006](docs/adr/0006-openai-shim-scope.md) (grandfathered as of v3.16.4), route (a).** Request shape (`n`, `level`), response shape (`count`, `level`, `entries[]`) and error shape are unchanged; the endpoint documented itself as "recent proxy log entries" and now returns them on a real install. The mismatch is not new: at v3.16.4 (`git show v3.16.4:server.mjs`, `handleLogs`) the handler already read the old path while `git show v3.16.4:setup.mjs` already wrote the service log to `~/.ocp/logs/proxy.log`, so the grandfathered snapshot *is* the defective behaviour. ADR 0012 is not engaged: no field is added, and `docs/governance/b2-response-keys.json` is unchanged.
+  It stayed hidden because `scripts/b2-key-snapshot.mjs` seeded the old path in its fixture; the fixture now seeds `~/.ocp/logs/proxy.log`, and a mutation that puts the handler back on the old path turns `node scripts/b2-key-snapshot.mjs` red. No new env var.
+
 ## v3.42.0 — 2026-09-29
 
 ### Added

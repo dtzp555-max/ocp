@@ -4145,14 +4145,27 @@ function handleLogs(req, res) {
   const n = Math.min(parseInt(url.searchParams.get("n") || "30", 10), 200);
   const level = url.searchParams.get("level") || "all"; // all | error | warn | info
 
-  const LOG_PATH = join(process.env.HOME || "/tmp", ".openclaw/logs/proxy.log");
+  // #514: the service setup.mjs installs sends launchd's StandardOutPath / systemd's
+  // StandardOutput=append: to ~/.ocp/logs/proxy.log (scripts/lib/install-autostart.mjs), and that is
+  // the file with the events in it. This used to read only ~/.openclaw/logs/proxy.log, which no
+  // current install writes, so /logs and `ocp logs` answered 500. The old path stays as a fallback for
+  // a host whose only log is there, tried ONLY when the first does not exist: a stale legacy file must
+  // never shadow the live one, and any failure other than "does not exist" (say EACCES) is reported
+  // as it is, not read past.
+  const home = homedir();
+  const LOG_PATHS = [join(home, ".ocp", "logs", "proxy.log"), join(home, ".openclaw", "logs", "proxy.log")];
   let lines;
-  try {
-    const raw = readFileSync(LOG_PATH, "utf8");
-    lines = raw.split("\n").filter(Boolean);
-  } catch (err) {
-    return jsonResponse(res, 500, { error: `Cannot read log: ${err.message}` });
+  let readErr;
+  for (const LOG_PATH of LOG_PATHS) {
+    try {
+      lines = readFileSync(LOG_PATH, "utf8").split("\n").filter(Boolean);
+      break;
+    } catch (err) {
+      readErr ??= err;
+      if (err.code !== "ENOENT") { readErr = err; break; }
+    }
   }
+  if (!lines) return jsonResponse(res, 500, { error: `Cannot read log: ${readErr.message}` });
 
   // Parse JSON lines, fall back to raw text
   let entries = lines.slice(-n * 3).map(line => {
