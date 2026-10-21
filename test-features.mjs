@@ -768,6 +768,19 @@ test("cacheHash framing: every option the previous key carried still partitions 
   assert.equal(cacheHash("sonnet", msgs1, { structured: schemaA }), cacheHash("sonnet", msgs1, { structured: { ...schemaA } }), "control: same descriptor, same key");
 });
 
+test("cacheHash framing: an option's value is keyed to WHICH option it is, not only that something was set", () => {
+  // temperature, max_tokens and top_p do not steer the sampler today (lib/unhonoured-fields.mjs), so a
+  // collision between them would not change an answer -- until one of them is honoured, at which point
+  // an unpinned position is a wrong answer served silently. The same value in a different slot is a
+  // different request.
+  const t = cacheHash("sonnet", msgs1, { temperature: 0.5 });
+  const m = cacheHash("sonnet", msgs1, { max_tokens: 0.5 });
+  const p = cacheHash("sonnet", msgs1, { top_p: 0.5 });
+  const e = cacheHash("sonnet", msgs1, { effort: "0.5" });
+  assert.equal(new Set([t, m, p, e]).size, 4, "the same value under four different options must be four different keys");
+  assert.equal(t, cacheHash("sonnet", msgs1, { temperature: 0.5 }), "control: same option, same value, same key");
+});
+
 test("cacheHash framing: a message with no `content` key is hashable (an assistant turn that only calls tools)", () => {
   // OpenAI's assistant message: `content` is "Required unless tool_calls or function_call is specified".
   const noContent = [{ role: "user", content: "q" }, { role: "assistant", tool_calls: frameToolCall("{}").tool_calls }];

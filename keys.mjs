@@ -537,7 +537,8 @@ export function getKeyQuota(keyId) {
 // message with no `content` key (OpenAI's assistant turn that only calls tools) reached
 // `hasher.update(undefined)` and threw. JSON.stringify of a fixed-arity array is injective over its
 // elements, which is the whole argument for the framing; it needs no delimiter that a value could
-// contain.
+// contain. "Injective" holds over strings, finite numbers and null: -0 and an overflowing literal
+// such as 1e400 serialize as 0 and null, exactly as they did under the old JSON.stringify(m.content).
 //
 // Each message is hashed WHOLE, not by a whitelist of fields. renderToolTurn reads `tool_calls`,
 // `tool_call_id` and `name`, messagesToPrompt reads `role` and `content`, and the image path reads
