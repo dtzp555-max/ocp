@@ -525,33 +525,53 @@ export function getKeyQuota(keyId) {
 // ── Response cache ──
 
 // Generate a cache key from model + messages + request params that affect output.
-// opts.keyId isolates per-API-key cache pools (v2 hash format).
+// opts.keyId isolates per-API-key cache pools.
 // When keyId is absent/null/empty, falls back to "anon" (shared anonymous pool).
+//
+// The key is the SHA-256 of ONE JSON document with a fixed arity, v3 format. It used to be a
+// concatenation (v2): `role`, `content`, the sampling options and the model went into the hasher
+// back to back with nothing marking where one ended, so a user turn reading "aassistantb" and the
+// two turns "a" / "b" hashed alike, and a string-valued `temperature` could spell what
+// `temperature` + `max_tokens` spelled. v2 also read only `role` and `content` of each message, so
+// two histories that differed only in a tool call's name or arguments shared a slot -- and a
+// message with no `content` key (OpenAI's assistant turn that only calls tools) reached
+// `hasher.update(undefined)` and threw. JSON.stringify of a fixed-arity array is injective over its
+// elements, which is the whole argument for the framing; it needs no delimiter that a value could
+// contain.
+//
+// Each message is hashed WHOLE, not by a whitelist of fields. renderToolTurn reads `tool_calls`,
+// `tool_call_id` and `name`, messagesToPrompt reads `role` and `content`, and the image path reads
+// the content parts; a list of "the fields that matter" is a second copy of what those functions
+// read, and the day one of them reads another field the list is wrong and the cache serves a wrong
+// answer -- which fails silently. The cost of the whole-message form is only a lower hit rate for
+// a client that attaches a per-request-varying extra field to its messages.
+//
+// The leading "v3" is the format version. Rows written under v2 are keyed ambiguously, so v3 must
+// not be able to land on one: changing the encoding does that, the version element keeps it true
+// across the next change, and the old rows age out through the TTL cleanup. Expiry: bump it when
+// this document's layout changes.
 export function cacheHash(model, messages, opts = {}) {
   const keyId = opts.keyId || "anon";
-  const h = createHash("sha256");
-  h.update(`v2|k:${keyId}|`);
-  h.update(model);
-  if (opts.temperature != null) h.update(`t:${opts.temperature}`);
-  if (opts.max_tokens != null) h.update(`mt:${opts.max_tokens}`);
-  if (opts.top_p != null) h.update(`tp:${opts.top_p}`);
-  // `reasoning_effort` changes the answer, so each level gets its own slot. Absent => unchanged hash.
-  if (opts.effort != null) h.update(`e:${opts.effort}|`);
-  // #176: fold the server's boot-config epoch into the key, so a config change that shapes
-  // answers (operator system prompt, wrapper text, allowed tools, NO_CONTEXT) invalidates
-  // the persistent cache instead of serving answers composed under the old config. Callers
-  // that omit it (older paths, tests) hash byte-identically to before.
-  if (opts.configEpoch != null) h.update(`ce:${opts.configEpoch}|`);
-  // Structured-output (OpenAI response_format / json_mode) requests must never share a cache slot
-  // with the conversational answer to the same prompt, nor with a different schema — the steering
-  // instruction and validated JSON payload differ. Keying on the detected descriptor isolates them.
-  // Absent for normal requests → hashes are byte-identical to pre-change.
-  if (opts.structured != null) h.update(`s:${JSON.stringify(opts.structured)}`);
-  for (const m of messages) {
-    h.update(m.role || "");
-    h.update(typeof m.content === "string" ? m.content : JSON.stringify(m.content));
-  }
-  return h.digest("hex");
+  const frame = [
+    "v3",
+    String(keyId),
+    model ?? null,
+    opts.temperature ?? null,
+    opts.max_tokens ?? null,
+    opts.top_p ?? null,
+    // `reasoning_effort` changes the answer, so each level gets its own slot.
+    opts.effort ?? null,
+    // #176: fold the server's boot-config epoch into the key, so a config change that shapes
+    // answers (operator system prompt, wrapper text, allowed tools, NO_CONTEXT) invalidates
+    // the persistent cache instead of serving answers composed under the old config.
+    opts.configEpoch ?? null,
+    // Structured-output (OpenAI response_format / json_mode) requests must never share a cache slot
+    // with the conversational answer to the same prompt, nor with a different schema -- the steering
+    // instruction and validated JSON payload differ. Keying on the detected descriptor isolates them.
+    opts.structured ?? null,
+    messages,
+  ];
+  return createHash("sha256").update(JSON.stringify(frame)).digest("hex");
 }
 
 // Check whether any message (or content part) carries an Anthropic cache_control field.

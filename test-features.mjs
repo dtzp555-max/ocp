@@ -687,21 +687,103 @@ test("cacheHash: different configEpoch → different key (config change invalida
   assert.notEqual(h1, h2);
 });
 
-test("cacheHash: same configEpoch is stable; absent epoch hashes byte-identically to pre-#176", () => {
+test("cacheHash: same configEpoch is stable; an absent epoch is one stable key, distinct from any epoch", () => {
   const e1 = cacheHash("sonnet", msgs1, { configEpoch: "aaaa000011112222" });
   const e2 = cacheHash("sonnet", msgs1, { configEpoch: "aaaa000011112222" });
   assert.equal(e1, e2);
-  // absent-epoch calls (older callers, all pre-existing tests) must not change behavior
+  // absent-epoch calls (callers that omit it, and most tests) are one stable key
   assert.equal(cacheHash("sonnet", msgs1, {}), cacheHash("sonnet", msgs1));
   assert.notEqual(e1, cacheHash("sonnet", msgs1), "epoch-carrying key differs from legacy key");
 });
 
-test("cacheHash: each reasoning_effort level gets its own slot; absent effort hashes as before", () => {
+test("cacheHash: each reasoning_effort level gets its own slot; a null effort is the same key as an absent one", () => {
   const low = cacheHash("sonnet", msgs1, { effort: "low" });
   const max = cacheHash("sonnet", msgs1, { effort: "max" });
   assert.notEqual(low, max, "an answer at low effort must not be served to a max-effort request");
   assert.notEqual(low, cacheHash("sonnet", msgs1));
   assert.equal(cacheHash("sonnet", msgs1, { effort: null }), cacheHash("sonnet", msgs1));
+});
+
+// ── cacheHash framing: the key is ONE unambiguous document, not a concatenation ──────────────
+// Found by an external review of 6cf0198, then reproduced. The old encoding fed `role`, `content`,
+// the sampling options and the model to the hasher back to back with nothing marking where one
+// ended, so two requests could spell the same byte string; and it read only `role` and `content`
+// of each message, so a tool call's name and arguments never entered the key at all.
+const frameToolCall = (args, name = "get_weather") => ({
+  role: "assistant", content: null,
+  tool_calls: [{ id: "call_1", type: "function", function: { name, arguments: args } }],
+});
+
+test("cacheHash framing: content cannot be shifted across a message boundary", () => {
+  const joined = cacheHash("sonnet", [{ role: "user", content: "aassistantb" }]);
+  const split = cacheHash("sonnet", [{ role: "user", content: "a" }, { role: "assistant", content: "b" }]);
+  assert.notEqual(joined, split, "one user turn spelling the next turn's role must not collide with two turns");
+  // Control: the property is "differs because the structure differs", not "everything differs".
+  assert.equal(
+    cacheHash("sonnet", [{ role: "user", content: "a" }, { role: "assistant", content: "b" }]), split);
+});
+
+test("cacheHash framing: a tool call's arguments and name are part of the key", () => {
+  const history = (call) => [{ role: "user", content: "weather?" }, call, { role: "tool", tool_call_id: "call_1", content: "ok" }];
+  const a = cacheHash("sonnet", history(frameToolCall('{"city":"A"}')));
+  const b = cacheHash("sonnet", history(frameToolCall('{"city":"B"}')));
+  const c = cacheHash("sonnet", history(frameToolCall('{"city":"A"}', "get_time")));
+  assert.notEqual(a, b, "histories that differ only in a tool call's arguments are different prompts");
+  assert.notEqual(a, c, "histories that differ only in a tool call's function name are different prompts");
+  assert.equal(a, cacheHash("sonnet", history(frameToolCall('{"city":"A"}'))), "control: identical history, identical key");
+});
+
+test("cacheHash framing: the fields renderToolTurn reads on a tool result are part of the key", () => {
+  const tool = (extra) => cacheHash("sonnet", [{ role: "user", content: "q" }, { role: "tool", content: "r", ...extra }]);
+  assert.notEqual(tool({ tool_call_id: "call_a" }), tool({ tool_call_id: "call_b" }), "tool_call_id pairs a result with its call");
+  assert.notEqual(tool({ name: "get_weather" }), tool({ name: "get_time" }), "`name` labels the result when no call id matches");
+  assert.equal(tool({ name: "get_weather" }), tool({ name: "get_weather" }), "control");
+});
+
+test("cacheHash framing: sampling options and the model/key head cannot be re-split", () => {
+  // `temperature` is client input and not validated, so a string can spell what two options spelled.
+  assert.notEqual(
+    cacheHash("sonnet", msgs1, { temperature: "0.5mt:1" }),
+    cacheHash("sonnet", msgs1, { temperature: 0.5, max_tokens: 1 }));
+  assert.notEqual(
+    cacheHash("y|z", msgs1, { keyId: "x" }),
+    cacheHash("z", msgs1, { keyId: "x|y" }));
+  // Control: the same options in the same slots are the same key.
+  assert.equal(
+    cacheHash("sonnet", msgs1, { temperature: 0.5, max_tokens: 1 }),
+    cacheHash("sonnet", msgs1, { temperature: 0.5, max_tokens: 1 }));
+});
+
+test("cacheHash framing: every option the previous key carried still partitions it (top_p, structured descriptor)", () => {
+  // Re-stating the old key as a document must not drop a member: each of these changes the answer.
+  const base = cacheHash("sonnet", msgs1);
+  assert.notEqual(cacheHash("sonnet", msgs1, { top_p: 0.9 }), base);
+  assert.notEqual(cacheHash("sonnet", msgs1, { top_p: 0.9 }), cacheHash("sonnet", msgs1, { top_p: 0.5 }));
+  const jsonObject = { mode: "json_object" };
+  const schemaA = { mode: "json_schema", name: "a", schema: { type: "object" } };
+  const schemaB = { mode: "json_schema", name: "b", schema: { type: "object" } };
+  assert.notEqual(cacheHash("sonnet", msgs1, { structured: jsonObject }), base, "a structured answer must not be the conversational one");
+  assert.notEqual(cacheHash("sonnet", msgs1, { structured: schemaA }), cacheHash("sonnet", msgs1, { structured: schemaB }), "a different schema is a different slot");
+  assert.notEqual(cacheHash("sonnet", msgs1, { structured: schemaA }), cacheHash("sonnet", msgs1, { structured: jsonObject }));
+  assert.equal(cacheHash("sonnet", msgs1, { structured: schemaA }), cacheHash("sonnet", msgs1, { structured: { ...schemaA } }), "control: same descriptor, same key");
+});
+
+test("cacheHash framing: a message with no `content` key is hashable (an assistant turn that only calls tools)", () => {
+  // OpenAI's assistant message: `content` is "Required unless tool_calls or function_call is specified".
+  const noContent = [{ role: "user", content: "q" }, { role: "assistant", tool_calls: frameToolCall("{}").tool_calls }];
+  let h;
+  assert.doesNotThrow(() => { h = cacheHash("sonnet", noContent); }, "an absent content key used to reach hasher.update(undefined)");
+  assert.match(h, /^[0-9a-f]{64}$/);
+  assert.equal(h, cacheHash("sonnet", noContent), "control: deterministic");
+  assert.doesNotThrow(() => cacheHash("sonnet", [{ role: "user" }]));
+  assert.doesNotThrow(() => cacheHash("sonnet", [null, 7, "x", {}]));
+});
+
+test("cacheHash framing: a digest made by the previous key encoding is not what is returned now", () => {
+  // The previous encoding, verbatim. Cache rows written under it were keyed ambiguously, so the new
+  // format must not be able to land on them: the old rows have to be unreachable, then age out.
+  const previous = createHash("sha256").update("v2|k:anon|").update("sonnet").update("user").update("Hello world").digest("hex");
+  assert.notEqual(cacheHash("sonnet", msgs1), previous);
 });
 
 test("cacheHash includes max_tokens in hash", () => {
@@ -2892,7 +2974,7 @@ test("localToolsSafetyError: multi is checked before loopback/anon (most severe 
 import { spawn as _ltSpawn, execFileSync as _ltExecFile } from "node:child_process";
 import { createServer as _ltNetServer, connect as _ltNetConnect } from "node:net";
 import { createServer as _ltHttpServer } from "node:http";
-import { writeFileSync as _ltWrite, chmodSync as _ltChmod, readFileSync as _ltRead, existsSync as _ltExists, rmSync as _ltRm, mkdtempSync as _ltMkdtemp, renameSync as _ltRename, mkdirSync as _ltMkdirSync, realpathSync as _ltRealpath } from "node:fs";
+import { writeFileSync as _ltWrite, chmodSync as _ltChmod, readFileSync as _ltRead, existsSync as _ltExists, rmSync as _ltRm, mkdtempSync as _ltMkdtemp, renameSync as _ltRename, mkdirSync as _ltMkdirSync, realpathSync as _ltRealpath, readdirSync as _ltReaddir } from "node:fs";
 import { tmpdir as _ltTmp } from "node:os";
 import { sep as _ltSep } from "node:path";
 import { fileURLToPath as _ltF2P } from "node:url";
@@ -8571,6 +8653,168 @@ exit 0
 `;
 function ltFakeJson(dir) { const p = join(dir, "claude-json"); _ltWrite(p, LT_FAKE_JSON); _ltChmod(p, 0o755); return p; }
 const LT_SCHEMA = { type: "object", properties: { ok: { type: "boolean" } }, required: ["ok"], additionalProperties: false };
+
+// ── cacheHash framing, through the real call sites ───────────────────────────────────────────
+// The unit tests above prove cacheHash CAN tell these histories apart; these prove each of the
+// three call sites hands it the messages. A POST with a deadline: before the fix a content-less
+// tool-call turn made cacheHash throw inside the async request callback, which Node does not
+// observe, so the client got no bytes and the socket stayed open -- `ltPostStatus` would wait
+// forever, and a hang has to read as a failed assertion, not a stuck suite.
+async function ltPostWithin(port, body, ms = 6000) {
+  try {
+    const r = await fetch(`http://127.0.0.1:${port}/v1/chat/completions`, {
+      method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body),
+      signal: AbortSignal.timeout(ms),
+    });
+    return { status: r.status, text: await r.text() };
+  } catch { return { status: 0, text: "" }; }
+}
+const ltSpawnCount = (counter) => Number(_ltRead(counter, "utf8")) || 0;
+const ltToolCallTurn = (args, { withContent = true } = {}) => ({
+  role: "assistant",
+  ...(withContent ? { content: null } : {}),
+  tool_calls: [{ id: "call_1", type: "function", function: { name: "get_weather", arguments: args } }],
+});
+
+ltTest("integration: histories that differ only in a tool call's arguments do not share a cache slot", async () => {
+  if (!LT_POSIX) return;
+  const dir = ltMkdir(); const fake = ltFake(dir); const counter = join(dir, "spawns.txt");
+  try {
+    const { child, buf, port } = await ltBootFresh({ CLAUDE_BIN: fake, CLAUDE_CACHE_TTL: "60000", SP_COUNTER: counter }, dir);
+    try {
+      assert.ok(await ltWait(() => buf.out.includes("listening on")), `— ${ltDiag(buf)}`);
+      _ltWrite(counter, "0");
+      const history = (args) => [
+        { role: "user", content: "weather?" }, ltToolCallTurn(args),
+        { role: "tool", tool_call_id: "call_1", content: "sunny" },
+      ];
+      const r1 = await ltPostWithin(port, { model: "sonnet", messages: history('{"city":"Oslo"}') });
+      assert.equal(r1.status, 200, r1.text.slice(0, 200));
+      assert.ok(await ltWait(() => ltSpawnCount(counter) === 1), `premise: the first request spawned — ${ltDiag(buf)}`);
+      const r2 = await ltPostWithin(port, { model: "sonnet", messages: history('{"city":"Rome"}') });
+      assert.equal(r2.status, 200, r2.text.slice(0, 200));
+      assert.ok(await ltWait(() => ltSpawnCount(counter) === 2), `a different tool call was answered from the first one's slot — spawns=${ltSpawnCount(counter)}`);
+      const r3 = await ltPostWithin(port, { model: "sonnet", messages: history('{"city":"Rome"}') });
+      assert.equal(r3.status, 200, r3.text.slice(0, 200));
+      await new Promise((res) => setTimeout(res, 400));
+      assert.equal(ltSpawnCount(counter), 2, "control: the same history again must be a cache hit, or the cache never stored anything");
+    } finally { child.kill("SIGKILL"); await ltDrain(() => buf.closed, "toolcall-args-cache", 5000); }
+  } finally { _ltRmRetry(dir); }
+});
+
+// OpenAI's assistant message: `content` is "Required unless tool_calls or function_call is
+// specified", so a turn that only calls tools legitimately has no `content` key. The pair
+// (absent, null) are each other's control: `content: null` was always answered, so a harness that
+// cannot see a 200 fails the control instead of passing the other half vacuously.
+ltTest("integration: an assistant turn with tool_calls and no content key is answered, not hung (plain path, cache on)", async () => {
+  if (!LT_POSIX) return;
+  const dir = ltMkdir(); const fake = ltFake(dir);
+  try {
+    const { child, buf, port } = await ltBootFresh({ CLAUDE_BIN: fake, CLAUDE_CACHE_TTL: "60000" }, dir);
+    try {
+      assert.ok(await ltWait(() => buf.out.includes("listening on")), `— ${ltDiag(buf)}`);
+      const history = (turn) => [{ role: "user", content: "weather?" }, turn, { role: "tool", tool_call_id: "call_1", content: "sunny" }];
+      const control = await ltPostWithin(port, { model: "sonnet", messages: history(ltToolCallTurn("{}", { withContent: true })) });
+      assert.equal(control.status, 200, `control: content:null must be answered — ${control.text.slice(0, 200)}`);
+      const absent = await ltPostWithin(port, { model: "sonnet", messages: history(ltToolCallTurn("{}", { withContent: false })) });
+      assert.equal(absent.status, 200, `no content key: expected 200, got ${absent.status === 0 ? "no response within the deadline" : absent.status} — ${ltDiag(buf)}`);
+    } finally { child.kill("SIGKILL"); await ltDrain(() => buf.closed, "toolcall-nocontent-plain", 5000); }
+  } finally { _ltRmRetry(dir); }
+});
+
+// The default configuration: CLAUDE_CACHE_TTL is 0, and the structured path still computes `dedupKey`
+// for single-flight (#200), so this is the reachable form of the same defect.
+ltTest("integration: an assistant turn with tool_calls and no content key is answered, not hung (structured path, cache off)", async () => {
+  if (!LT_POSIX) return;
+  const dir = ltMkdir(); const fake = ltFakeJson(dir);
+  try {
+    const { child, buf, port } = await ltBootFresh({ CLAUDE_BIN: fake }, dir);
+    try {
+      assert.ok(await ltWait(() => buf.out.includes("listening on")), `— ${ltDiag(buf)}`);
+      const rf = { type: "json_schema", json_schema: { name: "probe", schema: LT_SCHEMA } };
+      const history = (turn) => [{ role: "user", content: "weather?" }, turn, { role: "tool", tool_call_id: "call_1", content: "sunny" }];
+      const control = await ltPostWithin(port, { model: "sonnet", response_format: rf, messages: history(ltToolCallTurn("{}", { withContent: true })) });
+      assert.equal(control.status, 200, `control: content:null must be answered — ${control.text.slice(0, 200)}`);
+      const absent = await ltPostWithin(port, { model: "sonnet", response_format: rf, messages: history(ltToolCallTurn("{}", { withContent: false })) });
+      assert.equal(absent.status, 200, `no content key: expected 200, got ${absent.status === 0 ? "no response within the deadline" : absent.status} — ${ltDiag(buf)}`);
+    } finally { child.kill("SIGKILL"); await ltDrain(() => buf.closed, "toolcall-nocontent-structured", 5000); }
+  } finally { _ltRmRetry(dir); }
+});
+
+// The structured path's cache READ/WRITE key is a third call site (the other two are the plain path
+// and the single-flight key). Histories that collided under the old encoding must get separate
+// slots here too, with the cache ON; the repeat of the second is the control that it stores at all.
+ltTest("integration: structured requests with different histories do not share a cache slot", async () => {
+  if (!LT_POSIX) return;
+  const dir = ltMkdir(); const fake = ltFakeJson(dir); const counter = join(dir, "spawns.txt");
+  try {
+    const { child, buf, port } = await ltBootFresh({ CLAUDE_BIN: fake, CLAUDE_CACHE_TTL: "60000", SP_COUNTER: counter }, dir);
+    try {
+      assert.ok(await ltWait(() => buf.out.includes("listening on")), `— ${ltDiag(buf)}`);
+      _ltWrite(counter, "0");
+      const rf = { type: "json_schema", json_schema: { name: "probe", schema: LT_SCHEMA } };
+      const post = (messages) => ltPostWithin(port, { model: "sonnet", response_format: rf, messages });
+      const joined = [{ role: "user", content: "aassistantb" }];
+      const split = [{ role: "user", content: "a" }, { role: "assistant", content: "b" }];
+      const r1 = await post(joined);
+      assert.equal(r1.status, 200, r1.text.slice(0, 200));
+      assert.ok(await ltWait(() => ltSpawnCount(counter) === 1), `premise: the first request spawned — ${ltDiag(buf)}`);
+      const r2 = await post(split);
+      assert.equal(r2.status, 200, r2.text.slice(0, 200));
+      assert.ok(await ltWait(() => ltSpawnCount(counter) === 2), `a different history was answered from the first one's slot — spawns=${ltSpawnCount(counter)}`);
+      const r3 = await post(split);
+      assert.equal(r3.status, 200, r3.text.slice(0, 200));
+      await new Promise((res) => setTimeout(res, 400));
+      assert.equal(ltSpawnCount(counter), 2, "control: the same history again must be a cache hit, or the cache never stored anything");
+    } finally { child.kill("SIGKILL"); await ltDrain(() => buf.closed, "structured-history-cache", 5000); }
+  } finally { _ltRmRetry(dir); }
+});
+
+// Single-flight joins concurrent requests that share a key, with the cache OFF (the default), so a
+// key collision there serves one caller another caller's answer even when nothing was ever cached.
+// The fake sleeps one second so the second request really does arrive while the first is in flight
+// -- an instant fake would let the pair run back to back and the collision would pass unobserved.
+// The identical pair first is the control: it must still be ONE flight, so the machinery is live.
+// One marker file per spawn, named by pid, rather than the read-modify-write counter the other
+// fakes use: two spawns that START together both read the old count and both write the same new
+// one, so a counter under-reports exactly the concurrent case this fake exists for. (The first run of
+// this test failed on the FIXED tree for that reason, in the full suite and not in isolation.)
+const LT_FAKE_JSON_SLOW = `#!/bin/sh
+if [ "$1" = "auth" ] && [ "$2" = "status" ]; then exit 0; fi
+if [ -n "$SP_DIR" ]; then : > "$SP_DIR/spawn.$$"; fi
+sleep 1
+printf '%s\\n' '{"type":"assistant","message":{"content":[{"type":"text","text":"{\\"ok\\":true}"}]}}'
+printf '%s\\n' '{"type":"result"}'
+exit 0
+`;
+ltTest("integration: concurrent structured requests with different histories are not merged into one flight", async () => {
+  if (!LT_POSIX) return;
+  const dir = ltMkdir(); const spawnDir = join(dir, "spawns");
+  _ltMkdirSync(spawnDir);
+  const fake = join(dir, "claude-json-slow"); _ltWrite(fake, LT_FAKE_JSON_SLOW); _ltChmod(fake, 0o755);
+  const spawns = () => _ltReaddir(spawnDir).filter((n) => n.startsWith("spawn.")).length;
+  const clear = () => { for (const n of _ltReaddir(spawnDir)) _ltRm(join(spawnDir, n)); };
+  try {
+    const { child, buf, port } = await ltBootFresh({ CLAUDE_BIN: fake, SP_DIR: spawnDir }, dir);
+    try {
+      assert.ok(await ltWait(() => buf.out.includes("listening on")), `— ${ltDiag(buf)}`);
+      const rf = { type: "json_schema", json_schema: { name: "probe", schema: LT_SCHEMA } };
+      const post = (messages) => ltPostWithin(port, { model: "sonnet", response_format: rf, messages }, 15000);
+      clear();
+      const same = [{ role: "user", content: "same-probe" }];
+      const pairSame = await Promise.all([post(same), post(same)]);
+      assert.deepEqual(pairSame.map((r) => r.status), [200, 200], `control pair — ${pairSame.map((r) => r.text.slice(0, 80))}`);
+      assert.equal(spawns(), 1, "control: two identical concurrent requests must share ONE flight");
+      clear();
+      const joined = [{ role: "user", content: "aassistantb" }];
+      const split = [{ role: "user", content: "a" }, { role: "assistant", content: "b" }];
+      const pairDiff = await Promise.all([post(joined), post(split)]);
+      assert.deepEqual(pairDiff.map((r) => r.status), [200, 200], `— ${pairDiff.map((r) => r.text.slice(0, 80))}`);
+      assert.equal(spawns(), 2, "two different histories were served by one flight");
+    } finally { child.kill("SIGKILL"); await ltDrain(() => buf.closed, "structured-flight-collision", 5000); }
+  } finally { _ltRmRetry(dir); }
+});
+
 
 console.log("\nCache key resolves the model alias (#194):");
 
