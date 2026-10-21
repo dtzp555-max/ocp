@@ -122,7 +122,11 @@ function suiteLockAcquire(dir) {
       return myTicket;
     } catch (e) {
       try { _lockRmSync(tmpDir, { recursive: true, force: true }); } catch {}
-      if (e.code !== "EEXIST" && e.code !== "ENOTEMPTY") throw e; // rename onto a held lock
+      // rename onto a held lock. win32 reports that as EPERM (MoveFileEx refuses to replace an
+      // existing directory), which is also its code for a real permission failure, so it counts
+      // as "held" only while the lock dir actually exists.
+      const heldOnWin32 = process.platform === "win32" && e.code === "EPERM" && _lockExistsSync(dir);
+      if (e.code !== "EEXIST" && e.code !== "ENOTEMPTY" && !heldOnWin32) throw e;
     }
     // Fairness (issue #416 "Fairness"): the plain retry loop is a lottery — one contender waited
     // ~40 min. Register a ticket once, then only the OLDEST ticket acts each cycle; everyone else
@@ -12399,7 +12403,14 @@ function lt365SseError(text) {
 // server.mjs's sanitizeError, copied so the expected 500 body can be computed rather than
 // pattern-matched. A copy that drifts from production fails these tests loudly, which is the point:
 // the stderr accumulator is consumed THROUGH this function and the exact output is the contract.
-function lt365Sanitize(msg) { return String(msg || "Internal error").replace(/\/[\w/.\-]+/g, "[path]"); }
+// It must stay a COPY, not a slice of server.mjs: expected and actual computed by the same code
+// would agree whatever that code did. The two win32 patterns came with #529.
+function lt365Sanitize(msg) {
+  return String(msg || "Internal error")
+    .replace(/(?<![A-Za-z])[A-Za-z]:[\\/][^\s"'<>|]*/g, "[path]")
+    .replace(/\\\\[^\s\\"'<>|]+\\[^\s"'<>|]*/g, "[path]")
+    .replace(/\/[\w/.\-]+/g, "[path]");
+}
 // /health, not /status: both carry recentErrors (slice(-5) and slice(-3)) and both are Class B.2,
 // but handleStatus awaits fetchUsageFromApi() — a real call to api.anthropic.com — and a test that
 // asserts on a local accumulator must not depend on the network to read it.
@@ -12570,13 +12581,17 @@ ltTest("integration (#365): the stderr consumers — slice(300), sanitizeError, 
   try {
     assert.ok(await ltWait(() => buf.out.includes("listening on")), `did not start: ${buf.err.slice(0, 300)}`);
 
-    // Longer than 300 characters on purpose, with the marker up front and a path in it.
-    const head = `claude failed: /Users/x/.claude/creds.json ${LT365_MARK} `;
+    // Longer than 300 characters on purpose, with the marker up front and a path in it. A POSIX, a
+    // drive-letter and a UNC path (#529): sanitizeError's win32 patterns run on every platform, so
+    // this POSIX-only live test is what pins them in server.mjs on CI.
+    const head = `claude failed: /Users/x/.claude/creds.json C:\\Users\\x\\.claude\\creds.json \\\\fileserver\\share\\x.json ${LT365_MARK} `;
     const errText = head + LT_U8_THREE.repeat(320) + " END";
     const errBytes = Buffer.from(errText, "utf8");
     assert.ok(errText.length > 300, `stderr must exceed the 300-character slice, got ${errText.length}`);
     const expected = lt365Sanitize(errText.slice(0, 300));
     assert.ok(expected.includes("[path]"), "premise: sanitizeError must actually substitute in this payload");
+    assert.equal(expected.split("[path]").length - 1, 3, `premise: all three paths must be substituted, got ${JSON.stringify(expected.slice(0, 120))}`);
+    assert.ok(!expected.includes("C:\\") && !expected.includes("\\\\fileserver"), "premise: no win32 path may survive in the expected message");
     assert.ok(expected.includes(LT365_MARK), "premise: the marker must survive into the sliced+sanitized message");
 
     // Split offsets: every internal byte offset of the marker's three multi-byte characters (the
@@ -18214,6 +18229,47 @@ test("resolveBinaryPath: existsSyncFn is called with the absolute path being che
   assert.equal(seen, "/usr/sbin/lsof");
 });
 
+// win32 launcher (buildStartCmd): run the generated cmd file for real, once with the port held by
+// a listener (must refuse to start a second server) and once with it free (must start it). The
+// "server" is a stub script that prints a marker, so starting it is observable and instant.
+{
+  const { buildStartCmd } = await import("./scripts/lib/start-sh.mjs");
+  const runLauncher = (port) => {
+    const dir = mkdtempSync(join(tmpdir(), "ocp-startcmd-"));
+    const stub = join(dir, "stub_server.mjs");
+    testWriteFile(stub, 'console.log("STUB-SERVER-STARTED");\n');
+    const launcher = join(dir, "start_ocp.cmd");
+    testWriteFile(launcher, buildStartCmd({ port, serverPath: stub }));
+    const env = { ...process.env };
+    delete env.CLAUDE_PROXY_PORT;
+    const r = spawnSync("cmd.exe", ["/d", "/c", launcher], { encoding: "utf8", env, timeout: 30000, windowsHide: true });
+    rmSync(dir, { recursive: true, force: true });
+    return r;
+  };
+  if (process.platform !== "win32") {
+    testSkipped("buildStartCmd win32: port already listening -- does not start a duplicate", "cmd.exe launcher, win32 only");
+    testSkipped("buildStartCmd win32: port free -- starts the server", "cmd.exe launcher, win32 only");
+  } else {
+    const net = await import("node:net");
+    const holder = net.createServer();
+    await new Promise((res) => holder.listen(0, "127.0.0.1", res));
+    const heldPort = holder.address().port;
+    await testAsync("buildStartCmd win32: port already listening -- does not start a duplicate", async () => {
+      const r = runLauncher(heldPort);
+      assert.equal(r.status, 0, `stderr=${r.stderr}`);
+      assert.match(r.stdout, /already running/);
+      assert.doesNotMatch(r.stdout, /STUB-SERVER-STARTED/);
+    });
+    await new Promise((res) => holder.close(res));
+    await testAsync("buildStartCmd win32: port free -- starts the server", async () => {
+      const r = runLauncher(heldPort); // just released, so nothing listens on it now
+      assert.equal(r.status, 0, `stderr=${r.stderr}`);
+      assert.match(r.stdout, /STUB-SERVER-STARTED/);
+      assert.doesNotMatch(r.stdout, /already running/);
+    });
+  }
+}
+
 test("buildStartSh darwin: lsof cleanly matches -- already running, does not start a duplicate", () => {
   const r = _runStartShScenario({
     port: _startShTestPort,
@@ -21566,13 +21622,25 @@ test("messages guard: [{role:'user',content:'hi'}] → valid", () => {
 });
 
 // ── sanitizeError helper (issue #111) ────────────────────────────────────
-// Replicated verbatim from server.mjs (cannot import server.mjs).
+// server.mjs's own sanitizeError, sliced out of its source and executed (server.mjs cannot be
+// imported: it listens at top level). Until #529 this section held a copy "replicated verbatim",
+// which went stale when server.mjs gained the win32 patterns and kept passing whatever server.mjs
+// did. Anchors are checked by index before slicing; CRLF is accepted for a Windows checkout.
 // The SIGKILL-escalation and timer changes are process-lifecycle and are not
 // unit-testable here (no live-server harness).
 console.log("\nsanitizeError (issue #111):");
 
+let _sanitizeErrorReal = null;
 function sanitizeError(msg) {
-  return String(msg || "Internal error").replace(/\/[\w/.\-]+/g, "[path]");
+  if (!_sanitizeErrorReal) {
+    const src = _ltRead(_ltF2P(new URL("./server.mjs", import.meta.url)), "utf8");
+    const start = src.indexOf("function sanitizeError(msg) {");
+    const close = start === -1 ? null : /\r?\n\}\r?\n/.exec(src.slice(start));
+    const end = close ? start + close.index + close[0].length : -1;
+    assert.ok(start > -1 && end > start, "anchor drift: `function sanitizeError(msg) {` ... `}` not found in server.mjs");
+    _sanitizeErrorReal = new Function(`${src.slice(start, end)}return sanitizeError;`)();
+  }
+  return _sanitizeErrorReal(msg);
 }
 
 test("sanitizeError: strips home-dir path from message", () => {
@@ -21594,6 +21662,28 @@ test("sanitizeError: multiple paths all stripped", () => {
   assert.ok(!result.includes("/a/b"), `expected /a/b stripped, got: ${result}`);
   assert.ok(!result.includes("/c/d"), `expected /c/d stripped, got: ${result}`);
   assert.ok(result.includes("[path]"), `expected [path] in: ${result}`);
+});
+
+test("sanitizeError: a win32 drive-letter path with backslashes is stripped (#529)", () => {
+  assert.equal(sanitizeError("spawn C:\\Users\\x\\AppData\\claude.exe ENOENT"), "spawn [path] ENOENT");
+});
+
+test("sanitizeError: a win32 drive-letter path with forward slashes is stripped (#529)", () => {
+  assert.equal(sanitizeError("open 'D:/ocp/keys.db' failed"), "open '[path]' failed");
+});
+
+test("sanitizeError: a win32 UNC path is stripped (#529)", () => {
+  assert.equal(sanitizeError("read \\\\fileserver\\share\\ocp\\proxy.log failed"), "read [path] failed");
+});
+
+// Two literal backslashes followed by text, as in an escaped regex or a JSON-encoded string: a UNC
+// match needs a third backslash after a name, so neither of these is a share.
+test("sanitizeError: a JSON-escaped regex is not taken for a UNC path (#529)", () => {
+  assert.equal(sanitizeError('pattern "\\\\d{3}" does not match'), 'pattern "\\\\d{3}" does not match');
+});
+
+test("sanitizeError: an escaped backslash between words is not taken for a UNC path (#529)", () => {
+  assert.equal(sanitizeError("output was: a\\\\b"), "output was: a\\\\b");
 });
 
 // ── models.json SPOT wiring (issue #112) ────────────────────────────────────
@@ -22023,8 +22113,8 @@ function _s328Env(slice) {
   return seen;
 }
 
-for (const [label, marker] of [["which claude", "which claude 2>/dev/null"],
-                               ["claude --version", "claude --version 2>/dev/null"],
+for (const [label, marker] of [["which claude", "\"which claude\""],
+                               ["claude --version", "\"claude --version\""],
                                ["claude -p auth probe", "--no-session-persistence"]]) {
   test(`#328: setup.mjs's \`${label}\` spawn does not hand the child OCP's inbound credentials`, () => {
     const opts = _s328Env(_s328Slice(marker));

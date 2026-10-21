@@ -18,7 +18,7 @@
 import { readFileSync, writeFileSync, existsSync, mkdirSync, readdirSync } from "node:fs";
 import { resolveServicePlan } from "./scripts/lib/service-mode.mjs";
 import { installAutoStart } from "./scripts/lib/install-autostart.mjs";
-import { buildStartSh, classifyBindCheck } from "./scripts/lib/start-sh.mjs";
+import { buildStartSh, buildStartCmd, classifyBindCheck } from "./scripts/lib/start-sh.mjs";
 import { supportsUnflaggedSqlite, ENGINES_NODE } from "./scripts/lib/node-floor.mjs";
 import { execSync } from "node:child_process";
 import { join, dirname } from "node:path";
@@ -68,8 +68,13 @@ if (process.env.CLAUDE_BIN) {
   CLAUDE_BIN_INJECT = process.env.CLAUDE_BIN;
 } else {
   try {
-    const detected = execSync("which claude 2>/dev/null",
-      { encoding: "utf-8", env: scrubInboundAuthEnv({ ...process.env }).env }).trim();
+    // stderr discarded through stdio, not a `2>/dev/null` redirect: cmd.exe has no /dev/null.
+    // win32: `where` lists every match (an npm install adds extensionless and .cmd shims next to
+    // the .exe), and server.mjs's resolveClaude() accepts only claude.exe there, so take that.
+    const out = execSync(process.platform === "win32" ? "where claude" : "which claude",
+      { encoding: "utf-8", stdio: ["ignore", "pipe", "ignore"], env: scrubInboundAuthEnv({ ...process.env }).env });
+    const lines = out.split(/\r?\n/).map(l => l.trim()).filter(Boolean);
+    const detected = (process.platform === "win32" ? lines.find(l => /\.exe$/i.test(l)) : lines[0]) || "";
     if (detected && existsSync(detected)) {
       CLAUDE_BIN_INJECT = detected;
     }
@@ -157,8 +162,8 @@ try {
   // #328: this one had no `env` option at all, so it inherited everything. `--version` reads no
   // prompt, so it is the least exposed of the spawns — scrubbed anyway, because "which spawns are
   // safe to leak to" is not a judgement anyone should have to re-make at each call site.
-  const ver = execSync("claude --version 2>/dev/null",
-    { encoding: "utf-8", env: scrubInboundAuthEnv({ ...process.env }).env }).trim();
+  const ver = execSync("claude --version",
+    { encoding: "utf-8", stdio: ["ignore", "pipe", "ignore"], env: scrubInboundAuthEnv({ ...process.env }).env }).trim();
   log(`Claude CLI: ${ver}`);
 } catch {
   fail("Claude CLI not found. Install: https://docs.anthropic.com/en/docs/claude-code");
@@ -312,12 +317,17 @@ if (!existsSync(logDir)) mkdirSync(logDir, { recursive: true });
 // nohup'd) is extracted into scripts/lib/start-sh.mjs's buildStartSh() so it can be driven
 // by injected fake lsof/netstat binaries in tests -- see that file's header for the full
 // defect writeup and the darwin/non-darwin scope decision.
-const startSh = buildStartSh({ port: PORT, serverPath, logDir });
-
-const startPath = join(__dirname, "start.sh");
+// win32: no bash, so the launcher is a cmd file. It runs the proxy in the foreground of the
+// window it is started from (Windows auto-start is not installed by this script; see Step 7).
+const IS_WIN = process.platform === "win32";
+const startPath = join(__dirname, IS_WIN ? "start_ocp.cmd" : "start.sh");
 if (!DRY_RUN) {
-  writeFileSync(startPath, startSh);
-  execSync(`chmod +x "${startPath}"`);
+  if (IS_WIN) {
+    writeFileSync(startPath, buildStartCmd({ port: PORT, serverPath }));
+  } else {
+    writeFileSync(startPath, buildStartSh({ port: PORT, serverPath, logDir }));
+    execSync(`chmod +x "${startPath}"`);
+  }
 }
 log(`Launcher: ${startPath}`);
 
@@ -333,7 +343,9 @@ const banner = [
   `║  Default:  ${DEFAULT_MODEL_ID.padEnd(44)}║`,
   `║                                                              ║`,
   `║  Start proxy:                                                ║`,
-  `║    bash ${startPath.replace(HOME, "~").padEnd(50)}║`,
+  IS_WIN
+    ? `║    ${startPath.padEnd(55)}║`
+    : `║    bash ${startPath.replace(HOME, "~").padEnd(50)}║`,
   `║                                                              ║`,
   `║  Or directly:                                                ║`,
   `║    node ${serverPath.replace(HOME, "~").padEnd(49)}║`,
@@ -414,7 +426,14 @@ if (!DRY_RUN) {
   // Skipped under --reconfigure-only too: nothing was started above, so there is nothing
   // yet to verify — the upgrade flow's own post-flight phase (phase 6) checks the real
   // post-restart state after phase 5 actually restarts the service.
-  if (!SKIP_START && !servicePlan.reconfigureOnly) {
+  // win32: installAutoStart() starts nothing there, so there is no server to wait for.
+  if (IS_WIN && !SKIP_START && !servicePlan.reconfigureOnly) {
+    console.log(`  Start the proxy with:
+    ${startPath}
+  then check http://127.0.0.1:${PORT}/health
+`);
+  }
+  if (!IS_WIN && !SKIP_START && !servicePlan.reconfigureOnly) {
     console.log("⏳ Waiting for server to bind...\n");
     await new Promise(r => setTimeout(r, 3000));
 

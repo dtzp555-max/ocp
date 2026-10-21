@@ -21,7 +21,7 @@ OCP has two roles: **Server** (runs the proxy, needs Claude CLI) and **Client** 
 > **Recommended:** Install OCP on a device that stays powered on — Mac mini, NAS, Raspberry Pi, or a desktop that doesn't sleep. This ensures all clients always have access.
 
 **Prerequisites:**
-- macOS or Linux (Windows is not supported — `setup.mjs` installs launchd / systemd auto-start)
+- macOS or Linux for the service this guide installs (launchd / systemd). On Windows OCP runs the default `-p` path in the foreground without auto-start, see [README § Windows](../README.md#windows); the LAN steps below are untested there as of #529
 - Node.js 22.13+ — `keys.mjs` imports `node:sqlite` at module load, and Node removed that module's `--experimental-sqlite` requirement in **v22.13.0** and **v23.4.0** (nodejs.org/api/sqlite.html § History) — two lines, two points, so **23.0–23.3 are excluded too**. Below those the proxy cannot start, because nothing on the launch path passes the flag. Node 24+ is what CI and the reference fleet run.
 - `git`
 - [Claude CLI](https://docs.anthropic.com/en/docs/claude-cli) — install and authenticate:
@@ -132,7 +132,7 @@ OpenAI-compatible endpoint.
 Please follow https://github.com/dtzp555-max/ocp/blob/main/docs/lan-mode.md
 "Server Setup" → "LAN mode" path:
 
-1. Verify prerequisites: macOS or Linux (Windows not supported), Node.js
+1. Verify prerequisites: macOS or Linux (launchd / systemd only; on Windows see [README § Windows](../README.md#windows), where these LAN steps are untested as of #529), Node.js
    22.13+ (or 23.4+), git, Claude CLI installed and authenticated.
 2. Generate a strong admin key with `openssl rand -base64 32`. Save it —
    I'll need it to manage per-user keys later.
