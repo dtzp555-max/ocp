@@ -1998,7 +1998,7 @@ function spawnClaudeProcess(model, messages, conversationId, keyName, releaseSlo
   // that killChildTree() addresses (process.kill(-pid)). Without this, a grandchild that
   // inherited the stdout pipe (a real `claude` tool subprocess) survives the per-process kill
   // and the client hangs. win32: `detached` means something different there; the group kill is
-  // POSIX-only (see killChildTree), so win32 keeps the pre-#474 per-process behaviour.
+  // POSIX-only (see killChildTree); win32 reaches the tree with `taskkill /T` instead (#529).
   if (process.platform !== "win32") spawnOpts.detached = true;
   // win32: no console window per spawn when the server runs without one (Task Scheduler).
   else spawnOpts.windowsHide = true;
