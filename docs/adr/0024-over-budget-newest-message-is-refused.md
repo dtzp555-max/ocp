@@ -1,6 +1,6 @@
 # ADR 0024 — A newest message that cannot fit the prompt budget is refused, not truncated away
 
-- **Status**: Proposed — awaiting maintainer sign-off (the maintainer marks it Accepted, with the date, before this PR merges)
+- **Status**: Accepted (maintainer sign-off 2026-10-25)
 - **Date**: 2026-10-25
 - **Amends**: [ADR 0009](0009-spot-derived-prompt-budget.md) and [ADR 0011](0011-per-model-prompt-char-budget.md) — the truncation rule, for the one case where it dropped the question itself. Their budget (`contextWindow × 3`, per model, overridable) is unchanged.
 - **Class**: B.1 (`/v1/chat/completions`). No request field and no response field is added. ADR 0011 recorded that OpenAI's specification does not govern the truncation rule in either direction; this ADR changes one *outcome* of that rule (serve a degraded prompt → refuse), so the only specification it leans on is the shape of the error object. ADR 0006 route: not a grandfathered B.2 endpoint, so no contract-change ADR is needed beyond this amendment.
