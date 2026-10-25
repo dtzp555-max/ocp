@@ -2875,6 +2875,22 @@ test("PromptTooLargeError: carries all four fields OpenAI's Error object require
   assert.ok(e.message.includes("700022") && e.message.includes("600000"), e.message);
 });
 
+test("PromptTooLargeError: the 400 states the newest message's real room, not just the budget (review F3)", () => {
+  // With history: room = budget - note reserve - separator = 2000 - 200 - 2, and the message says so.
+  try { fitPromptToBudget(["o".repeat(200), "n".repeat(1850)], [false, false], 2000); assert.fail("must throw"); }
+  catch (e) { assert.ok(e instanceof PromptTooLargeError); assert.equal(e.roomChars, 1798); assert.ok(e.message.includes("at most 1798"), e.message); }
+  // Alone, the message could be the whole budget (it never enters the truncation path) -- and a tail eats into it.
+  try { fitPromptToBudget(["q".repeat(1001)], [false], 1000); assert.fail("must throw"); } catch (e) { assert.equal(e.roomChars, 1000); }
+  try { fitPromptToBudget(["q".repeat(1001)], [false], 1000, "t".repeat(10)); assert.fail("must throw"); } catch (e) { assert.equal(e.roomChars, 990); }
+  // Each stated room is exact: at the room the message is served.
+  assert.ok(fitPromptToBudget(["o".repeat(200), "n".repeat(1798)], [false, false], 2000).text.endsWith("n".repeat(1798)));
+  assert.equal(fitPromptToBudget(["q".repeat(990)], [false], 1000, "t".repeat(10)).truncated, false);
+  // The other arm of the max: history far over budget, so only the truncation path can keep the newest.
+  const big = (n) => fitPromptToBudget(["o".repeat(5000), "n".repeat(n)], [false, false], 2000);
+  try { big(1799); assert.fail("must throw"); } catch (e) { assert.equal(e.roomChars, 1798); }
+  assert.equal(big(1798).truncated, true);
+});
+
 test("promptCharBudgetFor: charsPerToken and floor are tunable parameters", () => {
   assert.equal(promptCharBudgetFor([{ id: "m", contextWindow: 1000000 }], "m", { charsPerToken: 3 }), 3000000);
   assert.equal(promptCharBudgetFor([], "m", { floor: 42 }), 42);
@@ -9106,6 +9122,7 @@ ltTest("integration (ADR 0024): an over-budget NEWEST message is refused with 40
     // Exact count: three served requests spawned, the four refusals did not.
     assert.equal(spawns(), 3, `refused requests must never reach the spawn — ${spawns()} spawns`);
     assert.equal(buf.err.split('"prompt_refused"').length - 1, 4, `each refusal is logged as prompt_refused. ${ltDiag(buf)}`);
+    assert.equal(buf.err.split('"prompt_refused","stage":"preflight"').length - 1, 4, "every refusal was the handler's pre-flight, none a lane backstop");
     assert.equal(buf.err.split('"prompt_truncated"').length - 1, 1, "a refusal is not a truncation; only the trimmed-history request logs prompt_truncated");
   } finally { child.kill("SIGKILL"); _ltRmRetry(dir); }
 });
@@ -9127,10 +9144,64 @@ ltTest("integration (ADR 0024): the TUI path refuses an over-budget newest messa
       ["one 700k message", [{ role: "user", content: "x".repeat(700000) }]],
       ["400k inline system + 300k user", [{ role: "system", content: "s".repeat(400000) }, { role: "user", content: "u".repeat(300000) }]],
     ]) {
+      const before = buf.err.split('"stage":"preflight"').length;
       const r = await ltPostStatus(port, { model: HAIKU, messages });
       assert.equal(r.status, 400, `${label}: must be refused in TUI mode, got ${r.status} ${r.text.slice(0, 200)}`);
       assert.equal(JSON.parse(r.text).error.code, "context_length_exceeded", label);
+      assert.ok(await ltWait(() => buf.err.split('"stage":"preflight"').length === before + 1, 5000), `${label}: refused by the pre-flight, not by callClaudeTui. ${ltDiag(buf)}`);
     }
+  } finally { child.kill("SIGKILL"); _ltRmRetry(dir); }
+});
+
+// Review F1/F2: the pre-flight must ask the question the LANE will ask, with the lane's own options.
+// F1 -- the -p image lane sends no continuation note under OCP_MULTIBLOCK_INPUT (the default); a
+// pre-flight that counted one refused a vision tool turn base served whole. F2 -- the TUI lane always
+// sends the note and keeps the structured-output instruction inline; a pre-flight that left them out
+// passed requests callClaudeTui then refused as a 500. Budget 2000 puts each case inside its band.
+ltTest("integration (ADR 0024, review F1): an image tool turn near the budget is served, not refused for a note the -p lane never sends", async () => {
+  if (!LT_POSIX) return;
+  const dir = ltMkdir(); const fake = ltFake(dir); const stdinFile = join(dir, "stdin.txt");
+  const { child, buf, port } = await ltBootFresh({ CLAUDE_BIN: fake, STDIN_CAPTURE: stdinFile, CLAUDE_MAX_PROMPT_CHARS: "2000" }, dir);
+  const PNG = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNkYAAAAAYAAjCB0C8AAAAASUVORK5CYII=";
+  const img = { type: "image_url", image_url: { url: PNG } };
+  const call = { role: "assistant", content: null, tool_calls: [{ id: "c1", type: "function", function: { name: "f", arguments: "{}" } }] };
+  try {
+    assert.ok(await ltWait(() => buf.out.includes("listening on")), `did not start: ${buf.err.slice(0, 200)}`);
+    const r = await ltPostStatus(port, { model: "claude-haiku-4-5-20251001", messages: [
+      { role: "user", content: [{ type: "text", text: "look" }, img ], }, call,
+      { role: "tool", tool_call_id: "c1", content: [{ type: "text", text: "MARK_F1" + "x".repeat(1843) }, img] }] });
+    assert.equal(r.status, 200, `a vision tool turn inside the budget must be served, got ${r.status} ${r.text.slice(0, 200)}`);
+    assert.ok(await ltWait(() => _ltExists(stdinFile) && _ltRead(stdinFile, "utf8").includes("MARK_F1"), 9000), `the result never reached the CLI. ${ltDiag(buf)}`);
+    const blocks = ltStdinBlocks(_ltRead(stdinFile, "utf8"));
+    assert.ok(Array.isArray(blocks), "premise: the image lane (stream-json)");
+    assert.ok(!blocks.some(b => b.type === "text" && b.text.includes("truncated to fit")), "and nothing was trimmed");
+  } finally { child.kill("SIGKILL"); _ltRmRetry(dir); }
+});
+
+ltTest("integration (ADR 0024, review F2): in TUI mode the continuation note and the structured instruction count, so the refusal is a 400 and not a 500", async () => {
+  if (!LT_POSIX) return;
+  const dir = ltMkdir(); const fake = ltFake(dir);
+  const { child, buf, port } = await ltBootFresh({ CLAUDE_TUI_MODE: "true", CLAUDE_BIN: fake, CLAUDE_MAX_PROMPT_CHARS: "2000" }, dir);
+  const HAIKU = "claude-haiku-4-5-20251001";
+  try {
+    assert.ok(await ltWait(() => buf.out.includes("listening on")), `did not start: ${buf.err.slice(0, 200)}`);
+    const N = 1900 - "[Tool tool returned]\n".length;
+    for (const [label, body] of [
+      ["tool-result newest (the note is sent after it)", { messages: [{ role: "user", content: "hi" }, { role: "tool", tool_call_id: "c1", content: "x".repeat(N) }] }],
+      ["structured json_object, one 1900-char message (the instruction is inline)", { response_format: { type: "json_object" }, messages: [{ role: "user", content: "x".repeat(1900) }] }],
+    ]) {
+      const before = buf.err.split('"stage":"preflight"').length;
+      const r = await ltPostStatus(port, { model: HAIKU, ...body });
+      assert.equal(r.status, 400, `${label}: got ${r.status} ${r.text.slice(0, 200)}`);
+      assert.equal(JSON.parse(r.text).error.code, "context_length_exceeded", label);
+      // Same 400 from the lane backstop would mean the pre-flight asked a different question than the lane.
+      assert.ok(await ltWait(() => buf.err.split('"stage":"preflight"').length === before + 1, 5000), `${label}: refused by the pre-flight, not by callClaudeTui. ${ltDiag(buf)}`);
+    }
+    // Control: the same 1900 chars WITHOUT response_format fit, so they pass the pre-flight and go on to
+    // the (stubbed, failing) tmux lane -- anything but the refusal.
+    const c = await ltPostStatus(port, { model: HAIKU, messages: [{ role: "user", content: "x".repeat(1900) }] });
+    assert.notEqual(c.status, 400, `control must pass the pre-flight, got ${c.status} ${c.text.slice(0, 200)}`);
+    assert.ok(!c.text.includes("context_length_exceeded"), c.text.slice(0, 200));
   } finally { child.kill("SIGKILL"); _ltRmRetry(dir); }
 });
 
