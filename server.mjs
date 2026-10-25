@@ -65,7 +65,7 @@ import { makeResolveSpawnToken } from "./lib/spawn-token.mjs";
 import { classifyCapabilityProbe, capabilityBootError } from "./lib/claude-capability.mjs";
 import { hasImageContent, buildImageBlocks, buildStreamJsonInput, MultimodalError } from "./lib/multimodal.mjs";
 import { parsePositiveInt } from "./lib/env.mjs";
-import { appendOperatorPrompt, promptCharBudgetFor, fallbackPromptCharBudget, resolveGlobalPromptCharOverride, selectPromptWrapper, localToolsSafetyError } from "./lib/prompt.mjs";
+import { appendOperatorPrompt, promptCharBudgetFor, fallbackPromptCharBudget, resolveGlobalPromptCharOverride, selectPromptWrapper, localToolsSafetyError, fitPromptToBudget, PromptTooLargeError } from "./lib/prompt.mjs";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 // lib/mcp-bridge.mjs, resolved from this file's own location so a relocated install (#348) still
@@ -1782,7 +1782,11 @@ function contentToText(content) {
 // argument in practice — the default only exists so a future internal caller that has no model
 // in hand still gets the conservative fallback rather than an undefined (NaN) ceiling, which
 // would disable the guard entirely.
-function messagesToPrompt(messages, maxChars = FALLBACK_PROMPT_CHARS, opts = {}) {
+//
+// Pure: renders the conversation and applies the budget, with no logging, so the request handler can
+// run it BEFORE any state changes and answer a refusal with a clean 400 (see promptTooLargeResponse).
+// Throws PromptTooLargeError when the budget would drop the newest message -- see lib/prompt.mjs.
+function planPrompt(messages, maxChars = FALLBACK_PROMPT_CHARS, opts = {}) {
   // ADR 0022: an assistant message carrying `tool_calls` and a `tool` message carrying a result are
   // rendered as text describing what happened, because a fresh spawn has no other way to learn
   // it (injecting real tool_use/tool_result blocks over stream-json input was measured NOT to work;
@@ -1796,50 +1800,53 @@ function messagesToPrompt(messages, maxChars = FALLBACK_PROMPT_CHARS, opts = {})
     if (m.role === "assistant") return `[Assistant] ${text}`;
     return text;
   });
-  // Appended to the RESULT rather than pushed into `full`: the truncation path below partitions
-  // `full` by indexing `messages[i].role`, so the two must stay the same length.
+  // Appended to the RESULT rather than pushed into `full`: the truncation path partitions `full` by
+  // indexing `messages[i].role`, so the two must stay the same length.
   // opts.continuationNote === false (#512): the -p path under MULTIBLOCK_INPUT, whose system prompt
   // already carries the note. The TUI lane has no such system prompt and keeps the default.
   const tail = opts.continuationNote !== false && endsWithToolResult(messages) ? `\n\n${TOOL_CONTINUATION_NOTE}` : "";
+  return fitPromptToBudget(full, messages.map((m) => m.role === "system"), maxChars, tail);
+}
 
-  const joined = full.join("\n\n");
-  if (joined.length + tail.length <= maxChars) return joined + tail;
+// What each lane hands the prompt builders. handleChatCompletions' pre-flight reads THESE objects, not
+// copies of them: the first version of the pre-flight spelled the options out again, got two of them
+// wrong (the image builder counted a continuation note the -p lane never sends; the TUI check left out
+// the note the TUI lane always sends), and refused requests the lane would have served, or let through
+// requests the lane then refused as a 500. Found by the independent review of this change.
+const P_LANE_PROMPT_OPTS = Object.freeze({ continuationNote: !MULTIBLOCK_INPUT });
+const TUI_LANE_PROMPT_OPTS = Object.freeze({});
+function streamJsonBuildOpts(maxTextChars) {
+  return { ...MULTIMODAL_OPTS, maxTextChars, continuationNote: !MULTIBLOCK_INPUT, coalesceToolResults: MULTIBLOCK_INPUT };
+}
 
-  // Truncation: keep system messages, first user msg, and trim from the tail
+function messagesToPrompt(messages, maxChars = FALLBACK_PROMPT_CHARS, opts = {}) {
+  const plan = planPrompt(messages, maxChars, opts);
+  if (!plan.truncated) return plan.text;
+
   logEvent("warn", "prompt_truncated", {
-    originalChars: joined.length,
+    originalChars: plan.originalChars,
     maxChars,
     originalMessages: messages.length,
   });
-
-  const system = [];
-  const rest = [];
-  for (let i = 0; i < full.length; i++) {
-    if (messages[i].role === "system") system.push(full[i]);
-    else rest.push(full[i]);
-  }
-
-  // Keep system + as many recent messages as fit
-  const systemText = system.join("\n\n");
-  const budget = maxChars - systemText.length - 200; // 200 for separator
-  const kept = [];
-  let used = 0;
-  for (let i = rest.length - 1; i >= 0; i--) {
-    if (used + rest[i].length + 2 > budget) break;
-    kept.unshift(rest[i]);
-    used += rest[i].length + 2;
-  }
-
-  const truncNote = `[System] Note: ${rest.length - kept.length} older messages were truncated to fit context limit.`;
-  const result = [systemText, truncNote, ...kept].filter(Boolean).join("\n\n") + tail;
-
   logEvent("info", "prompt_after_truncation", {
-    chars: result.length,
-    keptMessages: kept.length,
-    droppedMessages: rest.length - kept.length,
+    chars: plan.text.length,
+    keptMessages: plan.keptMessages,
+    droppedMessages: plan.droppedMessages,
   });
 
-  return result;
+  return plan.text;
+}
+
+// The 400 for a request whose newest message cannot fit the model's prompt budget. One body shape
+// for the text path and the image path, so the two cannot drift. `model` is the RESOLVED id the
+// budget was derived from. Logged as its own event: a refusal is not a truncation, and an operator
+// grepping prompt_truncated must not be shown a request that was never served. `stage` says WHO refused:
+// "preflight" (handleChatCompletions, before anything is spent) or "lane" (a builder's own backstop,
+// after the request got further than it should have). The status is the same 400 either way, so this
+// field is the only observable that tells the two apart -- the suite asserts "preflight".
+function promptTooLargeResponse(res, e, model = null, stage = "lane") {
+  logEvent("warn", "prompt_refused", { stage, model, newestChars: e.newestChars, roomChars: e.roomChars, maxChars: e.maxChars });
+  return jsonResponse(res, e.status, { error: { message: e.message, type: e.type, param: e.param, code: e.code } });
 }
 
 // Model tier — used for logging only (no timeout logic).
@@ -1962,11 +1969,12 @@ function spawnClaudeProcess(model, messages, conversationId, keyName, releaseSlo
   if (hasImages || MULTIBLOCK_INPUT) {
     // Pass the budget so the multimodal text is bounded by the same
     // runaway-context guard as the text path (PR #154 review F2). Images bypass it.
-    built = buildStreamJsonInput(nonSystemMessages, {
-      ...MULTIMODAL_OPTS, maxTextChars: maxPromptChars,
-      continuationNote: !MULTIBLOCK_INPUT, coalesceToolResults: MULTIBLOCK_INPUT,
-      cacheBreakpointTtl: bpTtl,
-    });
+    built = buildStreamJsonInput(nonSystemMessages, { ...streamJsonBuildOpts(maxPromptChars), cacheBreakpointTtl: bpTtl });
+    // ADR 0024: this throws PromptTooLargeError rather than cut the newest message. Unreachable from
+    // handleChatCompletions, whose pre-flight refused that request already: with images it ran this
+    // same builder at this same budget; text-only, its text-path check is the stricter of the two
+    // (newest + 202 vs newest + 2), so nothing it serves can trip this one. A backstop, unpinned --
+    // nothing in the suite reaches it without first defeating the pre-flight.
     if (!hasImages && built.stats.truncated) built = null;
   }
   const useStreamJson = built !== null;
@@ -1986,7 +1994,7 @@ function spawnClaudeProcess(model, messages, conversationId, keyName, releaseSlo
       });
     }
   } else {
-    stdinPayload = messagesToPrompt(nonSystemMessages, maxPromptChars, { continuationNote: !MULTIBLOCK_INPUT });
+    stdinPayload = messagesToPrompt(nonSystemMessages, maxPromptChars, P_LANE_PROMPT_OPTS);
     promptChars = stdinPayload.length;
   }
 
@@ -2717,7 +2725,7 @@ async function callClaude(model, messages, conversationId, keyName, res, opts = 
 // mid-turn instead of holding the semaphore slot for a dead socket.
 async function callClaudeTui(model, messages, _conversationId, _keyName, res, streamCtx = null) {
   const cliModel = MODEL_MAP[model] || model;
-  const prompt = messagesToPrompt(messages, promptCharBudget(cliModel)); // includes system as [System] inline
+  const prompt = messagesToPrompt(messages, promptCharBudget(cliModel), TUI_LANE_PROMPT_OPTS); // includes system as [System] inline
   recordModelRequest(cliModel, prompt.length);
   // C-4: gate the heavy interactive boot behind the TUI semaphore (queuing if all slots are
   // busy, up to maxQueue). F2: `signal` (tied to `res` "close") cancels a QUEUED wait the
@@ -3706,6 +3714,7 @@ function noteUpstreamRateLimit(message, lane) {
 }
 
 function respondUpstreamError(res, err) {
+  if (err instanceof PromptTooLargeError) return promptTooLargeResponse(res, err);
   if (err instanceof ConcurrencyOverflowError) {
     return jsonResponse(res, 429, { error: { message: sanitizeError(err.message), type: "rate_limit_error" } }, { "Retry-After": String(err.retryAfter) });
   }
@@ -4430,11 +4439,18 @@ const VALID_MODELS = new Set(Object.keys(MODEL_MAP));
 // STRUCTURED_MAX_ATTEMPTS. Appends a strict JSON-only steering instruction, extracts + validates the
 // reply (pure helpers in lib/structured-output.mjs), and escalates the instruction on failure.
 // Returns the canonical JSON string (message.content) or throws StructuredOutputError.
+// The message list one structured attempt sends. Shared with handleChatCompletions' pre-flight: on the
+// TUI lane system messages are inline, so the steering instruction counts against the prompt budget.
+const STRUCTURED_FIRST_ERR = "no valid JSON produced";
+function structuredAttemptMessages(messages, structured, attempt, lastErr = STRUCTURED_FIRST_ERR) {
+  return [...messages, { role: "system", content: structuredSystemInstruction(structured, attempt, lastErr) }];
+}
+
 async function runStructuredCompletion(upstreamCall, model, messages, conversationId, keyName, res, structured) {
-  let lastErr = "no valid JSON produced";
+  let lastErr = STRUCTURED_FIRST_ERR;
   let lastRaw = "";
   for (let attempt = 0; attempt < STRUCTURED_MAX_ATTEMPTS; attempt++) {
-    const augmented = [...messages, { role: "system", content: structuredSystemInstruction(structured, attempt, lastErr) }];
+    const augmented = structuredAttemptMessages(messages, structured, attempt, lastErr);
     const raw = await upstreamCall(model, augmented, conversationId, keyName, res);
     lastRaw = raw;
     const extracted = extractJsonPayload(raw, { whole: structured.mode === "json_object" });
@@ -4693,11 +4709,29 @@ async function handleChatCompletions(req, res) {
     try {
       // cacheModel is the RESOLVED canonical id, so this early validation pass uses the same
       // per-model ceiling spawnClaudeProcess will apply (ADR 0011).
-      buildImageBlocks(nonSystem, { ...MULTIMODAL_OPTS, maxTextChars: promptCharBudget(cacheModel) });
+      buildImageBlocks(nonSystem, streamJsonBuildOpts(promptCharBudget(cacheModel)));
     } catch (e) {
       if (e instanceof MultimodalError) {
         return jsonResponse(res, e.status, { error: { message: e.message, type: e.type, code: e.code } });
       }
+      if (e instanceof PromptTooLargeError) return promptTooLargeResponse(res, e, cacheModel, "preflight");
+      throw e;
+    }
+  } else {
+    // R4: the same question for the text path, asked HERE, before the quota gate and every counter, so
+    // a refusal is a plain 400 even on stream:true (no SSE headers are out yet) and consumes nothing.
+    // It runs the very function spawnClaudeProcess / callClaudeTui will run (planPrompt, same budget,
+    // same message list) -- a second copy of the fit rule here would drift from the one that decides.
+    // TUI keeps system messages inline in the prompt (they count against the budget), including the
+    // structured-output steering instruction of the FIRST attempt; -p sends them through
+    // --system-prompt-file, so they do not. A later structured attempt's escalated instruction can still
+    // tip a TUI request over: respondUpstreamError maps that to the same 400.
+    try {
+      const preStructured = TUI_MODE ? detectStructuredOutput(parsed) : null;
+      if (TUI_MODE) planPrompt(preStructured ? structuredAttemptMessages(messages, preStructured, 0) : messages, promptCharBudget(cacheModel), TUI_LANE_PROMPT_OPTS);
+      else planPrompt(messages.filter((m) => m.role !== "system"), promptCharBudget(cacheModel), P_LANE_PROMPT_OPTS);
+    } catch (e) {
+      if (e instanceof PromptTooLargeError) return promptTooLargeResponse(res, e, cacheModel, "preflight");
       throw e;
     }
   }
@@ -5045,6 +5079,7 @@ async function handleChatCompletions(req, res) {
         return;
       } catch (err) {
         if (res.headersSent || res.writableEnded || res.destroyed) { try { res.end(); } catch {} return; }
+        if (err instanceof PromptTooLargeError) return promptTooLargeResponse(res, err, cacheModel);
         return jsonResponse(res, 500, { error: { message: sanitizeError(err.message), type: "proxy_error" } });
       }
     }

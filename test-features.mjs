@@ -2784,7 +2784,7 @@ test("#214: tree==latest, /health version field unparseable → degrades gracefu
 // contract lives in lib/prompt.mjs. Mutation-proof: make appendOperatorPrompt
 // return `base` unconditionally and the first test fails; make it stop trimming
 // and the whitespace test fails.
-import { appendOperatorPrompt, promptCharBudgetFor, fallbackPromptCharBudget, resolveGlobalPromptCharOverride, selectPromptWrapper, localToolsSafetyError } from "./lib/prompt.mjs";
+import { appendOperatorPrompt, promptCharBudgetFor, fallbackPromptCharBudget, resolveGlobalPromptCharOverride, selectPromptWrapper, localToolsSafetyError, fitPromptToBudget, PromptTooLargeError } from "./lib/prompt.mjs";
 
 console.log("\nPrompt-char budget (ADR 0011 — per-model, superseding ADR 0009's global max):");
 
@@ -2818,6 +2818,81 @@ test("promptCharBudgetFor: floor wins over a tiny window; unknown/garbage entrie
   assert.equal(promptCharBudgetFor([], "anything"), 150000);
   assert.equal(promptCharBudgetFor(undefined, "anything"), 150000);
   assert.equal(promptCharBudgetFor([{ id: "a", contextWindow: "junk" }, { id: "b", contextWindow: -5 }], "a"), 150000);
+});
+
+// ── ADR 0024: fitPromptToBudget trims history, never the newest message ──
+test("fitPromptToBudget: under budget → the conversation whole, tail appended, not truncated", () => {
+  const r = fitPromptToBudget(["a", "b"], [false, false], 100, "|T");
+  assert.deepEqual(r, { text: "a\n\nb|T", truncated: false, originalChars: 4 });
+});
+
+test("fitPromptToBudget: over-budget HISTORY → oldest dropped, newest kept, note counts what was dropped", () => {
+  const r = fitPromptToBudget(["o".repeat(700), "[Assistant] ok", "NEWEST"], [false, false, false], 600);
+  assert.equal(r.truncated, true);
+  assert.equal(r.droppedMessages, 1);
+  assert.equal(r.text, "[System] Note: 1 older messages were truncated to fit context limit.\n\n[Assistant] ok\n\nNEWEST");
+});
+
+test("fitPromptToBudget: the newest message alone over budget → PromptTooLargeError, whether or not history exists", () => {
+  for (const parts of [["q".repeat(1001)], ["hi", "[Assistant] yo", "q".repeat(1001)]]) {
+    assert.throws(() => fitPromptToBudget(parts, parts.map(() => false), 1000),
+      (e) => e instanceof PromptTooLargeError && e.newestChars === 1001 && e.maxChars === 1000, `parts=${parts.length}`);
+  }
+  // One message is served whole up to the budget itself: it never enters the truncation path.
+  assert.equal(fitPromptToBudget(["q".repeat(1000)], [false], 1000).truncated, false);
+});
+
+test("fitPromptToBudget: newest-message boundary inside the truncation path is maxChars − system − 200 − 2", () => {
+  // maxChars 1000, no system: budget 800, a kept message costs length + 2, so 798 fits and 799 does not.
+  const at = (n) => fitPromptToBudget(["o".repeat(500), "n".repeat(n)], [false, false], 1000);
+  assert.equal(at(798).text.endsWith("n".repeat(798)), true, "798 is kept");
+  assert.equal(at(798).droppedMessages, 1, "premise: history was trimmed");
+  assert.throws(() => at(799), PromptTooLargeError);
+});
+
+test("fitPromptToBudget: system messages are kept whole and count against the newest message's room (the TUI layout)", () => {
+  // System 300 chars: budget 1000 - 300 - 200 = 500, so the newest may be 498.
+  const at = (n) => fitPromptToBudget(["S".repeat(300), "o".repeat(500), "n".repeat(n)], [true, false, false], 1000);
+  assert.ok(at(498).text.startsWith("S".repeat(300)), "system first, whole");
+  assert.throws(() => at(499), PromptTooLargeError);
+  // Without the system message the same newest message fits (the -p layout): the 300 is what moved the line.
+  assert.equal(fitPromptToBudget(["o".repeat(500), "n".repeat(499)], [false, false], 1000).truncated, true);
+});
+
+test("fitPromptToBudget: system-only input over budget is not refused — there is no newest message to protect", () => {
+  assert.equal(fitPromptToBudget(["S".repeat(2000)], [true], 1000).truncated, true);
+});
+
+test("fitPromptToBudget: the tail counts on the fits-whole check", () => {
+  // 995 + 10 > 1000 although the conversation alone fits: the truncation path runs, as before ADR 0024.
+  assert.equal(fitPromptToBudget(["a".repeat(495), "b".repeat(498)], [false, false], 1000, "t".repeat(10)).truncated, true);
+});
+
+test("PromptTooLargeError: carries all four fields OpenAI's Error object requires, and says the numbers", () => {
+  const e = new PromptTooLargeError({ newestChars: 700022, maxChars: 600000 });
+  assert.equal(e.status, 400);
+  assert.deepEqual({ type: e.type, param: e.param, code: e.code }, { type: "invalid_request_error", param: "messages", code: "context_length_exceeded" });
+  assert.ok(e.message.includes("700022") && e.message.includes("600000"), e.message);
+});
+
+test("PromptTooLargeError: the 400 states the newest message's real room, not just the budget (review F3)", () => {
+  // With history: room = budget - note reserve - separator = 2000 - 200 - 2, and the message says so.
+  try { fitPromptToBudget(["o".repeat(200), "n".repeat(1850)], [false, false], 2000); assert.fail("must throw"); }
+  catch (e) { assert.ok(e instanceof PromptTooLargeError); assert.equal(e.roomChars, 1798); assert.ok(e.message.includes("at most 1798"), e.message); }
+  // Alone, the message could be the whole budget (it never enters the truncation path) -- and a tail eats into it.
+  try { fitPromptToBudget(["q".repeat(1001)], [false], 1000); assert.fail("must throw"); } catch (e) { assert.equal(e.roomChars, 1000); }
+  try { fitPromptToBudget(["q".repeat(1001)], [false], 1000, "t".repeat(10)); assert.fail("must throw"); } catch (e) { assert.equal(e.roomChars, 990); }
+  // Each stated room is exact: at the room the message is served.
+  assert.ok(fitPromptToBudget(["o".repeat(200), "n".repeat(1798)], [false, false], 2000).text.endsWith("n".repeat(1798)));
+  assert.equal(fitPromptToBudget(["q".repeat(990)], [false], 1000, "t".repeat(10)).truncated, false);
+  // The other arm of the max: history far over budget, so only the truncation path can keep the newest.
+  const big = (n) => fitPromptToBudget(["o".repeat(5000), "n".repeat(n)], [false, false], 2000);
+  try { big(1799); assert.fail("must throw"); } catch (e) { assert.equal(e.roomChars, 1798); }
+  assert.equal(big(1798).truncated, true);
+  // No room at all (TUI: inline system text alone over budget): roomChars 0, and the message says why
+  // rather than printing a negative "at most" (review round 2).
+  try { fitPromptToBudget(["S".repeat(2500), "hi"], [true, false], 2000); assert.fail("must throw"); }
+  catch (e) { assert.equal(e.roomChars, 0); assert.ok(!/at most -/.test(e.message) && e.message.includes("system messages"), e.message); }
 });
 
 test("promptCharBudgetFor: charsPerToken and floor are tunable parameters", () => {
@@ -8848,6 +8923,14 @@ ltTest("integration: an alias and its canonical target share ONE cache slot (nor
   } finally { child.kill("SIGKILL"); _ltRmRetry(dir); }
 });
 
+// ADR 0024: the budget trims HISTORY, never the newest message, so the probe that makes these tests
+// truncate is an oversized OLDER message under a short newest one. Until ADR 0024 they sent ONE oversized
+// user message -- the case that used to reach the CLI as a bare 68-char note and is now a 400 (pinned
+// by the context_length_exceeded tests below). The budget each arm reads off prompt_truncated is the same.
+function ltOverBudgetHistory(big) {
+  return [{ role: "user", content: big }, { role: "assistant", content: "ok" }, { role: "user", content: "and the question is this one" }];
+}
+
 // #213 / ADR 0011 — the acceptance case, end-to-end against a real server.mjs child.
 //
 // This is the test the whole change exists to pass, and it is deliberately a PAIR on the same
@@ -8876,7 +8959,7 @@ ltTest("integration (#213): the SAME oversized prompt is truncated for a 200k mo
     const big = "x".repeat(700000);
 
     // Arm 1 — genuinely-200k model: MUST truncate, at exactly 600000.
-    await ltPost(port, { model: "claude-haiku-4-5-20251001", messages: [{ role: "user", content: big }] });
+    await ltPost(port, { model: "claude-haiku-4-5-20251001", messages: ltOverBudgetHistory(big) });
     assert.ok(await ltWait(() => nTrunc() >= 1, 15000),
       `claude-haiku-4-5 is 200k native: a 700k-char prompt must be truncated OCP-side. ${ltDiag(buf)}`);
     const hit = buf.err.split("\n").find(l => l.includes('"prompt_truncated"'));
@@ -8886,7 +8969,7 @@ ltTest("integration (#213): the SAME oversized prompt is truncated for a 200k mo
     assert.ok(await ltWait(() => (Number(_ltRead(counter, "utf8")) || 0) >= 1, 9000), "arm 1 reached the spawn");
 
     // Arm 2 — native-1M model, IDENTICAL prompt: must NOT truncate.
-    await ltPost(port, { model: "claude-opus-5", messages: [{ role: "user", content: big }] });
+    await ltPost(port, { model: "claude-opus-5", messages: ltOverBudgetHistory(big) });
     assert.ok(await ltWait(() => (Number(_ltRead(counter, "utf8")) || 0) >= 2, 15000),
       `arm 2 must reach the spawn, otherwise the no-truncation assertion below is vacuous. ${ltDiag(buf)}`);
     assert.equal(nTrunc(), 1,
@@ -8895,7 +8978,7 @@ ltTest("integration (#213): the SAME oversized prompt is truncated for a 200k mo
 
     // Arm 3 — the 1M model's budget is a real 3,000,000, not "no ceiling". Proves arm 2 passed
     // because the budget is larger, not because the guard was disabled.
-    await ltPost(port, { model: "claude-opus-5", messages: [{ role: "user", content: "y".repeat(3100000) }] });
+    await ltPost(port, { model: "claude-opus-5", messages: ltOverBudgetHistory("y".repeat(3100000)) });
     assert.ok(await ltWait(() => nTrunc() >= 2, 20000),
       `claude-opus-5 must still truncate ABOVE its own 3,000,000-char budget — otherwise the guard is ` +
       `off for this model rather than merely wider. ${ltDiag(buf)}`);
@@ -8940,7 +9023,7 @@ ltTest("integration (ADR 0011): /settings maxPromptChars is a GLOBAL override th
     assert.equal((await getSettings()).maxPromptChars.value, 200000, "GET must report the override that was just installed");
 
     // The 1M model must now truncate at the OVERRIDE, not at its own 3,000,000 budget.
-    await ltPost(port, { model: "claude-opus-5", messages: [{ role: "user", content: "z".repeat(700000) }] });
+    await ltPost(port, { model: "claude-opus-5", messages: ltOverBudgetHistory("z".repeat(700000)) });
     assert.ok(await ltWait(() => nTrunc() >= 1, 15000),
       `the global override must apply to claude-opus-5 too — without it a 700k prompt would pass whole. ${ltDiag(buf)}`);
     const hit = buf.err.split("\n").find(l => l.includes('"prompt_truncated"'));
@@ -8972,19 +9055,157 @@ ltTest("integration (#213): the TUI path bounds the prompt per model too, not by
     assert.ok(await ltWait(() => buf.out.includes("listening on")), `did not start: ${buf.err.slice(0, 200)}`);
 
     // Arm 1 — 200k model, over its 600,000 ceiling.
-    await ltPost(port, { model: "claude-haiku-4-5-20251001", messages: [{ role: "user", content: "x".repeat(700000) }] });
+    await ltPost(port, { model: "claude-haiku-4-5-20251001", messages: ltOverBudgetHistory("x".repeat(700000)) });
     assert.ok(await ltWait(() => truncLines().length >= 1, 20000),
       `the TUI path must still truncate a 700k prompt for a 200k model. ${ltDiag(buf)}`);
     assert.match(truncLines()[0], /"maxChars":600000/,
       `TUI ceiling for claude-haiku-4-5 must be 600000. Got: ${truncLines()[0]}`);
 
     // Arm 2 — 1M model, over its own 3,000,000 ceiling. Under a global budget this reads 600000.
-    await ltPost(port, { model: "claude-opus-5", messages: [{ role: "user", content: "y".repeat(3100000) }] });
+    await ltPost(port, { model: "claude-opus-5", messages: ltOverBudgetHistory("y".repeat(3100000)) });
     assert.ok(await ltWait(() => truncLines().length >= 2, 25000),
       `the TUI path must truncate a 3.1M prompt even for a 1M model. ${ltDiag(buf)}`);
     assert.match(truncLines()[1], /"maxChars":3000000/,
       `TUI ceiling for claude-opus-5 must be its own 3000000, not the global fallback — this is the ` +
       `assertion that catches callClaudeTui being wired to the wrong budget. Got: ${truncLines()[1]}`);
+  } finally { child.kill("SIGKILL"); _ltRmRetry(dir); }
+});
+
+// ADR 0024 (external review R4): a newest message that cannot fit the prompt budget is a 400
+// context_length_exceeded, decided before anything is spent -- on the -p text path, the image path and
+// stream:true alike -- while over-budget HISTORY is still trimmed and served. One boot; the spawn
+// counter is read only after a LATER request has spawned, so "the refused request never spawned" is
+// an exact count rather than the absence of something that might still be on its way.
+ltTest("integration (ADR 0024): an over-budget NEWEST message is refused with 400 context_length_exceeded before any spawn; history is still trimmed", async () => {
+  if (!LT_POSIX) return;
+  const dir = ltMkdir(); const fake = ltFake(dir); const counter = join(dir, "spawns.txt"); const stdinFile = join(dir, "stdin.txt");
+  const { child, buf, port } = await ltBootFresh({ CLAUDE_BIN: fake, SP_COUNTER: counter, STDIN_CAPTURE: stdinFile }, dir);
+  const spawns = () => Number(_ltExists(counter) ? _ltRead(counter, "utf8") : 0) || 0;
+  const HAIKU = "claude-haiku-4-5-20251001"; // 200k window -> 600000-char budget
+  const PNG = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNkYAAAAAYAAjCB0C8AAAAASUVORK5CYII=";
+  const refused = async (label, body) => {
+    const r = await ltPostStatus(port, { model: HAIKU, ...body });
+    assert.equal(r.status, 400, `${label}: must be refused, got ${r.status} ${r.text.slice(0, 200)} ${ltDiag(buf)}`);
+    const err = JSON.parse(r.text).error;
+    assert.deepEqual({ type: err.type, param: err.param, code: err.code }, { type: "invalid_request_error", param: "messages", code: "context_length_exceeded" }, label);
+    assert.ok(err.message.includes("600000"), `${label}: the 400 must name the budget — ${err.message}`);
+  };
+  const served = async (label, body, marker) => {
+    const before = spawns();
+    const r = await ltPostStatus(port, { model: HAIKU, ...body });
+    assert.equal(r.status, 200, `${label}: must be served, got ${r.status} ${r.text.slice(0, 200)}`);
+    assert.ok(await ltWait(() => spawns() === before + 1 && _ltExists(stdinFile) && _ltRead(stdinFile, "utf8").includes(marker), 9000),
+      `${label}: the spawn's stdin never carried ${marker}. ${ltDiag(buf)}`);
+    return _ltRead(stdinFile, "utf8");
+  };
+  try {
+    assert.ok(await ltWait(() => buf.out.includes("listening on")), `did not start: ${buf.err.slice(0, 200)}`);
+    _ltWrite(counter, "0");
+
+    // The designed case, served: an oversized OLDER message, a short newest one.
+    const s1 = await served("history over budget", { messages: [{ role: "user", content: "o".repeat(700000) }, { role: "assistant", content: "ok" }, { role: "user", content: "MARK_HIST" }] }, "MARK_HIST");
+    assert.ok(s1.includes("older messages were truncated"), `premise: history was trimmed — ${s1.slice(0, 160)}`);
+
+    await refused("one 700k message", { messages: [{ role: "user", content: "x".repeat(700000) }] });
+    await refused("700k newest after a short history", { messages: [{ role: "user", content: "hi" }, { role: "assistant", content: "yo" }, { role: "user", content: "x".repeat(700000) }] });
+    await refused("700k text + an image in the newest turn", { messages: [{ role: "user", content: [{ type: "text", text: "x".repeat(700000) }, { type: "image_url", image_url: { url: PNG } }] }] });
+
+    // stream:true is refused as plain JSON: no SSE headers were sent before the decision.
+    const sr = await fetch(`http://127.0.0.1:${port}/v1/chat/completions`, { method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ model: HAIKU, stream: true, messages: [{ role: "user", content: "x".repeat(700000) }] }) });
+    assert.equal(sr.status, 400, "stream:true must be refused too");
+    assert.match(sr.headers.get("content-type") || "", /application\/json/, "a refusal is JSON, not an event stream");
+    assert.equal(JSON.parse(await sr.text()).error.code, "context_length_exceeded");
+
+    // Served controls that sit next to the refusals: an image turn under budget, and the -p layout,
+    // where a big SYSTEM message travels in --system-prompt-file and does not count (the TUI test
+    // below refuses the very same request).
+    await served("500k text + an image", { messages: [{ role: "user", content: [{ type: "text", text: "MARK_IMG" + "x".repeat(500000) }, { type: "image_url", image_url: { url: PNG } }] }] }, "MARK_IMG");
+    await served("400k system + 300k user on -p", { messages: [{ role: "system", content: "s".repeat(400000) }, { role: "user", content: "MARK_SYS" + "u".repeat(300000) }] }, "MARK_SYS");
+
+    // Exact count: three served requests spawned, the four refusals did not.
+    assert.equal(spawns(), 3, `refused requests must never reach the spawn — ${spawns()} spawns`);
+    assert.equal(buf.err.split('"prompt_refused"').length - 1, 4, `each refusal is logged as prompt_refused. ${ltDiag(buf)}`);
+    assert.equal(buf.err.split('"prompt_refused","stage":"preflight"').length - 1, 4, "every refusal was the handler's pre-flight, none a lane backstop");
+    assert.equal(buf.err.split('"prompt_truncated"').length - 1, 1, "a refusal is not a truncation; only the trimmed-history request logs prompt_truncated");
+  } finally { child.kill("SIGKILL"); _ltRmRetry(dir); }
+});
+
+// The TUI lane keeps system messages INLINE, so they count against the budget there. Same pre-flight,
+// different message list: the request the -p test above serves is refused here. Needs no tmux -- the
+// refusal happens in the handler; the control's spawn failing afterwards is expected (see the #213 TUI test).
+ltTest("integration (ADR 0024): the TUI path refuses an over-budget newest message too, counting inline system messages", async () => {
+  if (!LT_POSIX) return;
+  const dir = ltMkdir(); const fake = ltFake(dir);
+  const { child, buf, port } = await ltBootFresh({ CLAUDE_TUI_MODE: "true", CLAUDE_BIN: fake }, dir);
+  const HAIKU = "claude-haiku-4-5-20251001";
+  try {
+    assert.ok(await ltWait(() => buf.out.includes("listening on")), `did not start: ${buf.err.slice(0, 200)}`);
+    // Control first: history over budget gets PAST the pre-flight and is truncated by callClaudeTui.
+    await ltPost(port, { model: HAIKU, messages: ltOverBudgetHistory("o".repeat(700000)) });
+    assert.ok(await ltWait(() => buf.err.includes('"prompt_truncated"'), 20000), `the TUI control must reach callClaudeTui. ${ltDiag(buf)}`);
+    for (const [label, messages] of [
+      ["one 700k message", [{ role: "user", content: "x".repeat(700000) }]],
+      ["400k inline system + 300k user", [{ role: "system", content: "s".repeat(400000) }, { role: "user", content: "u".repeat(300000) }]],
+    ]) {
+      const before = buf.err.split('"stage":"preflight"').length;
+      const r = await ltPostStatus(port, { model: HAIKU, messages });
+      assert.equal(r.status, 400, `${label}: must be refused in TUI mode, got ${r.status} ${r.text.slice(0, 200)}`);
+      assert.equal(JSON.parse(r.text).error.code, "context_length_exceeded", label);
+      assert.ok(await ltWait(() => buf.err.split('"stage":"preflight"').length === before + 1, 5000), `${label}: refused by the pre-flight, not by callClaudeTui. ${ltDiag(buf)}`);
+    }
+  } finally { child.kill("SIGKILL"); _ltRmRetry(dir); }
+});
+
+// Review F1/F2: the pre-flight must ask the question the LANE will ask, with the lane's own options.
+// F1 -- the -p image lane sends no continuation note under OCP_MULTIBLOCK_INPUT (the default); a
+// pre-flight that counted one refused a vision tool turn base served whole. F2 -- the TUI lane always
+// sends the note and keeps the structured-output instruction inline; a pre-flight that left them out
+// passed requests callClaudeTui then refused as a 500. Budget 2000 puts each case inside its band.
+ltTest("integration (ADR 0024, review F1): an image tool turn near the budget is served, not refused for a note the -p lane never sends", async () => {
+  if (!LT_POSIX) return;
+  const dir = ltMkdir(); const fake = ltFake(dir); const stdinFile = join(dir, "stdin.txt");
+  const { child, buf, port } = await ltBootFresh({ CLAUDE_BIN: fake, STDIN_CAPTURE: stdinFile, CLAUDE_MAX_PROMPT_CHARS: "2000" }, dir);
+  const PNG = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNkYAAAAAYAAjCB0C8AAAAASUVORK5CYII=";
+  const img = { type: "image_url", image_url: { url: PNG } };
+  const call = { role: "assistant", content: null, tool_calls: [{ id: "c1", type: "function", function: { name: "f", arguments: "{}" } }] };
+  try {
+    assert.ok(await ltWait(() => buf.out.includes("listening on")), `did not start: ${buf.err.slice(0, 200)}`);
+    const r = await ltPostStatus(port, { model: "claude-haiku-4-5-20251001", messages: [
+      { role: "user", content: [{ type: "text", text: "look" }, img ], }, call,
+      { role: "tool", tool_call_id: "c1", content: [{ type: "text", text: "MARK_F1" + "x".repeat(1843) }, img] }] });
+    assert.equal(r.status, 200, `a vision tool turn inside the budget must be served, got ${r.status} ${r.text.slice(0, 200)}`);
+    assert.ok(await ltWait(() => _ltExists(stdinFile) && _ltRead(stdinFile, "utf8").includes("MARK_F1"), 9000), `the result never reached the CLI. ${ltDiag(buf)}`);
+    const blocks = ltStdinBlocks(_ltRead(stdinFile, "utf8"));
+    assert.ok(Array.isArray(blocks), "premise: the image lane (stream-json)");
+    assert.ok(!blocks.some(b => b.type === "text" && b.text.includes("truncated to fit")), "and nothing was trimmed");
+  } finally { child.kill("SIGKILL"); _ltRmRetry(dir); }
+});
+
+ltTest("integration (ADR 0024, review F2): in TUI mode the continuation note and the structured instruction count, so the refusal is a 400 and not a 500", async () => {
+  if (!LT_POSIX) return;
+  const dir = ltMkdir(); const fake = ltFake(dir);
+  const { child, buf, port } = await ltBootFresh({ CLAUDE_TUI_MODE: "true", CLAUDE_BIN: fake, CLAUDE_MAX_PROMPT_CHARS: "2000" }, dir);
+  const HAIKU = "claude-haiku-4-5-20251001";
+  try {
+    assert.ok(await ltWait(() => buf.out.includes("listening on")), `did not start: ${buf.err.slice(0, 200)}`);
+    const N = 1900 - "[Tool tool returned]\n".length;
+    for (const [label, body] of [
+      ["tool-result newest (the note is sent after it)", { messages: [{ role: "user", content: "hi" }, { role: "tool", tool_call_id: "c1", content: "x".repeat(N) }] }],
+      ["structured json_object, one 1900-char message (the instruction is inline)", { response_format: { type: "json_object" }, messages: [{ role: "user", content: "x".repeat(1900) }] }],
+    ]) {
+      const before = buf.err.split('"stage":"preflight"').length;
+      const r = await ltPostStatus(port, { model: HAIKU, ...body });
+      assert.equal(r.status, 400, `${label}: got ${r.status} ${r.text.slice(0, 200)}`);
+      assert.equal(JSON.parse(r.text).error.code, "context_length_exceeded", label);
+      // Same 400 from the lane backstop would mean the pre-flight asked a different question than the lane.
+      assert.ok(await ltWait(() => buf.err.split('"stage":"preflight"').length === before + 1, 5000), `${label}: refused by the pre-flight, not by callClaudeTui. ${ltDiag(buf)}`);
+    }
+    // Control: the same 1900 chars WITHOUT response_format fit, so they pass the pre-flight and go on to
+    // the (stubbed, failing) tmux lane -- anything but the refusal.
+    const c = await ltPostStatus(port, { model: HAIKU, messages: [{ role: "user", content: "x".repeat(1900) }] });
+    assert.notEqual(c.status, 400, `control must pass the pre-flight, got ${c.status} ${c.text.slice(0, 200)}`);
+    assert.ok(!c.text.includes("context_length_exceeded"), c.text.slice(0, 200));
   } finally { child.kill("SIGKILL"); _ltRmRetry(dir); }
 });
 
@@ -21773,30 +21994,84 @@ test("buildImageBlocks: text under budget → not truncated, blocks unchanged", 
   assert.equal(blocks.filter(b => b.type === "image").length, 1);
 });
 
-test("buildImageBlocks: text over budget → truncated, keeps most-recent tail + note", () => {
+// ADR 0024: the newest message is never cut, so "over budget" here means over-budget HISTORY. The
+// single-oversized-message case these two tests used to pin is now a refusal (tests below); the
+// mid-block cut survives for the OLDER message at the budget boundary, which is what this one pins.
+test("buildImageBlocks: history over budget → truncated, the boundary message keeps its most-recent tail + note", () => {
   const big = "A".repeat(300) + "TAIL_MARKER";
   const { blocks, stats } = mmBuildImageBlocks(
-    [{ role: "user", content: [txtPart(big)] }],
+    [{ role: "user", content: [txtPart(big)] }, { role: "user", content: "Q" }],
     { maxTextChars: 50 }
   );
   assert.equal(stats.truncated, true);
-  assert.equal(stats.originalTextChars, big.length);
+  assert.equal(stats.originalTextChars, big.length + "\n\nQ".length);
   // The most recent characters (the tail) survive; the oldest 'A's are dropped.
   const joined = blocks.filter(b => b.type === "text").map(b => b.text).join("");
   assert.ok(joined.includes("TAIL_MARKER"), "tail text must be kept");
+  assert.ok(!joined.includes("A".repeat(300)), "premise: the boundary block really was cut");
+  assert.ok(joined.endsWith("\n\nQ"), "the newest message is whole");
   assert.ok(joined.includes("truncated to fit"), "a truncation note must be present");
   assert.ok(stats.originalTextChars > stats.textChars, "post-truncation text is smaller");
 });
 
-test("buildImageBlocks: F2 exact scenario — 500k chars + one image → text bounded, image preserved", () => {
+test("buildImageBlocks: F2 — 500k chars of HISTORY + an image in the newest turn → text bounded, newest turn and image intact", () => {
   const { blocks, stats } = mmBuildImageBlocks(
-    [{ role: "user", content: [txtPart("Z".repeat(500000)), imgPart()] }],
+    [{ role: "user", content: [txtPart("Z".repeat(500000))] }, { role: "assistant", content: "ok" },
+     { role: "user", content: [txtPart("NEWEST_TURN"), imgPart()] }],
     { maxTextChars: 150000 }
   );
   assert.equal(stats.truncated, true);
   assert.ok(stats.textChars <= 150000 + 200, "text char count is bounded by the budget (+note)");
   // The image bypasses the text budget and is NOT dropped by truncation.
   assert.equal(blocks.filter(b => b.type === "image").length, 1);
+  const text = blocks.filter(b => b.type === "text").map(b => b.text).join("");
+  assert.ok(text.includes("NEWEST_TURN"), "the newest turn's text survives whole");
+});
+
+// ── ADR 0024: the image path refuses instead of cutting the newest message ──
+test("buildImageBlocks: F2 exact scenario (one 500k message + image) now REFUSES — PromptTooLargeError, not a head-cut", () => {
+  const msgs = [{ role: "user", content: [txtPart("START_MARK" + "Z".repeat(500000)), imgPart()] }];
+  assert.throws(() => mmBuildImageBlocks(msgs, { maxTextChars: 150000 }),
+    (e) => e instanceof PromptTooLargeError && e.newestChars === 500010 && e.maxChars === 150000 && e.status === 400 && e.code === "context_length_exceeded");
+  // Contrast arm: the same message under a budget it fits is served whole, head included -- so the throw
+  // above is the budget's doing, not something this input does on its own.
+  const whole = mmBuildImageBlocks(msgs, { maxTextChars: 500010 });
+  assert.equal(whole.stats.truncated, false);
+  assert.ok(whole.blocks.some(b => b.type === "text" && b.text.startsWith("START_MARK")), "at its own size the message is whole");
+});
+
+test("buildImageBlocks: newest-message boundary — exactly maxTextChars is served, one more is refused", () => {
+  const at = (n) => [{ role: "user", content: "old".repeat(100) }, { role: "user", content: [txtPart("q".repeat(n)), imgPart()] }];
+  // The newest message's text is "\n\n" + n chars (it is not the first message), so the line sits at n = budget - 2.
+  const r = mmBuildImageBlocks(at(998), { maxTextChars: 1000 });
+  assert.equal(r.stats.truncated, true, "premise: history over budget");
+  assert.ok(r.blocks.some(b => b.type === "text" && b.text === "\n\n" + "q".repeat(998)), "at the budget the newest text block is whole");
+  assert.throws(() => mmBuildImageBlocks(at(999), { maxTextChars: 1000 }), PromptTooLargeError);
+});
+
+test("buildImageBlocks: the newest message's text counts across ALL its parts, not only its last block", () => {
+  // Two 300-char parts with an image between: no single block exceeds 500, the message does.
+  const msgs = [{ role: "user", content: [txtPart("a".repeat(300)), imgPart(), txtPart("b".repeat(300))] }];
+  assert.throws(() => mmBuildImageBlocks(msgs, { maxTextChars: 500 }), PromptTooLargeError);
+});
+
+test("buildImageBlocks: a coalesced tool result is measured by what the NEWEST message added, not by the merged block", () => {
+  const call = { role: "assistant", content: null, tool_calls: [
+    { id: "c1", type: "function", function: { name: "f", arguments: "{}" } },
+    { id: "c2", type: "function", function: { name: "g", arguments: "{}" } }] };
+  const res = (id, text) => ({ role: "tool", tool_call_id: id, content: [txtPart(text)] });
+  const o = { maxTextChars: 2000, coalesceToolResults: true, continuationNote: false };
+  // Big EARLIER result, small newest one: they share one text block, and that block is over budget --
+  // but the newest message is small, so this is history trimming, not a refusal.
+  const hist = [{ role: "user", content: "hi" }, call, res("c1", "x".repeat(5000)), res("c2", "NEWEST_RESULT")];
+  const whole = mmBuildImageBlocks(hist, { ...o, maxTextChars: Infinity });
+  assert.ok(whole.blocks.some(b => b.type === "text" && b.text.includes("xxxxx") && b.text.includes("NEWEST_RESULT")),
+    "premise: the two results were coalesced into ONE block, so that block's length is not the newest message's");
+  const ok = mmBuildImageBlocks(hist, o);
+  assert.equal(ok.stats.truncated, true, "premise: over budget");
+  assert.ok(ok.blocks.map(b => b.text || "").join("").includes("NEWEST_RESULT"), "the newest result survives");
+  // Small earlier result, big newest one: refused.
+  assert.throws(() => mmBuildImageBlocks([{ role: "user", content: "hi" }, call, res("c1", "small"), res("c2", "y".repeat(5000))], o), PromptTooLargeError);
 });
 
 test("buildImageBlocks: default (no maxTextChars) never truncates — pure module standalone", () => {
