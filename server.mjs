@@ -4997,7 +4997,7 @@ async function handleChatCompletions(req, res) {
       req._cacheHash = null;
       logEvent("info", "cache_skipped", { reason: "cache_control_present" });
     } else {
-      // D1: include keyId in hash to isolate per-key cache pools (v2 format).
+      // D1: include keyId in hash to isolate per-key cache pools (see cacheHash for the key format).
       // configEpoch (#176): any boot-config change that shapes answers invalidates the cache.
       const hash = cacheHash(cacheModel, messages, { keyId: req._authKeyId, temperature: parsed.temperature, max_tokens: parsed.max_tokens, top_p: parsed.top_p, effort, configEpoch: CONFIG_EPOCH });
       req._cacheHash = hash; // store for later write-back
