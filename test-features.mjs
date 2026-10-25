@@ -2889,6 +2889,10 @@ test("PromptTooLargeError: the 400 states the newest message's real room, not ju
   const big = (n) => fitPromptToBudget(["o".repeat(5000), "n".repeat(n)], [false, false], 2000);
   try { big(1799); assert.fail("must throw"); } catch (e) { assert.equal(e.roomChars, 1798); }
   assert.equal(big(1798).truncated, true);
+  // No room at all (TUI: inline system text alone over budget): roomChars 0, and the message says why
+  // rather than printing a negative "at most" (review round 2).
+  try { fitPromptToBudget(["S".repeat(2500), "hi"], [true, false], 2000); assert.fail("must throw"); }
+  catch (e) { assert.equal(e.roomChars, 0); assert.ok(!/at most -/.test(e.message) && e.message.includes("system messages"), e.message); }
 });
 
 test("promptCharBudgetFor: charsPerToken and floor are tunable parameters", () => {
