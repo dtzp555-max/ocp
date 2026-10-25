@@ -45,7 +45,7 @@ import { homedir, tmpdir } from "node:os";
 import { validateKey, recordUsage, getUsageByKey, getUsageTimeline, getRecentUsage, createKey, listKeys, revokeKey, closeDb, checkQuota, updateKeyQuota, getKeyQuota, findKey, cacheHash, getCachedResponse, setCachedResponse, clearCache, getCacheStats, hasCacheControl, singleflight, getInflightStats } from "./keys.mjs";
 import { DEFAULT_PORT } from "./lib/constants.mjs";
 import { StructuredOutputError, detectStructuredOutput, validateJsonSchemaSafe, extractJsonPayload, structuredSystemInstruction, resolveMaxAttempts } from "./lib/structured-output.mjs";
-import { scheduleKillEscalation } from "./lib/child-tree.mjs";
+import { scheduleKillEscalation, killChildTree } from "./lib/child-tree.mjs";
 import { isLoopbackBind } from "./lib/net.mjs";
 import { parseAllowedHosts, parseAuthority, matchesDeclared, evaluateOriginGate, parseAllowedOriginSchemes, matchesDeclaredScheme } from "./lib/host-gate.mjs";
 import { classifyToolRequest, countDeclaredTools } from "./lib/tool-support.mjs";
@@ -1875,48 +1875,6 @@ function getModelTier(cliModel) {
 // budget. releaseSlot is wired into the idempotent cleanup() so the slot is freed on EVERY exit
 // path (close/error/timeout/abort). Back-compat: releaseSlot defaults to a no-op so any future
 // internal caller that does its own gating still works.
-// #474: kill the child's ENTIRE process group, not just the direct child.
-//
-// Why a group: with spawnOpts.detached (set in spawnClaudeProcess below, POSIX only) the child
-// is a session leader, so proc.pid doubles as its pgid and process.kill(-pid) reaches every
-// process in that group — including a grandchild that inherited the stdout pipe. That grandchild
-// is the exact shape that kept 'close' (and with it the client request) open forever: the
-// timer's SIGTERM/SIGKILL landed on the parent, the parent died, the pipe stayed open, and the
-// request hung until the client gave up (issue #474, measured on v3.37.0: client silent past
-// 240 s while the log already showed request_timeout + claude_exit).
-//
-// A throw here means either the group was already fully reaped (the kill landed — nothing more
-// to do) or the group was never created (detached failed to apply). In BOTH cases we fall
-// through to the per-process kill below: in the first it is a harmless no-op, in the second it
-// still reaches the direct child instead of leaking it. win32: `detached` means something
-// different there and a negative pid is not killable, so the group path is POSIX-only and
-// win32 keeps the pre-#474 per-process behaviour.
-function killChildTree(proc, sig) {
-  // win32 has no process groups: `taskkill /T` walks the tree by parent pid instead, so it must
-  // run while claude.exe is still alive (its children are only found through it). Forced (/F)
-  // whatever `sig` asked for, since Windows has no graceful-signal equivalent for a console-less
-  // child. The per-process kill runs after it, as the fallback when taskkill itself fails.
-  if (proc.pid != null && process.platform === "win32") {
-    proc.killed = true;
-    execFile("taskkill", ["/PID", String(proc.pid), "/T", "/F"], { windowsHide: true, timeout: 10000 },
-      () => { try { proc.kill(sig); } catch { /* already gone */ } });
-    return;
-  }
-  if (proc.pid != null && process.platform !== "win32") {
-    try {
-      process.kill(-proc.pid, sig);
-      proc.killed = true; // honor the flag's contract: a signal WAS sent (see the #111 guard)
-      return;
-    } catch {
-      // ESRCH means EITHER the whole group was already reaped (the kill landed — nothing more to
-      // do) OR the group was never created (detached failed to take effect and the child is
-      // alive in its INHERITED group). In the second case giving up would be a silent leak, so
-      // fall through to the per-process kill below: at least it reaches the direct child.
-    }
-  }
-  try { proc.kill(sig); } catch { /* already gone */ }
-}
-
 function spawnClaudeProcess(model, messages, conversationId, keyName, releaseSlot = () => {}, spawnDecision = null, opts = {}) {
   const cliModel = MODEL_MAP[model] || model;
 
