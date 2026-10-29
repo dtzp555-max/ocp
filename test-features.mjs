@@ -17,7 +17,7 @@ import { PREFIX as BRIDGE_PREFIX } from "./lib/mcp-bridge.mjs";
 import { randomBytes } from "node:crypto";
 import { createSerialMutex, createTtlCache, isTokenExpiring, orderLabelsLastGoodFirst, scrubInboundAuthEnv, INBOUND_AUTH_ENV_VARS, applyRequestVerdictTtl } from "./lib/spawn-auth.mjs";
 import { makeResolveSpawnToken } from "./lib/spawn-token.mjs";
-import { scheduleKillEscalation, makeKillEscalation } from "./lib/child-tree.mjs";
+import { scheduleKillEscalation, makeKillEscalation, killChildTree, makeKillChildTree } from "./lib/child-tree.mjs";
 import { EventEmitter } from "node:events";
 import { parseAuthority, isRebindSafe, matchesDeclared, parseAllowedHosts, evaluateOriginGate, parseAllowedOriginSchemes, matchesDeclaredScheme } from "./lib/host-gate.mjs";
 import { createHash } from "node:crypto";
@@ -23012,6 +23012,85 @@ async function runAsyncTests() {
     await _settle();
     assert.deepEqual(sigs, []);
   });
+
+  // ── M1 (external review of 566b936): win32 taskkill on an exited child's pid ──
+  // On win32 defaultGroupEmpty returns false, so the #500 escalation is never cancelled on 'close'
+  // and fires 5 s after every SIGTERM — and killChildTree's win32 branch is `taskkill /PID <pid>
+  // /T /F`, a raw call on a number Windows may have reused once the child's handle closed. The fix
+  // declines to taskkill a child whose exitCode or signalCode is set (Node sets one in the same
+  // step that closes the handle). The fakes carry exitCode/signalCode = null like a live
+  // ChildProcess. Each claim has its own body (#405 "Mutual").
+  const _winProc = () => {
+    const p = new EventEmitter(); p.pid = 424242; p.exitCode = null; p.signalCode = null;
+    p.kills = []; p.kill = (sig) => { p.kills.push(sig); return true; };
+    return p;
+  };
+  const _recFile = (calls) => (file, args, _opts, cb) => { calls.push([file, ...args]); cb(null); };
+
+  test("M1 win32: a LIVE child is still taskkill'ed by pid, tree, forced (the control)", () => {
+    const calls = []; const proc = _winProc();
+    makeKillChildTree({ platform: "win32", execFile: _recFile(calls) })(proc, "SIGTERM");
+    assert.deepEqual(calls, [["taskkill", "/PID", "424242", "/T", "/F"]], "a live tree must still be killed");
+    assert.equal(proc.killed, true, "proc.killed records that a kill was sent");
+    assert.deepEqual(proc.kills, ["SIGTERM"], "the per-process kill still runs as taskkill's fallback");
+  });
+
+  test("M1 win32: a child that EXITED is never taskkill'ed — its pid may belong to someone else", () => {
+    const calls = []; const proc = _winProc(); proc.exitCode = 0;
+    makeKillChildTree({ platform: "win32", execFile: _recFile(calls) })(proc, "SIGKILL");
+    assert.deepEqual(calls, [], "taskkill on a released pid can force-kill an unrelated tree");
+    assert.notEqual(proc.killed, true, "no kill was sent, so proc.killed must not claim one");
+  });
+
+  test("M1 win32: a child that died BY SIGNAL is never taskkill'ed either (exitCode stays null)", () => {
+    // Node sets signalCode INSTEAD of exitCode for a signalled child (measured: exitCode=null,
+    // signalCode=SIGTERM at 'exit'), so a check on exitCode alone misses this case.
+    const calls = []; const proc = _winProc(); proc.signalCode = "SIGTERM";
+    makeKillChildTree({ platform: "win32", execFile: _recFile(calls) })(proc, "SIGKILL");
+    assert.deepEqual(calls, [], "a signalled child has released its pid just the same");
+  });
+
+  await testAsync("M1 win32: the #500 escalation after a normal exit sends no taskkill (the reported shape)", async () => {
+    // The sequence the review described, end to end through both helpers: SIGTERM, the child exits
+    // and closes, the timer is NOT cancelled (win32 has no group to check), and it fires.
+    const calls = []; const proc = _winProc();
+    const kill = makeKillChildTree({ platform: "win32", execFile: _recFile(calls) });
+    const sched = makeKillEscalation({ groupEmpty: () => false }); // what defaultGroupEmpty returns on win32
+    kill(proc, "SIGTERM");
+    sched(proc, kill, 30);
+    proc.exitCode = 1; proc.emit("exit", 1, null); proc.emit("close", 1, null);
+    await _settle();
+    assert.deepEqual(calls, [["taskkill", "/PID", "424242", "/T", "/F"]],
+      "only the SIGTERM's taskkill, sent while the child was alive; the escalation must not add a second");
+  });
+
+  test("M1 POSIX branch unchanged: the group kill lands and nothing else is sent", () => {
+    const groups = []; const proc = _winProc();
+    makeKillChildTree({ platform: "darwin", killGroup: (pid, sig) => groups.push([pid, sig]) })(proc, "SIGTERM");
+    assert.deepEqual(groups, [[424242, "SIGTERM"]]);
+    assert.equal(proc.killed, true);
+    assert.deepEqual(proc.kills, [], "a landed group kill needs no per-process kill");
+  });
+
+  test("M1 POSIX branch unchanged: a group kill that throws falls through to the per-process kill", () => {
+    const proc = _winProc();
+    makeKillChildTree({ platform: "linux", killGroup: () => { throw Object.assign(new Error("ESRCH"), { code: "ESRCH" }); } })(proc, "SIGTERM");
+    assert.deepEqual(proc.kills, ["SIGTERM"], "a group that was never created must not leak its direct child");
+  });
+
+  if (process.platform === "win32") {
+    testSkipped("M1 the production killChildTree binds the real platform and group kill",
+      "on win32 the real binding would run a real taskkill against the probe pid");
+  } else {
+  test("M1 the production killChildTree binds the real platform and group kill", () => {
+    // Signal 0 so nothing is delivered even if pgid 424242 happens to exist. The real group kill
+    // reports ESRCH for it and falls through to proc.kill(0); an injected non-throwing killGroup
+    // would not, and an injected "win32" would call execFile instead.
+    const proc = _winProc();
+    killChildTree(proc, 0);
+    assert.deepEqual(proc.kills, [0], "the exported binding must use process.kill(-pid), not a stub");
+  });
+  }
 
   await testAsync("createSerialMutex: second waiter blocks until first holder releases", async () => {
     const mutex = createSerialMutex();
