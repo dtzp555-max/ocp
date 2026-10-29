@@ -9,7 +9,7 @@ Inherits: @~/.cc-rules/AGENTS.md
 
 ## What this project is
 
-OCP (Open Claude Proxy) is an open-source HTTP gateway that sits between the Claude Code CLI (`cli.js`) and Anthropic's public API. It forwards, observes, and multiplexes traffic that `cli.js` already emits — it is explicitly **not** an extension layer. A secondary role: registering OCP as a local provider inside OpenClaw (a sibling IDE-agnostic tool), so that users running OpenClaw against OCP see the same model list as native Claude Code.
+OCP (Open Claude Proxy) is an open-source HTTP gateway that sits between the Claude Code CLI (`cli.js`) and Anthropic's public API. It forwards, observes, and multiplexes traffic that `cli.js` already emits, and it does **not** invent surface Anthropic does not expose. It is also an **agent backend** ([ADR 0021](docs/adr/0021-ocp-is-an-agent-backend.md)): on `/v1/chat/completions` it serves the tool-calling half of OpenAI's specification, and a client's declared tools run **on the client** — they reach the spawned CLI through a stateless MCP bridge with the CLI's own built-in tools emptied, and the model's calls go back to the client as `tool_calls` ([ADR 0022](docs/adr/0022-openai-tool-calling-over-a-stateless-mcp-bridge.md)). ADR 0021 narrowed this paragraph's former "explicitly not an extension layer" rather than deleting it: the no-invention half still binds. A secondary role: registering OCP as a local provider inside OpenClaw (a sibling IDE-agnostic tool), so that users running OpenClaw against OCP see the same model list as native Claude Code.
 
 Runtime: Node.js (ESM, `.mjs` throughout). No build step. No bundler. `server.mjs` is the single executable entrypoint; `ocp` and `ocp-connect` are CLI wrappers.
 
