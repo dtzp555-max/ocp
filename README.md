@@ -195,7 +195,12 @@ Every drop increments `/health`'s `stats.toolRequestsDropped` and logs `openai_t
 
 The tools the bridge grants run on the **client**, so this works in every auth mode, including `AUTH_MODE=multi`: a guest calling its own tool touches nothing on the OCP host. What the model can do on the host itself is a separate question, governed by `--allowedTools` and `OCP_LOCAL_TOOLS` below — and when a request declares client tools, the host-side built-ins are emptied for that spawn so there is exactly one way to do each thing.
 
-**What this means for choosing OCP (workload fit).** LAN/multi-device OCP is built for **chat-class** workloads — Q&A, translation, scripting against the API, chat frontends, home-automation backends — where text in/text out is the whole job. It is **not** the right tool for a coding agent running on a *client* machine that needs the AI to read and edit *that machine's* files: tools execute on the OCP host, so the model can never touch the client's filesystem. For that workload, run `claude` (or a local OCP) directly on the machine where the code lives.
+**What this means for choosing OCP (workload fit).** A coding agent on a *client* machine can use a LAN OCP when it **declares its tools in the request** (OpenAI `tools`). The model's calls come back as `tool_calls`, and the client runs them against its own files. (Before v3.34.0 this paragraph said the opposite, and it was true then: OCP dropped `tools`, and only the host's own tools existed.)
+
+Two things still describe the **host**, not the client:
+
+- **The CLI's own environment section.** `claude` writes the spawn's working directory (on an isolated spawn, the default, `~/.ocp/spawn-home`; otherwise the server's own directory), platform, shell and OS version into the system prompt itself, and no supported CLI flag removes it on this path. On a bridge spawn, OCP's prompt tells the model that this section describes the proxy's host and that paths come from the client's own messages (#532). Measured with `claude-opus-4-6`: without that sentence the model put the host path into a `read_file` call in 3 of 10 requests, and with it in 0 of 10. That is a small sample, and some models (`claude-sonnet-5-5`) did not do it either way. An agent should state its working directory in its own system prompt.
+- **Host-side tools.** `OCP_LOCAL_TOOLS`, the TUI lane and the CLI's built-ins on a request *without* `tools` all act on the OCP host. For a coding agent that relies on those rather than on its own declared tools, run `claude` (or a local OCP) on the machine where the code lives.
 
 ## Available Models
 

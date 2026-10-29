@@ -6998,6 +6998,44 @@ ltTest("integration (#479): in multi mode a BRIDGE spawn gets the neutral wrappe
   } finally { _ltRmRetry(dir); }
 });
 
+// #532 / ADR 0021 Amendment 1. A bridge spawn's tools run on the CLIENT, while the CLI's own
+// environment section names the PROXY's working directory -- so the bridge wrapper tells the model
+// whose environment that is. A plain spawn may hold the CLI's own tools, which run on this host, so it
+// must NOT be told that. The two halves are each other's control and stay in one test: the claim is
+// that the same instance sends the sentence to one spawn and not the other, so a build that sent it
+// to every spawn (or to none) fails one half.
+ltTest("integration (#532): a BRIDGE spawn is told the environment section is the proxy host's; a plain one is not", async () => {
+  if (!LT_POSIX) return;
+  const dir = ltMkdir(); const fake = ltFake(dir);
+  const cap = join(dir, "sp.txt");
+  const argvFile = join(dir, "argv.txt");
+  const HOST_SENTENCE = "describe the proxy's host, not the client";
+  try {
+    const { child, buf, port } = await ltBootFresh({ CLAUDE_BIN: fake, SP_CAPTURE: cap, ARGV_CAPTURE: argvFile }, dir);
+    try {
+      assert.ok(await ltWait(() => buf.out.includes("listening on")), `— ${ltDiag(buf)}`);
+      const TOOL = { type: "function", function: { name: "read_file", parameters: { type: "object" } } };
+
+      // A) with tools: the bridge is wired, and the prompt attributes the environment to the proxy.
+      const r1 = await ltPostStatus(port, { model: "sonnet", tools: [TOOL], messages: [{ role: "user", content: "hi" }] });
+      assert.equal(r1.status, 200, `${r1.status} ${r1.text.slice(0, 200)}`);
+      assert.ok(await ltWait(() => _ltExists(cap) && _ltRead(cap, "utf8").includes(HOST_SENTENCE)),
+        `a bridge spawn must say whose environment the CLI's section describes — ${_ltExists(cap) ? _ltRead(cap, "utf8").slice(0, 400) : "(no capture)"}`);
+      // Premise: this really was a bridge spawn, or the assertion above proves nothing about the bridge.
+      assert.ok(ltArgvCalls(argvFile).includes("--mcp-config"), "premise: the bridge must be wired");
+
+      // B) without tools, same instance: the plain spawn gets the neutral wrapper and NOT the sentence.
+      // The wait is on a B-only property (the neutral wrapper present WITHOUT the sentence), so it cannot
+      // unblock on A's capture; argv is written before the prompt capture by the fake, per call.
+      const r2 = await ltPostStatus(port, { model: "sonnet", messages: [{ role: "user", content: "hi" }] });
+      assert.equal(r2.status, 200, `${r2.status} ${r2.text.slice(0, 200)}`);
+      assert.ok(await ltWait(() => { const sp = _ltRead(cap, "utf8"); return sp.includes("Use only the tools actually provided") && !sp.includes(HOST_SENTENCE); }),
+        `a plain spawn must not be told the environment is someone else's — ${_ltRead(cap, "utf8").slice(0, 400)}`);
+      assert.ok(!ltArgvCalls(argvFile).includes("--mcp-config"), "premise: no bridge on the plain spawn");
+    } finally { child.kill("SIGKILL"); await ltDrain(() => buf.closed, "bridge-host-wrapper", 5000); }
+  } finally { _ltRmRetry(dir); }
+});
+
 console.log("\nCredential source selection: an expired source must not shadow a valid one (#475):");
 
 test("#475: selectCredential passes over an expired source in favour of a valid lower-precedence one", () => {
