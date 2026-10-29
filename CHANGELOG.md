@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## v3.43.0 — 2026-10-29
+
 ### Added
 
 - **OCP runs natively on Windows, on the default `-p` path (#529).** No request handler is modified, but two helpers change client-visible output, so the class is stated per helper instead of declaring "not endpoint-touching". `sanitizeError` changes error text on `/v1/chat/completions` (JSON and SSE error bodies, and the structured-output `refusal` text): **Class B.1**, OpenAI's published `Error` object ([`components.schemas.Error` in openai-openapi](https://github.com/openai/openai-openapi/blob/master/openapi.yaml), spec version 2.3.0 as read 2026-10-21: `message` is a required string with no stated content constraint; the `refusal` text is `ChatCompletionResponseMessage.refusal`, a `string|null` with none either), authorized by [ADR 0006](docs/adr/0006-openai-shim-scope.md); no field is added, removed or retyped. `SPAWN_HOME_DIR` changes `/health` `spawn.home` only when `HOME` is unset, where it was the relative path `undefined/.ocp/spawn-home` and is now the real home: **Class B.2**, ADR 0006 (grandfathered as of v3.16.4), route (a); the field already meant "the scratch HOME path when isolated" and now says so truthfully. Tested on Windows 11 with Node 24 and the native-installer `claude.exe`.
