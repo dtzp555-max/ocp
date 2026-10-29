@@ -1,7 +1,7 @@
 # ADR 0021 — OCP is an agent backend
 
 **Date:** 2026-09-09
-**Status:** Accepted (maintainer sign-off 2026-09-09); Amendment 1 (#532) Proposed, awaiting maintainer sign-off
+**Status:** Accepted (maintainer sign-off 2026-09-09); Amendment 1 (#532) Accepted (maintainer sign-off 2026-10-29)
 **Scope:** Class B.1 — `POST /v1/chat/completions`. Authority: OpenAI's published
 `/v1/chat/completions` specification + [ADR 0006](0006-openai-shim-scope.md).
 **Supersedes:** the **Decision** of [ADR 0013](0013-no-openai-tool-calling.md). Its Context and its
@@ -104,8 +104,7 @@ and its own review — exactly as 0013 said. This ADR authorizes the *direction*
 
 ## Amendment 1 — a bridge spawn is told whose environment the CLI describes (#532)
 
-> **Status: Proposed — awaiting maintainer sign-off.** The maintainer approved the direction on
-> 2026-10-29; this text becomes Accepted when the maintainer signs it, before the PR merges.
+> **Status: Accepted (maintainer sign-off 2026-10-29).**
 
 **Context.** Item 4, row 2 of this ADR says the prompt must not contradict the granted tool surface.
 On a bridge spawn it still did, one level down. The tools are the client's and run on the client.
