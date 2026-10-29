@@ -1,7 +1,7 @@
 # ADR 0021 — OCP is an agent backend
 
 **Date:** 2026-09-09
-**Status:** Accepted (maintainer sign-off 2026-09-09); Amendment 1 (#532) Accepted (maintainer sign-off 2026-10-29)
+**Status:** Accepted (maintainer sign-off 2026-09-09)
 **Scope:** Class B.1 — `POST /v1/chat/completions`. Authority: OpenAI's published
 `/v1/chat/completions` specification + [ADR 0006](0006-openai-shim-scope.md).
 **Supersedes:** the **Decision** of [ADR 0013](0013-no-openai-tool-calling.md). Its Context and its
@@ -99,41 +99,3 @@ and its own review — exactly as 0013 said. This ADR authorizes the *direction*
 - **Had the maintainer declined to sign this**, items 1–3 would still have been correct on their own
   merits, and ADR 0013 would have stood. None of the three depends on this ADR — which is why they
   are staged ahead of it.
-
----
-
-## Amendment 1 — a bridge spawn is told whose environment the CLI describes (#532)
-
-> **Status: Accepted (maintainer sign-off 2026-10-29).**
-
-**Context.** Item 4, row 2 of this ADR says the prompt must not contradict the granted tool surface.
-On a bridge spawn it still did, one level down. The tools are the client's and run on the client.
-But `claude` writes its own environment section into the system prompt: the spawn's working
-directory, platform, shell and OS. OCP's wrapper does not replace that section. The CLI has no
-supported flag that removes it on this path: `--exclude-dynamic-system-prompt-sections` is ignored
-with `--system-prompt`, and `--bare` never reads OAuth. So the model was told that the proxy's
-directory was its own. #532 reports a client whose model treated that directory as authoritative
-over the project's instructions.
-
-Measured on 2026-10-29 with CLI 2.1.310. The prompt was "Read probe.txt with the tool read_file.",
-with no client path given. With the neutral wrapper, `claude-opus-4-6` put the host path
-(`<spawn-home>/probe.txt`) into its `tool_calls` in 3 of 10 requests. With the sentence below it did
-so in 0 of 10. `claude-sonnet-5-5` did not leak in 5 requests with the neutral wrapper.
-
-**Decision.** A spawn that carries the tool bridge, and is not under `OCP_LOCAL_TOOLS=1`, gets the
-neutral wrapper followed by one sentence:
-
-> Any working directory, platform, shell or OS details elsewhere in this system prompt describe the
-> proxy's host, not the client: the tools provided here run on the client's own machine, so paths
-> and environment come from the client's own messages and instructions.
-
-Plain spawns are unchanged. There the model may hold the CLI's own tools, which do run on the host,
-so the environment section is true for them. The response cache is unaffected, for the reason item 2
-already records: a request that declares tools never reads or writes it.
-
-**Consequences.**
-- The sentence lowers the leak; it does not remove the CLI's section. The sample is small. The README
-  tells agents to state their own working directory in their system prompt.
-- `CONFIG_EPOCH` does not change, because the boot-time wrapper is untouched.
-- **Expiry.** If a future CLI offers a supported way to omit its environment section under
-  `--system-prompt-file`, that replaces this sentence. Re-measure before relying on either.

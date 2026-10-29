@@ -243,20 +243,6 @@ const OCP_LOCAL_TOOLS_WRAPPER = `You are accessed via the OCP HTTP proxy running
 // of the negative wrapper that was always true and always useful, the anti-invention clause.
 const OCP_NEUTRAL_TOOLS_WRAPPER = `You are accessed via the OCP HTTP proxy. Use only the tools actually provided to you in this session, and do not infer or invent filesystem, working-directory, shell, git or machine-environment details you have not obtained through them.`;
 
-// #532 / ADR 0021 Amendment 1. A BRIDGE spawn's tools are the client's and run on the client, but
-// the CLI still writes its own environment section into the system prompt -- "Primary working
-// directory: <the spawn's cwd>", platform, shell, OS -- and no supported flag removes it on this path
-// (`--exclude-dynamic-system-prompt-sections` is ignored with --system-prompt; `--bare` never reads
-// OAuth). So the model was handed the PROXY's directory as its own, and some models put it into the
-// client's tool calls as an absolute path. Measured 2026-10-29 (CLI 2.1.310, "Read probe.txt with the
-// tool read_file.", no client path given): claude-opus-4-6 sent `<spawn-home>/probe.txt` in 3 of 10
-// requests with the neutral wrapper and 0 of 10 with this exact sentence; claude-sonnet-5-5 sent it 0
-// of 5 with the neutral wrapper (and 0 of 5 under an earlier wording of the sentence, not this one).
-// That is a small sample, and the sentence reduces the leak -- it cannot remove the
-// CLI's block. Bridge spawns only: on a plain spawn the model may hold the CLI's own tools, which DO
-// run on this host, and there the environment section is true.
-const OCP_BRIDGE_TOOLS_WRAPPER = `${OCP_NEUTRAL_TOOLS_WRAPPER} Any working directory, platform, shell or OS details elsewhere in this system prompt describe the proxy's host, not the client: the tools provided here run on the client's own machine, so paths and environment come from the client's own messages and instructions.`;
-
 // OCP_LOCAL_TOOLS is inert in TUI mode: the interactive (non-`-p`) path composes its own prompt via
 // callClaudeTui/messagesToPrompt and never calls extractSystemPrompt, so the wrapper is only ever
 // applied on the `-p` path. LOCAL_TOOLS_ACTIVE is the single source of truth (hoisted once, house
@@ -300,7 +286,7 @@ const LOCAL_TOOLS_ACTIVE = LOCAL_TOOLS && process.env.CLAUDE_TUI_MODE !== "true"
 // never reads or writes the cache at all. Only non-bridge spawns are cached, and those still use
 // the boot-time wrapper this epoch was computed from.
 function extractSystemPrompt(messages, opts = {}) {
-  const chosen = opts.toolBridge && !LOCAL_TOOLS_ACTIVE ? OCP_BRIDGE_TOOLS_WRAPPER : SYSTEM_PROMPT_WRAPPER;
+  const chosen = opts.toolBridge && !LOCAL_TOOLS_ACTIVE ? OCP_NEUTRAL_TOOLS_WRAPPER : SYSTEM_PROMPT_WRAPPER;
   // #512: the continuation note, unconditionally and byte-constant, on every -p spawn. Conditional
   // placement (only when the history ends in a tool result) would change the SYSTEM prompt between
   // steps and invalidate the cache at a layer before the conversation, which is worse than before.
