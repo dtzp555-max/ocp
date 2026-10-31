@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+### Changed
+
+- `.gitignore` now ignores the root `start.sh` launcher that `setup.mjs` writes and the root `package-lock.json` that `npm install` writes, so an install directory's `git status` stays clean after `ocp update`. `package.json` declares no dependencies, so that lock file records only the package itself; if a dependency is ever added, the lock should be committed and the ignore line removed.
+
 ## v3.43.0 — 2026-10-29
 
 ### Added

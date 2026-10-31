@@ -4,6 +4,10 @@ logs/
 
 # Dependencies
 node_modules/
+# package.json declares no dependencies, so the lock `npm install` writes during `ocp update` records
+# nothing (#61 deleted a stale tracked copy). If package.json ever gains a dependency, delete this
+# line and commit the lock instead.
+/package-lock.json
 
 # Environment files
 .env
@@ -18,5 +22,6 @@ node_modules/
 # suite is running -- which is exactly when a `git add -A` from an agent will sweep it up.
 scratchpad/
 
-# Windows launcher written by setup.mjs
+# Launchers written by setup.mjs (Step 4). start.sh embeds this host's absolute paths.
 start_ocp.cmd
+/start.sh
