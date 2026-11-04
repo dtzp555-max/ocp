@@ -4951,6 +4951,17 @@ ltTest("integration (#460): an is_error result counts ONCE on the streaming lane
   } finally { _ltRmRetry(dir); }
 });
 
+// The lever below cannot be ARMED as root: it makes the spawn HOME's parent mode 0500 so that
+// ensureSpawnHome's mkdir fails, and with DAC override that mkdir succeeds -- the spawn then
+// runs with a usable cwd, answers 200, and the "should fail with an unusable cwd" premise
+// assertion reports a defect that is not there. Measured on a root-by-default container: the
+// full suite read 1484 passed / 1 failed with this test the only red, and `--only` on it alone
+// reproduced it, so it is not contention. Same cause and same top-level shape as #366's guard
+// above (`_m366IsRoot`), reused rather than redefined so there is one root predicate.
+if (_m366IsRoot) {
+  testSkipped("integration (#460): an ASYNCHRONOUSLY-failing spawn counts ONCE, not once per handler (was 2)",
+    "running as root — DAC override lets mkdir succeed under a mode-0500 parent, so the unusable-cwd lever cannot be armed");
+} else {
 ltTest("integration (#460): an ASYNCHRONOUSLY-failing spawn counts ONCE, not once per handler (was 2)", async () => {
   if (!LT_POSIX) return;
   const dir = ltMkdir();
@@ -4999,6 +5010,7 @@ ltTest("integration (#460): an ASYNCHRONOUSLY-failing spawn counts ONCE, not onc
     } finally { child.kill("SIGKILL"); await ltDrain(() => buf.closed, "err460-spawnfail", 5000); }
   } finally { _ltRmRetry(dir); }
 });
+}
 
 // THE CONTROL, and it is the one that matters most. A GLOBAL "already counted" flag would pass
 // all three tests above and then silence every subsequent request's error for the life of the
