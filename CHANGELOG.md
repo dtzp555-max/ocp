@@ -6,6 +6,10 @@
 
 - `.gitignore` now ignores the root `start.sh` launcher that `setup.mjs` writes and the root `package-lock.json` that `npm install` writes, so an install directory's `git status` stays clean after `ocp update`. `package.json` declares no dependencies, so that lock file records only the package itself; if a dependency is ever added, the lock should be committed and the ignore line removed.
 
+### Fixed
+
+- `npm test` no longer reports a false red when run as root (#546). The #460 integration test "an ASYNCHRONOUSLY-failing spawn counts ONCE" arms its fault by making the spawn HOME's parent mode `0500`, and with DAC override root's `mkdir` succeeds there, so the spawn ran normally and the test's premise assertion failed. It is now reported as skipped under root, using the same top-level guard (`_m366IsRoot`) that #366's two permission-bit tests already use. Test-only; no runtime change.
+
 ## v3.43.0 — 2026-10-29
 
 ### Added
