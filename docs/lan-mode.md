@@ -342,6 +342,8 @@ If OCP is already installed without it, re-export the env var and re-run `node s
 
 **Client side**: the anonymous key value is exposed via `GET /health` as the field `anonymousKey` (null when not set) **only to localhost callers** or when the admin has also set `PROXY_ADVERTISE_ANON_KEY=1` (default off — see issue #109). With that opt-in, clients like `ocp-connect` can auto-discover and use it, so the end user doesn't need to get a personal key from the admin.
 
+**Keyless requests.** Independently of the anonymous key, `multi` mode admits a request that sends **no key at all** as `anonymous` (keys are optional there, so family members can start without setup). On an instance reachable from outside your LAN — behind a reverse proxy on a public name, say — set `OCP_REQUIRE_KEY=1` so such a request receives `401` ([ADR 0025](adr/0025-require-key.md)). Loopback callers are always admitted. Don't combine it with `PROXY_ADVERTISE_ANON_KEY=1`: `/health` would hand the anonymous key to anyone, and OCP warns at boot when you do.
+
 **Security note**: setting this env var is an **opt-in** to public access — anyone who can reach your OCP endpoint can use it, up to any rate limits you configure. Don't enable this on internet-exposed OCP instances without additional protection.
 
 **Not a secret**: because `/health` is an unauthenticated endpoint, the anonymous key is **publicly readable** by anyone who can reach the server. That is intentional — the key exists so clients can self-configure without out-of-band coordination. Treat it as a convenience handle, not as an access credential.

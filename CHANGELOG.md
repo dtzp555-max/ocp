@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+### Added
+
+- **`OCP_REQUIRE_KEY=1`** ([ADR 0025](docs/adr/0025-require-key.md)): in `multi` mode, a non-loopback request with no `Bearer` token receives `401` instead of being admitted as `anonymous`. Off by default, so LAN zero-config setups are unchanged; meant for OCP served behind a reverse proxy on a public name, where the keyless arm admits anyone. Valid, admin and `PROXY_ANONYMOUS_KEY` tokens and loopback callers are unchanged. The boot banner now says in multi mode whether keyless requests are admitted or refused.
+
 ### Changed
 
 - `.gitignore` now ignores the root `start.sh` launcher that `setup.mjs` writes and the root `package-lock.json` that `npm install` writes, so an install directory's `git status` stays clean after `ocp update`. `package.json` declares no dependencies, so that lock file records only the package itself; if a dependency is ever added, the lock should be committed and the ignore line removed.

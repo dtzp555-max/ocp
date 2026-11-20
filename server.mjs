@@ -32,6 +32,7 @@
  *   CLAUDE_BREAKER_WINDOW        — sliding window duration in ms (default: 300000 = 5min)
  *   CLAUDE_BREAKER_HALF_OPEN_MAX — max concurrent probes in half-open state (default: 2)
  *   PROXY_API_KEY                — Bearer token for API auth (optional)
+ *   OCP_REQUIRE_KEY              — "1": in multi mode, refuse a non-loopback request with no Bearer token (ADR 0025)
  *   CLAUDE_HEARTBEAT_INTERVAL    — SSE heartbeat interval in ms on streaming path (default: 0 = disabled)
  */
 import { AsyncLocalStorage } from "node:async_hooks";
@@ -570,6 +571,11 @@ const CONFIG_EPOCH = cryptoCreateHash("sha256")
   .digest("hex").slice(0, 16);
 const ADMIN_KEY = process.env.OCP_ADMIN_KEY || "";
 const PROXY_ANONYMOUS_KEY = process.env.PROXY_ANONYMOUS_KEY || "";
+// ADR 0025. When "1", AUTH_MODE=multi refuses a non-loopback request that carries no Bearer token
+// (401) instead of admitting it as "anonymous". Default OFF: the keyless arm below has admitted such
+// callers since multi mode shipped, and LAN setups rely on it. Loopback is unchanged (still always
+// admitted), and PROXY_ANONYMOUS_KEY keeps working: it is a token, so it is validated, not keyless.
+const REQUIRE_KEY = process.env.OCP_REQUIRE_KEY === "1";
 // When set to "1", advertise PROXY_ANONYMOUS_KEY in the public /health body so
 // remote `ocp-connect` devices can zero-config auto-discover it (issue #12 §14 Path A).
 // Default OFF: /health is unauthenticated, so advertising hands the shared key to any
@@ -1036,6 +1042,14 @@ if (_localToolsBootError) {
 
 if (PROXY_ANONYMOUS_KEY && AUTH_MODE !== "multi") {
   console.warn("WARNING: PROXY_ANONYMOUS_KEY is set but AUTH_MODE is not 'multi' — anonymous key will be ignored");
+}
+
+if (REQUIRE_KEY && AUTH_MODE === "multi" && PROXY_ANONYMOUS_KEY && process.env.PROXY_ADVERTISE_ANON_KEY === "1") {
+  console.warn("WARNING: OCP_REQUIRE_KEY=1 with PROXY_ANONYMOUS_KEY and PROXY_ADVERTISE_ANON_KEY=1 — /health hands the anonymous key to anyone, so keyless callers are refused but anyone can still get in (ADR 0025)");
+}
+
+if (REQUIRE_KEY && AUTH_MODE !== "multi") {
+  console.warn("WARNING: OCP_REQUIRE_KEY=1 is set but AUTH_MODE is not 'multi' — it only governs multi mode's keyless arm and is ignored");
 }
 
 if (AUTH_MODE === "shared" && !PROXY_API_KEY) {
@@ -5310,6 +5324,8 @@ async function handleRequest(req, res) {
           authKeyName = keyInfo.name;
           authKeyId = keyInfo.id;
         }
+      } else if (REQUIRE_KEY) {
+        return jsonResponse(res, 401, { error: { message: "Unauthorized: an API key is required (OCP_REQUIRE_KEY=1)", type: "auth_error" } });
       } else {
         authKeyName = "anonymous";
       }
@@ -6019,6 +6035,8 @@ server.listen(PORT, BIND_ADDRESS, () => {
   console.log(`Auth: ${PROXY_API_KEY ? "enabled (PROXY_API_KEY set)" : "disabled (no PROXY_API_KEY)"}`);
   console.log(`Auth mode: ${AUTH_MODE}${AUTH_MODE === "shared" ? " (PROXY_API_KEY)" : AUTH_MODE === "multi" ? " (per-user keys)" : " (open)"}`);
   console.log(`Bind: ${BIND_ADDRESS}${BIND_ADDRESS === "0.0.0.0" ? " ⚠ LAN-accessible" : ""}`);
+  // ADR 0025: say which way multi mode's keyless arm goes, since the default admits it.
+  if (AUTH_MODE === "multi") console.log(`Keyless requests: ${REQUIRE_KEY ? "refused (OCP_REQUIRE_KEY=1)" : "admitted as anonymous (OCP_REQUIRE_KEY=1 refuses them)"}`);
   // Which of the three system-prompt wrappers this boot selected. Operator-facing because the
   // choice is invisible otherwise (the prompt travels in a 0600 temp file, #453) and because the
   // defect it replaces was exactly a mismatch between what the operator believed the model was
