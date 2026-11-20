@@ -3064,6 +3064,7 @@ import { createServer as _ltNetServer, connect as _ltNetConnect } from "node:net
 import { createServer as _ltHttpServer } from "node:http";
 import { writeFileSync as _ltWrite, chmodSync as _ltChmod, readFileSync as _ltRead, existsSync as _ltExists, rmSync as _ltRm, mkdtempSync as _ltMkdtemp, renameSync as _ltRename, mkdirSync as _ltMkdirSync, realpathSync as _ltRealpath, readdirSync as _ltReaddir } from "node:fs";
 import { tmpdir as _ltTmp } from "node:os";
+import { networkInterfaces as _rkInterfaces } from "node:os";
 import { sep as _ltSep } from "node:path";
 import { fileURLToPath as _ltF2P } from "node:url";
 
@@ -5564,6 +5565,80 @@ ltTest("integration: AUTH_MODE=multi spawns `--tools \"\"` so the built-in schem
     } finally {
       child.kill("SIGKILL");
       await ltDrain(() => buf.closed, "multi-tools", 5000);
+    }
+  } finally { _ltRmRetry(dir); }
+});
+
+// ADR 0025 — OCP_REQUIRE_KEY. multi mode's keyless arm (`else { authKeyName = "anonymous" }`) is
+// reached only by a NON-loopback caller: loopback takes the isLocalhost branch first and is always
+// admitted. So this test must send from a non-loopback address, or it would pass on a build where
+// the flag does nothing -- the loopback 200 below is the control that pins exactly that. The
+// address is this machine's own first non-internal IPv4, with the server bound to 0.0.0.0; a
+// runner without one cannot reach the arm at all, so the test is skipped there rather than faked.
+function _rkLanAddress() {
+  for (const list of Object.values(_rkInterfaces())) {
+    for (const a of list || []) if (a.family === "IPv4" && !a.internal) return a.address;
+  }
+  return null;
+}
+async function _rkPost(host, port, headers = {}) {
+  try {
+    const r = await fetch(`http://${host}:${port}/v1/chat/completions`, {
+      method: "POST", headers: { "Content-Type": "application/json", ...headers },
+      body: JSON.stringify({ model: "sonnet", messages: [{ role: "user", content: "hi" }] }),
+    });
+    return { status: r.status, text: await r.text() };
+  } catch (e) { return { status: 0, text: String(e) }; }
+}
+
+ltTest("integration: OCP_REQUIRE_KEY=1 refuses a keyless non-loopback request in multi mode; keyed and loopback still pass", async () => {
+  if (!LT_POSIX) return;
+  const lan = _rkLanAddress();
+  if (!lan) { console.log("    (skipped: no non-internal IPv4 to reach the keyless arm from)"); return; }
+  const dir = ltMkdir(); const fake = ltFake(dir);
+  try {
+    const { child, buf, port } = await ltBootFresh({ CLAUDE_AUTH_MODE: "multi", CLAUDE_BIND: "0.0.0.0", OCP_REQUIRE_KEY: "1", CLAUDE_BIN: fake }, dir);
+    try {
+      assert.ok(await ltWait(() => buf.out.includes("listening on")), `server never listened — ${ltDiag(buf)}`);
+      const banner = buf.out.split("\n").find(l => l.startsWith("Keyless requests: "));
+      assert.equal(banner, "Keyless requests: refused (OCP_REQUIRE_KEY=1)", `boot banner: ${banner} — ${ltDiag(buf)}`);
+
+      const keyless = await _rkPost(lan, port);
+      assert.equal(keyless.status, 401, `keyless request from ${lan} was not refused: ${keyless.status} ${keyless.text.slice(0, 200)}`);
+      assert.ok(keyless.text.includes("OCP_REQUIRE_KEY"), `401 body does not name the setting: ${keyless.text.slice(0, 200)}`);
+
+      // Controls: loopback is unchanged (always admitted), and a real key from the same LAN
+      // address still passes -- so the 401 above is the keyless arm, not "refuse everything".
+      const loop = await _rkPost("127.0.0.1", port);
+      assert.equal(loop.status, 200, `loopback must stay admitted: ${loop.status} ${loop.text.slice(0, 200)}`);
+      const made = await fetch(`http://127.0.0.1:${port}/api/keys`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ name: "rk-test" }) });
+      const { key } = await made.json();
+      assert.ok(key, `no key created (status ${made.status})`);
+      const keyed = await _rkPost(lan, port, { Authorization: `Bearer ${key}` });
+      assert.equal(keyed.status, 200, `a valid key from ${lan} was refused: ${keyed.status} ${keyed.text.slice(0, 200)}`);
+    } finally {
+      child.kill("SIGKILL");
+      await ltDrain(() => buf.closed, "require-key", 5000);
+    }
+  } finally { _ltRmRetry(dir); }
+});
+
+ltTest("integration: without OCP_REQUIRE_KEY, multi mode still admits a keyless non-loopback request as anonymous (default unchanged)", async () => {
+  if (!LT_POSIX) return;
+  const lan = _rkLanAddress();
+  if (!lan) { console.log("    (skipped: no non-internal IPv4 to reach the keyless arm from)"); return; }
+  const dir = ltMkdir(); const fake = ltFake(dir);
+  try {
+    const { child, buf, port } = await ltBootFresh({ CLAUDE_AUTH_MODE: "multi", CLAUDE_BIND: "0.0.0.0", OCP_REQUIRE_KEY: "", CLAUDE_BIN: fake }, dir);
+    try {
+      assert.ok(await ltWait(() => buf.out.includes("listening on")), `server never listened — ${ltDiag(buf)}`);
+      const banner = buf.out.split("\n").find(l => l.startsWith("Keyless requests: "));
+      assert.equal(banner, "Keyless requests: admitted as anonymous (OCP_REQUIRE_KEY=1 refuses them)", `boot banner: ${banner}`);
+      const keyless = await _rkPost(lan, port);
+      assert.equal(keyless.status, 200, `the default must keep admitting keyless callers: ${keyless.status} ${keyless.text.slice(0, 200)}`);
+    } finally {
+      child.kill("SIGKILL");
+      await ltDrain(() => buf.closed, "require-key-default", 5000);
     }
   } finally { _ltRmRetry(dir); }
 });

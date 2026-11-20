@@ -310,6 +310,7 @@ So the blind spot is real but narrow: it needs `stream: true`, no tools — or `
 | `OCP_ALLOWED_ORIGIN_SCHEMES` | *(empty)* | Comma-separated origin schemes admitted outright, for **browser extensions**: `moz-extension` admits every Firefox extension, `chrome-extension` every Chromium one (Chrome, Edge, Brave). **Every extension of that scheme can then use the proxy — and, with the default `CLAUDE_ALLOWED_TOOLS`, run tools on this machine** — so to admit just one extension, put its id (the part after `://` in its `Origin`) in `OCP_ALLOWED_HOSTS` instead; Firefox changes that id when the extension is reinstalled. `http`/`https` are refused. See [ADR 0023](docs/adr/0023-declared-origin-schemes.md). |
 | `CLAUDE_AUTH_MODE` | `none` | Auth mode: `none`, `shared`, or `multi` |
 | `OCP_ADMIN_KEY` | *(unset)* | Admin key for key management (multi mode) |
+| `OCP_REQUIRE_KEY` | *(unset)* | `1`: in `multi` mode, refuse a **non-loopback request with no key** (401) instead of admitting it as anonymous. For OCP behind a reverse proxy on a public name. Loopback and keyed callers are unchanged. [ADR 0025](docs/adr/0025-require-key.md) |
 | `CLAUDE_BIN` | *(auto-detect)* | Path to claude binary |
 | `CLAUDE_TIMEOUT` | `600000` | Request timeout (ms, default: 10 min) |
 | `OCP_TOOL_CALLING` | `1` | OpenAI tool calling over the MCP bridge (ADR 0022). `0` restores the pre-0022 behaviour: declared `tools` are dropped, answered as text, and counted in `/health`'s `stats.toolRequestsDropped` with the reason logged. |
