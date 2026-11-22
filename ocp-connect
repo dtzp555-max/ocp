@@ -181,6 +181,11 @@ model_meta = {
     # unknown-id floor and under-advertise both columns (CLI 2.1.289 registry: context.window 1e6,
     # max_output_tokens.default 64000).
     "claude-fable-5-1": {"name": "Claude Fable (OCP)", "reasoning": True, "maxTokens": 64000, "contextWindow": 1000000},
+    # claude-fable-5-2 and claude-haiku-5-5 need their own rows too: longest-prefix-wins would hand
+    # claude-fable-5-2 the "claude-fable-5" row (64000) and claude-haiku-5-5 the "claude-haiku" family
+    # row (no reasoning, 32000 / 200000), against the CLI 2.1.323 registry's 128000 / 1e6 for both.
+    "claude-fable-5-2": {"name": "Claude Fable (OCP)", "reasoning": True, "maxTokens": 128000, "contextWindow": 1000000},
+    "claude-haiku-5-5": {"name": "Claude Haiku (OCP)", "reasoning": True, "maxTokens": 128000, "contextWindow": 1000000},
     "claude-fable-5": {"name": "Claude Fable (OCP)", "reasoning": True, "maxTokens": 64000, "contextWindow": 1000000},
     # claude-opus-4-5 sits BELOW its family default: the "claude-opus" row would over-advertise
     # 64000 against the registry default of 32000 (CLI 2.1.289). claude-sonnet-4-5 needs no row:
