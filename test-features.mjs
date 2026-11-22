@@ -455,6 +455,39 @@ function testSkipped(name, reason) {
   _rawTestSkipped(name, reason);
 }
 
+// ── win32: tests whose premise Windows does not supply ──────────────────────────────────────────
+// #529 runs the proxy natively on Windows, but not the bash `ocp` CLI, the POSIX start.sh launcher
+// (setup.mjs writes start_ocp.cmd there) or TUI mode (refused at boot on win32). A test that drives
+// one of those through bash or /bin/sh fails on Windows for that reason alone, so it registers
+// through these wrappers: on win32 the TOP-LEVEL testSkipped() (the body never runs; the skip is
+// counted and printed with its reason, so a green Windows run does not read as coverage it did not
+// provide), everywhere else the plain test()/testAsync()/ltTest(). The same holds for a test whose
+// premise is a POSIX process or permission model that Windows does not have.
+const ON_WIN32 = process.platform === "win32";
+const WIN32_BASH_OCP = "drives the bash `ocp` CLI, which #529 does not port to Windows";
+const WIN32_START_SH = "runs start.sh, the POSIX launcher; on win32 setup.mjs writes start_ocp.cmd instead";
+const WIN32_TUI_SH = "runs the TUI pane command through /bin/sh; TUI mode is refused at boot on win32";
+const WIN32_SH_CLAUDE = "the fake claude is a /bin/sh script, and server.mjs on win32 spawns only a native .exe CLAUDE_BIN";
+const WIN32_SH_LSOF = "the fake lsof is a bash script run through POSIX sh redirection; win32 execSync uses cmd.exe, and setup.mjs never runs the bind check on win32";
+const WIN32_NO_PGROUP = "win32 has no process groups: defaultGroupEmpty returns false unconditionally, so the real binding cannot be told from an always-occupied stub";
+const WIN32_PS_STATE = "the #374 probe reads `ps -o state=` (zombie/alive) of SIGKILLed children; win32 has no zombie state and no such ps";
+const WIN32_PS_SCAN = "the grandchild scan parses POSIX `ps -eo pid=,ppid=,state=,command=`; win32 has no such process table";
+const WIN32_FAULTS = "win32 resourceUsage() has no context-switch counter and counts soft faults as major ones, so the per-window fault counters and the memory verdict built on them mean nothing there";
+const WIN32_NO_BOOTS = "no live-server test boots server.mjs on win32 (the fake claude is a /bin/sh script), so there is no peak to check";
+const WIN32_UNSTATTABLE = "win32 has no directory search permission: chmod or ACLs cannot make a listed entry unstattable, so the EACCES premise cannot be created";
+function posixTest(reason, name, fn) {
+  if (ON_WIN32) testSkipped(name, reason);
+  else test(name, fn);
+}
+async function posixTestAsync(reason, name, fn) {
+  if (ON_WIN32) testSkipped(name, reason);
+  else await testAsync(name, fn);
+}
+function posixLtTest(reason, name, fn) {
+  if (ON_WIN32) testSkipped(name, reason);
+  else ltTest(name, fn);
+}
+
 console.log("\n=== OCP Feature Tests (Quota + Cache) ===\n");
 
 // Initialize DB
@@ -1445,7 +1478,7 @@ test("doctor falls back to currentVersion when origin/main unreachable (no stale
 // $HOME, for the ones whose whole point is what $HOME does or doesn't contain) and assert on
 // the values it returns. None of them look at source text.
 const _D348_DOCTOR_URL = new URL("./scripts/doctor.mjs", import.meta.url).href;
-const _D348_REPO_ROOT = _ltF2P(new URL(".", import.meta.url)).replace(/\/$/, "");
+const _D348_REPO_ROOT = _ltF2P(new URL(".", import.meta.url)).replace(/[\\/]$/, "");
 
 // Runs the REAL runDoctor in a child process under a caller-controlled environment. A child,
 // not this process, because the fault under test is driven entirely by $HOME/$OCP_DIR and
@@ -1479,7 +1512,7 @@ test("#348: $HOME contains no ocp/ at all and the install is elsewhere → docto
     // homedir()-based resolution could accidentally succeed and this test would prove nothing.
     assert.ok(!testExistsSync(testJoin(fakeHome, "ocp")),
       "premise: the scratch $HOME must not contain an ocp/ directory");
-    const r = _d348RunDoctor({ HOME: fakeHome });
+    const r = _d348RunDoctor({ HOME: fakeHome, USERPROFILE: fakeHome });
     const expected = "v" + JSON.parse(_ltRead(testJoin(_D348_REPO_ROOT, "package.json"), "utf8")).version;
     assert.equal(r.current_version, expected,
       `doctor must read package.json from its OWN tree (${_D348_REPO_ROOT}), not $HOME/ocp`);
@@ -1498,7 +1531,7 @@ test("#348: $HOME contains no ocp/ at all and the install is elsewhere → docto
 test("#348: doctor reports WHICH directory it used, so a wrong answer is visible", () => {
   const fakeHome = mkdtempSync(testJoin(tmpdir(), "ocp-348-home-"));
   try {
-    const r = _d348RunDoctor({ HOME: fakeHome });
+    const r = _d348RunDoctor({ HOME: fakeHome, USERPROFILE: fakeHome });
     const check = r.checks.find(c => c.id === "install_dir");
     assert.ok(check, "doctor must push an install_dir check");
     assert.ok(check.message.includes(_D348_REPO_ROOT),
@@ -2308,9 +2341,9 @@ test("#366 severity: on the DOCUMENTED default layout, $HOME is ONE stray file a
 // default containers, and this fleet's Pi and Oracle hosts run system-level units.
 const _m366IsRoot = typeof process.getuid === "function" && process.getuid() === 0;
 
-if (_m366IsRoot) {
+if (_m366IsRoot || ON_WIN32) {
   testSkipped("#366 review F1: a marker that cannot be STAT'D is diagnosed as unreadable, never as 'not an OCP install'",
-    "running as root — DAC override makes a mode-444 directory readable, so the EACCES premise cannot be created");
+    ON_WIN32 ? WIN32_UNSTATTABLE : "running as root — DAC override makes a mode-444 directory readable, so the EACCES premise cannot be created");
 } else {
 test("#366 review F1: a marker that cannot be STAT'D is diagnosed as unreadable, never as 'not an OCP install'", () => {
   // The flag value was already right; the MESSAGE was catastrophically wrong. On a directory that
@@ -2368,9 +2401,9 @@ test("#366 review F1: a marker that cannot be STAT'D is diagnosed as unreadable,
 // line printed AFTER the corrected one — arguably worse than before, because the wrong advice now
 // comes last. Both branch on `unreadableMarkers`, which until this round had no production
 // consumer at all.
-if (_m366IsRoot) {
+if (_m366IsRoot || ON_WIN32) {
   testSkipped("#366 review F1/B: doctor and runFreshInstall must not tell an operator to delete an install they merely cannot read",
-    "running as root — DAC override makes a mode-444 directory readable, so the EACCES premise cannot be created");
+    ON_WIN32 ? WIN32_UNSTATTABLE : "running as root — DAC override makes a mode-444 directory readable, so the EACCES premise cannot be created");
 } else {
 test("#366 review F1/B: doctor and runFreshInstall must not tell an operator to delete an install they merely cannot read", async () => {
   const root = _m366Mkdtemp(testJoin(tmpdir(), "ocp-366-consumer-"));
@@ -6295,7 +6328,7 @@ ltTest("integration: a synchronous pre-spawn throw must not leak stats.activeReq
 // the one the unit describes.
 console.log("\nRequest body cap counts characters, not bytes, and the 413 says which (#310):");
 
-ltTest("integration (#310, the money test): a body far OVER the cap in BYTES but under it in CHARACTERS is admitted", async () => {
+posixLtTest(WIN32_SH_CLAUDE, "integration (#310, the money test): a body far OVER the cap in BYTES but under it in CHARACTERS is admitted", async () => {
   const dir = ltMkdir(); const fake = ltFake(dir);
   const { child, buf, port } = await ltBootFresh({ CLAUDE_BIN: fake, CLAUDE_MAX_BODY_SIZE: "1000" }, dir);
   try {
@@ -6318,7 +6351,7 @@ ltTest("integration (#310, the money test): a body far OVER the cap in BYTES but
   } finally { child.kill("SIGKILL"); _ltRmRetry(dir); }
 });
 
-ltTest("integration (#310): a body over the cap in characters is still rejected, and the 413 names the unit it measured", async () => {
+posixLtTest(WIN32_SH_CLAUDE, "integration (#310): a body over the cap in characters is still rejected, and the 413 names the unit it measured", async () => {
   const dir = ltMkdir(); const fake = ltFake(dir);
   const { child, buf, port } = await ltBootFresh({ CLAUDE_BIN: fake, CLAUDE_MAX_BODY_SIZE: "1000" }, dir);
   try {
@@ -8697,7 +8730,7 @@ test("#311: a malformed tool_choice is left alone rather than newly rejected", (
   }
 });
 
-ltTest("integration (#311): a forced tool_choice gets a 400 with the spec's error shape; a permissive one still gets a completion", async () => {
+posixLtTest(WIN32_SH_CLAUDE, "integration (#311): a forced tool_choice gets a 400 with the spec's error shape; a permissive one still gets a completion", async () => {
   const dir = ltMkdir(); const fake = ltFake(dir);
   const { child, buf, port } = await ltBootFresh({ CLAUDE_BIN: fake }, dir);
   try {
@@ -12698,7 +12731,7 @@ function lt400SinkFaults(dir, keysPath) {
 test("#400: a store fault inside the sink PROPAGATES out of getRecentUsage instead of being answered with default rows", () => {
   const dir = ltMkdir();
   try {
-    const r = lt400SinkFaults(dir, _ltF2P(new URL("./keys.mjs", import.meta.url)));
+    const r = lt400SinkFaults(dir, new URL("./keys.mjs", import.meta.url).href);
 
     // Control first: the harness reaches the code, and the input-domain path really does substitute.
     assert.equal(r.healthyBadLimit.threw, false,
@@ -13395,7 +13428,7 @@ async function _ltAwaitFreshTick(where) {
     `${where}: a tracer tick must land before the staged block, or the gap measured is not this control's own`);
 }
 
-ltTest("#374 control A: a CPU-BURNING parent block is never named STALL-NO-CPU, and the child it could not reap reads ZOMBIE-UNREAPED", async () => {
+posixLtTest(WIN32_PS_STATE, "#374 control A: a CPU-BURNING parent block is never named STALL-NO-CPU, and the child it could not reap reads ZOMBIE-UNREAPED", async () => {
   const where = "#374-control-A-EXPECTED-CONTROL";
   await _ltAwaitFreshTick(where);
   const { child, buf } = _ltStageChild(["/bin/sleep", "30"], where);
@@ -13450,7 +13483,7 @@ ltTest("#374 control A: a CPU-BURNING parent block is never named STALL-NO-CPU, 
   assert.equal(_ltOpenChildren.has(child.pid), false, "'close' must deregister it");
 });
 
-ltTest("#374 control B: a parent blocked WITHOUT consuming CPU reads STALL-NO-CPU — the same gap, the opposite cause", async () => {
+posixLtTest(WIN32_PS_STATE, "#374 control B: a parent blocked WITHOUT consuming CPU reads STALL-NO-CPU — the same gap, the opposite cause", async () => {
   const where = "#374-control-B-EXPECTED-CONTROL";
   await _ltAwaitFreshTick(where);
   const { child, buf } = _ltStageChild(["/bin/sleep", "30"], where);
@@ -13577,7 +13610,7 @@ test("#374: the mem bands map a per-window majflt delta to all three names, and 
 // — exactly the bug this control exists to catch — it would read AT LEAST the pre-window total
 // rather than below it. The staged burn is kept because it adds margin for free, but nothing is
 // asserted about its size.
-ltTest("#374 control H: a staged gap carries REAL per-window fault counters, bracketed to the gap and not to the process", async () => {
+posixLtTest(WIN32_FAULTS, "#374 control H: a staged gap carries REAL per-window fault counters, bracketed to the gap and not to the process", async () => {
   const where = "#374-control-H-EXPECTED-CONTROL";
   // Burn BEFORE the fresh tick, so it is outside the measured gap by construction.
   _ltBlockBusy(LT_CONTROL_BLOCK_MS);
@@ -13629,7 +13662,7 @@ ltTest("#374 control H: a staged gap carries REAL per-window fault counters, bra
 // recorded by NOTHING in the two drain ledgers. This control stages exactly that — a block with no
 // drain anywhere near it — and asserts the tick ledgered it anyway. It is the difference between a
 // lever that fires on the event and one that watched two 76-90s stalls go past in a green run.
-ltTest("#374 control I: a stall with NO drain watching is still ledgered, by the tick itself", async () => {
+posixLtTest(WIN32_FAULTS, "#374 control I: a stall with NO drain watching is still ledgered, by the tick itself", async () => {
   const where = "#374-control-I-EXPECTED-CONTROL";
   await _ltAwaitFreshTick(where);
   // Premise, checked rather than assumed: a saturated ledger silently stops recording, and this
@@ -13721,7 +13754,7 @@ test("#374: the host snapshot carries the level gauges and a suite-start delta, 
   }
 });
 
-ltTest("#374 control C: a grandchild holding stdout reads REAPED-GONE on a LIVE loop, and the scan names the holder", async () => {
+posixLtTest(WIN32_PS_SCAN, "#374 control C: a grandchild holding stdout reads REAPED-GONE on a LIVE loop, and the scan names the holder", async () => {
   // Marker rather than a directory: the ps filter is on the label. Includes this pid so two
   // concurrent suites cannot match each other's holder. The grandchild lives until RELEASED, not on
   // a fixed timer -- see _ltStageHolder for why the timer lost to the host (#485).
@@ -13774,7 +13807,7 @@ ltTest("#374 control C: a grandchild holding stdout reads REAPED-GONE on a LIVE 
 // between staging and the premise check" exactly, WITHOUT staging the stall itself -- so this adds
 // nothing to the #374 stall ledger, and it is deterministic where the field failure was not.
 // 3000 ms is chosen against the OLD lifetime (2500 ms), not tuned: it has to exceed it, nothing more.
-ltTest("#485: control C's holder outlives a delay longer than its old fixed lifetime, and exits when released", async () => {
+posixLtTest(WIN32_PS_SCAN, "#485: control C's holder outlives a delay longer than its old fixed lifetime, and exits when released", async () => {
   const where = `oc485hold${process.pid}`;   // distinct from control C's marker, so the scans cannot collide
   const { child, buf, release, cleanup } = _ltStageHolder(where);
   try {
@@ -13831,7 +13864,7 @@ ltTest("#374 control F: a child that closes WHILE the drain waits reads CLOSED-B
   assert.ok(await ltWait(() => _ltOpenChildren.size === 0, 10000),
     "premise: no earlier boot is still registered, or openAtStart is not this control's");
   const beforeTimeouts = _ltDrainTimeouts.length;
-  const { child, buf } = _ltStageChild(["/bin/sleep", "30"], where);
+  const { child, buf } = _ltStageChild([process.execPath, "-e", "setTimeout(() => {}, 30000)"], where);
   try {
     assert.equal(_ltOpenChildren.size, 1, "premise: exactly the staged child is registered");
     // Killed BEFORE the drain and never awaited, so it closes while the drain is waiting and the
@@ -13876,7 +13909,7 @@ ltTest("#374 control G: a drain that was never waiting on a child says NO-CHILD-
     "and the printed diagnosis must say so");
 });
 
-ltTest("#374 control D: a real ltDrain timeout carries the probe and the tracer, and a still-running child reads ALIVE", async () => {
+posixLtTest(WIN32_PS_STATE, "#374 control D: a real ltDrain timeout carries the probe and the tracer, and a still-running child reads ALIVE", async () => {
   const where = "#374-control-D-EXPECTED-CONTROL";
   const { child, buf } = _ltStageChild(["/bin/sleep", "30"], where);
   try {
@@ -14060,7 +14093,7 @@ if (process.platform === "darwin") {
 // _ltPeakBoots holds its final value by the time this reads it. Mutation-proof: bypass the
 // _ltQueue chain (return fn() directly from ltTest, or seed the chain with a stale/no-op
 // promise) and multiple ltBoot calls overlap, pushing this above 1.
-ltTest("integration: ltTest serialization keeps peak concurrent server.mjs children at 1 (#248)", async () => {
+posixLtTest(WIN32_NO_BOOTS, "integration: ltTest serialization keeps peak concurrent server.mjs children at 1 (#248)", async () => {
   // The predecessor's own test body resolves as soon as its assertions finish, but its
   // `finally { child.kill("SIGKILL"); ... }` only SENDS the signal — 'close' (and this file's
   // own decrement) fires asynchronously afterward. Being queued last guarantees no NEW ltBoot
@@ -15070,7 +15103,7 @@ test("#347 G1: the re-check hint names an invocation that ACCEPTS --post-flight-
   const cmd = postFlightOnlyCommand("v3.14.0");
   assert.ok(!/\bocp update\b/.test(cmd),
     `must not tell the operator to run a full update dispatch; got ${JSON.stringify(cmd)}`);
-  assert.match(cmd, /^node .*scripts\/upgrade\.mjs --post-flight-only v3\.14\.0$/,
+  assert.match(cmd, /^node .*scripts[\\/]upgrade\.mjs --post-flight-only v3\.14\.0$/,
     `must name the invocation ocp:1629 itself uses; got ${JSON.stringify(cmd)}`);
   // Never a guessed ~/ocp: issue #348 is about installs outside $HOME/ocp, where that path is a
   // file that does not exist. The path is this module's own resolved location.
@@ -15089,7 +15122,7 @@ test("#347 G1: the re-check hint names an invocation that ACCEPTS --post-flight-
   assert.ok(caught);
   assert.ok(!/ocp update --post-flight-only/.test(caught.hint),
     `the F1 recovery hint must not carry the flag that ocp update ignores; got hint=${JSON.stringify(caught.hint)}`);
-  assert.ok(caught.hint.includes("scripts/upgrade.mjs --post-flight-only"),
+  assert.ok(caught.hint.includes(join("scripts", "upgrade.mjs") + " --post-flight-only"),
     `it must carry the invocation that works; got hint=${JSON.stringify(caught.hint)}`);
 });
 
@@ -15437,7 +15470,7 @@ test("installAutoStart(darwin, first install): run gets bootout then bootstrap (
 // calls — a mutation that empties the gate, or moves the migration code outside it, makes
 // these calls actually happen, which these tests actually catch.
 test("installAutoStart(darwin, reconfigureOnly, legacy plist present): legacy bootout/unlink never happen (H1)", () => {
-  const legacyPath = "/fake/home/Library/LaunchAgents/ai.openclaw.proxy.plist";
+  const legacyPath = join("/fake/home", "Library", "LaunchAgents", "ai.openclaw.proxy.plist");
   const calls = [];
   const unlinked = [];
   installAutoStart(baseInstallOpts({
@@ -15452,7 +15485,7 @@ test("installAutoStart(darwin, reconfigureOnly, legacy plist present): legacy bo
 });
 
 test("installAutoStart(darwin, first install, legacy plist present): legacy IS migrated away (positive-path control)", () => {
-  const legacyPath = "/fake/home/Library/LaunchAgents/ai.openclaw.proxy.plist";
+  const legacyPath = join("/fake/home", "Library", "LaunchAgents", "ai.openclaw.proxy.plist");
   const calls = [];
   const unlinked = [];
   installAutoStart(baseInstallOpts({
@@ -15467,7 +15500,7 @@ test("installAutoStart(darwin, first install, legacy plist present): legacy IS m
 });
 
 test("installAutoStart(linux, reconfigureOnly, legacy service present): stop/disable/unlink never happen; daemon-reload runs exactly once (H1)", () => {
-  const legacyPath = "/fake/home/.config/systemd/user/openclaw-proxy.service";
+  const legacyPath = join("/fake/home", ".config", "systemd", "user", "openclaw-proxy.service");
   const calls = [];
   const unlinked = [];
   installAutoStart(baseInstallOpts({
@@ -15486,7 +15519,7 @@ test("installAutoStart(linux, reconfigureOnly, legacy service present): stop/dis
 });
 
 test("installAutoStart(linux, first install, legacy service present): stop/disable/unlink DO happen (positive-path control)", () => {
-  const legacyPath = "/fake/home/.config/systemd/user/openclaw-proxy.service";
+  const legacyPath = join("/fake/home", ".config", "systemd", "user", "openclaw-proxy.service");
   const calls = [];
   const unlinked = [];
   installAutoStart(baseInstallOpts({
@@ -15606,7 +15639,7 @@ test("G6: linux mergeSystemdEnv actually runs — a pre-existing operator env va
   // readFile(...) : null) is never exercised by any test above — closing G6 means exercising
   // it, not just asserting on mergeSystemdEnv in isolation (already covered at the unit level
   // around test-features.mjs:649-653; this is the WIRING, which was never proven).
-  const servicePath = "/fake/home/.config/systemd/user/ocp-proxy.service";
+  const servicePath = join("/fake/home", ".config", "systemd", "user", "ocp-proxy.service");
   const existingUnit = `[Unit]
 Description=OCP — Open Claude Proxy
 After=network.target
@@ -15638,7 +15671,7 @@ RestartSec=5
 // identical wiring gap on the platform this dev host actually runs under, so it's covered here
 // too rather than left as a known gap.
 test("G7: darwin mergePlistEnv actually runs — a pre-existing operator env var survives the rewrite", () => {
-  const plistPath = "/fake/home/Library/LaunchAgents/dev.ocp.proxy.plist";
+  const plistPath = join("/fake/home", "Library", "LaunchAgents", "dev.ocp.proxy.plist");
   const existingPlist = `<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
@@ -16419,7 +16452,7 @@ test("#352: restart commands OK but the probe could not RUN must not headline `t
     `it must lead with what is actually known; got hint=${JSON.stringify(caught.hint)}`);
   assert.ok(/do NOT re-run it/.test(caught.hint) && /local environment fault/.test(caught.hint),
     `and must say why re-running is wrong here; got hint=${JSON.stringify(caught.hint)}`);
-  assert.ok(caught.hint.includes("scripts/upgrade.mjs --post-flight-only"),
+  assert.ok(caught.hint.includes(join("scripts", "upgrade.mjs") + " --post-flight-only"),
     `and must name an invocation that actually accepts the flag (#347 G1); got hint=${JSON.stringify(caught.hint)}`);
 });
 
@@ -18748,7 +18781,7 @@ test("resolveBinaryPath: existsSyncFn is called with the absolute path being che
   }
 }
 
-test("buildStartSh darwin: lsof cleanly matches -- already running, does not start a duplicate", () => {
+posixTest(WIN32_START_SH, "buildStartSh darwin: lsof cleanly matches -- already running, does not start a duplicate", () => {
   const r = _runStartShScenario({
     port: _startShTestPort,
     lsofScript: `echo "node 1 u 4u IPv4 0x0 0t0 TCP *:${_startShTestPort} (LISTEN)"; exit 0`,
@@ -18759,7 +18792,7 @@ test("buildStartSh darwin: lsof cleanly matches -- already running, does not sta
   assert.match(r.stdout, /already running/);
 });
 
-test("buildStartSh darwin: lsof + netstat both cleanly report nothing -- starts the server", () => {
+posixTest(WIN32_START_SH, "buildStartSh darwin: lsof + netstat both cleanly report nothing -- starts the server", () => {
   const r = _runStartShScenario({
     port: _startShTestPort,
     lsofScript: `exit 1`,
@@ -18770,7 +18803,7 @@ test("buildStartSh darwin: lsof + netstat both cleanly report nothing -- starts 
   assert.match(r.stdout, /claude-proxy started/);
 });
 
-test("buildStartSh darwin (headline fix): lsof ambiguous + netstat CONFIRMS a privilege-gap listener -- refuses to start a duplicate", () => {
+posixTest(WIN32_START_SH, "buildStartSh darwin (headline fix): lsof ambiguous + netstat CONFIRMS a privilege-gap listener -- refuses to start a duplicate", () => {
   const r = _runStartShScenario({
     port: _startShTestPort,
     lsofScript: `exit 1`, // exit 1, empty stdout -- lsof's own "nothing matched" signature,
@@ -18840,7 +18873,7 @@ test("buildStartSh darwin: lsof hard error (neither 0 nor 1, e.g. a malformed in
 // parser (netstatHasListenerOnPort), applied here to this file's bash-native equivalent.
 console.log("\nbuildStartSh darwin: netstat suffix-anchoring guards (review round 2, finding 6):");
 
-test("buildStartSh darwin: netstat parser rejects an adjacent port that merely CONTAINS the target port's digits as a substring", () => {
+posixTest(WIN32_START_SH, "buildStartSh darwin: netstat parser rejects an adjacent port that merely CONTAINS the target port's digits as a substring", () => {
   const decoyPort = `9${_startShTestPort}`; // e.g. our port 54321 -> decoy "954321": contains
                                              // "54321" as a raw substring, but does NOT end in
                                              // ".54321" (the character before it is "9", not ".")
@@ -18854,7 +18887,7 @@ test("buildStartSh darwin: netstat parser rejects an adjacent port that merely C
     `an adjacent port containing our port's digits must NOT be read as a match; stdout=${JSON.stringify(r.stdout)}`);
 });
 
-test("buildStartSh darwin: netstat parser rejects a non-LISTEN row on the exact target port", () => {
+posixTest(WIN32_START_SH, "buildStartSh darwin: netstat parser rejects a non-LISTEN row on the exact target port", () => {
   const r = _runStartShScenario({
     port: _startShTestPort,
     lsofScript: `exit 1`,
@@ -18865,7 +18898,7 @@ test("buildStartSh darwin: netstat parser rejects a non-LISTEN row on the exact 
     `a TIME_WAIT (non-LISTEN) row on our own port must not block the not-listening conclusion; stdout=${JSON.stringify(r.stdout)}`);
 });
 
-test("MONEY TEST (money A): restricted PATH + genuinely free port -- FIXED code starts the server via the absolute lsof/netstat paths", () => {
+posixTest(WIN32_START_SH, "MONEY TEST (money A): restricted PATH + genuinely free port -- FIXED code starts the server via the absolute lsof/netstat paths", () => {
   const r = _runStartShScenario({
     port: _startShTestPort,
     lsofScript: `exit 1`,
@@ -18875,7 +18908,7 @@ test("MONEY TEST (money A): restricted PATH + genuinely free port -- FIXED code 
   assert.equal(r.started, true, `expected the FIXED script to start; stdout=${JSON.stringify(r.stdout)} stderr=${JSON.stringify(r.stderr)}`);
 });
 
-test("MONEY TEST (money B, the actual #246 regression): restricted PATH + a REAL listener -- pre-fix bare lsof cannot see it and starts a DUPLICATE; fixed absolute-path code correctly refuses", () => {
+posixTest(WIN32_START_SH, "MONEY TEST (money B, the actual #246 regression): restricted PATH + a REAL listener -- pre-fix bare lsof cannot see it and starts a DUPLICATE; fixed absolute-path code correctly refuses", () => {
   // Both runs use the IDENTICAL restricted $PATH (stubDir never on PATH, and -- per this
   // PR's own review round -- no real system directory reachable at all, see
   // _runStartShScenario's own header) and the IDENTICAL fake lsof/netstat behavior (both
@@ -18906,7 +18939,7 @@ test("MONEY TEST (money B, the actual #246 regression): restricted PATH + a REAL
     `fixed script must find the SAME listener via the absolute path and refuse to start a duplicate; stdout=${JSON.stringify(fixed.stdout)}`);
 });
 
-test("buildStartSh non-darwin: bare lsof resolves fine via PATH (unchanged pre-#246 behavior) -- lsof match means already running", () => {
+posixTest(WIN32_START_SH, "buildStartSh non-darwin: bare lsof resolves fine via PATH (unchanged pre-#246 behavior) -- lsof match means already running", () => {
   const r = _runStartShScenario({
     port: _startShTestPort,
     lsofScript: `echo "irrelevant -- never called on non-darwin"; exit 1`,
@@ -19141,7 +19174,7 @@ function _preFix246BindCheck({ port, lsofPath }) {
 
 console.log("\nclassifyBindCheck MONEY TEST -- real subprocess stderr preservation (issue #246, second half):");
 
-test("MONEY TEST: pre-fix command string swallows a real broken binary's stderr; buildBindCheckCommand's fixed command preserves it", () => {
+posixTest(WIN32_SH_LSOF, "MONEY TEST: pre-fix command string swallows a real broken binary's stderr; buildBindCheckCommand's fixed command preserves it", () => {
   const root = mkdtempSync(testJoin(tmpdir(), "bind-check-money-"));
   try {
     // A real, executable fake `lsof` that fails loudly on its OWN stderr -- proves this test
@@ -19268,7 +19301,7 @@ function _writeBindCheckLeakProbeScript(root, { lsofPath, port }) {
   return scriptPath;
 }
 
-test("classifyBindCheck (real subprocess, 'found' outcome): the real execFn default does NOT leak the underlying tool's stderr chatter to the caller's own stderr (MED-1 fix)", () => {
+posixTest(WIN32_SH_LSOF, "classifyBindCheck (real subprocess, 'found' outcome): the real execFn default does NOT leak the underlying tool's stderr chatter to the caller's own stderr (MED-1 fix)", () => {
   const root = mkdtempSync(testJoin(tmpdir(), "bind-check-leak-probe-found-"));
   try {
     const fakeLsofPath = testJoin(root, "fake-lsof");
@@ -19288,7 +19321,7 @@ test("classifyBindCheck (real subprocess, 'found' outcome): the real execFn defa
   }
 });
 
-test("classifyBindCheck (real subprocess, 'empty' outcome): the real execFn default does NOT leak the underlying tool's stderr chatter, and classification stays 'empty' (MED-1 fix)", () => {
+posixTest(WIN32_SH_LSOF, "classifyBindCheck (real subprocess, 'empty' outcome): the real execFn default does NOT leak the underlying tool's stderr chatter, and classification stays 'empty' (MED-1 fix)", () => {
   const root = mkdtempSync(testJoin(tmpdir(), "bind-check-leak-probe-empty-"));
   try {
     const fakeLsofPath = testJoin(root, "fake-lsof");
@@ -20342,7 +20375,7 @@ function mk190ArgvProbe() {
   return { paneArgv, cleanup };
 }
 
-test("buildTuiCmd OCP_TUI_TOOLS: unset or blank keeps today's argv, a value adds --tools once (#190)", () => {
+posixTest(WIN32_TUI_SH, "buildTuiCmd OCP_TUI_TOOLS: unset or blank keeps today's argv, a value adds --tools once (#190)", () => {
   const { paneArgv, cleanup } = mk190ArgvProbe();
   try {
     // unset => today's behaviour: no --tools at all, MCP wall intact.
@@ -20377,7 +20410,7 @@ test("buildTuiCmd OCP_TUI_TOOLS: unset or blank keeps today's argv, a value adds
   }
 });
 
-test("buildTuiCmd OCP_TUI_TOOLS: a value containing SPACES stays ONE argv element, not word-split (#190)", () => {
+posixTest(WIN32_TUI_SH, "buildTuiCmd OCP_TUI_TOOLS: a value containing SPACES stays ONE argv element, not word-split (#190)", () => {
   const { paneArgv, cleanup } = mk190ArgvProbe();
   try {
     // The contract is that whatever the operator sets reaches claude UNMODIFIED as one argument,
@@ -20393,7 +20426,7 @@ test("buildTuiCmd OCP_TUI_TOOLS: a value containing SPACES stays ONE argv elemen
   }
 });
 
-test("buildTuiCmd OCP_TUI_TOOLS: a scoped/globby value cannot break the shell string (#190)", () => {
+posixTest(WIN32_TUI_SH, "buildTuiCmd OCP_TUI_TOOLS: a scoped/globby value cannot break the shell string (#190)", () => {
   const { paneArgv, cleanup } = mk190ArgvProbe();
   try {
     // Scoped specifiers carry ( ) * ~ — unquoted those are a shell SYNTAX ERROR (caught by
@@ -20409,7 +20442,7 @@ test("buildTuiCmd OCP_TUI_TOOLS: a scoped/globby value cannot break the shell st
   }
 });
 
-test("buildTuiCmd OCP_TUI_TOOLS is scoped to the default surface — ignored under OCP_TUI_FULL_TOOLS (#190)", () => {
+posixTest(WIN32_TUI_SH, "buildTuiCmd OCP_TUI_TOOLS is scoped to the default surface — ignored under OCP_TUI_FULL_TOOLS (#190)", () => {
   const { paneArgv, cleanup } = mk190ArgvProbe();
   try {
     // The full-tools surface is governed by CLAUDE_ALLOWED_TOOLS. The branch-liveness assertion
@@ -23002,7 +23035,7 @@ async function runAsyncTests() {
     clearTimeout(timer);
   });
 
-  await testAsync("#500 the production binding uses the real group check, not an injected one", async () => {
+  await posixTestAsync(WIN32_NO_PGROUP, "#500 the production binding uses the real group check, not an injected one", async () => {
     // Pins the DEFAULT wiring: scheduleKillEscalation must be makeKillEscalation()'s product with
     // defaultGroupEmpty bound. pid 424242 is not a live pgid here, so the real check reports empty
     // and the helper declines to arm — which an injected always-occupied stub would not do.
@@ -23872,7 +23905,7 @@ test("a PRODUCTION process (no NODE_ENV) must IGNORE OCP_DIR_OVERRIDE", () => {
     // it anyway is the claim we actually want to make.
     const probe = `import { getDb, getDbPath, closeDb } from ${JSON.stringify(keysUrl)};
 getDb(); process.stdout.write(process.env.OCP_DIR_OVERRIDE + "\\n" + getDbPath()); closeDb();`;
-    const env = { ...process.env, HOME: home, OCP_DIR_OVERRIDE: evil };
+    const env = { ...process.env, HOME: home, USERPROFILE: home, OCP_DIR_OVERRIDE: evil };
     delete env.NODE_ENV;                       // a production server has no NODE_ENV
     const [seen, opened] = execFileSync(process.execPath, ["--input-type=module", "-e", probe],
       { env, encoding: "utf8" }).trim().split("\n");
@@ -25925,7 +25958,7 @@ function _ocpSurfaceChecks(checks) {
   );
 }
 
-test("ocp cmd_update's real doctor-check-surfacing block: WARN is surfaced (pre-existing #214 behavior, preserved)", () => {
+posixTest(WIN32_BASH_OCP, "ocp cmd_update's real doctor-check-surfacing block: WARN is surfaced (pre-existing #214 behavior, preserved)", () => {
   const out = _ocpSurfaceChecks([{ level: "WARN", message: "tree at X, service serving Y — restarting" }]);
   assert.ok(out.includes("tree at X, service serving Y — restarting"));
   assert.ok(out.startsWith("⚠"));
@@ -25946,7 +25979,7 @@ test("ocp cmd_update's real doctor-check-surfacing block: PASS/FAIL are still NO
   assert.equal(out, "", "PASS/FAIL checks must not be echoed by this block — the case-statement dispatch right after already handles FAIL/kind; this block is only for WARN/INFO context lines");
 });
 
-test("ocp cmd_update's real doctor-check-surfacing block: WARN and INFO both print together, in checks order, skipping PASS in between", () => {
+posixTest(WIN32_BASH_OCP, "ocp cmd_update's real doctor-check-surfacing block: WARN and INFO both print together, in checks order, skipping PASS in between", () => {
   const out = _ocpSurfaceChecks([
     { level: "WARN", message: "warn one" },
     { level: "PASS", message: "pass one" },
@@ -27438,7 +27471,7 @@ test("#254: injected runner — default expectedWorkingTree derives from THIS RU
   // match — not a spurious mismatch warning, which is what the old homedir()-based default would
   // produce in this sandboxed test environment (whose real $HOME is essentially never this repo's
   // checkout path).
-  const thisRepoRoot = realpathSync(_ltF2P(new URL(".", import.meta.url)).replace(/\/$/, ""));
+  const thisRepoRoot = realpathSync(_ltF2P(new URL(".", import.meta.url)).replace(/[\\/]$/, ""));
   const run = makeFakeRun({
     "ss -lptn": `LISTEN 0 511 0.0.0.0:3456 0.0.0.0:* users:(("node",pid=900003,fd=19))`,
     "cat /proc/900003/cgroup": "0::/system.slice/ocp.service\n",
@@ -27474,7 +27507,7 @@ test("#348: runFullUpgrade's git/npm/setup target is THIS installation, never $H
   // realpath (it hands back exactly what it resolved, which is what lands in the command
   // strings), while #254's expectedWorkingTree comparison does — so the /proc cwd fixture must
   // be the realpath'd form or the restart-resolve step reports a spurious mismatch.
-  const rawRoot = _ltF2P(new URL(".", import.meta.url)).replace(/\/$/, "");
+  const rawRoot = _ltF2P(new URL(".", import.meta.url)).replace(/[\\/]$/, "");
   const thisRepoRoot = realpathSync(rawRoot);
   const run = makeFakeRun({
     "ss -lptn": `LISTEN 0 511 0.0.0.0:3456 0.0.0.0:* users:(("node",pid=900004,fd=19))`,
@@ -27516,7 +27549,7 @@ test("#348: runRollback's checkout/npm target is THIS installation too, never $H
   // test and no mutation entry, so nothing held it in place. Same shape as the sibling above —
   // rollback git-checks-out and npm-installs into ocpDir, so a wrong answer here mutates the
   // wrong tree.
-  const rawRoot = _ltF2P(new URL(".", import.meta.url)).replace(/\/$/, "");
+  const rawRoot = _ltF2P(new URL(".", import.meta.url)).replace(/[\\/]$/, "");
   const result = await runUpgrade({
     rollback: true, yes: true, mockExec: true, mockPlatform: "darwin",
     mockSnapshots: [{ name: "upgrade-snapshot-2026-08-01T10:00:00Z", path: "/tmp/snap-348" }],
@@ -28637,7 +28670,7 @@ function _bwCalled(log, prefix) {
 // args[0]="update" drives this through ocp's REAL top-level dispatch (`case "$subcmd" in ...
 // update) cmd_update "$@" ;;`), not a direct call to cmd_update — see the driver-assembly
 // comment in _bwHarnessRun for why that distinction is load-bearing (MEDIUM-1 finding).
-test("#235: cmd_update kind=update --dry-run does NOT pull or restart (the money test)", () => {
+posixTest(WIN32_BASH_OCP, "#235: cmd_update kind=update --dry-run does NOT pull or restart (the money test)", () => {
   const r = _bwHarnessRun({ kind: "update", args: ["update", "--dry-run"] });
   assert.equal(r.status, 0, `expected a clean exit, got status=${r.status} stderr=${r.stderr}`);
   assert.ok(!_bwCalled(r.log, "FAKE-GIT-CALL"), `git must NOT run under --dry-run; log=${JSON.stringify(r.log)}`);
@@ -28645,14 +28678,14 @@ test("#235: cmd_update kind=update --dry-run does NOT pull or restart (the money
   assert.ok(r.stdout.includes("[dry-run]"), `expected a [dry-run] preview line in stdout, got: ${JSON.stringify(r.stdout)}`);
 });
 
-test("#235: cmd_update kind=update --dry-run still honors dry-run when --dry-run is NOT the first flag ('\"$@\"', not just $1)", () => {
+posixTest(WIN32_BASH_OCP, "#235: cmd_update kind=update --dry-run still honors dry-run when --dry-run is NOT the first flag ('\"$@\"', not just $1)", () => {
   const r = _bwHarnessRun({ kind: "update", args: ["update", "--yes", "--dry-run"] });
   assert.ok(!_bwCalled(r.log, "FAKE-GIT-CALL"), `git must NOT run; log=${JSON.stringify(r.log)}`);
   assert.ok(!_bwCalled(r.log, "FAKE-CMD-RESTART-CALLED"), `cmd_restart must NOT run; log=${JSON.stringify(r.log)}`);
   assert.ok(r.stdout.includes("[dry-run]"), `expected a [dry-run] line, got: ${JSON.stringify(r.stdout)}`);
 });
 
-test("#235 control: cmd_update kind=update with NO --dry-run DOES pull and restart (proves the money test above can fail)", () => {
+posixTest(WIN32_BASH_OCP, "#235 control: cmd_update kind=update with NO --dry-run DOES pull and restart (proves the money test above can fail)", () => {
   const r = _bwHarnessRun({ kind: "update", args: ["update"] });
   assert.equal(r.status, 0, `expected a clean exit, got status=${r.status} stderr=${r.stderr}`);
   assert.ok(_bwCalled(r.log, "FAKE-GIT-CALL pull origin main --ff-only"), `git pull must run; log=${JSON.stringify(r.log)}`);
@@ -28673,14 +28706,14 @@ test("#235 acceptance (independent-review MEDIUM-1): this money test runs throug
 });
 
 // ── Sibling non-regression: the "restart" kind's pre-existing --dry-run guard (PR #217) ──────
-test("non-regression: cmd_update kind=restart --dry-run still does not restart (pre-existing #217 guard, unaffected by #235's fix)", () => {
+posixTest(WIN32_BASH_OCP, "non-regression: cmd_update kind=restart --dry-run still does not restart (pre-existing #217 guard, unaffected by #235's fix)", () => {
   const r = _bwHarnessRun({ kind: "restart", args: ["update", "--dry-run"] });
   assert.ok(!_bwCalled(r.log, "FAKE-GIT-CALL"), `git must NOT run; log=${JSON.stringify(r.log)}`);
   assert.ok(!_bwCalled(r.log, "FAKE-CMD-RESTART-CALLED"), `cmd_restart must NOT run; log=${JSON.stringify(r.log)}`);
   assert.ok(r.stdout.includes("[dry-run]"), `expected a [dry-run] line, got: ${JSON.stringify(r.stdout)}`);
 });
 
-test("non-regression control: cmd_update kind=restart with NO --dry-run DOES restart + post-flight verify", () => {
+posixTest(WIN32_BASH_OCP, "non-regression control: cmd_update kind=restart with NO --dry-run DOES restart + post-flight verify", () => {
   const r = _bwHarnessRun({ kind: "restart", args: ["update"] });
   assert.ok(!_bwCalled(r.log, "FAKE-GIT-CALL"), `restart kind must never touch git; log=${JSON.stringify(r.log)}`);
   assert.ok(_bwCalled(r.log, "FAKE-CMD-RESTART-CALLED"), `cmd_restart must run; log=${JSON.stringify(r.log)}`);
@@ -28690,7 +28723,7 @@ test("non-regression control: cmd_update kind=restart with NO --dry-run DOES res
 
 // ── #260: --target REFUSES (not silent-drop) on noop/restart, driven through ocp's REAL outer
 // dispatch (not a direct function call) — same rigor as #235's own acceptance test above.
-test("#260 (the money test): cmd_update kind=noop --target vX.Y.Z REFUSES -- non-zero exit, no mutation, names what was asked", () => {
+posixTest(WIN32_BASH_OCP, "#260 (the money test): cmd_update kind=noop --target vX.Y.Z REFUSES -- non-zero exit, no mutation, names what was asked", () => {
   const r = _bwHarnessRun({ kind: "noop", args: ["update", "--target", "v9.9.9"] });
   assert.notEqual(r.status, 0, `expected a non-zero exit; stdout=${JSON.stringify(r.stdout)} stderr=${JSON.stringify(r.stderr)}`);
   assert.match(r.stderr, /--target v9\.9\.9/, `refusal must name what was asked; stderr=${JSON.stringify(r.stderr)}`);
@@ -28699,19 +28732,19 @@ test("#260 (the money test): cmd_update kind=noop --target vX.Y.Z REFUSES -- non
     `must NOT print the silent-success noop message; stdout=${JSON.stringify(r.stdout)}`);
 });
 
-test("#260: cmd_update kind=noop --target=vX.Y.Z (equals form, LOW-6 shape) ALSO refuses", () => {
+posixTest(WIN32_BASH_OCP, "#260: cmd_update kind=noop --target=vX.Y.Z (equals form, LOW-6 shape) ALSO refuses", () => {
   const r = _bwHarnessRun({ kind: "noop", args: ["update", "--target=v9.9.9"] });
   assert.notEqual(r.status, 0, `expected a non-zero exit; stdout=${JSON.stringify(r.stdout)}`);
   assert.match(r.stderr, /--target v9\.9\.9/, `stderr=${JSON.stringify(r.stderr)}`);
 });
 
-test("#260 control: cmd_update kind=noop WITHOUT --target still succeeds cleanly (proves the money test above can fail)", () => {
+posixTest(WIN32_BASH_OCP, "#260 control: cmd_update kind=noop WITHOUT --target still succeeds cleanly (proves the money test above can fail)", () => {
   const r = _bwHarnessRun({ kind: "noop", args: ["update"] });
   assert.equal(r.status, 0, `expected a clean exit; stdout=${JSON.stringify(r.stdout)} stderr=${JSON.stringify(r.stderr)}`);
   assert.ok(r.stdout.includes("Already at latest. Nothing to do."), `stdout=${JSON.stringify(r.stdout)}`);
 });
 
-test("#260 (the money test): cmd_update kind=restart --target vX.Y.Z REFUSES BEFORE cmd_restart ever runs -- no partial mutation", () => {
+posixTest(WIN32_BASH_OCP, "#260 (the money test): cmd_update kind=restart --target vX.Y.Z REFUSES BEFORE cmd_restart ever runs -- no partial mutation", () => {
   const r = _bwHarnessRun({ kind: "restart", args: ["update", "--target", "v9.9.9"] });
   assert.notEqual(r.status, 0, `expected a non-zero exit; stdout=${JSON.stringify(r.stdout)} stderr=${JSON.stringify(r.stderr)}`);
   assert.match(r.stderr, /--target v9\.9\.9/, `stderr=${JSON.stringify(r.stderr)}`);
@@ -28722,7 +28755,7 @@ test("#260 (the money test): cmd_update kind=restart --target vX.Y.Z REFUSES BEF
     `post-flight must never run either; log=${JSON.stringify(r.log)}`);
 });
 
-test("#260 control: cmd_update kind=restart WITHOUT --target still restarts + post-flight verifies (proves the money test above can fail)", () => {
+posixTest(WIN32_BASH_OCP, "#260 control: cmd_update kind=restart WITHOUT --target still restarts + post-flight verifies (proves the money test above can fail)", () => {
   const r = _bwHarnessRun({ kind: "restart", args: ["update"] });
   assert.equal(r.status, 0, `expected a clean exit; stdout=${JSON.stringify(r.stdout)} stderr=${JSON.stringify(r.stderr)}`);
   assert.ok(_bwCalled(r.log, "FAKE-CMD-RESTART-CALLED"), `log=${JSON.stringify(r.log)}`);
@@ -28733,7 +28766,7 @@ test("#260 acceptance: the refusal survives ocp's REAL outer dispatch (not a dir
   assert.notEqual(r.status, 0, `--target must survive the real outer dispatch and still refuse; stdout=${JSON.stringify(r.stdout)}`);
 });
 
-test("#260 non-regression: the light path's OWN --target WARNING (issue #241/#255) is UNCHANGED -- still a warning, still exit 0, not a refusal", () => {
+posixTest(WIN32_BASH_OCP, "#260 non-regression: the light path's OWN --target WARNING (issue #241/#255) is UNCHANGED -- still a warning, still exit 0, not a refusal", () => {
   const r = _bwHarnessRun({ kind: "update", args: ["update", "--target", "v9.9.9"] });
   assert.equal(r.status, 0, `light path must remain a WARN, not a refusal -- deliberately out of #260's own scope; stdout=${JSON.stringify(r.stdout)} stderr=${JSON.stringify(r.stderr)}`);
   assert.match(r.stderr, /is not honored on the light\/patch-bump path/, `stderr=${JSON.stringify(r.stderr)}`);
@@ -28745,7 +28778,7 @@ test("#260 non-regression: the light path's OWN --target WARNING (issue #241/#25
 // checkout-capable NOR pin-honoring. Following the original wording would have sent the user
 // to the ONE path guaranteed to silently ignore the pin they were just refused for asking.
 // Fixed to name only the full (cross-minor) path and to point at --rollback for a downgrade.
-test("#260 review fix: cmd_update's noop refusal names ONLY the full upgrade path -- never implies the light path can honor a pin", () => {
+posixTest(WIN32_BASH_OCP, "#260 review fix: cmd_update's noop refusal names ONLY the full upgrade path -- never implies the light path can honor a pin", () => {
   const r = _bwHarnessRun({ kind: "noop", args: ["update", "--target", "v9.9.9"] });
   assert.notEqual(r.status, 0, `stdout=${JSON.stringify(r.stdout)}`);
   assert.match(r.stderr, /full upgrade path/, `stderr=${JSON.stringify(r.stderr)}`);
@@ -28760,14 +28793,14 @@ test("#260 review fix: cmd_update's noop refusal names ONLY the full upgrade pat
 // was accepted and dropped with zero signal, same as noop/restart/fresh_install were before
 // #260's own fix. A warning (not a refusal -- there is nothing to refuse; --check never mutates
 // anything either way) is enough here.
-test("#260/#272 review round 2: cmd_update --check --target warns (read-only, so a warning suffices, not a refusal)", () => {
+posixTest(WIN32_BASH_OCP, "#260/#272 review round 2: cmd_update --check --target warns (read-only, so a warning suffices, not a refusal)", () => {
   const r = _bwHarnessRun({ kind: "noop", args: ["update", "--check", "--target", "v9.9.9"] });
   assert.equal(r.status, 0, `--check must remain read-only/exit 0 regardless; stdout=${JSON.stringify(r.stdout)} stderr=${JSON.stringify(r.stderr)}`);
   assert.match(r.stderr, /--target v9\.9\.9 has no effect on --check/, `stderr=${JSON.stringify(r.stderr)}`);
   assert.match(r.stdout, /OCP Update Check/, `--check's own report must still print; stdout=${JSON.stringify(r.stdout)}`);
 });
 
-test("#260/#272 review round 2 control: cmd_update --check WITHOUT --target prints no warning (proves the test above is target-specific)", () => {
+posixTest(WIN32_BASH_OCP, "#260/#272 review round 2 control: cmd_update --check WITHOUT --target prints no warning (proves the test above is target-specific)", () => {
   const r = _bwHarnessRun({ kind: "noop", args: ["update", "--check"] });
   assert.equal(r.status, 0, `stdout=${JSON.stringify(r.stdout)}`);
   assert.ok(!/has no effect on --check/.test(r.stderr), `stderr=${JSON.stringify(r.stderr)}`);
@@ -28775,7 +28808,7 @@ test("#260/#272 review round 2 control: cmd_update --check WITHOUT --target prin
 });
 
 // ── #236: the WARN/INFO block must not kill cmd_update when python3 is absent ────────────────
-test("#236: cmd_update survives an absent python3 — no silent 127 death before the kind dispatch even runs", () => {
+posixTest(WIN32_BASH_OCP, "#236: cmd_update survives an absent python3 — no silent 127 death before the kind dispatch even runs", () => {
   const r = _bwHarnessRun({ kind: "noop", args: ["update"], pythonAbsent: true });
   // Before the fix: bash's own command-not-found for the WARN/INFO block's python3 is exit 127,
   // with NOTHING printed yet (the case "$kind" in dispatch below it — the ONLY place this
@@ -28790,7 +28823,7 @@ test("#236: cmd_update survives an absent python3 — no silent 127 death before
   assert.ok(r.stdout.length > 0, `expected SOME output even in degraded mode, got empty stdout (log=${JSON.stringify(r.log)})`);
 });
 
-test("#236 control: cmd_update with python3 PRESENT reaches the kind dispatch and prints WARN/INFO lines", () => {
+posixTest(WIN32_BASH_OCP, "#236 control: cmd_update with python3 PRESENT reaches the kind dispatch and prints WARN/INFO lines", () => {
   const r = _bwHarnessRun({
     kind: "noop",
     args: ["update"],
@@ -28826,7 +28859,7 @@ test("#236 control: cmd_update with python3 PRESENT reaches the kind dispatch an
 // exercising `json.loads` raising a `JSONDecodeError`.
 console.log("\nocp display commands survive an absent/broken python3 formatter (#242):");
 
-test("#242 cmd_usage --by-key: absent python3 shows the raw usage-by-key JSON instead of dying silently", () => {
+posixTest(WIN32_BASH_OCP, "#242 cmd_usage --by-key: absent python3 shows the raw usage-by-key JSON instead of dying silently", () => {
   const r = _bwHarnessRun({
     args: ["usage", "--by-key"], pythonAbsent: true, adminKey: "test-admin-key-marker",
     curlResponses: [{ match: "/api/usage", body: JSON.stringify({ byKey: [{ key_name: "laptop-marker", requests: 10, successes: 9, errors: 1, avg_elapsed_ms: 2500, last_request: "2026-08-01T00:00:00Z" }] }) }],
@@ -28836,7 +28869,7 @@ test("#242 cmd_usage --by-key: absent python3 shows the raw usage-by-key JSON in
   assert.ok(r.stdout.includes("laptop-marker"), `expected the raw byKey JSON (still containing the real data) on stdout, got: ${JSON.stringify(r.stdout)}`);
 });
 
-test("#242 control: cmd_usage --by-key with python3 PRESENT still prints the formatted table (unaffected by the fix)", () => {
+posixTest(WIN32_BASH_OCP, "#242 control: cmd_usage --by-key with python3 PRESENT still prints the formatted table (unaffected by the fix)", () => {
   const r = _bwHarnessRun({
     args: ["usage", "--by-key"], adminKey: "test-admin-key-marker",
     curlResponses: [{ match: "/api/usage", body: JSON.stringify({ byKey: [{ key_name: "laptop-marker", requests: 10, successes: 9, errors: 1, avg_elapsed_ms: 2500, last_request: "2026-08-01T00:00:00Z" }] }) }],
@@ -28847,7 +28880,7 @@ test("#242 control: cmd_usage --by-key with python3 PRESENT still prints the for
   assert.ok(!r.stderr.includes("python3 is unavailable"), `must not print the degraded-mode warning on the happy path; stderr=${JSON.stringify(r.stderr)}`);
 });
 
-test("#242 cmd_usage (main): absent python3 shows the raw plan JSON instead of dying silently", () => {
+posixTest(WIN32_BASH_OCP, "#242 cmd_usage (main): absent python3 shows the raw plan JSON instead of dying silently", () => {
   const body = JSON.stringify({
     plan: {
       currentSession: { percent: "12%", resetsIn: "3h", resetsAtHuman: "3:00 PM" },
@@ -28863,7 +28896,7 @@ test("#242 cmd_usage (main): absent python3 shows the raw plan JSON instead of d
   assert.ok(r.stdout.includes("allowed"), `expected the raw plan JSON on stdout, got: ${JSON.stringify(r.stdout)}`);
 });
 
-test("#242 control: cmd_usage (main) with python3 PRESENT still prints the formatted panel", () => {
+posixTest(WIN32_BASH_OCP, "#242 control: cmd_usage (main) with python3 PRESENT still prints the formatted panel", () => {
   const body = JSON.stringify({
     plan: {
       currentSession: { percent: "12%", resetsIn: "3h", resetsAtHuman: "3:00 PM" },
@@ -28879,7 +28912,7 @@ test("#242 control: cmd_usage (main) with python3 PRESENT still prints the forma
   assert.ok(r.stdout.includes("Proxy: up 5h"), `expected the formatted proxy line, got: ${JSON.stringify(r.stdout)}`);
 });
 
-test("#242 cmd_logs: absent python3 shows the raw log-entries JSON instead of dying silently", () => {
+posixTest(WIN32_BASH_OCP, "#242 cmd_logs: absent python3 shows the raw log-entries JSON instead of dying silently", () => {
   const body = JSON.stringify({ entries: [{ raw: "2026-08-01 00:00:00 ERROR test-log-entry-marker" }], level: "error" });
   const r = _bwHarnessRun({ args: ["logs"], pythonAbsent: true, curlResponses: [{ match: "/logs?n=20&level=error", body }] });
   assert.ok(!(r.status === 127 && r.stdout === ""), `must not reproduce #236's silent-127 signature; status=${r.status} stdout=${JSON.stringify(r.stdout)}`);
@@ -28887,14 +28920,14 @@ test("#242 cmd_logs: absent python3 shows the raw log-entries JSON instead of dy
   assert.ok(r.stdout.includes("test-log-entry-marker"), `expected the raw entries JSON on stdout, got: ${JSON.stringify(r.stdout)}`);
 });
 
-test("#242 control: cmd_logs with python3 PRESENT still prints the formatted log line", () => {
+posixTest(WIN32_BASH_OCP, "#242 control: cmd_logs with python3 PRESENT still prints the formatted log line", () => {
   const body = JSON.stringify({ entries: [{ raw: "2026-08-01 00:00:00 ERROR test-log-entry-marker" }], level: "error" });
   const r = _bwHarnessRun({ args: ["logs"], curlResponses: [{ match: "/logs?n=20&level=error", body }] });
   assert.equal(r.status, 0, `expected a clean exit, got status=${r.status} stderr=${r.stderr}`);
   assert.ok(r.stdout.includes("test-log-entry-marker"), `expected the formatted log line, got: ${JSON.stringify(r.stdout)}`);
 });
 
-test("#242 cmd_models: absent python3 shows the raw models JSON instead of dying silently", () => {
+posixTest(WIN32_BASH_OCP, "#242 cmd_models: absent python3 shows the raw models JSON instead of dying silently", () => {
   const body = JSON.stringify({ data: [{ id: "claude-sonnet-5-marker" }] });
   const r = _bwHarnessRun({ args: ["models"], pythonAbsent: true, curlResponses: [{ match: "/v1/models", body }] });
   assert.ok(!(r.status === 127 && r.stdout === ""), `must not reproduce #236's silent-127 signature; status=${r.status} stdout=${JSON.stringify(r.stdout)}`);
@@ -28902,7 +28935,7 @@ test("#242 cmd_models: absent python3 shows the raw models JSON instead of dying
   assert.ok(r.stdout.includes("claude-sonnet-5-marker"), `expected the raw models JSON on stdout, got: ${JSON.stringify(r.stdout)}`);
 });
 
-test("#242 control: cmd_models with python3 PRESENT still prints the formatted list", () => {
+posixTest(WIN32_BASH_OCP, "#242 control: cmd_models with python3 PRESENT still prints the formatted list", () => {
   const body = JSON.stringify({ data: [{ id: "claude-sonnet-5-marker" }] });
   const r = _bwHarnessRun({ args: ["models"], curlResponses: [{ match: "/v1/models", body }] });
   assert.equal(r.status, 0, `expected a clean exit, got status=${r.status} stderr=${r.stderr}`);
@@ -28914,7 +28947,7 @@ test("#242 control: cmd_models with python3 PRESENT still prints the formatted l
 // PIPELINE's exit status rather than on "is python3 on PATH", a property every display command
 // shares. Re-hosted onto `ocp models` instead of deleted, because deleting it would have
 // retired the only coverage of that distinction.
-test("#242 cmd_models: python3 PRESENT but the response is malformed JSON — the fallback fires for a REAL crash, not just a missing binary", () => {
+posixTest(WIN32_BASH_OCP, "#242 cmd_models: python3 PRESENT but the response is malformed JSON — the fallback fires for a REAL crash, not just a missing binary", () => {
   // Real (unstubbed) /usr/bin/python3 on this harness's scratch $PATH — json.loads() genuinely
   // raises json.decoder.JSONDecodeError on this body, a different failure mode than
   // pythonAbsent:true's exit-127 stub.
@@ -28924,7 +28957,7 @@ test("#242 cmd_models: python3 PRESENT but the response is malformed JSON — th
   assert.ok(r.stdout.includes("not-json-at-all"), `expected the raw (malformed) response echoed back, got: ${JSON.stringify(r.stdout)}`);
 });
 
-test("#242 cmd_keys add: absent python3 shows the raw JSON — the ONLY place the new key is ever shown must not be lost", () => {
+posixTest(WIN32_BASH_OCP, "#242 cmd_keys add: absent python3 shows the raw JSON — the ONLY place the new key is ever shown must not be lost", () => {
   const r = _bwHarnessRun({
     args: ["keys", "add", "laptop-marker"], pythonAbsent: true, adminKey: "test-admin-key-marker",
     curlResponses: [{ match: "/api/keys", body: JSON.stringify({ name: "laptop-marker", key: "sk-marker-abc123" }) }],
@@ -28934,7 +28967,7 @@ test("#242 cmd_keys add: absent python3 shows the raw JSON — the ONLY place th
   assert.ok(r.stdout.includes("sk-marker-abc123"), `THE KEY ITSELF must still be visible in the raw fallback output — losing it here means it can never be retrieved again; got: ${JSON.stringify(r.stdout)}`);
 });
 
-test("#242 control: cmd_keys add with python3 PRESENT still prints the formatted key panel", () => {
+posixTest(WIN32_BASH_OCP, "#242 control: cmd_keys add with python3 PRESENT still prints the formatted key panel", () => {
   const r = _bwHarnessRun({
     args: ["keys", "add", "laptop-marker"], adminKey: "test-admin-key-marker",
     curlResponses: [{ match: "/api/keys", body: JSON.stringify({ name: "laptop-marker", key: "sk-marker-abc123" }) }],
@@ -28944,7 +28977,7 @@ test("#242 control: cmd_keys add with python3 PRESENT still prints the formatted
   assert.ok(r.stdout.includes("sk-marker-abc123"), `expected the formatted key line, got: ${JSON.stringify(r.stdout)}`);
 });
 
-test("#242 cmd_keys add: python3 PRESENT but the response is malformed JSON — the key-loss-prevention fallback fires for a REAL crash too", () => {
+posixTest(WIN32_BASH_OCP, "#242 cmd_keys add: python3 PRESENT but the response is malformed JSON — the key-loss-prevention fallback fires for a REAL crash too", () => {
   const r = _bwHarnessRun({
     args: ["keys", "add", "laptop-marker"], adminKey: "test-admin-key-marker",
     curlResponses: [{ match: "/api/keys", body: "not-json-at-all" }],
@@ -28954,7 +28987,7 @@ test("#242 cmd_keys add: python3 PRESENT but the response is malformed JSON — 
   assert.ok(r.stdout.includes("not-json-at-all"), `expected the raw (malformed) response echoed back rather than losing it, got: ${JSON.stringify(r.stdout)}`);
 });
 
-test("#242 cmd_keys revoke: absent python3 shows the raw revoke JSON instead of dying silently", () => {
+posixTest(WIN32_BASH_OCP, "#242 cmd_keys revoke: absent python3 shows the raw revoke JSON instead of dying silently", () => {
   const r = _bwHarnessRun({
     args: ["keys", "revoke", "laptop-marker"], pythonAbsent: true, adminKey: "test-admin-key-marker",
     curlResponses: [{ match: "/api/keys/laptop-marker", body: JSON.stringify({ revoked: true, idOrName: "laptop-marker" }) }],
@@ -28964,7 +28997,7 @@ test("#242 cmd_keys revoke: absent python3 shows the raw revoke JSON instead of 
   assert.ok(r.stdout.includes("laptop-marker"), `expected the raw revoke JSON on stdout, got: ${JSON.stringify(r.stdout)}`);
 });
 
-test("#242 control: cmd_keys revoke with python3 PRESENT still prints the formatted confirmation", () => {
+posixTest(WIN32_BASH_OCP, "#242 control: cmd_keys revoke with python3 PRESENT still prints the formatted confirmation", () => {
   const r = _bwHarnessRun({
     args: ["keys", "revoke", "laptop-marker"], adminKey: "test-admin-key-marker",
     curlResponses: [{ match: "/api/keys/laptop-marker", body: JSON.stringify({ revoked: true, idOrName: "laptop-marker" }) }],
@@ -28977,7 +29010,7 @@ test("#242 control: cmd_keys revoke with python3 PRESENT still prints the format
 // SOME fallback before this PR, but it was one umbrella `2>/dev/null || { generic message; exit
 // 1; }` covering a curl failure and a python3 failure with the SAME misleading text regardless of
 // which actually happened — the identical misdiagnosis class the other nine sites were fixed for.
-test("#242 (10th site) cmd_keys list: absent python3 shows the raw keys JSON instead of the generic 'proxy unreachable' misdiagnosis", () => {
+posixTest(WIN32_BASH_OCP, "#242 (10th site) cmd_keys list: absent python3 shows the raw keys JSON instead of the generic 'proxy unreachable' misdiagnosis", () => {
   const r = _bwHarnessRun({
     args: ["keys"], pythonAbsent: true, adminKey: "test-admin-key-marker",
     curlResponses: [{ match: "/api/keys", body: JSON.stringify({ keys: [{ name: "laptop-marker", keyPreview: "sk-ab..12", revoked: false, created_at: "2026-08-01" }] }) }],
@@ -28988,7 +29021,7 @@ test("#242 (10th site) cmd_keys list: absent python3 shows the raw keys JSON ins
   assert.ok(r.stdout.includes("laptop-marker"), `expected the raw keys JSON on stdout, got: ${JSON.stringify(r.stdout)}`);
 });
 
-test("#242 (10th site) control: cmd_keys list with python3 PRESENT still prints the formatted table", () => {
+posixTest(WIN32_BASH_OCP, "#242 (10th site) control: cmd_keys list with python3 PRESENT still prints the formatted table", () => {
   const r = _bwHarnessRun({
     args: ["keys"], adminKey: "test-admin-key-marker",
     curlResponses: [{ match: "/api/keys", body: JSON.stringify({ keys: [{ name: "laptop-marker", keyPreview: "sk-ab..12", revoked: false, created_at: "2026-08-01" }] }) }],
@@ -28997,7 +29030,7 @@ test("#242 (10th site) control: cmd_keys list with python3 PRESENT still prints 
   assert.ok(r.stdout.includes("API Keys") && r.stdout.includes("laptop-marker"), `expected the formatted keys table, got: ${JSON.stringify(r.stdout)}`);
 });
 
-test("#242 (10th site) control: cmd_keys list with a genuinely unreachable proxy still reports THAT (not a python3 message)", () => {
+posixTest(WIN32_BASH_OCP, "#242 (10th site) control: cmd_keys list with a genuinely unreachable proxy still reports THAT (not a python3 message)", () => {
   // No curlResponses registered for "/api/keys" -> the harness's default curl stub refuses any
   // unhandled invocation (exit 94) -- close enough to "unreachable" for this assertion's purpose
   // (proving the curl-failure branch's own message is unaffected by this site's restructuring).
@@ -29006,7 +29039,7 @@ test("#242 (10th site) control: cmd_keys list with a genuinely unreachable proxy
   assert.ok(r.stderr.includes("Error: proxy unreachable"), `expected the curl-failure message preserved (#475: the network label is now exactly that), got stderr=${JSON.stringify(r.stderr)}`);
 });
 
-test("#242 cmd_settings (GET): absent python3 shows the raw settings JSON instead of dying silently", () => {
+posixTest(WIN32_BASH_OCP, "#242 cmd_settings (GET): absent python3 shows the raw settings JSON instead of dying silently", () => {
   const body = JSON.stringify({
     timeout: { value: 60000, unit: "ms", desc: "x" }, firstByteTimeout: { value: 15000, unit: "ms", desc: "x" },
     maxConcurrent: { value: 4, unit: "", desc: "x" },
@@ -29019,7 +29052,7 @@ test("#242 cmd_settings (GET): absent python3 shows the raw settings JSON instea
   assert.ok(r.stdout.includes("maxPromptChars"), `expected the raw settings JSON on stdout, got: ${JSON.stringify(r.stdout)}`);
 });
 
-test("#242 control: cmd_settings (GET) with python3 PRESENT still prints the formatted panel", () => {
+posixTest(WIN32_BASH_OCP, "#242 control: cmd_settings (GET) with python3 PRESENT still prints the formatted panel", () => {
   const body = JSON.stringify({
     timeout: { value: 60000, unit: "ms", desc: "x" }, firstByteTimeout: { value: 15000, unit: "ms", desc: "x" },
     maxConcurrent: { value: 4, unit: "", desc: "x" },
@@ -29041,28 +29074,28 @@ test("#242 control: cmd_settings (GET) with python3 PRESENT still prints the for
 // for the purpose of exercising this guard.
 console.log("\nocp display commands: 'proxy unreachable' guards write to stderr, not stdout (#242 review fix 3):");
 
-test("#242 fix-3 cmd_logs: 'Error: proxy unreachable' goes to stderr, stdout stays empty", () => {
+posixTest(WIN32_BASH_OCP, "#242 fix-3 cmd_logs: 'Error: proxy unreachable' goes to stderr, stdout stays empty", () => {
   const r = _bwHarnessRun({ args: ["logs"] });
   assert.notEqual(r.status, 0);
   assert.ok(r.stderr.includes("Error: proxy unreachable"), `expected the message on stderr, got: ${JSON.stringify(r.stderr)}`);
   assert.equal(r.stdout, "", `stdout must stay clean of the error text (a consumer piping this output would read it as data); got: ${JSON.stringify(r.stdout)}`);
 });
 
-test("#242 fix-3 cmd_models: 'Error: proxy unreachable' goes to stderr, stdout stays empty", () => {
+posixTest(WIN32_BASH_OCP, "#242 fix-3 cmd_models: 'Error: proxy unreachable' goes to stderr, stdout stays empty", () => {
   const r = _bwHarnessRun({ args: ["models"] });
   assert.notEqual(r.status, 0);
   assert.ok(r.stderr.includes("Error: proxy unreachable"), `expected the message on stderr, got: ${JSON.stringify(r.stderr)}`);
   assert.equal(r.stdout, "", `stdout must stay clean; got: ${JSON.stringify(r.stdout)}`);
 });
 
-test("#242 fix-3 cmd_settings (GET): 'Error: proxy unreachable' goes to stderr, stdout stays empty", () => {
+posixTest(WIN32_BASH_OCP, "#242 fix-3 cmd_settings (GET): 'Error: proxy unreachable' goes to stderr, stdout stays empty", () => {
   const r = _bwHarnessRun({ args: ["settings"] });
   assert.notEqual(r.status, 0);
   assert.ok(r.stderr.includes("Error: proxy unreachable"), `expected the message on stderr, got: ${JSON.stringify(r.stderr)}`);
   assert.equal(r.stdout, "", `stdout must stay clean; got: ${JSON.stringify(r.stdout)}`);
 });
 
-test("#242 fix-3 cmd_keys revoke: 'Error: proxy unreachable' goes to stderr, stdout stays empty", () => {
+posixTest(WIN32_BASH_OCP, "#242 fix-3 cmd_keys revoke: 'Error: proxy unreachable' goes to stderr, stdout stays empty", () => {
   const r = _bwHarnessRun({ args: ["keys", "revoke", "laptop-marker"], adminKey: "test-admin-key-marker" });
   assert.notEqual(r.status, 0);
   assert.ok(r.stderr.includes("Error: proxy unreachable"), `expected the message on stderr (#475: the network label is now exactly that), got: ${JSON.stringify(r.stderr)}`);
@@ -29087,7 +29120,7 @@ test("#242 fix-3 cmd_keys revoke: 'Error: proxy unreachable' goes to stderr, std
 // fixing that parity gap is in scope here because this PR rewrites these exact lines anyway.
 console.log("\nocp _curl call sites distinguish 'the command could not run' from 'the request failed' (#261):");
 
-test("#261 cmd_usage --by-key: curl missing from $PATH must be reported as a local fault, not 'proxy unreachable' (generalizes #256's exact repro)", () => {
+posixTest(WIN32_BASH_OCP, "#261 cmd_usage --by-key: curl missing from $PATH must be reported as a local fault, not 'proxy unreachable' (generalizes #256's exact repro)", () => {
   const r = _bwHarnessRun({ args: ["usage", "--by-key"], adminKey: "test-admin-key-marker", curlAbsent: true });
   assert.notEqual(r.status, 0, `expected a nonzero exit; status=${r.status}`);
   assert.ok(!r.stderr.includes("proxy unreachable") && !r.stdout.includes("proxy unreachable"),
@@ -29095,14 +29128,14 @@ test("#261 cmd_usage --by-key: curl missing from $PATH must be reported as a loc
   assert.ok(/curl/i.test(r.stderr), `expected the message to name curl/the local command failure, got stderr=${JSON.stringify(r.stderr)}`);
 });
 
-test("#261 control: cmd_usage --by-key with curl present but the proxy genuinely unreachable still says so", () => {
+posixTest(WIN32_BASH_OCP, "#261 control: cmd_usage --by-key with curl present but the proxy genuinely unreachable still says so", () => {
   const r = _bwHarnessRun({ args: ["usage", "--by-key"], adminKey: "test-admin-key-marker" });
   assert.notEqual(r.status, 0, `expected a nonzero exit; status=${r.status}`);
   assert.ok(r.stderr.includes("Error: proxy unreachable"),  // #475: network label is now exactly this,
     `a GENUINE network failure must still be reported as such (proves the fix does not just delete the diagnosis), got stderr=${JSON.stringify(r.stderr)}`);
 });
 
-test("#261 cmd_usage (main): curl missing from $PATH must be reported as a local fault, not 'proxy unreachable'", () => {
+posixTest(WIN32_BASH_OCP, "#261 cmd_usage (main): curl missing from $PATH must be reported as a local fault, not 'proxy unreachable'", () => {
   const r = _bwHarnessRun({ args: ["usage"], curlAbsent: true });
   assert.notEqual(r.status, 0, `expected a nonzero exit; status=${r.status}`);
   assert.ok(!r.stderr.includes("proxy unreachable") && !r.stdout.includes("proxy unreachable"),
@@ -29110,14 +29143,14 @@ test("#261 cmd_usage (main): curl missing from $PATH must be reported as a local
   assert.ok(/curl/i.test(r.stderr), `expected the message to name curl/the local command failure, got stderr=${JSON.stringify(r.stderr)}`);
 });
 
-test("#261 control: cmd_usage (main) with curl present but the proxy genuinely unreachable still says so", () => {
+posixTest(WIN32_BASH_OCP, "#261 control: cmd_usage (main) with curl present but the proxy genuinely unreachable still says so", () => {
   const r = _bwHarnessRun({ args: ["usage"] });
   assert.notEqual(r.status, 0, `expected a nonzero exit; status=${r.status}`);
   assert.ok(r.stderr.includes("Error: proxy unreachable"),
     `a GENUINE network failure must still be reported as such, got stderr=${JSON.stringify(r.stderr)}`);
 });
 
-test("#261 cmd_keys add: curl missing from $PATH must be reported as a local fault, not 'proxy unreachable or unauthorized'", () => {
+posixTest(WIN32_BASH_OCP, "#261 cmd_keys add: curl missing from $PATH must be reported as a local fault, not 'proxy unreachable or unauthorized'", () => {
   const r = _bwHarnessRun({ args: ["keys", "add", "laptop-marker"], adminKey: "test-admin-key-marker", curlAbsent: true });
   assert.notEqual(r.status, 0, `expected a nonzero exit; status=${r.status}`);
   assert.ok(!r.stderr.includes("proxy unreachable") && !r.stdout.includes("proxy unreachable"),
@@ -29125,7 +29158,7 @@ test("#261 cmd_keys add: curl missing from $PATH must be reported as a local fau
   assert.ok(/curl/i.test(r.stderr), `expected the message to name curl/the local command failure, got stderr=${JSON.stringify(r.stderr)}`);
 });
 
-test("#261 control: cmd_keys add with curl present but the proxy genuinely unreachable still says so", () => {
+posixTest(WIN32_BASH_OCP, "#261 control: cmd_keys add with curl present but the proxy genuinely unreachable still says so", () => {
   const r = _bwHarnessRun({ args: ["keys", "add", "laptop-marker"], adminKey: "test-admin-key-marker" });
   assert.notEqual(r.status, 0, `expected a nonzero exit; status=${r.status}`);
   assert.ok(r.stderr.includes("Error: proxy unreachable"),  // #475: the network label is now exactly this; the HTTP-error half has its own label
@@ -29147,7 +29180,7 @@ console.log("\nocp: a proxy that ANSWERED with an HTTP error is not \"unreachabl
 // The defect: `curl -sf` turns a 502-with-a-body into exit 22 and an EMPTY stderr (-s silences
 // curl's own message), so _curl_or_die's network branch printed "proxy unreachable" about a proxy
 // that had just answered /health -- and the body naming the real fault was discarded.
-test("#475: `ocp usage` on a 502 names the status and shows the proxy's own error, never 'unreachable'", () => {
+posixTest(WIN32_BASH_OCP, "#475: `ocp usage` on a 502 names the status and shows the proxy's own error, never 'unreachable'", () => {
   const body = JSON.stringify({ error: "Usage API returned 401 with no rate-limit headers", proxy: {} });
   // cmd_usage now fetches without -f and with the status appended, so the stub returns body + code.
   const r = _bwHarnessRun({ args: ["usage"], curlResponses: [{ match: "/usage", body: `${body}\n502`, exit: 0 }] });
@@ -29163,14 +29196,14 @@ test("#475: `ocp usage` on a 502 names the status and shows the proxy's own erro
 // The body is not always JSON: a reverse proxy in front of OCP answers 502 with "Bad Gateway". The
 // first version of the printer read stdin twice and showed NOTHING for that -- the shape this row
 // exists to keep visible.
-test("#475: `ocp usage` on a NON-JSON error body still shows the body", () => {
+posixTest(WIN32_BASH_OCP, "#475: `ocp usage` on a NON-JSON error body still shows the body", () => {
   const r = _bwHarnessRun({ args: ["usage"], curlResponses: [{ match: "/usage", body: "Bad Gateway\n502", exit: 0 }] });
   assert.notEqual(r.status, 0);
   assert.ok(r.stderr.includes("answered HTTP 502"), `status named; stderr=${JSON.stringify(r.stderr)}`);
   assert.ok(r.stderr.includes("Bad Gateway"), `a non-JSON body must still be shown; stderr=${JSON.stringify(r.stderr)}`);
 });
 
-test("#475 control: `ocp usage` on a 200 still formats the plan as before", () => {
+posixTest(WIN32_BASH_OCP, "#475 control: `ocp usage` on a 200 still formats the plan as before", () => {
   // Shape copied from the formatter's own reads (plan.currentSession / plan.weeklyLimits.allModels
   // / plan.extraUsage.status / proxy / models), not guessed -- the first version of this fixture
   // spelled `weekly` and the control reddened on a KeyError, which is the fixture lying rather
@@ -29193,7 +29226,7 @@ test("#475 control: `ocp usage` on a 200 still formats the plan as before", () =
 // The general layer: every OTHER call site still uses -sf, so exit 22 must at least stop being
 // reported as unreachable there, even though the body is gone. `usage --by-key` hits /api/usage
 // through _curl_or_die with -sf.
-test("#475: _curl_or_die on curl exit 22 (HTTP error under -f) says 'answered', not 'unreachable'", () => {
+posixTest(WIN32_BASH_OCP, "#475: _curl_or_die on curl exit 22 (HTTP error under -f) says 'answered', not 'unreachable'", () => {
   const r = _bwHarnessRun({ args: ["usage", "--by-key"], adminKey: "test-admin-key-marker", curlResponses: [{ match: "/api/usage", body: "", exit: 22 }] });
   assert.notEqual(r.status, 0, `expected a nonzero exit; status=${r.status}`);
   assert.ok(_bwCalled(r.log, "FAKE-CURL-CALL"), `premise: curl was invoked; log=${JSON.stringify(r.log)}`);
@@ -29205,7 +29238,7 @@ test("#475: _curl_or_die on curl exit 22 (HTTP error under -f) says 'answered', 
   assert.ok(/refused \/api\/usage/.test(r.stderr), `must say the proxy REFUSED, i.e. answered; stderr=${JSON.stringify(r.stderr)}`);
 });
 
-test("#475 control: a genuine connection failure (curl exit 7) is STILL 'proxy unreachable'", () => {
+posixTest(WIN32_BASH_OCP, "#475 control: a genuine connection failure (curl exit 7) is STILL 'proxy unreachable'", () => {
   const r = _bwHarnessRun({ args: ["usage", "--by-key"], adminKey: "test-admin-key-marker", curlResponses: [{ match: "/api/usage", body: "", exit: 7 }] });
   assert.notEqual(r.status, 0);
   assert.ok(r.stderr.includes("proxy unreachable"), `exit 7 IS unreachable and must keep saying so; stderr=${JSON.stringify(r.stderr)}`);
@@ -29213,7 +29246,7 @@ test("#475 control: a genuine connection failure (curl exit 7) is STILL 'proxy u
 
 console.log("\nocp _curl_or_die: independent review round 1 fold-ins (exit 126, mktemp security):");
 
-test("#261 fold-in B (independent review round 1): curl present but NOT EXECUTABLE (exit 126) is reported as a local fault, not 'proxy unreachable'", () => {
+posixTest(WIN32_BASH_OCP, "#261 fold-in B (independent review round 1): curl present but NOT EXECUTABLE (exit 126) is reported as a local fault, not 'proxy unreachable'", () => {
   // Reviewer's own repro: `chmod 000` a real curl -> exit 126 -> "Error: proxy unreachable...",
   // the exact headline this issue exists to kill, and this repo's own ENOEXEC footgun history
   // (a corrupted `claude` native binary) makes this a real, not merely theoretical, scenario.
@@ -29224,7 +29257,7 @@ test("#261 fold-in B (independent review round 1): curl present but NOT EXECUTAB
   assert.ok(/curl/i.test(r.stderr), `expected the message to name curl/the local command failure, got stderr=${JSON.stringify(r.stderr)}`);
 });
 
-test("#261 fold-in A (independent review round 1, security): a mktemp failure is FATAL, not a silent fallback to a predictable/world-readable/symlink-following temp path", () => {
+posixTest(WIN32_BASH_OCP, "#261 fold-in A (independent review round 1, security): a mktemp failure is FATAL, not a silent fallback to a predictable/world-readable/symlink-following temp path", () => {
   // The original fallback (`errfile="$TMPDIR/.ocp-curlerr.$$"`, used only when mktemp itself
   // failed) was 0644 at a PID-predictable path, and a plain `>` redirect follows a pre-existing
   // symlink there instead of refusing -- the review demonstrated a symlink-planted-in-advance
@@ -29271,7 +29304,7 @@ test("#261 fold-in A (independent review round 1, security): a mktemp failure is
 // heredoc.
 console.log("\nocp cmd_status / cmd_settings PATCH: two more silent-failure sites (#273):");
 
-test("#273 cmd_status: the money test — curl present but the proxy genuinely unreachable must not be COMPLETELY SILENT (reproduces the exact status=7/stdout=[]/stderr=[] signature)", () => {
+posixTest(WIN32_BASH_OCP, "#273 cmd_status: the money test — curl present but the proxy genuinely unreachable must not be COMPLETELY SILENT (reproduces the exact status=7/stdout=[]/stderr=[] signature)", () => {
   // exit:7, body:"" reproduces curl's own real silent-connection-failure shape under `-sf` —
   // verified directly against a real closed port before writing this fixture (see block comment
   // above) — rather than the harness's default-refusal arm, which (being a stub script, not a
@@ -29285,7 +29318,7 @@ test("#273 cmd_status: the money test — curl present but the proxy genuinely u
   assert.equal(r.stdout, "", `the diagnostic belongs on stderr, not stdout (a consumer piping 'ocp status' output must not read it as data); got stdout=${JSON.stringify(r.stdout)}`);
 });
 
-test("#273 cmd_status: curl missing from $PATH must be reported as a local fault, not 'proxy unreachable' or silence", () => {
+posixTest(WIN32_BASH_OCP, "#273 cmd_status: curl missing from $PATH must be reported as a local fault, not 'proxy unreachable' or silence", () => {
   const r = _bwHarnessRun({ args: ["status"], curlAbsent: true });
   assert.notEqual(r.status, 0, `expected a nonzero exit; status=${r.status}`);
   assert.ok(!(r.stdout === "" && r.stderr === ""), `must not be silent; stdout=${JSON.stringify(r.stdout)} stderr=${JSON.stringify(r.stderr)}`);
@@ -29294,14 +29327,14 @@ test("#273 cmd_status: curl missing from $PATH must be reported as a local fault
   assert.ok(/curl/i.test(r.stderr), `expected the message to name curl/the local command failure, got stderr=${JSON.stringify(r.stderr)}`);
 });
 
-test("#273 control: cmd_status with curl present and the proxy genuinely reachable still prints the (pretty-printed) status body (proves the fix does not just replace one silence with another)", () => {
+posixTest(WIN32_BASH_OCP, "#273 control: cmd_status with curl present and the proxy genuinely reachable still prints the (pretty-printed) status body (proves the fix does not just replace one silence with another)", () => {
   const r = _bwHarnessRun({ args: ["status"], curlResponses: [{ match: "/status", body: JSON.stringify({ ok: true, uptime: "1h" }) }] });
   assert.equal(r.status, 0, `expected a clean exit, got status=${r.status} stderr=${r.stderr}`);
   assert.ok(r.stdout.includes('"ok"') && r.stdout.includes("true"), `expected the status JSON on stdout, got: ${JSON.stringify(r.stdout)}`);
   assert.equal(r.stderr, "", `a successful run must not print anything to stderr; got: ${JSON.stringify(r.stderr)}`);
 });
 
-test("#273 cmd_settings PATCH: the money test — curl present but the proxy genuinely unreachable must not be COMPLETELY SILENT (reproduces the exact status=7/stdout=[]/stderr=[] signature)", () => {
+posixTest(WIN32_BASH_OCP, "#273 cmd_settings PATCH: the money test — curl present but the proxy genuinely unreachable must not be COMPLETELY SILENT (reproduces the exact status=7/stdout=[]/stderr=[] signature)", () => {
   const r = _bwHarnessRun({ args: ["settings", "maxPromptChars", "200000"], curlResponses: [{ match: "/settings", body: "", exit: 7 }] });
   assert.notEqual(r.status, 0, `expected a nonzero exit; status=${r.status}`);
   assert.ok(!(r.stdout === "" && r.stderr === ""),
@@ -29310,7 +29343,7 @@ test("#273 cmd_settings PATCH: the money test — curl present but the proxy gen
   assert.equal(r.stdout, "", `the diagnostic belongs on stderr, not stdout; got stdout=${JSON.stringify(r.stdout)}`);
 });
 
-test("#273 cmd_settings PATCH: curl missing from $PATH must be reported as a local fault, not 'proxy unreachable' or silence (reproduces the exact status=127/stdout=[]/stderr=[] signature)", () => {
+posixTest(WIN32_BASH_OCP, "#273 cmd_settings PATCH: curl missing from $PATH must be reported as a local fault, not 'proxy unreachable' or silence (reproduces the exact status=127/stdout=[]/stderr=[] signature)", () => {
   const r = _bwHarnessRun({ args: ["settings", "maxPromptChars", "200000"], curlAbsent: true });
   assert.notEqual(r.status, 0, `expected a nonzero exit; status=${r.status}`);
   assert.ok(!(r.stdout === "" && r.stderr === ""), `must not be silent; stdout=${JSON.stringify(r.stdout)} stderr=${JSON.stringify(r.stderr)}`);
@@ -29319,7 +29352,7 @@ test("#273 cmd_settings PATCH: curl missing from $PATH must be reported as a loc
   assert.ok(/curl/i.test(r.stderr), `expected the message to name curl/the local command failure, got stderr=${JSON.stringify(r.stderr)}`);
 });
 
-test("#273 control: cmd_settings PATCH with curl present and the proxy genuinely reachable still reports the result (proves the fix does not just replace one silence with another)", () => {
+posixTest(WIN32_BASH_OCP, "#273 control: cmd_settings PATCH with curl present and the proxy genuinely reachable still reports the result (proves the fix does not just replace one silence with another)", () => {
   const r = _bwHarnessRun({
     args: ["settings", "maxPromptChars", "200000"],
     curlResponses: [{ match: "/settings", body: JSON.stringify({ maxPromptChars: { value: 200000 } }) }],
@@ -29329,7 +29362,7 @@ test("#273 control: cmd_settings PATCH with curl present and the proxy genuinely
   assert.equal(r.stderr, "", `a successful run must not print anything to stderr; got: ${JSON.stringify(r.stderr)}`);
 });
 
-test("#273 non-regression: cmd_settings PATCH still surfaces server-side VALIDATION errors from a 2xx-or-not JSON body (the reason this call site deliberately omits curl's -f)", () => {
+posixTest(WIN32_BASH_OCP, "#273 non-regression: cmd_settings PATCH still surfaces server-side VALIDATION errors from a 2xx-or-not JSON body (the reason this call site deliberately omits curl's -f)", () => {
   // A validation failure is NOT a network fault -- the server answered, just with an `errors`
   // array instead of an accepted value. `_curl_or_die` must not be handed `-f` here, or curl
   // would swallow this body on a non-2xx response and this path would misreport a validation
@@ -29364,7 +29397,7 @@ test("#273 stream parity: cmd_status / cmd_settings PATCH 'proxy unreachable' gu
 // license. Tests mirror the cmd_status set exactly (same helper, same fixtures, same shape).
 console.log("\nocp cmd_health: the same silent-failure shape as cmd_status, found during PR #279's own independent review (#273):");
 
-test("#273 cmd_health: the money test — curl present but the proxy genuinely unreachable must not be COMPLETELY SILENT (reproduces the exact status=7/stdout=[]/stderr=[] signature)", () => {
+posixTest(WIN32_BASH_OCP, "#273 cmd_health: the money test — curl present but the proxy genuinely unreachable must not be COMPLETELY SILENT (reproduces the exact status=7/stdout=[]/stderr=[] signature)", () => {
   const r = _bwHarnessRun({ args: ["health"], curlResponses: [{ match: "/health", body: "", exit: 7 }] });
   assert.notEqual(r.status, 0, `expected a nonzero exit; status=${r.status}`);
   assert.ok(!(r.stdout === "" && r.stderr === ""),
@@ -29373,7 +29406,7 @@ test("#273 cmd_health: the money test — curl present but the proxy genuinely u
   assert.equal(r.stdout, "", `the diagnostic belongs on stderr, not stdout; got stdout=${JSON.stringify(r.stdout)}`);
 });
 
-test("#273 cmd_health: curl missing from $PATH must be reported as a local fault, not 'proxy unreachable' or silence", () => {
+posixTest(WIN32_BASH_OCP, "#273 cmd_health: curl missing from $PATH must be reported as a local fault, not 'proxy unreachable' or silence", () => {
   const r = _bwHarnessRun({ args: ["health"], curlAbsent: true });
   assert.notEqual(r.status, 0, `expected a nonzero exit; status=${r.status}`);
   assert.ok(!(r.stdout === "" && r.stderr === ""), `must not be silent; stdout=${JSON.stringify(r.stdout)} stderr=${JSON.stringify(r.stderr)}`);
@@ -29382,7 +29415,7 @@ test("#273 cmd_health: curl missing from $PATH must be reported as a local fault
   assert.ok(/curl/i.test(r.stderr), `expected the message to name curl/the local command failure, got stderr=${JSON.stringify(r.stderr)}`);
 });
 
-test("#273 control: cmd_health with curl present and the proxy genuinely reachable still prints the (pretty-printed) health body", () => {
+posixTest(WIN32_BASH_OCP, "#273 control: cmd_health with curl present and the proxy genuinely reachable still prints the (pretty-printed) health body", () => {
   const r = _bwHarnessRun({ args: ["health"], curlResponses: [{ match: "/health", body: JSON.stringify({ status: "ok", version: "3.26.0" }) }] });
   assert.equal(r.status, 0, `expected a clean exit, got status=${r.status} stderr=${r.stderr}`);
   assert.ok(r.stdout.includes('"status"') && r.stdout.includes("ok"), `expected the health JSON on stdout, got: ${JSON.stringify(r.stdout)}`);
@@ -29423,7 +29456,7 @@ test("#273 stream parity: cmd_health 'proxy unreachable' guard writes to stderr,
 // as a side effect of the fix rather than a separate change.
 console.log("\nocp: eight more silent-failure sites route through _curl_or_die (#278, generalizes #261's repro):");
 
-test("#278 cmd_logs: curl missing from $PATH must be reported as a local fault, not 'proxy unreachable'", () => {
+posixTest(WIN32_BASH_OCP, "#278 cmd_logs: curl missing from $PATH must be reported as a local fault, not 'proxy unreachable'", () => {
   const r = _bwHarnessRun({ args: ["logs"], curlAbsent: true });
   assert.notEqual(r.status, 0, `expected a nonzero exit; status=${r.status}`);
   assert.ok(!r.stderr.includes("proxy unreachable") && !r.stdout.includes("proxy unreachable"),
@@ -29431,14 +29464,14 @@ test("#278 cmd_logs: curl missing from $PATH must be reported as a local fault, 
   assert.ok(/curl/i.test(r.stderr), `expected the message to name curl/the local command failure, got stderr=${JSON.stringify(r.stderr)}`);
 });
 
-test("#278 control: cmd_logs with curl present but the proxy genuinely unreachable still says 'proxy unreachable'", () => {
+posixTest(WIN32_BASH_OCP, "#278 control: cmd_logs with curl present but the proxy genuinely unreachable still says 'proxy unreachable'", () => {
   const r = _bwHarnessRun({ args: ["logs"] });
   assert.notEqual(r.status, 0, `expected a nonzero exit; status=${r.status}`);
   assert.ok(r.stderr.includes("Error: proxy unreachable"),
     `a GENUINE network failure must still be reported as such (proves the fix does not just delete the diagnosis), got stderr=${JSON.stringify(r.stderr)}`);
 });
 
-test("#278 cmd_models: curl missing from $PATH must be reported as a local fault, not 'proxy unreachable'", () => {
+posixTest(WIN32_BASH_OCP, "#278 cmd_models: curl missing from $PATH must be reported as a local fault, not 'proxy unreachable'", () => {
   const r = _bwHarnessRun({ args: ["models"], curlAbsent: true });
   assert.notEqual(r.status, 0, `expected a nonzero exit; status=${r.status}`);
   assert.ok(!r.stderr.includes("proxy unreachable") && !r.stdout.includes("proxy unreachable"),
@@ -29446,7 +29479,7 @@ test("#278 cmd_models: curl missing from $PATH must be reported as a local fault
   assert.ok(/curl/i.test(r.stderr), `expected the message to name curl/the local command failure, got stderr=${JSON.stringify(r.stderr)}`);
 });
 
-test("#278 fold-in (exit 126 coverage): cmd_models with curl present but NOT EXECUTABLE must also be reported as a local fault, not 'proxy unreachable'", () => {
+posixTest(WIN32_BASH_OCP, "#278 fold-in (exit 126 coverage): cmd_models with curl present but NOT EXECUTABLE must also be reported as a local fault, not 'proxy unreachable'", () => {
   // Mirrors #261 fold-in B: the reviewer's own repro (`chmod 000` a real curl -> exit 126 +
   // "Permission denied") for at least one of this issue's eight sites, so exit 126 is proven
   // covered here too, not just exit 127 (curlAbsent).
@@ -29457,14 +29490,14 @@ test("#278 fold-in (exit 126 coverage): cmd_models with curl present but NOT EXE
   assert.ok(/curl/i.test(r.stderr), `expected the message to name curl/the local command failure, got stderr=${JSON.stringify(r.stderr)}`);
 });
 
-test("#278 control: cmd_models with curl present but the proxy genuinely unreachable still says 'proxy unreachable'", () => {
+posixTest(WIN32_BASH_OCP, "#278 control: cmd_models with curl present but the proxy genuinely unreachable still says 'proxy unreachable'", () => {
   const r = _bwHarnessRun({ args: ["models"] });
   assert.notEqual(r.status, 0, `expected a nonzero exit; status=${r.status}`);
   assert.ok(r.stderr.includes("Error: proxy unreachable"),
     `a GENUINE network failure must still be reported as such, got stderr=${JSON.stringify(r.stderr)}`);
 });
 
-test("#278 cmd_keys revoke: curl missing from $PATH must be reported as a local fault, not 'proxy unreachable or unauthorized'", () => {
+posixTest(WIN32_BASH_OCP, "#278 cmd_keys revoke: curl missing from $PATH must be reported as a local fault, not 'proxy unreachable or unauthorized'", () => {
   const r = _bwHarnessRun({ args: ["keys", "revoke", "laptop-marker"], adminKey: "test-admin-key-marker", curlAbsent: true });
   assert.notEqual(r.status, 0, `expected a nonzero exit; status=${r.status}`);
   assert.ok(!r.stderr.includes("proxy unreachable") && !r.stdout.includes("proxy unreachable"),
@@ -29472,14 +29505,14 @@ test("#278 cmd_keys revoke: curl missing from $PATH must be reported as a local 
   assert.ok(/curl/i.test(r.stderr), `expected the message to name curl/the local command failure, got stderr=${JSON.stringify(r.stderr)}`);
 });
 
-test("#278 control: cmd_keys revoke with curl present but the proxy genuinely unreachable still says 'proxy unreachable'", () => {
+posixTest(WIN32_BASH_OCP, "#278 control: cmd_keys revoke with curl present but the proxy genuinely unreachable still says 'proxy unreachable'", () => {
   const r = _bwHarnessRun({ args: ["keys", "revoke", "laptop-marker"], adminKey: "test-admin-key-marker" });
   assert.notEqual(r.status, 0, `expected a nonzero exit; status=${r.status}`);
   assert.ok(r.stderr.includes("Error: proxy unreachable"),  // #475: the network label is now exactly this; the HTTP-error half has its own label
     `a GENUINE network failure must still be reported as such, got stderr=${JSON.stringify(r.stderr)}`);
 });
 
-test("#278 cmd_keys list: curl missing from $PATH must be reported as a local fault, not 'proxy unreachable or key management not available'", () => {
+posixTest(WIN32_BASH_OCP, "#278 cmd_keys list: curl missing from $PATH must be reported as a local fault, not 'proxy unreachable or key management not available'", () => {
   const r = _bwHarnessRun({ args: ["keys"], adminKey: "test-admin-key-marker", curlAbsent: true });
   assert.notEqual(r.status, 0, `expected a nonzero exit; status=${r.status}`);
   assert.ok(!r.stderr.includes("proxy unreachable") && !r.stdout.includes("proxy unreachable"),
@@ -29487,14 +29520,14 @@ test("#278 cmd_keys list: curl missing from $PATH must be reported as a local fa
   assert.ok(/curl/i.test(r.stderr), `expected the message to name curl/the local command failure, got stderr=${JSON.stringify(r.stderr)}`);
 });
 
-test("#278 control: cmd_keys list with curl present but the proxy genuinely unreachable still says 'proxy unreachable'", () => {
+posixTest(WIN32_BASH_OCP, "#278 control: cmd_keys list with curl present but the proxy genuinely unreachable still says 'proxy unreachable'", () => {
   const r = _bwHarnessRun({ args: ["keys"], adminKey: "test-admin-key-marker" });
   assert.notEqual(r.status, 0, `expected a nonzero exit; status=${r.status}`);
   assert.ok(r.stderr.includes("Error: proxy unreachable"),  // #475: the network label is now exactly this; the HTTP-error half has its own label
     `a GENUINE network failure must still be reported as such, got stderr=${JSON.stringify(r.stderr)}`);
 });
 
-test("#278 cmd_settings (GET): curl missing from $PATH must be reported as a local fault, not 'proxy unreachable'", () => {
+posixTest(WIN32_BASH_OCP, "#278 cmd_settings (GET): curl missing from $PATH must be reported as a local fault, not 'proxy unreachable'", () => {
   const r = _bwHarnessRun({ args: ["settings"], curlAbsent: true });
   assert.notEqual(r.status, 0, `expected a nonzero exit; status=${r.status}`);
   assert.ok(!r.stderr.includes("proxy unreachable") && !r.stdout.includes("proxy unreachable"),
@@ -29502,7 +29535,7 @@ test("#278 cmd_settings (GET): curl missing from $PATH must be reported as a loc
   assert.ok(/curl/i.test(r.stderr), `expected the message to name curl/the local command failure, got stderr=${JSON.stringify(r.stderr)}`);
 });
 
-test("#278 control: cmd_settings (GET) with curl present but the proxy genuinely unreachable still says 'proxy unreachable'", () => {
+posixTest(WIN32_BASH_OCP, "#278 control: cmd_settings (GET) with curl present but the proxy genuinely unreachable still says 'proxy unreachable'", () => {
   const r = _bwHarnessRun({ args: ["settings"] });
   assert.notEqual(r.status, 0, `expected a nonzero exit; status=${r.status}`);
   assert.ok(r.stderr.includes("Error: proxy unreachable"),
@@ -29517,7 +29550,7 @@ test("#278 control: cmd_settings (GET) with curl present but the proxy genuinely
 // (3456) applies unmodified; this test file introduces no new port literal.
 console.log("\nocp cmd_connect: the eighth, higher-severity site — was a TRUE silence via 2>/dev/null (#278):");
 
-test("#278 cmd_connect: curl missing from $PATH must be reported as a local fault, not 'Cannot reach ...' — and must NOT carry the 'make sure OCP is running' hint (wrong advice for a local fault)", () => {
+posixTest(WIN32_BASH_OCP, "#278 cmd_connect: curl missing from $PATH must be reported as a local fault, not 'Cannot reach ...' — and must NOT carry the 'make sure OCP is running' hint (wrong advice for a local fault)", () => {
   const r = _bwHarnessRun({ args: ["connect", "192.0.2.1"], curlAbsent: true });
   assert.notEqual(r.status, 0, `expected a nonzero exit; status=${r.status}`);
   assert.ok(!r.stderr.includes("Cannot reach") && !r.stdout.includes("Cannot reach"),
@@ -29529,7 +29562,7 @@ test("#278 cmd_connect: curl missing from $PATH must be reported as a local faul
     `stderr=${JSON.stringify(r.stderr)} stdout=${JSON.stringify(r.stdout)}`);
 });
 
-test("#278 control: cmd_connect with curl present but the remote genuinely unreachable still surfaces 'Cannot reach ... make sure OCP is running ...'", () => {
+posixTest(WIN32_BASH_OCP, "#278 control: cmd_connect with curl present but the remote genuinely unreachable still surfaces 'Cannot reach ... make sure OCP is running ...'", () => {
   const r = _bwHarnessRun({ args: ["connect", "192.0.2.1"] });
   assert.notEqual(r.status, 0, `expected a nonzero exit; status=${r.status}`);
   assert.ok(r.stderr.includes("Cannot reach") && r.stderr.includes("make sure OCP is running"),
@@ -29558,7 +29591,7 @@ test("#278 cmd_connect: the diagnostic now goes to stderr, not stdout (previousl
 // would pass just as well as "we fixed it".
 console.log("\nocp: the remaining bare-curl probes distinguish a local fault from a remote condition (#296, #299, #300):");
 
-test("#296 ocp lan: curl missing from $PATH must NOT be narrated as 'bound to localhost only'", () => {
+posixTest(WIN32_BASH_OCP, "#296 ocp lan: curl missing from $PATH must NOT be narrated as 'bound to localhost only'", () => {
   const r = _bwHarnessRun({ args: ["lan"], curlAbsent: true });
   assert.ok(!r.stdout.includes("bound to localhost only") && !r.stderr.includes("bound to localhost only"),
     `a missing local curl must not be reported as a proxy bind-address fact — the remediation printed ` +
@@ -29569,7 +29602,7 @@ test("#296 ocp lan: curl missing from $PATH must NOT be narrated as 'bound to lo
     `the status line must decline to characterise LAN reachability at all, got stdout=${JSON.stringify(r.stdout)}`);
 });
 
-test("#296 control: ocp lan with curl present but the port genuinely unreachable still says 'Not LAN-accessible'", () => {
+posixTest(WIN32_BASH_OCP, "#296 control: ocp lan with curl present but the port genuinely unreachable still says 'Not LAN-accessible'", () => {
   const r = _bwHarnessRun({ args: ["lan"] });
   assert.ok(r.stdout.includes("Not LAN-accessible"),
     `a GENUINE unreachable port must still produce the original diagnosis — proves the fix does not ` +
@@ -29578,7 +29611,7 @@ test("#296 control: ocp lan with curl present but the port genuinely unreachable
     `and must NOT take the undetermined arm, got stdout=${JSON.stringify(r.stdout)}`);
 });
 
-test("#299 cmd_restart: curl missing from $PATH must NOT report a successful restart as 'Proxy not responding after restart'", () => {
+posixTest(WIN32_BASH_OCP, "#299 cmd_restart: curl missing from $PATH must NOT report a successful restart as 'Proxy not responding after restart'", () => {
   const r = _bwHarnessRun({ args: ["restart"], overrideCmdRestart: false, serviceStubsSucceed: true, curlAbsent: true });
   assert.ok(!r.stdout.includes("Proxy not responding after restart") && !r.stderr.includes("Proxy not responding after restart"),
     `this probe is the restart's OWN verdict and it reaches _cmd_update_light's restart_status (#255) — ` +
@@ -29589,7 +29622,7 @@ test("#299 cmd_restart: curl missing from $PATH must NOT report a successful res
   assert.ok(/curl/i.test(r.stderr), `expected the message to name curl, got stderr=${JSON.stringify(r.stderr)}`);
 });
 
-test("#299 control: cmd_restart with curl present but the proxy genuinely not answering still says 'Proxy not responding after restart'", () => {
+posixTest(WIN32_BASH_OCP, "#299 control: cmd_restart with curl present but the proxy genuinely not answering still says 'Proxy not responding after restart'", () => {
   const r = _bwHarnessRun({ args: ["restart"], overrideCmdRestart: false, serviceStubsSucceed: true, curlHealthExit: 1 });
   assert.ok(r.stdout.includes("Proxy not responding after restart"),
     `a GENUINE post-restart failure must still be reported as such — proves the fix does not just ` +
@@ -29609,7 +29642,7 @@ test("#299 control: cmd_restart with curl present but the proxy genuinely not an
 // comes from the health probe rather than a subcommand's exit status, so the four combinations
 // of (command ok?, proxy up?) get four distinct messages instead of two.
 
-test("#325 (the money test): a command that fails ONCE then succeeds is retried, and the restart succeeds", () => {
+posixTest(WIN32_BASH_OCP, "#325 (the money test): a command that fails ONCE then succeeds is retried, and the restart succeeds", () => {
   // A self-counting command: exits 1 on the first invocation, 0 on the second. If cmd_restart
   // still ran each resolved command exactly once, this restart would be reported as failed.
   // NO `$`, backticks or `$((...))` anywhere in this command. The harness emits each resolved
@@ -29632,7 +29665,7 @@ test("#325 (the money test): a command that fails ONCE then succeeds is retried,
     "a recovered transient failure must not be reported as the proxy being down");
 });
 
-test("#325: command fails after retries AND the proxy is not answering → says the service is DOWN, and how to start it", () => {
+posixTest(WIN32_BASH_OCP, "#325: command fails after retries AND the proxy is not answering → says the service is DOWN, and how to start it", () => {
   // A resolved command is REQUIRED: resolveRestartStdout defaults to [], the loop reads nothing,
   // and restart_failed stays 0 no matter what serviceStubsSucceed says.
   const r = _bwHarnessRun({ args: ["restart"], overrideCmdRestart: false, serviceStubsSucceed: false,
@@ -29644,7 +29677,7 @@ test("#325: command fails after retries AND the proxy is not answering → says 
   assert.notEqual(r.status, 0, "and it must still be a failure exit");
 });
 
-test("#325: command fails after retries but the proxy IS answering → not a plain success, and not DOWN", () => {
+posixTest(WIN32_BASH_OCP, "#325: command fails after retries but the proxy IS answering → not a plain success, and not DOWN", () => {
   const r = _bwHarnessRun({ args: ["restart"], overrideCmdRestart: false, serviceStubsSucceed: false,
     resolveRestartStdout: ["systemctl restart -- ocp.service"], curlHealthExit: 0 });
   assert.ok(/service is UP/i.test(r.stdout) || /responding, but a restart command failed/i.test(r.stdout),
@@ -29653,7 +29686,7 @@ test("#325: command fails after retries but the proxy IS answering → not a pla
   assert.equal(r.status, 0, "the service is up, so this is not a failure for callers like _cmd_update_light");
 });
 
-test("#325 (precedence): a LOCAL curl fault must stay UNKNOWN and must never be reported as DOWN", () => {
+posixTest(WIN32_BASH_OCP, "#325 (precedence): a LOCAL curl fault must stay UNKNOWN and must never be reported as DOWN", () => {
   // The dangerous interaction: the new DOWN branch keys on "probe non-zero", and the local-fault
   // arm (#299) is also non-zero. If ordering were wrong, a machine that merely cannot RUN curl
   // would be told its proxy is dead — asserting a state nobody measured, which is the exact
@@ -29674,7 +29707,7 @@ test("#325 (precedence): a LOCAL curl fault must stay UNKNOWN and must never be 
     `and must offer the start command, since the stop half already ran; got stdout=${JSON.stringify(r.stdout)}`);
 });
 
-test("#325 control: rc==2 with all commands SUCCEEDING keeps the original wording byte-for-byte", () => {
+posixTest(WIN32_BASH_OCP, "#325 control: rc==2 with all commands SUCCEEDING keeps the original wording byte-for-byte", () => {
   // Proves the split above did not simply rewrite the pre-existing #299 message for everyone.
   const r = _bwHarnessRun({ args: ["restart"], overrideCmdRestart: false, serviceStubsSucceed: true,
     resolveRestartStdout: ["systemctl restart -- ocp.service"], curlAbsent: true });
@@ -29688,7 +29721,7 @@ test("#325 control: rc==2 with all commands SUCCEEDING keeps the original wordin
 // by the #278 tests above) and never reach these. A `curlResponses` arm that exits 127 does it —
 // the stub runs and returns 127, which is indistinguishable from bash's own "command not found"
 // to `_curl_or_die`, since all it ever sees is the exit status and the captured stderr.
-test("#300 cmd_connect /v1/models: a local curl fault must NOT be narrated as 'key may be invalid or revoked'", () => {
+posixTest(WIN32_BASH_OCP, "#300 cmd_connect /v1/models: a local curl fault must NOT be narrated as 'key may be invalid or revoked'", () => {
   const r = _bwHarnessRun({
     args: ["connect", "192.0.2.1"],
     curlHealthExit: 0,
@@ -29701,7 +29734,7 @@ test("#300 cmd_connect /v1/models: a local curl fault must NOT be narrated as 'k
     `expected _curl_or_die's local-fault message to name curl, got stderr=${JSON.stringify(r.stderr)}`);
 });
 
-test("#300 control: cmd_connect /v1/models with curl running and the remote genuinely refusing still names the key as a possible cause", () => {
+posixTest(WIN32_BASH_OCP, "#300 control: cmd_connect /v1/models with curl running and the remote genuinely refusing still names the key as a possible cause", () => {
   const r = _bwHarnessRun({
     args: ["connect", "192.0.2.1"],
     curlHealthExit: 0,
@@ -30058,7 +30091,7 @@ test("issue #233 defect 1: lsof is invoked at its absolute path (/usr/sbin/lsof)
 // complaint: "cmd_restart currently has no failure exit code at all").
 console.log("\ncmd_restart resolver wiring (#224):");
 
-test("#224: cmd_restart refuses when the resolver can't determine the restart target -- no hard-coded fallback, real exit code", () => {
+posixTest(WIN32_BASH_OCP, "#224: cmd_restart refuses when the resolver can't determine the restart target -- no hard-coded fallback, real exit code", () => {
   const r = _bwHarnessRun({
     args: ["restart"],
     overrideCmdRestart: false,
@@ -30087,7 +30120,7 @@ test("#224: cmd_restart refuses when the resolver can't determine the restart ta
   }
 });
 
-test("#224: cmd_restart runs the resolver's actual resolved command, not the old hard-coded guess", () => {
+posixTest(WIN32_BASH_OCP, "#224: cmd_restart runs the resolver's actual resolved command, not the old hard-coded guess", () => {
   const r = _bwHarnessRun({
     args: ["restart"],
     overrideCmdRestart: false,
@@ -30118,7 +30151,7 @@ test("#224: cmd_restart runs the resolver's actual resolved command, not the old
 // the DEFAULT curl stub's own refusal for any URL other than "*/health*" (exit 94) already
 // reproduces "the /usage probe fails" without needing one -- `curl -sf` on a non-2xx/unreachable
 // response is exactly what makes cmd_usage's own guard fire.
-test("#241 MEDIUM-2 (the money test): a healthy restart with a merely-cosmetic /usage display failure must NOT make cmd_restart itself report failure", () => {
+posixTest(WIN32_BASH_OCP, "#241 MEDIUM-2 (the money test): a healthy restart with a merely-cosmetic /usage display failure must NOT make cmd_restart itself report failure", () => {
   const r = _bwHarnessRun({
     args: ["restart"], overrideCmdRestart: false,
     resolveRestartExit: 0, resolveRestartStdout: ["true"],
@@ -30131,7 +30164,7 @@ test("#241 MEDIUM-2 (the money test): a healthy restart with a merely-cosmetic /
   assert.ok(r.stdout.includes("✓ Proxy restarted successfully."), `expected the success line; stdout=${JSON.stringify(r.stdout)}`);
 });
 
-test("#241 MEDIUM-2: the SAME scenario end-to-end through _cmd_update_light -- a healthy restart's cosmetic /usage failure must not make the light path report overall failure either", () => {
+posixTest(WIN32_BASH_OCP, "#241 MEDIUM-2: the SAME scenario end-to-end through _cmd_update_light -- a healthy restart's cosmetic /usage failure must not make the light path report overall failure either", () => {
   const r = _bwHarnessRun({
     kind: "update", args: ["update"], overrideCmdRestart: false,
     resolveRestartExit: 0, resolveRestartStdout: ["true"],
@@ -30143,7 +30176,7 @@ test("#241 MEDIUM-2: the SAME scenario end-to-end through _cmd_update_light -- a
     `stdout=${JSON.stringify(r.stdout)} stderr=${JSON.stringify(r.stderr)}`);
 });
 
-test("#224: _cmd_update_light no longer swallows cmd_restart's refusal (operator sees why it failed, and the exit code is non-zero)", () => {
+posixTest(WIN32_BASH_OCP, "#224: _cmd_update_light no longer swallows cmd_restart's refusal (operator sees why it failed, and the exit code is non-zero)", () => {
   const r = _bwHarnessRun({
     kind: "update",
     args: ["update"],
@@ -30184,7 +30217,7 @@ test("#224: _cmd_update_light no longer swallows cmd_restart's refusal (operator
 // 0, still calm, still on stdout).
 console.log("\ncmd_restart gateway: 'not found on $PATH' vs 'installed and failed' (#263):");
 
-test("#263 cmd_restart gateway: openclaw not found on $PATH is reported once, calmly, on stdout, and reports SUCCESS", () => {
+posixTest(WIN32_BASH_OCP, "#263 cmd_restart gateway: openclaw not found on $PATH is reported once, calmly, on stdout, and reports SUCCESS", () => {
   const r = _bwHarnessRun({ args: ["restart", "gateway"], overrideCmdRestart: false, openclawAbsent: true });
   assert.equal(r.status, 0,
     `absence of an OPTIONAL sibling tool must not fail 'ocp restart gateway'; status=${r.status} ` +
@@ -30197,7 +30230,7 @@ test("#263 cmd_restart gateway: openclaw not found on $PATH is reported once, ca
   assert.ok(_bwCalled(r.log, "FAKE-OPENCLAW-ABSENT-CALL"), `sanity check the absent stub was actually reached; log=${JSON.stringify(r.log)}`);
 });
 
-test("#263 cmd_restart gateway: openclaw installed but its OWN restart fails is reported LOUDLY, on stderr, with a nonzero exit", () => {
+posixTest(WIN32_BASH_OCP, "#263 cmd_restart gateway: openclaw installed but its OWN restart fails is reported LOUDLY, on stderr, with a nonzero exit", () => {
   const r = _bwHarnessRun({ args: ["restart", "gateway"], overrideCmdRestart: false });
   assert.notEqual(r.status, 0,
     `a REAL failure of an installed tool must be reported as failure, not silently treated like ` +
@@ -30207,14 +30240,14 @@ test("#263 cmd_restart gateway: openclaw installed but its OWN restart fails is 
   assert.ok(_bwCalled(r.log, "FAKE-OPENCLAW-CALL"), `sanity check the (installed) stub was actually reached; log=${JSON.stringify(r.log)}`);
 });
 
-test("#263 control: cmd_restart gateway with openclaw installed and succeeding reports success and shows openclaw's own output", () => {
+posixTest(WIN32_BASH_OCP, "#263 control: cmd_restart gateway with openclaw installed and succeeding reports success and shows openclaw's own output", () => {
   const r = _bwHarnessRun({ args: ["restart", "gateway"], overrideCmdRestart: false, serviceStubsSucceed: true });
   assert.equal(r.status, 0, `expected a clean exit; status=${r.status} stderr=${JSON.stringify(r.stderr)}`);
   assert.ok(r.stdout.includes("gateway restarted"), `expected openclaw's own reported output, got stdout=${JSON.stringify(r.stdout)}`);
   assert.ok(r.stdout.includes("✓ Gateway restarted."), `expected the success line, got stdout=${JSON.stringify(r.stdout)}`);
 });
 
-test("#263 the money contrast: 'not found on $PATH' (exit 0) and 'installed and failed' (nonzero) are genuinely distinguishable exit codes -- the bug's own complaint was that they were not", () => {
+posixTest(WIN32_BASH_OCP, "#263 the money contrast: 'not found on $PATH' (exit 0) and 'installed and failed' (nonzero) are genuinely distinguishable exit codes -- the bug's own complaint was that they were not", () => {
   const absent = _bwHarnessRun({ args: ["restart", "gateway"], overrideCmdRestart: false, openclawAbsent: true });
   const failed = _bwHarnessRun({ args: ["restart", "gateway"], overrideCmdRestart: false });
   assert.equal(absent.status, 0, `not-found-on-$PATH must be status 0; got ${absent.status}`);
@@ -30232,7 +30265,7 @@ test("#263 the money contrast: 'not found on $PATH' (exit 0) and 'installed and 
 // removal this reintroduced #263's own defect through the very marker meant to fix it: a real
 // gateway failure silently reported as a successful no-op. This is the regression test for that
 // specific text-arm, using the harness's new openclawFailExit/openclawFailOutput fixtures.
-test("#263 case 6 (independent review round 1, blocking): openclaw installed and genuinely failing, whose own output happens to contain the phrase 'command not found', must still be reported LOUDLY and non-zero", () => {
+posixTest(WIN32_BASH_OCP, "#263 case 6 (independent review round 1, blocking): openclaw installed and genuinely failing, whose own output happens to contain the phrase 'command not found', must still be reported LOUDLY and non-zero", () => {
   const r = _bwHarnessRun({
     args: ["restart", "gateway"], overrideCmdRestart: false,
     openclawFailExit: 2,
@@ -30261,7 +30294,7 @@ test("#263 case 6 (independent review round 1, blocking): openclaw installed and
 // restarting -- only `curl $PROXY/health` told the truth in the real incident.
 console.log("\n_cmd_update_light post-flight verification + --target handling (#241):");
 
-test("#241 (the money test): light path reports FAILURE when post-flight verification does not confirm the new version, even though cmd_restart itself reported success", () => {
+posixTest(WIN32_BASH_OCP, "#241 (the money test): light path reports FAILURE when post-flight verification does not confirm the new version, even though cmd_restart itself reported success", () => {
   // overrideCmdRestart stays at its default (true): the FAKE-CMD-RESTART-CALLED stub always
   // echoes "Restarting proxy..." / "✓ Proxy restarted successfully." and returns 0 -- exactly
   // the pre-#241 failure mode (a restart that LOOKS successful while the service is still
@@ -30277,7 +30310,7 @@ test("#241 (the money test): light path reports FAILURE when post-flight verific
     `updated, service stale, reported success anyway); status=${r.status}`);
 });
 
-test("#241 control: light path reports SUCCESS when post-flight verification confirms the new version (proves the money test's failure is real, not the path just always failing now)", () => {
+posixTest(WIN32_BASH_OCP, "#241 control: light path reports SUCCESS when post-flight verification confirms the new version (proves the money test's failure is real, not the path just always failing now)", () => {
   const r = _bwHarnessRun({ kind: "update", args: ["update"], postFlightExit: 0 });
   assert.equal(r.status, 0, `expected a clean exit when post-flight succeeds; status=${r.status} stderr=${r.stderr}`);
   assert.ok(_bwCalled(r.log, "FAKE-CMD-RESTART-CALLED"), `cmd_restart must run; log=${JSON.stringify(r.log)}`);
@@ -30293,7 +30326,7 @@ test("#241 control: light path reports SUCCESS when post-flight verification con
 // where the pull ACTUALLY changes the version (simulateGitPullVersionBump) and a node stub that
 // only succeeds for the CORRECT post-pull target (postFlightExpectedTarget) — so using the stale
 // value now fails this test with a target-mismatch, not merely produces the same log line.
-test("#241 MEDIUM-3: post-flight verification target reflects the version the pull ACTUALLY landed on (v3.27.0), not the stale pre-pull version (v3.26.0)", () => {
+posixTest(WIN32_BASH_OCP, "#241 MEDIUM-3: post-flight verification target reflects the version the pull ACTUALLY landed on (v3.27.0), not the stale pre-pull version (v3.26.0)", () => {
   const r = _bwHarnessRun({
     kind: "update", args: ["update"],
     simulateGitPullVersionBump: true,
@@ -30317,7 +30350,7 @@ test("#241 MEDIUM-3: post-flight verification target reflects the version the pu
 // exit code 0, looking like a clean success -- and "Verifying restart...", the post-flight call,
 // and everything after it would simply never run. Content-based assertions (not just the exit
 // code, which would misleadingly still read as "0 = fine") are what catch that.
-test("#241 LOW-4: the outer subshell around cmd_restart actually contains an exit() reached through its success path -- post-flight still runs afterward", () => {
+posixTest(WIN32_BASH_OCP, "#241 LOW-4: the outer subshell around cmd_restart actually contains an exit() reached through its success path -- post-flight still runs afterward", () => {
   const r = _bwHarnessRun({ kind: "update", args: ["update"], cmdRestartStubExits: true, postFlightExit: 0 });
   assert.ok(_bwCalled(r.log, "FAKE-CMD-RESTART-CALLED"), `cmd_restart (stub) must have run; log=${JSON.stringify(r.log)}`);
   assert.ok(r.log.some((l) => l.includes("FAKE-NODE-CALL") && l.includes("--post-flight-only")),
@@ -30329,7 +30362,7 @@ test("#241 LOW-4: the outer subshell around cmd_restart actually contains an exi
   assert.equal(r.status, 0, `expected a clean success given postFlightExit:0; status=${r.status} stderr=${r.stderr}`);
 });
 
-test("#241: a resolver refusal (cmd_restart itself fails) is NOT masked into success by post-flight happening to answer anyway", () => {
+posixTest(WIN32_BASH_OCP, "#241: a resolver refusal (cmd_restart itself fails) is NOT masked into success by post-flight happening to answer anyway", () => {
   // overrideCmdRestart:false lets the REAL cmd_restart run; the resolver refuses, so cmd_restart
   // itself returns non-zero (restart_status). postFlightExit defaults to 0 (the fake node stub
   // would "succeed") -- this proves the combined check does not let a lucky post-flight result
@@ -30355,7 +30388,7 @@ test("#241: a resolver refusal (cmd_restart itself fails) is NOT masked into suc
 // real reason. The fix: skip strict post-flight verification (which cannot succeed without a
 // known target anyway) and say so explicitly instead of either blocking a real success or
 // silently claiming a verified one.
-test("#241 MEDIUM-1 (the money test): a python3 failure isolated to the package.json version read does NOT force the light path to report failure", () => {
+posixTest(WIN32_BASH_OCP, "#241 MEDIUM-1 (the money test): a python3 failure isolated to the package.json version read does NOT force the light path to report failure", () => {
   const r = _bwHarnessRun({
     kind: "update", args: ["update"], pythonPackageJsonFails: true,
     // postFlightExit deliberately NOT set to 0 here -- if the code wrongly still called
@@ -30373,7 +30406,7 @@ test("#241 MEDIUM-1 (the money test): a python3 failure isolated to the package.
     `--post-flight-only must not be invoked with an unverifiable "v?" target at all; log=${JSON.stringify(r.log)}`);
 });
 
-test("#241 MEDIUM-1 control: with python3 fully healthy, the SAME scenario still runs strict post-flight verification normally", () => {
+posixTest(WIN32_BASH_OCP, "#241 MEDIUM-1 control: with python3 fully healthy, the SAME scenario still runs strict post-flight verification normally", () => {
   const r = _bwHarnessRun({ kind: "update", args: ["update"], postFlightExit: 0 });
   assert.equal(r.status, 0, `expected success; status=${r.status} stderr=${r.stderr}`);
   assert.ok(r.log.some((l) => l.includes("FAKE-NODE-CALL") && l.includes("--post-flight-only") && l.includes("v3.26.0")),
@@ -30398,7 +30431,7 @@ test("#241 MEDIUM-1: postFlightOk() itself, driven directly, confirms WHY 'v?' i
 // `--target=vX.Y.Z` (one token, the equals form) must be detected — the equals form is exactly
 // the silently-ignored pin this fix exists to eliminate, and the original guard only matched the
 // two-token form.
-test("#241: --target (two-token form) on the light path prints an explicit no-op warning on STDERR instead of being silently ignored", () => {
+posixTest(WIN32_BASH_OCP, "#241: --target (two-token form) on the light path prints an explicit no-op warning on STDERR instead of being silently ignored", () => {
   const r = _bwHarnessRun({ kind: "update", args: ["update", "--target", "v9.9.9"] });
   assert.ok(r.stderr.includes("--target v9.9.9 is not honored on the light/patch-bump path"),
     `expected the explicit --target no-op warning on stderr, got: ${JSON.stringify(r.stderr)}`);
@@ -30407,7 +30440,7 @@ test("#241: --target (two-token form) on the light path prints an explicit no-op
   assert.ok(_bwCalled(r.log, "FAKE-GIT-CALL"), `--target must not BLOCK the ordinary light-path update; log=${JSON.stringify(r.log)}`);
 });
 
-test("#241 LOW-6: --target=vX.Y.Z (equals form, one token) is ALSO detected, not just the two-token form", () => {
+posixTest(WIN32_BASH_OCP, "#241 LOW-6: --target=vX.Y.Z (equals form, one token) is ALSO detected, not just the two-token form", () => {
   const r = _bwHarnessRun({ kind: "update", args: ["update", "--target=v9.9.9"] });
   assert.ok(r.stderr.includes("--target v9.9.9 is not honored on the light/patch-bump path"),
     `expected the equals form to be recognized and its value extracted; stderr=${JSON.stringify(r.stderr)}`);
@@ -30420,7 +30453,7 @@ test("#241 control: light path WITHOUT --target prints no --target warning at al
     `must not print the --target warning when --target was never passed; stdout=${JSON.stringify(r.stdout)} stderr=${JSON.stringify(r.stderr)}`);
 });
 
-test("#241: --target warning still fires under --dry-run (detected before the dry-run early-return, matching --target reaching this function per #235)", () => {
+posixTest(WIN32_BASH_OCP, "#241: --target warning still fires under --dry-run (detected before the dry-run early-return, matching --target reaching this function per #235)", () => {
   const r = _bwHarnessRun({ kind: "update", args: ["update", "--target", "v9.9.9", "--dry-run"] });
   assert.ok(r.stderr.includes("--target v9.9.9 is not honored on the light/patch-bump path"),
     `expected the warning even under --dry-run, got stderr=${JSON.stringify(r.stderr)}`);
@@ -30428,7 +30461,7 @@ test("#241: --target warning still fires under --dry-run (detected before the dr
   assert.ok(!_bwCalled(r.log, "FAKE-GIT-CALL"), `--dry-run must still prevent the git pull; log=${JSON.stringify(r.log)}`);
 });
 
-test("#241: cmd_update_help documents the light-path --target caveat", () => {
+posixTest(WIN32_BASH_OCP, "#241: cmd_update_help documents the light-path --target caveat", () => {
   const r = _bwHarnessRun({ args: ["update", "--help"] });
   assert.equal(r.status, 0, `expected --help to exit cleanly; status=${r.status} stderr=${r.stderr}`);
   assert.ok(r.stdout.includes("--target"), `expected --target to be mentioned at all in help output; got: ${JSON.stringify(r.stdout)}`);
@@ -30440,7 +30473,7 @@ test("#241: cmd_update_help documents the light-path --target caveat", () => {
 // untouched by this PR -- _cmd_update_light is a distinct function; this PR does not modify
 // _cmd_update_restart at all. Re-asserts the pre-existing "non-regression control" test's own
 // invariant explicitly under the #241 banner so a future reviewer sees it was checked here too.
-test("#241 non-regression: _cmd_update_restart (the sibling 'restart' kind) is unaffected -- still restarts + post-flight verifies, never touches git", () => {
+posixTest(WIN32_BASH_OCP, "#241 non-regression: _cmd_update_restart (the sibling 'restart' kind) is unaffected -- still restarts + post-flight verifies, never touches git", () => {
   const r = _bwHarnessRun({ kind: "restart", args: ["update"] });
   assert.ok(!_bwCalled(r.log, "FAKE-GIT-CALL"), `restart kind must never touch git; log=${JSON.stringify(r.log)}`);
   assert.ok(_bwCalled(r.log, "FAKE-CMD-RESTART-CALLED"), `cmd_restart must run; log=${JSON.stringify(r.log)}`);
@@ -30635,7 +30668,7 @@ function _cuArgv(log) {
   return { argc, args };
 }
 
-test("ocp `ocp keys` (list) must not die with 'unbound variable' when _AUTH_ARGS is empty (bash 3.2 set -u, issue #256)", () => {
+posixTest(WIN32_BASH_OCP, "ocp `ocp keys` (list) must not die with 'unbound variable' when _AUTH_ARGS is empty (bash 3.2 set -u, issue #256)", () => {
   const r = _cuRun(["keys"], [
     `  *"/api/keys"*)`,
     `    echo '{"keys": []}'`,
@@ -30667,7 +30700,7 @@ test("ocp `ocp keys` (list) must not die with 'unbound variable' when _AUTH_ARGS
     `no curl argument may be an empty string; args=${JSON.stringify(args)}`);
 });
 
-test("ocp `ocp usage --by-key` must not die with 'unbound variable' when _AUTH_ARGS is empty (bash 3.2 set -u, issue #256)", () => {
+posixTest(WIN32_BASH_OCP, "ocp `ocp usage --by-key` must not die with 'unbound variable' when _AUTH_ARGS is empty (bash 3.2 set -u, issue #256)", () => {
   const r = _cuRun(["usage", "--by-key"], [
     `  *"/api/usage"*)`,
     `    echo '{"byKey": []}'`,
