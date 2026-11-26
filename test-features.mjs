@@ -3152,7 +3152,7 @@ test("localToolsSafetyError: multi is checked before loopback/anon (most severe 
 // silently reverted with the unit suite still green — the maintainer's #1 rejection pattern.
 import { spawn as _ltSpawn, execFileSync as _ltExecFile } from "node:child_process";
 import { createServer as _ltNetServer, connect as _ltNetConnect } from "node:net";
-import { createServer as _ltHttpServer } from "node:http";
+import { createServer as _ltHttpServer, request as _ltHttpRequest } from "node:http";
 import { writeFileSync as _ltWrite, chmodSync as _ltChmod, readFileSync as _ltRead, existsSync as _ltExists, rmSync as _ltRm, mkdtempSync as _ltMkdtemp, renameSync as _ltRename, mkdirSync as _ltMkdirSync, realpathSync as _ltRealpath, readdirSync as _ltReaddir } from "node:fs";
 import { tmpdir as _ltTmp } from "node:os";
 import { sep as _ltSep } from "node:path";
@@ -8493,6 +8493,134 @@ ltTest("integration (#474 control): a normal spawn still completes with the deta
         "fixture A must answer normally — the control that the detached/group-kill change did not break the happy path");
     } finally { child.kill("SIGKILL"); await ltDrain(() => buf.closed, "474-control", 5000); }
   } finally { _ltRmRetry(dir); }
+});
+
+// ── #551: streaming disconnect SIGKILL escalation must survive direct child 'exit' ────────────
+//
+// callClaudeStreaming's res.on("close") used to arm a bare 5 s setTimeout and clear it on
+// `proc.once("exit", ...)`. When a client disconnects mid-stream and `killChildTree(proc, "SIGTERM")`
+// signals the process group, the direct `claude` child dies on SIGTERM and emits 'exit' right away
+// — disarming the 5 s SIGKILL escalation and leaving any SIGTERM-ignoring grandchild alive.
+// Wiring `scheduleKillEscalation(proc, killChildTree)` cancels ONLY when 'close' fires AND the
+// process group is empty (`groupEmpty(proc.pid)`), so a surviving grandchild is still killed 5 s
+// later by SIGKILL — even when it redirected stdio away from the inherited pipes so 'close' fires.
+const LT551_FAKE = `#!/bin/sh
+if [ "$1" = "auth" ] && [ "$2" = "status" ]; then
+  echo '{"loggedIn":true}'
+  exit 0
+fi
+echo $$ > "$PARENT_PID_FILE.tmp" && mv "$PARENT_PID_FILE.tmp" "$PARENT_PID_FILE"
+trap '' TERM
+sleep 60 </dev/null >/dev/null 2>&1 &
+GP=$!
+trap - TERM
+echo "$GP" > "$GRANDCHILD_PID_FILE.tmp" && mv "$GRANDCHILD_PID_FILE.tmp" "$GRANDCHILD_PID_FILE"
+cat >/dev/null
+printf '%s\\n' '{"type":"stream_event","event":{"type":"content_block_delta","delta":{"type":"text_delta","text":"hello-551"}}}'
+exec sleep 60
+`;
+
+posixLtTest(WIN32_SH_CLAUDE, "integration (#551): streaming client disconnect escalates SIGKILL to a SIGTERM-ignoring grandchild", async () => {
+  const dir = ltMkdir();
+  const fake = join(dir, "claude-551");
+  _ltWrite(fake, LT551_FAKE);
+  _ltChmod(fake, 0o755);
+  const parentPidFile = join(dir, "parent.pid");
+  const grandchildPidFile = join(dir, "grandchild.pid");
+  const isEsrch = (pid) => {
+    try { process.kill(pid, 0); return false; }
+    catch (e) { if (e?.code === "ESRCH") return true; throw e; }
+  };
+  try {
+    const { child, buf, port } = await ltBootFresh({
+      CLAUDE_BIN: fake,
+      CLAUDE_TIMEOUT: "30000",
+      PARENT_PID_FILE: parentPidFile,
+      GRANDCHILD_PID_FILE: grandchildPidFile,
+    }, dir);
+    try {
+      assert.ok(await ltWait(() => buf.out.includes("listening on")), `— ${ltDiag(buf)}`);
+      const psBlind = lt474PsSanity(child.pid);
+      assert.ok(!psBlind, `the liveness oracle is blind on this platform — ${psBlind}`);
+
+      const body = JSON.stringify({ model: "sonnet", stream: true, messages: [{ role: "user", content: "hi" }] });
+      let sseText = "";
+      let respStatus = null;
+      let sseHeaders = null;
+      let reqErr = null;
+      let destroyed = false;
+      const req = _ltHttpRequest({
+        hostname: "127.0.0.1",
+        port,
+        path: "/v1/chat/completions",
+        method: "POST",
+        agent: false,
+        headers: {
+          "Content-Type": "application/json",
+          "Content-Length": Buffer.byteLength(body),
+        },
+      }, (res) => {
+        respStatus = res.statusCode;
+        sseHeaders = res.headers;
+        res.setEncoding("utf8");
+        res.on("data", (chunk) => { sseText += chunk; });
+        res.on("error", () => {});
+      });
+      req.on("error", (e) => { if (!destroyed) reqErr = e; });
+      req.end(body);
+
+      assert.ok(await ltWait(() =>
+        reqErr || (_ltExists(parentPidFile) && _ltExists(grandchildPidFile) && sseText.includes("hello-551")),
+        10000),
+        `streaming SSE chunk and pid files did not arrive (status=${respStatus}, sse=${JSON.stringify(sseText.slice(0, 200))}) — ${ltDiag(buf)}`);
+      assert.equal(reqErr, null, `unexpected request error before disconnect: ${reqErr?.message}`);
+      assert.equal(respStatus, 200, `expected 200 SSE response, got ${respStatus}`);
+      assert.match(sseHeaders?.["content-type"] || "", /text\/event-stream/, "expected SSE content-type");
+
+      const pp = parseInt(_ltRead(parentPidFile, "utf8").trim(), 10);
+      const gp = parseInt(_ltRead(grandchildPidFile, "utf8").trim(), 10);
+      assert.ok(Number.isInteger(pp) && pp > 0, `invalid parent pid: ${_ltRead(parentPidFile, "utf8")}`);
+      assert.ok(Number.isInteger(gp) && gp > 0 && gp !== pp, `invalid grandchild pid: ${_ltRead(grandchildPidFile, "utf8")}`);
+
+      const ppStart = lt474Start(pp);
+      const gpStart = lt474Start(gp);
+      assert.ok(lt474Alive(pp, ppStart), `premise: fake claude parent (pid ${pp}) must be alive before disconnect`);
+      assert.ok(lt474Alive(gp, gpStart), `premise: grandchild (pid ${gp}) must be alive before disconnect`);
+      assert.doesNotThrow(() => process.kill(gp, 0), "premise: grandchild must respond to kill(0) before disconnect");
+
+      destroyed = true;
+      const disconnectAt = Date.now();
+      req.destroy();
+
+      // Step 1: direct fake claude child exits promptly on SIGTERM.
+      const parentDied = await ltWait(() => !lt474Alive(pp, ppStart) && isEsrch(pp), 4000);
+      assert.ok(parentDied, `direct fake claude child (pid ${pp}) did not exit on SIGTERM — ${ltDiag(buf)}`);
+
+      // Step 2: SIGTERM-ignoring grandchild initially survives SIGTERM (even after parent exited).
+      await new Promise((r) => setTimeout(r, 200));
+      assert.ok(lt474Alive(gp, gpStart),
+        `premise: SIGTERM-ignoring grandchild (pid ${gp}) died too early on SIGTERM instead of surviving to SIGKILL escalation`);
+      assert.doesNotThrow(() => process.kill(gp, 0),
+        `premise: grandchild (pid ${gp}) must still be alive after SIGTERM`);
+
+      // Step 3: 5 s SIGKILL escalation kills the surviving grandchild (ESRCH within ~8s).
+      const killedByEscalation = await ltWait(() => isEsrch(gp), 8500);
+      const escalationElapsed = Date.now() - disconnectAt;
+      assert.ok(killedByEscalation,
+        `SIGTERM-ignoring grandchild (pid ${gp}) is still alive ${escalationElapsed}ms after disconnect — 5s SIGKILL escalation did not kill the process group — ${lt474KillDiag(grandchildPidFile, buf)}`);
+      assert.throws(() => process.kill(gp, 0), { code: "ESRCH" },
+        `grandchild (pid ${gp}) must throw ESRCH after 5s SIGKILL escalation`);
+      assert.ok(escalationElapsed >= 4500,
+        `grandchild (pid ${gp}) died at ${escalationElapsed}ms — expected ~5s SIGKILL escalation, not initial SIGTERM`);
+    } finally {
+      child.kill("SIGKILL");
+      await ltDrain(() => buf.closed, "551-disconnect", 5000);
+    }
+  } finally {
+    lt474ReapGrandchild(grandchildPidFile);
+    lt474ReapGrandchild(parentPidFile);
+    _ltRmRetry(dir);
+  }
 });
 
 // #512 split this test in two: the rendering is the same on both input paths, but WHERE the
@@ -23102,7 +23230,7 @@ async function runAsyncTests() {
   await testAsync("#500 'exit' without 'close' does NOT cancel the escalation (the #474 stuck-pipe shape)", async () => {
     // The parent has been reaped while a grandchild still holds the stdout pipe: 'exit' has
     // fired, 'close' has not. This is precisely the case #474 exists for, so clearing on 'exit'
-    // — what the disconnect site (#111) does, and the obvious thing to copy — would cancel the
+    // — what the disconnect site (#111) did until #551, and the obvious thing to copy — would cancel the
     // one kill that matters.
     const proc = _esc(); const sigs = [];
     _occupied(proc, (_p, sig) => sigs.push(sig), 30);
