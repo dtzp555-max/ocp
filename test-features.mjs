@@ -33062,6 +33062,155 @@ ltTest("ADR 0020: an unparseable OCP_ALLOWED_HOSTS entry is REPORTED at boot, no
   } finally { child.kill("SIGKILL"); _ltRmRetry(dir); }
 });
 
+// ── ADR 0025 (#542): OCP_TRUST_LOOPBACK=0 (same-host reverse proxy auth enforcement) ────────
+posixLtTest(WIN32_SH_CLAUDE, "ADR 0025 (#542): OCP_TRUST_LOOPBACK=0 enforces shared-mode auth on loopback and hides /health anonymousKey", async () => {
+  const dir = ltMkdir(); const fake = ltFake(dir);
+  try {
+    const { child, buf, port } = await ltBootFresh(
+      { CLAUDE_BIN: fake, CLAUDE_AUTH_MODE: "shared", PROXY_API_KEY: "test-shared-542", OCP_TRUST_LOOPBACK: "0" }, dir);
+    try {
+      assert.ok(await ltWait(() => buf.out.includes("Loopback trust: disabled") || buf.exit != null),
+        `boot banner did not announce disabled loopback trust — ${ltDiag(buf)}`);
+      const noTokModels = await fetch(`http://127.0.0.1:${port}/v1/models`);
+      assert.equal(noTokModels.status, 401, `loopback without token must be 401 on /v1/models; got ${noTokModels.status}`);
+      const noTokSettings = await fetch(`http://127.0.0.1:${port}/settings`);
+      assert.equal(noTokSettings.status, 401, `loopback without token must be 401 on /settings; got ${noTokSettings.status}`);
+      const wrongTok = await fetch(`http://127.0.0.1:${port}/v1/models`, { headers: { Authorization: "Bearer wrong-key" } });
+      assert.equal(wrongTok.status, 401, `wrong Bearer token on loopback must be 401; got ${wrongTok.status}`);
+      const okModels = await fetch(`http://127.0.0.1:${port}/v1/models`, { headers: { Authorization: "Bearer test-shared-542" } });
+      assert.equal(okModels.status, 200, `valid shared key on loopback must be 200 on /v1/models; got ${okModels.status}`);
+      const okSettings = await fetch(`http://127.0.0.1:${port}/settings`, { headers: { Authorization: "Bearer test-shared-542" } });
+      assert.equal(okSettings.status, 200, `valid shared key on loopback must be 200 on /settings; got ${okSettings.status}`);
+      const healthRes = await fetch(`http://127.0.0.1:${port}/health`, { headers: { "X-Forwarded-For": "203.0.113.8" } });
+      assert.equal(healthRes.status, 200, `/health must remain public; got ${healthRes.status}`);
+      const healthBody = await healthRes.json();
+      assert.equal(Object.hasOwn(healthBody, "anonymousKey"), false,
+        `/health must omit anonymousKey on loopback when OCP_TRUST_LOOPBACK=0 (without PROXY_ADVERTISE_ANON_KEY=1)`);
+      assert.ok(!buf.err.includes("loopback_forwarded_header_seen"),
+        `when OCP_TRUST_LOOPBACK=0 is already active, X-Forwarded-For must NOT emit the bypass warning — ${ltDiag(buf)}`);
+    } finally { child.kill("SIGKILL"); await ltDrain(() => buf.closed, "adr25-shared", 5000); }
+  } finally { _ltRmRetry(dir); }
+});
+
+posixLtTest(WIN32_SH_CLAUDE, "ADR 0025 (#542): OCP_TRUST_LOOPBACK=0 enforces multi-mode auth, admin gate, and /health anonymousKey hiding on loopback", async () => {
+  const dir = ltMkdir(); const fake = ltFake(dir);
+  try {
+    const { child, buf, port } = await ltBootFresh(
+      { CLAUDE_BIN: fake, CLAUDE_AUTH_MODE: "multi", OCP_ADMIN_KEY: "test-admin-542", PROXY_ANONYMOUS_KEY: "test-anon-542", OCP_TRUST_LOOPBACK: "0" }, dir);
+    try {
+      assert.ok(await ltWait(() => buf.out.includes("Loopback trust: disabled") || buf.exit != null),
+        `boot banner did not announce disabled loopback trust — ${ltDiag(buf)}`);
+      const anonKeys = await fetch(`http://127.0.0.1:${port}/api/keys`);
+      assert.equal(anonKeys.status, 403, `keyless loopback in multi mode must not be admin (/api/keys); got ${anonKeys.status}`);
+      const anonSettings = await fetch(`http://127.0.0.1:${port}/settings`);
+      assert.equal(anonSettings.status, 403, `keyless loopback in multi mode must not be admin (/settings); got ${anonSettings.status}`);
+      const badTok = await fetch(`http://127.0.0.1:${port}/v1/models`, { headers: { Authorization: "Bearer ocp_invalid" } });
+      assert.equal(badTok.status, 401, `invalid token on loopback in multi mode must be 401; got ${badTok.status}`);
+
+      // Mint a regular DB key using OCP_ADMIN_KEY, then confirm it can call /v1/models but NOT /api/keys.
+      const createRes = await fetch(`http://127.0.0.1:${port}/api/keys`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Authorization: "Bearer test-admin-542" },
+        body: JSON.stringify({ name: "loopback-user" }),
+      });
+      assert.equal(createRes.status, 201, `admin key must still mint keys on loopback; got ${createRes.status}`);
+      const { key: userKey } = await createRes.json();
+      assert.ok(userKey, "expected minted key");
+      const userModels = await fetch(`http://127.0.0.1:${port}/v1/models`, { headers: { Authorization: `Bearer ${userKey}` } });
+      assert.equal(userModels.status, 200, `regular DB key must be admitted on /v1/models; got ${userModels.status}`);
+      const userAdmin = await fetch(`http://127.0.0.1:${port}/api/keys`, { headers: { Authorization: `Bearer ${userKey}` } });
+      assert.equal(userAdmin.status, 403, `regular DB key on loopback must NOT be admin; got ${userAdmin.status}`);
+      const adminSettings = await fetch(`http://127.0.0.1:${port}/settings`, { headers: { Authorization: "Bearer test-admin-542" } });
+      assert.equal(adminSettings.status, 200, `OCP_ADMIN_KEY must still access /settings; got ${adminSettings.status}`);
+
+      const healthRes = await fetch(`http://127.0.0.1:${port}/health`);
+      assert.equal(healthRes.status, 200);
+      const healthBody = await healthRes.json();
+      assert.equal(Object.hasOwn(healthBody, "anonymousKey"), false,
+        `/health must omit anonymousKey on loopback when OCP_TRUST_LOOPBACK=0 even if PROXY_ANONYMOUS_KEY is set`);
+    } finally { child.kill("SIGKILL"); await ltDrain(() => buf.closed, "adr25-multi", 5000); }
+  } finally { _ltRmRetry(dir); }
+});
+
+posixLtTest(WIN32_SH_CLAUDE, "ADR 0025 (#542) control: default OCP_TRUST_LOOPBACK keeps loopback trusted and warns ONCE on X-Forwarded-For/Forwarded", async () => {
+  const dir = ltMkdir(); const fake = ltFake(dir);
+  try {
+    const { child, buf, port } = await ltBootFresh(
+      { CLAUDE_BIN: fake, CLAUDE_AUTH_MODE: "shared", PROXY_API_KEY: "test-shared-542", OCP_TRUST_LOOPBACK: "" }, dir);
+    try {
+      assert.ok(await ltWait(() => buf.out.includes("listening on") || buf.exit != null),
+        `server did not start — ${ltDiag(buf)}`);
+      const modelsRes = await fetch(`http://127.0.0.1:${port}/v1/models`);
+      assert.equal(modelsRes.status, 200, `default loopback must stay admitted; got ${modelsRes.status}`);
+      const settingsRes = await fetch(`http://127.0.0.1:${port}/settings`);
+      assert.equal(settingsRes.status, 200, `default loopback must stay admin; got ${settingsRes.status}`);
+      const healthBody = await (await fetch(`http://127.0.0.1:${port}/health`)).json();
+      assert.equal(Object.hasOwn(healthBody, "anonymousKey"), true,
+        `default loopback /health must still include anonymousKey`);
+      assert.ok(!buf.err.includes("loopback_forwarded_header_seen"),
+        `ordinary loopback requests WITHOUT forwarding headers must NOT trigger loopback_forwarded_header_seen — ${ltDiag(buf)}`);
+
+      const fwd1 = await fetch(`http://127.0.0.1:${port}/v1/models`, { headers: { "X-Forwarded-For": "203.0.113.9" } });
+      assert.equal(fwd1.status, 200, `warning must not change response status; got ${fwd1.status}`);
+      assert.ok(await ltWait(() => buf.err.includes("loopback_forwarded_header_seen"), 5000),
+        `loopback request with X-Forwarded-For while auth enabled must log loopback_forwarded_header_seen — ${ltDiag(buf)}`);
+      const fwd2 = await fetch(`http://127.0.0.1:${port}/v1/models`, { headers: { Forwarded: "for=203.0.113.10" } });
+      assert.equal(fwd2.status, 200);
+      await new Promise((r) => setTimeout(r, 50));
+      const hits = (buf.err.match(/loopback_forwarded_header_seen/g) || []).length;
+      assert.equal(hits, 1, `loopback_forwarded_header_seen must be one-shot (expected 1, got ${hits})`);
+    } finally { child.kill("SIGKILL"); await ltDrain(() => buf.closed, "adr25-control", 5000); }
+  } finally { _ltRmRetry(dir); }
+});
+
+posixLtTest(WIN32_SH_CLAUDE, "ADR 0025 (#542): RFC 7239 Forwarded header triggers the one-shot warning; AUTH_MODE=none does not", async () => {
+  const dir = ltMkdir(); const fake = ltFake(dir);
+  try {
+    const boot1 = await ltBootFresh(
+      { CLAUDE_BIN: fake, CLAUDE_AUTH_MODE: "shared", PROXY_API_KEY: "test-shared-542", OCP_TRUST_LOOPBACK: "" }, dir);
+    try {
+      assert.ok(await ltWait(() => boot1.buf.out.includes("listening on") || boot1.buf.exit != null),
+        `server did not start — ${ltDiag(boot1.buf)}`);
+      const r = await fetch(`http://127.0.0.1:${boot1.port}/v1/models`, { headers: { Forwarded: "for=203.0.113.10" } });
+      assert.equal(r.status, 200);
+      assert.ok(await ltWait(() => boot1.buf.err.includes("loopback_forwarded_header_seen"), 5000),
+        `RFC 7239 Forwarded header must trigger loopback_forwarded_header_seen — ${ltDiag(boot1.buf)}`);
+    } finally { boot1.child.kill("SIGKILL"); await ltDrain(() => boot1.buf.closed, "adr25-fwd", 5000); }
+
+    const boot2 = await ltBootFresh(
+      { CLAUDE_BIN: fake, CLAUDE_AUTH_MODE: "none", OCP_TRUST_LOOPBACK: "" }, dir);
+    try {
+      assert.ok(await ltWait(() => boot2.buf.out.includes("listening on") || boot2.buf.exit != null),
+        `server did not start — ${ltDiag(boot2.buf)}`);
+      const r = await fetch(`http://127.0.0.1:${boot2.port}/v1/models`, { headers: { "X-Forwarded-For": "203.0.113.11" } });
+      assert.equal(r.status, 200);
+      assert.ok(!boot2.buf.err.includes("loopback_forwarded_header_seen"),
+        `AUTH_MODE=none has no auth to bypass and must NOT emit loopback_forwarded_header_seen — ${ltDiag(boot2.buf)}`);
+    } finally { boot2.child.kill("SIGKILL"); await ltDrain(() => boot2.buf.closed, "adr25-none-fwd", 5000); }
+  } finally { _ltRmRetry(dir); }
+});
+
+posixLtTest(WIN32_SH_CLAUDE, "ADR 0025 (#542): OCP_TRUST_LOOPBACK=0 warns at boot when AUTH_MODE=multi has no OCP_ADMIN_KEY or AUTH_MODE=none", async () => {
+  const dir = ltMkdir(); const fake = ltFake(dir);
+  try {
+    const boot1 = await ltBootFresh(
+      { CLAUDE_BIN: fake, CLAUDE_AUTH_MODE: "multi", OCP_TRUST_LOOPBACK: "0", OCP_ADMIN_KEY: "" }, dir);
+    try {
+      assert.ok(await ltWait(() => boot1.buf.err.includes("OCP_TRUST_LOOPBACK=0 with AUTH_MODE=multi and no OCP_ADMIN_KEY")
+                                && boot1.buf.out.includes("Loopback trust: disabled"), 5000),
+        `missing boot warning for multi + OCP_TRUST_LOOPBACK=0 without OCP_ADMIN_KEY — ${ltDiag(boot1.buf)}`);
+    } finally { boot1.child.kill("SIGKILL"); await ltDrain(() => boot1.buf.closed, "adr25-warn-multi", 5000); }
+
+    const boot2 = await ltBootFresh(
+      { CLAUDE_BIN: fake, CLAUDE_AUTH_MODE: "none", OCP_TRUST_LOOPBACK: "0" }, dir);
+    try {
+      assert.ok(await ltWait(() => boot2.buf.err.includes("OCP_TRUST_LOOPBACK=0 is set but AUTH_MODE is 'none'")
+                                && boot2.buf.out.includes("Loopback trust: disabled"), 5000),
+        `missing boot warning for none + OCP_TRUST_LOOPBACK=0 — ${ltDiag(boot2.buf)}`);
+    } finally { boot2.child.kill("SIGKILL"); await ltDrain(() => boot2.buf.closed, "adr25-warn-none", 5000); }
+  } finally { _ltRmRetry(dir); }
+});
+
 // ── ADR 0020 unit level: the decision, without a socket ───────────────────────────────────
 //
 // The live-server tests above prove the gate is WIRED. These prove it DECIDES correctly across a

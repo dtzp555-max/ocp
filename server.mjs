@@ -32,6 +32,7 @@
  *   CLAUDE_BREAKER_WINDOW        — sliding window duration in ms (default: 300000 = 5min)
  *   CLAUDE_BREAKER_HALF_OPEN_MAX — max concurrent probes in half-open state (default: 2)
  *   PROXY_API_KEY                — Bearer token for API auth (optional)
+ *   OCP_TRUST_LOOPBACK           — "0": disable implicit loopback auth/admin trust (for same-host reverse proxies, ADR 0025)
  *   CLAUDE_HEARTBEAT_INTERVAL    — SSE heartbeat interval in ms on streaming path (default: 0 = disabled)
  */
 import { AsyncLocalStorage } from "node:async_hooks";
@@ -570,11 +571,16 @@ const CONFIG_EPOCH = cryptoCreateHash("sha256")
   .digest("hex").slice(0, 16);
 const ADMIN_KEY = process.env.OCP_ADMIN_KEY || "";
 const PROXY_ANONYMOUS_KEY = process.env.PROXY_ANONYMOUS_KEY || "";
+// ADR 0025 (#542). Default ON (unset or any value other than "0"): loopback peers bypass
+// shared/multi Bearer rejection, are always admin, and receive `anonymousKey` on /health.
+// Set OCP_TRUST_LOOPBACK=0 when a same-host reverse proxy (nginx/Caddy) connects from
+// 127.0.0.1 / ::1 — otherwise every forwarded remote caller inherits loopback trust.
+const TRUST_LOOPBACK = process.env.OCP_TRUST_LOOPBACK !== "0";
+let _warnedLoopbackForwarded = false;
 // When set to "1", advertise PROXY_ANONYMOUS_KEY in the public /health body so
 // remote `ocp-connect` devices can zero-config auto-discover it (issue #12 §14 Path A).
 // Default OFF: /health is unauthenticated, so advertising hands the shared key to any
-// LAN-reachable device (issue #109 P0). Localhost callers always see it regardless,
-// since localhost is already fully trusted by the auth path.
+// LAN-reachable device (issue #109 P0). Trusted loopback callers see it regardless.
 const ADVERTISE_ANON_KEY = process.env.PROXY_ADVERTISE_ANON_KEY === "1";
 
 // #327, additive under ADR 0012. A non-primary OCP instance names itself.
@@ -1040,6 +1046,16 @@ if (PROXY_ANONYMOUS_KEY && AUTH_MODE !== "multi") {
 
 if (AUTH_MODE === "shared" && !PROXY_API_KEY) {
   console.warn("WARNING: AUTH_MODE=shared but PROXY_API_KEY is not set — all requests will pass unauthenticated");
+}
+
+if (!TRUST_LOOPBACK && AUTH_MODE === "none") {
+  console.warn("WARNING: OCP_TRUST_LOOPBACK=0 is set but AUTH_MODE is 'none' — no auth is configured to enforce (ADR 0025)");
+}
+if (!TRUST_LOOPBACK && AUTH_MODE === "shared" && !PROXY_API_KEY) {
+  console.warn("WARNING: OCP_TRUST_LOOPBACK=0 with AUTH_MODE=shared but PROXY_API_KEY is unset — requests still pass unauthenticated (ADR 0025)");
+}
+if (!TRUST_LOOPBACK && AUTH_MODE === "multi" && !ADMIN_KEY) {
+  console.warn("WARNING: OCP_TRUST_LOOPBACK=0 with AUTH_MODE=multi and no OCP_ADMIN_KEY — admin endpoints (/settings, /logs, /api/keys, /cache) will be unreachable until OCP_ADMIN_KEY is set (ADR 0025)");
 }
 
 const VERSION = _pkg.version;
@@ -5241,15 +5257,25 @@ async function handleRequest(req, res) {
   const isPublicEndpoint = pathname === "/health" || pathname === "/dashboard";
   const remoteAddr = req.socket.remoteAddress || "";
   const isLocalhost = remoteAddr === "127.0.0.1" || remoteAddr === "::1" || remoteAddr === "::ffff:127.0.0.1";
-  let authKeyName = isLocalhost ? "local" : "remote";
+  const isTrustedLocal = isLocalhost && TRUST_LOOPBACK;
+  if (isTrustedLocal && AUTH_MODE !== "none" && !_warnedLoopbackForwarded
+      && (req.headers["x-forwarded-for"] || req.headers["forwarded"])) {
+    _warnedLoopbackForwarded = true;
+    logEvent("warn", "loopback_forwarded_header_seen", {
+      authMode: AUTH_MODE,
+      path: pathname,
+      hint: "Loopback request carries X-Forwarded-For/Forwarded while OCP_TRUST_LOOPBACK is enabled — a same-host reverse proxy bypasses auth and admin gates. Set OCP_TRUST_LOOPBACK=0 (ADR 0025).",
+    });
+  }
+  let authKeyName = isTrustedLocal ? "local" : "remote";
   let authKeyId = null;
 
   if (!isPublicEndpoint) {
     const auth = req.headers["authorization"] || "";
     const token = auth.startsWith("Bearer ") ? auth.slice(7) : "";
 
-    if (isLocalhost) {
-      // Localhost always allowed — try to identify key if provided, but never reject
+    if (isTrustedLocal) {
+      // Trusted loopback always allowed — try to identify key if provided, but never reject
       if (token) {
         if (ADMIN_KEY) {
           const adminBuf = Buffer.from(ADMIN_KEY);
@@ -5321,9 +5347,9 @@ async function handleRequest(req, res) {
 
   // isAdmin computed here (early, before any admin-gated handler) so that
   // GET /logs, GET /usage, GET /status, PATCH /settings
-  // can all gate on it.  Localhost and explicit admin key are always admin;
+  // can all gate on it.  Trusted loopback and explicit admin key are always admin;
   // in multi-tenant mode only the "admin" named key qualifies.
-  const isAdmin = AUTH_MODE !== "multi" || authKeyName === "admin" || isLocalhost;
+  const isAdmin = AUTH_MODE !== "multi" || authKeyName === "admin" || isTrustedLocal;
 
   // GET /v1/models
   if (req.url === "/v1/models" && req.method === "GET") {
@@ -5357,7 +5383,7 @@ async function handleRequest(req, res) {
       claudeBinary: CLAUDE,
       claudeBinaryOk: binaryOk,
       authMode: AUTH_MODE,
-      ...((isLocalhost || ADVERTISE_ANON_KEY) ? { anonymousKey: PROXY_ANONYMOUS_KEY || null } : {}),
+      ...((isTrustedLocal || ADVERTISE_ANON_KEY) ? { anonymousKey: PROXY_ANONYMOUS_KEY || null } : {}),
       auth: effectiveAuthStatus(), // #308: the TTL on a request-verified verdict is applied at read time
       // #327: empty string rather than omitted, so a consumer can tell "primary" from "an older
       // build that does not report this at all" — the same distinction #324's backward-compat
@@ -6019,6 +6045,7 @@ server.listen(PORT, BIND_ADDRESS, () => {
   console.log(`Auth: ${PROXY_API_KEY ? "enabled (PROXY_API_KEY set)" : "disabled (no PROXY_API_KEY)"}`);
   console.log(`Auth mode: ${AUTH_MODE}${AUTH_MODE === "shared" ? " (PROXY_API_KEY)" : AUTH_MODE === "multi" ? " (per-user keys)" : " (open)"}`);
   console.log(`Bind: ${BIND_ADDRESS}${BIND_ADDRESS === "0.0.0.0" ? " ⚠ LAN-accessible" : ""}`);
+  if (!TRUST_LOOPBACK) console.log(`Loopback trust: disabled (OCP_TRUST_LOOPBACK=0 — loopback callers must authenticate)`);
   // Which of the three system-prompt wrappers this boot selected. Operator-facing because the
   // choice is invisible otherwise (the prompt travels in a 0600 temp file, #453) and because the
   // defect it replaces was exactly a mismatch between what the operator believed the model was
