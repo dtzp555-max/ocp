@@ -885,9 +885,11 @@ cmd_lan() {
     *)
       echo "  Status: ✗ Not LAN-accessible (bound to localhost only)"
       echo ""
-      echo "  To enable LAN mode, set env var and restart:"
-      echo "    CLAUDE_BIND=0.0.0.0"
+      echo "  To enable LAN mode (recommended — per-user auth, built-in host tools emptied):"
+      echo "    node setup.mjs --bind 0.0.0.0 --auth-mode multi"
+      echo "    # Or set CLAUDE_BIND=0.0.0.0 and CLAUDE_AUTH_MODE=multi (or shared + PROXY_API_KEY), then:"
       echo "    ocp restart"
+      echo "  (Open LAN without auth is refused at boot unless OCP_ALLOW_OPEN_LAN=1 is set; see ADR 0026.)"
       ;;
   esac
 }

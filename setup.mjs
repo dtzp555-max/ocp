@@ -25,6 +25,7 @@ import { join, dirname } from "node:path";
 import { homedir } from "node:os";
 import { fileURLToPath } from "node:url";
 import { DEFAULT_PORT } from "./lib/constants.mjs";
+import { resolveSetupAuthMode } from "./lib/net.mjs";
 import { scrubInboundAuthEnv } from "./lib/spawn-auth.mjs";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -56,7 +57,11 @@ const SKIP_START = flag("no-start");
 // setup.mjs-local assignment that no test can reach.
 const PROVIDER_NAME = opt("provider-name", "claude-local");
 const BIND_ADDRESS = opt("bind", "127.0.0.1");
-const AUTH_MODE_CONFIG = opt("auth-mode", "none");
+const {
+  authMode: AUTH_MODE_CONFIG,
+  defaultedForLan: AUTH_MODE_DEFAULTED_FOR_LAN,
+  lanWarning: AUTH_MODE_LAN_WARNING,
+} = resolveSetupAuthMode(args, BIND_ADDRESS);
 
 // ── Service-env injection: CLAUDE_BIN, OCP_ADMIN_KEY, PROXY_ANONYMOUS_KEY ──
 // These are read from the user's shell env at install time and written into
@@ -144,6 +149,11 @@ function writeJSON(path, data) {
 
 // ── Step 1: Verify prerequisites ────────────────────────────────────────
 console.log("\n🔍 Checking prerequisites...\n");
+if (AUTH_MODE_DEFAULTED_FOR_LAN) {
+  log(`Non-loopback --bind ${BIND_ADDRESS} without --auth-mode: defaulting to --auth-mode multi (per-user keys, built-in host tools emptied; ADR 0026)`);
+} else if (AUTH_MODE_LAN_WARNING) {
+  warn(AUTH_MODE_LAN_WARNING);
+}
 
 // Check node version. The gate is "can this Node load node:sqlite unflagged", NOT a major-only
 // floor: keys.mjs imports node:sqlite at module load and server.mjs imports keys.mjs at module
