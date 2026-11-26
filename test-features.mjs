@@ -6,7 +6,7 @@
 // MUST come before keys.mjs: redirects the key store to a scratch dir (see test-env.mjs).
 import { TEST_OCP_DIR } from "./test-env.mjs";
 import { getDb, getDbPath, createKey, listKeys, LIST_KEYS_SQL, validateKey, recordUsage, checkQuota, updateKeyQuota, getKeyQuota, findKey, cacheHash, getCachedResponse, setCachedResponse, clearCache, getCacheStats, closeDb, hasCacheControl, singleflight, getInflightStats } from "./keys.mjs";
-import { isLoopbackBind } from "./lib/net.mjs";
+import { isLoopbackBind, openLanSafetyError, resolveSetupAuthMode } from "./lib/net.mjs";
 import { classifyToolRequest, countDeclaredTools } from "./lib/tool-support.mjs";
 import { isUpstreamRateLimit, retryAfterSeconds } from "./lib/upstream-errors.mjs";
 import { listUnhonouredFields, CACHE_KEY_ONLY, ALWAYS_UNHONOURED, cliEffort, CLI_EFFORT_LEVELS } from "./lib/unhonoured-fields.mjs";
@@ -33208,6 +33208,160 @@ posixLtTest(WIN32_SH_CLAUDE, "ADR 0025 (#542): OCP_TRUST_LOOPBACK=0 warns at boo
                                 && boot2.buf.out.includes("Loopback trust: disabled"), 5000),
         `missing boot warning for none + OCP_TRUST_LOOPBACK=0 — ${ltDiag(boot2.buf)}`);
     } finally { boot2.child.kill("SIGKILL"); await ltDrain(() => boot2.buf.closed, "adr25-warn-none", 5000); }
+  } finally { _ltRmRetry(dir); }
+});
+
+// ── ADR 0026 (#544): open-LAN boot gate & OCP_ALLOW_OPEN_LAN=1 ──────────────────────────────
+test("ADR 0026 (#544): openLanSafetyError refuses non-loopback open-auth configs with tools granted and allows safe/opted-in ones", () => {
+  const base = {
+    bindAddress: "0.0.0.0",
+    loopbackBind: false,
+    authMode: "none",
+    hasSharedKey: false,
+    toolsGranted: true,
+    tuiMode: false,
+    allowOpenLan: false,
+  };
+  const errNone = openLanSafetyError(base);
+  assert.ok(typeof errNone === "string" && errNone.includes("0.0.0.0") && errNone.includes("CLAUDE_AUTH_MODE=none") && errNone.includes("OCP_ALLOW_OPEN_LAN=1"),
+    `expected fatal open-LAN message for none, got: ${errNone}`);
+
+  const errSharedNoKey = openLanSafetyError({ ...base, authMode: "shared", hasSharedKey: false });
+  assert.ok(typeof errSharedNoKey === "string" && errSharedNoKey.includes("CLAUDE_AUTH_MODE=shared with no PROXY_API_KEY"),
+    `expected fatal message naming shared-without-key, got: ${errSharedNoKey}`);
+
+  const errTypo = openLanSafetyError({ ...base, authMode: "mulit" });
+  assert.ok(typeof errTypo === "string" && errTypo.includes("CLAUDE_AUTH_MODE=mulit"),
+    `unrecognised authMode must fail closed on non-loopback, got: ${errTypo}`);
+
+  // Safe / opted-in controls:
+  assert.equal(openLanSafetyError({ ...base, loopbackBind: true, bindAddress: "127.0.0.1" }), null, "loopback bind must be allowed");
+  assert.equal(openLanSafetyError({ ...base, authMode: "multi", toolsGranted: false }), null, "multi mode (tools emptied) must be allowed");
+  assert.equal(openLanSafetyError({ ...base, authMode: "shared", hasSharedKey: true }), null, "shared with PROXY_API_KEY must be allowed");
+  assert.equal(openLanSafetyError({ ...base, allowOpenLan: true }), null, "OCP_ALLOW_OPEN_LAN=1 must open the gate");
+  assert.equal(openLanSafetyError({ ...base, tuiMode: true }), null, "TUI mode is governed by its own stricter OCP_TUI_ALLOW_LAN gate");
+});
+
+test("ADR 0026 (#544): resolveSetupAuthMode defaults non-loopback installs to multi and warns on non-multi LAN installs", () => {
+  assert.deepEqual(resolveSetupAuthMode([], "127.0.0.1"), { authMode: "none", defaultedForLan: false, lanWarning: null });
+  assert.deepEqual(resolveSetupAuthMode(["--bind", "0.0.0.0"], "0.0.0.0"), { authMode: "multi", defaultedForLan: true, lanWarning: null });
+  assert.deepEqual(resolveSetupAuthMode(["--bind", "0.0.0.0", "--auth-mode", "multi"], "0.0.0.0"), { authMode: "multi", defaultedForLan: false, lanWarning: null });
+  assert.deepEqual(resolveSetupAuthMode(["--bind", "0.0.0.0", "--auth-mode", "--dry-run"], "0.0.0.0"), { authMode: "multi", defaultedForLan: true, lanWarning: null });
+
+  const sharedLan = resolveSetupAuthMode(["--bind", "0.0.0.0", "--auth-mode", "shared"], "0.0.0.0");
+  assert.equal(sharedLan.authMode, "shared");
+  assert.equal(sharedLan.defaultedForLan, false);
+  assert.ok(typeof sharedLan.lanWarning === "string" && sharedLan.lanWarning.includes("PROXY_API_KEY"),
+    `non-loopback --auth-mode shared must warn that PROXY_API_KEY is not written to the service unit; got: ${sharedLan.lanWarning}`);
+
+  const noneLan = resolveSetupAuthMode(["--bind", "0.0.0.0", "--auth-mode", "none"], "0.0.0.0");
+  assert.equal(noneLan.authMode, "none");
+  assert.ok(typeof noneLan.lanWarning === "string" && noneLan.lanWarning.includes("OCP_ALLOW_OPEN_LAN=1"),
+    `non-loopback --auth-mode none must warn about OCP_ALLOW_OPEN_LAN=1; got: ${noneLan.lanWarning}`);
+
+  const typoLan = resolveSetupAuthMode(["--bind", "0.0.0.0", "--auth-mode", "mulit"], "0.0.0.0");
+  assert.equal(typoLan.authMode, "mulit");
+  assert.ok(typeof typoLan.lanWarning === "string" && typoLan.lanWarning.includes("mulit"),
+    `non-loopback unrecognised --auth-mode must warn; got: ${typoLan.lanWarning}`);
+
+  // Loopback controls stay warning-free even for explicit shared/none
+  assert.equal(resolveSetupAuthMode(["--auth-mode", "shared"], "127.0.0.1").lanWarning, null);
+  assert.equal(resolveSetupAuthMode(["--auth-mode", "none"], "127.0.0.1").lanWarning, null);
+});
+
+posixTest(WIN32_BASH_OCP, "ADR 0026 (#544): ocp lan steers operators to --auth-mode multi and documents OCP_ALLOW_OPEN_LAN=1", () => {
+  const r = _bwHarnessRun({ args: ["lan"] });
+  assert.ok(r.stdout.includes("--auth-mode multi"), `ocp lan must steer to --auth-mode multi; stdout=${JSON.stringify(r.stdout)}`);
+  assert.ok(r.stdout.includes("OCP_ALLOW_OPEN_LAN=1"), `ocp lan must mention OCP_ALLOW_OPEN_LAN=1; stdout=${JSON.stringify(r.stdout)}`);
+});
+
+posixLtTest(WIN32_SH_CLAUDE, "ADR 0026 (#544): non-loopback + AUTH_MODE=none refuses boot BEFORE listen()", async () => {
+  const dir = ltMkdir(); const fake = ltFake(dir);
+  const port = await ltFreePort();
+  const { child, buf } = ltBoot({
+    CLAUDE_BIND: LT_NONLOOPBACK_BIND,
+    CLAUDE_AUTH_MODE: "none",
+    CLAUDE_BIN: fake,
+    CLAUDE_PROXY_PORT: String(port),
+  }, dir);
+  try {
+    assert.ok(await ltWait(() => buf.closed || buf.spawnErr), `process never closed — ${ltDiag(buf)}`);
+    assert.ok(buf.err.length > 0, `expected stderr output — ${ltDiag(buf)}`);
+    assert.notEqual(buf.exit, 0, `open-LAN boot must exit non-zero — ${ltDiag(buf)}`);
+    assert.ok(/^FATAL: /m.test(buf.err), `expected FATAL line — ${ltDiag(buf)}`);
+    assert.ok(buf.err.includes(`non-loopback CLAUDE_BIND (${LT_NONLOOPBACK_BIND})`) && buf.err.includes("CLAUDE_AUTH_MODE=none") && buf.err.includes("OCP_ALLOW_OPEN_LAN=1"),
+      `expected ADR 0026 FATAL naming bind, auth mode, and opt-in — ${ltDiag(buf)}`);
+    assert.ok(!/EADDRNOTAVAIL/.test(buf.err), `gate must refuse before listen() — ${ltDiag(buf)}`);
+  } finally { child.kill("SIGKILL"); _ltRmRetry(dir); }
+});
+
+posixLtTest(WIN32_SH_CLAUDE, "ADR 0026 (#544): non-loopback + AUTH_MODE=shared without PROXY_API_KEY refuses boot BEFORE listen()", async () => {
+  const dir = ltMkdir(); const fake = ltFake(dir);
+  const port = await ltFreePort();
+  const { child, buf } = ltBoot({
+    CLAUDE_BIND: LT_NONLOOPBACK_BIND,
+    CLAUDE_AUTH_MODE: "shared",
+    PROXY_API_KEY: "",
+    CLAUDE_BIN: fake,
+    CLAUDE_PROXY_PORT: String(port),
+  }, dir);
+  try {
+    assert.ok(await ltWait(() => buf.closed || buf.spawnErr), `process never closed — ${ltDiag(buf)}`);
+    assert.notEqual(buf.exit, 0, `shared-without-key LAN boot must exit non-zero — ${ltDiag(buf)}`);
+    assert.ok(buf.err.includes("CLAUDE_AUTH_MODE=shared with no PROXY_API_KEY") && buf.err.includes("OCP_ALLOW_OPEN_LAN=1"),
+      `expected ADR 0026 FATAL naming shared-without-key — ${ltDiag(buf)}`);
+    assert.ok(!/EADDRNOTAVAIL/.test(buf.err), `gate must refuse before listen() — ${ltDiag(buf)}`);
+  } finally { child.kill("SIGKILL"); _ltRmRetry(dir); }
+});
+
+posixLtTest(WIN32_SH_CLAUDE, "ADR 0026 (#544): OCP_ALLOW_OPEN_LAN=1 clears the gate, warns, and reaches listen() (TEST-NET-1 EADDRNOTAVAIL)", async () => {
+  const dir = ltMkdir(); const fake = ltFake(dir);
+  const port = await ltFreePort();
+  const { child, buf } = ltBoot({
+    CLAUDE_BIND: LT_NONLOOPBACK_BIND,
+    CLAUDE_AUTH_MODE: "none",
+    OCP_ALLOW_OPEN_LAN: "1",
+    CLAUDE_BIN: fake,
+    CLAUDE_PROXY_PORT: String(port),
+  }, dir);
+  try {
+    assert.ok(await ltWait(() => /EADDRNOTAVAIL/.test(buf.err) || buf.out.includes("listening on") || buf.closed || buf.spawnErr),
+      `boot produced no bind attempt, no listener and no exit — ${ltDiag(buf)}`);
+    assert.ok(await ltWait(() => buf.closed || buf.spawnErr, 20000), `bind failure must terminate child — ${ltDiag(buf)}`);
+    assert.ok(!buf.out.includes("listening on"), `${LT_NONLOOPBACK_BIND} must not bind on this host — ${ltDiag(buf)}`);
+    assert.ok(/EADDRNOTAVAIL/.test(buf.err), `OCP_ALLOW_OPEN_LAN=1 must clear the gate and reach listen() — ${ltDiag(buf)}`);
+    assert.ok(!buf.err.includes("FATAL: non-loopback CLAUDE_BIND"), `must not hit the open-LAN FATAL gate — ${ltDiag(buf)}`);
+    assert.ok(buf.err.includes("WARNING: OCP_ALLOW_OPEN_LAN=1"), `expected boot warning when OCP_ALLOW_OPEN_LAN=1 bypasses the gate — ${ltDiag(buf)}`);
+  } finally { child.kill("SIGKILL"); _ltRmRetry(dir); }
+});
+
+posixLtTest(WIN32_SH_CLAUDE, "ADR 0026 (#544) controls: AUTH_MODE=multi and AUTH_MODE=shared+PROXY_API_KEY clear the open-LAN gate", async () => {
+  const dir = ltMkdir(); const fake = ltFake(dir);
+  const cases = [
+    { label: "multi", env: { CLAUDE_AUTH_MODE: "multi" } },
+    { label: "shared-with-key", env: { CLAUDE_AUTH_MODE: "shared", PROXY_API_KEY: "lan-secret-544" } },
+  ];
+  try {
+    for (const c of cases) {
+      const port = await ltFreePort();
+      const { child, buf } = ltBoot({
+        CLAUDE_BIND: LT_NONLOOPBACK_BIND,
+        CLAUDE_BIN: fake,
+        CLAUDE_PROXY_PORT: String(port),
+        ...c.env,
+      }, dir);
+      try {
+        assert.ok(await ltWait(() => /EADDRNOTAVAIL/.test(buf.err) || buf.out.includes("listening on") || buf.closed || buf.spawnErr),
+          `[${c.label}] boot produced no bind attempt or exit — ${ltDiag(buf)}`);
+        assert.ok(await ltWait(() => buf.closed || buf.spawnErr, 20000), `[${c.label}] bind failure must terminate child — ${ltDiag(buf)}`);
+        assert.ok(!buf.out.includes("listening on"), `[${c.label}] ${LT_NONLOOPBACK_BIND} must not bind — ${ltDiag(buf)}`);
+        assert.ok(/EADDRNOTAVAIL/.test(buf.err), `[${c.label}] authenticated LAN config must clear the gate and reach listen() — ${ltDiag(buf)}`);
+        assert.ok(!buf.err.includes("FATAL: non-loopback CLAUDE_BIND"), `[${c.label}] must not hit the open-LAN gate — ${ltDiag(buf)}`);
+      } finally {
+        child.kill("SIGKILL");
+        await ltDrain(() => buf.closed, `adr26-ctrl-${c.label}`, 5000);
+      }
+    }
   } finally { _ltRmRetry(dir); }
 });
 

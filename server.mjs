@@ -47,7 +47,7 @@ import { validateKey, recordUsage, getUsageByKey, getUsageTimeline, getRecentUsa
 import { DEFAULT_PORT } from "./lib/constants.mjs";
 import { StructuredOutputError, detectStructuredOutput, validateJsonSchemaSafe, extractJsonPayload, structuredSystemInstruction, resolveMaxAttempts } from "./lib/structured-output.mjs";
 import { scheduleKillEscalation, killChildTree } from "./lib/child-tree.mjs";
-import { isLoopbackBind } from "./lib/net.mjs";
+import { isLoopbackBind, openLanSafetyError } from "./lib/net.mjs";
 import { parseAllowedHosts, parseAuthority, matchesDeclared, evaluateOriginGate, parseAllowedOriginSchemes, matchesDeclaredScheme } from "./lib/host-gate.mjs";
 import { classifyToolRequest, countDeclaredTools } from "./lib/tool-support.mjs";
 import { isUpstreamRateLimit, retryAfterSeconds } from "./lib/upstream-errors.mjs";
@@ -1038,6 +1038,30 @@ const _localToolsBootError = localToolsSafetyError({
 if (_localToolsBootError) {
   console.error(`FATAL: ${_localToolsBootError}\n  See README § "Environment Variables" (OCP_LOCAL_TOOLS) and docs/adr/0007-tui-interactive-mode.md. Refusing to start.`);
   process.exit(1);
+}
+
+// ADR 0026 (#544). Explicit opt-in to allow non-loopback open-auth `-p` boots with host-side
+// tools granted (`AUTH_MODE=none`, `AUTH_MODE=shared` without `PROXY_API_KEY`, or unrecognised
+// mode). Off by default — symmetric with `OCP_TUI_ALLOW_LAN=1`.
+const ALLOW_OPEN_LAN = process.env.OCP_ALLOW_OPEN_LAN === "1";
+
+const _openLanBootError = openLanSafetyError({
+  bindAddress: BIND_ADDRESS,
+  loopbackBind: isLoopbackBind(BIND_ADDRESS),
+  authMode: AUTH_MODE,
+  hasSharedKey: Boolean(PROXY_API_KEY),
+  toolsGranted: TOOLS_GRANTED,
+  tuiMode: TUI_MODE,
+  allowOpenLan: ALLOW_OPEN_LAN,
+});
+if (_openLanBootError) {
+  console.error(`FATAL: ${_openLanBootError}\n  See docs/adr/0026-open-lan-boot-gate.md. Refusing to start.`);
+  process.exit(1);
+}
+const _openLanOverrideActive = ALLOW_OPEN_LAN && !TUI_MODE && !isLoopbackBind(BIND_ADDRESS)
+  && TOOLS_GRANTED && !(AUTH_MODE === "shared" && Boolean(PROXY_API_KEY));
+if (_openLanOverrideActive) {
+  console.warn(`WARNING: OCP_ALLOW_OPEN_LAN=1 — booting non-loopback (${BIND_ADDRESS}) with open auth (${AUTH_MODE}) and host-side tools granted (ADR 0026)`);
 }
 
 if (PROXY_ANONYMOUS_KEY && AUTH_MODE !== "multi") {
@@ -6045,6 +6069,7 @@ server.listen(PORT, BIND_ADDRESS, () => {
   console.log(`Auth: ${PROXY_API_KEY ? "enabled (PROXY_API_KEY set)" : "disabled (no PROXY_API_KEY)"}`);
   console.log(`Auth mode: ${AUTH_MODE}${AUTH_MODE === "shared" ? " (PROXY_API_KEY)" : AUTH_MODE === "multi" ? " (per-user keys)" : " (open)"}`);
   console.log(`Bind: ${BIND_ADDRESS}${BIND_ADDRESS === "0.0.0.0" ? " ⚠ LAN-accessible" : ""}`);
+  if (_openLanOverrideActive) console.log(`Open LAN override: OCP_ALLOW_OPEN_LAN=1 (non-loopback open auth with host-side tools explicitly allowed)`);
   if (!TRUST_LOOPBACK) console.log(`Loopback trust: disabled (OCP_TRUST_LOOPBACK=0 — loopback callers must authenticate)`);
   // Which of the three system-prompt wrappers this boot selected. Operator-facing because the
   // choice is invisible otherwise (the prompt travels in a 0600 temp file, #453) and because the
