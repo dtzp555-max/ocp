@@ -3413,19 +3413,18 @@ async function callClaudeStreaming(model, messages, conversationId, res, authInf
   // If client disconnects, kill the process to free resources
   res.on("close", () => {
     hb.stop();
-    // Only escalate when the child is still alive. On the normal-success path res.end()
-    // also fires "close", but the child has usually already exited — skip the spurious
-    // SIGTERM and the 5s kill-timer entirely (a post-exit proc.once("exit") never fires,
-    // so the timer would otherwise leak a closure over proc for 5s per request). (issue #111)
+    // Only signal and escalate when the child is still alive. On the normal-success path
+    // res.end() also fires "close", usually after the child has exited — skip the spurious
+    // SIGTERM and escalation arming entirely. (issue #111)
     if (!proc.killed && proc.exitCode === null && proc.signalCode === null) {
       // #474: the whole group — the client is gone, so nothing waits for 'close' on this lane,
       // and a pipe-holding grandchild must not outlive the request either.
       killChildTree(proc, "SIGTERM");
-      // Mirror the overallTimer escalation (server.mjs ~818): a SIGTERM-resistant child would
-      // otherwise hold its concurrency slot until the request timeout — #37 on the disconnect path. (issue #111)
-      const killTimer = setTimeout(() => killChildTree(proc, "SIGKILL"), 5000);
-      killTimer.unref();
-      proc.once("exit", () => clearTimeout(killTimer));
+      // #551: mirror fireTimeout's escalation via scheduleKillEscalation (lib/child-tree.mjs).
+      // Clearing on proc 'exit' (#111) disarmed the 5s SIGKILL timer as soon as the direct child
+      // died on SIGTERM, leaving any SIGTERM-ignoring grandchild alive in the group;
+      // scheduleKillEscalation cancels only on 'close' when the process group is empty.
+      scheduleKillEscalation(proc, killChildTree);
     }
   });
 }
