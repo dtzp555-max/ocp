@@ -552,7 +552,7 @@ else:
       # Issue #278 (same shape as cmd_logs above, see its comment) — kept on `_curl` (not bare
       # curl): `_curl` adds the admin-key auth header via `_AUTH_ARGS`, dropping it here would
       # silently break authenticated revoke requests.
-      result=$(_CURL_HTTP_ERROR_LABEL="the proxy refused the revoke — unauthorized, or no such key (is OCP_ADMIN_KEY set and correct?)" \
+      result=$(_CURL_HTTP_ERROR_LABEL="the proxy refused the revoke — unauthorized, ambiguous key name (specify numeric id), or no such key (is OCP_ADMIN_KEY set and correct?)" \
         _curl_or_die "proxy unreachable" _curl -sf --max-time 5 -X DELETE "$PROXY/api/keys/$2") || return 1
       echo "$result" | python3 -c "
 import sys, json

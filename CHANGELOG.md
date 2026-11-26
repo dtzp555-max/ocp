@@ -16,6 +16,12 @@
 
 ### Fixed
 
+- **Key identity, privilege separation, and unambiguous key addressing** ([ADR 0027](docs/adr/0027-key-identity-and-unambiguous-addressing.md), #543):
+  - `isAdmin` and `/api/usage`'s `isAnonCaller` are now decided strictly from explicit auth-branch booleans (`authIsAdmin` from timing-safe `OCP_ADMIN_KEY` match; `authIsAnonymous` from `PROXY_ANONYMOUS_KEY` or keyless `multi`), never by comparing `authKeyName` strings — so a DB key named `admin` (including any pre-existing key created before upgrade) never gains admin access, and a legacy DB key named `anonymous` cannot trigger `isAnonCaller` exemptions (note: `/api/usage` single-caller `scope.self` still filters `usage_log` by `key_name`, so revoke and re-create any pre-upgrade DB key carrying a reserved name).
+  - `POST /api/keys` now reserves synthetic caller names (`admin`, `anonymous`, `local`, `remote`, `shared`, case-insensitive after trimming) with `400 invalid_request_error` (amends ADR 0017).
+  - `DELETE /api/keys/:id`, `PATCH /api/keys/:id/quota`, and `GET /api/keys/:id/quota` resolve targets through `resolveKeyTarget` (strict canonical positive-integer id matching, no SQLite implicit numeric affinity) and refuse ambiguous identifiers (duplicate active names, or a numeric id colliding with another key's name — including when the id row is already revoked) with **`409 Conflict`** and zero rows modified. `PATCH /api/keys/:id/quota` now restricts updates to `revoked = 0` (returning `404` on revoked keys).
+  - `dashboard.html` now revokes keys by numeric `k.id` (`data-revoke-id`), alerts API errors on create/revoke, and guards `refreshKeys()` against non-admin `403` bodies.
+  - Class B.2, ADR 0006 route (b); B.2 200/201 response key-set snapshot unchanged.
 - `npm test` no longer reports a false red when run as root (#546). The #460 integration test "an ASYNCHRONOUSLY-failing spawn counts ONCE" arms its fault by making the spawn HOME's parent mode `0500`, and with DAC override root's `mkdir` succeeds there, so the spawn ran normally and the test's premise assertion failed. It is now reported as skipped under root, using the same top-level guard (`_m366IsRoot`) that #366's two permission-bit tests already use. Test-only; no runtime change.
 
 ## v3.43.0 — 2026-10-29

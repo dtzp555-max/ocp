@@ -126,10 +126,10 @@ ADR 0006 retroactively authorizes the B.2 endpoints listed in the inventory tabl
 | `/logs` | GET | B.2 (administrative) | ADR 0006 (grandfathered as of v3.16.4) |
 | `/status` | GET | B.2 (administrative) | ADR 0006 (grandfathered as of v3.16.4); status verdict per ADR 0010 |
 | `/settings` | GET, PATCH | B.2 (administrative) | ADR 0006 (grandfathered as of v3.16.4) |
-| `/api/keys` | GET, POST | B.2 (administrative) | ADR 0006 (grandfathered as of v3.16.4); POST request shape + key-name regex per ADR 0017 |
-| `/api/keys/:id` | DELETE | B.2 (administrative) | ADR 0006 (grandfathered as of v3.16.4) |
-| `/api/keys/:id/quota` | GET, PATCH | B.2 (administrative) | ADR 0006 (grandfathered as of v3.16.4) |
-| `/api/usage` | GET | B.2 (administrative) | ADR 0006 (grandfathered as of v3.16.4) |
+| `/api/keys` | GET, POST | B.2 (administrative) | ADR 0006 (grandfathered as of v3.16.4); POST request shape + key-name regex per ADR 0017; reserved synthetic names per ADR 0027 |
+| `/api/keys/:id` | DELETE | B.2 (administrative) | ADR 0006 (grandfathered as of v3.16.4); 409 on ambiguous id/name target per ADR 0027 |
+| `/api/keys/:id/quota` | GET, PATCH | B.2 (administrative) | ADR 0006 (grandfathered as of v3.16.4); 409 on ambiguous id/name target + active-only PATCH per ADR 0027 |
+| `/api/usage` | GET | B.2 (administrative) | ADR 0006 (grandfathered as of v3.16.4); auth-flag anonymous scope per ADR 0027 |
 | `/cache/stats` | GET | B.2 (administrative) | ADR 0006 (grandfathered as of v3.16.4); additive `inflight` / `requesters` per ADR 0012 |
 | `/cache` | DELETE | B.2 (administrative) | ADR 0006 (grandfathered as of v3.16.4) |
 
@@ -137,13 +137,13 @@ ADR 0006 retroactively authorizes the B.2 endpoints listed in the inventory tabl
 
 > The citation above is anchored on a **grep-able marker**, not on a bare line number, because the bare line number is what rotted: this note cited `server.mjs` line 845–849 from before v3.16.4 until #292, and by then those lines were the `OCP_LOCAL_TOOLS` boot gate — a reviewer following the citation as instructed landed on unrelated code. The block had moved to 2374–2379, and even #292's own corrected range (2349–2354) was stale again by the time the fix was written. `// ALIGNMENT:` appears exactly once in `server.mjs` and marks this block deliberately, so it survives the drift a line number cannot. Line numbers in this document are always secondary to a named anchor, and are pinned to a stated version so that staleness is visible rather than silent.
 
-**Cross-cutting authorizations (ADR 0019, ADR 0020, ADR 0023, ADR 0025).** The table above maps each
-endpoint to the ADR that authorized *its existence*. Four authorizations are not endpoint-scoped and
-therefore have no row. The first three govern the same gate at the top of `handleRequest`, which
-runs before `OPTIONS`, before auth and before routing; ADR 0025 governs the auth, admin, and
-`/health` loopback-trust gate that follows `OPTIONS`. Each changes **semantics** for every endpoint
-in this table — a request that previously executed now receives `403` (or, under ADR 0025,
-`401`/`403`), or one that previously received `403` now executes — which is why each is ADR 0006
+**Cross-cutting authorizations (ADR 0019, ADR 0020, ADR 0023, ADR 0025, ADR 0027).** The table above maps each
+endpoint to the ADR that authorized *its existence*. Five authorizations are not solely single-endpoint-scoped.
+The first three govern the same gate at the top of `handleRequest`, which
+runs before `OPTIONS`, before auth and before routing; ADR 0025 and ADR 0027 govern the auth, admin, and
+key-identity checks that follow `OPTIONS`. Each changes **semantics** for endpoints
+in this table — a request that previously executed now receives `403` (or, under ADR 0025/0027,
+`401`/`403`/`409`), or one that previously received `403` now executes — which is why each is ADR 0006
 route **(b)** and not the grandfather clause, and none adds a field or an endpoint, so none is filed
 under ADR 0012.
 
@@ -178,6 +178,13 @@ under ADR 0012.
   reverse proxy (nginx/Caddy). While default loopback trust remains on with `AUTH_MODE !== "none"`,
   a loopback request carrying `X-Forwarded-For` or `Forwarded` emits a one-shot warning log without
   changing any response. It runs in the **refusing** direction, like ADR 0019's.
+- [ADR 0027](docs/adr/0027-key-identity-and-unambiguous-addressing.md) decouples `isAdmin` and
+  `/api/usage`'s `isAnonCaller` from `authKeyName` string comparisons (so a DB key named `admin`
+  never gains admin access on any admin-gated B.2 endpoint or the B.2 synthesis layer of `/usage`),
+  reserves synthetic caller names (`admin`, `anonymous`, `local`, `remote`, `shared`) at
+  `POST /api/keys` (amending ADR 0017), and makes `DELETE /api/keys/:id`, `PATCH /api/keys/:id/quota`,
+  and `GET /api/keys/:id/quota` refuse ambiguous identifiers with `409 Conflict` while restricting
+  quota updates to active (`revoked = 0`) rows. Class B.2, ADR 0006 route (b).
 
 > Recorded here rather than only in the ADR because **this paragraph is what a reviewer reads when
 > CLAUDE.md tells them to "independently confirm the declared class against the `ALIGNMENT.md`
