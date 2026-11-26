@@ -5,7 +5,9 @@
  */
 // MUST come before keys.mjs: redirects the key store to a scratch dir (see test-env.mjs).
 import { TEST_OCP_DIR } from "./test-env.mjs";
-import { getDb, getDbPath, createKey, listKeys, LIST_KEYS_SQL, validateKey, recordUsage, checkQuota, updateKeyQuota, getKeyQuota, findKey, cacheHash, getCachedResponse, setCachedResponse, clearCache, getCacheStats, closeDb, hasCacheControl, singleflight, getInflightStats } from "./keys.mjs";
+import { getDb, getDbPath, createKey, listKeys, LIST_KEYS_SQL, validateKey, revokeKey, RESERVED_KEY_NAMES, isReservedKeyName, AmbiguousKeyError, resolveKeyTarget, recordUsage, checkQuota, updateKeyQuota, getKeyQuota, findKey, cacheHash, getCachedResponse, setCachedResponse, clearCache, getCacheStats, closeDb, hasCacheControl, singleflight, getInflightStats } from "./keys.mjs";
+import { DatabaseSync } from "node:sqlite";
+import vm from "node:vm";
 import { isLoopbackBind, openLanSafetyError, resolveSetupAuthMode } from "./lib/net.mjs";
 import { classifyToolRequest, countDeclaredTools } from "./lib/tool-support.mjs";
 import { isUpstreamRateLimit, retryAfterSeconds } from "./lib/upstream-errors.mjs";
@@ -607,10 +609,10 @@ test("updateKeyQuota stores a malicious quota value as bound data, not executabl
   assert.equal(getKeyQuota(key.id).daily.limit, injected);
 });
 
-test("updateKeyQuota with a multi-match idOrName does not clobber the non-targeted row's untouched columns", () => {
+test("updateKeyQuota with a multi-match idOrName refuses with AmbiguousKeyError and modifies zero rows (ADR 0027, supersedes #498 multi-match)", () => {
   const keyB = createKey("clobber-b");
   updateKeyQuota(keyB.id, { weekly: 5 });
-  // keyC's name collides with keyB's numeric id: `id = ? OR name = ?` matches both rows.
+  // keyC's name collides with keyB's numeric id: both rows match idOrName = String(keyB.id).
   const keyC = createKey(String(keyB.id));
   updateKeyQuota(keyC.id, { monthly: 7 });
 
@@ -618,15 +620,71 @@ test("updateKeyQuota with a multi-match idOrName does not clobber the non-target
   const preMatches = db.prepare("SELECT id FROM api_keys WHERE id = ? OR name = ?").all(idOrName, idOrName);
   assert.equal(preMatches.length, 2, "fixture must produce a genuine multi-match");
 
-  const ok = updateKeyQuota(idOrName, { daily: 99 });
-  assert.ok(ok);
+  assert.throws(
+    () => updateKeyQuota(idOrName, { daily: 99 }),
+    (err) => err instanceof AmbiguousKeyError && err.code === "AMBIGUOUS_KEY" && err.matches.length === 2,
+    "ambiguous id/name collision must throw AmbiguousKeyError instead of updating both rows"
+  );
 
   const quotaB = getKeyQuota(keyB.id);
   const quotaC = getKeyQuota(keyC.id);
-  assert.equal(quotaB.daily.limit, 99);
-  assert.equal(quotaB.weekly.limit, 5, "keyB's own weekly quota must be untouched");
-  assert.equal(quotaC.daily.limit, 99);
-  assert.equal(quotaC.monthly.limit, 7, "keyC's monthly quota must survive an update aimed at a field it never set");
+  assert.equal(quotaB.daily.limit, null, "keyB daily quota must remain untouched on ambiguity");
+  assert.equal(quotaB.weekly.limit, 5, "keyB weekly quota must remain intact");
+  assert.equal(quotaC.daily.limit, null, "keyC daily quota must remain untouched on ambiguity");
+  assert.equal(quotaC.monthly.limit, 7, "keyC monthly quota must remain intact");
+});
+
+test("ADR 0027 (#543) unit: isReservedKeyName rejects synthetic names case-insensitively and allows normal names", () => {
+  for (const r of ["admin", "Admin", "ADMIN", " admin ", "anonymous", "LOCAL", "remote", "shared"]) {
+    assert.equal(isReservedKeyName(r), true, `${JSON.stringify(r)} must be reserved`);
+  }
+  for (const ok of ["admin-bot", "my-local", "guest", "team_1", "shared-ci"]) {
+    assert.equal(isReservedKeyName(ok), false, `${JSON.stringify(ok)} must be allowed`);
+  }
+  assert.deepEqual([...RESERVED_KEY_NAMES], ["admin", "anonymous", "local", "remote", "shared"]);
+});
+
+test("ADR 0027 (#543) unit: revokeKey / updateKeyQuota / findKey refuse duplicate names & id/name collisions and honour revoked = 0", () => {
+  // 1. Duplicate active names
+  const dup1 = createKey("dup-team-543");
+  const dup2 = createKey("dup-team-543");
+  assert.throws(() => revokeKey("dup-team-543"), (e) => e.code === "AMBIGUOUS_KEY");
+  assert.throws(() => updateKeyQuota("dup-team-543", { daily: 10 }), (e) => e.code === "AMBIGUOUS_KEY");
+  assert.throws(() => findKey("dup-team-543"), (e) => e.code === "AMBIGUOUS_KEY");
+  assert.ok(validateKey(dup1.key) && validateKey(dup2.key), "neither duplicate key may be revoked on ambiguity");
+
+  // Revoking by unique numeric id revokes ONLY that row
+  assert.equal(revokeKey(dup1.id), true);
+  assert.equal(validateKey(dup1.key), null, "dup1 must be revoked");
+  assert.ok(validateKey(dup2.key), "dup2 must remain active");
+
+  // updateKeyQuota must ignore revoked keys (revoked = 0 filter), while findKey retains
+  // unambiguous historical lookup by revoked numeric id (for GET /api/keys/:id/quota).
+  assert.equal(updateKeyQuota(dup1.id, { daily: 10 }), false, "updateKeyQuota must refuse revoked key");
+  assert.equal(getKeyQuota(dup1.id).daily.limit, null);
+  assert.equal(findKey(dup1.id)?.id, dup1.id, "findKey must resolve an unambiguous revoked numeric id");
+
+  // Key rotation: one revoked + one active of same name is unambiguous and targets the active row
+  assert.equal(updateKeyQuota("dup-team-543", { daily: 15 }), true);
+  assert.equal(getKeyQuota(dup2.id).daily.limit, 15);
+  assert.equal(findKey("dup-team-543").id, dup2.id);
+
+  // 2. Non-canonical numeric string "0<id>" must NOT coerce to numeric id
+  assert.equal(findKey("0" + String(dup2.id)), null, "leading-zero numeric string must not coerce to id");
+
+  // 3. Revoked id colliding with active key named String(id) MUST still refuse (no silent hit on retry)
+  const victim = createKey("id-retry-orig");
+  assert.equal(revokeKey(victim.id), true);
+  const namedAsId = createKey(String(victim.id));
+  assert.throws(
+    () => revokeKey(String(victim.id)),
+    (e) => e.code === "AMBIGUOUS_KEY",
+    "retrying revoke on already-revoked numeric id must not silently revoke active key named that id"
+  );
+  assert.ok(validateKey(namedAsId.key), "active key named after revoked id must remain active");
+  // Clean up by its own unambiguous id
+  assert.equal(revokeKey(namedAsId.id), true);
+  assert.equal(revokeKey(dup2.id), true);
 });
 
 test("checkQuota passes when under limit", () => {
@@ -33363,6 +33421,283 @@ posixLtTest(WIN32_SH_CLAUDE, "ADR 0026 (#544) controls: AUTH_MODE=multi and AUTH
       }
     }
   } finally { _ltRmRetry(dir); }
+});
+
+// ── ADR 0027 (#543): key identity, privilege separation & unambiguous addressing ──────────────
+posixLtTest(WIN32_SH_CLAUDE, "ADR 0027 (#543): pre-existing DB key named 'admin' is NOT admin; isAdmin and isAnonCaller use auth flags", async () => {
+  const dir = ltMkdir(); const fake = ltFake(dir);
+  const adminKey = "super-admin-543";
+  const anonKey = "pub-anon-543";
+  const { child, port, buf } = await ltBootFresh({
+    CLAUDE_AUTH_MODE: "multi",
+    OCP_TRUST_LOOPBACK: "0",
+    OCP_ADMIN_KEY: adminKey,
+    PROXY_ANONYMOUS_KEY: anonKey,
+    CLAUDE_BIN: fake,
+  }, dir);
+  let seedAdminToken, seedAnonToken;
+  try {
+    assert.ok(await ltWait(() => buf.out.includes("listening on") || buf.closed), `server never booted — ${ltDiag(buf)}`);
+    // Create two valid keys via API, then rename them in SQLite to simulate a pre-upgrade DB
+    // containing legacy keys literally named "admin" and "anonymous".
+    const c1 = await fetch(`http://127.0.0.1:${port}/api/keys`, {
+      method: "POST",
+      headers: { Authorization: `Bearer ${adminKey}`, "Content-Type": "application/json" },
+      body: JSON.stringify({ name: "seed-admin-543" }),
+    });
+    assert.equal(c1.status, 201);
+    const k1 = await c1.json();
+    seedAdminToken = k1.key;
+
+    const c2 = await fetch(`http://127.0.0.1:${port}/api/keys`, {
+      method: "POST",
+      headers: { Authorization: `Bearer ${adminKey}`, "Content-Type": "application/json" },
+      body: JSON.stringify({ name: "seed-anon-543" }),
+    });
+    assert.equal(c2.status, 201);
+    const k2 = await c2.json();
+    seedAnonToken = k2.key;
+
+    const rawDb = new DatabaseSync(join(dir, "ocp.db"));
+    try {
+      rawDb.prepare("UPDATE api_keys SET name = 'admin' WHERE id = ?").run(k1.id);
+      rawDb.prepare("UPDATE api_keys SET name = 'anonymous' WHERE id = ?").run(k2.id);
+    } finally { rawDb.close(); }
+
+    // 1. DB key named "admin" MUST be refused 403 on admin endpoints and denied full usage scope.
+    for (const [method, path, body] of [
+      ["GET", "/api/keys", null],
+      ["GET", "/logs", null],
+      ["PATCH", "/settings", JSON.stringify({ timeout: 600000 })],
+    ]) {
+      const r = await fetch(`http://127.0.0.1:${port}${path}`, {
+        method,
+        headers: {
+          Authorization: `Bearer ${seedAdminToken}`,
+          ...(body ? { "Content-Type": "application/json" } : {}),
+        },
+        ...(body ? { body } : {}),
+      });
+      assert.equal(r.status, 403, `DB key named 'admin' must receive 403 on ${method} ${path}, got ${r.status}`);
+    }
+    const uFakeAdmin = await fetch(`http://127.0.0.1:${port}/api/usage?all=true`, {
+      headers: { Authorization: `Bearer ${seedAdminToken}` },
+    });
+    assert.equal(uFakeAdmin.status, 200);
+    assert.equal((await uFakeAdmin.json()).scope.all, false, "DB key named 'admin' must not receive full usage scope");
+
+    // 2. Positive control: real OCP_ADMIN_KEY succeeds with 200 and full usage scope.
+    const rRealKeys = await fetch(`http://127.0.0.1:${port}/api/keys`, {
+      headers: { Authorization: `Bearer ${adminKey}` },
+    });
+    assert.equal(rRealKeys.status, 200, "real OCP_ADMIN_KEY must receive 200 on GET /api/keys");
+    const uRealAdmin = await fetch(`http://127.0.0.1:${port}/api/usage?all=true`, {
+      headers: { Authorization: `Bearer ${adminKey}` },
+    });
+    assert.equal(uRealAdmin.status, 200);
+    assert.equal((await uRealAdmin.json()).scope.all, true, "real OCP_ADMIN_KEY must receive full usage scope");
+  } finally {
+    child.kill("SIGKILL");
+    await ltDrain(() => buf.closed, "adr27-priv-sep-1", 5000);
+  }
+
+  // 3. Second boot on same DB with trusted loopback (isAdmin=true): proves /api/usage's
+  //    isAnonCaller checks the auth-branch boolean rather than callerName === "anonymous".
+  const boot2 = await ltBootFresh({
+    CLAUDE_AUTH_MODE: "multi",
+    OCP_TRUST_LOOPBACK: "1",
+    OCP_ADMIN_KEY: adminKey,
+    PROXY_ANONYMOUS_KEY: anonKey,
+    CLAUDE_BIN: fake,
+  }, dir);
+  try {
+    assert.ok(await ltWait(() => boot2.buf.out.includes("listening on") || boot2.buf.closed), `boot2 failed — ${ltDiag(boot2.buf)}`);
+    const uRealAnon = await fetch(`http://127.0.0.1:${boot2.port}/api/usage?all=true`, {
+      headers: { Authorization: `Bearer ${anonKey}` },
+    });
+    assert.equal(uRealAnon.status, 200);
+    assert.equal((await uRealAnon.json()).scope.all, false, "real PROXY_ANONYMOUS_KEY must be blocked from ?all=true");
+
+    const uDbNamedAnon = await fetch(`http://127.0.0.1:${boot2.port}/api/usage?all=true`, {
+      headers: { Authorization: `Bearer ${seedAnonToken}` },
+    });
+    assert.equal(uDbNamedAnon.status, 200);
+    assert.equal((await uDbNamedAnon.json()).scope.all, true,
+      "DB key named 'anonymous' on trusted loopback must NOT be misclassified as isAnonCaller by name");
+  } finally {
+    boot2.child.kill("SIGKILL");
+    await ltDrain(() => boot2.buf.closed, "adr27-priv-sep-2", 5000);
+    _ltRmRetry(dir);
+  }
+});
+
+posixLtTest(WIN32_SH_CLAUDE, "ADR 0027 (#543): POST /api/keys rejects reserved synthetic names (400) and allows normal names (201)", async () => {
+  const dir = ltMkdir(); const fake = ltFake(dir);
+  const { child, port, buf } = await ltBootFresh({ CLAUDE_AUTH_MODE: "multi", CLAUDE_BIN: fake }, dir);
+  try {
+    assert.ok(await ltWait(() => buf.out.includes("listening on") || buf.closed), `server never booted — ${ltDiag(buf)}`);
+    for (const badName of ["admin", "Admin", " admin ", "anonymous", "local", "remote", "shared"]) {
+      const r = await fetch(`http://127.0.0.1:${port}/api/keys`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ name: badName }),
+      });
+      assert.equal(r.status, 400, `POST /api/keys with reserved name ${JSON.stringify(badName)} must return 400, got ${r.status}`);
+      const j = await r.json();
+      assert.ok(j.error?.message?.includes("reserved"), `expected 'reserved' in error message for ${badName}, got ${JSON.stringify(j)}`);
+    }
+    const listEmpty = await (await fetch(`http://127.0.0.1:${port}/api/keys`)).json();
+    assert.equal(listEmpty.keys.length, 0, "reserved-name rejections must mint zero keys");
+
+    // Positive control
+    const ok = await fetch(`http://127.0.0.1:${port}/api/keys`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ name: "admin-laptop" }),
+    });
+    assert.equal(ok.status, 201, "non-reserved name 'admin-laptop' must succeed with 201");
+  } finally { child.kill("SIGKILL"); _ltRmRetry(dir); }
+});
+
+posixLtTest(WIN32_SH_CLAUDE, "ADR 0027 (#543): DELETE/PATCH/GET /api/keys/:x return 409 on duplicate names or id/name collision, and PATCH rejects revoked keys (404)", async () => {
+  const dir = ltMkdir(); const fake = ltFake(dir);
+  const { child, port, buf } = await ltBootFresh({ CLAUDE_AUTH_MODE: "multi", CLAUDE_BIN: fake }, dir);
+  try {
+    assert.ok(await ltWait(() => buf.out.includes("listening on") || buf.closed), `server never booted — ${ltDiag(buf)}`);
+    const postKey = async (name) => {
+      const r = await fetch(`http://127.0.0.1:${port}/api/keys`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ name }),
+      });
+      assert.equal(r.status, 201);
+      return r.json();
+    };
+
+    // Duplicate active names: DELETE, PATCH quota, GET quota must all return 409
+    const t1 = await postKey("team");
+    const t2 = await postKey("team");
+    const delDup = await fetch(`http://127.0.0.1:${port}/api/keys/team`, { method: "DELETE" });
+    assert.equal(delDup.status, 409, `DELETE duplicate name must return 409, got ${delDup.status}`);
+    const patchDup = await fetch(`http://127.0.0.1:${port}/api/keys/team/quota`, {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ daily: 5 }),
+    });
+    assert.equal(patchDup.status, 409, `PATCH quota duplicate name must return 409, got ${patchDup.status}`);
+    const getDup = await fetch(`http://127.0.0.1:${port}/api/keys/team/quota`);
+    assert.equal(getDup.status, 409, `GET quota duplicate name must return 409, got ${getDup.status}`);
+
+    // Neither row was revoked; revoking by unique numeric id revokes ONLY t1
+    const delId1 = await fetch(`http://127.0.0.1:${port}/api/keys/${t1.id}`, { method: "DELETE" });
+    assert.equal(delId1.status, 200);
+    assert.equal((await delId1.json()).revoked, true);
+
+    // PATCH quota on now-revoked t1 must return 404 (revoked = 0 filter),
+    // while GET quota still resolves the unambiguous revoked row (200) for historical usage.
+    const patchRevoked = await fetch(`http://127.0.0.1:${port}/api/keys/${t1.id}/quota`, {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ daily: 10 }),
+    });
+    assert.equal(patchRevoked.status, 404, `PATCH quota on revoked key must return 404, got ${patchRevoked.status}`);
+    const getRevoked = await fetch(`http://127.0.0.1:${port}/api/keys/${t1.id}/quota`);
+    assert.equal(getRevoked.status, 200, `GET quota on unambiguous revoked id must return 200, got ${getRevoked.status}`);
+    assert.equal((await getRevoked.json()).keyId, t1.id, "GET quota on revoked id must return historical keyId");
+
+    // Now only t2 is active for "team", so DELETE /api/keys/team is unambiguous
+    const delLastTeam = await fetch(`http://127.0.0.1:${port}/api/keys/team`, { method: "DELETE" });
+    assert.equal(delLastTeam.status, 200);
+    assert.equal((await delLastTeam.json()).revoked, true);
+
+    // ID / name namespace collision: keyA (id = N) + keyB (name = String(N))
+    const kA = await postKey("guest-a");
+    const kB = await postKey(String(kA.id));
+    const delCollision = await fetch(`http://127.0.0.1:${port}/api/keys/${kA.id}`, { method: "DELETE" });
+    assert.equal(delCollision.status, 409, `DELETE colliding id/name must return 409, got ${delCollision.status}`);
+    // Revoke kB by its own unambiguous id, then kA becomes unambiguous
+    assert.equal((await fetch(`http://127.0.0.1:${port}/api/keys/${kB.id}`, { method: "DELETE" })).status, 200);
+    const delA = await fetch(`http://127.0.0.1:${port}/api/keys/${kA.id}`, { method: "DELETE" });
+    assert.equal(delA.status, 200);
+    assert.equal((await delA.json()).revoked, true);
+  } finally { child.kill("SIGKILL"); _ltRmRetry(dir); }
+});
+
+testAsync("ADR 0027 (#543): dashboard.html revokes by numeric k.id (not k.name) and keeps admin panel hidden on 403", async () => {
+  const html = _ltRead(join(import.meta.dirname, "dashboard.html"), "utf8");
+  const scriptMatch = html.match(/<script>([\s\S]*?)<\/script>/);
+  assert.ok(scriptMatch, "dashboard.html must contain an inline <script>");
+
+  const makeHarness = (keysPayload) => {
+    const fetchCalls = [];
+    const elements = {
+      "key-mgmt-section": { style: { display: "none" } },
+      "usage-scope-toggle": { style: { display: "none" } },
+      "refresh-indicator": { textContent: "" },
+      "status-cards": { innerHTML: "" },
+      "plan-cards": { innerHTML: "" },
+      "usage-show-all": { checked: false, addEventListener() {} },
+      "new-key-name": { value: "" },
+    };
+    const buttons = [];
+    const tbody = {
+      _html: "",
+      set innerHTML(v) {
+        this._html = v;
+        buttons.length = 0;
+        for (const m of v.matchAll(/<button[^>]*data-revoke-id="([^"]*)"[^>]*data-revoke-name="([^"]*)"/g)) {
+          const attrs = { "data-revoke-id": m[1], "data-revoke-name": m[2] };
+          const handlers = [];
+          buttons.push({
+            getAttribute: (k) => attrs[k] ?? null,
+            addEventListener: (ev, fn) => { if (ev === "click") handlers.push(fn); },
+            click: () => handlers.map((fn) => fn()),
+          });
+        }
+      },
+      get innerHTML() { return this._html; },
+      querySelectorAll: (sel) => (sel === "button[data-revoke-id]" ? buttons : []),
+    };
+    const ctx = {
+      location: { origin: "http://127.0.0.1:3456", search: "" },
+      URLSearchParams,
+      localStorage: { getItem: () => null, setItem() {} },
+      history: { replaceState() {} },
+      document: {
+        getElementById: (id) => elements[id] || { style: {}, innerHTML: "", textContent: "", value: "" },
+        querySelector: (sel) => (sel === "#keys-table tbody" ? tbody : { innerHTML: "" }),
+      },
+      fetch: async (url, opts = {}) => {
+        fetchCalls.push({ url, method: opts.method || "GET" });
+        if (url.endsWith("/api/keys")) return { status: keysPayload.status, json: async () => keysPayload.body };
+        if (url.includes("/api/keys/") && opts.method === "DELETE") return { status: 200, json: async () => ({ revoked: true }) };
+        return { status: 200, json: async () => ({}) };
+      },
+      confirm: () => true,
+      alert: () => {},
+      prompt: () => null,
+      setInterval: () => 0,
+      console: { warn() {}, error() {}, log() {} },
+    };
+    ctx.window = ctx;
+    vm.runInNewContext(scriptMatch[1], ctx);
+    return { ctx, elements, buttons, fetchCalls };
+  };
+
+  // Case 1: admin receives keys -> clicking Revoke sends DELETE /api/keys/42, NOT /api/keys/team
+  const h1 = makeHarness({ status: 200, body: { keys: [{ id: 42, name: "team", keyPreview: "ocp_aaaa...1111", created_at: "2026-11-26", revoked: 0 }] } });
+  await new Promise((r) => setTimeout(r, 20));
+  assert.equal(h1.elements["key-mgmt-section"].style.display, "", "admin must see key-mgmt-section");
+  assert.equal(h1.buttons.length, 1, "expected 1 revoke button");
+  await Promise.all(h1.buttons[0].click());
+  const delCall = h1.fetchCalls.find((c) => c.method === "DELETE");
+  assert.ok(delCall, "clicking Revoke must issue a DELETE request");
+  assert.ok(delCall.url.endsWith("/api/keys/42"), `Revoke must target numeric k.id (42), not k.name; got ${delCall.url}`);
+
+  // Case 2: non-admin receives 403 -> key-mgmt-section stays hidden
+  const h2 = makeHarness({ status: 403, body: { error: "Admin access required" } });
+  await new Promise((r) => setTimeout(r, 20));
+  assert.equal(h2.elements["key-mgmt-section"].style.display, "none", "non-admin 403 must keep key-mgmt-section hidden");
 });
 
 // ── ADR 0020 unit level: the decision, without a socket ───────────────────────────────────

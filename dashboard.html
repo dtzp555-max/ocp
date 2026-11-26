@@ -213,21 +213,22 @@ async function refreshUsage() {
 async function refreshKeys() {
   try {
     const data = await api("/api/keys");
+    if (!data || !Array.isArray(data.keys)) return;
     document.getElementById("key-mgmt-section").style.display = "";
     // Admin-only "Show all keys" toggle for /api/usage scope.
     document.getElementById("usage-scope-toggle").style.display = "flex";
     const tbody = document.querySelector("#keys-table tbody");
-    tbody.innerHTML = (data.keys || []).map(k => `
+    tbody.innerHTML = data.keys.map(k => `
       <tr>
         <td>${escapeHtml(k.name)}</td>
         <td class="mono">${escapeHtml(k.keyPreview)}</td>
         <td class="mono">${escapeHtml(k.created_at)}</td>
         <td><span class="tag ${k.revoked ? 'tag-err' : 'tag-ok'}">${k.revoked ? 'revoked' : 'active'}</span></td>
-        <td>${k.revoked ? '' : `<button class="btn btn-sm btn-danger" data-revoke="${escapeHtml(k.name)}">Revoke</button>`}</td>
+        <td>${k.revoked ? '' : `<button class="btn btn-sm btn-danger" data-revoke-id="${escapeHtml(String(k.id))}" data-revoke-name="${escapeHtml(k.name)}">Revoke</button>`}</td>
       </tr>
     `).join("");
-    tbody.querySelectorAll("button[data-revoke]").forEach(btn =>
-      btn.addEventListener("click", () => revokeKeyUI(btn.getAttribute("data-revoke")))
+    tbody.querySelectorAll("button[data-revoke-id]").forEach(btn =>
+      btn.addEventListener("click", () => revokeKeyUI(btn.getAttribute("data-revoke-id"), btn.getAttribute("data-revoke-name")))
     );
   } catch(e) { /* not admin */ }
 }
@@ -236,16 +237,22 @@ async function addKey() {
   const name = document.getElementById("new-key-name").value.trim();
   if (!name) return alert("Enter a key name");
   const result = await apiPost("/api/keys", { name });
-  if (result.key) {
+  if (result && result.key) {
     alert("New API Key (copy it now — you won't see it again):\n\n" + result.key);
     document.getElementById("new-key-name").value = "";
     refreshKeys();
+  } else if (result && result.error) {
+    const msg = typeof result.error === "string" ? result.error : (result.error.message || "Failed to create key");
+    alert(msg);
   }
 }
 
-async function revokeKeyUI(name) {
-  if (!confirm(`Revoke key "${name}"?`)) return;
-  await apiDelete(`/api/keys/${encodeURIComponent(name)}`);
+async function revokeKeyUI(id, name) {
+  if (!confirm(`Revoke key "${name}" (id ${id})?`)) return;
+  const result = await apiDelete(`/api/keys/${encodeURIComponent(id)}`);
+  if (result && result.error) {
+    alert(typeof result.error === "string" ? result.error : (result.error.message || "Failed to revoke key"));
+  }
   refreshKeys();
 }
 

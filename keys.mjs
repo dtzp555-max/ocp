@@ -128,6 +128,91 @@ function initSchema() {
 
 // ── Key CRUD ──
 
+// ADR 0027 (#543): synthetic caller names used in server.mjs auth and usage accounting.
+// Reserved at POST /api/keys (case-insensitive after trim) so newly minted DB keys cannot
+// collide with synthetic identities in usage logs or auth checks.
+export const RESERVED_KEY_NAMES = Object.freeze(["admin", "anonymous", "local", "remote", "shared"]);
+
+export function isReservedKeyName(name) {
+  return RESERVED_KEY_NAMES.includes(String(name ?? "").trim().toLowerCase());
+}
+
+// Thrown by resolveKeyTarget / revokeKey / updateKeyQuota / findKey when an identifier matches
+// more than one candidate row (duplicate names, or a canonical numeric id that also matches a
+// different row's name). HTTP handlers map `err.code === "AMBIGUOUS_KEY"` to 409 Conflict with
+// zero rows modified.
+export class AmbiguousKeyError extends Error {
+  constructor(idOrName, matches) {
+    const desc = matches.map((m) => `id=${m.id} (${m.name}${m.revoked ? ", revoked" : ""})`).join(", ");
+    super(`Ambiguous key identifier "${idOrName}": matches ${matches.length} keys (${desc}). Specify the unique numeric id.`);
+    this.name = "AmbiguousKeyError";
+    this.code = "AMBIGUOUS_KEY";
+    this.matches = matches;
+  }
+}
+
+// Canonical positive integer id test (no leading zeros, whitespace, or floats — avoids SQLite's
+// implicit INTEGER affinity where "01" or "1.0" silently matches id 1).
+function parseCanonicalKeyId(idOrName) {
+  if (typeof idOrName === "number") {
+    return Number.isSafeInteger(idOrName) && idOrName > 0 ? idOrName : null;
+  }
+  const s = String(idOrName ?? "");
+  if (!/^[1-9]\d*$/.test(s)) return null;
+  const n = Number(s);
+  return Number.isSafeInteger(n) ? n : null;
+}
+
+// Unambiguous key lookup (ADR 0027, #543).
+// - Canonical positive integers check both `id = ?` and `name = ?`; all other strings check only
+//   `name = ?`.
+// - If >1 active row matches, OR a canonical numeric id matches a revoked row while a different
+//   active row carries that string as its name, throw AmbiguousKeyError so an idempotent retry of
+//   `DELETE /api/keys/1` can never silently hit an active key named "1".
+// - When `activeOnly` is false (read-only lookup via findKey), fall back to revoked rows only if
+//   no active row matched, throwing AmbiguousKeyError if >1 revoked row matches.
+export function resolveKeyTarget(idOrName, { activeOnly = true } = {}) {
+  const d = getDb();
+  const raw = String(idOrName ?? "");
+  const numericId = parseCanonicalKeyId(idOrName);
+
+  const byId = numericId !== null
+    ? d.prepare("SELECT id, name, revoked FROM api_keys WHERE id = ?").get(numericId) || null
+    : null;
+  const byNameAll = d.prepare("SELECT id, name, revoked FROM api_keys WHERE name = ?").all(raw);
+
+  const activeMap = new Map();
+  if (byId && byId.revoked === 0) activeMap.set(byId.id, byId);
+  for (const r of byNameAll) {
+    if (r.revoked === 0) activeMap.set(r.id, r);
+  }
+
+  if (byId && byId.revoked !== 0) {
+    const otherActiveByName = [...activeMap.values()].filter((r) => r.id !== byId.id);
+    if (otherActiveByName.length > 0) {
+      throw new AmbiguousKeyError(raw, [byId, ...otherActiveByName]);
+    }
+  }
+
+  const activeRows = [...activeMap.values()];
+  if (activeRows.length > 1) {
+    throw new AmbiguousKeyError(raw, activeRows);
+  }
+  if (activeRows.length === 1) {
+    return activeRows[0];
+  }
+  if (activeOnly) return null;
+
+  const revokedMap = new Map();
+  if (byId) revokedMap.set(byId.id, byId);
+  for (const r of byNameAll) revokedMap.set(r.id, r);
+  const revokedRows = [...revokedMap.values()];
+  if (revokedRows.length > 1) {
+    throw new AmbiguousKeyError(raw, revokedRows);
+  }
+  return revokedRows.length === 1 ? revokedRows[0] : null;
+}
+
 export function createKey(name) {
   const key = "ocp_" + randomBytes(24).toString("base64url");
   const d = getDb();
@@ -146,10 +231,12 @@ export function listKeys() {
 
 export function revokeKey(idOrName) {
   const d = getDb();
+  const target = resolveKeyTarget(idOrName, { activeOnly: true });
+  if (!target) return false;
   const stmt = d.prepare(
-    "UPDATE api_keys SET revoked = 1 WHERE (id = ? OR name = ?) AND revoked = 0"
+    "UPDATE api_keys SET revoked = 1 WHERE id = ? AND revoked = 0"
   );
-  return stmt.run(idOrName, idOrName).changes > 0;
+  return stmt.run(target.id).changes > 0;
 }
 
 export function validateKey(key) {
@@ -486,9 +573,11 @@ export function updateKeyQuota(idOrName, updates = {}) {
   if ("weekly" in updates) { setClauses.push("quota_weekly = ?"); params.push(updates.weekly ?? null); }
   if ("monthly" in updates){ setClauses.push("quota_monthly = ?");params.push(updates.monthly ?? null); }
   if (setClauses.length === 0) return false;
-  params.push(idOrName, idOrName);
+  const target = resolveKeyTarget(idOrName, { activeOnly: true });
+  if (!target) return false;
+  params.push(target.id);
   const result = d.prepare(
-    `UPDATE api_keys SET ${setClauses.join(", ")} WHERE id = ? OR name = ?`
+    `UPDATE api_keys SET ${setClauses.join(", ")} WHERE id = ? AND revoked = 0`
   ).run(...params);
   return result.changes > 0;
 }
@@ -680,10 +769,10 @@ export function getInflightStats() {
   };
 }
 
-// Find a key by id or name (returns { id, name } or null)
+// Find a key unambiguously by id or name (returns { id, name } or null; throws AmbiguousKeyError on collision)
 export function findKey(idOrName) {
-  const d = getDb();
-  return d.prepare("SELECT id, name FROM api_keys WHERE id = ? OR name = ?").get(idOrName, idOrName) || null;
+  const target = resolveKeyTarget(idOrName, { activeOnly: false });
+  return target ? { id: target.id, name: target.name } : null;
 }
 
 export function closeDb() {

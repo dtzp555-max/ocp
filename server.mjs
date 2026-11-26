@@ -43,7 +43,7 @@ import { readFileSync, readdirSync, accessSync, existsSync, constants, chmodSync
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 import { homedir, tmpdir } from "node:os";
-import { validateKey, recordUsage, getUsageByKey, getUsageTimeline, getRecentUsage, createKey, listKeys, revokeKey, closeDb, checkQuota, updateKeyQuota, getKeyQuota, findKey, cacheHash, getCachedResponse, setCachedResponse, clearCache, getCacheStats, hasCacheControl, singleflight, getInflightStats } from "./keys.mjs";
+import { validateKey, recordUsage, getUsageByKey, getUsageTimeline, getRecentUsage, createKey, listKeys, revokeKey, closeDb, checkQuota, updateKeyQuota, getKeyQuota, findKey, RESERVED_KEY_NAMES, isReservedKeyName, cacheHash, getCachedResponse, setCachedResponse, clearCache, getCacheStats, hasCacheControl, singleflight, getInflightStats } from "./keys.mjs";
 import { DEFAULT_PORT } from "./lib/constants.mjs";
 import { StructuredOutputError, detectStructuredOutput, validateJsonSchemaSafe, extractJsonPayload, structuredSystemInstruction, resolveMaxAttempts } from "./lib/structured-output.mjs";
 import { scheduleKillEscalation, killChildTree } from "./lib/child-tree.mjs";
@@ -5293,6 +5293,12 @@ async function handleRequest(req, res) {
   }
   let authKeyName = isTrustedLocal ? "local" : "remote";
   let authKeyId = null;
+  // ADR 0027 (#543): admin and anonymous auth privileges are decided strictly by which
+  // authentication branch succeeded — NEVER by comparing authKeyName strings (a legacy DB key
+  // named "admin" or "anonymous" must never inherit isAdmin or isAnonCaller status; note
+  // /api/usage single-caller grouping still filters usage_log by callerName, see ADR 0027).
+  let authIsAdmin = false;
+  let authIsAnonymous = false;
 
   if (!isPublicEndpoint) {
     const auth = req.headers["authorization"] || "";
@@ -5306,17 +5312,19 @@ async function handleRequest(req, res) {
           const tokenBuf = Buffer.from(token);
           if (adminBuf.length === tokenBuf.length && timingSafeEqual(adminBuf, tokenBuf)) {
             authKeyName = "admin";
+            authIsAdmin = true;
           }
         }
-        if (authKeyName !== "admin" && PROXY_ANONYMOUS_KEY) {
+        if (!authIsAdmin && PROXY_ANONYMOUS_KEY) {
           // anonymous allowlist (issue #12 §14 Path A) — same check as multi branch
           const anonBuf = Buffer.from(PROXY_ANONYMOUS_KEY);
           const tokenBufA = Buffer.from(token);
           if (anonBuf.length === tokenBufA.length && timingSafeEqual(anonBuf, tokenBufA)) {
             authKeyName = "anonymous";
+            authIsAnonymous = true;
           }
         }
-        if (authKeyName !== "admin" && authKeyName !== "anonymous") {
+        if (!authIsAdmin && !authIsAnonymous) {
           const keyInfo = validateKey(token);
           if (keyInfo) { authKeyName = keyInfo.name; authKeyId = keyInfo.id; }
         }
@@ -5333,26 +5341,24 @@ async function handleRequest(req, res) {
     } else if (AUTH_MODE === "multi") {
       // If a token is provided, validate it; if not, allow as anonymous
       if (token) {
-        let isAdminToken = false;
         if (ADMIN_KEY) {
           const adminBuf = Buffer.from(ADMIN_KEY);
           const tokenBuf2 = Buffer.from(token);
           if (adminBuf.length === tokenBuf2.length && timingSafeEqual(adminBuf, tokenBuf2)) {
             authKeyName = "admin";
-            isAdminToken = true;
+            authIsAdmin = true;
           }
         }
         // === NEW: anonymous allowlist (issue #12 §14 Path A) ===
-        let isAnonymousToken = false;
-        if (!isAdminToken && PROXY_ANONYMOUS_KEY) {
+        if (!authIsAdmin && PROXY_ANONYMOUS_KEY) {
           const anonBuf = Buffer.from(PROXY_ANONYMOUS_KEY);
           const tokenBuf3 = Buffer.from(token);
           if (anonBuf.length === tokenBuf3.length && timingSafeEqual(anonBuf, tokenBuf3)) {
             authKeyName = "anonymous";
-            isAnonymousToken = true;
+            authIsAnonymous = true;
           }
         }
-        if (!isAdminToken && !isAnonymousToken) {
+        if (!authIsAdmin && !authIsAnonymous) {
           const keyInfo = validateKey(token);
           if (!keyInfo) {
             return jsonResponse(res, 401, { error: { message: "Unauthorized: invalid or revoked API key", type: "auth_error" } });
@@ -5362,18 +5368,21 @@ async function handleRequest(req, res) {
         }
       } else {
         authKeyName = "anonymous";
+        authIsAnonymous = true;
       }
     }
   }
 
   req._authKeyName = authKeyName;
   req._authKeyId = authKeyId;
+  req._authIsAdmin = authIsAdmin;
+  req._authIsAnonymous = authIsAnonymous;
 
   // isAdmin computed here (early, before any admin-gated handler) so that
-  // GET /logs, GET /usage, GET /status, PATCH /settings
-  // can all gate on it.  Trusted loopback and explicit admin key are always admin;
-  // in multi-tenant mode only the "admin" named key qualifies.
-  const isAdmin = AUTH_MODE !== "multi" || authKeyName === "admin" || isTrustedLocal;
+  // GET /logs, GET /usage, GET /status, PATCH /settings, /api/keys*, /cache*
+  // can all gate on it. Trusted loopback and explicit OCP_ADMIN_KEY match are admin;
+  // in multi-tenant mode a DB key NEVER qualifies regardless of its name (ADR 0027).
+  const isAdmin = AUTH_MODE !== "multi" || authIsAdmin || isTrustedLocal;
 
   // GET /v1/models
   if (req.url === "/v1/models" && req.method === "GET") {
@@ -5585,6 +5594,11 @@ async function handleRequest(req, res) {
     if (!/^[A-Za-z0-9 ._-]{1,64}$/.test(name)) {
       return jsonResponse(res, 400, { error: { message: "Invalid key name: 1-64 chars of letters, digits, space, dot, underscore, hyphen", type: "invalid_request_error" } });
     }
+    // Authorized by ADR 0027 (#543), amending ADR 0017: reserve synthetic caller names so DB keys
+    // cannot collide with synthetic identities in auth or usage_log.
+    if (isReservedKeyName(name)) {
+      return jsonResponse(res, 400, { error: { message: `Invalid key name: "${String(name).trim()}" is reserved (reserved names: ${RESERVED_KEY_NAMES.join(", ")})`, type: "invalid_request_error" } });
+    }
     const newKey = createKey(name);
     return jsonResponse(res, 201, newKey);
   }
@@ -5600,7 +5614,13 @@ async function handleRequest(req, res) {
     // today. See decodeKeySegment for the 404-vs-400 evidence and the ADR 0006 route (a) argument.
     const idOrName = decodeKeySegment(req.url.split("/api/keys/")[1]);
     if (idOrName === null) return jsonResponse(res, 404, { error: "Key not found" });
-    const revoked = revokeKey(idOrName);
+    let revoked;
+    try {
+      revoked = revokeKey(idOrName);
+    } catch (e) {
+      if (e?.code === "AMBIGUOUS_KEY") return jsonResponse(res, 409, { error: e.message });
+      throw e;
+    }
     return jsonResponse(res, 200, { revoked, idOrName });
   }
 
@@ -5653,7 +5673,13 @@ async function handleRequest(req, res) {
       }
     }
     if (Object.keys(quotaFields).length === 0) return jsonResponse(res, 400, { error: "Provide at least one of: daily, weekly, monthly" });
-    const updated = updateKeyQuota(idOrName, quotaFields);
+    let updated;
+    try {
+      updated = updateKeyQuota(idOrName, quotaFields);
+    } catch (e) {
+      if (e?.code === "AMBIGUOUS_KEY") return jsonResponse(res, 409, { error: e.message });
+      throw e;
+    }
     if (!updated) return jsonResponse(res, 404, { error: "Key not found" });
     logEvent("info", "quota_updated", { idOrName, ...quotaFields });
     return jsonResponse(res, 200, { ok: true, idOrName, quota: quotaFields });
@@ -5666,7 +5692,13 @@ async function handleRequest(req, res) {
     // hang identically. Folded in under Iron Rule 11 §11.1 rather than deferred. See decodeKeySegment.
     const idOrName = decodeKeySegment(req.url.split("/api/keys/")[1].replace("/quota", ""));
     if (idOrName === null) return jsonResponse(res, 404, { error: "Key not found" });
-    const keyRow = findKey(idOrName);
+    let keyRow;
+    try {
+      keyRow = findKey(idOrName);
+    } catch (e) {
+      if (e?.code === "AMBIGUOUS_KEY") return jsonResponse(res, 409, { error: e.message });
+      throw e;
+    }
     if (!keyRow) return jsonResponse(res, 404, { error: "Key not found" });
     const quota = getKeyQuota(keyRow.id);
     return jsonResponse(res, 200, { keyId: keyRow.id, quota });
@@ -5687,7 +5719,8 @@ async function handleRequest(req, res) {
     const callerName = req._authKeyName;
 
     // Anonymous callers may never opt into all-keys view, even if they pass ?all=true.
-    const isAnonCaller = callerName === "anonymous";
+    // ADR 0027 (#543): driven by the auth-branch boolean, never by key name string comparison.
+    const isAnonCaller = Boolean(req._authIsAnonymous);
     const fullScope = isAdmin && wantAll && !isAnonCaller;
 
     // scopeName === null when fullScope is true (no filter); otherwise the key_name to filter by.
