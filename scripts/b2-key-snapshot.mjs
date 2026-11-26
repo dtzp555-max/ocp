@@ -344,6 +344,9 @@ export function makeB2Fixture(profileId = "default") {
       // Value-only, but pinned so an ambient export cannot make one machine's run differ.
       OCP_INSTANCE_NAME: "",
       PROXY_ADVERTISE_ANON_KEY: "0",
+      // ADR 0025 (#542): OCP_TRUST_LOOPBACK=0 omits `anonymousKey` from /health on loopback even
+      // in AUTH_MODE=none, so pin the default here rather than inheriting an ambient export.
+      OCP_TRUST_LOOPBACK: "1",
       // The profile's overrides come LAST so a profile can override any pin above — EXCEPT the
       // tmux pin, which is applied after this spread and is refused above.
       ...profile.env,

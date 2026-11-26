@@ -331,6 +331,8 @@ ocp keys revoke son-ipad   # Revoke a key
 
 **Real per-user isolation (sandboxed, multi-tenant-safe) is still not implemented.** ADR 0007 lists three requirements: tool lockdown, a per-key ephemeral `HOME`, and an OS sandbox. **The first one now holds** for the `-p` path (`--tools ""`); the other two do not. One of three is not a boundary — the conclusion below is unchanged by it. Treat a multi-user OCP as a *trusted-group convenience*, not a security boundary. (This is also why `CLAUDE_TUI_MODE` is single-user-only — see [Subscription-pool (TUI) mode](tui-mode.md#subscription-pool-tui-mode).)
 
+**Same-host reverse proxy warning (nginx / Caddy).** By default (`OCP_TRUST_LOOPBACK=1`), OCP treats requests from `127.0.0.1` / `::1` as trusted local admin and skips `shared`/`multi` auth. A reverse proxy running on the **same host** connects from `127.0.0.1`, which silently disables auth and grants every proxied remote client admin access (#542). Always set `OCP_TRUST_LOOPBACK=0` when fronting OCP with a same-host reverse proxy (and set `OCP_ADMIN_KEY` in `multi` mode so admin endpoints stay reachable; `ocp` CLI reads `OCP_ADMIN_KEY` / `~/.ocp/admin-key`). See [ADR 0025](adr/0025-trust-loopback.md).
+
 ## Anonymous Access (optional)
 
 In `multi` mode, the admin can designate a single well-known "anonymous" key that bypasses `validateKey()` and grants public read/write access. This is useful for letting LAN users (or clients like OpenClaw multi-agent setups) connect without individual per-user keys.
