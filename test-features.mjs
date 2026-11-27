@@ -2977,15 +2977,20 @@ test("promptCharBudgetFor: the named model's OWN contextWindow × 3 chars/token"
 // budgets, asserted together — a fix that raised the ceiling globally passes the first
 // assertion and fails the second, and ADR 0009's shipped behaviour fails the first.
 test("promptCharBudgetFor: a 1M model gets 3M chars while a 200k model in the SAME registry still gets 600k (#213)", () => {
+  const mixed = [
+    { id: "claude-opus-5-5", contextWindow: 1000000 },
+    { id: "claude-haiku-4-5-20251001", contextWindow: 200000 },
+  ];
+  assert.equal(promptCharBudgetFor(mixed, "claude-opus-5-5"), 3000000,
+    "1M entry in a mixed registry must get the 3M budget");
+  assert.equal(promptCharBudgetFor(mixed, "claude-haiku-4-5-20251001"), 600000,
+    "200k entry in the SAME registry must keep its 600k ceiling — a global raise turns OCP-side truncation into an upstream rejection");
+
   const spot = JSON.parse(tuiReadFileSync(new URL("./models.json", import.meta.url), "utf8"));
-  assert.equal(promptCharBudgetFor(spot.models, "claude-opus-5"), 3000000,
-    "claude-opus-5 is native 1M in the CLI registry — it must get the large budget");
-  assert.equal(promptCharBudgetFor(spot.models, "claude-sonnet-5"), 3000000,
-    "claude-sonnet-5 is native 1M in the CLI registry — it must get the large budget");
-  assert.equal(promptCharBudgetFor(spot.models, "claude-haiku-4-5-20251001"), 600000,
-    "claude-haiku-4-5 is genuinely 200k — raising ITS ceiling turns OCP-side truncation into an upstream rejection");
-  assert.equal(promptCharBudgetFor(spot.models, "claude-sonnet-4-6"), 600000,
-    "claude-sonnet-4-6 is genuinely 200k");
+  for (const id of ["claude-fable-5-2", "claude-opus-5-5", "claude-sonnet-5-5", "claude-haiku-5-5"]) {
+    assert.equal(promptCharBudgetFor(spot.models, id), 3000000,
+      `${id} is native 1M in models.json — it must derive a 3,000,000-char budget`);
+  }
 });
 
 test("promptCharBudgetFor: floor wins over a tiny window; unknown/garbage entries fall back", () => {
@@ -3086,12 +3091,11 @@ test("fallbackPromptCharBudget: SMALLEST known window × 3, so an unknown model 
   assert.equal(fallbackPromptCharBudget(undefined), 150000);
 });
 
-// The number GET /settings reports on the default path must not move: every non-1M entry
-// is still 200000, so the fallback is the same 600000 ADR 0009's max() produced before
-// the 1M windows were declared.
-test("fallbackPromptCharBudget: the live SPOT still yields 600000, so /settings' default-path value is unchanged", () => {
+// The live SPOT now contains only 1M-window models (latest per family), so min(contextWindow) × 3
+// yields 3,000,000 for GET /settings' un-overridden default path.
+test("fallbackPromptCharBudget: the live SPOT yields 3000000 when every exposed model is 1M", () => {
   const spot = JSON.parse(tuiReadFileSync(new URL("./models.json", import.meta.url), "utf8"));
-  assert.equal(fallbackPromptCharBudget(spot.models), 600000);
+  assert.equal(fallbackPromptCharBudget(spot.models), 3000000);
 });
 
 // PR #179 review regression, carried forward: EMPTY env value must mean "use the default"
@@ -9246,22 +9250,15 @@ function ltOverBudgetHistory(big) {
   return [{ role: "user", content: big }, { role: "assistant", content: "ok" }, { role: "user", content: "and the question is this one" }];
 }
 
-// #213 / ADR 0011 — the acceptance case, end-to-end against a real server.mjs child.
+// #213 / ADR 0011 — end-to-end budget check against a real server.mjs child.
 //
-// This is the test the whole change exists to pass, and it is deliberately a PAIR on the same
-// boot: raising the ceiling globally (the naive fix) satisfies the 1M arm and fails the 200k
-// arm, while shipped ADR 0009 behaviour fails the 1M arm. Only a per-model budget passes both.
-//
-// Observable: server.mjs logs `prompt_truncated` at level warn, which logEvent sends to
-// console.error, i.e. the child's stderr — and the entry carries `maxChars`, which IS the
-// budget that was in force. So the assertions read the actual number, not a proxy for it.
-//
-// The spawn counter is what makes the negative arm honest. Asserting "no new truncation line
-// appeared" right after a POST would also pass if the request simply had not been processed
-// yet; `prompt_truncated` is emitted inside messagesToPrompt, which runs BEFORE the CLI spawn,
-// so waiting for the counter to bump proves the request got past the point that would have
-// logged. Wait for the thing you are about to assert.
-ltTest("integration (#213): the SAME oversized prompt is truncated for a 200k model and NOT for a 1M model", async () => {
+// Because every model in models.json currently has a 1M window, promptCharBudgetFor() and
+// FALLBACK_PROMPT_CHARS both resolve to 3,000,000, so live integration tests alone cannot
+// distinguish a per-model lookup from FALLBACK_PROMPT_CHARS at the call site (recorded in
+// AGENTS.md § Wiring-pin ledger; mixed 1M-vs-200k helper differentiation is pinned by the
+// promptCharBudgetFor unit test above). What this test proves live is that 700k prompts pass
+// whole (not truncated at a hardcoded 600k ceiling) and 3.1M prompts truncate at 3000000.
+ltTest("integration (#213): native-1M catalog passes a 700k prompt whole and truncates above 3,000,000 chars", async () => {
   if (!LT_POSIX) return;
   const dir = ltMkdir(); const fake = ltFake(dir); const counter = join(dir, "spawns.txt");
   const { child, buf, port } = await ltBootFresh({ CLAUDE_BIN: fake, SP_COUNTER: counter }, dir);
@@ -9270,34 +9267,30 @@ ltTest("integration (#213): the SAME oversized prompt is truncated for a 200k mo
     assert.ok(await ltWait(() => buf.out.includes("listening on")), `did not start: ${buf.err.slice(0, 200)}`);
     _ltWrite(counter, "0");
 
-    // Over the 200k model's 600,000-char ceiling, well under the 1M model's 3,000,000.
+    // Over the historical 600,000-char cap, well under the 1M models' 3,000,000.
     const big = "x".repeat(700000);
 
-    // Arm 1 — genuinely-200k model: MUST truncate, at exactly 600000.
-    await ltPost(port, { model: "claude-haiku-4-5-20251001", messages: ltOverBudgetHistory(big) });
-    assert.ok(await ltWait(() => nTrunc() >= 1, 15000),
-      `claude-haiku-4-5 is 200k native: a 700k-char prompt must be truncated OCP-side. ${ltDiag(buf)}`);
-    const hit = buf.err.split("\n").find(l => l.includes('"prompt_truncated"'));
-    assert.match(hit, /"maxChars":600000/,
-      `the 200k model's ceiling must still be 600000 (contextWindow 200000 x 3) — a global raise would ` +
-      `show 3000000 here and hand this model prompts the upstream will reject. Got: ${hit}`);
-    assert.ok(await ltWait(() => (Number(_ltRead(counter, "utf8")) || 0) >= 1, 9000), "arm 1 reached the spawn");
+    // Arm 1 — claude-haiku-5-5 (1M): must NOT truncate at the old 600k Haiku 4.5 ceiling.
+    await ltPost(port, { model: "claude-haiku-5-5", messages: ltOverBudgetHistory(big) });
+    assert.ok(await ltWait(() => (Number(_ltRead(counter, "utf8")) || 0) >= 1, 15000),
+      `arm 1 must reach the spawn. ${ltDiag(buf)}`);
+    assert.equal(nTrunc(), 0,
+      `claude-haiku-5-5 is native 1M: a 700k-char prompt must pass whole. stderr: ${buf.err.slice(-400)}`);
 
-    // Arm 2 — native-1M model, IDENTICAL prompt: must NOT truncate.
-    await ltPost(port, { model: "claude-opus-5", messages: ltOverBudgetHistory(big) });
+    // Arm 2 — claude-opus-5-5 (1M): IDENTICAL 700k prompt must NOT truncate.
+    await ltPost(port, { model: "claude-opus-5-5", messages: ltOverBudgetHistory(big) });
     assert.ok(await ltWait(() => (Number(_ltRead(counter, "utf8")) || 0) >= 2, 15000),
       `arm 2 must reach the spawn, otherwise the no-truncation assertion below is vacuous. ${ltDiag(buf)}`);
-    assert.equal(nTrunc(), 1,
-      `claude-opus-5 is native 1M: the same 700k-char prompt must pass through WHOLE. A second ` +
-      `prompt_truncated line means the ceiling is still the old global 600000. stderr: ${buf.err.slice(-400)}`);
+    assert.equal(nTrunc(), 0,
+      `claude-opus-5-5 is native 1M: the same 700k-char prompt must pass through WHOLE. stderr: ${buf.err.slice(-400)}`);
 
-    // Arm 3 — the 1M model's budget is a real 3,000,000, not "no ceiling". Proves arm 2 passed
+    // Arm 3 — the 1M model's budget is a real 3,000,000, not "no ceiling". Proves arms 1-2 passed
     // because the budget is larger, not because the guard was disabled.
-    await ltPost(port, { model: "claude-opus-5", messages: ltOverBudgetHistory("y".repeat(3100000)) });
-    assert.ok(await ltWait(() => nTrunc() >= 2, 20000),
-      `claude-opus-5 must still truncate ABOVE its own 3,000,000-char budget — otherwise the guard is ` +
+    await ltPost(port, { model: "claude-opus-5-5", messages: ltOverBudgetHistory("y".repeat(3100000)) });
+    assert.ok(await ltWait(() => nTrunc() >= 1, 20000),
+      `claude-opus-5-5 must still truncate ABOVE its own 3,000,000-char budget — otherwise the guard is ` +
       `off for this model rather than merely wider. ${ltDiag(buf)}`);
-    const hit3 = buf.err.split("\n").filter(l => l.includes('"prompt_truncated"'))[1];
+    const hit3 = buf.err.split("\n").find(l => l.includes('"prompt_truncated"'));
     assert.match(hit3, /"maxChars":3000000/,
       `the 1M model's ceiling must be exactly 3000000 (contextWindow 1000000 x 3). Got: ${hit3}`);
   } finally { child.kill("SIGKILL"); _ltRmRetry(dir); }
@@ -9309,9 +9302,8 @@ ltTest("integration (#213): the SAME oversized prompt is truncated for a 200k mo
 // chosen semantics from a clamp/ceiling reading (which would be a no-op in the raising
 // direction) and from "the override only applies to models without a SPOT entry".
 //
-// It also pins the GET contract that ADR 0011 deliberately did not move: a plain number, and
-// 600000 on the default path — the same value the field reported before the change, because
-// the fallback is the smallest known window x 3.
+// Since every exposed model in models.json is now 1M, GET /settings reports 3,000,000 on
+// the default path (smallest known window × 3).
 ltTest("integration (ADR 0011): /settings maxPromptChars is a GLOBAL override that beats a 1M model's per-model budget", async () => {
   if (!LT_POSIX) return;
   const dir = ltMkdir(); const fake = ltFake(dir); const counter = join(dir, "spawns.txt");
@@ -9322,14 +9314,14 @@ ltTest("integration (ADR 0011): /settings maxPromptChars is a GLOBAL override th
     assert.ok(await ltWait(() => buf.out.includes("listening on")), `did not start: ${buf.err.slice(0, 200)}`);
     _ltWrite(counter, "0");
 
-    // Default path: a plain number, and the pre-ADR-0011 value.
+    // Default path: a plain number matching min(models[].contextWindow) * 3 = 3,000,000.
     const before = await getSettings();
     assert.equal(typeof before.maxPromptChars.value, "number",
       "`ocp settings` formats this into a fixed-width column — it must stay a scalar, never null or a per-model map");
-    assert.equal(before.maxPromptChars.value, 600000,
-      "with no override set, GET /settings must report the fallback (smallest known window x 3) — unchanged by ADR 0011");
+    assert.equal(before.maxPromptChars.value, 3000000,
+      "with no override set, GET /settings must report min(contextWindow) x 3 across live models.json (3,000,000)");
 
-    // Install a global override well BELOW what claude-opus-5 derives on its own (3,000,000).
+    // Install a global override well BELOW what claude-opus-5-5 derives on its own (3,000,000).
     const patch = await fetch(`http://127.0.0.1:${port}/settings`, {
       method: "PATCH", headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ maxPromptChars: 200000 }),
@@ -9338,29 +9330,21 @@ ltTest("integration (ADR 0011): /settings maxPromptChars is a GLOBAL override th
     assert.equal((await getSettings()).maxPromptChars.value, 200000, "GET must report the override that was just installed");
 
     // The 1M model must now truncate at the OVERRIDE, not at its own 3,000,000 budget.
-    await ltPost(port, { model: "claude-opus-5", messages: ltOverBudgetHistory("z".repeat(700000)) });
+    await ltPost(port, { model: "claude-opus-5-5", messages: ltOverBudgetHistory("z".repeat(700000)) });
     assert.ok(await ltWait(() => nTrunc() >= 1, 15000),
-      `the global override must apply to claude-opus-5 too — without it a 700k prompt would pass whole. ${ltDiag(buf)}`);
+      `the global override must apply to claude-opus-5-5 too — without it a 700k prompt would pass whole. ${ltDiag(buf)}`);
     const hit = buf.err.split("\n").find(l => l.includes('"prompt_truncated"'));
     assert.match(hit, /"maxChars":200000/,
-      `the override is ABSOLUTE: claude-opus-5's ceiling must be the 200000 that was set, not its derived ` +
+      `the override is ABSOLUTE: claude-opus-5-5's ceiling must be the 200000 that was set, not its derived ` +
       `3000000 and not a min/max blend with it. Got: ${hit}`);
   } finally { child.kill("SIGKILL"); _ltRmRetry(dir); }
 });
 
 // The TUI path takes its budget from a DIFFERENT call site than the -p path
-// (callClaudeTui -> messagesToPrompt, vs spawnClaudeProcess), so covering one does not cover
-// the other: a mutation reverting only callClaudeTui to the global fallback survived the whole
-// suite until this test existed.
-//
-// It needs no tmux and no real claude. messagesToPrompt is the FIRST statement in
-// callClaudeTui, ahead of the semaphore and every tmux/pane operation, so the truncation
-// decision is made and logged before anything that would need a real interactive CLI — the
-// turn failing afterwards is expected and irrelevant (ltPost already tolerates it).
-//
-// BOTH arms assert positively (each waits for a truncation line and then reads its maxChars),
-// so neither can pass vacuously by the request simply not having been processed. Arm 2 is the
-// discriminating one: with a single global budget it would report 600000, not 3000000.
+// (callClaudeTui -> messagesToPrompt, vs spawnClaudeProcess). While every model in models.json
+// is 1M, promptCharBudgetFor and FALLBACK_PROMPT_CHARS both resolve to 3,000,000, so reverting
+// callClaudeTui to FALLBACK_PROMPT_CHARS stays green here (recorded in AGENTS.md § Wiring-pin
+// ledger); this test verifies the TUI lane truncates at 3000000 (not a hardcoded 600k constant).
 ltTest("integration (#213): the TUI path bounds the prompt per model too, not by the global fallback", async () => {
   if (!LT_POSIX) return;
   const dir = ltMkdir(); const fake = ltFake(dir);
@@ -9369,20 +9353,19 @@ ltTest("integration (#213): the TUI path bounds the prompt per model too, not by
   try {
     assert.ok(await ltWait(() => buf.out.includes("listening on")), `did not start: ${buf.err.slice(0, 200)}`);
 
-    // Arm 1 — 200k model, over its 600,000 ceiling.
-    await ltPost(port, { model: "claude-haiku-4-5-20251001", messages: ltOverBudgetHistory("x".repeat(700000)) });
-    assert.ok(await ltWait(() => truncLines().length >= 1, 20000),
-      `the TUI path must still truncate a 700k prompt for a 200k model. ${ltDiag(buf)}`);
-    assert.match(truncLines()[0], /"maxChars":600000/,
-      `TUI ceiling for claude-haiku-4-5 must be 600000. Got: ${truncLines()[0]}`);
+    // Arm 1 — claude-haiku-5-5 (1M), over its 3,000,000 ceiling.
+    await ltPost(port, { model: "claude-haiku-5-5", messages: ltOverBudgetHistory("x".repeat(3100000)) });
+    assert.ok(await ltWait(() => truncLines().length >= 1, 25000),
+      `the TUI path must truncate a 3.1M prompt for claude-haiku-5-5. ${ltDiag(buf)}`);
+    assert.match(truncLines()[0], /"maxChars":3000000/,
+      `TUI ceiling for claude-haiku-5-5 must be 3000000. Got: ${truncLines()[0]}`);
 
-    // Arm 2 — 1M model, over its own 3,000,000 ceiling. Under a global budget this reads 600000.
-    await ltPost(port, { model: "claude-opus-5", messages: ltOverBudgetHistory("y".repeat(3100000)) });
+    // Arm 2 — claude-opus-5-5 (1M), over its 3,000,000 ceiling.
+    await ltPost(port, { model: "claude-opus-5-5", messages: ltOverBudgetHistory("y".repeat(3100000)) });
     assert.ok(await ltWait(() => truncLines().length >= 2, 25000),
-      `the TUI path must truncate a 3.1M prompt even for a 1M model. ${ltDiag(buf)}`);
+      `the TUI path must truncate a 3.1M prompt even for claude-opus-5-5. ${ltDiag(buf)}`);
     assert.match(truncLines()[1], /"maxChars":3000000/,
-      `TUI ceiling for claude-opus-5 must be its own 3000000, not the global fallback — this is the ` +
-      `assertion that catches callClaudeTui being wired to the wrong budget. Got: ${truncLines()[1]}`);
+      `TUI ceiling for claude-opus-5-5 must be its own 3000000, not a legacy 600000 fallback. Got: ${truncLines()[1]}`);
   } finally { child.kill("SIGKILL"); _ltRmRetry(dir); }
 });
 
@@ -9394,9 +9377,9 @@ ltTest("integration (#213): the TUI path bounds the prompt per model too, not by
 ltTest("integration (ADR 0024): an over-budget NEWEST message is refused with 400 context_length_exceeded before any spawn; history is still trimmed", async () => {
   if (!LT_POSIX) return;
   const dir = ltMkdir(); const fake = ltFake(dir); const counter = join(dir, "spawns.txt"); const stdinFile = join(dir, "stdin.txt");
-  const { child, buf, port } = await ltBootFresh({ CLAUDE_BIN: fake, SP_COUNTER: counter, STDIN_CAPTURE: stdinFile }, dir);
+  const { child, buf, port } = await ltBootFresh({ CLAUDE_BIN: fake, SP_COUNTER: counter, STDIN_CAPTURE: stdinFile, CLAUDE_MAX_PROMPT_CHARS: "600000" }, dir);
   const spawns = () => Number(_ltExists(counter) ? _ltRead(counter, "utf8") : 0) || 0;
-  const HAIKU = "claude-haiku-4-5-20251001"; // 200k window -> 600000-char budget
+  const HAIKU = "claude-haiku-5-5"; // bounded to 600000 chars via CLAUDE_MAX_PROMPT_CHARS above
   const PNG = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNkYAAAAAYAAjCB0C8AAAAASUVORK5CYII=";
   const refused = async (label, body) => {
     const r = await ltPostStatus(port, { model: HAIKU, ...body });
@@ -9452,8 +9435,8 @@ ltTest("integration (ADR 0024): an over-budget NEWEST message is refused with 40
 ltTest("integration (ADR 0024): the TUI path refuses an over-budget newest message too, counting inline system messages", async () => {
   if (!LT_POSIX) return;
   const dir = ltMkdir(); const fake = ltFake(dir);
-  const { child, buf, port } = await ltBootFresh({ CLAUDE_TUI_MODE: "true", CLAUDE_BIN: fake }, dir);
-  const HAIKU = "claude-haiku-4-5-20251001";
+  const { child, buf, port } = await ltBootFresh({ CLAUDE_TUI_MODE: "true", CLAUDE_BIN: fake, CLAUDE_MAX_PROMPT_CHARS: "600000" }, dir);
+  const HAIKU = "claude-haiku-5-5";
   try {
     assert.ok(await ltWait(() => buf.out.includes("listening on")), `did not start: ${buf.err.slice(0, 200)}`);
     // Control first: history over budget gets PAST the pre-flight and is truncated by callClaudeTui.
@@ -9486,7 +9469,7 @@ ltTest("integration (ADR 0024, review F1): an image tool turn near the budget is
   const call = { role: "assistant", content: null, tool_calls: [{ id: "c1", type: "function", function: { name: "f", arguments: "{}" } }] };
   try {
     assert.ok(await ltWait(() => buf.out.includes("listening on")), `did not start: ${buf.err.slice(0, 200)}`);
-    const r = await ltPostStatus(port, { model: "claude-haiku-4-5-20251001", messages: [
+    const r = await ltPostStatus(port, { model: "claude-haiku-5-5", messages: [
       { role: "user", content: [{ type: "text", text: "look" }, img ], }, call,
       { role: "tool", tool_call_id: "c1", content: [{ type: "text", text: "MARK_F1" + "x".repeat(1843) }, img] }] });
     assert.equal(r.status, 200, `a vision tool turn inside the budget must be served, got ${r.status} ${r.text.slice(0, 200)}`);
@@ -9501,7 +9484,7 @@ ltTest("integration (ADR 0024, review F2): in TUI mode the continuation note and
   if (!LT_POSIX) return;
   const dir = ltMkdir(); const fake = ltFake(dir);
   const { child, buf, port } = await ltBootFresh({ CLAUDE_TUI_MODE: "true", CLAUDE_BIN: fake, CLAUDE_MAX_PROMPT_CHARS: "2000" }, dir);
-  const HAIKU = "claude-haiku-4-5-20251001";
+  const HAIKU = "claude-haiku-5-5";
   try {
     assert.ok(await ltWait(() => buf.out.includes("listening on")), `did not start: ${buf.err.slice(0, 200)}`);
     const N = 1900 - "[Tool tool returned]\n".length;
@@ -9555,7 +9538,7 @@ ltTest("integration: a legacyAlias shares ONE cache slot with its canonical targ
     const msgs = [{ role: "user", content: "legacy-alias-probe" }];
     await ltPost(port, { model: "claude-haiku-4-5", messages: msgs });            // legacyAlias
     await ltWait(() => (Number(_ltRead(counter, "utf8")) || 0) >= 1, 3000);
-    await ltPost(port, { model: "claude-haiku-4-5-20251001", messages: msgs });   // canonical
+    await ltPost(port, { model: "claude-haiku-5-5", messages: msgs });            // canonical
     await new Promise(r => setTimeout(r, 600));
     assert.equal(Number(_ltRead(counter, "utf8")) || 0, 1,
       "legacyAliases live in MODEL_MAP too — resolving must collapse them onto the canonical slot");
@@ -22546,8 +22529,12 @@ console.log("\nmodels.json SPOT aliases (issue #112):");
 const _spotDir = spotDirname(spotFileURLToPath(import.meta.url));
 const _spotModels = JSON.parse(spotReadFileSync(spotJoin(_spotDir, "models.json"), "utf8"));
 
-test("models.json aliases.haiku === 'claude-haiku-4-5-20251001' (usage-probe SPOT)", () => {
-  assert.equal(_spotModels.aliases.haiku, "claude-haiku-4-5-20251001");
+// aliases.haiku now points to claude-haiku-5-5 for client completions; fetchUsageFromApi()
+// uses internal constant USAGE_PROBE_MODEL = 'claude-haiku-4-5-20251001' (decoupled from this
+// alias — see server.mjs) because bare max_tokens:1 usage probes against haiku-5-5 return 429
+// without rate-limit headers.
+test("models.json aliases.haiku === 'claude-haiku-5-5' (haiku-alias SPOT)", () => {
+  assert.equal(_spotModels.aliases.haiku, "claude-haiku-5-5");
 });
 
 test("models.json aliases.sonnet === 'claude-sonnet-5-5' (default-request-model SPOT)", () => {
@@ -22567,12 +22554,33 @@ test("models.json aliases.opus === 'claude-opus-5-5' (opus-alias SPOT)", () => {
 // nothing else checks alias *targets*. This is the guard with teeth.
 const _spotModelIds = new Set(_spotModels.models.map(m => m.id));
 
-test("models.json: claude-sonnet-5 is present in models[] (the entry this PR adds)", () => {
-  assert.ok(_spotModelIds.has("claude-sonnet-5"), "claude-sonnet-5 must exist as a models[].id");
-});
-
-test("models.json: claude-opus-5 is present in models[] (the entry this PR adds)", () => {
-  assert.ok(_spotModelIds.has("claude-opus-5"), "claude-opus-5 must exist as a models[].id");
+test("models.json: exposes only the 4 latest models (one per family) and maps retired IDs via legacyAliases", () => {
+  assert.deepEqual(_spotModels.models.map(m => m.id), [
+    "claude-fable-5-2",
+    "claude-opus-5-5",
+    "claude-sonnet-5-5",
+    "claude-haiku-5-5",
+  ]);
+  const expectedLegacy = {
+    "claude-fable-5-1": "claude-fable-5-2",
+    "claude-fable-5": "claude-fable-5-2",
+    "claude-opus-5": "claude-opus-5-5",
+    "claude-opus-4-8": "claude-opus-5-5",
+    "claude-opus-4-7": "claude-opus-5-5",
+    "claude-opus-4-6": "claude-opus-5-5",
+    "claude-opus-4-5": "claude-opus-5-5",
+    "claude-opus-4": "claude-opus-5-5",
+    "claude-sonnet-5": "claude-sonnet-5-5",
+    "claude-sonnet-4-6": "claude-sonnet-5-5",
+    "claude-sonnet-4-5": "claude-sonnet-5-5",
+    "claude-haiku-4-5-20251001": "claude-haiku-5-5",
+    "claude-haiku-4": "claude-haiku-5-5",
+    "claude-haiku-4-5": "claude-haiku-5-5",
+  };
+  for (const [legacyId, target] of Object.entries(expectedLegacy)) {
+    assert.equal(_spotModels.legacyAliases[legacyId], target,
+      `retired model ${legacyId} must remain resolvable via legacyAliases -> ${target}`);
+  }
 });
 
 // ADR 0011 removed the coupling this slot used to guard. Until #213 the budget was GLOBAL
@@ -22628,15 +22636,10 @@ test("models.json: every contextWindow is a positive integer (shape guard; the c
 //      below plus claude-fable-5, claude-fable-5-1, claude-mythos-5 and claude-mythos-5-1, none of which
 //      OCP exposes. (Review of that change proposed "7" by inference; the binary says 9.)
 const _spotRegistryContextWindow = {
-  "claude-fable-5-2": 1000000, "claude-haiku-5-5": 1000000, // CLI 2.1.323 registry: context:{window:1e6}
-  "claude-fable-5-1": 1000000,  // CLI 2.1.289 registry: context:{window:1e6}
-  "claude-fable-5": 1000000,    // CLI 2.1.289 registry: context:{window:1e6}
-  "claude-opus-4-5": 200000, "claude-sonnet-4-5": 200000, // CLI 2.1.289 registry: context:{window:200000}
+  "claude-fable-5-2": 1000000, // CLI 2.1.323 registry: context:{window:1e6}
+  "claude-haiku-5-5": 1000000, // CLI 2.1.323 registry: context:{window:1e6}
   "claude-sonnet-5-5": 1000000, // CLI 2.1.284 registry: context:{window:1e6}
   "claude-opus-5-5": 1000000,   // CLI 2.1.280 registry: context:{window:1e6}
-  "claude-opus-5": 1000000, "claude-opus-4-8": 1000000, "claude-opus-4-7": 1000000,
-  "claude-opus-4-6": 200000, "claude-sonnet-5": 1000000, "claude-sonnet-4-6": 200000,
-  "claude-haiku-4-5-20251001": 200000,      // registry id: claude-haiku-4-5
 };
 
 test("models.json: contextWindow equals the CLI registry exactly, for every model (#213)", () => {
@@ -22709,26 +22712,12 @@ test("models.json: every aliases value resolves to a real models[].id (referenti
 // -> 633 passed, 0 failed (the wrong-repro trap — renaming without adding the new id anywhere
 // fails the FORWARD check instead and masks this gap entirely; see #222 for both repros).
 const _spotRegistryMaxTokens = {
-  // claude-fable-5-1: CLI 2.1.289 registry, max_output_tokens:{default:64000,upper:128000}. The API
-  // accepts up to 128000, but this table records the registry DEFAULT, as for claude-opus-5 (same pair).
-  "claude-fable-5-1": 64000,
-  // CLI 2.1.323 registry: claude-fable-5-2 and claude-haiku-5-5 both {default:128000,upper:128000} --
-  // NOT their siblings' 64000 (claude-fable-5-1) and 32000 (claude-haiku-4-5).
+  // CLI 2.1.323 registry: claude-fable-5-2 and claude-haiku-5-5 both {default:128000,upper:128000}.
   "claude-fable-5-2": 128000, "claude-haiku-5-5": 128000,
-  // CLI 2.1.289 registry: claude-fable-5 {default:64000,upper:128000}; claude-opus-4-5 and
-  // claude-sonnet-4-5 {default:32000,upper:64000}.
-  "claude-fable-5": 64000, "claude-opus-4-5": 32000, "claude-sonnet-4-5": 32000,
-  // claude-sonnet-5-5: CLI 2.1.284 registry, max_output_tokens:{default:128000,upper:128000} -- NOT the
-  // sibling claude-sonnet-5's 64000 (same trap as claude-opus-5-5 below).
+  // claude-sonnet-5-5: CLI 2.1.284 registry, max_output_tokens:{default:128000,upper:128000}.
   "claude-sonnet-5-5": 128000,
-  // claude-opus-5-5 is read from the CLI 2.1.280 registry, NOT 2.1.220 like the rows below -- the model
-  // did not exist then. Record: max_output_tokens:{default:128000,upper:128000}. Note it is NOT the
-  // sibling claude-opus-5 value (default:64000,upper:128000): copying the neighbour row, which is what
-  // the first draft of this change did, would have under-advertised it by half and this test caught it.
+  // claude-opus-5-5: CLI 2.1.280 registry, max_output_tokens:{default:128000,upper:128000}.
   "claude-opus-5-5": 128000,
-  "claude-opus-5": 64000, "claude-opus-4-8": 64000, "claude-opus-4-7": 64000, "claude-opus-4-6": 64000,
-  "claude-sonnet-5": 64000, "claude-sonnet-4-6": 32000,
-  "claude-haiku-4-5-20251001": 32000,       // registry id: claude-haiku-4-5
 };
 test("models.json: every maxTokens equals the CLI registry's max_output_tokens.default (#195)", () => {
   for (const m of _spotModels.models) {
@@ -24503,18 +24492,24 @@ const _ocKnownRegistryExtras = {
   "claude-opus-4-0": 32000,
   "claude-opus-4-1": 32000,
   "claude-opus-4-5": 32000,
+  "claude-opus-4-6": 64000,
+  "claude-sonnet-4-6": 32000,
+  "claude-haiku-4": 32000,
+  "claude-haiku-4-5-20251001": 32000,
 };
 
 // Resolve the registry ground truth for an id ocp-connect might classify: directly (a
-// models.json id), via models.json's legacyAliases/aliases (e.g. the hardcoded fallback's bare
-// "claude-haiku-4" -> "claude-haiku-4-5-20251001"), or via the manually-pinned extras above.
+// models.json id), via the pinned extras above (true CLI cap for legacy ids remapped to
+// higher-cap successors), or via models.json's legacyAliases/aliases. Checking extras BEFORE
+// legacyAliases ensures the legacy fallback test still validates against the legacy id's own
+// registry cap (64000/32000) instead of its remapped successor (128000).
 function _ocRegistryTruth(id) {
   if (id in _spotRegistryMaxTokens) return _spotRegistryMaxTokens[id];
+  if (id in _ocKnownRegistryExtras) return _ocKnownRegistryExtras[id];
   const viaLegacy = (_spotModels.legacyAliases || {})[id];
   if (viaLegacy && viaLegacy in _spotRegistryMaxTokens) return _spotRegistryMaxTokens[viaLegacy];
   const viaAlias = (_spotModels.aliases || {})[id];
   if (viaAlias && viaAlias in _spotRegistryMaxTokens) return _spotRegistryMaxTokens[viaAlias];
-  if (id in _ocKnownRegistryExtras) return _ocKnownRegistryExtras[id];
   return undefined;
 }
 

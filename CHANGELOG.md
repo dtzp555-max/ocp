@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+### Changed
+
+- **Trim advertised models to the latest per family (`models.json`) and decouple the `/usage` probe (`server.mjs`).** Class Hybrid (`GET /v1/models` Class B.1, OpenAI "List models" + ADR 0003/0006; outbound `/v1/messages` `/usage` probe Class A, `cli.js vE4`). `models[]` now exposes only the 4 latest models (`claude-fable-5-2`, `claude-opus-5-5`, `claude-sonnet-5-5`, `claude-haiku-5-5`), pointing `aliases.haiku` at `claude-haiku-5-5` and routing all 11 retired model IDs to each family's latest model via `legacyAliases`. `fetchUsageFromApi()` now pins internal constant `USAGE_PROBE_MODEL = "claude-haiku-4-5-20251001"` instead of reading `modelsConfig.aliases.haiku`, because re-measurement on 2026-11-27 (5h utilization 0.14) confirmed `claude-haiku-5-5` still returns `429` without `anthropic-ratelimit-*` headers on bare `max_tokens: 1` probes while `claude-haiku-4-5-20251001` returns `200` with all 12 headers. Because all 4 exposed models have 1M windows, `FALLBACK_PROMPT_CHARS` and `GET /settings`'s un-overridden `maxPromptChars.value` move from `600000` to `3000000` (above the `PATCH /settings` max of `1000000`, which stays unchanged per ADR 0011). No B.2 response key-set change.
+
 ## v3.44.0 — 2026-11-27
 
 ### Added

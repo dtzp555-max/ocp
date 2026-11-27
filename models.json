@@ -11,68 +11,12 @@
       "maxTokens": 128000
     },
     {
-      "id": "claude-fable-5-1",
-      "displayName": "Claude Fable 5.1",
-      "openclawName": "Claude Fable 5.1 (via CLI)",
-      "reasoning": true,
-      "contextWindow": 1000000,
-      "maxTokens": 64000
-    },
-    {
-      "id": "claude-fable-5",
-      "displayName": "Claude Fable 5",
-      "openclawName": "Claude Fable 5 (via CLI)",
-      "reasoning": true,
-      "contextWindow": 1000000,
-      "maxTokens": 64000
-    },
-    {
       "id": "claude-opus-5-5",
       "displayName": "Claude Opus 5.5",
       "openclawName": "Claude Opus 5.5 (via CLI)",
       "reasoning": true,
       "contextWindow": 1000000,
       "maxTokens": 128000
-    },
-    {
-      "id": "claude-opus-5",
-      "displayName": "Claude Opus 5",
-      "openclawName": "Claude Opus 5 (via CLI)",
-      "reasoning": true,
-      "contextWindow": 1000000,
-      "maxTokens": 64000
-    },
-    {
-      "id": "claude-opus-4-8",
-      "displayName": "Claude Opus 4.8",
-      "openclawName": "Claude Opus 4.8 (via CLI)",
-      "reasoning": true,
-      "contextWindow": 1000000,
-      "maxTokens": 64000
-    },
-    {
-      "id": "claude-opus-4-7",
-      "displayName": "Claude Opus 4.7",
-      "openclawName": "Claude Opus 4.7 (via CLI)",
-      "reasoning": true,
-      "contextWindow": 1000000,
-      "maxTokens": 64000
-    },
-    {
-      "id": "claude-opus-4-6",
-      "displayName": "Claude Opus 4.6",
-      "openclawName": "Claude Opus 4.6 (via CLI)",
-      "reasoning": true,
-      "contextWindow": 200000,
-      "maxTokens": 64000
-    },
-    {
-      "id": "claude-opus-4-5",
-      "displayName": "Claude Opus 4.5",
-      "openclawName": "Claude Opus 4.5 (via CLI)",
-      "reasoning": true,
-      "contextWindow": 200000,
-      "maxTokens": 32000
     },
     {
       "id": "claude-sonnet-5-5",
@@ -83,54 +27,33 @@
       "maxTokens": 128000
     },
     {
-      "id": "claude-sonnet-5",
-      "displayName": "Claude Sonnet 5",
-      "openclawName": "Claude Sonnet 5 (via CLI)",
-      "reasoning": true,
-      "contextWindow": 1000000,
-      "maxTokens": 64000
-    },
-    {
-      "id": "claude-sonnet-4-6",
-      "displayName": "Claude Sonnet 4.6",
-      "openclawName": "Claude Sonnet 4.6 (via CLI)",
-      "reasoning": true,
-      "contextWindow": 200000,
-      "maxTokens": 32000
-    },
-    {
-      "id": "claude-sonnet-4-5",
-      "displayName": "Claude Sonnet 4.5",
-      "openclawName": "Claude Sonnet 4.5 (via CLI)",
-      "reasoning": true,
-      "contextWindow": 200000,
-      "maxTokens": 32000
-    },
-    {
       "id": "claude-haiku-5-5",
       "displayName": "Claude Haiku 5.5",
       "openclawName": "Claude Haiku 5.5 (via CLI)",
       "reasoning": true,
       "contextWindow": 1000000,
       "maxTokens": 128000
-    },
-    {
-      "id": "claude-haiku-4-5-20251001",
-      "displayName": "Claude Haiku 4.5",
-      "openclawName": "Claude Haiku 4.5 (via CLI)",
-      "reasoning": false,
-      "contextWindow": 200000,
-      "maxTokens": 32000
     }
   ],
   "aliases": {
     "opus": "claude-opus-5-5",
     "sonnet": "claude-sonnet-5-5",
-    "haiku": "claude-haiku-4-5-20251001"
+    "haiku": "claude-haiku-5-5"
   },
   "legacyAliases": {
-    "claude-opus-4": "claude-opus-4-7",
-    "claude-haiku-4": "claude-haiku-4-5-20251001",
-    "claude-haiku-4-5": "claude-haiku-4-5-20251001"
+    "claude-fable-5-1": "claude-fable-5-2",
+    "claude-fable-5": "claude-fable-5-2",
+    "claude-opus-5": "claude-opus-5-5",
+    "claude-opus-4-8": "claude-opus-5-5",
+    "claude-opus-4-7": "claude-opus-5-5",
+    "claude-opus-4-6": "claude-opus-5-5",
+    "claude-opus-4-5": "claude-opus-5-5",
+    "claude-opus-4": "claude-opus-5-5",
+    "claude-sonnet-5": "claude-sonnet-5-5",
+    "claude-sonnet-4-6": "claude-sonnet-5-5",
+    "claude-sonnet-4-5": "claude-sonnet-5-5",
+    "claude-haiku-4-5-20251001": "claude-haiku-5-5",
+    "claude-haiku-4": "claude-haiku-5-5",
+    "claude-haiku-4-5": "claude-haiku-5-5"
   }
 }

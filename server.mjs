@@ -4012,6 +4012,15 @@ async function refreshOAuthToken(refreshToken) {
   }
 }
 
+// Internal Class A /v1/messages rate-limit header probe model (cli.js vE4).
+// Kept decoupled from modelsConfig.aliases.haiku (now claude-haiku-5-5): measured on
+// 2026-11-22 (5h util 0.83) and re-measured on 2026-11-27 (5h util 0.14), claude-haiku-5-5
+// returns HTTP 429 with zero anthropic-ratelimit-* headers on bare max_tokens:1 probes,
+// whereas claude-haiku-4-5-20251001 returns HTTP 200 with all 12 unified rate-limit headers.
+// EXPIRY: switch back to modelsConfig.aliases.haiku once claude-haiku-5-5 returns
+// anthropic-ratelimit-unified-* headers on /v1/messages max_tokens:1 probes.
+const USAGE_PROBE_MODEL = "claude-haiku-4-5-20251001";
+
 async function fetchUsageFromApi() {
   const creds = getOAuthCredentials();
   if (!creds?.accessToken) {
@@ -4030,7 +4039,7 @@ async function fetchUsageFromApi() {
   // Minimal /v1/messages request — we only need the response headers.
   // Mirrors Claude Code cli.js vE4: headers anthropic-ratelimit-unified-{5h,7d}-{utilization,reset}.
   const body = JSON.stringify({
-    model: modelsConfig.aliases.haiku,
+    model: USAGE_PROBE_MODEL,
     max_tokens: 1,
     messages: [{ role: "user", content: "." }],
   });
@@ -4301,8 +4310,8 @@ function getSettings() {
     maxConcurrent:    { value: MAX_CONCURRENT, ...SETTINGS_SCHEMA.maxConcurrent },
     // Stays a plain number: `ocp settings` formats this into a fixed-width column and PATCH
     // takes a single scalar, so a null or a per-model map would break both consumers. When no
-    // override is set this is FALLBACK_PROMPT_CHARS (600,000 today) — the same number this
-    // field reported before ADR 0011, because every non-1M entry is still 200000.
+    // override is set this is FALLBACK_PROMPT_CHARS (3,000,000 today because every model
+    // currently exposed in models.json has a 1M window, which sits above PATCH's 1,000,000 cap).
     maxPromptChars:   { value: MAX_PROMPT_CHARS_OVERRIDE ?? FALLBACK_PROMPT_CHARS, ...SETTINGS_SCHEMA.maxPromptChars },
     cacheTTL:         { value: CACHE_TTL, ...SETTINGS_SCHEMA.cacheTTL },
   };
