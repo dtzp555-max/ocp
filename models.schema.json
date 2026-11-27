@@ -18,7 +18,7 @@
     "models": {
       "type": "array",
       "minItems": 1,
-      "description": "Every model OCP advertises on /v1/models, newest first. Order is load-bearing: ocp-connect uses model_ids[0] as a primary fallback.",
+      "description": "Every model OCP advertises on /v1/models, newest first. Order is load-bearing: ocp-connect uses model_ids[0] as a primary fallback. Policy: expose only the single latest model per family; move retired ids into legacyAliases pointing to the new canonical id.",
       "items": {
         "type": "object",
         "required": ["id", "displayName", "openclawName", "reasoning", "contextWindow", "maxTokens"],
