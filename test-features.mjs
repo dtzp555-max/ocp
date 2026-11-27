@@ -5,7 +5,7 @@
  */
 // MUST come before keys.mjs: redirects the key store to a scratch dir (see test-env.mjs).
 import { TEST_OCP_DIR } from "./test-env.mjs";
-import { getDb, getDbPath, createKey, listKeys, LIST_KEYS_SQL, validateKey, revokeKey, RESERVED_KEY_NAMES, isReservedKeyName, AmbiguousKeyError, resolveKeyTarget, recordUsage, checkQuota, updateKeyQuota, getKeyQuota, findKey, cacheHash, getCachedResponse, setCachedResponse, clearCache, getCacheStats, closeDb, hasCacheControl, singleflight, getInflightStats } from "./keys.mjs";
+import { getDb, getDbPath, createKey, listKeys, LIST_KEYS_SQL, validateKey, revokeKey, RESERVED_KEY_NAMES, isReservedKeyName, AmbiguousKeyError, resolveKeyTarget, recordUsage, checkQuota, updateKeyQuota, getKeyQuota, findKey, cacheHash, getCachedResponse, setCachedResponse, clearCache, getCacheStats, closeDb, hasCacheControl, singleflight, getInflightStats, KEY_HASH_PREFIX, isHashedApiKey, hashApiKey, formatKeyPreview } from "./keys.mjs";
 import { DatabaseSync } from "node:sqlite";
 import vm from "node:vm";
 import { isLoopbackBind, openLanSafetyError, resolveSetupAuthMode } from "./lib/net.mjs";
@@ -551,6 +551,90 @@ test("listKeys keyPreview matches the expected redaction of a real key", () => {
         `property "${prop}" must not contain a full-length key`);
     }
   }
+});
+
+test("Quota (#545): createKey stores SHA-256 hash and key_preview; validateKey hashes input and rejects stored hash/empty", () => {
+  assert.equal(KEY_HASH_PREFIX, "sha256:");
+  const created = createKey("hash-unit-545");
+  assert.ok(created.key.startsWith("ocp_"));
+
+  const row = db.prepare("SELECT id, key, key_preview, name FROM api_keys WHERE id = ?").get(created.id);
+  assert.ok(row, "created key row must exist in api_keys");
+  assert.match(row.key, /^sha256:[0-9a-f]{64}$/);
+  assert.equal(isHashedApiKey(row.key), true);
+  assert.equal(row.key, hashApiKey(created.key));
+  assert.notEqual(row.key, created.key, "stored api_keys.key must never hold plaintext");
+  assert.equal(row.key_preview, formatKeyPreview(created.key));
+  assert.equal(row.key_preview, created.key.slice(0, 8) + "..." + created.key.slice(-4));
+
+  const validated = validateKey(created.key);
+  assert.ok(validated, "validateKey(raw) must return { id, name }");
+  assert.deepEqual({ ...validated }, { id: created.id, name: "hash-unit-545" });
+  assert.equal(validateKey(row.key), null, "passing stored sha256 hash to validateKey must return null");
+  assert.equal(validateKey(""), null);
+  assert.equal(validateKey(null), null);
+  assert.equal(validateKey(undefined), null);
+  assert.equal(isHashedApiKey(created.key), false);
+  assert.equal(isHashedApiKey(null), false);
+  assert.equal(isHashedApiKey("sha256:" + "A".repeat(64)), false);
+});
+
+test("Quota (#545): migratePlaintextKeys scrubs multi-page freed SQLite pages and WAL while DB remains open", () => {
+  const dir = ltMkdir();
+  const legacyDbPath = join(dir, "ocp.db");
+  const legacyKeys = [];
+  const preDb = new DatabaseSync(legacyDbPath);
+  try {
+    preDb.exec("PRAGMA journal_mode = WAL");
+    preDb.exec(`
+      CREATE TABLE api_keys (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        key TEXT UNIQUE NOT NULL,
+        name TEXT NOT NULL,
+        created_at TEXT NOT NULL DEFAULT (datetime('now')),
+        revoked INTEGER NOT NULL DEFAULT 0,
+        quota_daily INTEGER DEFAULT NULL,
+        quota_weekly INTEGER DEFAULT NULL,
+        quota_monthly INTEGER DEFAULT NULL
+      );
+    `);
+    const ins = preDb.prepare("INSERT INTO api_keys (key, name) VALUES (?, ?)");
+    for (let i = 0; i < 60; i++) {
+      const k = `ocp_multiPage545_${String(i).padStart(4, "0")}_abcdefghij123456`;
+      legacyKeys.push(k);
+      ins.run(k, `multi-${i}`);
+    }
+  } finally { preDb.close(); }
+
+  const preBytes = _ltRead(legacyDbPath);
+  assert.ok(legacyKeys.every((k) => preBytes.includes(k)), "premise: pre-migration DB holds all 60 plaintext keys");
+
+  try {
+    const keysUrl = pathToFileURL(join(import.meta.dirname, "keys.mjs")).href;
+    const probe = `
+      import { readFileSync, existsSync } from "node:fs";
+      import { getDb, validateKey, closeDb } from ${JSON.stringify(keysUrl)};
+      getDb();
+      const dbBytes = readFileSync(${JSON.stringify(legacyDbPath)});
+      const walPath = ${JSON.stringify(legacyDbPath + "-wal")};
+      const walBytes = existsSync(walPath) ? readFileSync(walPath) : Buffer.alloc(0);
+      const leakedInDb = ${JSON.stringify(legacyKeys)}.filter((k) => dbBytes.includes(k)).length;
+      const leakedInWal = ${JSON.stringify(legacyKeys)}.filter((k) => walBytes.includes(k)).length;
+      const v0 = validateKey(${JSON.stringify(legacyKeys[0])});
+      const v59 = validateKey(${JSON.stringify(legacyKeys[59])});
+      process.stdout.write(JSON.stringify({ leakedInDb, leakedInWal, v0, v59 }));
+      closeDb();
+    `;
+    const out = execFileSync(process.execPath, ["--input-type=module", "-e", probe], {
+      env: { ...process.env, NODE_ENV: "test", OCP_DIR_OVERRIDE: dir },
+      encoding: "utf8",
+    });
+    const res = JSON.parse(out);
+    assert.equal(res.leakedInDb, 0, "VACUUM + trailing wal_checkpoint must scrub all 60 plaintext keys from ocp.db while still open");
+    assert.equal(res.leakedInWal, 0, "wal_checkpoint(TRUNCATE) must scrub all plaintext keys from ocp.db-wal");
+    assert.equal(res.v0?.name, "multi-0");
+    assert.equal(res.v59?.name, "multi-59");
+  } finally { _ltRmRetry(dir); }
 });
 
 test("checkQuota returns null when no quota set", () => {
@@ -3153,7 +3237,7 @@ test("localToolsSafetyError: multi is checked before loopback/anon (most severe 
 import { spawn as _ltSpawn, execFileSync as _ltExecFile } from "node:child_process";
 import { createServer as _ltNetServer, connect as _ltNetConnect } from "node:net";
 import { createServer as _ltHttpServer, request as _ltHttpRequest } from "node:http";
-import { writeFileSync as _ltWrite, chmodSync as _ltChmod, readFileSync as _ltRead, existsSync as _ltExists, rmSync as _ltRm, mkdtempSync as _ltMkdtemp, renameSync as _ltRename, mkdirSync as _ltMkdirSync, realpathSync as _ltRealpath, readdirSync as _ltReaddir } from "node:fs";
+import { writeFileSync as _ltWrite, chmodSync as _ltChmod, readFileSync as _ltRead, existsSync as _ltExists, rmSync as _ltRm, mkdtempSync as _ltMkdtemp, renameSync as _ltRename, mkdirSync as _ltMkdirSync, realpathSync as _ltRealpath, readdirSync as _ltReaddir, statSync as _ltStat } from "node:fs";
 import { tmpdir as _ltTmp } from "node:os";
 import { sep as _ltSep } from "node:path";
 import { fileURLToPath as _ltF2P } from "node:url";
@@ -34195,4 +34279,151 @@ test("deriveEnginesRange REFUSES a malformed table instead of emitting an empty 
   assert.equal(deriveEnginesRange([{ major: 22, minor: 13 }, { major: 23, minor: 4 }, { major: 26, minor: 2 }]),
     ">=22.13.0 <23.0.0 || >=23.4.0 <26.0.0 || >=26.2.0");
   assert.equal(deriveEnginesRange([{ major: 24, minor: 0 }]), ">=24.0.0", "a single row has no upper bound");
+});
+
+// ── #545: API keys hashed at rest + legacy plaintext migration ──────────────────────────────
+posixLtTest(WIN32_SH_CLAUDE, "integration (#545): legacy plaintext ocp.db migrates atomically on boot, scrubs disk bytes, and is idempotent", async () => {
+  const dir = ltMkdir();
+  try {
+    const fake = ltFake(dir);
+    const legacyDbPath = join(dir, "ocp.db");
+    const rawLegacy = "ocp_legacyActive545Key_1234567890abcd";
+    const rawRevoked = "ocp_revokedLegacy545Key_0987654321wxyz";
+    const expectedLegacyPreview = rawLegacy.slice(0, 8) + "..." + rawLegacy.slice(-4);
+    const expectedRevokedPreview = rawRevoked.slice(0, 8) + "..." + rawRevoked.slice(-4);
+    const expectedLegacyHash = hashApiKey(rawLegacy);
+    const expectedRevokedHash = hashApiKey(rawRevoked);
+
+    // Pre-create a legacy pre-#545 ocp.db WITHOUT a key_preview column.
+    const preDb = new DatabaseSync(legacyDbPath);
+    try {
+      preDb.exec("PRAGMA journal_mode = WAL");
+      preDb.exec(`
+        CREATE TABLE api_keys (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          key TEXT UNIQUE NOT NULL,
+          name TEXT NOT NULL,
+          created_at TEXT NOT NULL DEFAULT (datetime('now')),
+          revoked INTEGER NOT NULL DEFAULT 0,
+          quota_daily INTEGER DEFAULT NULL,
+          quota_weekly INTEGER DEFAULT NULL,
+          quota_monthly INTEGER DEFAULT NULL
+        );
+      `);
+      preDb.prepare("INSERT INTO api_keys (key, name, revoked) VALUES (?, ?, 0)").run(rawLegacy, "legacy-active-545");
+      preDb.prepare("INSERT INTO api_keys (key, name, revoked) VALUES (?, ?, 1)").run(rawRevoked, "legacy-revoked-545");
+    } finally { preDb.close(); }
+
+    // Premise: pre-migration database file on disk holds the plaintext keys.
+    const preBytes = _ltRead(legacyDbPath);
+    assert.ok(preBytes.includes(rawLegacy), "premise: pre-migration ocp.db must contain rawLegacy plaintext bytes");
+    assert.ok(preBytes.includes(rawRevoked), "premise: pre-migration ocp.db must contain rawRevoked plaintext bytes");
+
+    const adminKey = "admin-545";
+    const env = {
+      CLAUDE_AUTH_MODE: "multi",
+      OCP_TRUST_LOOPBACK: "0",
+      OCP_ADMIN_KEY: adminKey,
+      CLAUDE_BIN: fake,
+    };
+
+    const boot1 = await ltBootFresh(env, dir);
+    try {
+      assert.ok(await ltWait(() => boot1.buf.out.includes("listening on") || boot1.buf.closed), `boot1 failed — ${ltDiag(boot1.buf)}`);
+
+      // (a) Active legacy plaintext key authenticates (200) — triggers getDb() migration.
+      const rActive = await fetch(`http://127.0.0.1:${boot1.port}/v1/models`, {
+        headers: { Authorization: `Bearer ${rawLegacy}` },
+      });
+      assert.equal(rActive.status, 200, `Bearer <rawLegacy> must return 200, got ${rActive.status}`);
+
+      // Verify stored hash in ocp.db matches hashApiKey(raw) for both active and revoked rows.
+      const checkDb = new DatabaseSync(legacyDbPath, { readOnly: true });
+      let activeRow, revokedRow;
+      try {
+        const rows = checkDb.prepare("SELECT id, key, key_preview, name, revoked FROM api_keys ORDER BY id").all();
+        assert.equal(rows.length, 2);
+        activeRow = rows.find((r) => r.name === "legacy-active-545");
+        revokedRow = rows.find((r) => r.name === "legacy-revoked-545");
+      } finally { checkDb.close(); }
+      assert.equal(activeRow.key, expectedLegacyHash);
+      assert.equal(revokedRow.key, expectedRevokedHash);
+
+      // (b) Passing stored sha256:<hex> digest directly as Bearer MUST return 401.
+      const rHash = await fetch(`http://127.0.0.1:${boot1.port}/v1/models`, {
+        headers: { Authorization: `Bearer ${activeRow.key}` },
+      });
+      assert.equal(rHash.status, 401, `Bearer <storedSha256Hash> must return 401, got ${rHash.status}`);
+
+      // (c) Revoked migrated key MUST remain rejected with 401.
+      const rRevoked = await fetch(`http://127.0.0.1:${boot1.port}/v1/models`, {
+        headers: { Authorization: `Bearer ${rawRevoked}` },
+      });
+      assert.equal(rRevoked.status, 401, `Bearer <rawRevoked> must return 401, got ${rRevoked.status}`);
+
+      // (d) GET /api/keys (as admin) returns exact original keyPreview for both active and revoked rows.
+      const rKeys = await fetch(`http://127.0.0.1:${boot1.port}/api/keys`, {
+        headers: { Authorization: `Bearer ${adminKey}` },
+      });
+      assert.equal(rKeys.status, 200, `GET /api/keys as admin must return 200, got ${rKeys.status}`);
+      const { keys } = await rKeys.json();
+      const kActive = keys.find((k) => k.name === "legacy-active-545");
+      const kRevoked = keys.find((k) => k.name === "legacy-revoked-545");
+      assert.ok(kActive && kRevoked, "both migrated active and revoked keys must appear in GET /api/keys");
+      assert.equal(kActive.keyPreview, expectedLegacyPreview);
+      assert.equal(kRevoked.keyPreview, expectedRevokedPreview);
+      assert.equal(kActive.revoked, 0);
+      assert.equal(kRevoked.revoked, 1);
+
+      // (e) Raw bytes of ocp.db (and ocp.db-wal if present) contain NEITHER plaintext key.
+      const dbBytes = _ltRead(legacyDbPath);
+      assert.equal(dbBytes.includes(rawLegacy), false, "ocp.db must not retain rawLegacy plaintext bytes after migration");
+      assert.equal(dbBytes.includes(rawRevoked), false, "ocp.db must not retain rawRevoked plaintext bytes after migration");
+      const walPath = `${legacyDbPath}-wal`;
+      if (_ltExists(walPath)) {
+        const walBytes = _ltRead(walPath);
+        assert.equal(walBytes.includes(rawLegacy), false, "ocp.db-wal must not retain rawLegacy plaintext bytes after migration");
+        assert.equal(walBytes.includes(rawRevoked), false, "ocp.db-wal must not retain rawRevoked plaintext bytes after migration");
+      }
+      assert.equal(_ltStat(legacyDbPath).mode & 0o777, 0o600, "migrated ocp.db must keep 0600 mode");
+    } finally {
+      boot1.child.kill("SIGKILL");
+      await ltDrain(() => boot1.buf.closed, "hash-545-boot1", 5000);
+    }
+
+    // (f) Second boot against the migrated DB is idempotent.
+    const boot2 = await ltBootFresh(env, dir);
+    try {
+      assert.ok(await ltWait(() => boot2.buf.out.includes("listening on") || boot2.buf.closed), `boot2 failed — ${ltDiag(boot2.buf)}`);
+
+      const rActive2 = await fetch(`http://127.0.0.1:${boot2.port}/v1/models`, {
+        headers: { Authorization: `Bearer ${rawLegacy}` },
+      });
+      assert.equal(rActive2.status, 200, "second boot must continue accepting rawLegacy");
+
+      const rKeys2 = await fetch(`http://127.0.0.1:${boot2.port}/api/keys`, {
+        headers: { Authorization: `Bearer ${adminKey}` },
+      });
+      assert.equal(rKeys2.status, 200);
+      const { keys: keys2 } = await rKeys2.json();
+      assert.equal(keys2.find((k) => k.name === "legacy-active-545")?.keyPreview, expectedLegacyPreview);
+      assert.equal(keys2.find((k) => k.name === "legacy-revoked-545")?.keyPreview, expectedRevokedPreview);
+
+      const checkDb2 = new DatabaseSync(legacyDbPath, { readOnly: true });
+      try {
+        const rows2 = checkDb2.prepare("SELECT key, name FROM api_keys").all();
+        assert.equal(rows2.find((r) => r.name === "legacy-active-545")?.key, expectedLegacyHash,
+          "second boot must not re-hash migrated active key");
+        assert.equal(rows2.find((r) => r.name === "legacy-revoked-545")?.key, expectedRevokedHash,
+          "second boot must not re-hash migrated revoked key");
+      } finally { checkDb2.close(); }
+
+      const dbBytes2 = _ltRead(legacyDbPath);
+      assert.equal(dbBytes2.includes(rawLegacy), false);
+      assert.equal(dbBytes2.includes(rawRevoked), false);
+    } finally {
+      boot2.child.kill("SIGKILL");
+      await ltDrain(() => boot2.buf.closed, "hash-545-boot2", 5000);
+    }
+  } finally { _ltRmRetry(dir); }
 });
