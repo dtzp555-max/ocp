@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## v3.44.0 — 2026-11-27
+
 ### Added
 
 - **Open-LAN boot gate & `OCP_ALLOW_OPEN_LAN=1`** ([ADR 0026](docs/adr/0026-open-lan-boot-gate.md), #544): `server.mjs` now refuses to boot (`FATAL:` + exit 1 before `server.listen()`) when binding to a non-loopback address (`CLAUDE_BIND=0.0.0.0`, `::`, or a LAN/Tailscale IP) with open auth (`CLAUDE_AUTH_MODE=none`, `shared` without `PROXY_API_KEY`, or an unrecognised mode) and host-side tools granted (`TOOLS_GRANTED`, i.e. not `multi`), mirroring the existing TUI (`OCP_TUI_ALLOW_LAN=1`) and `OCP_LOCAL_TOOLS` boot gates. Operators intentionally running open LAN behind a separate network boundary (firewall/VPN) can opt in explicitly with `OCP_ALLOW_OPEN_LAN=1` (emits a boot warning and banner line). `setup.mjs --bind <non-loopback>` now defaults `--auth-mode` to `multi` when omitted, and `ocp lan` steers to authenticated LAN setup. Not endpoint-touching; no request/response contract or B.2 key-set change.
