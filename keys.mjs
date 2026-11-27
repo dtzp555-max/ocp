@@ -79,6 +79,7 @@ function initSchema() {
     CREATE TABLE IF NOT EXISTS api_keys (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       key TEXT UNIQUE NOT NULL,
+      key_preview TEXT DEFAULT NULL,
       name TEXT NOT NULL,
       created_at TEXT NOT NULL DEFAULT (datetime('now')),
       revoked INTEGER NOT NULL DEFAULT 0
@@ -113,17 +114,64 @@ function initSchema() {
     CREATE INDEX IF NOT EXISTS idx_cache_created ON response_cache(created_at);
   `);
 
-  // Idempotent migrations: add quota columns if they don't exist yet.
+  // Idempotent migrations: add quota and key_preview columns if they don't exist yet.
   for (const col of [
     "ALTER TABLE api_keys ADD COLUMN quota_daily INTEGER DEFAULT NULL",
     "ALTER TABLE api_keys ADD COLUMN quota_weekly INTEGER DEFAULT NULL",
     "ALTER TABLE api_keys ADD COLUMN quota_monthly INTEGER DEFAULT NULL",
+    "ALTER TABLE api_keys ADD COLUMN key_preview TEXT DEFAULT NULL",
   ]) {
     try { db.exec(col); } catch (e) {
       // SQLite throws "duplicate column name" if already present — safe to ignore.
       if (!e.message?.includes("duplicate column")) throw e;
     }
   }
+
+  migratePlaintextKeys();
+}
+
+export const KEY_HASH_PREFIX = "sha256:";
+
+export function isHashedApiKey(v) {
+  return /^sha256:[0-9a-f]{64}$/.test(String(v ?? ""));
+}
+
+export function hashApiKey(rawKey) {
+  return KEY_HASH_PREFIX + createHash("sha256").update(String(rawKey)).digest("hex");
+}
+
+export function formatKeyPreview(rawKey) {
+  const s = String(rawKey);
+  return s.slice(0, 8) + "..." + s.slice(-4);
+}
+
+// Idempotently migrate legacy plaintext api_keys rows to SHA-256 digests and scrub plaintext
+// bytes from -wal and freed SQLite pages on disk.
+function migratePlaintextKeys() {
+  const rows = db.prepare("SELECT id, key, key_preview FROM api_keys").all();
+  const legacyRows = rows.filter((row) => !isHashedApiKey(row.key));
+  if (legacyRows.length === 0) return;
+
+  db.exec("BEGIN IMMEDIATE");
+  try {
+    const update = db.prepare("UPDATE api_keys SET key = ?, key_preview = ? WHERE id = ?");
+    for (const row of legacyRows) {
+      const preview = row.key_preview ?? formatKeyPreview(row.key);
+      const hashed = hashApiKey(row.key);
+      update.run(hashed, preview, row.id);
+    }
+    db.exec("COMMIT");
+  } catch (err) {
+    try { db.exec("ROLLBACK"); } catch { /* ignore */ }
+    throw err;
+  }
+
+  // Checkpoint before VACUUM shrinks any pre-existing WAL; checkpoint after VACUUM flushes the
+  // rebuilt clean database image out of WAL into ocp.db and truncates -wal to zero bytes.
+  db.exec("PRAGMA wal_checkpoint(TRUNCATE)");
+  db.exec("VACUUM");
+  db.exec("PRAGMA wal_checkpoint(TRUNCATE)");
+  try { chmodSync(dbPath, 0o600); } catch { /* ignore — same-user access still works */ }
 }
 
 // ── Key CRUD ──
@@ -216,13 +264,13 @@ export function resolveKeyTarget(idOrName, { activeOnly = true } = {}) {
 export function createKey(name) {
   const key = "ocp_" + randomBytes(24).toString("base64url");
   const d = getDb();
-  const stmt = d.prepare("INSERT INTO api_keys (key, name) VALUES (?, ?)");
-  const result = stmt.run(key, name);
+  const stmt = d.prepare("INSERT INTO api_keys (key, key_preview, name) VALUES (?, ?, ?)");
+  const result = stmt.run(hashApiKey(key), formatKeyPreview(key), name);
   return { id: result.lastInsertRowid, key, name };
 }
 
 export const LIST_KEYS_SQL =
-  "SELECT id, substr(key,1,8)||'...'||substr(key,-4) AS keyPreview, name, created_at, revoked, quota_daily, quota_weekly, quota_monthly FROM api_keys ORDER BY created_at DESC";
+  "SELECT id, COALESCE(key_preview, '') AS keyPreview, name, created_at, revoked, quota_daily, quota_weekly, quota_monthly FROM api_keys ORDER BY created_at DESC";
 
 export function listKeys() {
   const d = getDb();
@@ -240,10 +288,11 @@ export function revokeKey(idOrName) {
 }
 
 export function validateKey(key) {
+  if (typeof key !== "string" || !key) return null;
   const d = getDb();
   const row = d.prepare(
     "SELECT id, name FROM api_keys WHERE key = ? AND revoked = 0"
-  ).get(key);
+  ).get(hashApiKey(key));
   return row || null;
 }
 

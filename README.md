@@ -821,7 +821,7 @@ Top-level files a contributor or operator may need to know:
 - **Admin-only key management** — creating, listing, and revoking keys requires the admin key
 - **Public endpoints** — `/health` and `/dashboard` are always accessible without auth
 - **No API keys needed** — authentication goes through Claude CLI's OAuth session
-- **Keys stored locally** — `~/.ocp/ocp.db` (SQLite), never sent to external services
+- **Keys stored locally** — API keys are stored as SHA-256 digests (`sha256:<hex>`) with redacted previews in `~/.ocp/ocp.db` (`0600` SQLite), never in plaintext and never sent to external services
 - **Auto-start** — launchd (macOS) / systemd (Linux)
 
 ## Governance

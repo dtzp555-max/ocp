@@ -12,6 +12,7 @@
 
 ### Changed
 
+- **API keys are stored hashed at rest (`sha256:<hex>`) instead of plaintext (#545).** `createKey()` stores `hashApiKey(key)` in `api_keys.key` and `formatKeyPreview(key)` in a new `key_preview` column, `LIST_KEYS_SQL` selects `COALESCE(key_preview, '') AS keyPreview`, and `validateKey()` hashes the incoming Bearer token before querying (rejecting raw stored digests and empty/non-string inputs). On DB open, `migratePlaintextKeys()` atomically migrates any legacy plaintext rows inside `BEGIN IMMEDIATE` ... `COMMIT` (capturing `key_preview` before hashing) and runs `PRAGMA wal_checkpoint(TRUNCATE)` → `VACUUM` → `PRAGMA wal_checkpoint(TRUNCATE)` (plus `0600` chmod) so legacy plaintext bytes are scrubbed from `-wal` and freed SQLite pages on disk. **One-way migration:** rolling back to a pre-#545 release will leave existing hashed DB keys rejected `401` by legacy `validateKey()` (`OCP_ADMIN_KEY` is unaffected). `server.mjs` is untouched; `POST /api/keys` and `GET /api/keys` wire responses are unchanged (Class B.2, [ADR 0006](docs/adr/0006-openai-shim-scope.md) grandfathered as of v3.16.4, route (a) behaviour-preserving).
 - `.gitignore` now ignores the root `start.sh` launcher that `setup.mjs` writes and the root `package-lock.json` that `npm install` writes, so an install directory's `git status` stays clean after `ocp update`. `package.json` declares no dependencies, so that lock file records only the package itself; if a dependency is ever added, the lock should be committed and the ignore line removed.
 
 ### Fixed
